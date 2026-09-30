@@ -20,10 +20,10 @@
 //! instead of writing through the standby receive/apply object.
 
 const std = @import("std");
-const storage_contract = @import("../db/ha_contract.zig");
+const storage_contract = @import("../db/replication_contract.zig");
 const fencing = @import("fencing.zig");
 const primary_mod = @import("primary.zig");
-const replication_record = @import("replication_record.zig");
+const replication_record = @import("../db/replication_record.zig");
 const standby_mod = @import("standby.zig");
 
 var test_path_counter: u64 = 0;

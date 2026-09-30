@@ -13,7 +13,8 @@
 // limitations.
 
 //! End-to-end LSM lifecycle and standby contracts, plus reproducible work counts.
-const ha_publisher_adapter = @import("../hot_standby/db_commit.zig");
+const hot_standby_publisher_adapter = @import("../hot_standby/db_commit.zig");
+const replication_ingress = @import("replication_ingress.zig");
 const std = @import("std");
 const db_mod = @import("mod.zig");
 const rows = @import("relational_rows.zig");
@@ -884,7 +885,7 @@ test "relational index system restore replay projection bounds allocation for wi
     defer alloc.free(payload);
     var scratch: [16 * 1024]u8 = undefined;
     var bounded = std.heap.FixedBufferAllocator.init(&scratch);
-    const record: @import("../hot_standby/replication_record.zig").RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = payload };
+    const record: @import("replication_record.zig").RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = payload };
     try std.testing.expectEqual(null, try effects.decodeRestoreFinishForReplay(bounded.allocator(), record));
 }
 
@@ -952,7 +953,7 @@ test "relational index system restore receipts require local coverage through fa
             try std.testing.expectEqual(.building, (try target.relationalIndexBuildStatus("tenant_id")).state);
             try std.testing.expectError(error.IndexRebuilding, target.finishRestoreStaging(alloc, scope.digest(), phase));
             if (trial == 1) {
-                target.ha_write_gate = .{ .shared = .{ .state = standby_gate.storageWriteState() } };
+                target.replication_write_gate = .{ .shared = .{ .state = standby_gate.storageWriteState() } };
                 try std.testing.expectError(error.HAReadOnlyStandby, target.prepareRestoreStagingIndexesStep(alloc, scope.digest()));
             }
             const request: db_mod.types.BatchRequest = .{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = phase } } };
@@ -978,25 +979,25 @@ test "relational index system restore receipts require local coverage through fa
     }
     // The hot-standby LSN fast path has the same obligation as Raft: a replay
     // receipt cannot skip reconstructing this replica's missing local proof.
-    const ha_payload = try @import("../hot_standby/effects.zig").encodeBatchMutationRequestAlloc(alloc, .{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .published } } });
-    defer alloc.free(ha_payload);
-    const record: @import("../hot_standby/replication_record.zig").RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = ha_payload };
-    try target.applyHAReplicationRecord(record);
+    const replication_payload = try @import("../hot_standby/effects.zig").encodeBatchMutationRequestAlloc(alloc, .{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .published } } });
+    defer alloc.free(replication_payload);
+    const record: @import("replication_record.zig").RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = replication_payload };
+    try replication_ingress.applyRecord(&target, record);
     try resetRestoreIndexCoverage(&target, false);
     target.close();
     target = try db_mod.DB.open(alloc, target_directory.path(), target_options);
-    target.ha_write_gate = .{ .shared = .{ .state = standby_gate.storageWriteState() } };
+    target.replication_write_gate = .{ .shared = .{ .state = standby_gate.storageWriteState() } };
     // Superseded entries and an unrelated scope must not perform maintenance
     // against the current generation, even when its local coverage is missing.
     try target.batchRaftReplicatedApply(.{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .validated } } }, .{ .index = 2, .term = 1 });
     try std.testing.expectEqual(.building, (try target.relationalIndexBuildStatus("tenant_id")).state);
     try target.batchRaftReplicatedApply(.{ .restore_staging = .{ .finish = .{ .scope = @splat(99), .phase = .published } } }, .{ .index = 3, .term = 1 });
     try std.testing.expectEqual(.building, (try target.relationalIndexBuildStatus("tenant_id")).state);
-    var ha_pending: usize = 0;
+    var replication_pending: usize = 0;
     for (0..32) |_| {
-        target.applyHAReplicationRecord(record) catch |err| switch (err) {
+        replication_ingress.applyRecord(&target, record) catch |err| switch (err) {
             error.RestoreProjectionCatchUpPending => {
-                ha_pending += 1;
+                replication_pending += 1;
                 continue;
             },
             else => return err,
@@ -1004,7 +1005,7 @@ test "relational index system restore receipts require local coverage through fa
         break;
     } else return error.IndexBuildDidNotConverge;
     try std.testing.expectEqual(.ready, (try target.relationalIndexBuildStatus("tenant_id")).state);
-    try std.testing.expect(ha_pending != 0);
+    try std.testing.expect(replication_pending != 0);
     target.close();
     target = try db_mod.DB.open(alloc, target_directory.path(), target_options);
     try std.testing.expectEqual(@as(usize, 1), try expressionIndexCount(&target, 20));
@@ -2414,8 +2415,8 @@ fn replay(primary: *primary_mod.Primary, replica: *db_mod.DB, next: *u64) !void 
     while (next.* <= primary.lastLsn()) : (next.* += 1) {
         var entry = (try primary.log.entryAt(alloc, next.*)) orelse return error.MissingReplicationRecord;
         defer entry.deinit(alloc);
-        try replica.applyHAReplicationRecord(entry.record);
-        try replica.applyHAReplicationRecord(entry.record);
+        try replication_ingress.applyRecord(&replica, entry.record);
+        try replication_ingress.applyRecord(&replica, entry.record);
     }
 }
 
@@ -2434,8 +2435,8 @@ test "relational index system standby replays schema churn and rebuilds ready ge
     var last_lsn = std.atomic.Value(u64).init(0);
     var failures = std.atomic.Value(u64).init(0);
     var mirrored = options;
-    mirrored.ha_async_metadata_mirror = .{ .publisher = ha_publisher_adapter.bind(&primary), .last_lsn = &last_lsn, .failure_count = &failures };
-    mirrored.ha_async_batch_mirror = .{ .publisher = ha_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .async } };
+    mirrored.replication_async_metadata_mirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .last_lsn = &last_lsn, .failure_count = &failures };
+    mirrored.replication_async_batch_mirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .async } };
     var source = try db_mod.DB.open(alloc, source_path, mirrored);
     defer source.close();
     var replica = try db_mod.DB.open(alloc, replica_path, options);
@@ -2490,7 +2491,7 @@ test "relational index system standby replays schema churn and rebuilds ready ge
     const current = try replica.relationalIndexBuildStatus("tenant_id");
     try std.testing.expect(current.generation > first.generation);
     try std.testing.expectEqual(@as(usize, 2), (try scan(&replica, true)).count);
-    try std.testing.expectEqual(next - 1, try replica.haAppliedReplicationLsn());
+    try std.testing.expectEqual(next - 1, try replica.replicationAppliedSequence());
     try std.testing.expectEqual(@as(u64, 0), failures.load(.acquire));
     // The recovered replica's active plan must also serve fresh primary writes;
     // replay completion alone is insufficient evidence of a usable write plan.

@@ -12,8 +12,8 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const ha_write_gate_adapter = @import("../../storage/hot_standby/write_gate.zig");
-const ha_publisher_adapter = @import("../../storage/hot_standby/db_commit.zig");
+const hot_standby_write_gate_adapter = @import("../../storage/hot_standby/write_gate.zig");
+const hot_standby_publisher_adapter = @import("../../storage/hot_standby/db_commit.zig");
 const std = @import("std");
 const store_report_baseline = @import("../store_report_baseline.zig");
 const secret_store = @import("../secret_store.zig");
@@ -5577,7 +5577,7 @@ test "standalone metadata released JSON replay is atomic exact and checkpoint du
     const table: metadata.TableRecord = .{ .table_id = 7, .name = "legacy", .storage = .{ .dense_embeddings = .vector_store }, .storage_migration = .{ .request = .{ .job_id = "vectors", .mode = .online } } };
     const ranges = [_]metadata.RangeRecord{.{ .table_id = 7, .group_id = 17, .range_id = 19, .start_key = "" }};
     const payload = try std.json.Stringify.valueAlloc(scratch, RaftApplyStore.LegacyCatalogCreate{ .table = table, .ranges = &ranges }, .{});
-    var record: @import("../../storage/hot_standby/replication_record.zig").Record = .{ .kind = .metadata_mutation, .payload_codec = .json, .cluster_id = 7, .timeline_id = 1, .epoch = 1, .lsn = 5, .previous_lsn = 4, .payload = payload };
+    var record: @import("../../storage/db/replication_record.zig").Record = .{ .kind = .metadata_mutation, .payload_codec = .json, .cluster_id = 7, .timeline_id = 1, .epoch = 1, .lsn = 5, .previous_lsn = 4, .payload = payload };
     const group = group_ids.main_metadata_group_id;
     {
         var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
@@ -5650,7 +5650,7 @@ test "standalone metadata released JSON replay verifies imported ranges and pres
     wrong_ranges[0].range_id += 1;
     const invalid_payload = try std.json.Stringify.valueAlloc(alloc, RaftApplyStore.LegacyCatalogCreate{ .table = table, .ranges = &wrong_ranges }, .{});
     defer alloc.free(invalid_payload);
-    var record: @import("../../storage/hot_standby/replication_record.zig").Record = .{ .kind = .metadata_mutation, .payload_codec = .json, .cluster_id = 7, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = invalid_payload };
+    var record: @import("../../storage/db/replication_record.zig").Record = .{ .kind = .metadata_mutation, .payload_codec = .json, .cluster_id = 7, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = invalid_payload };
     try std.testing.expectError(error.TableLifecycleConflict, store.applyHARecord(record));
     try std.testing.expectError(error.NotFound, store.store.get(alloc, RaftApplyStore.metadata_ha.replay_key));
     try std.testing.expectEqual(@as(u64, 1), try store.standaloneRevision());
@@ -5794,7 +5794,7 @@ test "standalone metadata HA preserves incremental jobs outbox recovery and full
     {
         var source = try RaftApplyStore.init(alloc, .{ .root_dir = source_root });
         defer source.deinit();
-        try source.bindHA(.{ .primary = ha_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = ha_publisher_adapter.bind(&primary) });
+        try source.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary) });
         try source.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = logical_key, .value = queued } });
         var first = (try primary.log.entryAt(alloc, 1)).?;
         defer first.deinit(alloc);
@@ -5810,7 +5810,7 @@ test "standalone metadata HA preserves incremental jobs outbox recovery and full
             }
         };
         var context: u8 = 0;
-        try source.bindHA(.{ .primary = ha_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = ha_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &context, .sync_wait_fn = Failure.wait });
+        try source.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &context, .sync_wait_fn = Failure.wait });
         try std.testing.expectError(error.InjectedAfterMetadataHAAppend, source.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = logical_key, .value = importing } }));
         try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
         try std.testing.expectError(error.MetadataHAOutboxPending, source.exportHACheckpoint(io, checkpoint));
@@ -5818,7 +5818,7 @@ test "standalone metadata HA preserves incremental jobs outbox recovery and full
     {
         var source = try RaftApplyStore.init(alloc, .{ .root_dir = source_root });
         defer source.deinit();
-        try source.bindHA(.{ .primary = ha_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = ha_publisher_adapter.bind(&primary) });
+        try source.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary) });
         try source.flushHAOutbox();
         try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
         try source.store.put("\x00\x00__metadata__:private_fixture", "private-reservation-proof");
@@ -5893,7 +5893,7 @@ test "standalone metadata chunked HA resumes large effects through checkpoint wi
             }
         };
         var context: u8 = 0;
-        try source.bindHA(.{ .primary = ha_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = ha_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &context, .sync_wait_fn = Failure.wait });
+        try source.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &context, .sync_wait_fn = Failure.wait });
         try std.testing.expectError(error.MetadataMutationOutcomeUnknown, source.replaceStandaloneCatalog(group, 0, &.{}, &.{}, value));
     }
     const final_lsn = primary.lastLsn();
@@ -5901,7 +5901,7 @@ test "standalone metadata chunked HA resumes large effects through checkpoint wi
     {
         var source = try RaftApplyStore.init(alloc, .{ .root_dir = source_root });
         defer source.deinit();
-        try source.bindHA(.{ .primary = ha_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = ha_publisher_adapter.bind(&primary) });
+        try source.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary) });
         try source.flushHAOutbox();
         try std.testing.expectEqual(final_lsn, primary.lastLsn());
     }
@@ -5913,7 +5913,7 @@ test "standalone metadata chunked HA resumes large effects through checkpoint wi
         while (lsn <= 3) : (lsn += 1) {
             var entry = (try primary.log.entryAt(alloc, lsn)).?;
             defer entry.deinit(alloc);
-            try std.testing.expect(entry.record.payload.len + @import("../../storage/hot_standby/replication_record.zig").header_size <= 1024 * 1024);
+            try std.testing.expect(entry.record.payload.len + @import("../../storage/db/replication_record.zig").header_size <= 1024 * 1024);
             try target.applyHARecord(entry.record);
             try target.applyHARecord(entry.record);
             try std.testing.expect((try target.loadStandaloneCatalog(alloc)) == null);
@@ -5994,9 +5994,9 @@ test "standalone metadata chunked HA resumes large effects through checkpoint wi
     var promoted = try RaftApplyStore.init(alloc, .{ .root_dir = promoted_root });
     defer promoted.deinit();
     try promoted.importHACheckpoint(io, checkpoint, checkpoint_size);
-    try promoted.bindHA(.{ .primary = ha_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = ha_publisher_adapter.bind(&primary) });
+    try promoted.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary) });
     try std.testing.expectError(error.MetadataHAIncompleteEffect, promoted.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = key, .value = "promoted" } }));
-    try promoted.bindHA(.{ .primary = ha_write_gate_adapter.bindPrimary(&new_primary) }, .{ .publisher = ha_publisher_adapter.bind(&new_primary) });
+    try promoted.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&new_primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&new_primary) });
     try promoted.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = key, .value = "promoted" } });
     var follower = try RaftApplyStore.init(alloc, .{ .root_dir = follower_root });
     defer follower.deinit();
@@ -6050,9 +6050,9 @@ pub const RaftApplyStore = struct {
     active_outcome: ?*CommittedApplyOutcome = null,
     verified_catalog_groups: std.AutoHashMapUnmanaged(u64, void) = .empty,
     read_only: bool = false,
-    ha_gate: ?@import("../../storage/db/ha_contract.zig").WriteGate = null,
-    ha_mirror: ?@import("../../storage/db/ha_contract.zig").AsyncEffectMirror = null,
-    ha_port: ?@import("../../storage/metadata_ha_port.zig").Port = null,
+    ha_gate: ?@import("../../storage/db/replication_contract.zig").WriteGate = null,
+    ha_mirror: ?@import("../../storage/db/replication_contract.zig").AsyncEffectMirror = null,
+    ha_port: ?@import("../../storage/metadata_hot_standby_port.zig").Port = null,
 
     const ProjectedPlacementIntent = struct {
         metadata_group_id: u64,
@@ -6184,7 +6184,7 @@ pub const RaftApplyStore = struct {
 
     /// The embedding owns the shared HA mutation lease BEFORE its catalog
     /// mutex. Do not recursively acquire the writer-preferring seed barrier.
-    pub fn bindHA(self: *RaftApplyStore, gate: ?@import("../../storage/db/ha_contract.zig").WriteGate, mirror: ?@import("../../storage/db/ha_contract.zig").AsyncEffectMirror) !void {
+    pub fn bindHA(self: *RaftApplyStore, gate: ?@import("../../storage/db/replication_contract.zig").WriteGate, mirror: ?@import("../../storage/db/replication_contract.zig").AsyncEffectMirror) !void {
         if (!self.apply_mutex.tryLock()) return error.MetadataHABindingBusy;
         defer self.apply_mutex.unlock(self.io_impl.io());
         self.ha_gate = gate;
@@ -6192,7 +6192,7 @@ pub const RaftApplyStore = struct {
         self.ha_port = null;
     }
 
-    pub fn bindHAPort(self: *RaftApplyStore, port: ?@import("../../storage/metadata_ha_port.zig").Port) !void {
+    pub fn bindHAPort(self: *RaftApplyStore, port: ?@import("../../storage/metadata_hot_standby_port.zig").Port) !void {
         if (!self.apply_mutex.tryLock()) return error.MetadataHABindingBusy;
         defer self.apply_mutex.unlock(self.io_impl.io());
         self.ha_port = port;
@@ -6222,7 +6222,7 @@ pub const RaftApplyStore = struct {
     fn stageStandaloneHA(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, capture: *@import("../../storage/txn_mutation_capture.zig").Capture, group_id: u64) !void {
         txn.mutation_capture = null;
         if (!self.hasHAMirror()) return;
-        const identity: @import("../../storage/metadata_ha_port.zig").Identity = if (self.ha_port) |port| try port.identity() else .{
+        const identity: @import("../../storage/metadata_hot_standby_port.zig").Identity = if (self.ha_port) |port| try port.identity() else .{
             .next_lsn = self.ha_mirror.?.publisher.nextLsn(),
             .timeline_id = self.ha_mirror.?.publisher.identity().timeline_id,
             .epoch = self.ha_mirror.?.publisher.identity().epoch,
@@ -6308,8 +6308,8 @@ pub const RaftApplyStore = struct {
             try self.lockHATransition();
             transition_locked = true;
             if (gate) |value| try value.check();
-            const prior = if (same_timeline) try (try ha_publisher_adapter.runtimePrimary(mirror)).findMatchingRecordFrom(search_from, .metadata_mutation, frame, 0, 0) else null;
-            lsn = prior orelse try (try ha_publisher_adapter.runtimePrimary(mirror)).append(.{ .kind = .metadata_mutation, .payload_codec = .binary, .shard_id = 0, .table_id = 0, .payload = frame });
+            const prior = if (same_timeline) try (try hot_standby_publisher_adapter.runtimePrimary(mirror)).findMatchingRecordFrom(search_from, .metadata_mutation, frame, 0, 0) else null;
+            lsn = prior orelse try (try hot_standby_publisher_adapter.runtimePrimary(mirror)).append(.{ .kind = .metadata_mutation, .payload_codec = .binary, .shard_id = 0, .table_id = 0, .payload = frame });
             search_from = lsn +| 1;
         }
         if (mirror.last_lsn) |last| last.store(lsn, .release);
@@ -6317,7 +6317,7 @@ pub const RaftApplyStore = struct {
         transition_locked = false;
         if (mirror.sync_policy.mode != .async) {
             if (mirror.sync_wait_fn) |wait| try wait(mirror.sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.publisher.ptr, lsn, mirror.sync_policy);
-            const decision = try @import("../../storage/hot_standby/commit_gate.zig").evaluate(try ha_publisher_adapter.runtimePrimary(mirror), lsn, mirror.sync_policy);
+            const decision = try @import("../../storage/hot_standby/commit_gate.zig").evaluate(try hot_standby_publisher_adapter.runtimePrimary(mirror), lsn, mirror.sync_policy);
             if (!decision.shouldAcknowledge()) return error.HASyncCommitWouldBlock;
         }
         // A remote acknowledgment can outlive the role generation that
@@ -6340,7 +6340,7 @@ pub const RaftApplyStore = struct {
         try self.flushHAOutboxLocked();
     }
 
-    pub fn applyHARecord(self: *RaftApplyStore, record: @import("../../storage/hot_standby/replication_record.zig").RecordView) !void {
+    pub fn applyHARecord(self: *RaftApplyStore, record: @import("../../storage/db/replication_record.zig").RecordView) !void {
         if (record.payload_codec == .json) return self.applyLegacyCatalogCreate(record);
         return self.applyHAChunk(record);
     }
@@ -6358,7 +6358,7 @@ pub const RaftApplyStore = struct {
         } = null,
     };
 
-    fn applyLegacyCatalogCreate(self: *RaftApplyStore, record: @import("../../storage/hot_standby/replication_record.zig").RecordView) !void {
+    fn applyLegacyCatalogCreate(self: *RaftApplyStore, record: @import("../../storage/db/replication_record.zig").RecordView) !void {
         if (record.kind != .metadata_mutation or record.table_id != 0 or record.shard_id != 0 or record.lsn == 0 or record.previous_lsn >= record.lsn or record.payload.len > metadata_ha.max_effect_bytes) return error.InvalidMetadataHAEffect;
         const parsed = std.json.parseFromSlice(LegacyCatalogCreate, self.alloc, record.payload, .{}) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -6457,7 +6457,7 @@ pub const RaftApplyStore = struct {
         try self.commitStandaloneTxn(&txn, &outcome, &committed);
     }
 
-    fn metadataReplayReceipt(txn: *docstore.DocStore.Txn, record: @import("../../storage/hot_standby/replication_record.zig").RecordView) !void {
+    fn metadataReplayReceipt(txn: *docstore.DocStore.Txn, record: @import("../../storage/db/replication_record.zig").RecordView) !void {
         if (try stagingGet(txn, metadata_ha.replay_key)) |previous| {
             if (previous.len != 40) return error.InvalidMetadataHAEffect;
             if (std.mem.readInt(u64, previous[0..8], .little) != record.cluster_id) return error.MetadataHASourceChanged;
@@ -6477,7 +6477,7 @@ pub const RaftApplyStore = struct {
         try txn.delete(metadata_pending_key);
     }
 
-    fn applyHAChunk(self: *RaftApplyStore, record: @import("../../storage/hot_standby/replication_record.zig").RecordView) !void {
+    fn applyHAChunk(self: *RaftApplyStore, record: @import("../../storage/db/replication_record.zig").RecordView) !void {
         if (record.kind != .metadata_mutation or record.payload_codec != .binary or record.table_id != 0 or record.shard_id != 0) return error.InvalidMetadataHAEffect;
         const frame = try metadata_chunks.decodeFrame(record.payload);
         const descriptor = frame.descriptor;

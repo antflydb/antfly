@@ -1192,7 +1192,7 @@ pub const AntflyApiHandler = struct {
     }
 
     fn haMutationRejection(self: *AntflyApiHandler, ctx: *httpx.Context) !?httpx.Response {
-        const policy = self.api_server.haMutationPolicy();
+        const policy = self.api_server.hotStandbyMutationPolicy();
         if (!policy.failover_safe_mutations_only) return null;
         const path = http_server_mod.stripApiPrefix(ctx.request.uri.path);
         const mutation = classifyHaMutation(ctx.request.method, path) orelse return null;
@@ -9503,7 +9503,7 @@ test "system catalog SQL setting publication requires cluster admin and forwards
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 77, .metrics = .{}, .projected_stores = 1 };
         }
-        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, context: operation_contract.RequestContext, call: system_catalog.Call) ![]u8 {
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, context: operation_contract.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (!context.setting_admin or call != .setting_mutate or call.setting_mutate != .put) return error.TestUnexpectedResult;
             self.calls += 1;
@@ -9566,7 +9566,7 @@ test "store-root enrollment requires cluster admin and forwards only valid posse
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 77, .metrics = .{}, .projected_stores = 1 };
         }
-        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, context: operation_contract.RequestContext, call: system_catalog.Call) ![]u8 {
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, context: operation_contract.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (!context.setting_admin) return error.TestUnexpectedResult;
             switch (call) {
@@ -12409,7 +12409,7 @@ test "httpx SQL durable session settings enforce scoped typed authority" {
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 77, .metrics = .{}, .projected_stores = 1 };
         }
-        fn catalog(ptr: *anyopaque, arena: std.mem.Allocator, context: operation_contract.RequestContext, call: system_catalog.Call) ![]u8 {
+        fn catalog(ptr: *anyopaque, arena: std.mem.Allocator, context: operation_contract.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (call != .setting_snapshot) return error.TestUnexpectedCatalogCall;
             if (!std.mem.eql(u8, context.setting_read_principal orelse "", call.setting_snapshot.principal)) return error.Forbidden;
@@ -12692,7 +12692,7 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 77, .metrics = .{}, .projected_stores = 1 };
         }
-        fn catalog(_: *anyopaque, arena: std.mem.Allocator, context: operation_contract.RequestContext, call: system_catalog.Call) ![]u8 {
+        fn catalog(_: *anyopaque, arena: std.mem.Allocator, context: operation_contract.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             if (call != .setting_snapshot) return error.TestUnexpectedCatalogCall;
             if (!std.mem.eql(u8, context.setting_read_principal orelse "", call.setting_snapshot.principal)) return error.Forbidden;
             return std.json.Stringify.valueAlloc(arena, @import("../sql/setting_catalog.zig").RawSnapshot{ .scope = call.setting_snapshot, .epoch = 1, .definitions = &definitions }, .{});
@@ -12843,7 +12843,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
-        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, context: operation_contract.RequestContext, input: system_catalog.Call) ![]u8 {
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, context: operation_contract.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try context.ensureActive();
             // This fixture has no row-policy publication. The production
@@ -14004,7 +14004,7 @@ test "httpx SQL coordinated UNIQUE owner rejects duplicate batch and updates def
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
-        fn catalog(_: *anyopaque, a: std.mem.Allocator, context: operation_contract.RequestContext, input: system_catalog.Call) ![]u8 {
+        fn catalog(_: *anyopaque, a: std.mem.Allocator, context: operation_contract.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             try context.ensureActive();
             if (input == .policy_publication_status) return error.RowPolicyCatalogChanged;
             if (input == .write_validation) return std.json.Stringify.valueAlloc(a, .{ .schema_json = schema_json }, .{});
@@ -14436,7 +14436,7 @@ test "httpx lookup revalidates missing catalog bindings across restore" {
 
         const original = "{\"table_id\":7,\"name\":\"physical-old\"}";
 
-        fn catalog(ptr: *anyopaque, alloc: std.mem.Allocator, _: operation_contract.RequestContext, call: system_catalog.Call) ![]u8 {
+        fn catalog(ptr: *anyopaque, alloc: std.mem.Allocator, _: operation_contract.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const target = switch (call) {
                 .resolve => |target| target,

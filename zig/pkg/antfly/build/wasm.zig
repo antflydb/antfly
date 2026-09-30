@@ -182,6 +182,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .optimize = optimize,
     });
     wasm_runtime_abi_mod.addImport("httpx", httpx_mod);
+    wasm_runtime_abi_mod.addImport("antfly_platform", wasm_platform_mod);
     embedded_support_wasm_mod.addImport("antfly_runtime_abi", wasm_runtime_abi_mod);
     const wasm_runtime_fs_mod = b.createModule(.{
         .root_source_file = b.path("lib/runtime/src/fs.zig"),

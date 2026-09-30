@@ -19,7 +19,7 @@ pub fn capture(alloc: std.mem.Allocator, db: anytype, db_path: []const u8, snaps
     defer Io.Dir.cwd().deleteTree(io_impl.io(), snapshot_root) catch {};
     const maintenance_clock = db.backend_runtime.monotonicClock();
     const maintenance_deadline_ns = maintenance_clock.nowRealtimeNs() +| std.time.ns_per_s;
-    _ = db.snapshotHASeed(snapshot_token, maintenance_deadline_ns) catch |err| switch (err) {
+    _ = db.snapshotWithMaintenanceDeadline(snapshot_token, maintenance_deadline_ns) catch |err| switch (err) {
         error.EnrichmentWaitCanceled,
         error.EnrichmentWaitTimeout,
         error.EnrichmentRetryInProgress,

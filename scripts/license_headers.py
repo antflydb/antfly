@@ -37,6 +37,7 @@ ELV2_ROOTS = (
 
 # Source moves preserve the original license until the licensing PR lands.
 ELV2_FILES = {
+    "zig/lib/runtime/src/mutation_barrier.zig",
     "zig/build_support/openapi.zig",
     "zig/build_support/openapi_exact_sort_test.zig",
     "zig/build_support/openapi_split_test.zig",

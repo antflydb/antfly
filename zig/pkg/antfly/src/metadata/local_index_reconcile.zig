@@ -21,7 +21,23 @@ pub const coverage_policy = @import("../api/coverage_policy.zig");
 pub const table_index_config = @import("../api/table_index_config.zig");
 pub const indexes_api = @import("../api/local_indexes.zig");
 pub const enrichment_config_validation = @import("../storage/db/enrichment/config_validation.zig");
-pub const ProvisionSummary = @import("antfly_provision_contract").ProvisionSummary;
+/// Results of reconciling indexes and producers in one local DB.
+pub const IndexReconcileSummary = struct {
+    indexes_added: usize = 0,
+    indexes_removed: usize = 0,
+    indexes_pending: usize = 0,
+    enrichments_added: usize = 0,
+    enrichments_updated: usize = 0,
+    enrichments_removed: usize = 0,
+    resolvers_added: usize = 0,
+    resolvers_updated: usize = 0,
+    resolvers_removed: usize = 0,
+
+    pub fn indexManagerCatalogChanged(self: @This()) bool {
+        return self.indexes_added > 0 or self.indexes_removed > 0 or
+            self.resolvers_added > 0 or self.resolvers_updated > 0 or self.resolvers_removed > 0;
+    }
+};
 
 pub const ReconcileDbIndexOptions = struct {
     /// Hidden restore owners admit physical projections while empty. External
@@ -42,7 +58,7 @@ pub fn reconcileDbIndexesWithOptions(
     db: *db_mod.DB,
     indexes_json: []const u8,
     options: ReconcileDbIndexOptions,
-) !ProvisionSummary {
+) !IndexReconcileSummary {
     if (options.restore_build_only) {
         if (!dbIndexReconciliationCanMutate(db)) return error.ReadOnly;
         const removed = try removeMissingIndexes(alloc, db, indexes_json);
@@ -86,8 +102,6 @@ pub fn reconcileDbIndexesWithOptions(
         }
     }
     return .{
-        .groups_considered = 0,
-        .dbs_opened = 0,
         .indexes_added = index_summary.added,
         .indexes_removed = indexes_removed,
         .indexes_pending = index_summary.pending,
@@ -110,7 +124,7 @@ pub fn reconcileDbIndexTargetWithOptions(
     indexes_json: []const u8,
     index_name: []const u8,
     options: ReconcileDbIndexOptions,
-) !ProvisionSummary {
+) !IndexReconcileSummary {
     if (!dbIndexReconciliationCanMutate(db)) return .{};
     if (index_name.len == 0 or indexes_api.isReservedIndexMetadataEntry(index_name))
         return error.InvalidTableIndexMetadata;

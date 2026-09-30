@@ -50,8 +50,8 @@ const template_remote = if (builtin.os.tag == .freestanding or builtin.is_test)
 else
     @import("../template_remote.zig");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
-const http_common = @import("../raft/transport/http_common.zig");
-const std_http_listener = @import("../raft/transport/std_http_listener.zig");
+const http_common = @import("../common/http/http_common.zig");
+const std_http_listener = @import("../common/http/std_http_listener.zig");
 const enrichment_types = @import("../storage/db/enrichment/enrichment_types.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 const inference_work = @import("antfly_inference_work");

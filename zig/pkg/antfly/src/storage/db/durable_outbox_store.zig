@@ -43,27 +43,27 @@ pub const PendingPage = struct {
 /// Own one bounded page and all three rolling-upgrade singleton obligations.
 /// Buffers survive releasing the apply fence so remote waits do not hold it.
 pub fn readPending(alloc: Allocator, store: *docstore.DocStore) !PendingPage {
-    const batch = try readOptional(alloc, store, outbox.ha_batch_outbox_key);
+    const batch = try readOptional(alloc, store, outbox.replication_batch_outbox_key);
     errdefer if (batch) |bytes| alloc.free(bytes);
-    const replay = try readOptional(alloc, store, outbox.ha_replay_outbox_key);
+    const replay = try readOptional(alloc, store, outbox.replication_replay_outbox_key);
     errdefer if (replay) |bytes| alloc.free(bytes);
-    const schema = try readOptional(alloc, store, outbox.ha_schema_outbox_key);
+    const schema = try readOptional(alloc, store, outbox.replication_schema_outbox_key);
     errdefer if (schema) |bytes| alloc.free(bytes);
     return .{
         .legacy_batch = batch,
         .legacy_replay = replay,
         .legacy_schema = schema,
-        .entries = try store.scanPrefixPage(alloc, outbox.ha_outbox_v2_prefix, null, outbox.ha_outbox_recovery_batch_size),
+        .entries = try store.scanPrefixPage(alloc, outbox.replication_outbox_v2_prefix, null, outbox.replication_outbox_recovery_batch_size),
     };
 }
 
 /// Clear only the mutation which the replication adapter successfully
 /// published. No prefix deletion or arbitrary internal key access is exposed.
 pub fn clearPublished(store: *docstore.DocStore, key: []const u8) !void {
-    if (!std.mem.eql(u8, key, outbox.ha_batch_outbox_key) and
-        !std.mem.eql(u8, key, outbox.ha_replay_outbox_key) and
-        !std.mem.eql(u8, key, outbox.ha_schema_outbox_key))
-        _ = try outbox.durableHAOutboxKindFromKey(key);
+    if (!std.mem.eql(u8, key, outbox.replication_batch_outbox_key) and
+        !std.mem.eql(u8, key, outbox.replication_replay_outbox_key) and
+        !std.mem.eql(u8, key, outbox.replication_schema_outbox_key))
+        _ = try outbox.durableReplicationOutboxKindFromKey(key);
     try store.putBatch(&.{}, &.{key});
 }
 
@@ -80,16 +80,16 @@ test "storage.hot_standby durable outbox storage pages legacy and mutation oblig
     defer backend.close();
     var store = try docstore.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
     defer store.close();
-    const value = try outbox.encodeDurableHAOutboxAlloc(alloc, 7, "pending");
+    const value = try outbox.encodeDurableReplicationOutboxAlloc(alloc, 7, "pending");
     defer alloc.free(value);
     try store.putBatch(&.{
-        .{ .key = outbox.ha_batch_outbox_key, .value = value },
-        .{ .key = outbox.ha_replay_outbox_key, .value = value },
-        .{ .key = outbox.ha_schema_outbox_key, .value = value },
+        .{ .key = outbox.replication_batch_outbox_key, .value = value },
+        .{ .key = outbox.replication_replay_outbox_key, .value = value },
+        .{ .key = outbox.replication_schema_outbox_key, .value = value },
         .{ .key = "unrelated", .value = "keep" },
     }, &.{});
-    for (0..outbox.ha_outbox_recovery_batch_size + 3) |i| {
-        const key = try outbox.durableHAOutboxKeyAlloc(alloc, .batch, @intCast(i + 1), 1, "pending");
+    for (0..outbox.replication_outbox_recovery_batch_size + 3) |i| {
+        const key = try outbox.durableReplicationOutboxKeyAlloc(alloc, .batch, @intCast(i + 1), 1, "pending");
         defer alloc.free(key);
         try store.putBatch(&.{.{ .key = key, .value = value }}, &.{});
     }
@@ -97,7 +97,7 @@ test "storage.hot_standby durable outbox storage pages legacy and mutation oblig
         var page = try readPending(alloc, &store);
         defer page.deinit(alloc);
         try std.testing.expect(!page.isEmpty());
-        try std.testing.expectEqual(outbox.ha_outbox_recovery_batch_size, page.entries.len);
+        try std.testing.expectEqual(outbox.replication_outbox_recovery_batch_size, page.entries.len);
         try std.testing.expectEqualSlices(u8, value, page.legacy_batch.?);
         try std.testing.expectEqualSlices(u8, value, page.legacy_replay.?);
         try std.testing.expectEqualSlices(u8, value, page.legacy_schema.?);
@@ -107,9 +107,9 @@ test "storage.hot_standby durable outbox storage pages legacy and mutation oblig
         defer alloc.free(surviving);
         try std.testing.expectEqualSlices(u8, value, surviving);
         try std.testing.expectError(error.InvalidHAOutbox, clearPublished(&store, "unrelated"));
-        try clearPublished(&store, outbox.ha_batch_outbox_key);
-        try clearPublished(&store, outbox.ha_replay_outbox_key);
-        try clearPublished(&store, outbox.ha_schema_outbox_key);
+        try clearPublished(&store, outbox.replication_batch_outbox_key);
+        try clearPublished(&store, outbox.replication_replay_outbox_key);
+        try clearPublished(&store, outbox.replication_schema_outbox_key);
     }
     while (true) {
         var page = try readPending(alloc, &store);
@@ -128,12 +128,12 @@ test "storage.hot_standby durable outbox storage releases partial pages on alloc
     defer backend.close();
     var store = try docstore.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
     defer store.close();
-    const key = try outbox.durableHAOutboxKeyAlloc(alloc, .schema, 9, 1, "pending");
+    const key = try outbox.durableReplicationOutboxKeyAlloc(alloc, .schema, 9, 1, "pending");
     defer alloc.free(key);
     try store.putBatch(&.{
-        .{ .key = outbox.ha_batch_outbox_key, .value = "legacy batch" },
-        .{ .key = outbox.ha_replay_outbox_key, .value = "legacy replay" },
-        .{ .key = outbox.ha_schema_outbox_key, .value = "legacy schema" },
+        .{ .key = outbox.replication_batch_outbox_key, .value = "legacy batch" },
+        .{ .key = outbox.replication_replay_outbox_key, .value = "legacy replay" },
+        .{ .key = outbox.replication_schema_outbox_key, .value = "legacy schema" },
         .{ .key = key, .value = "pending" },
     }, &.{});
     const Check = struct {

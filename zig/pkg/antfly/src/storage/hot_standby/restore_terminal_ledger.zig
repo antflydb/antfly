@@ -17,7 +17,7 @@
 const std = @import("std");
 const lsm = @import("../lsm_backend.zig");
 const fs = @import("antfly_runtime_fs").fs_paths;
-const record_mod = @import("replication_record.zig");
+const record_mod = @import("../db/replication_record.zig");
 pub const replay_floor = @import("replay_floor.zig");
 const ns: @import("../backend_types.zig").Namespace = .{ .name = "restore-terminal" };
 const meta_ns: @import("../backend_types.zig").Namespace = .{ .name = "restore-terminal-meta" };

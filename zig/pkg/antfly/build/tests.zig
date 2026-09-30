@@ -5809,6 +5809,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.backfill_state.",
             "storage.db.batcher.",
             "storage.db.config.",
+            "storage.db.apply_receipts.",
+            "storage.db.durable_outbox.",
+            "storage.db.durable_outbox_store.",
+            "storage.db.primary_effect.",
+            "storage.db.replication_contract.",
+            "storage.db.replication_effects.",
+            "storage.db.commit_integration.",
+            "storage.db.replication_record.",
+
             "storage.db.column_read_cache.",
             "storage.db.column_scan_plan.",
             "storage.db.db.",
@@ -5826,7 +5835,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.graph_retirement_config.",
             "storage.db.graph_retirement_seal.",
             "storage.db.empty_generation_handoff.",
-            "storage.db.native_topology_receipt.",
             "storage.db.receipt_position.",
             "storage.db.graph_edge_ttl_expiration.",
             "storage.db.graph_edge_ttl_tombstone.",
@@ -5945,6 +5953,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.backup_bundle.",
             "storage.backup_bundle_io.",
             "storage.backup_codec.",
+            "storage.backup_restore.",
             "storage.backup_repository.",
             "storage.coverage_identity.",
             "storage.coordinated_ttl.",
@@ -6050,6 +6059,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "Verify every test-bearing storage module belongs to a bounded codegen shard",
     );
     unit_storage_shard_audit_step.dependOn(&unit_storage_shard_audit.step);
+    const embedded_source_boundary = b.addSystemCommand(&.{"python3"});
+    embedded_source_boundary.addFileArg(b.path("tools/audit_embedded_source_boundary.py"));
+    const embedded_source_boundary_tests = b.addSystemCommand(&.{"python3"});
+    embedded_source_boundary_tests.addFileArg(b.path("tools/test_audit_embedded_source_boundary.py"));
+    const embedded_source_boundary_step = b.step(
+        "embedded-source-boundary-check",
+        "Verify the authored local engine sources do not import server coordination",
+    );
+    embedded_source_boundary_step.dependOn(&embedded_source_boundary.step);
+    embedded_source_boundary_step.dependOn(&embedded_source_boundary_tests.step);
+    unit_storage_shard_audit.step.dependOn(embedded_source_boundary_step);
     const storage_runtime_filter_is_default =
         lib_storage_runtime_filters.len == 1 and
         std.mem.eql(u8, lib_storage_runtime_filters[0], "storage.");

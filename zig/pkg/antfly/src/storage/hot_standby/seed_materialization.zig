@@ -203,7 +203,7 @@ pub fn materialize(alloc: Allocator, request: MaterializeRequest) !MaterializeRe
         defer transition.deinit();
         var staged = try transition.beginStaging();
         defer staged.deinit();
-        try db_mod.DB.restoreCoherentHASeedReplicaToStagedGeneration(&staged, alloc, snapshot_root, staged.path(), .{
+        try db_mod.DB.restoreAuthenticatedReplicaToStagedGeneration(&staged, alloc, snapshot_root, staged.path(), .{
             .identity_namespace = .{
                 .table_id = replica.identity_table_id,
                 .shard_id = replica.identity_shard_id,

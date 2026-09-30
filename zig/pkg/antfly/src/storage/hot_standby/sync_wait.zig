@@ -17,27 +17,27 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
-const ha_primary_mod = @import("primary.zig");
-const ha_standby_mod = @import("standby.zig");
-const ha_session_mod = @import("session.zig");
-const ha_commit_gate_mod = @import("commit_gate.zig");
+const hot_standby_primary_mod = @import("primary.zig");
+const hot_standby_standby_mod = @import("standby.zig");
+const hot_standby_session_mod = @import("session.zig");
+const hot_standby_commit_gate_mod = @import("commit_gate.zig");
 
-pub const HAProgressPollFn = *const fn (
+pub const HotStandbyProgressPollFn = *const fn (
     ctx: *anyopaque,
-    primary: *ha_primary_mod.Primary,
+    primary: *hot_standby_primary_mod.Primary,
     target_lsn: u64,
-    policy: ha_primary_mod.SyncPolicy,
+    policy: hot_standby_primary_mod.SyncPolicy,
     round: usize,
 ) anyerror!void;
 
-pub const HAPrimaryProgressSyncWait = struct {
+pub const HotStandbyPrimaryProgressSyncWait = struct {
     max_rounds: usize = 64,
     sleep_ns: u64 = 0,
     poll_ctx: ?*anyopaque = null,
-    poll_fn: ?HAProgressPollFn = null,
+    poll_fn: ?HotStandbyProgressPollFn = null,
 
-    pub fn wait(ctx: *anyopaque, primary_ctx: *anyopaque, target_lsn: u64, policy: ha_primary_mod.SyncPolicy) !void {
-        const primary: *ha_primary_mod.Primary = @ptrCast(@alignCast(primary_ctx));
+    pub fn wait(ctx: *anyopaque, primary_ctx: *anyopaque, target_lsn: u64, policy: hot_standby_primary_mod.SyncPolicy) !void {
+        const primary: *hot_standby_primary_mod.Primary = @ptrCast(@alignCast(primary_ctx));
         const self: *@This() = @ptrCast(@alignCast(ctx));
         if (policy.mode == .async) return;
         if (self.max_rounds == 0) return error.HASyncCommitWaitLimitExceeded;
@@ -49,7 +49,7 @@ pub const HAPrimaryProgressSyncWait = struct {
                 try poll(poll_ctx, primary, target_lsn, policy, round);
             }
 
-            const gate = try ha_commit_gate_mod.evaluate(primary, target_lsn, policy);
+            const gate = try hot_standby_commit_gate_mod.evaluate(primary, target_lsn, policy);
             if (gate.shouldAcknowledge()) return;
             if (gate.action == .reject) return error.SyncPolicyUnsatisfied;
             // A wait can only make progress when enough eligible slots exist.
@@ -68,25 +68,25 @@ pub const HAPrimaryProgressSyncWait = struct {
     }
 };
 
-pub const HASessionSyncWait = struct {
+pub const HotStandbySessionSyncWait = struct {
     alloc: Allocator,
     slot_name: []const u8,
-    standby: *ha_standby_mod.Standby,
+    standby: *hot_standby_standby_mod.Standby,
     apply_ctx: *anyopaque,
-    apply_fn: ha_standby_mod.ApplyFn,
+    apply_fn: hot_standby_standby_mod.ApplyFn,
     max_rounds: usize = 8,
 
-    pub fn wait(ctx: *anyopaque, primary_ctx: *anyopaque, target_lsn: u64, policy: ha_primary_mod.SyncPolicy) !void {
-        const primary: *ha_primary_mod.Primary = @ptrCast(@alignCast(primary_ctx));
+    pub fn wait(ctx: *anyopaque, primary_ctx: *anyopaque, target_lsn: u64, policy: hot_standby_primary_mod.SyncPolicy) !void {
+        const primary: *hot_standby_primary_mod.Primary = @ptrCast(@alignCast(primary_ctx));
         const self: *@This() = @ptrCast(@alignCast(ctx));
         if (policy.mode == .async) return;
-        if (!haSyncPolicyIncludesStandby(policy, self.slot_name)) return error.HASyncCommitWaitStandbyNotInPolicy;
+        if (!hotStandbySyncPolicyIncludesStandby(policy, self.slot_name)) return error.HASyncCommitWaitStandbyNotInPolicy;
         if (self.max_rounds == 0) return error.HASyncCommitWaitLimitExceeded;
 
         var progress = self.standby.currentProgress();
         var round: usize = 0;
         while (round < self.max_rounds) : (round += 1) {
-            const result = ha_session_mod.replicateAvailable(
+            const result = hot_standby_session_mod.replicateAvailable(
                 self.alloc,
                 primary,
                 self.slot_name,
@@ -95,13 +95,13 @@ pub const HASessionSyncWait = struct {
                 self.apply_fn,
             ) catch |err| {
                 if (policy.mode == .remote_write) {
-                    const gate = ha_commit_gate_mod.evaluate(primary, target_lsn, policy) catch return err;
+                    const gate = hot_standby_commit_gate_mod.evaluate(primary, target_lsn, policy) catch return err;
                     if (gate.shouldAcknowledge()) return;
                 }
                 return err;
             };
 
-            const gate = try ha_commit_gate_mod.evaluate(primary, target_lsn, policy);
+            const gate = try hot_standby_commit_gate_mod.evaluate(primary, target_lsn, policy);
             if (gate.shouldAcknowledge()) return;
             if (gate.action == .reject) return error.SyncPolicyUnsatisfied;
             if (result.received_count == 0 and result.applied_count == 0) break;
@@ -120,7 +120,7 @@ pub const HASessionSyncWait = struct {
     }
 };
 
-pub fn haSyncPolicyIncludesStandby(policy: ha_primary_mod.SyncPolicy, slot_name: []const u8) bool {
+pub fn hotStandbySyncPolicyIncludesStandby(policy: hot_standby_primary_mod.SyncPolicy, slot_name: []const u8) bool {
     for (policy.standby_names) |name| {
         if (std.mem.eql(u8, name, slot_name)) return true;
     }

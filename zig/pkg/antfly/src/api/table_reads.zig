@@ -48,7 +48,7 @@ const doc_identity = if (control_only_storage_sources) struct {} else @import(".
 const db_embedder = if (control_only_storage_sources) struct {} else @import("../storage/db/enrichment/embedder.zig");
 const ha_public_gate_state = @import("../storage/hot_standby/public_gate_state.zig");
 const ha_read_gate_mod = @import("../storage/hot_standby/read_gate.zig");
-const ha_standby_mod = @import("../storage/hot_standby/standby.zig");
+const hot_standby_standby_mod = @import("../storage/hot_standby/standby.zig");
 const storage_schema = @import("../storage/schema.zig");
 const dynamic_field_capability = @import("../storage/db/dynamic_field_capability.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
@@ -1541,7 +1541,7 @@ pub const GraphReadBarrier = struct {
 };
 
 pub const HAReadGate = union(enum) {
-    standby: *const ha_standby_mod.Standby,
+    standby: *const hot_standby_standby_mod.Standby,
     shared: *const ha_public_gate_state.State,
 
     pub fn check(self: HAReadGate, consistency: raft_mod.ReadConsistency) !void {
@@ -21838,7 +21838,7 @@ fn consumerTests() type {
             const progress_path = try alloc.dupeZ(u8, progress_path_raw);
             defer alloc.free(progress_path);
 
-            var standby = try ha_standby_mod.Standby.open(alloc, receive_path.ptr, progress_path.ptr, .{
+            var standby = try hot_standby_standby_mod.Standby.open(alloc, receive_path.ptr, progress_path.ptr, .{
                 .cluster_id = 100,
                 .shard_id = 10,
                 .table_id = 20,

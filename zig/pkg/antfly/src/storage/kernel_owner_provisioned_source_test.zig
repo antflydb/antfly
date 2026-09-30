@@ -179,7 +179,7 @@ test "empty hidden bootstrap read retries when the root generation advances" {
     });
     try std.testing.expectError(
         error.StorageKernelOwnerTransitionRequired,
-        owners.readHAHiddenOwnerBootstrap(alloc, 7196, 71),
+        owners.readHotStandbyHiddenOwnerBootstrap(alloc, 7196, 71),
     );
     try std.testing.expectEqual(@as(usize, 2), generation.reads);
 }
@@ -208,7 +208,7 @@ test "concurrent cold hidden bootstrap reads share one configured context" {
         fn run(self: *@This()) void {
             _ = self.ready.fetchAdd(1, .acq_rel);
             while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
-            const bootstrap = self.source.readHAHiddenOwnerBootstrap(std.heap.page_allocator, 7196, 71) catch |err| {
+            const bootstrap = self.source.readHotStandbyHiddenOwnerBootstrap(std.heap.page_allocator, 7196, 71) catch |err| {
                 self.failure = err;
                 return;
             };
@@ -1036,7 +1036,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         ));
     }
     try owner_source.waitForCurrentSyncGroupLocal(7001, "articles", .full_index);
-    try owner_source.applyHAReplicationRecordGroupLocal(7001, "articles", .{
+    try owner_source.applyHotStandbyReplicationRecordGroupLocal(7001, "articles", .{
         .kind = .checkpoint,
         .cluster_id = 1,
         .shard_id = 7001,

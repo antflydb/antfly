@@ -439,9 +439,9 @@ fn runRecoveryPageWithConfig(
         };
 
         const has_intents = try manager.hasIntents(txn.txn_id);
-        const has_ha_outbox = if (config.replicated_metadata) false else try manager.hasHAOutbox(txn.txn_id);
+        const has_replication_outbox = if (config.replicated_metadata) false else try manager.hasReplicationOutbox(txn.txn_id);
         var local_effects_resolved = true;
-        if (has_intents or has_ha_outbox) {
+        if (has_intents or has_replication_outbox) {
             if (config.replicated_metadata) {
                 summary.notification_attempts += 1;
                 config.resolve_participant_fn.?(
@@ -653,12 +653,12 @@ test "transaction recovery drains terminal HA outbox without remaining intents" 
     defer manager.deinit();
     try manager.initTransaction(txn_id, 1_000);
     try manager.writeIntents(txn_id, &.{.{ .key = "doc:a", .value = "{}" }}, &.{});
-    const outbox_key = transactions_mod.makeTransactionHABatchOutboxKey(txn_id);
+    const outbox_key = transactions_mod.makeTransactionReplicationBatchOutboxKey(txn_id);
     _ = try manager.resolveIntentsWithExtraBatch(txn_id, .committed, 2_000, .{
         .writes = &.{.{ .key = &outbox_key, .value = "encoded-ha-batch" }},
     });
     try std.testing.expect(!try manager.hasIntents(txn_id));
-    try std.testing.expect(try manager.hasHAOutbox(txn_id));
+    try std.testing.expect(try manager.hasReplicationOutbox(txn_id));
 
     const Recorder = struct {
         store: *backend_erased.Store,
@@ -671,7 +671,7 @@ test "transaction recovery drains terminal HA outbox without remaining intents" 
             try std.testing.expectEqual(transactions_mod.TxnStatus.committed, status);
             var local_manager = try transactions_mod.TxnManager.init(std.testing.allocator, self.store);
             defer local_manager.deinit();
-            try local_manager.clearHAOutbox(actual_txn_id, .batch);
+            try local_manager.clearReplicationOutbox(actual_txn_id, .batch);
         }
     };
     var recorder = Recorder{ .store = &runtime_store };
@@ -684,7 +684,7 @@ test "transaction recovery drains terminal HA outbox without remaining intents" 
     }, 3_000, null, 1);
     try std.testing.expectEqual(@as(usize, 1), recorder.calls);
     try std.testing.expectEqual(@as(u64, 1), summary.recovery.scanned_records);
-    try std.testing.expect(!try manager.hasHAOutbox(txn_id));
+    try std.testing.expect(!try manager.hasReplicationOutbox(txn_id));
 }
 
 test "transaction recovery advances past a failed local resolution" {
@@ -703,7 +703,7 @@ test "transaction recovery advances past a failed local resolution" {
     try manager.initTransaction(healthy_txn, 1_000);
     for ([_]transactions_mod.TxnId{ poison_txn, healthy_txn }) |txn_id| {
         try manager.writeIntents(txn_id, &.{.{ .key = "doc:a", .value = "{}" }}, &.{});
-        const outbox_key = transactions_mod.makeTransactionHABatchOutboxKey(txn_id);
+        const outbox_key = transactions_mod.makeTransactionReplicationBatchOutboxKey(txn_id);
         _ = try manager.resolveIntentsWithExtraBatch(txn_id, .committed, 2_000, .{
             .writes = &.{.{ .key = &outbox_key, .value = "encoded-ha-batch" }},
         });
@@ -724,7 +724,7 @@ test "transaction recovery advances past a failed local resolution" {
 
             var local_manager = try transactions_mod.TxnManager.init(std.testing.allocator, self.store);
             defer local_manager.deinit();
-            try local_manager.clearHAOutbox(txn_id, .batch);
+            try local_manager.clearReplicationOutbox(txn_id, .batch);
         }
 
         fn resolveParticipant(ptr: *anyopaque, txn_id: transactions_mod.TxnId, participant: []const u8, status: transactions_mod.TxnStatus, commit_version: u64) !void {
@@ -752,8 +752,8 @@ test "transaction recovery advances past a failed local resolution" {
     try std.testing.expectEqual(@as(u64, 3), summary.notification_attempts);
     try std.testing.expectEqual(@as(u64, 1), summary.notification_failures);
     try std.testing.expectEqual(@as(u64, 2), summary.notification_successes);
-    try std.testing.expect(try manager.hasHAOutbox(poison_txn));
-    try std.testing.expect(!try manager.hasHAOutbox(healthy_txn));
+    try std.testing.expect(try manager.hasReplicationOutbox(poison_txn));
+    try std.testing.expect(!try manager.hasReplicationOutbox(healthy_txn));
     const unresolved = try manager.getUnresolvedParticipants(alloc, poison_txn);
     defer transactions_mod.freeParticipantList(alloc, unresolved);
     try std.testing.expectEqual(@as(usize, 0), unresolved.len);

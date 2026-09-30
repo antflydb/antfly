@@ -19,7 +19,7 @@
 //! can close the standby without leaving request paths with borrowed pointers.
 
 const std = @import("std");
-const storage_contract = @import("../db/ha_contract.zig");
+const storage_contract = @import("../db/replication_contract.zig");
 const platform_time = @import("antfly_platform").time;
 const primary_mod = @import("primary.zig");
 const read_gate = @import("read_gate.zig");

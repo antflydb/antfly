@@ -12,16 +12,16 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const ha_write_gate_adapter = @import("../hot_standby/write_gate.zig");
+const replication_ingress = @import("replication_ingress.zig");
 const std = @import("std");
 const GraphTtlSha256 = @import("antfly_hash").Sha256;
-const ha_contract = @import("ha_contract.zig");
+const replication_contract = @import("replication_contract.zig");
 const durable_outbox = @import("durable_outbox.zig");
 const durable_outbox_store = @import("durable_outbox_store.zig");
 const apply_receipts = @import("apply_receipts.zig");
-const ha_sync_wait = @import("../hot_standby/sync_wait.zig");
-const ha_db_commit = @import("commit_integration.zig");
-const ha_publisher_adapter = @import("../hot_standby/db_commit.zig");
+
+const replication_commit = @import("commit_integration.zig");
+
 const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
 const ant_json = @import("antfly-json");
 const vector_mod = @import("antfly_vector").vector;
@@ -100,16 +100,12 @@ test {
 }
 
 const change_journal_mod = @import("derived/change_journal.zig");
-const ha_effects_mod = @import("replication_effects.zig");
-const ha_commit_gate_mod = @import("../hot_standby/commit_gate.zig");
-const ha_fencing_mod = @import("../hot_standby/fencing.zig");
-const ha_mutation_barrier_mod = @import("../hot_standby/mutation_barrier.zig");
-const ha_primary_mod = @import("../hot_standby/primary.zig");
-const ha_public_gate_state_mod = @import("../hot_standby/public_gate_state.zig");
-const ha_replication_record_mod = @import("../hot_standby/replication_record.zig");
-const ha_session_mod = @import("../hot_standby/session.zig");
-const ha_standby_mod = @import("../hot_standby/standby.zig");
-const ha_write_gate_mod = @import("../hot_standby/write_gate.zig");
+const replication_effects_mod = @import("replication_effects.zig");
+
+const replication_mutation_barrier_mod = @import("antfly_runtime_abi").mutation_barrier;
+
+const replication_record_mod = @import("replication_record.zig");
+
 const replay_stream_mod = @import("derived/replay_stream.zig");
 const derived_types = @import("derived/derived_types.zig");
 const derived_worker = @import("derived/derived_worker.zig");
@@ -351,22 +347,22 @@ const default_visibility_wait_timeout_ms: u64 = 5 * std.time.ms_per_min;
 const public_schema_json_key = "\x00\x00__metadata__:schema_json";
 const index_catalog_key = "\x00\x00__metadata__:indexes";
 // Legacy singleton keys remain readable for crash recovery across upgrades.
-const ha_batch_outbox_key = durable_outbox.ha_batch_outbox_key;
-const ha_replay_outbox_key = durable_outbox.ha_replay_outbox_key;
-const ha_schema_outbox_key = durable_outbox.ha_schema_outbox_key;
-const ha_outbox_v2_prefix = durable_outbox.ha_outbox_v2_prefix;
-const ha_outbox_header_len = durable_outbox.ha_outbox_header_len;
-const ha_outbox_checksum_len = durable_outbox.ha_outbox_checksum_len;
+const replication_batch_outbox_key = durable_outbox.replication_batch_outbox_key;
+const replication_replay_outbox_key = durable_outbox.replication_replay_outbox_key;
+const replication_schema_outbox_key = durable_outbox.replication_schema_outbox_key;
+const replication_outbox_v2_prefix = durable_outbox.replication_outbox_v2_prefix;
+const replication_outbox_header_len = durable_outbox.replication_outbox_header_len;
+const replication_outbox_checksum_len = durable_outbox.replication_outbox_checksum_len;
 
-const DurableHAOutbox = durable_outbox.DurableHAOutbox;
+const DurableReplicationOutbox = durable_outbox.DurableReplicationOutbox;
 
-const durableHAOutboxKeyAlloc = durable_outbox.durableHAOutboxKeyAlloc;
+const durableReplicationOutboxKeyAlloc = durable_outbox.durableReplicationOutboxKeyAlloc;
 
-const durableHAOutboxKindFromKey = durable_outbox.durableHAOutboxKindFromKey;
+const durableReplicationOutboxKindFromKey = durable_outbox.durableReplicationOutboxKindFromKey;
 
-const encodeDurableHAOutboxAlloc = durable_outbox.encodeDurableHAOutboxAlloc;
+const encodeDurableReplicationOutboxAlloc = durable_outbox.encodeDurableReplicationOutboxAlloc;
 
-const decodeDurableHAOutbox = durable_outbox.decodeDurableHAOutbox;
+const decodeDurableReplicationOutbox = durable_outbox.decodeDurableReplicationOutbox;
 
 const generated_embed_default_batch_items: usize = 8;
 const generated_embed_default_batch_bytes: usize = 256 * 1024;
@@ -681,23 +677,23 @@ pub const OpenOptions = struct {
     /// replication stream. The default policy is async/best-effort; configuring
     /// a non-async sync_policy makes normal DB writes evaluate the HA commit
     /// gate for the appended replication record.
-    ha_async_effect_mirror: ?HAAsyncEffectMirror = null,
+    replication_async_effect_mirror: ?ReplicationAsyncEffectMirror = null,
     /// Optional mirror for committed user batch mutations into the HA
     /// replication stream. This emits versioned `batch_mutation` envelopes for
     /// catch-up/read-replica apply and can be paired with sync_policy for
     /// remote-write/remote-apply gate decisions.
-    ha_async_batch_mirror: ?HAAsyncBatchMirror = null,
+    replication_async_batch_mirror: ?ReplicationAsyncBatchMirror = null,
     /// Optional mirror for committed metadata/catalog changes into the HA
     /// replication stream. The initial metadata mutation payload covers table
     /// schema changes; additional catalog mutation kinds should be nested under
     /// the stable HA `metadata_mutation` envelope.
-    ha_async_metadata_mirror: ?HAAsyncMetadataMirror = null,
+    replication_async_metadata_mirror: ?ReplicationAsyncMetadataMirror = null,
     /// Optional HA write ownership gate. Client/API writes are allowed only
     /// when this DB is attached to the current HA primary. Standby apply paths
     /// must use replicated-apply entry points that explicitly bypass this
     /// client-write guard. A standby gate also suppresses mutating background
     /// runtimes at open, even if the generic runtime defaults are enabled.
-    ha_write_gate: ?HAWriteGate = null,
+    replication_write_gate: ?ReplicationWriteGate = null,
     /// Bounded stall guard for the foreground `runUntilIdle` drain (Lite's
     /// synchronous ingest drain, in particular): if a managed derived index
     /// cannot advance its replay target for this long, `runUntilIdle` fails
@@ -763,7 +759,7 @@ pub const NativeRestoreOpenPlan = struct {
 
 pub const OpenMode = OpenOptions.OpenMode;
 
-pub const HAMutationBarrier = ha_mutation_barrier_mod.MutationBarrier;
+pub const MutationBarrier = replication_mutation_barrier_mod.MutationBarrier;
 
 fn deinitOwnedEnrichmentConfig(alloc: Allocator, cfg: *enrichment_runtime_mod.Config) void {
     if (cfg.dense_embedder) |dense_embedder| {
@@ -794,23 +790,19 @@ test "uninstalled enrichment config releases owned chunk provider routing" {
     try std.testing.expect(cfg.chunk_provider == null);
 }
 
-pub const HAAsyncEffectMirror = ha_contract.AsyncEffectMirror;
-pub const HASyncWaitFn = ha_contract.SyncWaitFn;
+pub const ReplicationAsyncEffectMirror = replication_contract.AsyncEffectMirror;
+pub const ReplicationSyncWaitFn = replication_contract.SyncWaitFn;
 
-const HADeferredCommitGate = ha_db_commit.HADeferredCommitGate;
+const ReplicationDeferredCommitGate = replication_commit.ReplicationDeferredCommitGate;
 
-const HADeferredCommitGates = ha_db_commit.HADeferredCommitGates;
+const ReplicationDeferredCommitGates = replication_commit.ReplicationDeferredCommitGates;
 
-const HAPrimaryProgressSyncWait = ha_sync_wait.HAPrimaryProgressSyncWait;
+pub const ReplicationAsyncBatchMirror = replication_contract.AsyncBatchMirror;
+pub const ReplicationAsyncMetadataMirror = replication_contract.AsyncMetadataMirror;
+pub const SharedReplicationWriteGate = replication_contract.SharedWriteGate;
+pub const ReplicationWriteGate = replication_contract.WriteGate;
 
-const HASessionSyncWait = ha_sync_wait.HASessionSyncWait;
-
-pub const HAAsyncBatchMirror = ha_contract.AsyncBatchMirror;
-pub const HAAsyncMetadataMirror = ha_contract.AsyncMetadataMirror;
-pub const SharedHAWriteGate = ha_contract.SharedWriteGate;
-pub const HAWriteGate = ha_contract.WriteGate;
-
-fn haWriteGateIsStandby(gate: ?HAWriteGate) bool {
+fn replicationWriteGateIsStandby(gate: ?ReplicationWriteGate) bool {
     const configured = gate orelse return false;
     return switch (configured) {
         .primary => false,
@@ -1437,8 +1429,8 @@ const AsyncContext = struct {
     // after admission.
     portable_runtime_activation_pending: std.atomic.Value(bool) = .init(false),
     /// Stable notification shared by TTL callbacks and the resident HA owner.
-    primary_ha_outbox_pending: std.atomic.Value(bool) = .init(false),
-    primary_ha_append_pending: std.atomic.Value(bool) = .init(false),
+    primary_replication_outbox_pending: std.atomic.Value(bool) = .init(false),
+    primary_replication_append_pending: std.atomic.Value(bool) = .init(false),
     snapshot_replay_admission: ?*snapshot_admission_mod.SnapshotAdmission = null,
     repair_replay_mutex: ?*std.Io.Mutex = null,
     repair_sequence: u64 = 0,
@@ -2140,10 +2132,10 @@ const EnrichmentAppendContext = struct {
     executor: *derived_executor_mod.Executor,
     async_context: ?*AsyncContext,
     log_mutex: *std.atomic.Mutex,
-    ha_async_effect_mirror: ?HAAsyncEffectMirror = null,
-    ha_async_batch_mirror: ?HAAsyncBatchMirror = null,
-    ha_async_metadata_mirror: ?HAAsyncMetadataMirror = null,
-    ha_write_gate: ?HAWriteGate = null,
+    replication_async_effect_mirror: ?ReplicationAsyncEffectMirror = null,
+    replication_async_batch_mirror: ?ReplicationAsyncBatchMirror = null,
+    replication_async_metadata_mirror: ?ReplicationAsyncMetadataMirror = null,
+    replication_write_gate: ?ReplicationWriteGate = null,
     identity_visibility: ?*db_core.IdentityVisibilityState = null,
     resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
     promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
@@ -2170,10 +2162,10 @@ const EnrichmentAppendContext = struct {
             .io = if (self.async_context) |ctx| ctx.io else null,
             .async_context = self.async_context,
             .relational_base_rows = if (self.async_context) |ctx| ctx.relational_base_rows else false,
-            .ha_async_effect_mirror = self.ha_async_effect_mirror,
-            .ha_async_batch_mirror = self.ha_async_batch_mirror,
-            .ha_async_metadata_mirror = self.ha_async_metadata_mirror,
-            .ha_write_gate = self.ha_write_gate,
+            .replication_async_effect_mirror = self.replication_async_effect_mirror,
+            .replication_async_batch_mirror = self.replication_async_batch_mirror,
+            .replication_async_metadata_mirror = self.replication_async_metadata_mirror,
+            .replication_write_gate = self.replication_write_gate,
             .identity_visibility = self.identity_visibility,
             .enrichment_runtime = null,
             .resolution_runtime = self.resolution_runtime,
@@ -2220,10 +2212,10 @@ const BatchExecutionContext = struct {
     relational_base_rows: bool = false,
     table_catalog: ?*table_catalog_mod.Catalog = null,
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
-    ha_async_effect_mirror: ?HAAsyncEffectMirror = null,
-    ha_async_batch_mirror: ?HAAsyncBatchMirror = null,
-    ha_async_metadata_mirror: ?HAAsyncMetadataMirror = null,
-    ha_write_gate: ?HAWriteGate = null,
+    replication_async_effect_mirror: ?ReplicationAsyncEffectMirror = null,
+    replication_async_batch_mirror: ?ReplicationAsyncBatchMirror = null,
+    replication_async_metadata_mirror: ?ReplicationAsyncMetadataMirror = null,
+    replication_write_gate: ?ReplicationWriteGate = null,
     identity_visibility: ?*db_core.IdentityVisibilityState = null,
 };
 
@@ -2903,7 +2895,7 @@ const BatchExecutionOptions = struct {
     restore_artifacts: []const @import("restore_staging.zig").Artifact = &.{},
     restore_timestamps: ?*const std.StringHashMapUnmanaged(u64) = null,
     preserve_logical_values: bool = false,
-    restore_ha_request: ?types.BatchRequest = null,
+    restore_replication_request: ?types.BatchRequest = null,
     /// Borrowed upload identity. Finalization retires staged bytes in the
     /// same transaction as either accepted effects or a durable rejection.
     artifact_upload_finalize: ?@import("artifact_publication_transport.zig").Finalization = null,
@@ -2914,8 +2906,8 @@ const BatchExecutionOptions = struct {
     force_generated_artifact_names: []const []const u8 = &.{},
     document_child_range_dispatcher: ?DocumentArtifactChildRangeDispatcher = null,
     committed_batch_effects_observer: ?CommittedBatchEffectsObserver = null,
-    bypass_ha_write_gate: bool = false,
-    ha_applied_lsn_marker: ?u64 = null,
+    bypass_replication_write_gate: bool = false,
+    replication_applied_lsn_marker: ?u64 = null,
     online_source_applied_index: ?u64 = null,
     raft_applied_entry_marker: ?RaftAppliedEntryIdentity = null,
     /// Metadata-authorized native hidden-child receipt identity. Never
@@ -2957,11 +2949,11 @@ const TransactionResolution = struct {
     schema_namespace_generation: ?u64 = null,
 };
 
-const ha_applied_lsn_value_len = apply_receipts.ha_applied_lsn_value_len;
+const replication_applied_lsn_value_len = apply_receipts.replication_applied_lsn_value_len;
 
-const haAppliedReplicationLsnWrite = apply_receipts.haAppliedReplicationLsnWrite;
+const replicationAppliedSequenceWrite = apply_receipts.replicationAppliedSequenceWrite;
 
-const readHAAppliedReplicationLsn = apply_receipts.readHAAppliedReplicationLsn;
+const readReplicationAppliedSequence = apply_receipts.readReplicationAppliedSequence;
 
 pub const OpenProfile = struct {
     primary_store_ns: u64 = 0,
@@ -5070,7 +5062,7 @@ pub const DB = struct {
     status_publication_mutex: std.atomic.Mutex = .unlocked,
     status_publication_revision: u64 = 0,
     repair_cleanup_owner_id: u64,
-    ha_recovery_owner_id: u64 = 0,
+    replication_recovery_owner_id: u64 = 0,
     algebraic_hll_owner_id: u64 = 0,
     owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager,
@@ -5096,18 +5088,18 @@ pub const DB = struct {
     entity_sink: ?promotion_runtime_mod.EntitySink = null,
     promotion_owner: ?promotion_runtime_mod.PromotionOwner = null,
     entity_sink_missing_policy: promotion_runtime_mod.MissingSinkPolicy = .wait,
-    ha_async_effect_mirror: ?HAAsyncEffectMirror = null,
-    ha_async_batch_mirror: ?HAAsyncBatchMirror = null,
-    ha_async_metadata_mirror: ?HAAsyncMetadataMirror = null,
-    ha_write_gate: ?HAWriteGate = null,
+    replication_async_effect_mirror: ?ReplicationAsyncEffectMirror = null,
+    replication_async_batch_mirror: ?ReplicationAsyncBatchMirror = null,
+    replication_async_metadata_mirror: ?ReplicationAsyncMetadataMirror = null,
+    replication_write_gate: ?ReplicationWriteGate = null,
     /// Fast negative cache for crash-recovery scans. Writers publish `true`
     /// under apply before committing an outbox; only an apply-fenced empty scan
     /// may return it to false.
-    durable_ha_outbox_maybe: std.atomic.Value(bool) = .init(true),
+    durable_replication_outbox_maybe: std.atomic.Value(bool) = .init(true),
     /// A committed policy publication cannot be followed by row mutations in
     /// the HA tail until its metadata record has been appended. The ordinary
     /// startup barrier also serves as this transient publication barrier.
-    row_policy_ha_outbox_pending: std.atomic.Value(bool) = .init(false),
+    row_policy_replication_outbox_pending: std.atomic.Value(bool) = .init(false),
     source_pin_gc_epoch: @import("antfly_platform").atomic.Value(u64) = .init(1),
     source_pin_gc_turn: @import("antfly_platform").atomic.Value(u64) = .init(0),
     source_pin_gc_next_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
@@ -5116,17 +5108,17 @@ pub const DB = struct {
     source_pin_gc_work_units: @import("antfly_platform").atomic.Value(u64) = .init(0),
     source_pin_gc_error: std.atomic.Value(u32) = .init(0),
     source_pin_gc_log_next_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    durable_ha_flush_mutex: std.Io.Mutex = .init,
+    durable_replication_flush_mutex: std.Io.Mutex = .init,
     /// Crash-left records must be replayed before this process publishes its
     /// first HA mutation. Once crossed, foreground commits append under the
     /// apply/log ordering fences and may await independent LSNs concurrently.
-    durable_ha_startup_barrier_pending: std.atomic.Value(bool) = .init(true),
+    durable_replication_startup_barrier_pending: std.atomic.Value(bool) = .init(true),
     /// Owner-scoped recovery keeps remote acknowledgement off the open/read
     /// path. The startup barrier orders crash-left obligations before new WAL
     /// records; steady-state mutations then wait on independent LSN watermarks.
-    durable_ha_recovery_state: std.atomic.Value(u8) = .init(0),
-    durable_ha_recovery_failure_streak: u32 = 0,
-    durable_ha_recovery_next_attempt_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    durable_replication_recovery_state: std.atomic.Value(u8) = .init(0),
+    durable_replication_recovery_failure_streak: u32 = 0,
+    durable_replication_recovery_next_attempt_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
     /// 0 = idle, 1 = queued/running, 2 = rerun requested. The owner-scoped
     /// durable lane is drained before DB teardown, so jobs may safely borrow
     /// this DB while keeping schema publication latency independent of index
@@ -5305,10 +5297,10 @@ pub const DB = struct {
             .async_context = self.async_context,
             .relational_base_rows = relationalColumns(self) != null,
             .table_catalog = &self.core.table_catalog,
-            .ha_async_effect_mirror = self.ha_async_effect_mirror,
-            .ha_async_batch_mirror = self.ha_async_batch_mirror,
-            .ha_async_metadata_mirror = self.ha_async_metadata_mirror,
-            .ha_write_gate = self.ha_write_gate,
+            .replication_async_effect_mirror = self.replication_async_effect_mirror,
+            .replication_async_batch_mirror = self.replication_async_batch_mirror,
+            .replication_async_metadata_mirror = self.replication_async_metadata_mirror,
+            .replication_write_gate = self.replication_write_gate,
         };
     }
 
@@ -5330,10 +5322,10 @@ pub const DB = struct {
         }
     }
 
-    fn enforceHAWriteGate(self: *DB) !void {
+    fn enforceReplicationWriteGate(self: *DB) !void {
         try self.enforcePortableRuntimeGate();
-        try enforceHAWriteGateOptional(self.ha_write_gate);
-        if (self.async_context.primary_ha_append_pending.load(.acquire)) return error.HAMirrorUnavailable;
+        try enforceReplicationWriteGateOptional(self.replication_write_gate);
+        if (self.async_context.primary_replication_append_pending.load(.acquire)) return error.HAMirrorUnavailable;
     }
 
     /// Keep unavailable work out of lock queues, then revalidate after acquiring
@@ -5367,12 +5359,12 @@ pub const DB = struct {
             return error.GraphMaintenanceInProgress;
     }
 
-    fn haMutationBarrier(self: *const DB) ?*HAMutationBarrier {
-        var barrier: ?*HAMutationBarrier = null;
+    fn replicationMutationBarrier(self: *const DB) ?*MutationBarrier {
+        var barrier: ?*MutationBarrier = null;
         const mirrors = .{
-            self.ha_async_effect_mirror,
-            self.ha_async_batch_mirror,
-            self.ha_async_metadata_mirror,
+            self.replication_async_effect_mirror,
+            self.replication_async_batch_mirror,
+            self.replication_async_metadata_mirror,
         };
         inline for (mirrors) |maybe_mirror| {
             if (maybe_mirror) |mirror| {
@@ -5388,8 +5380,8 @@ pub const DB = struct {
         return barrier;
     }
 
-    fn acquireHAMutationShared(self: *const DB) ?HAMutationBarrier.SharedLease {
-        const barrier = self.haMutationBarrier() orelse return null;
+    fn acquireReplicationMutationShared(self: *const DB) ?MutationBarrier.SharedLease {
+        const barrier = self.replicationMutationBarrier() orelse return null;
         return barrier.acquireShared();
     }
 
@@ -5433,9 +5425,9 @@ pub const DB = struct {
             const validator = active.validator() orelse return false;
             if (validator.execution.checks == null) return false;
         }
-        var ha_mutation = if (replicated) null else self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        if (!replicated) try self.enforceHAWriteGate();
+        var replication_mutation = if (replicated) null else self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        if (!replicated) try self.enforceReplicationWriteGate();
         var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
         defer snapshot_mutation.release();
         var replay_mutation = try self.acquireSnapshotReplayMutation();
@@ -5444,7 +5436,7 @@ pub const DB = struct {
         defer page.deinit();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
-        if (!replicated) try self.enforceHAWriteGate();
+        if (!replicated) try self.enforceReplicationWriteGate();
         try page.commit(self.core);
         return true;
     }
@@ -5452,16 +5444,16 @@ pub const DB = struct {
     /// Retry only an observed failed epoch, never reset a newer declaration.
     pub fn retryConstraintValidation(self: *DB, schema_version: u32) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
         defer snapshot_mutation.release();
         var replay_mutation = try self.acquireSnapshotReplayMutation();
         defer replay_mutation.release();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
-        try self.enforceHAWriteGate();
+        try self.enforceReplicationWriteGate();
         var view = self.core.acquireSchemaView() orelse return error.ConstraintNotFound;
         defer view.release();
         if (view.version() != schema_version) return error.PreparedGenerationChanged;
@@ -5498,9 +5490,9 @@ pub const DB = struct {
 
     fn buildRelationalIndexStepLocal(self: *DB, name: []const u8, budget: RelationalIndexBuildBudget, replicated: bool) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var ha_mutation = if (replicated) null else self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        if (!replicated) try self.enforceHAWriteGate();
+        var replication_mutation = if (replicated) null else self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        if (!replicated) try self.enforceReplicationWriteGate();
         var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
         defer snapshot_mutation.release();
         var replay_mutation = try self.acquireSnapshotReplayMutation();
@@ -5509,15 +5501,15 @@ pub const DB = struct {
         defer page.deinit();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
-        if (!replicated) try self.enforceHAWriteGate();
+        if (!replicated) try self.enforceReplicationWriteGate();
         try page.commit(self.core);
     }
 
     pub fn collectRelationalIndexGarbageStep(self: *DB) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
         defer snapshot_mutation.release();
         var replay_mutation = try self.acquireSnapshotReplayMutation();
@@ -5526,7 +5518,7 @@ pub const DB = struct {
         defer page.deinit();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
-        try self.enforceHAWriteGate();
+        try self.enforceReplicationWriteGate();
         try page.commit(self.core);
         return true;
     }
@@ -5535,16 +5527,16 @@ pub const DB = struct {
     /// are idempotent; an old admin request cannot reset a replacement index.
     pub fn retryRelationalIndexBuild(self: *DB, name: []const u8, generation: u64) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
         defer snapshot_mutation.release();
         var replay_mutation = try self.acquireSnapshotReplayMutation();
         defer replay_mutation.release();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
-        try self.enforceHAWriteGate();
+        try self.enforceReplicationWriteGate();
         var pinned = self.core.relational_indexes.acquire() orelse return error.IndexNotFound;
         defer pinned.deinit();
         const index = for (pinned.plan.boundIndexes()) |index| {
@@ -5674,49 +5666,49 @@ pub const DB = struct {
         return .{ .generation = progress.id.generation, .slot = progress.id.slot, .state = progress.state, .rows_scanned = progress.rows_scanned, .failure = progress.failure };
     }
 
-    fn mirrorHAReplayPayloadBestEffort(self: *DB, payload: []const u8) void {
+    fn mirrorReplicationReplayPayloadBestEffort(self: *DB, payload: []const u8) void {
         var ctx = self.batchContext();
-        mirrorHAReplayPayloadBestEffortContext(&ctx, payload);
+        mirrorReplicationReplayPayloadBestEffortContext(&ctx, payload);
     }
 
-    fn mirrorHABatchMutationBestEffort(self: *DB, request: types.BatchRequest) void {
+    fn mirrorReplicationBatchMutationBestEffort(self: *DB, request: types.BatchRequest) void {
         var ctx = self.batchContext();
-        mirrorHABatchMutationBestEffortContext(&ctx, request);
+        mirrorReplicationBatchMutationBestEffortContext(&ctx, request);
     }
 
-    fn mirrorHASchemaMetadataBestEffort(self: *DB, table_schema: schema_mod.TableSchema, public_schema_json: ?[]const u8) void {
+    fn mirrorReplicationSchemaMetadataBestEffort(self: *DB, table_schema: schema_mod.TableSchema, public_schema_json: ?[]const u8) void {
         var ctx = self.batchContext();
-        mirrorHASchemaMetadataBestEffortContext(&ctx, table_schema, public_schema_json);
+        mirrorReplicationSchemaMetadataBestEffortContext(&ctx, table_schema, public_schema_json);
     }
 
-    fn preflightHABatchSyncCommit(self: *DB) !void {
+    fn preflightReplicationBatchSyncCommit(self: *DB) !void {
         var ctx = self.batchContext();
-        try preflightHAMirrorSyncCommitContext(&ctx, ctx.ha_async_batch_mirror);
-        try preflightHAMirrorSyncCommitContext(&ctx, ctx.ha_async_effect_mirror);
+        try preflightReplicationMirrorSyncCommitContext(&ctx, ctx.replication_async_batch_mirror);
+        try preflightReplicationMirrorSyncCommitContext(&ctx, ctx.replication_async_effect_mirror);
     }
 
-    fn preflightHAMetadataSyncCommit(self: *DB) !void {
+    fn preflightReplicationMetadataSyncCommit(self: *DB) !void {
         var ctx = self.batchContext();
-        try preflightHAMirrorSyncCommitContext(&ctx, ctx.ha_async_metadata_mirror);
+        try preflightReplicationMirrorSyncCommitContext(&ctx, ctx.replication_async_metadata_mirror);
     }
 
-    fn mirrorHABatchMutationCommit(self: *DB, request: types.BatchRequest) !void {
+    fn mirrorReplicationBatchMutationCommit(self: *DB, request: types.BatchRequest) !void {
         var ctx = self.batchContext();
-        try mirrorHABatchMutationCommitContext(&ctx, request);
+        try mirrorReplicationBatchMutationCommitContext(&ctx, request);
     }
 
-    fn mirrorHAEncodedBatchMutationCommit(self: *DB, payload: []const u8) !void {
+    fn mirrorReplicationEncodedBatchMutationCommit(self: *DB, payload: []const u8) !void {
         var ctx = self.batchContext();
-        try mirrorHAEncodedBatchMutationCommitContext(&ctx, payload);
+        try mirrorReplicationEncodedBatchMutationCommitContext(&ctx, payload);
     }
 
-    fn mirrorHAReplayPayloadCommit(self: *DB, payload: []const u8) !void {
+    fn mirrorReplicationReplayPayloadCommit(self: *DB, payload: []const u8) !void {
         var ctx = self.batchContext();
-        try mirrorHAReplayPayloadCommitContext(&ctx, payload);
+        try mirrorReplicationReplayPayloadCommitContext(&ctx, payload);
     }
 
-    fn flushTransactionHAOutbox(self: *DB, txn_id: transactions_mod.TxnId) !void {
-        var outbox = try self.core.loadTransactionHAOutbox(self.alloc, txn_id);
+    fn flushTransactionReplicationOutbox(self: *DB, txn_id: transactions_mod.TxnId) !void {
+        var outbox = try self.core.loadTransactionReplicationOutbox(self.alloc, txn_id);
         defer outbox.deinit(self.alloc);
         if (outbox.batch_payload == null and outbox.replay_payload == null) return;
 
@@ -5724,33 +5716,33 @@ pub const DB = struct {
         // not silently discard it if a restart temporarily removes or
         // downgrades the corresponding mirror configuration.
         if (outbox.batch_payload != null) {
-            const mirror = self.ha_async_batch_mirror orelse return error.HAMirrorUnavailable;
-            if (!haMirrorSyncEnabled(mirror)) return error.HAMirrorUnavailable;
+            const mirror = self.replication_async_batch_mirror orelse return error.HAMirrorUnavailable;
+            if (!replicationMirrorSyncEnabled(mirror)) return error.HAMirrorUnavailable;
         }
         if (outbox.replay_payload != null) {
-            const mirror = self.ha_async_effect_mirror orelse return error.HAMirrorUnavailable;
-            if (!haMirrorSyncEnabled(mirror)) return error.HAMirrorUnavailable;
+            const mirror = self.replication_async_effect_mirror orelse return error.HAMirrorUnavailable;
+            if (!replicationMirrorSyncEnabled(mirror)) return error.HAMirrorUnavailable;
         }
-        try self.enforceHAWriteGate();
+        try self.enforceReplicationWriteGate();
         var ctx = self.batchContext();
-        if (outbox.batch_payload != null) try preflightHAMirrorSyncCommitContext(&ctx, ctx.ha_async_batch_mirror);
-        if (outbox.replay_payload != null) try preflightHAMirrorSyncCommitContext(&ctx, ctx.ha_async_effect_mirror);
+        if (outbox.batch_payload != null) try preflightReplicationMirrorSyncCommitContext(&ctx, ctx.replication_async_batch_mirror);
+        if (outbox.replay_payload != null) try preflightReplicationMirrorSyncCommitContext(&ctx, ctx.replication_async_effect_mirror);
 
         if (outbox.batch_payload) |payload| {
-            try self.mirrorHAEncodedBatchMutationCommit(payload);
+            try self.mirrorReplicationEncodedBatchMutationCommit(payload);
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
-            try self.core.clearTransactionHAOutbox(txn_id, .batch);
+            try self.core.clearTransactionReplicationOutbox(txn_id, .batch);
         }
         if (outbox.replay_payload) |payload| {
-            try self.mirrorHAReplayPayloadCommit(payload);
+            try self.mirrorReplicationReplayPayloadCommit(payload);
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
-            try self.core.clearTransactionHAOutbox(txn_id, .replay);
+            try self.core.clearTransactionReplicationOutbox(txn_id, .replay);
         }
     }
 
-    fn clearDurableHAOutbox(self: *DB, key: []const u8) !void {
+    fn clearDurableReplicationOutbox(self: *DB, key: []const u8) !void {
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         try durable_outbox_store.clearPublished(self.core.store, key);
@@ -5760,49 +5752,49 @@ pub const DB = struct {
     /// records are mutation-scoped; the three singleton keys remain readable
     /// only for rolling-upgrade recovery. A changed/missing mirror cannot
     /// silently discard a durability obligation.
-    fn flushDurableHAOutboxes(self: *DB) !void {
-        if (self.async_context.primary_ha_outbox_pending.load(.acquire)) self.durable_ha_outbox_maybe.store(true, .release);
-        if (!self.durable_ha_outbox_maybe.load(.acquire)) return;
+    fn flushDurableReplicationOutboxes(self: *DB) !void {
+        if (self.async_context.primary_replication_outbox_pending.load(.acquire)) self.durable_replication_outbox_maybe.store(true, .release);
+        if (!self.durable_replication_outbox_maybe.load(.acquire)) return;
         const io = self.backend_runtime.io() orelse std.Options.debug_io;
-        self.durable_ha_flush_mutex.lockUncancelable(io);
-        defer self.durable_ha_flush_mutex.unlock(io);
-        try self.flushDurableHAOutboxesLocked();
+        self.durable_replication_flush_mutex.lockUncancelable(io);
+        defer self.durable_replication_flush_mutex.unlock(io);
+        try self.flushDurableReplicationOutboxesLocked();
     }
 
-    fn ensureDurableHAStartupBarrier(self: *DB) !void {
+    fn ensureDurableReplicationStartupBarrier(self: *DB) !void {
         // A failed primary append must complete before a later mutation can
         // overtake its afterimage in the HA tail.
-        while (self.async_context.primary_ha_append_pending.load(.acquire)) try self.flushDurableHAOutboxes();
-        if (!self.durable_ha_startup_barrier_pending.load(.acquire) and
-            !self.row_policy_ha_outbox_pending.load(.acquire)) return;
+        while (self.async_context.primary_replication_append_pending.load(.acquire)) try self.flushDurableReplicationOutboxes();
+        if (!self.durable_replication_startup_barrier_pending.load(.acquire) and
+            !self.row_policy_replication_outbox_pending.load(.acquire)) return;
         const io = self.backend_runtime.io() orelse std.Options.debug_io;
-        self.durable_ha_flush_mutex.lockUncancelable(io);
-        defer self.durable_ha_flush_mutex.unlock(io);
-        if (!self.durable_ha_startup_barrier_pending.load(.acquire) and
-            !self.row_policy_ha_outbox_pending.load(.acquire)) return;
+        self.durable_replication_flush_mutex.lockUncancelable(io);
+        defer self.durable_replication_flush_mutex.unlock(io);
+        if (!self.durable_replication_startup_barrier_pending.load(.acquire) and
+            !self.row_policy_replication_outbox_pending.load(.acquire)) return;
         while (true) {
-            while (self.durable_ha_outbox_maybe.load(.acquire))
-                try self.flushDurableHAOutboxesLocked();
+            while (self.durable_replication_outbox_maybe.load(.acquire))
+                try self.flushDurableReplicationOutboxesLocked();
             // Close the race with a policy commit that published its flag just
             // after the final scan. The same apply fence orders that commit
             // and the flag clear against subsequent row writers.
             try self.lockApplyForPortableRuntime();
-            const empty = !self.durable_ha_outbox_maybe.load(.acquire);
+            const empty = !self.durable_replication_outbox_maybe.load(.acquire);
             if (empty) {
-                self.durable_ha_startup_barrier_pending.store(false, .release);
-                self.row_policy_ha_outbox_pending.store(false, .release);
+                self.durable_replication_startup_barrier_pending.store(false, .release);
+                self.row_policy_replication_outbox_pending.store(false, .release);
             }
             self.core.unlockApply();
             if (empty) return;
         }
     }
 
-    /// The caller owns `durable_ha_flush_mutex`. Recovery may overlap foreground
+    /// The caller owns `durable_replication_flush_mutex`. Recovery may overlap foreground
     /// acknowledgement, but the apply fence ensures a committed outbox is not
     /// visible until its WAL record was appended, and WAL matching makes such
     /// overlap idempotent.
-    fn flushDurableHAOutboxesLocked(self: *DB) !void {
-        if (!self.durable_ha_outbox_maybe.load(.acquire)) return;
+    fn flushDurableReplicationOutboxesLocked(self: *DB) !void {
+        if (!self.durable_replication_outbox_maybe.load(.acquire)) return;
         try self.lockApplyForPortableRuntime();
         var apply_held = true;
         errdefer if (apply_held) self.core.unlockApply();
@@ -5814,71 +5806,71 @@ pub const DB = struct {
         const pending = page.entries;
         const any_pending = !page.isEmpty();
         if (!any_pending) {
-            self.durable_ha_outbox_maybe.store(false, .release);
-            self.async_context.primary_ha_outbox_pending.store(false, .release);
-            self.async_context.primary_ha_append_pending.store(false, .release);
+            self.durable_replication_outbox_maybe.store(false, .release);
+            self.async_context.primary_replication_outbox_pending.store(false, .release);
+            self.async_context.primary_replication_append_pending.store(false, .release);
         }
         self.core.unlockApply();
         apply_held = false;
         if (!any_pending) return;
 
-        const batch_outbox = if (batch_raw) |raw| try decodeDurableHAOutbox(raw) else null;
-        const replay_outbox = if (replay_raw) |raw| try decodeDurableHAOutbox(raw) else null;
-        const schema_outbox = if (schema_raw) |raw| try decodeDurableHAOutbox(raw) else null;
+        const batch_outbox = if (batch_raw) |raw| try decodeDurableReplicationOutbox(raw) else null;
+        const replay_outbox = if (replay_raw) |raw| try decodeDurableReplicationOutbox(raw) else null;
+        const schema_outbox = if (schema_raw) |raw| try decodeDurableReplicationOutbox(raw) else null;
 
         if (batch_outbox != null) {
-            const mirror = self.ha_async_batch_mirror orelse return error.HAMirrorUnavailable;
-            if (!haMirrorRequiresDurableOutbox(mirror)) return error.HAMirrorUnavailable;
+            const mirror = self.replication_async_batch_mirror orelse return error.HAMirrorUnavailable;
+            if (!replicationMirrorRequiresDurableOutbox(mirror)) return error.HAMirrorUnavailable;
         }
         if (replay_outbox != null) {
-            const mirror = self.ha_async_effect_mirror orelse return error.HAMirrorUnavailable;
-            if (!haMirrorRequiresDurableOutbox(mirror)) return error.HAMirrorUnavailable;
+            const mirror = self.replication_async_effect_mirror orelse return error.HAMirrorUnavailable;
+            if (!replicationMirrorRequiresDurableOutbox(mirror)) return error.HAMirrorUnavailable;
         }
         if (schema_outbox != null) {
-            const mirror = self.ha_async_metadata_mirror orelse return error.HAMirrorUnavailable;
-            if (!haMirrorRequiresDurableOutbox(mirror)) return error.HAMirrorUnavailable;
+            const mirror = self.replication_async_metadata_mirror orelse return error.HAMirrorUnavailable;
+            if (!replicationMirrorRequiresDurableOutbox(mirror)) return error.HAMirrorUnavailable;
         }
         // Recovery delivers the unlogged effect that closes foreground writes.
         try self.enforcePortableRuntimeGate();
-        try enforceHAWriteGateOptional(self.ha_write_gate);
+        try enforceReplicationWriteGateOptional(self.replication_write_gate);
 
         if (batch_outbox) |outbox| {
             var ctx = self.batchContext();
-            try recoverDurableHAOutboxContext(&ctx, self.ha_async_batch_mirror.?, outbox, .batch);
-            try self.clearDurableHAOutbox(ha_batch_outbox_key);
+            try recoverDurableReplicationOutboxContext(&ctx, self.replication_async_batch_mirror.?, outbox, .batch);
+            try self.clearDurableReplicationOutbox(replication_batch_outbox_key);
         }
         if (replay_outbox) |outbox| {
             var ctx = self.batchContext();
-            try recoverDurableHAOutboxContext(&ctx, self.ha_async_effect_mirror.?, outbox, .replay);
-            try self.clearDurableHAOutbox(ha_replay_outbox_key);
+            try recoverDurableReplicationOutboxContext(&ctx, self.replication_async_effect_mirror.?, outbox, .replay);
+            try self.clearDurableReplicationOutbox(replication_replay_outbox_key);
         }
         if (schema_outbox) |outbox| {
             var ctx = self.batchContext();
-            try recoverDurableHAOutboxContext(&ctx, self.ha_async_metadata_mirror.?, outbox, .schema);
-            try self.clearDurableHAOutbox(ha_schema_outbox_key);
+            try recoverDurableReplicationOutboxContext(&ctx, self.replication_async_metadata_mirror.?, outbox, .schema);
+            try self.clearDurableReplicationOutbox(replication_schema_outbox_key);
         }
 
         for (pending) |entry| {
-            const kind = try durableHAOutboxKindFromKey(entry.key);
-            const outbox = try decodeDurableHAOutbox(entry.value);
+            const kind = try durableReplicationOutboxKindFromKey(entry.key);
+            const outbox = try decodeDurableReplicationOutbox(entry.value);
             const mirror = switch (kind) {
-                .batch, .restore_batch => self.ha_async_batch_mirror,
-                .replay, .primary_effect => self.ha_async_effect_mirror,
-                .schema, .row_policy => self.ha_async_metadata_mirror,
+                .batch, .restore_batch => self.replication_async_batch_mirror,
+                .replay, .primary_effect => self.replication_async_effect_mirror,
+                .schema, .row_policy => self.replication_async_metadata_mirror,
             } orelse return error.HAMirrorUnavailable;
-            if (kind != .restore_batch and kind != .primary_effect and kind != .row_policy and !haMirrorRequiresDurableOutbox(mirror)) return error.HAMirrorUnavailable;
+            if (kind != .restore_batch and kind != .primary_effect and kind != .row_policy and !replicationMirrorRequiresDurableOutbox(mirror)) return error.HAMirrorUnavailable;
             var ctx = self.batchContext();
-            try recoverDurableHAOutboxContext(&ctx, mirror, outbox, kind);
+            try recoverDurableReplicationOutboxContext(&ctx, mirror, outbox, kind);
             // The key names this exact mutation, so concurrent publishers cannot
             // replace the record which this recovery pass is about to remove.
-            try self.clearDurableHAOutbox(entry.key);
+            try self.clearDurableReplicationOutbox(entry.key);
         }
     }
 
-    const DurableHARecoveryWork = struct {
+    const DurableReplicationRecoveryWork = struct {
         fn run(ptr: *anyopaque) anyerror!void {
             const self: *DB = @ptrCast(@alignCast(ptr));
-            self.runDurableHAOutboxRecovery();
+            self.runDurableReplicationOutboxRecovery();
         }
 
         fn deinit(_: *anyopaque) void {}
@@ -5887,87 +5879,87 @@ pub const DB = struct {
     /// Queue remote acknowledgement without coupling it to DB open or reads.
     /// The dedicated owner gives this retry state an independent maintenance
     /// probe and makes close a lifetime barrier for every borrowed callback.
-    fn scheduleDurableHAOutboxRecovery(self: *DB) void {
-        if (!self.stable_address or self.ha_recovery_owner_id == 0) return;
+    fn scheduleDurableReplicationOutboxRecovery(self: *DB) void {
+        if (!self.stable_address or self.replication_recovery_owner_id == 0) return;
         if (self.async_context.background_closing.load(.acquire)) return;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return;
-        if (self.async_context.primary_ha_outbox_pending.load(.acquire)) self.durable_ha_outbox_maybe.store(true, .release);
-        if (!self.durable_ha_outbox_maybe.load(.acquire)) {
-            if (self.ha_async_effect_mirror == null) self.backend_runtime.disarmOwnerMaintenanceProbe(self.ha_recovery_owner_id);
+        if (self.async_context.primary_replication_outbox_pending.load(.acquire)) self.durable_replication_outbox_maybe.store(true, .release);
+        if (!self.durable_replication_outbox_maybe.load(.acquire)) {
+            if (self.replication_async_effect_mirror == null) self.backend_runtime.disarmOwnerMaintenanceProbe(self.replication_recovery_owner_id);
             return;
         }
         if (self.backend_runtime.durable_jobs.executesInline()) return;
-        if (monotonicTimeNs() < self.durable_ha_recovery_next_attempt_ns.load(.acquire)) {
-            self.armDurableHARecoveryProbe();
+        if (monotonicTimeNs() < self.durable_replication_recovery_next_attempt_ns.load(.acquire)) {
+            self.armDurableReplicationRecoveryProbe();
             return;
         }
-        if (self.durable_ha_recovery_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) return;
+        if (self.durable_replication_recovery_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) return;
         self.backend_runtime.durable_jobs.submit(.{
-            .owner_id = self.ha_recovery_owner_id,
+            .owner_id = self.replication_recovery_owner_id,
             .class = .maintenance,
             .ptr = self,
-            .run = DurableHARecoveryWork.run,
-            .deinit = DurableHARecoveryWork.deinit,
+            .run = DurableReplicationRecoveryWork.run,
+            .deinit = DurableReplicationRecoveryWork.deinit,
         }) catch |err| {
-            self.durable_ha_recovery_state.store(0, .release);
-            self.durable_ha_recovery_next_attempt_ns.store(
+            self.durable_replication_recovery_state.store(0, .release);
+            self.durable_replication_recovery_next_attempt_ns.store(
                 monotonicTimeNs() +| portable_activation_retry_base_ns,
                 .release,
             );
-            self.armDurableHARecoveryProbe();
+            self.armDurableReplicationRecoveryProbe();
             std.log.warn("durable HA recovery queue unavailable path={s} err={s}", .{ self.core.path, @errorName(err) });
         };
     }
 
-    fn runDurableHAOutboxRecovery(self: *DB) void {
+    fn runDurableReplicationOutboxRecovery(self: *DB) void {
         // A successful delivery leaves the conservative maybe-bit set until a
         // fenced empty scan. A second pass supplies that proof without making
         // every individual clear perform another prefix scan.
         for (0..2) |_| {
-            self.flushDurableHAOutboxes() catch |err| {
+            self.flushDurableReplicationOutboxes() catch |err| {
                 if (self.async_context.background_closing.load(.acquire)) {
-                    self.durable_ha_recovery_state.store(0, .release);
+                    self.durable_replication_recovery_state.store(0, .release);
                     return;
                 }
-                self.durable_ha_recovery_failure_streak +|= 1;
+                self.durable_replication_recovery_failure_streak +|= 1;
                 const delay_ns = portableActivationRetryDelayNs(
                     self.core.path,
-                    @as(u64, @truncate(self.root_incarnation)) ^ self.ha_recovery_owner_id,
-                    self.durable_ha_recovery_failure_streak - 1,
+                    @as(u64, @truncate(self.root_incarnation)) ^ self.replication_recovery_owner_id,
+                    self.durable_replication_recovery_failure_streak - 1,
                 );
-                self.durable_ha_recovery_next_attempt_ns.store(monotonicTimeNs() +| delay_ns, .release);
-                self.durable_ha_recovery_state.store(0, .release);
-                self.armDurableHARecoveryProbe();
+                self.durable_replication_recovery_next_attempt_ns.store(monotonicTimeNs() +| delay_ns, .release);
+                self.durable_replication_recovery_state.store(0, .release);
+                self.armDurableReplicationRecoveryProbe();
                 std.log.warn(
                     "durable HA acknowledgement pending path={s} err={s} failures={d} next_retry_ms={d}",
-                    .{ self.core.path, @errorName(err), self.durable_ha_recovery_failure_streak, delay_ns / std.time.ns_per_ms },
+                    .{ self.core.path, @errorName(err), self.durable_replication_recovery_failure_streak, delay_ns / std.time.ns_per_ms },
                 );
                 return;
             };
-            if (!self.durable_ha_outbox_maybe.load(.acquire)) break;
+            if (!self.durable_replication_outbox_maybe.load(.acquire)) break;
         }
-        self.durable_ha_recovery_failure_streak = 0;
-        self.durable_ha_recovery_next_attempt_ns.store(0, .release);
-        self.durable_ha_recovery_state.store(0, .release);
-        if (self.durable_ha_outbox_maybe.load(.acquire)) {
-            self.scheduleDurableHAOutboxRecovery();
+        self.durable_replication_recovery_failure_streak = 0;
+        self.durable_replication_recovery_next_attempt_ns.store(0, .release);
+        self.durable_replication_recovery_state.store(0, .release);
+        if (self.durable_replication_outbox_maybe.load(.acquire)) {
+            self.scheduleDurableReplicationOutboxRecovery();
         } else {
-            if (self.ha_async_effect_mirror == null) self.backend_runtime.disarmOwnerMaintenanceProbe(self.ha_recovery_owner_id);
+            if (self.replication_async_effect_mirror == null) self.backend_runtime.disarmOwnerMaintenanceProbe(self.replication_recovery_owner_id);
         }
     }
 
-    fn armDurableHARecoveryProbe(self: *DB) void {
-        self.backend_runtime.armOwnerMaintenanceProbe(self.ha_recovery_owner_id, .{
+    fn armDurableReplicationRecoveryProbe(self: *DB) void {
+        self.backend_runtime.armOwnerMaintenanceProbe(self.replication_recovery_owner_id, .{
             .ptr = self,
-            .run = durableHARecoveryMaintenanceProbeMain,
+            .run = durableReplicationRecoveryMaintenanceProbeMain,
         }) catch |err| {
             std.log.warn("durable HA recovery supervisor unavailable path={s} err={s}", .{ self.core.path, @errorName(err) });
         };
     }
 
-    fn durableHARecoveryMaintenanceProbeMain(ptr: *anyopaque) void {
+    fn durableReplicationRecoveryMaintenanceProbeMain(ptr: *anyopaque) void {
         const self: *DB = @ptrCast(@alignCast(ptr));
-        self.scheduleDurableHAOutboxRecovery();
+        self.scheduleDurableReplicationOutboxRecovery();
     }
 
     fn attachAlgebraicHllMaintenanceLane(self: *DB) !void {
@@ -6062,7 +6054,7 @@ pub const DB = struct {
             }
 
             const open_started_ns = monotonicTimeNs();
-            const ha_write_gate = if (opts.ha_write_gate) |gate| gate.pinned() else null;
+            const replication_write_gate = if (opts.replication_write_gate) |gate| gate.pinned() else null;
             var profile = OpenProfile{};
             var owned_resource_manager: ?*resource_manager_mod.ResourceManager = null;
             const bind_cache_resource_manager = opts.resource_manager != null;
@@ -6096,10 +6088,10 @@ pub const DB = struct {
             var repair_cleanup_owner_transferred = false;
             errdefer if (!repair_cleanup_owner_transferred)
                 backend_runtime.durable_jobs.closeOwner(repair_cleanup_owner_id);
-            const ha_recovery_owner_id = try backend_runtime.allocOwnerId();
-            var ha_recovery_owner_transferred = false;
-            errdefer if (!ha_recovery_owner_transferred)
-                backend_runtime.durable_jobs.closeOwner(ha_recovery_owner_id);
+            const replication_recovery_owner_id = try backend_runtime.allocOwnerId();
+            var replication_recovery_owner_transferred = false;
+            errdefer if (!replication_recovery_owner_transferred)
+                backend_runtime.durable_jobs.closeOwner(replication_recovery_owner_id);
             var primary_lsm_background_executor: lsm_backend_mod.BackgroundExecutor = undefined;
             var effective_primary_backend = opts.primary_backend;
             var effective_index_backends = opts.index_backends;
@@ -6211,8 +6203,8 @@ pub const DB = struct {
                 .lsm_memory => |*lsm_opts| lsm_opts.background_executor = null,
                 .mem => {},
             }
-            const ha_standby_role = haWriteGateIsStandby(ha_write_gate);
-            const start_index_workers = opts.open_mode.allowsIndexWorkers() and opts.start_index_workers and !ha_standby_role;
+            const replication_standby_role = replicationWriteGateIsStandby(replication_write_gate);
+            const start_index_workers = opts.open_mode.allowsIndexWorkers() and opts.start_index_workers and !replication_standby_role;
 
             core_owner.* = try db_core.DBCore.fromOpened(
                 alloc,
@@ -6272,7 +6264,7 @@ pub const DB = struct {
                 .backend_owner_id = backend_owner_id,
                 .status_owner_epoch = @import("publication.zig").allocateOwnerEpoch(),
                 .repair_cleanup_owner_id = repair_cleanup_owner_id,
-                .ha_recovery_owner_id = ha_recovery_owner_id,
+                .replication_recovery_owner_id = replication_recovery_owner_id,
                 .owned_backend_runtime = owned_backend_runtime,
                 .owned_resource_manager = owned_resource_manager,
                 .index_repair_clock = opts.index_repair_clock,
@@ -6296,10 +6288,10 @@ pub const DB = struct {
                 .entity_sink = opts.entity_sink,
                 .promotion_owner = opts.promotion_owner,
                 .entity_sink_missing_policy = opts.entity_sink_missing_policy,
-                .ha_async_effect_mirror = opts.ha_async_effect_mirror,
-                .ha_async_batch_mirror = opts.ha_async_batch_mirror,
-                .ha_async_metadata_mirror = opts.ha_async_metadata_mirror,
-                .ha_write_gate = ha_write_gate,
+                .replication_async_effect_mirror = opts.replication_async_effect_mirror,
+                .replication_async_batch_mirror = opts.replication_async_batch_mirror,
+                .replication_async_metadata_mirror = opts.replication_async_metadata_mirror,
+                .replication_write_gate = replication_write_gate,
                 .ttl_cleanup_context = null,
                 .ttl_runtime = null,
                 .transaction_recovery_identity_context = null,
@@ -6313,7 +6305,7 @@ pub const DB = struct {
             core_owner_transferred = true;
             backend_owner_transferred = true;
             repair_cleanup_owner_transferred = true;
-            ha_recovery_owner_transferred = true;
+            replication_recovery_owner_transferred = true;
             var executor_ready = false;
             owned_async_context = null;
             owned_backend_runtime = null;
@@ -6430,7 +6422,7 @@ pub const DB = struct {
                 if (graph_retirement.intent != null)
                     db.core.index_manager.setGraphRetirementAdmissionAssumeCatalogLock(false);
             }
-            const optional_runtimes_initialized = opts.open_mode.allowsOptionalRuntimes() and opts.start_optional_runtimes and !ha_standby_role;
+            const optional_runtimes_initialized = opts.open_mode.allowsOptionalRuntimes() and opts.start_optional_runtimes and !replication_standby_role;
             const optional_runtime_workers_enabled = optional_runtimes_initialized and opts.start_optional_runtime_workers;
             db.optional_runtime_workers_enabled = optional_runtime_workers_enabled;
             if (optional_runtimes_initialized) {
@@ -7116,7 +7108,7 @@ pub const DB = struct {
     fn openSourceVectors(self: *DB, create: bool) !void {
         if (self.source_vectors.load(.acquire) != null) return;
         if (self.primary_backend != .lsm or self.physical_root_mode != .filesystem_managed or
-            self.ha_write_gate != null or self.ha_async_batch_mirror != null or self.ha_async_effect_mirror != null)
+            self.replication_write_gate != null or self.replication_async_batch_mirror != null or self.replication_async_effect_mirror != null)
             return error.VectorStoreRequiresLocalSingleShardTable;
         const storage = try self.alloc.create(lsm_backend_mod.NativeStorage);
         errdefer self.alloc.destroy(storage);
@@ -7256,8 +7248,8 @@ pub const DB = struct {
         self.stable_address = true;
         // TTL callbacks retain only stable context, never this movable wrapper.
         // The resident probe observes their atomic outbox notification.
-        if (self.ha_async_effect_mirror != null) self.armDurableHARecoveryProbe();
-        self.scheduleDurableHAOutboxRecovery();
+        if (self.replication_async_effect_mirror != null) self.armDurableReplicationRecoveryProbe();
+        self.scheduleDurableReplicationOutboxRecovery();
         self.startArtifactRepairMetadataWorkerIfNeeded();
         self.startQuarantineRetryWorkerIfNeeded();
     }
@@ -7718,10 +7710,10 @@ pub const DB = struct {
             .executor = self.executor,
             .async_context = self.async_context,
             .log_mutex = resources.log_mutex,
-            .ha_async_effect_mirror = self.ha_async_effect_mirror,
-            .ha_async_batch_mirror = self.ha_async_batch_mirror,
-            .ha_async_metadata_mirror = self.ha_async_metadata_mirror,
-            .ha_write_gate = self.ha_write_gate,
+            .replication_async_effect_mirror = self.replication_async_effect_mirror,
+            .replication_async_batch_mirror = self.replication_async_batch_mirror,
+            .replication_async_metadata_mirror = self.replication_async_metadata_mirror,
+            .replication_write_gate = self.replication_write_gate,
             .resolution_runtime = self.resolution_runtime,
             .promotion_runtime = self.promotion_runtime,
             .artifact_publication_dispatcher = self.artifact_publication_dispatcher,
@@ -7935,10 +7927,10 @@ pub const DB = struct {
             .executor = self.executor,
             .async_context = self.async_context,
             .log_mutex = resources.log_mutex,
-            .ha_async_effect_mirror = self.ha_async_effect_mirror,
-            .ha_async_batch_mirror = self.ha_async_batch_mirror,
-            .ha_async_metadata_mirror = self.ha_async_metadata_mirror,
-            .ha_write_gate = self.ha_write_gate,
+            .replication_async_effect_mirror = self.replication_async_effect_mirror,
+            .replication_async_batch_mirror = self.replication_async_batch_mirror,
+            .replication_async_metadata_mirror = self.replication_async_metadata_mirror,
+            .replication_write_gate = self.replication_write_gate,
         };
 
         const runtime = try self.runtime_alloc.create(resolution_runtime_mod.ResolutionRuntime);
@@ -8020,10 +8012,10 @@ pub const DB = struct {
                 .promotion_runtime = self.promotion_runtime,
                 .relational_base_rows = relationalColumns(self) != null,
                 .table_catalog = &self.core.table_catalog,
-                .ha_async_effect_mirror = self.ha_async_effect_mirror,
-                .ha_async_batch_mirror = self.ha_async_batch_mirror,
-                .ha_async_metadata_mirror = self.ha_async_metadata_mirror,
-                .ha_write_gate = self.ha_write_gate,
+                .replication_async_effect_mirror = self.replication_async_effect_mirror,
+                .replication_async_batch_mirror = self.replication_async_batch_mirror,
+                .replication_async_metadata_mirror = self.replication_async_metadata_mirror,
+                .replication_write_gate = self.replication_write_gate,
             },
             .grace_period_ns = cfg.grace_period_ns,
             .clock = cfg.clock,
@@ -8332,9 +8324,9 @@ pub const DB = struct {
             self.backend_runtime.durable_jobs.closeOwner(self.algebraic_hll_owner_id);
             self.algebraic_hll_owner_id = 0;
         }
-        if (self.ha_recovery_owner_id != 0) {
-            self.backend_runtime.durable_jobs.closeOwner(self.ha_recovery_owner_id);
-            self.ha_recovery_owner_id = 0;
+        if (self.replication_recovery_owner_id != 0) {
+            self.backend_runtime.durable_jobs.closeOwner(self.replication_recovery_owner_id);
+            self.replication_recovery_owner_id = 0;
         }
         self.backend_runtime.durable_jobs.closeOwner(self.repair_cleanup_owner_id);
         self.backend_runtime.durable_jobs.closeOwner(self.backend_owner_id);
@@ -8455,9 +8447,9 @@ pub const DB = struct {
     }
 
     pub fn runTransactionRecoveryOnce(self: *DB, config: transaction_runtime_mod.Config) !types.TransactionRecoveryStats {
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         if (!config.enabled) return .{};
         if (config.replicated_metadata) {
             return try transaction_runtime_mod.recoverOnce(
@@ -8538,9 +8530,9 @@ pub const DB = struct {
     }
 
     pub fn beginBulkIngestSession(self: *DB) !void {
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         // Fail promptly while a restored catalog is degraded instead of
         // entering the dense-session admission wait. The apply-locked check
         // below remains authoritative and closes a concurrent publication.
@@ -8568,9 +8560,9 @@ pub const DB = struct {
     }
 
     pub fn finishBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         try self.flushBulkIngestCoalescerWithSyncLevel(.write, null);
         var external_session_tracked = true;
         defer if (external_session_tracked) finishExternalDenseBulkSessionTrackedBestEffort(self.async_context);
@@ -8608,9 +8600,9 @@ pub const DB = struct {
     }
 
     pub fn beginDenseAutoBulkIngestSession(self: *DB) !void {
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         try self.enforcePortableRuntimeGate();
         try beginExternalDenseBulkSessionTrackedWait(self.async_context, self.backend_runtime.io());
         errdefer finishExternalDenseBulkSessionTrackedBestEffort(self.async_context);
@@ -8622,9 +8614,9 @@ pub const DB = struct {
     }
 
     pub fn beginPrimaryStoreAutoBulkIngestSession(self: *DB) !void {
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         const resources = self.core.batchExecutionResources();
@@ -8636,9 +8628,9 @@ pub const DB = struct {
     }
 
     pub fn finishPrimaryStoreAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         try self.flushBulkIngestCoalescerWithSyncLevel(.write, null);
         {
             try self.lockApplyForPortableRuntime();
@@ -8675,9 +8667,9 @@ pub const DB = struct {
     }
 
     fn finishDenseAutoBulkIngestSessionWithOptionsInternal(self: *DB, options: backend_types.BulkIngestFinishOptions, notify_executor: bool) !void {
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         try self.flushBulkIngestCoalescerWithSyncLevel(.write, null);
         var external_session_tracked = true;
         defer if (external_session_tracked) finishExternalDenseBulkSessionTrackedBestEffort(self.async_context);
@@ -8710,8 +8702,8 @@ pub const DB = struct {
     }
 
     pub fn abortDenseAutoBulkIngestSession(self: *DB) void {
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
         lockApply(self);
         {
             defer self.core.unlockApply();
@@ -8724,8 +8716,8 @@ pub const DB = struct {
     }
 
     pub fn abortPrimaryStoreAutoBulkIngestSession(self: *DB) void {
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
         lockApply(self);
         defer self.core.unlockApply();
         const resources = self.core.batchExecutionResources();
@@ -8735,8 +8727,8 @@ pub const DB = struct {
     }
 
     pub fn abortBulkIngestSession(self: *DB) void {
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
         lockApply(self);
         {
             defer self.core.unlockApply();
@@ -9064,12 +9056,12 @@ pub const DB = struct {
     }
 
     pub fn runLsmMaintenanceStep(self: *DB) !bool {
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        return try self.runLsmMaintenanceStepWithHAMutationHeld();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        return try self.runLsmMaintenanceStepWithReplicationMutationHeld();
     }
 
-    fn runLsmMaintenanceStepWithHAMutationHeld(self: *DB) !bool {
+    fn runLsmMaintenanceStepWithReplicationMutationHeld(self: *DB) !bool {
         var snapshot_replay = try self.acquireSnapshotReplayMutation();
         defer snapshot_replay.release();
         return self.runLsmMaintenanceStepAdmitted(&snapshot_replay);
@@ -9098,8 +9090,8 @@ pub const DB = struct {
     }
 
     pub fn runLsmMaintenanceStepBestEffort(self: *DB) !bool {
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
         var snapshot_replay = try self.acquireSnapshotReplayMutation();
         defer snapshot_replay.release();
         if (self.source_pin_gc_turn.fetchAdd(1, .monotonic) % 4 == 0 and try self.runSourcePinCleanupStep()) return true;
@@ -9168,8 +9160,8 @@ pub const DB = struct {
     }
 
     pub fn runPrimaryLsmMaintenanceStep(self: *DB) !bool {
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
         var snapshot_replay = try self.acquireSnapshotReplayMutation();
         defer snapshot_replay.release();
         if (try self.core.primary_store_owner.runDueLsmObsoleteReclaim()) return true;
@@ -9182,8 +9174,8 @@ pub const DB = struct {
     }
 
     pub fn runPrimaryLsmMaintenanceStepBestEffort(self: *DB) !bool {
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
         var snapshot_replay = try self.acquireSnapshotReplayMutation();
         defer snapshot_replay.release();
         if (try self.core.primary_store_owner.runDueLsmObsoleteReclaim()) return true;
@@ -9208,8 +9200,8 @@ pub const DB = struct {
     }
 
     pub fn runDueLsmObsoleteReclaimUntilIdle(self: *DB, max_steps: usize) !usize {
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
         var snapshot_replay = try self.acquireSnapshotReplayMutation();
         defer snapshot_replay.release();
         var steps: usize = 0;
@@ -9553,9 +9545,9 @@ pub const DB = struct {
         limit: usize,
     ) anyerror!DocumentArtifactChildRangeOutboxDrainResult {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
 
         const prefix = try internal_keys.documentChildRangeOutboxRootPrefixAlloc(self.alloc);
         defer self.alloc.free(prefix);
@@ -9591,9 +9583,9 @@ pub const DB = struct {
     }
 
     fn deleteDocumentArtifactChildRangeOutboxEntry(self: *DB, key: []const u8) !void {
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         const deletes = [_][]const u8{key};
@@ -9611,7 +9603,7 @@ pub const DB = struct {
     /// Applies one exact data-Raft log entry and persists its identity in the
     /// same primary-store batch. Replaying the entry after a crash becomes an
     /// allocation-light no-op before transforms or derived work execute.
-    fn requiresDurableLifecycleHA(req: types.BatchRequest) bool {
+    fn requiresDurableLifecycleReplication(req: types.BatchRequest) bool {
         return req.artifact_catalog != null or req.online_source != null or req.restore_staging != null or req.restore_staging_scope != null or
             req.relational_topology != null or req.relational_generation_gc != null or req.split_transition != null or
             req.split_checkpoint != null or req.split_replication != null or
@@ -9623,11 +9615,11 @@ pub const DB = struct {
         req: types.BatchRequest,
         identity: RaftAppliedEntryIdentity,
     ) anyerror!void {
-        const mirror_scoped_restore = requiresDurableLifecycleHA(req) and self.ha_async_batch_mirror != null;
+        const mirror_scoped_restore = requiresDurableLifecycleReplication(req) and self.replication_async_batch_mirror != null;
         // HA is process-local and includes this node's Raft follower roots.
         // Recover the local committed obligation before a Raft receipt can
         // short-circuit replay after a crash between store and HA publication.
-        if (mirror_scoped_restore) try self.flushDurableHAOutboxes();
+        if (mirror_scoped_restore) try self.flushDurableReplicationOutboxes();
         // Most restart replays should avoid executor health checks, resource
         // admission, transform expansion, and derived-payload construction.
         // batchInternal repeats this check under the mutation lock, which is
@@ -9643,7 +9635,7 @@ pub const DB = struct {
                     try self.applyOnlineSourceBatch(req, .{
                         .validate_range_ownership = false,
                         .wait_for_sync_level = false,
-                        .bypass_ha_write_gate = !mirror_scoped_restore,
+                        .bypass_replication_write_gate = !mirror_scoped_restore,
                         .raft_applied_entry_marker = identity,
                     });
                 }
@@ -9667,7 +9659,7 @@ pub const DB = struct {
         self.batchInternal(apply_req, null, .{
             .validate_range_ownership = false,
             .wait_for_sync_level = false,
-            .bypass_ha_write_gate = !mirror_scoped_restore,
+            .bypass_replication_write_gate = !mirror_scoped_restore,
             .raft_applied_entry_marker = identity,
         }) catch |err| switch (err) {
             error.GraphMaintenanceInProgress => return error.RaftApplyWriterUnavailable,
@@ -9707,8 +9699,8 @@ pub const DB = struct {
             req.relational_integrity_generation_set != null or req.timestamp_ns != 0)
             return error.InvalidInitialChildPublication;
         const bootstrap = self.initial_child_bootstrap orelse return error.InvalidInitialChildPublication;
-        if (self.ha_async_batch_mirror != null or self.ha_async_metadata_mirror != null or
-            self.ha_async_effect_mirror != null or self.ha_write_gate != null or
+        if (self.replication_async_batch_mirror != null or self.replication_async_metadata_mirror != null or
+            self.replication_async_effect_mirror != null or self.replication_write_gate != null or
             openModeRequiresReadOnlyBackends(self.open_mode))
             return error.InvalidInitialChildPublication;
         if (!bootstrap.namespace.eql(command.fence.namespace) or
@@ -9742,7 +9734,7 @@ pub const DB = struct {
         return self.batchInternal(req, null, .{
             .validate_range_ownership = false,
             .wait_for_sync_level = false,
-            .bypass_ha_write_gate = true,
+            .bypass_replication_write_gate = true,
             .native_initial_child_entry = receipt,
         });
     }
@@ -9778,8 +9770,8 @@ pub const DB = struct {
             command.initial_child_provision != null or command.initial_child_control != null or command.graph_retirement != null or
             command.generation_handoff != null or command.generation_handoff_seal != null or command.generation_handoff_install != null)
             return error.InvalidBatchRequest;
-        if (self.ha_async_batch_mirror != null or self.ha_async_metadata_mirror != null or
-            self.ha_async_effect_mirror != null or self.ha_write_gate != null or openModeRequiresReadOnlyBackends(self.open_mode))
+        if (self.replication_async_batch_mirror != null or self.replication_async_metadata_mirror != null or
+            self.replication_async_effect_mirror != null or self.replication_write_gate != null or openModeRequiresReadOnlyBackends(self.open_mode))
             return error.UnsupportedOperation;
         _ = try command.fence.encode();
         var authority = try self.core.store.beginReadTxn();
@@ -9806,8 +9798,8 @@ pub const DB = struct {
         self: *DB,
         transition: types.SplitTransitionMutation,
         identity: ?RaftAppliedEntryIdentity,
-        ha_lsn: ?u64,
-        ha_payload: ?[]const u8,
+        replication_lsn: ?u64,
+        replication_payload: ?[]const u8,
     ) !void {
         var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
         defer snapshot_mutation.release();
@@ -9845,7 +9837,7 @@ pub const DB = struct {
         };
         if (builtin.is_test and graph_mod.test_abort_ownership_before_range_commit) return error.TestInjectedBackfillFailure;
         var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
-        var ha_marker_buf: [ha_applied_lsn_value_len]u8 = undefined;
+        var replication_marker_buf: [replication_applied_lsn_value_len]u8 = undefined;
         var outbox_value: ?[]u8 = null;
         defer if (outbox_value) |bytes| self.alloc.free(bytes);
         var outbox_key: ?[]u8 = null;
@@ -9857,14 +9849,14 @@ pub const DB = struct {
         defer metadata_writes.deinit(self.alloc);
         try metadata_writes.append(self.alloc, .{ .key = range_state_mod.range_key, .value = range_value });
         if (identity) |entry| try metadata_writes.append(self.alloc, raftAppliedEntryWrite(entry, &marker_buf));
-        if (ha_lsn) |lsn| try metadata_writes.append(self.alloc, haAppliedReplicationLsnWrite(lsn, &ha_marker_buf));
-        if (ha_payload) |payload| {
-            const mirror = self.ha_async_batch_mirror orelse return error.HAMirrorUnavailable;
+        if (replication_lsn) |lsn| try metadata_writes.append(self.alloc, replicationAppliedSequenceWrite(lsn, &replication_marker_buf));
+        if (replication_payload) |payload| {
+            const mirror = self.replication_async_batch_mirror orelse return error.HAMirrorUnavailable;
             const from_lsn = mirror.publisher.nextLsn();
-            outbox_value = try encodeDurableHAOutboxAlloc(self.alloc, from_lsn, payload);
-            outbox_key = try durableHAOutboxKeyAlloc(self.alloc, .restore_batch, from_lsn, self.core.root_generation, payload);
+            outbox_value = try encodeDurableReplicationOutboxAlloc(self.alloc, from_lsn, payload);
+            outbox_key = try durableReplicationOutboxKeyAlloc(self.alloc, .restore_batch, from_lsn, self.core.root_generation, payload);
             try metadata_writes.append(self.alloc, .{ .key = outbox_key.?, .value = outbox_value.? });
-            self.durable_ha_outbox_maybe.store(true, .release);
+            self.durable_replication_outbox_maybe.store(true, .release);
         }
         {
             var view = self.core.acquireSchemaView();
@@ -10120,66 +10112,66 @@ pub const DB = struct {
         return self.applyRowPolicyPublicationInternal(bundle_bytes, request, identity, null);
     }
 
-    fn finishRowPolicyHACommitLocked(self: *DB, payload: ?[]const u8, outbox_key: ?[]const u8, apply_held: *bool, ha_mutation: *?HAMutationBarrier.ExclusiveLease) !void {
+    fn finishRowPolicyReplicationCommitLocked(self: *DB, payload: ?[]const u8, outbox_key: ?[]const u8, apply_held: *bool, replication_mutation: *?MutationBarrier.ExclusiveLease) !void {
         const encoded = payload orelse return;
         var ctx = self.batchContext();
-        var deferred = HADeferredCommitGates.begin(haTransitionMutexFromContext(&ctx));
+        var deferred = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(&ctx));
         defer deferred.releaseTransition();
-        deferred.append(appendHAEncodedSchemaMetadataCommitLockedContext(&ctx, encoded) catch {
+        deferred.append(appendReplicationEncodedSchemaMetadataCommitLockedContext(&ctx, encoded) catch {
             self.core.unlockApply();
             apply_held.* = false;
-            if (ha_mutation.*) |*lease| lease.release();
-            ha_mutation.* = null;
+            if (replication_mutation.*) |*lease| lease.release();
+            replication_mutation.* = null;
             return error.DurabilityOutcomeUnknown;
         });
         self.core.unlockApply();
         apply_held.* = false;
-        if (ha_mutation.*) |*lease| lease.release();
-        ha_mutation.* = null;
-        deferred.waitForDurabilityAndAuthority(ctx.ha_write_gate) catch return error.DurabilityOutcomeUnknown;
-        self.clearDurableHAOutbox(outbox_key.?) catch |err| std.log.warn(
+        if (replication_mutation.*) |*lease| lease.release();
+        replication_mutation.* = null;
+        deferred.waitForDurabilityAndAuthority(ctx.replication_write_gate) catch return error.DurabilityOutcomeUnknown;
+        self.clearDurableReplicationOutbox(outbox_key.?) catch |err| std.log.warn(
             "row policy HA durability acknowledged but outbox cleanup is pending path={s} err={s}",
             .{ self.core.path, @errorName(err) },
         );
     }
 
-    fn applyRowPolicyPublicationInternal(self: *DB, bundle_bytes: []const u8, request: @import("../../system_catalog/policies.zig").InstallRequest, identity: RaftAppliedEntryIdentity, ha_lsn: ?u64) !?row_policy_bundle_mod.Receipt {
+    fn applyRowPolicyPublicationInternal(self: *DB, bundle_bytes: []const u8, request: @import("../../system_catalog/policies.zig").InstallRequest, identity: RaftAppliedEntryIdentity, replication_lsn: ?u64) !?row_policy_bundle_mod.Receipt {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        if (identity.term == 0 or identity.index == 0 or (ha_lsn != null and ha_lsn.? == 0)) return error.InvalidRowPolicyPublication;
-        if (ha_lsn == null and self.ha_async_metadata_mirror == null and
-            (self.ha_async_batch_mirror != null or self.ha_write_gate != null)) return error.HAMirrorUnavailable;
+        if (identity.term == 0 or identity.index == 0 or (replication_lsn != null and replication_lsn.? == 0)) return error.InvalidRowPolicyPublication;
+        if (replication_lsn == null and self.replication_async_metadata_mirror == null and
+            (self.replication_async_batch_mirror != null or self.replication_write_gate != null)) return error.HAMirrorUnavailable;
         // The policy cut must be serialized with all in-flight primary writes,
         // including writers that passed their fast outbox preflight already.
         // Production HA mirrors share this capture barrier with every mutation.
-        if (ha_lsn == null) if (self.ha_async_metadata_mirror) |mirror|
+        if (replication_lsn == null) if (self.replication_async_metadata_mirror) |mirror|
             if (mirror.mutation_barrier == null) return error.HAMirrorUnavailable;
-        var ha_mutation: ?HAMutationBarrier.ExclusiveLease = null;
-        defer if (ha_mutation) |*lease| lease.release();
-        if (ha_lsn == null) {
-            try self.enforceHAWriteGate();
-            try self.ensureDurableHAStartupBarrier();
-            try self.preflightHAMetadataSyncCommit();
-            if (self.ha_async_metadata_mirror) |mirror|
-                ha_mutation = mirror.mutation_barrier.?.acquireExclusive();
+        var replication_mutation: ?MutationBarrier.ExclusiveLease = null;
+        defer if (replication_mutation) |*lease| lease.release();
+        if (replication_lsn == null) {
+            try self.enforceReplicationWriteGate();
+            try self.ensureDurableReplicationStartupBarrier();
+            try self.preflightReplicationMetadataSyncCommit();
+            if (self.replication_async_metadata_mirror) |mirror|
+                replication_mutation = mirror.mutation_barrier.?.acquireExclusive();
         }
-        var schedule_ha_recovery_on_exit = false;
-        defer if (schedule_ha_recovery_on_exit) self.scheduleDurableHAOutboxRecovery();
-        const ha_payload = if (ha_lsn == null and self.ha_async_metadata_mirror != null)
-            try ha_effects_mod.encodeRowPolicyMetadataMutationAlloc(self.alloc, bundle_bytes, request, identity)
+        var schedule_replication_recovery_on_exit = false;
+        defer if (schedule_replication_recovery_on_exit) self.scheduleDurableReplicationOutboxRecovery();
+        const replication_payload = if (replication_lsn == null and self.replication_async_metadata_mirror != null)
+            try replication_effects_mod.encodeRowPolicyMetadataMutationAlloc(self.alloc, bundle_bytes, request, identity)
         else
             null;
-        defer if (ha_payload) |payload| self.alloc.free(payload);
-        const ha_outbox = if (ha_payload) |payload| blk: {
+        defer if (replication_payload) |payload| self.alloc.free(payload);
+        const replication_outbox = if (replication_payload) |payload| blk: {
             // This is a WAL search lower bound, not an LSN reservation.
             // Recovery matches the exact payload and owner identity under the
             // transition/log locks even if another publisher appended first.
-            const from_lsn = self.ha_async_metadata_mirror.?.publisher.nextLsn();
-            const encoded = try encodeDurableHAOutboxAlloc(self.alloc, from_lsn, payload);
+            const from_lsn = self.replication_async_metadata_mirror.?.publisher.nextLsn();
+            const encoded = try encodeDurableReplicationOutboxAlloc(self.alloc, from_lsn, payload);
             errdefer self.alloc.free(encoded);
-            const key = try durableHAOutboxKeyAlloc(self.alloc, .row_policy, from_lsn, self.core.root_generation, payload);
+            const key = try durableReplicationOutboxKeyAlloc(self.alloc, .row_policy, from_lsn, self.core.root_generation, payload);
             break :blk .{ .key = key, .value = encoded };
         } else null;
-        defer if (ha_outbox) |outbox| {
+        defer if (replication_outbox) |outbox| {
             self.alloc.free(outbox.key);
             self.alloc.free(outbox.value);
         };
@@ -10210,7 +10202,7 @@ pub const DB = struct {
                 return err;
             };
             self.core.unlockApply();
-            if (ha_lsn) |lsn| try self.markHAReplicationRecordApplied(lsn);
+            if (replication_lsn) |lsn| try self.recordReplicationApplied(lsn);
             return already;
         }
         const phase = installed.parsed.value.phase;
@@ -10225,7 +10217,7 @@ pub const DB = struct {
             const already = try self.readRowPolicyApplyResultLocked(expected_receipt);
             self.core.unlockApply();
             apply_held = false;
-            if (ha_lsn) |lsn| try self.markHAReplicationRecordApplied(lsn);
+            if (replication_lsn) |lsn| try self.recordReplicationApplied(lsn);
             return already;
         }
         {
@@ -10307,23 +10299,23 @@ pub const DB = struct {
             try stage_txn.put(row_policy_bundle_mod.candidate_key, bundle_bytes);
             try stage_txn.put(receipt_key, &encoded_receipt);
             try stage_txn.put(receipt.key, receipt.value);
-            var ha_lsn_buf: [ha_applied_lsn_value_len]u8 = undefined;
-            if (ha_lsn) |lsn| {
-                const marker = haAppliedReplicationLsnWrite(lsn, &ha_lsn_buf);
+            var replication_lsn_buf: [replication_applied_lsn_value_len]u8 = undefined;
+            if (replication_lsn) |lsn| {
+                const marker = replicationAppliedSequenceWrite(lsn, &replication_lsn_buf);
                 try stage_txn.put(marker.key, marker.value);
             }
-            if (ha_outbox) |outbox| try stage_txn.put(outbox.key, outbox.value);
-            if (ha_outbox != null) {
+            if (replication_outbox) |outbox| try stage_txn.put(outbox.key, outbox.value);
+            if (replication_outbox != null) {
                 // Conservative on abort: the next admission performs an
                 // apply-fenced empty scan and clears both fast-negative flags.
-                self.durable_ha_outbox_maybe.store(true, .release);
-                self.row_policy_ha_outbox_pending.store(true, .release);
+                self.durable_replication_outbox_maybe.store(true, .release);
+                self.row_policy_replication_outbox_pending.store(true, .release);
             }
             try stage_txn.commit();
-            if (ha_outbox != null) {
-                schedule_ha_recovery_on_exit = true;
+            if (replication_outbox != null) {
+                schedule_replication_recovery_on_exit = true;
             }
-            try self.finishRowPolicyHACommitLocked(ha_payload, if (ha_outbox) |outbox| outbox.key else null, &apply_held, &ha_mutation);
+            try self.finishRowPolicyReplicationCommitLocked(replication_payload, if (replication_outbox) |outbox| outbox.key else null, &apply_held, &replication_mutation);
             return expected_receipt;
         }
         if (phase == .serving_install or phase == .serving_disable) {
@@ -10361,24 +10353,24 @@ pub const DB = struct {
         try txn.put(row_policy_bundle_mod.pending_key, &encoded_pending);
         try txn.put(table_catalog_mod.key, &catalog_bytes);
         try txn.put(receipt.key, receipt.value);
-        var ha_lsn_buf: [ha_applied_lsn_value_len]u8 = undefined;
-        if (ha_lsn) |lsn| {
-            const marker = haAppliedReplicationLsnWrite(lsn, &ha_lsn_buf);
+        var replication_lsn_buf: [replication_applied_lsn_value_len]u8 = undefined;
+        if (replication_lsn) |lsn| {
+            const marker = replicationAppliedSequenceWrite(lsn, &replication_lsn_buf);
             try txn.put(marker.key, marker.value);
         }
-        if (ha_outbox) |outbox| try txn.put(outbox.key, outbox.value);
-        if (ha_outbox != null) {
-            self.durable_ha_outbox_maybe.store(true, .release);
-            self.row_policy_ha_outbox_pending.store(true, .release);
+        if (replication_outbox) |outbox| try txn.put(outbox.key, outbox.value);
+        if (replication_outbox != null) {
+            self.durable_replication_outbox_maybe.store(true, .release);
+            self.row_policy_replication_outbox_pending.store(true, .release);
         }
         try txn.commit();
-        if (ha_outbox != null) {
-            schedule_ha_recovery_on_exit = true;
+        if (replication_outbox != null) {
+            schedule_replication_recovery_on_exit = true;
         }
         self.core.table_catalog = next;
         // Keep the old immutable bundle alive for previously admitted bound
         // readers. The receipt probe swaps it only after those leases drain.
-        try self.finishRowPolicyHACommitLocked(ha_payload, if (ha_outbox) |outbox| outbox.key else null, &apply_held, &ha_mutation);
+        try self.finishRowPolicyReplicationCommitLocked(replication_payload, if (replication_outbox) |outbox| outbox.key else null, &apply_held, &replication_mutation);
         return null;
     }
 
@@ -10398,8 +10390,8 @@ pub const DB = struct {
         try self.batchInternal(apply_req, null, .{
             .validate_range_ownership = false,
             .wait_for_sync_level = false,
-            .bypass_ha_write_gate = true,
-            .ha_applied_lsn_marker = applied_lsn_marker,
+            .bypass_replication_write_gate = true,
+            .replication_applied_lsn_marker = applied_lsn_marker,
         });
     }
 
@@ -10521,14 +10513,14 @@ pub const DB = struct {
             self.publishRelationalRuntimeModePrepared(if (prepared_recovery) |*prepared| prepared else null);
         }
         self.reconcilePublishedSchemaIndexes(table_schema.version);
-        if (applied_lsn_marker) |lsn| try self.markHAReplicationRecordApplied(lsn);
+        if (applied_lsn_marker) |lsn| try self.recordReplicationApplied(lsn);
     }
 
     /// The HA journal carries the primary's authenticated child-source cut.
     /// Apply the schema, accepted integrity catalog, source-fence release,
     /// owner receipt and HA LSN in one standby transaction. Generic metadata
     /// replay deliberately cannot publish a changed FK generation.
-    fn setPublishedChildSchemaReplicatedApplyWithMarker(self: *DB, table_schema: schema_mod.TableSchema, schema_json: []const u8, published: ha_effects_mod.PublishedChildSchema, lsn: u64) !void {
+    fn setPublishedChildSchemaReplicatedApplyWithMarker(self: *DB, table_schema: schema_mod.TableSchema, schema_json: []const u8, published: replication_effects_mod.PublishedChildSchema, lsn: u64) !void {
         if (lsn == 0 or (published.fence.role != .child_generation_source and published.fence.role != .child_generation_dual) or
             !published.fence.namespace.eql(self.core.identity_namespace) or
             published.applied_term == 0 or published.applied_index == 0) return error.InvalidGenerationPublication;
@@ -10545,8 +10537,8 @@ pub const DB = struct {
         const admission = @import("relational_integrity_generation_admission.zig");
         const receipt_digest = try admission.sourceInstallDigest(published.fence, published.before_schema_json_digest, published.schema_json_digest, published.before_catalog_digest, published.after_catalog_digest);
         const receipt_bytes = (admission.AppliedReceipt{ .digest = receipt_digest, .term = published.applied_term, .index = published.applied_index }).encode();
-        var lsn_buf: [ha_applied_lsn_value_len]u8 = undefined;
-        const marker = haAppliedReplicationLsnWrite(lsn, &lsn_buf);
+        var lsn_buf: [replication_applied_lsn_value_len]u8 = undefined;
+        const marker = replicationAppliedSequenceWrite(lsn, &lsn_buf);
         const writes = [_]docstore_mod.KVPair{
             .{ .key = public_schema_json_key, .value = schema_json },
             .{ .key = versioned_key, .value = schema_json },
@@ -10580,134 +10572,105 @@ pub const DB = struct {
         self.reconcilePublishedSchemaIndexes(table_schema.version);
     }
 
-    pub fn applyHAReplicationRecord(self: *DB, record: ha_replication_record_mod.RecordView) anyerror!void {
-        if (try self.haReplicationRecordAlreadyApplied(record)) {
-            // Older records remain allocation-light no-ops. Only the current
-            // receipt on a restored owner can require replica-local repair;
-            // ordinary batch replays never decode their row payload here.
-            if (record.kind == .batch_mutation and record.lsn == try self.haAppliedReplicationLsn()) {
-                // The replicated marker can precede local immutable-pin
-                // completion. Resume that exact durable cut before ACKing an
-                // already applied retry; never recapture a current live view.
-                try self.resumePreparedSourcePin();
-                if (try self.restoreStagingStatus(self.alloc)) |stored| {
-                    var progress = stored;
-                    defer progress.deinit();
-                    if (progress.value.phase == .validated or progress.value.phase == .published) {
-                        if (try ha_effects_mod.decodeRestoreFinishForReplay(self.alloc, record)) |finish|
-                            try self.prepareAppliedRestoreFinishReplay(.{ .restore_staging = .{ .finish = finish } });
-                    }
-                }
-            }
-            return;
-        }
-
-        switch (record.kind) {
-            .batch_mutation => {
-                var decoded = try ha_effects_mod.decodeBatchMutationRequest(self.alloc, record);
-                defer decoded.deinit();
-                if (decoded.value.native_topology_position) |stamp| {
-                    try self.batchInternal(decoded.value.request, null, .{
-                        .validate_range_ownership = false,
-                        .wait_for_sync_level = false,
-                        .bypass_ha_write_gate = true,
-                        .native_topology_position = stamp,
-                        .ha_applied_lsn_marker = record.lsn,
-                    });
-                } else if (decoded.value.ordinary_raft_entry orelse decoded.value.artifact_publication_raft_entry orelse decoded.value.artifact_publication_transport_raft_entry orelse decoded.value.merge_proof_adoption_raft_entry orelse decoded.value.artifact_catalog_raft_entry orelse decoded.value.initial_child_raft_entry orelse decoded.value.graph_retirement_raft_entry orelse decoded.value.restore_generation_admission_raft_entry) |entry| {
-                    if (decoded.value.request.artifact_catalog) |command| if (decoded.value.request.online_source != null or decoded.value.request.merge_checkpoint != null) {
-                        const context = try self.preflightArtifactAdmission(decoded.value.request, entry);
-                        if (!try self.reconcileOrderedArtifactCatalogWithContext(command, entry.index, context)) return error.ArtifactCatalogDrift;
-                    };
-                    try self.batchInternal(decoded.value.request, null, .{
-                        .validate_range_ownership = false,
-                        .wait_for_sync_level = false,
-                        .bypass_ha_write_gate = true,
-                        .raft_applied_entry_marker = entry,
-                        .ha_applied_lsn_marker = record.lsn,
-                    });
-                } else if (decoded.value.request.online_source != null) {
-                    var source_req = decoded.value.request;
-                    source_req.sync_level = .write;
-                    try self.batchInternal(source_req, null, .{
-                        .validate_range_ownership = false,
-                        .wait_for_sync_level = false,
-                        .bypass_ha_write_gate = true,
-                        .ha_applied_lsn_marker = record.lsn,
-                        .online_source_applied_index = decoded.value.online_source_applied_index orelse return error.InvalidOnlineSourceCommand,
-                    });
-                } else try self.batchReplicatedApplyWithMarker(decoded.value.request, record.lsn);
-            },
-            .metadata_mutation => {
-                var metadata = try ha_effects_mod.decodeMetadataMutation(self.alloc, record);
-                defer metadata.deinit();
-                switch (metadata.value.kind) {
-                    .schema => {
-                        var decoded = try ha_effects_mod.decodeSchemaMetadataMutation(self.alloc, record);
-                        defer decoded.deinit();
-                        if (decoded.published_child) |published|
-                            try self.setPublishedChildSchemaReplicatedApplyWithMarker(decoded.schema, decoded.public_schema_json orelse return error.InvalidGenerationPublication, published, record.lsn)
-                        else
-                            try self.setSchemaReplicatedApplyWithMarker(decoded.schema, decoded.public_schema_json, record.lsn);
-                    },
-                    .row_policy => _ = try self.applyRowPolicyPublicationInternal(
-                        metadata.value.row_policy_bundle.?,
-                        metadata.value.row_policy_request.?,
-                        metadata.value.row_policy_raft_entry.?,
-                        record.lsn,
-                    ),
-                }
-            },
-            .derived_effect => {
-                _ = try self.applyHADerivedEffectRecord(record);
-                try self.markHAReplicationRecordApplied(record.lsn);
-            },
-            .backup_start,
-            .backup_end,
-            .checkpoint,
-            .manifest,
-            .truncate,
-            .timeline_switch,
-            => try self.markHAReplicationRecordApplied(record.lsn),
-            _ => return error.HAReplicationRecordApplyUnsupported,
-        }
+    /// Apply an already decoded committed batch. The mutation and its replay
+    /// receipt remain in the same primary-store transaction.
+    pub fn applyReplicatedBatch(self: *DB, mutation: replication_effects_mod.BatchMutationPayload, sequence: u64) !void {
+        if (mutation.native_topology_position) |stamp| {
+            try self.batchInternal(mutation.request, null, .{
+                .validate_range_ownership = false,
+                .wait_for_sync_level = false,
+                .bypass_replication_write_gate = true,
+                .native_topology_position = stamp,
+                .replication_applied_lsn_marker = sequence,
+            });
+        } else if (mutation.ordinary_raft_entry orelse mutation.artifact_publication_raft_entry orelse mutation.artifact_publication_transport_raft_entry orelse mutation.merge_proof_adoption_raft_entry orelse mutation.artifact_catalog_raft_entry orelse mutation.initial_child_raft_entry orelse mutation.graph_retirement_raft_entry orelse mutation.restore_generation_admission_raft_entry) |entry| {
+            if (mutation.request.artifact_catalog) |command| if (mutation.request.online_source != null or mutation.request.merge_checkpoint != null) {
+                const context = try self.preflightArtifactAdmission(mutation.request, entry);
+                if (!try self.reconcileOrderedArtifactCatalogWithContext(command, entry.index, context)) return error.ArtifactCatalogDrift;
+            };
+            try self.batchInternal(mutation.request, null, .{
+                .validate_range_ownership = false,
+                .wait_for_sync_level = false,
+                .bypass_replication_write_gate = true,
+                .raft_applied_entry_marker = entry,
+                .replication_applied_lsn_marker = sequence,
+            });
+        } else if (mutation.request.online_source != null) {
+            var source_req = mutation.request;
+            source_req.sync_level = .write;
+            try self.batchInternal(source_req, null, .{
+                .validate_range_ownership = false,
+                .wait_for_sync_level = false,
+                .bypass_replication_write_gate = true,
+                .replication_applied_lsn_marker = sequence,
+                .online_source_applied_index = mutation.online_source_applied_index orelse return error.InvalidOnlineSourceCommand,
+            });
+        } else try self.batchReplicatedApplyWithMarker(mutation.request, sequence);
     }
 
-    pub fn applyHADerivedEffectRecord(self: *DB, record: ha_replication_record_mod.RecordView) anyerror!u64 {
+    pub fn applyReplicatedSchema(self: *DB, mutation: replication_effects_mod.SchemaMutation, sequence: u64) !void {
+        if (mutation.published_child) |published|
+            try self.setPublishedChildSchemaReplicatedApplyWithMarker(mutation.schema, mutation.public_schema_json orelse return error.InvalidGenerationPublication, published, sequence)
+        else
+            try self.setSchemaReplicatedApplyWithMarker(mutation.schema, mutation.public_schema_json, sequence);
+    }
+
+    pub fn applyReplicatedRowPolicy(self: *DB, mutation: replication_effects_mod.RowPolicyMutation, sequence: u64) !void {
+        _ = try self.applyRowPolicyPublicationInternal(
+            mutation.bundle,
+            mutation.request,
+            mutation.entry,
+            sequence,
+        );
+    }
+
+    /// Only the latest replay receipt may need local source-pin repair.
+    /// Older retries remain allocation-free and do not decode their payloads.
+    pub fn recoverReplicatedBatchCut(self: *DB, sequence: u64) !bool {
+        if (sequence != try self.replicationAppliedSequence()) return false;
+        try self.resumePreparedSourcePin();
+        if (try self.restoreStagingStatus(self.alloc)) |stored| {
+            var progress = stored;
+            defer progress.deinit();
+            return progress.value.phase == .validated or progress.value.phase == .published;
+        }
+        return false;
+    }
+
+    pub fn recoverReplicatedRestoreFinish(self: *DB, finish: @FieldType(@import("restore_staging_contract.zig").Control, "finish")) !void {
+        try self.prepareAppliedRestoreFinishReplay(.{ .restore_staging = .{ .finish = finish } });
+    }
+
+    pub fn applyReplicatedDerivedEffect(self: *DB, change: change_journal_mod.Record, primary: ?replication_effects_mod.primary_effect.View, sequence: u64) !u64 {
         var ctx = self.batchContext();
-        return try appendReplicatedHADerivedEffectContext(&ctx, record);
+        return try appendReplicatedDerivedEffectContext(&ctx, change, primary, sequence);
     }
 
-    pub fn haAppliedReplicationLsn(self: *DB) anyerror!u64 {
-        return try readHAAppliedReplicationLsn(self.alloc, self.core.store);
+    pub fn replicationAppliedSequence(self: *DB) anyerror!u64 {
+        return try readReplicationAppliedSequence(self.alloc, self.core.store);
     }
 
-    fn haReplicationRecordAlreadyApplied(self: *DB, record: ha_replication_record_mod.RecordView) !bool {
-        if (record.lsn == 0) return false;
-        return (try self.haAppliedReplicationLsn()) >= record.lsn;
+    pub fn replicationMutationAlreadyApplied(self: *DB, sequence: u64) !bool {
+        if (sequence == 0) return false;
+        return (try self.replicationAppliedSequence()) >= sequence;
     }
 
-    fn markHAReplicationRecordApplied(self: *DB, lsn: u64) !void {
+    pub fn recordReplicationApplied(self: *DB, lsn: u64) !void {
         if (lsn == 0) return;
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
-        const current = try self.haAppliedReplicationLsn();
+        const current = try self.replicationAppliedSequence();
         if (current >= lsn) return;
-        var value_buf: [ha_applied_lsn_value_len]u8 = undefined;
-        const marker = haAppliedReplicationLsnWrite(lsn, &value_buf);
+        var value_buf: [replication_applied_lsn_value_len]u8 = undefined;
+        const marker = replicationAppliedSequenceWrite(lsn, &value_buf);
         try self.core.store.putBatch(&.{marker}, &.{});
-    }
-
-    pub fn applyHAReplicationRecordCallback(ctx: *anyopaque, record: ha_replication_record_mod.RecordView) anyerror!void {
-        const self: *DB = @ptrCast(@alignCast(ctx));
-        try self.applyHAReplicationRecord(record);
     }
 
     pub fn applyDocumentArtifactChildRangeBatch(self: *DB, child_batch: DocumentArtifactChildRangeApplyBatch) anyerror!u64 {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         if (child_batch.artifact_writes.len == 0 and
             child_batch.artifact_delete_keys.len == 0 and
             child_batch.documents.len == 0 and
@@ -10830,7 +10793,7 @@ pub const DB = struct {
                 .payload = replay_payload,
             },
         );
-        self.mirrorHAReplayPayloadBestEffort(replay_payload);
+        self.mirrorReplicationReplayPayloadBestEffort(replay_payload);
         if (shouldAppendSplitDelta(self)) {
             try self.core.appendSplitDelta(currentTimeNs(), store_writes.items, delete_keys.items);
         }
@@ -10889,7 +10852,7 @@ pub const DB = struct {
         var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
         defer if (verified_principal) |*principal| principal.deinit();
         var row_policy_lease: ?row_policy_gate_mod.Gate.Lease = null;
-        const trusted_replay = opts.raft_applied_entry_marker != null or opts.native_initial_child_entry != null or opts.ha_applied_lsn_marker != null;
+        const trusted_replay = opts.raft_applied_entry_marker != null or opts.native_initial_child_entry != null or opts.replication_applied_lsn_marker != null;
         if (!trusted_replay) try self.maybeFinalizePendingRowPolicyPublication();
         if (req.row_policy_principal_proof.len != 0) {
             if (req.row_policy_admitted_at_seconds <= 0 or req.row_policy_database.len == 0 or
@@ -11035,7 +10998,7 @@ pub const DB = struct {
                     apply_opts.wait_for_sync_level = !page.artifact_page and !page.source_generation_proof_page;
                     apply_opts.restore_staging = .{ .expected = page.expected, .next = page.next, .scope = page.scope, .rewrite = control == .rewrite_page, .source_effects = page.source_effects, .artifact_page = page.artifact_page, .projection_page = page.projection_page, .source_generation_proof_page = page.source_generation_proof_page };
                     apply_opts.restore_timestamps = &timestamps;
-                    apply_opts.restore_ha_request = req;
+                    apply_opts.restore_replication_request = req;
                     apply_opts.restore_artifacts = page.artifacts;
                     const extra = try self.alloc.alloc(docstore_mod.KVPair, opts.extra_store_writes.len + 1 + @intFromBool(page.artifacts.len != 0 and !page.source_generation_proof_page));
                     defer self.alloc.free(extra);
@@ -11083,7 +11046,7 @@ pub const DB = struct {
             apply_opts.extra_store_deletes = extra_deletes;
             // Standby receives the same bounded command, never the assembled
             // row re-escaped into an oversized replication JSON envelope.
-            apply_opts.restore_ha_request = req;
+            apply_opts.restore_replication_request = req;
         };
         if (apply_req.merge_page) |page| if (page.provenance_effects.len != 0) {
             try @import("merge_page_contract.zig").validateRequest(apply_req);
@@ -11167,7 +11130,7 @@ pub const DB = struct {
             self.relational_index_retry_after_ns.store(0, .release);
         };
         for (req.writes) |write| if (relational_index_catalog.Controller.isReservedMetadataKey(write.key)) {
-            const trusted = opts.transaction_resolution != null or opts.ha_applied_lsn_marker != null;
+            const trusted = opts.transaction_resolution != null or opts.replication_applied_lsn_marker != null;
             if (!trusted or !maintenance_contract.isControlKey(write.key)) return error.ReservedRelationalIndexMetadataKey;
             _ = try maintenance_contract.Control.decode(write.value);
             maintenance_attempted = true;
@@ -11180,16 +11143,16 @@ pub const DB = struct {
             self.core.schemaNamespaceGeneration();
         if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        if (!opts.bypass_ha_write_gate and self.denseRepairWriteBackpressured()) return error.DenseRepairBackpressure;
-        var ha_mutation = if (opts.bypass_ha_write_gate) null else self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        if (!opts.bypass_ha_write_gate) try self.ensureDurableHAStartupBarrier();
-        if (!opts.bypass_ha_write_gate) try self.enforceHAWriteGate();
-        if (!opts.bypass_ha_write_gate) try self.preflightHABatchSyncCommit();
+        if (!opts.bypass_replication_write_gate and self.denseRepairWriteBackpressured()) return error.DenseRepairBackpressure;
+        var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        if (!opts.bypass_replication_write_gate) try self.ensureDurableReplicationStartupBarrier();
+        if (!opts.bypass_replication_write_gate) try self.enforceReplicationWriteGate();
+        if (!opts.bypass_replication_write_gate) try self.preflightReplicationBatchSyncCommit();
         const total_start_ns = monotonicTimeNs();
-        var schedule_ha_recovery_on_exit = false;
+        var schedule_replication_recovery_on_exit = false;
         defer {
-            if (schedule_ha_recovery_on_exit) self.scheduleDurableHAOutboxRecovery();
+            if (schedule_replication_recovery_on_exit) self.scheduleDurableReplicationOutboxRecovery();
             if (profile) |active_profile| {
                 active_profile.total_ns += monotonicTimeNs() - total_start_ns;
             }
@@ -11329,9 +11292,9 @@ pub const DB = struct {
         // Only authenticated HA replay may supply final scoped metadata effects
         // without local participant intents. Scope, key kinds, owner range and
         // generation are revalidated below under the apply fence.
-        const scoped_restore_ha_apply = opts.ha_applied_lsn_marker != null and effective_req.restore_staging_scope != null and opts.restore_staging == null;
-        const live_ha_apply = opts.ha_applied_lsn_marker != null and effective_req.restore_staging_scope == null and opts.restore_staging == null;
-        if (opts.transaction_resolution == null and !scoped_restore_ha_apply and !live_ha_apply) {
+        const scoped_restore_replication_apply = opts.replication_applied_lsn_marker != null and effective_req.restore_staging_scope != null and opts.restore_staging == null;
+        const live_replication_apply = opts.replication_applied_lsn_marker != null and effective_req.restore_staging_scope == null and opts.restore_staging == null;
+        if (opts.transaction_resolution == null and !scoped_restore_replication_apply and !live_replication_apply) {
             for (effective_ops.writes) |write| if (isProtectedIntegrityKey(write.key) or isProtectedRangeWriteKey(write.key)) return error.InvalidIntegrityOperation;
             for (effective_ops.deletes) |key| if (isProtectedIntegrityKey(key) or isProtectedRangeWriteKey(key)) return error.InvalidIntegrityOperation;
             if (hasCoordinatedConstraints(request_schema_view) and opts.restore_staging == null and req.split_replication == null and req.merge_replication == null and (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0))
@@ -11553,21 +11516,21 @@ pub const DB = struct {
         // apply section, then reuse the exact bytes for durable outboxes and
         // the stream append. This also avoids holding the HA log mutex while
         // walking and encoding every document in a large request.
-        var preencoded_ha_batch_payload: ?[]u8 = null;
-        defer if (preencoded_ha_batch_payload) |payload| preparation_alloc.free(payload);
-        const scoped_restore_ha = opts.restore_staging != null or requiresDurableLifecycleHA(effective_req);
-        if (!opts.bypass_ha_write_gate) if (self.ha_async_batch_mirror) |mirror| {
-            preencoded_ha_batch_payload = (if (req.artifact_catalog != null)
-                ha_effects_mod.encodeArtifactCatalogMutationRequestAlloc(preparation_alloc, req, opts.raft_applied_entry_marker orelse return error.InvalidArtifactCatalogCommand)
+        var preencoded_replication_batch_payload: ?[]u8 = null;
+        defer if (preencoded_replication_batch_payload) |payload| preparation_alloc.free(payload);
+        const scoped_restore_ha = opts.restore_staging != null or requiresDurableLifecycleReplication(effective_req);
+        if (!opts.bypass_replication_write_gate) if (self.replication_async_batch_mirror) |mirror| {
+            preencoded_replication_batch_payload = (if (req.artifact_catalog != null)
+                replication_effects_mod.encodeArtifactCatalogMutationRequestAlloc(preparation_alloc, req, opts.raft_applied_entry_marker orelse return error.InvalidArtifactCatalogCommand)
             else if (opts.raft_applied_entry_marker) |entry|
-                ha_effects_mod.encodeRaftBatchMutationRequestAlloc(preparation_alloc, opts.restore_ha_request orelse effective_req, entry)
+                replication_effects_mod.encodeRaftBatchMutationRequestAlloc(preparation_alloc, opts.restore_replication_request orelse effective_req, entry)
             else
-                ha_effects_mod.encodeBatchMutationRequestAlloc(preparation_alloc, opts.restore_ha_request orelse effective_req)) catch |err| blk: {
+                replication_effects_mod.encodeBatchMutationRequestAlloc(preparation_alloc, opts.restore_replication_request orelse effective_req)) catch |err| blk: {
                 if (err == error.OutOfMemory) return err;
                 // Non-resource encoding failures retain best-effort async
                 // behavior. Admission failures must never retry allocation
                 // uncharged after commit.
-                if (scoped_restore_ha or haMirrorSyncEnabled(mirror)) return err;
+                if (scoped_restore_ha or replicationMirrorSyncEnabled(mirror)) return err;
                 break :blk null;
             };
         };
@@ -11640,10 +11603,10 @@ pub const DB = struct {
             return error.InitialChildNotPublished;
         if (req.schema_version != null) try self.validatePreparedSchemaViewLocked(request_schema_view);
         if (!self.core.relational_indexes.isCurrent(relational_index_snapshot)) return error.PreparedGenerationChanged;
-        if (live_ha_apply) {
+        if (live_replication_apply) {
             var integrity_read = try self.core.store.beginProbeTxn();
             defer integrity_read.abort();
-            try self.validateLiveHAIntegrityEffects(preparation_alloc, &integrity_read, effective_req);
+            try self.validateLiveReplicationIntegrityEffects(preparation_alloc, &integrity_read, effective_req);
         }
         if (self.restore_staging_required.load(.acquire) or opts.restore_staging != null or effective_req.restore_staging_scope != null) {
             var restore_read = try self.core.store.beginProbeTxn();
@@ -11651,9 +11614,9 @@ pub const DB = struct {
             if (opts.restore_staging) |admission|
                 try @import("restore_staging.zig").validateImport(preparation_alloc, &restore_read, admission, effective_req.writes.len, effective_req.deletes.len)
             else if (opts.transaction_resolution == null) {
-                if (opts.ha_applied_lsn_marker != null and effective_req.restore_staging_scope != null) {
+                if (opts.replication_applied_lsn_marker != null and effective_req.restore_staging_scope != null) {
                     try @import("restore_staging.zig").requireMutableScope(preparation_alloc, &restore_read, effective_req.restore_staging_scope);
-                    try self.validateRestoreStagingHAEffects(preparation_alloc, &restore_read, effective_req);
+                    try self.validateRestoreStagingReplicationEffects(preparation_alloc, &restore_read, effective_req);
                 } else try @import("restore_staging.zig").requireScope(preparation_alloc, &restore_read, null, false);
             }
         }
@@ -11687,16 +11650,16 @@ pub const DB = struct {
             var state = if (raw) |value| try merge_state_mod.decodeAlloc(self.alloc, value) else null;
             defer if (state) |*value| value.deinit(self.alloc);
             if (!merge_state_mod.copyAllowed(state, replication)) {
-                if (!opts.bypass_ha_write_gate) return error.MergeCopyFenced;
+                if (!opts.bypass_replication_write_gate) return error.MergeCopyFenced;
                 // A delayed committed command must advance the receipt without
                 // touching documents, artifacts, indexes or visibility state.
                 if (opts.raft_applied_entry_marker) |identity| {
                     var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
                     try self.core.store.putBatch(&.{raftAppliedEntryWrite(identity, &marker_buf)}, &.{});
                 }
-                if (opts.ha_applied_lsn_marker) |lsn| {
-                    var marker_buf: [ha_applied_lsn_value_len]u8 = undefined;
-                    try self.core.store.putBatch(&.{haAppliedReplicationLsnWrite(lsn, &marker_buf)}, &.{});
+                if (opts.replication_applied_lsn_marker) |lsn| {
+                    var marker_buf: [replication_applied_lsn_value_len]u8 = undefined;
+                    try self.core.store.putBatch(&.{replicationAppliedSequenceWrite(lsn, &marker_buf)}, &.{});
                 }
                 self.core.unlockApply();
                 apply_mutex_held = false;
@@ -11717,13 +11680,13 @@ pub const DB = struct {
                             var marker_writes: [2]docstore_mod.KVPair = undefined;
                             var count: usize = 0;
                             var raft_buffer: [raft_applied_entry_value_len]u8 = undefined;
-                            var standby_buffer: [ha_applied_lsn_value_len]u8 = undefined;
+                            var standby_buffer: [replication_applied_lsn_value_len]u8 = undefined;
                             if (opts.raft_applied_entry_marker) |identity| {
                                 marker_writes[count] = raftAppliedEntryWrite(identity, &raft_buffer);
                                 count += 1;
                             }
-                            if (opts.ha_applied_lsn_marker) |lsn| {
-                                marker_writes[count] = haAppliedReplicationLsnWrite(lsn, &standby_buffer);
+                            if (opts.replication_applied_lsn_marker) |lsn| {
+                                marker_writes[count] = replicationAppliedSequenceWrite(lsn, &standby_buffer);
                                 count += 1;
                             }
                             if (count != 0) try self.core.store.putBatch(marker_writes[0..count], &.{});
@@ -11844,7 +11807,7 @@ pub const DB = struct {
                     },
                 );
                 unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
-                if (!opts.bypass_ha_write_gate) try self.flushTransactionHAOutbox(resolution.txn_id);
+                if (!opts.bypass_replication_write_gate) try self.flushTransactionReplicationOutbox(resolution.txn_id);
                 try self.waitForResolvedTransactionSync(req.sync_level, outcome.replay_sequence);
                 return;
             }
@@ -11872,7 +11835,7 @@ pub const DB = struct {
         // including ordinary graph writes and document/relational deletes.
         // Coalescer flushing above may run nested visibility waits, so acquire
         // only after it finishes, without retaining a catalog lease.
-        if (!opts.bypass_ha_write_gate and self.async_context.primary_ha_append_pending.load(.acquire)) return error.HAMirrorUnavailable;
+        if (!opts.bypass_replication_write_gate and self.async_context.primary_replication_append_pending.load(.acquire)) return error.HAMirrorUnavailable;
         var graph_publication = if (self.core.index_manager.hasGraphIndexes())
             self.core.index_manager.beginGraphPrimaryMutation()
         else
@@ -11903,7 +11866,7 @@ pub const DB = struct {
         // HA carries already committed effects, including prepared decisions
         // drained after a topology fence. It must not rerun fresh-write
         // admission on the replica and strand an authoritative commit.
-        if (!coordinated_handoff and opts.transaction_resolution == null and !live_ha_apply and !scoped_restore_ha_apply and (effective_req.writes.len != 0 or effective_req.deletes.len != 0 or
+        if (!coordinated_handoff and opts.transaction_resolution == null and !live_replication_apply and !scoped_restore_replication_apply and (effective_req.writes.len != 0 or effective_req.deletes.len != 0 or
             effective_req.graph_writes.len != 0 or effective_req.graph_deletes.len != 0))
         {
             var topology_read = try self.core.store.beginProbeTxn();
@@ -12004,7 +11967,7 @@ pub const DB = struct {
 
         if (opts.validate_range_ownership) {
             const validate_range_start_ns = monotonicTimeNs();
-            if (opts.transaction_resolution != null or scoped_restore_ha_apply or live_ha_apply) {
+            if (opts.transaction_resolution != null or scoped_restore_replication_apply or live_replication_apply) {
                 // Participant preparation routes private claims/references by
                 // their logical address, never by their NUL-prefixed physical
                 // key. Repeat that same ownership check at resolution. Other
@@ -12786,7 +12749,7 @@ pub const DB = struct {
         const elide_semantic_noop_replay = use_thin_replay_fast_path and
             opts.extra_store_writes.len == 0 and
             opts.transaction_resolution == null and
-            opts.ha_applied_lsn_marker == null and
+            opts.replication_applied_lsn_marker == null and
             opts.raft_applied_entry_marker == null and
             !thinReplayInputsHaveDerivedWork(
                 effective_req,
@@ -12978,55 +12941,55 @@ pub const DB = struct {
                 &owned_store_values,
             );
         }
-        var durable_ha_batch_payload: ?[]u8 = null;
-        var durable_ha_replay_payload: ?[]u8 = null;
-        var durable_ha_batch_outbox_key: ?[]const u8 = null;
-        var durable_ha_replay_outbox_key: ?[]const u8 = null;
-        if (!opts.bypass_ha_write_gate and (opts.transaction_resolution == null or scoped_restore_ha)) {
-            if (self.ha_async_batch_mirror) |mirror| if (scoped_restore_ha or haMirrorRequiresDurableOutbox(mirror)) {
-                const payload = preencoded_ha_batch_payload orelse return error.HAMirrorUnavailable;
+        var durable_replication_batch_payload: ?[]u8 = null;
+        var durable_replication_replay_payload: ?[]u8 = null;
+        var durable_replication_batch_outbox_key: ?[]const u8 = null;
+        var durable_replication_replay_outbox_key: ?[]const u8 = null;
+        if (!opts.bypass_replication_write_gate and (opts.transaction_resolution == null or scoped_restore_ha)) {
+            if (self.replication_async_batch_mirror) |mirror| if (scoped_restore_ha or replicationMirrorRequiresDurableOutbox(mirror)) {
+                const payload = preencoded_replication_batch_payload orelse return error.HAMirrorUnavailable;
                 const from_lsn = mirror.publisher.nextLsn();
-                const outbox = try encodeDurableHAOutboxAlloc(self.alloc, from_lsn, payload);
+                const outbox = try encodeDurableReplicationOutboxAlloc(self.alloc, from_lsn, payload);
                 owned_store_values.append(self.alloc, outbox) catch |err| {
                     self.alloc.free(outbox);
                     return err;
                 };
-                const outbox_key = try durableHAOutboxKeyAlloc(
+                const outbox_key = try durableReplicationOutboxKeyAlloc(
                     self.alloc,
                     if (scoped_restore_ha) .restore_batch else .batch,
                     from_lsn,
                     self.core.root_generation,
-                    outbox[ha_outbox_header_len .. outbox.len - ha_outbox_checksum_len],
+                    outbox[replication_outbox_header_len .. outbox.len - replication_outbox_checksum_len],
                 );
                 var outbox_key_owned = true;
                 errdefer if (outbox_key_owned) self.alloc.free(outbox_key);
                 try owned_store_keys.append(self.alloc, outbox_key);
                 outbox_key_owned = false;
                 try store_writes.append(self.alloc, .{ .key = outbox_key, .value = outbox });
-                durable_ha_batch_payload = outbox[ha_outbox_header_len .. outbox.len - ha_outbox_checksum_len];
-                durable_ha_batch_outbox_key = outbox_key;
+                durable_replication_batch_payload = outbox[replication_outbox_header_len .. outbox.len - replication_outbox_checksum_len];
+                durable_replication_batch_outbox_key = outbox_key;
             };
-            if (append_derived_replay and !scoped_restore_ha) if (self.ha_async_effect_mirror) |mirror| if (haMirrorRequiresDurableOutbox(mirror)) {
+            if (append_derived_replay and !scoped_restore_ha) if (self.replication_async_effect_mirror) |mirror| if (replicationMirrorRequiresDurableOutbox(mirror)) {
                 const from_lsn = mirror.publisher.nextLsn();
-                const outbox = try encodeDurableHAOutboxAlloc(self.alloc, from_lsn, replay_payload);
+                const outbox = try encodeDurableReplicationOutboxAlloc(self.alloc, from_lsn, replay_payload);
                 owned_store_values.append(self.alloc, outbox) catch |err| {
                     self.alloc.free(outbox);
                     return err;
                 };
-                const outbox_key = try durableHAOutboxKeyAlloc(
+                const outbox_key = try durableReplicationOutboxKeyAlloc(
                     self.alloc,
                     .replay,
                     from_lsn,
                     self.core.root_generation,
-                    outbox[ha_outbox_header_len .. outbox.len - ha_outbox_checksum_len],
+                    outbox[replication_outbox_header_len .. outbox.len - replication_outbox_checksum_len],
                 );
                 var outbox_key_owned = true;
                 errdefer if (outbox_key_owned) self.alloc.free(outbox_key);
                 try owned_store_keys.append(self.alloc, outbox_key);
                 outbox_key_owned = false;
                 try store_writes.append(self.alloc, .{ .key = outbox_key, .value = outbox });
-                durable_ha_replay_payload = outbox[ha_outbox_header_len .. outbox.len - ha_outbox_checksum_len];
-                durable_ha_replay_outbox_key = outbox_key;
+                durable_replication_replay_payload = outbox[replication_outbox_header_len .. outbox.len - replication_outbox_checksum_len];
+                durable_replication_replay_outbox_key = outbox_key;
             };
         }
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.build_derived_ns, build_derived_start_ns);
@@ -13039,10 +13002,10 @@ pub const DB = struct {
             .{ .mode = .bulk_ingest, .defer_commit_flush = true }
         else
             .{};
-        var ha_applied_lsn_value_buf: [ha_applied_lsn_value_len]u8 = undefined;
-        if (opts.ha_applied_lsn_marker) |lsn| {
+        var replication_applied_lsn_value_buf: [replication_applied_lsn_value_len]u8 = undefined;
+        if (opts.replication_applied_lsn_marker) |lsn| {
             if (lsn != 0) {
-                try store_writes.append(self.alloc, haAppliedReplicationLsnWrite(lsn, &ha_applied_lsn_value_buf));
+                try store_writes.append(self.alloc, replicationAppliedSequenceWrite(lsn, &replication_applied_lsn_value_buf));
             }
         }
         var raft_applied_entry_value_buf: [raft_applied_entry_value_len]u8 = undefined;
@@ -13267,7 +13230,7 @@ pub const DB = struct {
         try delete_keys.appendSlice(self.alloc, opts.extra_store_deletes);
         if (index_stage) |*stage| {
             const effects = try stage.seal();
-            if (opts.transaction_resolution == null and !live_ha_apply and !scoped_restore_ha_apply) {
+            if (opts.transaction_resolution == null and !live_replication_apply and !scoped_restore_replication_apply) {
                 var forward_keys = std.ArrayListUnmanaged([]const u8).empty;
                 defer forward_keys.deinit(self.alloc);
                 for (effects.writes) |effect| if (relational_index_records.isForwardKey(effect.key))
@@ -13289,27 +13252,27 @@ pub const DB = struct {
         // Persist the exact committed payloads in the same backend batch so an
         // idempotent resolve retry can finish mirroring without reconstructing
         // data from already-deleted intents.
-        var transaction_ha_batch_payload: ?[]const u8 = null;
-        var transaction_ha_replay_payload: ?[]const u8 = null;
-        if (opts.transaction_resolution) |resolution| if (!opts.bypass_ha_write_gate and !scoped_restore_ha) {
-            if (self.ha_async_batch_mirror) |mirror| if (haMirrorSyncEnabled(mirror)) {
-                const payload = preencoded_ha_batch_payload orelse return error.HAMirrorUnavailable;
+        var transaction_replication_batch_payload: ?[]const u8 = null;
+        var transaction_replication_replay_payload: ?[]const u8 = null;
+        if (opts.transaction_resolution) |resolution| if (!opts.bypass_replication_write_gate and !scoped_restore_ha) {
+            if (self.replication_async_batch_mirror) |mirror| if (replicationMirrorSyncEnabled(mirror)) {
+                const payload = preencoded_replication_batch_payload orelse return error.HAMirrorUnavailable;
                 // The outbox borrows the request-owned buffer through commit
                 // and the HA wait; keep its original budgeted owner intact.
-                const key_array = transactions_mod.makeTransactionHABatchOutboxKey(resolution.txn_id);
+                const key_array = transactions_mod.makeTransactionReplicationBatchOutboxKey(resolution.txn_id);
                 const key = try self.alloc.dupe(u8, &key_array);
                 try owned_store_keys.append(self.alloc, key);
                 try store_writes.append(self.alloc, .{ .key = key, .value = payload });
-                transaction_ha_batch_payload = payload;
+                transaction_replication_batch_payload = payload;
             };
-            if (append_derived_replay) if (self.ha_async_effect_mirror) |mirror| if (haMirrorSyncEnabled(mirror)) {
+            if (append_derived_replay) if (self.replication_async_effect_mirror) |mirror| if (replicationMirrorSyncEnabled(mirror)) {
                 const payload = try self.alloc.dupe(u8, replay_payload);
                 try owned_store_values.append(self.alloc, payload);
-                const key_array = transactions_mod.makeTransactionHAReplayOutboxKey(resolution.txn_id);
+                const key_array = transactions_mod.makeTransactionReplicationReplayOutboxKey(resolution.txn_id);
                 const key = try self.alloc.dupe(u8, &key_array);
                 try owned_store_keys.append(self.alloc, key);
                 try store_writes.append(self.alloc, .{ .key = key, .value = payload });
-                transaction_ha_replay_payload = payload;
+                transaction_replication_replay_payload = payload;
             };
         };
         const replay_append: ?docstore_mod.DocStore.ReplayAppend = if (append_derived_replay)
@@ -13371,8 +13334,8 @@ pub const DB = struct {
             }
             break :blk outcome;
         } else blk: {
-            if (durable_ha_batch_outbox_key != null or durable_ha_replay_outbox_key != null)
-                self.durable_ha_outbox_maybe.store(true, .release);
+            if (durable_replication_batch_outbox_key != null or durable_replication_replay_outbox_key != null)
+                self.durable_replication_outbox_maybe.store(true, .release);
             try self.core.store.putBatchWithReplayAndParticipant(
                 self.backend_runtime.io(),
                 store_writes.items,
@@ -13381,7 +13344,7 @@ pub const DB = struct {
                 store_batch_options,
                 if (authored_acceptance.vectors.len != 0) authored_acceptance.participant() else null,
             );
-            schedule_ha_recovery_on_exit = durable_ha_batch_outbox_key != null or durable_ha_replay_outbox_key != null;
+            schedule_replication_recovery_on_exit = durable_replication_batch_outbox_key != null or durable_replication_replay_outbox_key != null;
             break :blk transactions_mod.ResolutionOutcome{ .applied = true, .replay_sequence = sequence };
         };
         if (graph_publication) |*lease| lease.release();
@@ -13396,23 +13359,23 @@ pub const DB = struct {
             persisted_range_start_owned = null;
             persisted_range_end_owned = null;
         }
-        var deferred_ha_gates = HADeferredCommitGates{};
-        defer deferred_ha_gates.releaseTransition();
-        if (!opts.bypass_ha_write_gate) {
-            var ha_ctx = self.batchContext();
-            deferred_ha_gates = HADeferredCommitGates.begin(haTransitionMutexFromContext(&ha_ctx));
-            if (transaction_ha_batch_payload) |payload| {
-                deferred_ha_gates.append(try appendHAEncodedBatchMutationCommitLockedContext(&ha_ctx, payload));
-            } else if (durable_ha_batch_payload) |payload| {
-                deferred_ha_gates.append(try appendHAEncodedBatchMutationCommitLockedContextStrict(&ha_ctx, payload, scoped_restore_ha));
-            } else if (preencoded_ha_batch_payload) |payload| {
-                deferred_ha_gates.append(try appendHAEncodedBatchMutationCommitLockedContext(&ha_ctx, payload));
-            } else deferred_ha_gates.append(try appendHABatchMutationCommitLockedContext(&ha_ctx, effective_req));
-            if (transaction_ha_replay_payload) |payload| {
-                deferred_ha_gates.append(try appendHAReplayPayloadCommitLockedContext(&ha_ctx, payload));
-            } else if (durable_ha_replay_payload) |payload| {
-                deferred_ha_gates.append(try appendHAReplayPayloadCommitLockedContext(&ha_ctx, payload));
-            } else if (append_derived_replay and !scoped_restore_ha) deferred_ha_gates.append(try appendHAReplayPayloadCommitLockedContext(&ha_ctx, replay_payload));
+        var deferred_replication_gates = ReplicationDeferredCommitGates{};
+        defer deferred_replication_gates.releaseTransition();
+        if (!opts.bypass_replication_write_gate) {
+            var replication_ctx = self.batchContext();
+            deferred_replication_gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(&replication_ctx));
+            if (transaction_replication_batch_payload) |payload| {
+                deferred_replication_gates.append(try appendReplicationEncodedBatchMutationCommitLockedContext(&replication_ctx, payload));
+            } else if (durable_replication_batch_payload) |payload| {
+                deferred_replication_gates.append(try appendReplicationEncodedBatchMutationCommitLockedContextStrict(&replication_ctx, payload, scoped_restore_ha));
+            } else if (preencoded_replication_batch_payload) |payload| {
+                deferred_replication_gates.append(try appendReplicationEncodedBatchMutationCommitLockedContext(&replication_ctx, payload));
+            } else deferred_replication_gates.append(try appendReplicationBatchMutationCommitLockedContext(&replication_ctx, effective_req));
+            if (transaction_replication_replay_payload) |payload| {
+                deferred_replication_gates.append(try appendReplicationReplayPayloadCommitLockedContext(&replication_ctx, payload));
+            } else if (durable_replication_replay_payload) |payload| {
+                deferred_replication_gates.append(try appendReplicationReplayPayloadCommitLockedContext(&replication_ctx, payload));
+            } else if (append_derived_replay and !scoped_restore_ha) deferred_replication_gates.append(try appendReplicationReplayPayloadCommitLockedContext(&replication_ctx, replay_payload));
         }
         if (opts.committed_batch_effects_observer) |observer| {
             try observer.observe(if (append_derived_replay) replay_payload else "");
@@ -13463,7 +13426,7 @@ pub const DB = struct {
                 sync_targets.target_identities,
                 sync_targets.target_scope_known,
             );
-        releaseHAMutationShared(&ha_mutation);
+        releaseReplicationMutationShared(&replication_mutation);
         if (builtin.is_test and opts.restore_staging != null and test_fail_restore_projection_apply) {
             test_fail_restore_projection_apply = false;
             return error.InjectedRestoreProjectionApplyFailure;
@@ -13477,10 +13440,10 @@ pub const DB = struct {
             notifyExecutorForSyncLevelWithDenseBulkDeferral(self.async_context, self.executor, effective_req.sync_level, sequence, sync_targets);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.executor_notify_ns, notify_executor_start_ns);
         }
-        if (!opts.bypass_ha_write_gate) {
-            const ha_ctx = self.batchContext();
-            try deferred_ha_gates.waitForDurabilityAndAuthority(ha_ctx.ha_write_gate);
-            if (opts.transaction_resolution != null or durable_ha_batch_payload != null or durable_ha_replay_payload != null) {
+        if (!opts.bypass_replication_write_gate) {
+            const replication_ctx = self.batchContext();
+            try deferred_replication_gates.waitForDurabilityAndAuthority(replication_ctx.replication_write_gate);
+            if (opts.transaction_resolution != null or durable_replication_batch_payload != null or durable_replication_replay_payload != null) {
                 // The outbox is cleared only after every appended record has
                 // satisfied durability and the final authority recheck. Keep
                 // the cleanup atomic with other local DB mutations without
@@ -13488,18 +13451,18 @@ pub const DB = struct {
                 lockApply(self);
                 defer self.core.unlockApply();
                 if (opts.transaction_resolution) |resolution| {
-                    if (transaction_ha_batch_payload != null)
-                        try self.core.clearTransactionHAOutbox(resolution.txn_id, .batch);
-                    if (transaction_ha_replay_payload != null)
-                        try self.core.clearTransactionHAOutbox(resolution.txn_id, .replay);
+                    if (transaction_replication_batch_payload != null)
+                        try self.core.clearTransactionReplicationOutbox(resolution.txn_id, .batch);
+                    if (transaction_replication_replay_payload != null)
+                        try self.core.clearTransactionReplicationOutbox(resolution.txn_id, .replay);
                 }
                 var durable_outbox_deletes: [2][]const u8 = undefined;
                 var durable_outbox_delete_count: usize = 0;
-                if (durable_ha_batch_outbox_key) |key| {
+                if (durable_replication_batch_outbox_key) |key| {
                     durable_outbox_deletes[durable_outbox_delete_count] = key;
                     durable_outbox_delete_count += 1;
                 }
-                if (durable_ha_replay_outbox_key) |key| {
+                if (durable_replication_replay_outbox_key) |key| {
                     durable_outbox_deletes[durable_outbox_delete_count] = key;
                     durable_outbox_delete_count += 1;
                 }
@@ -15803,9 +15766,9 @@ pub const DB = struct {
         update: types.DocumentArtifactChildRangePlacementUpdate,
     ) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         try self.executor.failIfUnhealthy();
 
         var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
@@ -15874,7 +15837,7 @@ pub const DB = struct {
             .sequence = sequence,
             .payload = replay_payload,
         });
-        self.mirrorHAReplayPayloadBestEffort(replay_payload);
+        self.mirrorReplicationReplayPayloadBestEffort(replay_payload);
         self.executor.commitBacklogAdmission(sequence, &backlog_admission);
         self.core.unlockApply();
         apply_mutex_held = false;
@@ -24812,9 +24775,9 @@ pub const DB = struct {
 
     pub fn updateRange(self: *DB, byte_range: types.ByteRange) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         {
@@ -24882,9 +24845,9 @@ pub const DB = struct {
 
     pub fn setSplitState(self: *DB, state: ?types.SplitState) !void {
         if (self.source_vectors.load(.acquire) != null) return error.VectorStoreLifecycleUnsupported;
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         if (state == null) {
@@ -24916,18 +24879,18 @@ pub const DB = struct {
     }
 
     pub fn setSplitDeltaFinalSeq(self: *DB, seq: u64) !void {
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         try self.core.saveSplitDeltaFinalSeq(seq);
     }
 
     pub fn clearSplitDeltaFinalSeq(self: *DB) !void {
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         try self.core.clearSplitDeltaFinalSeq();
@@ -25007,7 +24970,7 @@ pub const DB = struct {
         }, null, .{
             .validate_range_ownership = false,
             .wait_for_sync_level = false,
-            .bypass_ha_write_gate = true,
+            .bypass_replication_write_gate = true,
             .extra_store_writes = &.{range_write},
         });
         try self.refreshSplitBootstrapRangeInMemory(byte_range);
@@ -25035,7 +24998,7 @@ pub const DB = struct {
         }, null, .{
             .validate_range_ownership = false,
             .wait_for_sync_level = false,
-            .bypass_ha_write_gate = true,
+            .bypass_replication_write_gate = true,
         });
     }
 
@@ -25052,7 +25015,7 @@ pub const DB = struct {
         try self.batchInternal(.{ .sync_level = .write }, null, .{
             .validate_range_ownership = false,
             .wait_for_sync_level = false,
-            .bypass_ha_write_gate = true,
+            .bypass_replication_write_gate = true,
             .extra_store_writes = &.{range_write},
         });
         try self.refreshSplitBootstrapRangeInMemory(byte_range);
@@ -25166,7 +25129,7 @@ pub const DB = struct {
         }, null, .{
             .validate_range_ownership = false,
             .wait_for_sync_level = false,
-            .bypass_ha_write_gate = true,
+            .bypass_replication_write_gate = true,
             .extra_store_writes = &metadata_writes,
         }) catch |err| {
             if (try self.getSplitBootstrapMarker(alloc)) |committed| {
@@ -25236,7 +25199,7 @@ pub const DB = struct {
         try self.batchInternal(.{ .sync_level = .write }, null, .{
             .validate_range_ownership = false,
             .wait_for_sync_level = false,
-            .bypass_ha_write_gate = true,
+            .bypass_replication_write_gate = true,
             .extra_store_writes = &metadata_writes,
         });
         try self.refreshSplitBootstrapRangeInMemory(byte_range);
@@ -25302,18 +25265,18 @@ pub const DB = struct {
     }
 
     pub fn clearSplitDeltaEntries(self: *DB) !void {
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         try self.core.clearSplitDeltas();
     }
 
     pub fn createShadowIndexManager(self: *DB, split_key: []const u8, original_range_end: []const u8) !void {
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         if (self.shadow != null) return error.ShadowIndexManagerExists;
@@ -25357,9 +25320,9 @@ pub const DB = struct {
     }
 
     pub fn closeShadowIndexManager(self: *DB) !void {
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         try self.closeShadowIndexManagerLocked();
@@ -25404,9 +25367,9 @@ pub const DB = struct {
         prepare_only: bool,
     ) !void {
         if (self.source_vectors.load(.acquire) != null) return error.VectorStoreLifecycleUnsupported;
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
         defer snapshot_mutation.release();
         _ = dest_dir1;
@@ -25448,9 +25411,9 @@ pub const DB = struct {
     }
 
     pub fn finalizeSplit(self: *DB, new_range: types.ByteRange) !void {
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
         defer snapshot_mutation.release();
         try self.lockApplyForPortableRuntime();
@@ -25464,13 +25427,11 @@ pub const DB = struct {
         return try self.snapshotInternal(id, false, .none, null, null, false);
     }
 
-    /// Drain every durable replay/enrichment effect that a portable HA seed
-    /// must include before the runtime freezes its process-wide mutation
-    /// boundary. Seed capture calls this before taking that boundary: a
-    /// background enrichment completion may itself be a primary mutation and
-    /// therefore cannot make progress once the exclusive HA barrier is held.
+    /// Drain durable replay/enrichment effects before a caller freezes writes
+    /// for snapshot capture. Background completion can itself mutate storage,
+    /// so callers must drain before taking an exclusive mutation barrier.
     /// The deadline is in this DB's BackendRuntime.monotonicClock domain.
-    pub fn prepareHASeedSnapshot(self: *DB, deadline_ns: u64) !void {
+    pub fn drainSnapshotMaintenance(self: *DB, deadline_ns: u64) !void {
         while (true) {
             self.runMaintenanceUntilWithCancellation(
                 self.currentMaintenanceTargetSequence(),
@@ -25497,13 +25458,11 @@ pub const DB = struct {
         }
     }
 
-    /// Capture a portable seed with a bounded final maintenance verification.
-    /// The runtime has already drained maintenance before freezing writes, but
-    /// the deadline closes the race between that preflight and acquisition of
-    /// the global HA barrier. A raced follow-up fails retryably instead of
-    /// holding HA state/control traffic forever.
+    /// Capture a portable snapshot with bounded maintenance verification.
+    /// Callers drain maintenance before freezing writes; this deadline bounds
+    /// any follow-up work that raced with their capture barrier.
     /// The deadline is in this DB's BackendRuntime.monotonicClock domain.
-    pub fn snapshotHASeed(self: *DB, id: []const u8, maintenance_deadline_ns: u64) !u64 {
+    pub fn snapshotWithMaintenanceDeadline(self: *DB, id: []const u8, maintenance_deadline_ns: u64) !u64 {
         var row_policy_lease = try self.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
         return try self.snapshotInternal(id, false, .none, maintenance_deadline_ns, null, false);
@@ -26784,7 +26743,7 @@ pub const DB = struct {
         historical_table,
         /// Only the authenticated, whole-generation HA seed installer supplies
         /// this identity. Never derived from a request or OpenOptions flag.
-        coherent_ha_seed: doc_identity.Namespace,
+        replica_snapshot: doc_identity.Namespace,
     };
 
     fn restoreSnapshotStoreTo(
@@ -26874,7 +26833,7 @@ pub const DB = struct {
             defer catalog.deinit();
             if (@import("relational_integrity_activation.zig").hasActive(catalog)) switch (purpose) {
                 .historical_table => return error.CoordinatedConstraintRestoreRequired,
-                .coherent_ha_seed => |expected_namespace| {
+                .replica_snapshot => |expected_namespace| {
                     const stored_namespace = (try doc_identity.loadNamespaceFromStore(&opened_primary.store)) orelse return error.IdentityNamespaceMismatch;
                     if (!stored_namespace.eql(expected_namespace)) return error.IdentityNamespaceMismatch;
                     const incarnation = try @import("relational_integrity_catalog.zig").incarnationFromTableId(expected_namespace.table_id);
@@ -26967,11 +26926,11 @@ pub const DB = struct {
         try restoreSnapshotTo(alloc, snapshot_root, path, staged_opts);
     }
 
-    /// Internal HA seed installation only. The caller must have authenticated
-    /// the complete seed topology and every replica artifact before invoking
-    /// this entry point, and must publish the whole seed before serving reads.
+    /// Install an authenticated replica snapshot into a staged local generation. The caller must have authenticated
+    /// the complete source manifest and every replica artifact before invoking
+    /// this entry point, and must publish the complete generation before serving reads.
     /// Historical table restore APIs deliberately cannot select this purpose.
-    pub fn restoreCoherentHASeedReplicaToStagedGeneration(
+    pub fn restoreAuthenticatedReplicaToStagedGeneration(
         staged_generation: *const generation_lifecycle.StagedGeneration,
         alloc: Allocator,
         snapshot_root: []const u8,
@@ -26985,7 +26944,7 @@ pub const DB = struct {
             return error.IdentityNamespaceMismatch;
         var staged_opts = opts;
         staged_opts.staged_generation = staged_generation;
-        try restoreSnapshotStoreTo(alloc, snapshot_root, path, staged_opts, null, null, .none, null, .{ .coherent_ha_seed = expected_namespace });
+        try restoreSnapshotStoreTo(alloc, snapshot_root, path, staged_opts, null, null, .none, null, .{ .replica_snapshot = expected_namespace });
         try finishSnapshotRuntimeRepair(alloc, path, staged_opts);
     }
 
@@ -27014,7 +26973,7 @@ pub const DB = struct {
         if (native_generation) |*manifest| {
             if (std.mem.eql(u8, manifest.value().primary.artifact_format, "antfly-lsm-checkpoint")) source_opts.primary_backend = .{ .lsm = .{} };
         }
-        try restoreSnapshotStoreTo(alloc, snapshot_root, path, source_opts, null, io, cancellation, if (native_generation) |*manifest| manifest.value() else null, .{ .coherent_ha_seed = expected_namespace });
+        try restoreSnapshotStoreTo(alloc, snapshot_root, path, source_opts, null, io, cancellation, if (native_generation) |*manifest| manifest.value() else null, .{ .replica_snapshot = expected_namespace });
         source_opts.open_mode = .query_readonly;
         source_opts.primary_only_readonly = true;
         return try DB.open(alloc, path, source_opts);
@@ -28314,8 +28273,8 @@ pub const DB = struct {
         if (self.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         var row_policy_lease = try self.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
-        var schedule_ha_recovery_on_exit = false;
-        defer if (schedule_ha_recovery_on_exit) self.scheduleDurableHAOutboxRecovery();
+        var schedule_replication_recovery_on_exit = false;
+        defer if (schedule_replication_recovery_on_exit) self.scheduleDurableReplicationOutboxRecovery();
         var prepared_recovery = if (self.transaction_recovery_identity_context != null)
             try db_core.PreparedRecoveryRelationalState.init(
                 self.runtime_alloc,
@@ -28326,32 +28285,32 @@ pub const DB = struct {
             null;
         defer if (prepared_recovery) |*prepared| prepared.deinit();
 
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.ensureDurableHAStartupBarrier();
-        try self.enforceHAWriteGate();
-        try self.preflightHAMetadataSyncCommit();
-        const durable_ha_schema_payload = if (self.ha_async_metadata_mirror) |mirror|
-            if (haMirrorRequiresDurableOutbox(mirror)) try ha_effects_mod.encodeSchemaMetadataMutationAlloc(self.alloc, table_schema, null) else null
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.ensureDurableReplicationStartupBarrier();
+        try self.enforceReplicationWriteGate();
+        try self.preflightReplicationMetadataSyncCommit();
+        const durable_replication_schema_payload = if (self.replication_async_metadata_mirror) |mirror|
+            if (replicationMirrorRequiresDurableOutbox(mirror)) try replication_effects_mod.encodeSchemaMetadataMutationAlloc(self.alloc, table_schema, null) else null
         else
             null;
-        defer if (durable_ha_schema_payload) |payload| self.alloc.free(payload);
-        const durable_ha_schema_lsn = if (durable_ha_schema_payload != null)
-            self.ha_async_metadata_mirror.?.publisher.nextLsn()
+        defer if (durable_replication_schema_payload) |payload| self.alloc.free(payload);
+        const durable_replication_schema_lsn = if (durable_replication_schema_payload != null)
+            self.replication_async_metadata_mirror.?.publisher.nextLsn()
         else
             null;
-        const durable_ha_schema_outbox = if (durable_ha_schema_payload) |payload|
-            try encodeDurableHAOutboxAlloc(self.alloc, durable_ha_schema_lsn.?, payload)
+        const durable_replication_schema_outbox = if (durable_replication_schema_payload) |payload|
+            try encodeDurableReplicationOutboxAlloc(self.alloc, durable_replication_schema_lsn.?, payload)
         else
             null;
-        defer if (durable_ha_schema_outbox) |outbox| self.alloc.free(outbox);
-        const durable_ha_schema_outbox_key = if (durable_ha_schema_outbox != null)
-            try durableHAOutboxKeyAlloc(self.alloc, .schema, durable_ha_schema_lsn.?, self.core.root_generation, durable_ha_schema_payload.?)
+        defer if (durable_replication_schema_outbox) |outbox| self.alloc.free(outbox);
+        const durable_replication_schema_outbox_key = if (durable_replication_schema_outbox != null)
+            try durableReplicationOutboxKeyAlloc(self.alloc, .schema, durable_replication_schema_lsn.?, self.core.root_generation, durable_replication_schema_payload.?)
         else
             null;
-        defer if (durable_ha_schema_outbox_key) |key| self.alloc.free(key);
-        const schema_metadata_writes: []const docstore_mod.KVPair = if (durable_ha_schema_outbox) |outbox|
-            &.{.{ .key = durable_ha_schema_outbox_key.?, .value = outbox }}
+        defer if (durable_replication_schema_outbox_key) |key| self.alloc.free(key);
+        const schema_metadata_writes: []const docstore_mod.KVPair = if (durable_replication_schema_outbox) |outbox|
+            &.{.{ .key = durable_replication_schema_outbox_key.?, .value = outbox }}
         else
             &.{};
         var prepared_schema = try self.core.prepareSchemaMetadata(table_schema, schema_metadata_writes);
@@ -28360,45 +28319,45 @@ pub const DB = struct {
         var apply_held = true;
         errdefer if (apply_held) self.core.unlockApply();
         if (self.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
-        if (self.async_context.primary_ha_append_pending.load(.acquire)) return error.HAMirrorUnavailable;
+        if (self.async_context.primary_replication_append_pending.load(.acquire)) return error.HAMirrorUnavailable;
         try self.enforceVectorMigrationConfigurationGate();
         const reconciled_row_count = try self.validateStorageModeCompatibilityLocked(table_schema);
-        if (durable_ha_schema_outbox_key != null) self.durable_ha_outbox_maybe.store(true, .release);
+        if (durable_replication_schema_outbox_key != null) self.durable_replication_outbox_maybe.store(true, .release);
         _ = try self.core.commitPreparedSchemaMetadata(
             &prepared_schema,
             schema_metadata_writes,
             &.{public_schema_json_key},
             reconciled_row_count,
         );
-        schedule_ha_recovery_on_exit = durable_ha_schema_outbox_key != null;
+        schedule_replication_recovery_on_exit = durable_replication_schema_outbox_key != null;
         self.publishRelationalRuntimeModePrepared(if (prepared_recovery) |*prepared| prepared else null);
 
         var ctx = self.batchContext();
-        var deferred_ha_gates = HADeferredCommitGates.begin(haTransitionMutexFromContext(&ctx));
-        defer deferred_ha_gates.releaseTransition();
+        var deferred_replication_gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(&ctx));
+        defer deferred_replication_gates.releaseTransition();
         var post_commit_error: ?anyerror = null;
-        if (durable_ha_schema_payload) |payload|
-            deferred_ha_gates.append(appendHAEncodedSchemaMetadataCommitLockedContext(&ctx, payload) catch |err| blk: {
+        if (durable_replication_schema_payload) |payload|
+            deferred_replication_gates.append(appendReplicationEncodedSchemaMetadataCommitLockedContext(&ctx, payload) catch |err| blk: {
                 post_commit_error = err;
                 break :blk null;
             })
         else
-            deferred_ha_gates.append(appendHASchemaMetadataCommitLockedContext(&ctx, table_schema, null) catch |err| blk: {
+            deferred_replication_gates.append(appendReplicationSchemaMetadataCommitLockedContext(&ctx, table_schema, null) catch |err| blk: {
                 post_commit_error = err;
                 break :blk null;
             });
         self.core.unlockApply();
         apply_held = false;
-        releaseHAMutationShared(&ha_mutation);
+        releaseReplicationMutationShared(&replication_mutation);
         if (post_commit_error == null) {
-            deferred_ha_gates.waitForDurabilityAndAuthority(ctx.ha_write_gate) catch |err| {
+            deferred_replication_gates.waitForDurabilityAndAuthority(ctx.replication_write_gate) catch |err| {
                 post_commit_error = err;
             };
         } else {
-            deferred_ha_gates.releaseTransition();
+            deferred_replication_gates.releaseTransition();
         }
-        if (post_commit_error == null) if (durable_ha_schema_outbox_key) |key| {
-            self.clearDurableHAOutbox(key) catch |err| std.log.warn(
+        if (post_commit_error == null) if (durable_replication_schema_outbox_key) |key| {
+            self.clearDurableReplicationOutbox(key) catch |err| std.log.warn(
                 "schema HA durability acknowledged but outbox cleanup is pending path={s} version={d} err={s}",
                 .{ self.core.path, table_schema.version, @errorName(err) },
             );
@@ -28631,7 +28590,7 @@ pub const DB = struct {
     /// after a durable metadata decision. The hidden record and schema share
     /// one write; Raft owners also persist the Raft marker, while native
     /// owners use the record itself as their exact durable operation receipt.
-    pub fn provisionInitialHiddenChild(self: *DB, schema_json: []const u8, input: InitialHiddenChild, ha_lsn: ?u64, ha_payload: ?[]const u8) !void {
+    pub fn provisionInitialHiddenChild(self: *DB, schema_json: []const u8, input: InitialHiddenChild, replication_lsn: ?u64, replication_payload: ?[]const u8) !void {
         const hidden = @import("relational_initial_child_publication.zig");
         if (self.initial_child_bootstrap) |bootstrap| {
             if (!std.mem.eql(u8, &bootstrap.plan_id, &input.plan_id) or
@@ -28646,7 +28605,7 @@ pub const DB = struct {
             input.child_table_name.len == 0 or input.child_table_name.len > 256 or
             !std.unicode.utf8ValidateSlice(input.child_table_name) or
             std.mem.allEqual(u8, &input.plan_id, 0) or std.mem.allEqual(u8, &input.plan_digest, 0) or
-            (ha_lsn != null and ha_payload != null))
+            (replication_lsn != null and replication_payload != null))
             return error.InvalidInitialChildPublication;
         const replay = if (input.native)
             try self.core.getStoreValue(self.alloc, hidden.key)
@@ -28665,7 +28624,7 @@ pub const DB = struct {
                 !std.mem.eql(u8, &prior.catalog_digest, &input.catalog_digest) or
                 prior.provision_term != input.raft_entry.term or prior.provision_index != input.raft_entry.index)
                 return error.InitialChildPublicationChanged;
-            if (ha_lsn) |lsn| try self.markHAReplicationRecordApplied(lsn);
+            if (replication_lsn) |lsn| try self.recordReplicationApplied(lsn);
             return;
         }
         var public_digest: [32]u8 = undefined;
@@ -28740,23 +28699,23 @@ pub const DB = struct {
             writes[write_count] = .{ .key = key, .value = try scope.encode(self_alloc) };
             write_count += 1;
         }
-        var ha_lsn_buffer: [ha_applied_lsn_value_len]u8 = undefined;
-        if (ha_lsn) |lsn| {
-            writes[write_count] = haAppliedReplicationLsnWrite(lsn, &ha_lsn_buffer);
+        var replication_lsn_buffer: [replication_applied_lsn_value_len]u8 = undefined;
+        if (replication_lsn) |lsn| {
+            writes[write_count] = replicationAppliedSequenceWrite(lsn, &replication_lsn_buffer);
             write_count += 1;
         }
-        const ha_outbox = if (ha_payload) |payload| blk: {
-            const mirror = self.ha_async_batch_mirror orelse return error.HAMirrorUnavailable;
+        const replication_outbox = if (replication_payload) |payload| blk: {
+            const mirror = self.replication_async_batch_mirror orelse return error.HAMirrorUnavailable;
             const from_lsn = mirror.publisher.nextLsn();
-            const encoded = try encodeDurableHAOutboxAlloc(self.alloc, from_lsn, payload);
-            const key = try durableHAOutboxKeyAlloc(self.alloc, .restore_batch, from_lsn, self.core.root_generation, payload);
+            const encoded = try encodeDurableReplicationOutboxAlloc(self.alloc, from_lsn, payload);
+            const key = try durableReplicationOutboxKeyAlloc(self.alloc, .restore_batch, from_lsn, self.core.root_generation, payload);
             break :blk .{ .key = key, .value = encoded };
         } else null;
-        defer if (ha_outbox) |outbox| {
+        defer if (replication_outbox) |outbox| {
             self.alloc.free(outbox.key);
             self.alloc.free(outbox.value);
         };
-        if (ha_outbox) |outbox| {
+        if (replication_outbox) |outbox| {
             writes[write_count] = .{ .key = outbox.key, .value = outbox.value };
             write_count += 1;
         }
@@ -28827,7 +28786,7 @@ pub const DB = struct {
         const row_count = try self.validateStorageModeCompatibilityLocked(runtime_schema);
         if (row_count != null and row_count.? != 0) return error.InitialChildPublicationChanged;
         _ = try self.core.commitPreparedSchemaMetadata(&prepared, writes[0..write_count], &.{}, row_count);
-        if (ha_outbox != null) self.durable_ha_outbox_maybe.store(true, .release);
+        if (replication_outbox != null) self.durable_replication_outbox_maybe.store(true, .release);
         self.initial_child_hidden.store(true, .release);
         self.publishRelationalRuntimeModePrepared(if (prepared_recovery) |*state| state else null);
         self.core.unlockApply();
@@ -28835,12 +28794,12 @@ pub const DB = struct {
         self.reconcilePublishedSchemaIndexes(runtime_schema.version);
     }
 
-    fn applyInitialChildPhase(self: *DB, fence: @import("relational_integrity_topology_contract.zig").Fence, control: @import("relational_integrity_topology_contract.zig").InitialChildControl, phase: @import("relational_initial_child_publication.zig").Phase, entry: RaftAppliedEntryIdentity, native: bool, ha_lsn: ?u64, ha_payload: ?[]const u8) !void {
+    fn applyInitialChildPhase(self: *DB, fence: @import("relational_integrity_topology_contract.zig").Fence, control: @import("relational_integrity_topology_contract.zig").InitialChildControl, phase: @import("relational_initial_child_publication.zig").Phase, entry: RaftAppliedEntryIdentity, native: bool, replication_lsn: ?u64, replication_payload: ?[]const u8) !void {
         const hidden = @import("relational_initial_child_publication.zig");
         if (fence.role != .child_generation_source or !fence.namespace.eql(self.core.identity_namespace) or
             std.mem.allEqual(u8, &control.plan_id, 0) or std.mem.allEqual(u8, &control.plan_digest, 0) or
             !std.mem.eql(u8, &control.catalog_digest, &fence.catalog_digest) or
-            phase == .hidden or (ha_lsn != null and ha_payload != null)) return error.InvalidInitialChildPublication;
+            phase == .hidden or (replication_lsn != null and replication_payload != null)) return error.InvalidInitialChildPublication;
         const replay = if (native)
             try self.core.getStoreValue(self.alloc, hidden.key)
         else if (try self.raftEntryAlreadyApplied(entry))
@@ -28859,7 +28818,7 @@ pub const DB = struct {
                 return error.InitialChildPublicationChanged;
             if (prior.phase == phase) {
                 if (prior.phase_term != entry.term or prior.phase_index != entry.index) return error.InitialChildPublicationChanged;
-                if (ha_lsn) |lsn| try self.markHAReplicationRecordApplied(lsn);
+                if (replication_lsn) |lsn| try self.recordReplicationApplied(lsn);
                 return;
             }
             if (!native or prior.phase != .hidden) return error.InitialChildPublicationChanged;
@@ -28897,12 +28856,12 @@ pub const DB = struct {
                 const marker = raftAppliedEntryWrite(entry, &marker_buf);
                 try txn.put(marker.key, marker.value);
             }
-            if (ha_lsn) |lsn| {
-                var lsn_buf: [ha_applied_lsn_value_len]u8 = undefined;
-                const lsn_marker = haAppliedReplicationLsnWrite(lsn, &lsn_buf);
+            if (replication_lsn) |lsn| {
+                var lsn_buf: [replication_applied_lsn_value_len]u8 = undefined;
+                const lsn_marker = replicationAppliedSequenceWrite(lsn, &lsn_buf);
                 try txn.put(lsn_marker.key, lsn_marker.value);
             }
-            try self.stageRestoreStagingHAOutbox(&txn, ha_payload);
+            try self.stageRestoreStagingReplicationOutbox(&txn, replication_payload);
             try txn.commit();
             self.initial_child_hidden.store(true, .release);
             return;
@@ -28927,12 +28886,12 @@ pub const DB = struct {
                 const marker = raftAppliedEntryWrite(entry, &marker_buf);
                 try txn.put(marker.key, marker.value);
             }
-            if (ha_lsn) |lsn| {
-                var lsn_buf: [ha_applied_lsn_value_len]u8 = undefined;
-                const lsn_marker = haAppliedReplicationLsnWrite(lsn, &lsn_buf);
+            if (replication_lsn) |lsn| {
+                var lsn_buf: [replication_applied_lsn_value_len]u8 = undefined;
+                const lsn_marker = replicationAppliedSequenceWrite(lsn, &lsn_buf);
                 try txn.put(lsn_marker.key, lsn_marker.value);
             }
-            try self.stageRestoreStagingHAOutbox(&txn, ha_payload);
+            try self.stageRestoreStagingReplicationOutbox(&txn, replication_payload);
             try txn.commit();
             return;
         }
@@ -28975,12 +28934,12 @@ pub const DB = struct {
             const marker = raftAppliedEntryWrite(entry, &marker_buf);
             try txn.put(marker.key, marker.value);
         }
-        if (ha_lsn) |lsn| {
-            var lsn_buf: [ha_applied_lsn_value_len]u8 = undefined;
-            const lsn_marker = haAppliedReplicationLsnWrite(lsn, &lsn_buf);
+        if (replication_lsn) |lsn| {
+            var lsn_buf: [replication_applied_lsn_value_len]u8 = undefined;
+            const lsn_marker = replicationAppliedSequenceWrite(lsn, &lsn_buf);
             try txn.put(lsn_marker.key, lsn_marker.value);
         }
-        try self.stageRestoreStagingHAOutbox(&txn, ha_payload);
+        try self.stageRestoreStagingReplicationOutbox(&txn, replication_payload);
         try txn.commit();
         if (phase == .released) self.initial_child_hidden.store(false, .release);
     }
@@ -29032,8 +28991,8 @@ pub const DB = struct {
         if (self.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         var row_policy_lease = try self.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
-        var schedule_ha_recovery_on_exit = false;
-        defer if (schedule_ha_recovery_on_exit) self.scheduleDurableHAOutboxRecovery();
+        var schedule_replication_recovery_on_exit = false;
+        defer if (schedule_replication_recovery_on_exit) self.scheduleDurableReplicationOutboxRecovery();
         _ = alloc;
         var parsed_schema = try public_table_schema.parseValidatedTableSchema(self.alloc, schema_json);
         defer parsed_schema.deinit(self.alloc);
@@ -29049,14 +29008,14 @@ pub const DB = struct {
             null;
         defer if (prepared_recovery) |*prepared| prepared.deinit();
 
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.ensureDurableHAStartupBarrier();
-        try self.enforceHAWriteGate();
-        try self.preflightHAMetadataSyncCommit();
-        const ha_schema_payload = if (self.ha_async_metadata_mirror) |mirror|
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.ensureDurableReplicationStartupBarrier();
+        try self.enforceReplicationWriteGate();
+        try self.preflightReplicationMetadataSyncCommit();
+        const replication_schema_payload = if (self.replication_async_metadata_mirror) |mirror|
             if (publication) |published|
-                try ha_effects_mod.encodePublishedChildSchemaMetadataMutationAlloc(self.alloc, runtime_schema, schema_json, .{
+                try replication_effects_mod.encodePublishedChildSchemaMetadataMutationAlloc(self.alloc, runtime_schema, schema_json, .{
                     .fence = published.fence,
                     .before_schema_json_digest = published.before_schema_json_digest,
                     .schema_json_digest = published.schema_json_digest,
@@ -29065,39 +29024,39 @@ pub const DB = struct {
                     .applied_term = published.raft_entry.term,
                     .applied_index = published.raft_entry.index,
                 })
-            else if (haMirrorRequiresDurableOutbox(mirror))
-                try ha_effects_mod.encodeSchemaMetadataMutationAlloc(self.alloc, runtime_schema, schema_json)
+            else if (replicationMirrorRequiresDurableOutbox(mirror))
+                try replication_effects_mod.encodeSchemaMetadataMutationAlloc(self.alloc, runtime_schema, schema_json)
             else
                 null
         else
             null;
-        defer if (ha_schema_payload) |payload| self.alloc.free(payload);
-        const durable_ha_schema_payload = if (self.ha_async_metadata_mirror) |mirror|
-            if (haMirrorRequiresDurableOutbox(mirror)) ha_schema_payload else null
+        defer if (replication_schema_payload) |payload| self.alloc.free(payload);
+        const durable_replication_schema_payload = if (self.replication_async_metadata_mirror) |mirror|
+            if (replicationMirrorRequiresDurableOutbox(mirror)) replication_schema_payload else null
         else
             null;
-        const durable_ha_schema_lsn = if (durable_ha_schema_payload != null)
-            self.ha_async_metadata_mirror.?.publisher.nextLsn()
+        const durable_replication_schema_lsn = if (durable_replication_schema_payload != null)
+            self.replication_async_metadata_mirror.?.publisher.nextLsn()
         else
             null;
-        const durable_ha_schema_outbox = if (durable_ha_schema_payload) |payload|
-            try encodeDurableHAOutboxAlloc(self.alloc, durable_ha_schema_lsn.?, payload)
+        const durable_replication_schema_outbox = if (durable_replication_schema_payload) |payload|
+            try encodeDurableReplicationOutboxAlloc(self.alloc, durable_replication_schema_lsn.?, payload)
         else
             null;
-        defer if (durable_ha_schema_outbox) |outbox| self.alloc.free(outbox);
-        const durable_ha_schema_outbox_key = if (durable_ha_schema_outbox != null)
-            try durableHAOutboxKeyAlloc(self.alloc, .schema, durable_ha_schema_lsn.?, self.core.root_generation, durable_ha_schema_payload.?)
+        defer if (durable_replication_schema_outbox) |outbox| self.alloc.free(outbox);
+        const durable_replication_schema_outbox_key = if (durable_replication_schema_outbox != null)
+            try durableReplicationOutboxKeyAlloc(self.alloc, .schema, durable_replication_schema_lsn.?, self.core.root_generation, durable_replication_schema_payload.?)
         else
             null;
-        defer if (durable_ha_schema_outbox_key) |key| self.alloc.free(key);
+        defer if (durable_replication_schema_outbox_key) |key| self.alloc.free(key);
         const versioned_public_key = try public_table_schema.versionedSchemaKeyAlloc(self.alloc, runtime_schema.version);
         defer self.alloc.free(versioned_public_key);
         var schema_metadata_writes: [5]docstore_mod.KVPair = undefined;
         var schema_metadata_write_count: usize = 2;
         schema_metadata_writes[0] = .{ .key = public_schema_json_key, .value = schema_json };
         schema_metadata_writes[1] = .{ .key = versioned_public_key, .value = schema_json };
-        if (durable_ha_schema_outbox) |outbox| {
-            schema_metadata_writes[2] = .{ .key = durable_ha_schema_outbox_key.?, .value = outbox };
+        if (durable_replication_schema_outbox) |outbox| {
+            schema_metadata_writes[2] = .{ .key = durable_replication_schema_outbox_key.?, .value = outbox };
             schema_metadata_write_count = 3;
         }
         var raft_marker_buffer: [raft_applied_entry_value_len]u8 = undefined;
@@ -29147,9 +29106,9 @@ pub const DB = struct {
             std.crypto.hash.Blake3.hash(existing_schema, &before_schema_digest, .{});
             if (!std.mem.eql(u8, &before_schema_digest, &published.before_schema_json_digest)) return error.IntegrityCatalogChanged;
         }
-        try self.enforceHAWriteGate();
+        try self.enforceReplicationWriteGate();
         const reconciled_row_count = try self.validateStorageModeCompatibilityLocked(runtime_schema);
-        if (durable_ha_schema_outbox_key != null) self.durable_ha_outbox_maybe.store(true, .release);
+        if (durable_replication_schema_outbox_key != null) self.durable_replication_outbox_maybe.store(true, .release);
         _ = if (publication) |published|
             try self.core.commitPreparedSchemaMetadataPublishedChild(
                 &prepared_schema,
@@ -29165,35 +29124,35 @@ pub const DB = struct {
                 &.{},
                 reconciled_row_count,
             );
-        schedule_ha_recovery_on_exit = durable_ha_schema_outbox_key != null;
+        schedule_replication_recovery_on_exit = durable_replication_schema_outbox_key != null;
         self.publishRelationalRuntimeModePrepared(if (prepared_recovery) |*prepared| prepared else null);
 
         var ctx = self.batchContext();
-        var deferred_ha_gates = HADeferredCommitGates.begin(haTransitionMutexFromContext(&ctx));
-        defer deferred_ha_gates.releaseTransition();
+        var deferred_replication_gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(&ctx));
+        defer deferred_replication_gates.releaseTransition();
         var post_commit_error: ?anyerror = null;
-        if (ha_schema_payload) |payload|
-            deferred_ha_gates.append(appendHAEncodedSchemaMetadataCommitLockedContext(&ctx, payload) catch |err| blk: {
+        if (replication_schema_payload) |payload|
+            deferred_replication_gates.append(appendReplicationEncodedSchemaMetadataCommitLockedContext(&ctx, payload) catch |err| blk: {
                 post_commit_error = err;
                 break :blk null;
             })
         else
-            deferred_ha_gates.append(appendHASchemaMetadataCommitLockedContext(&ctx, runtime_schema, schema_json) catch |err| blk: {
+            deferred_replication_gates.append(appendReplicationSchemaMetadataCommitLockedContext(&ctx, runtime_schema, schema_json) catch |err| blk: {
                 post_commit_error = err;
                 break :blk null;
             });
         self.core.unlockApply();
         apply_held = false;
-        releaseHAMutationShared(&ha_mutation);
+        releaseReplicationMutationShared(&replication_mutation);
         if (post_commit_error == null) {
-            deferred_ha_gates.waitForDurabilityAndAuthority(ctx.ha_write_gate) catch |err| {
+            deferred_replication_gates.waitForDurabilityAndAuthority(ctx.replication_write_gate) catch |err| {
                 post_commit_error = err;
             };
         } else {
-            deferred_ha_gates.releaseTransition();
+            deferred_replication_gates.releaseTransition();
         }
-        if (post_commit_error == null) if (durable_ha_schema_outbox_key) |key| {
-            self.clearDurableHAOutbox(key) catch |err| std.log.warn(
+        if (post_commit_error == null) if (durable_replication_schema_outbox_key) |key| {
+            self.clearDurableReplicationOutbox(key) catch |err| std.log.warn(
                 "schema HA durability acknowledged but outbox cleanup is pending path={s} version={d} err={s}",
                 .{ self.core.path, runtime_schema.version, @errorName(err) },
             );
@@ -29254,9 +29213,9 @@ pub const DB = struct {
     ) !transactions_mod.TxnId {
         var row_policy_lease = try self.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         if (self.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
@@ -29301,9 +29260,9 @@ pub const DB = struct {
     pub fn beginTransactionScoped(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, scope: ?[32]u8) !transactions_mod.TxnId {
         var row_policy_lease = try self.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         if (self.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
@@ -29368,9 +29327,9 @@ pub const DB = struct {
         predicates: []const transactions_mod.VersionPredicate,
     ) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         var preparation: RequestPreparationContext = undefined;
         preparation.init(self);
         defer preparation.deinit();
@@ -29443,9 +29402,9 @@ pub const DB = struct {
     pub fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) !void {
         if (self.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         try self.writeTransactionInternal(txn_id, req, null);
     }
 
@@ -29582,7 +29541,7 @@ pub const DB = struct {
         // These internal observations address this exact owner's metadata,
         // never document keyspace. The coordinator routes them by owner fence.
         const tracking = @import("../range_protection.zig");
-        if (req.range_guards.len > @import("../../api/range_read_guards.zig").max_proofs) return error.TransactionTooLarge;
+        if (req.range_guards.len > @import("../range_protection.zig").max_proofs) return error.TransactionTooLarge;
         const range_keys = try preparation_alloc.alloc([tracking.counter_prefix.len + 2]u8, req.range_guards.len);
         defer preparation_alloc.free(range_keys);
         const index_range_keys = try preparation_alloc.alloc([tracking.index_counter_prefix.len + tracking.index_span_digest_bytes]u8, req.range_guards.len);
@@ -30237,12 +30196,12 @@ pub const DB = struct {
         var staging_progress = if (self.restore_staging_required.load(.acquire)) try self.restoreStagingStatus(alloc) else null;
         defer if (staging_progress) |*progress| progress.deinit();
         const restore_scope: ?[32]u8 = if (staging_progress) |progress| progress.value.scope.digest() else null;
-        const mirror_scoped_restore = restore_scope != null and self.ha_async_batch_mirror != null;
+        const mirror_scoped_restore = restore_scope != null and self.replication_async_batch_mirror != null;
         const bypass_ha = raft_entry != null and !mirror_scoped_restore;
-        var ha_mutation = if (!bypass_ha) self.acquireHAMutationShared() else null;
-        defer if (ha_mutation) |*lease| lease.release();
-        if (!bypass_ha) try self.enforceHAWriteGate();
-        if (mirror_scoped_restore) try self.flushDurableHAOutboxes();
+        var replication_mutation = if (!bypass_ha) self.acquireReplicationMutationShared() else null;
+        defer if (replication_mutation) |*lease| lease.release();
+        if (!bypass_ha) try self.enforceReplicationWriteGate();
+        if (mirror_scoped_restore) try self.flushDurableReplicationOutboxes();
         if (status != .committed) {
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
@@ -30312,7 +30271,7 @@ pub const DB = struct {
                     return err;
                 };
                 self.core.unlockApply();
-                try self.flushTransactionHAOutbox(txn_id);
+                try self.flushTransactionReplicationOutbox(txn_id);
                 try self.waitForResolvedTransactionSyncWithCancellation(sync_level, outcome.replay_sequence, visibility_cancellation);
                 return;
             }
@@ -30333,7 +30292,7 @@ pub const DB = struct {
                 .restore_staging_scope = restore_scope,
             }, null, .{
                 .visibility_cancellation = visibility_cancellation,
-                .bypass_ha_write_gate = bypass_ha,
+                .bypass_replication_write_gate = bypass_ha,
                 .raft_applied_entry_marker = raft_entry,
                 .durable_rows = &durable_rows,
                 .transaction_resolution = .{
@@ -30760,7 +30719,7 @@ pub const DB = struct {
         command: @import("relational_integrity_topology.zig").Command,
         raft_entry: ?RaftAppliedEntryIdentity,
     ) !void {
-        return self.applyRelationalTopologyControlWithHA(command, raft_entry, null, null, null, null);
+        return self.applyRelationalTopologyControlWithReplication(command, raft_entry, null, null, null, null);
     }
 
     /// Internal source-retention controls share the lifecycle transaction path:
@@ -30777,13 +30736,13 @@ pub const DB = struct {
             error.OnlineSourcePinPending => {}, // Repair this exact prepared cut below.
             else => return err,
         };
-        var ha_mutation = if (opts.bypass_ha_write_gate) null else self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        if (!opts.bypass_ha_write_gate) {
-            try self.enforceHAWriteGate();
-            try self.ensureDurableHAStartupBarrier();
-            try self.flushDurableHAOutboxes();
-            try self.preflightHABatchSyncCommit();
+        var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        if (!opts.bypass_replication_write_gate) {
+            try self.enforceReplicationWriteGate();
+            try self.ensureDurableReplicationStartupBarrier();
+            try self.flushDurableReplicationOutboxes();
+            try self.preflightReplicationBatchSyncCommit();
         }
         var applied_index = if (opts.raft_applied_entry_marker) |entry| entry.index else opts.online_source_applied_index orelse 0;
         var payload: ?[]u8 = null;
@@ -30908,20 +30867,20 @@ pub const DB = struct {
             }
             try @import("online_source.zig").stage(&txn, command, applied_index);
             if (req.artifact_catalog) |install| try @import("artifact_reconcile_intent.zig").clear(self.alloc, &txn, install, applied_index);
-            if (!opts.bypass_ha_write_gate and self.ha_async_batch_mirror != null)
-                payload = if (req.artifact_catalog != null) try ha_effects_mod.encodeArtifactCatalogMutationRequestAlloc(self.alloc, req, opts.raft_applied_entry_marker orelse return error.InvalidArtifactCatalogCommand) else try ha_effects_mod.encodeOnlineSourceMutationRequestAlloc(self.alloc, req, applied_index);
+            if (!opts.bypass_replication_write_gate and self.replication_async_batch_mirror != null)
+                payload = if (req.artifact_catalog != null) try replication_effects_mod.encodeArtifactCatalogMutationRequestAlloc(self.alloc, req, opts.raft_applied_entry_marker orelse return error.InvalidArtifactCatalogCommand) else try replication_effects_mod.encodeOnlineSourceMutationRequestAlloc(self.alloc, req, applied_index);
             for (opts.extra_store_writes) |write| try txn.put(write.key, write.value);
             if (opts.raft_applied_entry_marker) |entry| {
                 var bytes: [raft_applied_entry_value_len]u8 = undefined;
                 const marker = raftAppliedEntryWrite(entry, &bytes);
                 try txn.put(marker.key, marker.value);
             }
-            if (opts.ha_applied_lsn_marker) |lsn| {
-                var bytes: [ha_applied_lsn_value_len]u8 = undefined;
-                const marker = haAppliedReplicationLsnWrite(lsn, &bytes);
+            if (opts.replication_applied_lsn_marker) |lsn| {
+                var bytes: [replication_applied_lsn_value_len]u8 = undefined;
+                const marker = replicationAppliedSequenceWrite(lsn, &bytes);
                 try txn.put(marker.key, marker.value);
             }
-            try self.stageRestoreStagingHAOutbox(&txn, payload);
+            try self.stageRestoreStagingReplicationOutbox(&txn, payload);
             try txn.commit();
             txn_open = false;
             if (command == .admit) {
@@ -30940,7 +30899,7 @@ pub const DB = struct {
             // or misreport the replicated terminal decision as rejected.
             if (builtin.is_test and err == error.InjectedSourcePinFailure) return err;
         };
-        if (payload != null) try self.flushDurableHAOutboxes();
+        if (payload != null) try self.flushDurableReplicationOutboxes();
     }
 
     fn preflightArtifactAdmission(self: *DB, req: types.BatchRequest, entry: anytype) !@import("artifact_reconcile_intent.zig").Context {
@@ -31072,8 +31031,8 @@ pub const DB = struct {
     }
     pub fn reconcileArtifactAddEnrichment(self: *DB, cfg: types.EnrichmentConfig, context: @import("artifact_reconcile_intent.zig").Context) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
         // Exact committed reconciliation provenance authorizes standby
         // materialization; no public/local configuration bypass is exposed.
         try self.lockApplyForPortableRuntime();
@@ -31153,19 +31112,19 @@ pub const DB = struct {
             opts.extra_store_writes.len != 0 or opts.extra_store_deletes.len != 0) return error.InvalidBatchRequest;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
 
-        var ha_mutation = if (opts.bypass_ha_write_gate) null else self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        if (!opts.bypass_ha_write_gate) {
-            try self.enforceHAWriteGate();
-            try self.ensureDurableHAStartupBarrier();
-            try self.flushDurableHAOutboxes();
-            try self.preflightHABatchSyncCommit();
+        var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        if (!opts.bypass_replication_write_gate) {
+            try self.enforceReplicationWriteGate();
+            try self.ensureDurableReplicationStartupBarrier();
+            try self.flushDurableReplicationOutboxes();
+            try self.preflightReplicationBatchSyncCommit();
         }
-        const ha_payload = if (!opts.bypass_ha_write_gate and self.ha_async_batch_mirror != null)
-            try ha_effects_mod.encodeMergeProofAdoptionMutationRequestAlloc(self.alloc, req, entry)
+        const replication_payload = if (!opts.bypass_replication_write_gate and self.replication_async_batch_mirror != null)
+            try replication_effects_mod.encodeMergeProofAdoptionMutationRequestAlloc(self.alloc, req, entry)
         else
             null;
-        defer if (ha_payload) |value| self.alloc.free(value);
+        defer if (replication_payload) |value| self.alloc.free(value);
 
         var preparation_budget = if (self.core.index_manager.resource_manager) |manager|
             resource_manager_mod.BudgetedAllocator.init(manager, .shard_transition_working_set, self.alloc, 1)
@@ -31234,16 +31193,16 @@ pub const DB = struct {
         var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
         const marker = raftAppliedEntryWrite(entry, &marker_buf);
         try txn.put(marker.key, marker.value);
-        var standby_buf: [ha_applied_lsn_value_len]u8 = undefined;
-        if (opts.ha_applied_lsn_marker) |lsn| {
-            const standby = haAppliedReplicationLsnWrite(lsn, &standby_buf);
+        var standby_buf: [replication_applied_lsn_value_len]u8 = undefined;
+        if (opts.replication_applied_lsn_marker) |lsn| {
+            const standby = replicationAppliedSequenceWrite(lsn, &standby_buf);
             try txn.put(standby.key, standby.value);
         }
-        try self.stageRestoreStagingHAOutbox(&txn, ha_payload);
+        try self.stageRestoreStagingReplicationOutbox(&txn, replication_payload);
         try txn.commit();
         self.core.unlockApply();
         apply_held = false;
-        if (ha_payload != null) try self.flushDurableHAOutboxes();
+        if (replication_payload != null) try self.flushDurableReplicationOutboxes();
     }
 
     fn applyArtifactPublicationTransportBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
@@ -31293,19 +31252,19 @@ pub const DB = struct {
                 return self.applyArtifactPublicationBatch(.{ .artifact_publication = decoded.command, .sync_level = req.sync_level }, publication_opts);
             }
         }
-        var ha_mutation = if (opts.bypass_ha_write_gate) null else self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        if (!opts.bypass_ha_write_gate) {
-            try self.enforceHAWriteGate();
-            try self.ensureDurableHAStartupBarrier();
-            try self.flushDurableHAOutboxes();
-            try self.preflightHABatchSyncCommit();
+        var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        if (!opts.bypass_replication_write_gate) {
+            try self.enforceReplicationWriteGate();
+            try self.ensureDurableReplicationStartupBarrier();
+            try self.flushDurableReplicationOutboxes();
+            try self.preflightReplicationBatchSyncCommit();
         }
-        const ha_payload = if (!opts.bypass_ha_write_gate and self.ha_async_batch_mirror != null)
-            try ha_effects_mod.encodeArtifactPublicationTransportMutationRequestAlloc(self.alloc, req, entry)
+        const replication_payload = if (!opts.bypass_replication_write_gate and self.replication_async_batch_mirror != null)
+            try replication_effects_mod.encodeArtifactPublicationTransportMutationRequestAlloc(self.alloc, req, entry)
         else
             null;
-        defer if (ha_payload) |value| self.alloc.free(value);
+        defer if (replication_payload) |value| self.alloc.free(value);
         // Decode at most one chunk before entering the serialized writer.
         const chunk: ?[]u8 = if (control.action == .chunk) blk: {
             const length = std.base64.standard.Decoder.calcSizeForSlice(control.chunk_base64) catch return error.InvalidBatchRequest;
@@ -31353,21 +31312,21 @@ pub const DB = struct {
         var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
         const marker = raftAppliedEntryWrite(entry, &marker_buf);
         try txn.put(marker.key, marker.value);
-        var standby_buf: [ha_applied_lsn_value_len]u8 = undefined;
-        if (opts.ha_applied_lsn_marker) |lsn| {
-            const standby = haAppliedReplicationLsnWrite(lsn, &standby_buf);
+        var standby_buf: [replication_applied_lsn_value_len]u8 = undefined;
+        if (opts.replication_applied_lsn_marker) |lsn| {
+            const standby = replicationAppliedSequenceWrite(lsn, &standby_buf);
             try txn.put(standby.key, standby.value);
         }
         for (opts.extra_store_writes) |write| try txn.put(write.key, write.value);
         for (opts.extra_store_deletes) |key| try txn.delete(key);
-        try self.stageRestoreStagingHAOutbox(&txn, ha_payload);
+        try self.stageRestoreStagingReplicationOutbox(&txn, replication_payload);
         try txn.commit();
         self.core.unlockApply();
         apply_held = false;
-        if (ha_payload != null) try self.flushDurableHAOutboxes();
+        if (replication_payload != null) try self.flushDurableReplicationOutboxes();
     }
 
-    fn rejectArtifactPublicationAssumeApply(self: *DB, command: @import("artifact_publication.zig").Command, opts: BatchExecutionOptions, ha_payload: ?[]const u8, reason: @import("artifact_publication.zig").Rejection, apply_held: *bool) !void {
+    fn rejectArtifactPublicationAssumeApply(self: *DB, command: @import("artifact_publication.zig").Command, opts: BatchExecutionOptions, replication_payload: ?[]const u8, reason: @import("artifact_publication.zig").Rejection, apply_held: *bool) !void {
         // A source/catalog race is an ordered outcome, not an apply failure.
         // Keep accepted provenance intact and commit the rejection with the
         // applied watermark, so retries cannot wedge a committed Raft entry.
@@ -31382,18 +31341,18 @@ pub const DB = struct {
         var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
         const marker = raftAppliedEntryWrite(entry, &marker_buf);
         try txn.put(marker.key, marker.value);
-        var standby_buf: [ha_applied_lsn_value_len]u8 = undefined;
-        if (opts.ha_applied_lsn_marker) |lsn| {
-            const standby = haAppliedReplicationLsnWrite(lsn, &standby_buf);
+        var standby_buf: [replication_applied_lsn_value_len]u8 = undefined;
+        if (opts.replication_applied_lsn_marker) |lsn| {
+            const standby = replicationAppliedSequenceWrite(lsn, &standby_buf);
             try txn.put(standby.key, standby.value);
         }
         for (opts.extra_store_writes) |write| try txn.put(write.key, write.value);
         for (opts.extra_store_deletes) |key| try txn.delete(key);
-        try self.stageRestoreStagingHAOutbox(&txn, ha_payload);
+        try self.stageRestoreStagingReplicationOutbox(&txn, replication_payload);
         try txn.commit();
         self.core.unlockApply();
         apply_held.* = false;
-        if (ha_payload != null) try self.flushDurableHAOutboxes();
+        if (replication_payload != null) try self.flushDurableReplicationOutboxes();
     }
 
     fn applyArtifactPublicationBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
@@ -31404,22 +31363,22 @@ pub const DB = struct {
         const entry = opts.raft_applied_entry_marker orelse return error.InvalidBatchRequest;
         if (entry.term == 0 or entry.index == 0) return error.InvalidBatchRequest;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var ha_mutation = if (opts.bypass_ha_write_gate) null else self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        if (!opts.bypass_ha_write_gate) {
-            try self.enforceHAWriteGate();
-            try self.ensureDurableHAStartupBarrier();
-            try self.flushDurableHAOutboxes();
-            try self.preflightHABatchSyncCommit();
+        var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        if (!opts.bypass_replication_write_gate) {
+            try self.enforceReplicationWriteGate();
+            try self.ensureDurableReplicationStartupBarrier();
+            try self.flushDurableReplicationOutboxes();
+            try self.preflightReplicationBatchSyncCommit();
         }
-        const ha_payload = if (!opts.bypass_ha_write_gate and self.ha_async_batch_mirror != null)
+        const replication_payload = if (!opts.bypass_replication_write_gate and self.replication_async_batch_mirror != null)
             if (opts.artifact_upload_finalize) |upload|
-                try ha_effects_mod.encodeArtifactPublicationTransportMutationRequestAlloc(self.alloc, .{ .artifact_publication_transport = upload.control, .sync_level = req.sync_level }, entry)
+                try replication_effects_mod.encodeArtifactPublicationTransportMutationRequestAlloc(self.alloc, .{ .artifact_publication_transport = upload.control, .sync_level = req.sync_level }, entry)
             else
-                try ha_effects_mod.encodeArtifactPublicationMutationRequestAlloc(self.alloc, req, entry)
+                try replication_effects_mod.encodeArtifactPublicationMutationRequestAlloc(self.alloc, req, entry)
         else
             null;
-        defer if (ha_payload) |value| self.alloc.free(value);
+        defer if (replication_payload) |value| self.alloc.free(value);
         // Prepare immutable producer bytes against a copied ordered catalog
         // before taking apply. The exact epoch/digest is checked again below;
         // a concurrent catalog change makes this work a durable rejection.
@@ -31608,10 +31567,10 @@ pub const DB = struct {
             break :blk try inventory.load(self.alloc, &read);
         };
         defer if (ordered) |*value| value.deinit();
-        const ordered_value = if (ordered) |*value| value else return self.rejectArtifactPublicationAssumeApply(command, opts, ha_payload, .stale_catalog, &apply_held);
+        const ordered_value = if (ordered) |*value| value else return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .stale_catalog, &apply_held);
         if (ordered_value.value.command.binding.epoch != command.authority_epoch or
             !std.mem.eql(u8, &ordered_value.value.command.binding.digest, &command.catalog_digest) or
-            !std.mem.eql(u8, &ordered_value.value.command.namespace, &namespace)) return self.rejectArtifactPublicationAssumeApply(command, opts, ha_payload, .stale_catalog, &apply_held);
+            !std.mem.eql(u8, &ordered_value.value.command.namespace, &namespace)) return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .stale_catalog, &apply_held);
         if (command.mode != .publish) {
             var txn = try self.core.store.beginWriteTxn();
             var txn_open = true;
@@ -31640,7 +31599,7 @@ pub const DB = struct {
                     };
                     txn.abort();
                     txn_open = false;
-                    return self.rejectArtifactPublicationAssumeApply(command, opts, ha_payload, reason, &apply_held);
+                    return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, reason, &apply_held);
                 }
                 try completeArtifactUpload(&txn, opts.artifact_upload_finalize, entry);
             } else if (command.mode == .validate_inputs) {
@@ -31648,7 +31607,7 @@ pub const DB = struct {
                     error.ArtifactCatalogDrift, error.InvalidBatchRequest => {
                         txn.abort();
                         txn_open = false;
-                        return self.rejectArtifactPublicationAssumeApply(command, opts, ha_payload, if (err == error.ArtifactCatalogDrift) .stale_catalog else .invalid_output, &apply_held);
+                        return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, if (err == error.ArtifactCatalogDrift) .stale_catalog else .invalid_output, &apply_held);
                     },
                     else => return err,
                 };
@@ -31658,7 +31617,7 @@ pub const DB = struct {
                     error.ArtifactCatalogDrift, error.InvalidBatchRequest => {
                         txn.abort();
                         txn_open = false;
-                        return self.rejectArtifactPublicationAssumeApply(command, opts, ha_payload, if (err == error.ArtifactCatalogDrift) .stale_catalog else .invalid_output, &apply_held);
+                        return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, if (err == error.ArtifactCatalogDrift) .stale_catalog else .invalid_output, &apply_held);
                     },
                     else => return err,
                 };
@@ -31681,40 +31640,40 @@ pub const DB = struct {
             var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
             const marker = raftAppliedEntryWrite(entry, &marker_buf);
             try txn.put(marker.key, marker.value);
-            var standby_buf: [ha_applied_lsn_value_len]u8 = undefined;
-            if (opts.ha_applied_lsn_marker) |lsn| {
-                const standby = haAppliedReplicationLsnWrite(lsn, &standby_buf);
+            var standby_buf: [replication_applied_lsn_value_len]u8 = undefined;
+            if (opts.replication_applied_lsn_marker) |lsn| {
+                const standby = replicationAppliedSequenceWrite(lsn, &standby_buf);
                 try txn.put(standby.key, standby.value);
             }
             for (opts.extra_store_writes) |write| try txn.put(write.key, write.value);
             for (opts.extra_store_deletes) |key| try txn.delete(key);
-            try self.stageRestoreStagingHAOutbox(&txn, ha_payload);
+            try self.stageRestoreStagingReplicationOutbox(&txn, replication_payload);
             try txn.commit();
             txn_open = false;
             self.core.unlockApply();
             apply_held = false;
-            if (ha_payload != null) try self.flushDurableHAOutboxes();
+            if (replication_payload != null) try self.flushDurableReplicationOutboxes();
             return;
         }
         {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
-            const producer = (try publication.authority(&read)) orelse return self.rejectArtifactPublicationAssumeApply(command, opts, ha_payload, .stale_catalog, &apply_held);
+            const producer = (try publication.authority(&read)) orelse return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .stale_catalog, &apply_held);
             if (producer.epoch != command.authority_epoch or !std.mem.eql(u8, &producer.namespace, &namespace) or
-                !std.mem.eql(u8, &producer.catalog_digest, &command.catalog_digest)) return self.rejectArtifactPublicationAssumeApply(command, opts, ha_payload, .stale_catalog, &apply_held);
+                !std.mem.eql(u8, &producer.catalog_digest, &command.catalog_digest)) return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .stale_catalog, &apply_held);
             if (try @import("artifact_producer_obligations.zig").load(&read)) |obligations| {
                 try obligations.requireAuthority(producer);
-                if (obligations.sealed_attempt != null) return self.rejectArtifactPublicationAssumeApply(command, opts, ha_payload, .sealed_source, &apply_held);
+                if (obligations.sealed_attempt != null) return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .sealed_source, &apply_held);
             }
             // Reject known stale work before allocating a local replay
             // reservation. The final writer guard repeats this against the
             // exact write snapshot; provider input never grants write access.
             publication.validateSources(self.alloc, &read, command.namespace, command.sources) catch |err| switch (err) {
-                error.EnrichmentSourceChanged => return self.rejectArtifactPublicationAssumeApply(command, opts, ha_payload, .stale_source, &apply_held),
+                error.EnrichmentSourceChanged => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .stale_source, &apply_held),
                 else => return err,
             };
             publication.validateArtifactSources(self.alloc, &read, command.namespace, command.sources, command.artifact_sources) catch |err| switch (err) {
-                error.EnrichmentSourceChanged => return self.rejectArtifactPublicationAssumeApply(command, opts, ha_payload, .stale_source, &apply_held),
+                error.EnrichmentSourceChanged => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .stale_source, &apply_held),
                 else => return err,
             };
             var duplicate = true;
@@ -31726,7 +31685,7 @@ pub const DB = struct {
                     duplicate = false;
                     continue;
                 };
-                if (!std.mem.eql(u8, &receipt.publication_digest, &command.publication_digest)) return self.rejectArtifactPublicationAssumeApply(command, opts, ha_payload, .stale_source, &apply_held);
+                if (!std.mem.eql(u8, &receipt.publication_digest, &command.publication_digest)) return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .stale_source, &apply_held);
             }
             if (duplicate) {
                 var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
@@ -31735,33 +31694,33 @@ pub const DB = struct {
                 try completeArtifactUpload(&txn, opts.artifact_upload_finalize, entry);
                 const marker = raftAppliedEntryWrite(entry, &marker_buf);
                 try txn.put(marker.key, marker.value);
-                var standby_buf: [ha_applied_lsn_value_len]u8 = undefined;
-                if (opts.ha_applied_lsn_marker) |lsn| {
-                    const standby = haAppliedReplicationLsnWrite(lsn, &standby_buf);
+                var standby_buf: [replication_applied_lsn_value_len]u8 = undefined;
+                if (opts.replication_applied_lsn_marker) |lsn| {
+                    const standby = replicationAppliedSequenceWrite(lsn, &standby_buf);
                     try txn.put(standby.key, standby.value);
                 }
                 for (opts.extra_store_writes) |write| try txn.put(write.key, write.value);
                 for (opts.extra_store_deletes) |key| try txn.delete(key);
-                try self.stageRestoreStagingHAOutbox(&txn, ha_payload);
+                try self.stageRestoreStagingReplicationOutbox(&txn, replication_payload);
                 try txn.commit();
                 self.core.unlockApply();
                 apply_held = false;
-                if (ha_payload != null) try self.flushDurableHAOutboxes();
+                if (replication_payload != null) try self.flushDurableReplicationOutboxes();
                 return;
             }
         }
         if (preparation_error) |err| switch (err) {
-            error.EnrichmentSourceChanged => return self.rejectArtifactPublicationAssumeApply(command, opts, ha_payload, if (input_preparation_error) .stale_source else .stale_catalog, &apply_held),
-            error.ArtifactCoverageBaselinePending => return self.rejectArtifactPublicationAssumeApply(command, opts, ha_payload, .baseline_pending, &apply_held),
-            error.ArtifactCatalogDrift => return self.rejectArtifactPublicationAssumeApply(command, opts, ha_payload, .stale_catalog, &apply_held),
-            error.InvalidBatchRequest, error.OnlineMergeArtifactTailsUnsupported => return self.rejectArtifactPublicationAssumeApply(command, opts, ha_payload, .invalid_output, &apply_held),
+            error.EnrichmentSourceChanged => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, if (input_preparation_error) .stale_source else .stale_catalog, &apply_held),
+            error.ArtifactCoverageBaselinePending => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .baseline_pending, &apply_held),
+            error.ArtifactCatalogDrift => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .stale_catalog, &apply_held),
+            error.InvalidBatchRequest, error.OnlineMergeArtifactTailsUnsupported => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .invalid_output, &apply_held),
             else => return err,
         };
         {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
             publication.validateArtifactSources(self.alloc, &read, command.namespace, command.sources, command.mutation_preconditions) catch |err| switch (err) {
-                error.EnrichmentSourceChanged => return self.rejectArtifactPublicationAssumeApply(command, opts, ha_payload, .stale_source, &apply_held),
+                error.EnrichmentSourceChanged => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .stale_source, &apply_held),
                 else => return err,
             };
         }
@@ -31792,13 +31751,13 @@ pub const DB = struct {
         try appendDenseArtifactCounterMutations(self.alloc, self.core.store, self.core.index_manager, &writes, deletes.items, &owned_keys, &owned_values);
         var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
         try writes.append(self.alloc, raftAppliedEntryWrite(entry, &marker_buf));
-        var standby_buf: [ha_applied_lsn_value_len]u8 = undefined;
-        if (opts.ha_applied_lsn_marker) |lsn| try writes.append(self.alloc, haAppliedReplicationLsnWrite(lsn, &standby_buf));
+        var standby_buf: [replication_applied_lsn_value_len]u8 = undefined;
+        if (opts.replication_applied_lsn_marker) |lsn| try writes.append(self.alloc, replicationAppliedSequenceWrite(lsn, &standby_buf));
         try writes.appendSlice(self.alloc, opts.extra_store_writes);
         try deletes.appendSlice(self.alloc, opts.extra_store_deletes);
         const Guard = struct {
             db: *DB,
-            ha_payload: ?[]const u8,
+            replication_payload: ?[]const u8,
             command: publication.Command,
             sequence: u64,
             coverage: []const publication.Coverage,
@@ -31823,19 +31782,19 @@ pub const DB = struct {
                 try publication.stageArtifactRevisions(txn, guard.command, guard.position);
                 if (guard.command.producer_kind == .resolver) try @import("artifact_publication_resolution.zig").stageHandoff(alloc, txn, guard.command);
                 try DB.completeArtifactUpload(txn, guard.upload, .{ .term = guard.position.raft.term, .index = guard.position.raft.index });
-                try guard.db.stageRestoreStagingHAOutbox(txn, guard.ha_payload);
+                try guard.db.stageRestoreStagingReplicationOutbox(txn, guard.replication_payload);
             }
         };
-        var guard: Guard = .{ .db = self, .ha_payload = ha_payload, .command = command, .sequence = sequence, .coverage = prepared_value.coverage, .chunk_fence = prepared_value.chunk_fence, .chunk_vector_fence = prepared_value.chunk_vector_fence, .asset_upstream_fences = prepared_value.asset_upstream_fences, .position = .{ .raft = .{ .term = entry.term, .index = entry.index } }, .proof = prepared_proof orelse return error.ArtifactCatalogCorrupt, .document_references = if (prepared_document_refs) |*value| value else return error.ArtifactCatalogCorrupt, .upload = opts.artifact_upload_finalize };
+        var guard: Guard = .{ .db = self, .replication_payload = replication_payload, .command = command, .sequence = sequence, .coverage = prepared_value.coverage, .chunk_fence = prepared_value.chunk_fence, .chunk_vector_fence = prepared_value.chunk_vector_fence, .asset_upstream_fences = prepared_value.asset_upstream_fences, .position = .{ .raft = .{ .term = entry.term, .index = entry.index } }, .proof = prepared_proof orelse return error.ArtifactCatalogCorrupt, .document_references = if (prepared_document_refs) |*value| value else return error.ArtifactCatalogCorrupt, .upload = opts.artifact_upload_finalize };
         _ = self.core.store.putBatchWithPromotionsReplayAndBuiltWrite(batch_ctx.io, writes.items, deletes.items, &.{}, .{ .sequence = sequence, .payload = replay }, null, .{ .ptr = &guard, .validate = Guard.validate }) catch |err| switch (err) {
-            error.EnrichmentSourceChanged => return self.rejectArtifactPublicationAssumeApply(command, opts, ha_payload, .stale_source, &apply_held),
-            error.ArtifactCoverageBaselinePending => return self.rejectArtifactPublicationAssumeApply(command, opts, ha_payload, .baseline_pending, &apply_held),
+            error.EnrichmentSourceChanged => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .stale_source, &apply_held),
+            error.ArtifactCoverageBaselinePending => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .baseline_pending, &apply_held),
             else => return err,
         };
         self.executor.commitBacklogAdmission(sequence, &backlog);
         self.core.unlockApply();
         apply_held = false;
-        if (ha_payload != null) try self.flushDurableHAOutboxes();
+        if (replication_payload != null) try self.flushDurableReplicationOutboxes();
         DB.notifyQueryVisibilityTargetAdvancedContext(&batch_ctx, sequence);
         if (self.executor.hasWorkers()) self.executor.forceSequence(sequence) else {
             prepared_value.batch.sequence = sequence;
@@ -31851,13 +31810,13 @@ pub const DB = struct {
         const command = req.artifact_catalog orelse return error.InvalidArtifactCatalogCommand;
         const entry = opts.raft_applied_entry_marker orelse return error.InvalidArtifactCatalogCommand;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var ha_mutation = if (opts.bypass_ha_write_gate) null else self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        if (!opts.bypass_ha_write_gate) {
-            try self.enforceHAWriteGate();
-            try self.ensureDurableHAStartupBarrier();
-            try self.flushDurableHAOutboxes();
-            try self.preflightHABatchSyncCommit();
+        var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        if (!opts.bypass_replication_write_gate) {
+            try self.enforceReplicationWriteGate();
+            try self.ensureDurableReplicationStartupBarrier();
+            try self.flushDurableReplicationOutboxes();
+            try self.preflightReplicationBatchSyncCommit();
         }
         var payload: ?[]u8 = null;
         defer if (payload) |bytes| self.alloc.free(bytes);
@@ -31880,17 +31839,17 @@ pub const DB = struct {
             var marker_bytes: [raft_applied_entry_value_len]u8 = undefined;
             const marker = raftAppliedEntryWrite(entry, &marker_bytes);
             try txn.put(marker.key, marker.value);
-            if (opts.ha_applied_lsn_marker) |lsn| {
-                var bytes: [ha_applied_lsn_value_len]u8 = undefined;
-                const ha_marker = haAppliedReplicationLsnWrite(lsn, &bytes);
-                try txn.put(ha_marker.key, ha_marker.value);
+            if (opts.replication_applied_lsn_marker) |lsn| {
+                var bytes: [replication_applied_lsn_value_len]u8 = undefined;
+                const replication_marker = replicationAppliedSequenceWrite(lsn, &bytes);
+                try txn.put(replication_marker.key, replication_marker.value);
             }
-            if (!opts.bypass_ha_write_gate and self.ha_async_batch_mirror != null)
-                payload = try ha_effects_mod.encodeArtifactCatalogMutationRequestAlloc(self.alloc, req, entry);
-            try self.stageRestoreStagingHAOutbox(&txn, payload);
+            if (!opts.bypass_replication_write_gate and self.replication_async_batch_mirror != null)
+                payload = try replication_effects_mod.encodeArtifactCatalogMutationRequestAlloc(self.alloc, req, entry);
+            try self.stageRestoreStagingReplicationOutbox(&txn, payload);
             try txn.commit();
         }
-        if (payload != null) try self.flushDurableHAOutboxes();
+        if (payload != null) try self.flushDurableReplicationOutboxes();
     }
 
     pub fn onlineSourceStatus(self: *DB, scope: @import("online_source_contract.zig").Scope) !@import("online_source.zig").Progress {
@@ -31959,16 +31918,16 @@ pub const DB = struct {
             req.merge_checkpoint != null or req.merge_replication != null or req.merge_source_transition != null or
             req.merge_artifacts.len != 0 or req.range_guards.len != 0 or req.activate_range_tracking or
             req.schema_version != null or req.relational_schema_version != null or req.relational_integrity_generation_set != null) return error.InvalidBatchRequest;
-        var mutation = if (opts.bypass_ha_write_gate) null else self.acquireHAMutationShared();
+        var mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
         defer if (mutation) |*lease| lease.release();
-        if (!opts.bypass_ha_write_gate) {
-            try self.enforceHAWriteGate();
-            try self.ensureDurableHAStartupBarrier();
-            try self.flushDurableHAOutboxes();
-            try self.preflightHABatchSyncCommit();
+        if (!opts.bypass_replication_write_gate) {
+            try self.enforceReplicationWriteGate();
+            try self.ensureDurableReplicationStartupBarrier();
+            try self.flushDurableReplicationOutboxes();
+            try self.preflightReplicationBatchSyncCommit();
         }
-        const payload = if (!opts.bypass_ha_write_gate and self.ha_async_batch_mirror != null)
-            try ha_effects_mod.encodeBatchMutationRequestAlloc(self.alloc, req)
+        const payload = if (!opts.bypass_replication_write_gate and self.replication_async_batch_mirror != null)
+            try replication_effects_mod.encodeBatchMutationRequestAlloc(self.alloc, req)
         else
             null;
         defer if (payload) |bytes| self.alloc.free(bytes);
@@ -31998,14 +31957,14 @@ pub const DB = struct {
             const marker = raftAppliedEntryWrite(entry, &marker_buf);
             try txn.put(marker.key, marker.value);
         }
-        if (opts.ha_applied_lsn_marker) |lsn| {
-            var marker_buf: [ha_applied_lsn_value_len]u8 = undefined;
-            const marker = haAppliedReplicationLsnWrite(lsn, &marker_buf);
+        if (opts.replication_applied_lsn_marker) |lsn| {
+            var marker_buf: [replication_applied_lsn_value_len]u8 = undefined;
+            const marker = replicationAppliedSequenceWrite(lsn, &marker_buf);
             try txn.put(marker.key, marker.value);
         }
-        try self.stageRestoreStagingHAOutbox(&txn, payload);
+        try self.stageRestoreStagingReplicationOutbox(&txn, payload);
         try txn.commit();
-        if (payload != null) try self.flushDurableHAOutboxes();
+        if (payload != null) try self.flushDurableReplicationOutboxes();
     }
 
     fn applyRelationalTopologyBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
@@ -32056,17 +32015,17 @@ pub const DB = struct {
                 command.parent_activation != null or command.child_generations != null) return error.InvalidBatchRequest;
             const provision = command.initial_child_provision.?;
             const entry = opts.raft_applied_entry_marker orelse opts.native_initial_child_entry orelse return error.InvalidBatchRequest;
-            var ha_mutation = if (opts.bypass_ha_write_gate) null else self.acquireHAMutationShared();
-            defer if (ha_mutation) |*lease| lease.release();
-            if (!opts.bypass_ha_write_gate) {
-                if (self.ha_async_metadata_mirror != null and self.ha_async_batch_mirror == null) return error.HAMirrorUnavailable;
-                try self.enforceHAWriteGate();
-                try self.ensureDurableHAStartupBarrier();
-                try self.flushDurableHAOutboxes();
-                try self.preflightHABatchSyncCommit();
+            var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
+            defer if (replication_mutation) |*lease| lease.release();
+            if (!opts.bypass_replication_write_gate) {
+                if (self.replication_async_metadata_mirror != null and self.replication_async_batch_mirror == null) return error.HAMirrorUnavailable;
+                try self.enforceReplicationWriteGate();
+                try self.ensureDurableReplicationStartupBarrier();
+                try self.flushDurableReplicationOutboxes();
+                try self.preflightReplicationBatchSyncCommit();
             }
-            const payload = if (!opts.bypass_ha_write_gate and self.ha_async_batch_mirror != null)
-                try ha_effects_mod.encodeInitialChildMutationRequestAlloc(self.alloc, req, entry)
+            const payload = if (!opts.bypass_replication_write_gate and self.replication_async_batch_mirror != null)
+                try replication_effects_mod.encodeInitialChildMutationRequestAlloc(self.alloc, req, entry)
             else
                 null;
             defer if (payload) |bytes| self.alloc.free(bytes);
@@ -32080,8 +32039,8 @@ pub const DB = struct {
                 .catalog_digest = provision.catalog_digest,
                 .raft_entry = entry,
                 .native = opts.native_initial_child_entry != null,
-            }, opts.ha_applied_lsn_marker, payload);
-            if (payload != null) try self.flushDurableHAOutboxes();
+            }, opts.replication_applied_lsn_marker, payload);
+            if (payload != null) try self.flushDurableReplicationOutboxes();
             return;
         };
         if (req.relational_topology) |command| if (command.action == .release_initial_child or command.action == .cancel_initial_child) {
@@ -32089,53 +32048,53 @@ pub const DB = struct {
                 command.child_schema_install != null or command.transfer != null or command.parent_retirement != null or
                 command.parent_activation != null or command.child_generations != null) return error.InvalidBatchRequest;
             const entry = opts.raft_applied_entry_marker orelse opts.native_initial_child_entry orelse return error.InvalidBatchRequest;
-            var ha_mutation = if (opts.bypass_ha_write_gate) null else self.acquireHAMutationShared();
-            defer if (ha_mutation) |*lease| lease.release();
-            if (!opts.bypass_ha_write_gate) {
-                if (self.ha_async_metadata_mirror != null and self.ha_async_batch_mirror == null) return error.HAMirrorUnavailable;
-                try self.enforceHAWriteGate();
-                try self.ensureDurableHAStartupBarrier();
-                try self.flushDurableHAOutboxes();
-                try self.preflightHABatchSyncCommit();
+            var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
+            defer if (replication_mutation) |*lease| lease.release();
+            if (!opts.bypass_replication_write_gate) {
+                if (self.replication_async_metadata_mirror != null and self.replication_async_batch_mirror == null) return error.HAMirrorUnavailable;
+                try self.enforceReplicationWriteGate();
+                try self.ensureDurableReplicationStartupBarrier();
+                try self.flushDurableReplicationOutboxes();
+                try self.preflightReplicationBatchSyncCommit();
             }
-            const payload = if (!opts.bypass_ha_write_gate and self.ha_async_batch_mirror != null)
-                try ha_effects_mod.encodeInitialChildMutationRequestAlloc(self.alloc, req, entry)
+            const payload = if (!opts.bypass_replication_write_gate and self.replication_async_batch_mirror != null)
+                try replication_effects_mod.encodeInitialChildMutationRequestAlloc(self.alloc, req, entry)
             else
                 null;
             defer if (payload) |bytes| self.alloc.free(bytes);
-            try self.applyInitialChildPhase(command.fence, command.initial_child_control.?, if (command.action == .release_initial_child) .released else .canceled, entry, opts.native_initial_child_entry != null, opts.ha_applied_lsn_marker, payload);
-            if (payload != null) try self.flushDurableHAOutboxes();
+            try self.applyInitialChildPhase(command.fence, command.initial_child_control.?, if (command.action == .release_initial_child) .released else .canceled, entry, opts.native_initial_child_entry != null, opts.replication_applied_lsn_marker, payload);
+            if (payload != null) try self.flushDurableReplicationOutboxes();
             return;
         };
-        var mutation = if (opts.bypass_ha_write_gate) null else self.acquireHAMutationShared();
+        var mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
         defer if (mutation) |*lease| lease.release();
-        if (!opts.bypass_ha_write_gate) {
-            try self.enforceHAWriteGate();
-            try self.ensureDurableHAStartupBarrier();
-            try self.flushDurableHAOutboxes();
-            try self.preflightHABatchSyncCommit();
+        if (!opts.bypass_replication_write_gate) {
+            try self.enforceReplicationWriteGate();
+            try self.ensureDurableReplicationStartupBarrier();
+            try self.flushDurableReplicationOutboxes();
+            try self.preflightReplicationBatchSyncCommit();
         }
         const native_control = opts.raft_applied_entry_marker == null and opts.native_fk_generation_entry == null and
             (if (req.relational_topology) |command| @import("native_topology_receipt.zig").supports(command) else false);
         if (native_control) try @import("native_topology_receipt.zig").validateRequest(self.alloc, req);
-        const mirror_control = !opts.bypass_ha_write_gate and self.ha_async_batch_mirror != null;
+        const mirror_control = !opts.bypass_replication_write_gate and self.replication_async_batch_mirror != null;
         const payload = if (mirror_control and !native_control)
             if (req.relational_topology) |command|
                 if (command.action == .seal_graph_retirement)
-                    try ha_effects_mod.encodeGraphRetirementSealMutationRequestAlloc(self.alloc, req, opts.raft_applied_entry_marker orelse return error.InvalidBatchRequest)
+                    try replication_effects_mod.encodeGraphRetirementSealMutationRequestAlloc(self.alloc, req, opts.raft_applied_entry_marker orelse return error.InvalidBatchRequest)
                 else
-                    try ha_effects_mod.encodeBatchMutationRequestAlloc(self.alloc, req)
+                    try replication_effects_mod.encodeBatchMutationRequestAlloc(self.alloc, req)
             else
-                try ha_effects_mod.encodeBatchMutationRequestAlloc(self.alloc, req)
+                try replication_effects_mod.encodeBatchMutationRequestAlloc(self.alloc, req)
         else
             null;
         defer if (payload) |bytes| self.alloc.free(bytes);
         if (req.relational_topology) |command| {
-            try self.applyRelationalTopologyControlWithHA(command, opts.raft_applied_entry_marker, opts.ha_applied_lsn_marker, payload, opts.native_fk_generation_entry, if (native_control) .{ .request = req, .replay = opts.native_topology_position, .mirror = mirror_control } else null);
+            try self.applyRelationalTopologyControlWithReplication(command, opts.raft_applied_entry_marker, opts.replication_applied_lsn_marker, payload, opts.native_fk_generation_entry, if (native_control) .{ .request = req, .replay = opts.native_topology_position, .mirror = mirror_control } else null);
         } else {
-            try self.applyRaftSplitFinalization(req.split_transition.?, opts.raft_applied_entry_marker, opts.ha_applied_lsn_marker, payload);
+            try self.applyRaftSplitFinalization(req.split_transition.?, opts.raft_applied_entry_marker, opts.replication_applied_lsn_marker, payload);
         }
-        if (mirror_control) try self.flushDurableHAOutboxes();
+        if (mirror_control) try self.flushDurableReplicationOutboxes();
     }
 
     const NativeTopologyContext = struct {
@@ -32144,12 +32103,12 @@ pub const DB = struct {
         mirror: bool,
     };
 
-    fn applyRelationalTopologyControlWithHA(
+    fn applyRelationalTopologyControlWithReplication(
         self: *DB,
         command: @import("relational_integrity_topology.zig").Command,
         raft_entry: ?RaftAppliedEntryIdentity,
-        ha_lsn: ?u64,
-        ha_payload: ?[]const u8,
+        replication_lsn: ?u64,
+        replication_payload: ?[]const u8,
         native_receipt: ?RaftAppliedEntryIdentity,
         native_control: ?NativeTopologyContext,
     ) !void {
@@ -32212,7 +32171,7 @@ pub const DB = struct {
             null;
         const native_payload = if (native_control) |control|
             if (control.mirror)
-                if (native_prepared) |prepared| try ha_effects_mod.encodeNativeTopologyMutationRequestAlloc(self.alloc, control.request, prepared.receipt) else try ha_effects_mod.encodeBatchMutationRequestAlloc(self.alloc, control.request)
+                if (native_prepared) |prepared| try replication_effects_mod.encodeNativeTopologyMutationRequestAlloc(self.alloc, control.request, prepared.receipt) else try replication_effects_mod.encodeBatchMutationRequestAlloc(self.alloc, control.request)
             else
                 null
         else
@@ -32237,10 +32196,10 @@ pub const DB = struct {
                             if (!previous.value.destination.eql(command.fence)) return error.IntegrityHandoffDestinationResetRequired;
                         }
                     }
-                    if (ha_lsn == null and self.bulk_ingest_coalescer.hasPending()) return error.IntegrityTopologyBusy;
+                    if (replication_lsn == null and self.bulk_ingest_coalescer.hasPending()) return error.IntegrityTopologyBusy;
                     const enrichment = self.enrichmentStatsWithSupervisorState(.{ .enabled = true });
                     const has_producers = enrichment.enabled or self.core.hasGeneratedEnrichmentTargets() or self.core.index_manager.enrichments.items.len != 0 or self.hasConfiguredResolvers();
-                    if (ha_lsn == null and has_producers) {
+                    if (replication_lsn == null and has_producers) {
                         const target = self.currentMaintenanceTargetSequence();
                         if (enrichment.retrying or enrichment.worker_failed or enrichment.stalled or
                             ((enrichment.enabled or self.core.hasGeneratedEnrichmentTargets() or self.core.index_manager.enrichments.items.len != 0) and enrichment.applied_sequence < @max(target, enrichment.target_sequence))) return error.IntegrityTopologyBusy;
@@ -32499,30 +32458,30 @@ pub const DB = struct {
             const marker = raftAppliedEntryWrite(entry, &marker_buf);
             try txn.put(marker.key, marker.value);
         }
-        if (ha_lsn) |lsn| {
-            var marker_buf: [ha_applied_lsn_value_len]u8 = undefined;
-            const marker = haAppliedReplicationLsnWrite(lsn, &marker_buf);
+        if (replication_lsn) |lsn| {
+            var marker_buf: [replication_applied_lsn_value_len]u8 = undefined;
+            const marker = replicationAppliedSequenceWrite(lsn, &marker_buf);
             try txn.put(marker.key, marker.value);
         }
-        try self.stageRestoreStagingHAOutbox(&txn, native_payload orelse ha_payload);
+        try self.stageRestoreStagingReplicationOutbox(&txn, native_payload orelse replication_payload);
         try txn.commit();
         if (close_graph_after_commit) self.core.index_manager.setGraphRetirementAdmissionAssumeCatalogLock(false);
         if (open_graph_after_commit) self.core.index_manager.setGraphRetirementAdmissionAssumeCatalogLock(true);
     }
 
     pub fn markTransactionParticipantResolved(self: *DB, txn_id: transactions_mod.TxnId, participant: []const u8) !void {
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         try self.core.markTransactionParticipantResolved(txn_id, participant);
     }
 
     pub fn markTransactionParticipantsResolved(self: *DB, txn_id: transactions_mod.TxnId, participants: []const []const u8) !void {
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         try self.core.markTransactionParticipantsResolvedExtraBatch(txn_id, participants, .{});
@@ -32614,9 +32573,9 @@ pub const DB = struct {
     }
 
     pub fn recoverTransactions(self: *DB, cutoff_timestamp: u64, resolution_timestamp: u64) !transactions_mod.RecoveryStats {
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         const resolved_finalized = try self.resolveFinalizedTransactionIntentsForRecovery(resolution_timestamp);
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
@@ -32631,7 +32590,7 @@ pub const DB = struct {
         var resolved_finalized: u64 = 0;
         for (txns) |txn| {
             if (txn.status == .pending or
-                (!(try self.core.transactionHasIntents(txn.txn_id)) and !(try self.core.transactionHasHAOutbox(txn.txn_id)))) continue;
+                (!(try self.core.transactionHasIntents(txn.txn_id)) and !(try self.core.transactionHasReplicationOutbox(txn.txn_id)))) continue;
             const resolve_version = if (txn.status == .committed and txn.commit_version != 0)
                 txn.commit_version
             else
@@ -33600,9 +33559,9 @@ pub const DB = struct {
         var row_policy_lease = self.row_policy_gate.enterRaw() catch return error.RowPolicyUnsupported;
         defer row_policy_lease.release();
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        if (context == null) try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        if (context == null) try self.enforceReplicationWriteGate();
         var structural_guard = self.beginIndexStructuralMutation("index creation", cfg.name);
         defer structural_guard.deinit();
         {
@@ -33673,9 +33632,9 @@ pub const DB = struct {
 
     pub fn addEnrichment(self: *DB, cfg: types.EnrichmentConfig) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         {
@@ -33684,15 +33643,15 @@ pub const DB = struct {
             try self.requireOnlineArtifactCatalogMutableLocked(&probe);
         }
         try self.enforceVectorMigrationConfigurationGate();
-        try self.enforceHAWriteGate();
+        try self.enforceReplicationWriteGate();
         try self.core.addEnrichment(cfg);
     }
 
     pub fn upsertEnrichment(self: *DB, cfg: types.EnrichmentConfig) !index_manager_mod.IndexManager.EnrichmentUpsertResult {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         {
@@ -33701,7 +33660,7 @@ pub const DB = struct {
             try self.requireOnlineArtifactCatalogMutableLocked(&probe);
         }
         try self.enforceVectorMigrationConfigurationGate();
-        try self.enforceHAWriteGate();
+        try self.enforceReplicationWriteGate();
         return try self.core.upsertEnrichment(cfg);
     }
 
@@ -33735,9 +33694,9 @@ pub const DB = struct {
 
     pub fn addResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         {
             var activity = try self.acquireResolverCatalogActivity(true);
             defer activity.deinit();
@@ -33773,9 +33732,9 @@ pub const DB = struct {
         options: ResolverUpsertOptions,
     ) !index_manager_mod.IndexManager.ResolverUpsertResult {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         const upsert_result = blk: {
             try cfg.validate();
             // An unchanged catalog observation does not mutate resolver state.
@@ -33858,7 +33817,7 @@ pub const DB = struct {
 
     pub fn removeResolver(self: *DB, name: []const u8) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        try self.enforceHAWriteGate();
+        try self.enforceReplicationWriteGate();
         while (true) {
             try self.retireResolverReplayBeforeCatalogRemoval();
             return self.removeResolverWithoutDrain(name) catch |err| {
@@ -33877,9 +33836,9 @@ pub const DB = struct {
     fn removeResolverForReconciliation(self: *DB, name: []const u8, context: ?@import("artifact_reconcile_intent.zig").Context) !bool {
         if (context) |authority| return self.removeResolverReconciliationPage(name, authority);
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        if (context == null) try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        if (context == null) try self.enforceReplicationWriteGate();
         {
             var activity = try self.acquireResolverCatalogActivity(false);
             defer activity.deinit();
@@ -34082,7 +34041,7 @@ pub const DB = struct {
             .sequence = sequence,
             .payload = replay_payload,
         });
-        self.mirrorHAReplayPayloadBestEffort(replay_payload);
+        self.mirrorReplicationReplayPayloadBestEffort(replay_payload);
         self.executor.commitBacklogAdmission(sequence, &backlog_admission);
         return sequence;
     }
@@ -34179,9 +34138,9 @@ pub const DB = struct {
         key: []const u8,
     ) !u64 {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         try self.executor.failIfUnhealthy();
 
         var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
@@ -34233,7 +34192,7 @@ pub const DB = struct {
             .sequence = sequence,
             .payload = replay_payload,
         });
-        self.mirrorHAReplayPayloadBestEffort(replay_payload);
+        self.mirrorReplicationReplayPayloadBestEffort(replay_payload);
         self.executor.commitBacklogAdmission(sequence, &backlog_admission);
         self.core.unlockApply();
         apply_mutex_held = false;
@@ -35171,9 +35130,9 @@ pub const DB = struct {
         var row_policy_lease = self.row_policy_gate.enterRaw() catch return error.RowPolicyUnsupported;
         defer row_policy_lease.release();
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        if (context == null) try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        if (context == null) try self.enforceReplicationWriteGate();
         var structural_guard = self.beginIndexStructuralMutation("index deletion", name);
         defer structural_guard.deinit();
         {
@@ -35280,9 +35239,9 @@ pub const DB = struct {
 
     fn deleteEnrichmentForReconciliation(self: *DB, kind: types.EnrichmentKind, name: []const u8, context: ?@import("artifact_reconcile_intent.zig").Context) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        if (context == null) try self.enforceHAWriteGate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        if (context == null) try self.enforceReplicationWriteGate();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         {
@@ -36509,9 +36468,9 @@ pub const DB = struct {
         if (admission.jobs.len == 0) {
             // Accepted/metadata-only pages need no provider wakeup or empty
             // replay record. Apply the same authority and snapshot fences.
-            var ha_mutation = acquireHAMutationSharedContext(&ctx);
-            defer if (ha_mutation) |*lease| lease.release();
-            try enforceHAWriteGateOptional(ctx.ha_write_gate);
+            var replication_mutation = acquireReplicationMutationSharedContext(&ctx);
+            defer if (replication_mutation) |*lease| lease.release();
+            try enforceReplicationWriteGateOptional(ctx.replication_write_gate);
             var snapshot_replay = try acquireSnapshotReplayContext(&ctx);
             defer if (snapshot_replay) |*lease| lease.release();
             try lockApplyForPortableRuntimeContext(&ctx);
@@ -36536,9 +36495,9 @@ pub const DB = struct {
     pub fn retireArtifactUnitJob(self: *DB, retirement: *const @import("artifact_unit_jobs.zig").Retirement) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var ctx = self.batchContext();
-        var ha_mutation = acquireHAMutationSharedContext(&ctx);
-        defer if (ha_mutation) |*lease| lease.release();
-        try enforceHAWriteGateOptional(ctx.ha_write_gate);
+        var replication_mutation = acquireReplicationMutationSharedContext(&ctx);
+        defer if (replication_mutation) |*lease| lease.release();
+        try enforceReplicationWriteGateOptional(ctx.replication_write_gate);
         var snapshot_replay = try acquireSnapshotReplayContext(&ctx);
         defer if (snapshot_replay) |*lease| lease.release();
         try lockApplyForPortableRuntimeContext(&ctx);
@@ -36584,9 +36543,9 @@ pub const DB = struct {
             }
         }
         var ctx = self.batchContext();
-        var ha_mutation = acquireHAMutationSharedContext(&ctx);
-        defer if (ha_mutation) |*lease| lease.release();
-        try enforceHAWriteGateOptional(ctx.ha_write_gate);
+        var replication_mutation = acquireReplicationMutationSharedContext(&ctx);
+        defer if (replication_mutation) |*lease| lease.release();
+        try enforceReplicationWriteGateOptional(ctx.replication_write_gate);
         var snapshot_replay = try acquireSnapshotReplayContext(&ctx);
         defer if (snapshot_replay) |*lease| lease.release();
         try lockApplyForPortableRuntimeContext(&ctx);
@@ -42135,13 +42094,13 @@ pub const DB = struct {
     /// Private provisioners call this before cache adoption, after installing
     /// the durable reservation. Initial empty schema/index admission must not
     /// emit an HA mutation before its owner authorization exists.
-    pub fn attachRestoreStagingHAMirror(self: *DB, mirror: ?HAAsyncEffectMirror) !void {
+    pub fn attachRestoreStagingReplicationMirror(self: *DB, mirror: ?ReplicationAsyncEffectMirror) !void {
         if (!self.restore_staging_required.load(.acquire)) return error.RestoreStagingScopeChanged;
         if (mirror != null and self.core.table_catalog.row_policy_phase != .disabled)
             return error.RowPolicyUnsupported;
-        self.ha_async_batch_mirror = mirror;
-        self.ha_async_effect_mirror = mirror;
-        self.ha_async_metadata_mirror = mirror;
+        self.replication_async_batch_mirror = mirror;
+        self.replication_async_effect_mirror = mirror;
+        self.replication_async_metadata_mirror = mirror;
     }
 
     /// Retryable owner-side repair for a crash after an import page committed
@@ -42426,20 +42385,20 @@ pub const DB = struct {
         try txn.commit();
     }
 
-    fn encodeRestoreStagingHAPayload(self: *DB, req: types.BatchRequest, raft_entry: ?RaftAppliedEntryIdentity) ![]u8 {
+    fn encodeRestoreStagingReplicationPayload(self: *DB, req: types.BatchRequest, raft_entry: ?RaftAppliedEntryIdentity) ![]u8 {
         const staging = @import("restore_staging.zig");
         if (req.restore_staging.? == .install_generation_admissions)
-            return ha_effects_mod.encodeRestoreGenerationAdmissionMutationRequestAlloc(self.alloc, req, raft_entry orelse return error.InvalidRestoreStagingCommand);
+            return replication_effects_mod.encodeRestoreGenerationAdmissionMutationRequestAlloc(self.alloc, req, raft_entry orelse return error.InvalidRestoreStagingCommand);
         if (req.restore_staging.? == .begin) {
             const stored = try self.core.getStoreValue(self.alloc, staging.bootstrap_key);
             defer if (stored) |bytes| self.alloc.free(bytes);
             if (stored) |bytes| {
                 var descriptor = try staging.OwnerBootstrap.decode(self.alloc, bytes);
                 defer descriptor.deinit();
-                return ha_effects_mod.encodeBatchMutationWithRestoreBootstrapAlloc(self.alloc, req, descriptor.value);
+                return replication_effects_mod.encodeBatchMutationWithRestoreBootstrapAlloc(self.alloc, req, descriptor.value);
             }
         }
-        return ha_effects_mod.encodeBatchMutationRequestAlloc(self.alloc, req);
+        return replication_effects_mod.encodeBatchMutationRequestAlloc(self.alloc, req);
     }
 
     /// An exact replicated completion receipt may survive a crash before its
@@ -42466,8 +42425,8 @@ pub const DB = struct {
         alloc: Allocator,
         command: @import("restore_staging_contract.zig").InstallGenerationAdmissions,
         marker: ?RaftAppliedEntryIdentity,
-        ha_lsn: ?u64,
-        ha_payload: ?[]const u8,
+        replication_lsn: ?u64,
+        replication_payload: ?[]const u8,
     ) !@import("restore_staging_contract.zig").GenerationAdmissionReceipt {
         const contract = @import("restore_staging_contract.zig");
         const entry = marker orelse return error.InvalidRestoreStagingCommand;
@@ -42504,12 +42463,12 @@ pub const DB = struct {
         var marker_bytes: [raft_applied_entry_value_len]u8 = undefined;
         const applied = raftAppliedEntryWrite(entry, &marker_bytes);
         try txn.put(applied.key, applied.value);
-        if (ha_lsn) |lsn| {
-            var lsn_bytes: [ha_applied_lsn_value_len]u8 = undefined;
-            const replicated = haAppliedReplicationLsnWrite(lsn, &lsn_bytes);
+        if (replication_lsn) |lsn| {
+            var lsn_bytes: [replication_applied_lsn_value_len]u8 = undefined;
+            const replicated = replicationAppliedSequenceWrite(lsn, &lsn_bytes);
             try txn.put(replicated.key, replicated.value);
         }
-        try self.stageRestoreStagingHAOutbox(&txn, ha_payload);
+        try self.stageRestoreStagingReplicationOutbox(&txn, replication_payload);
         try txn.commit();
         txn_open = false;
         try self.core.store.sync(true);
@@ -42525,37 +42484,37 @@ pub const DB = struct {
         // receipt before its projection watermark was durable. Repair one
         // bounded local slice on EVERY committed-control retry; no optional
         // worker or leader RPC is required, and no apply lock is held here.
-        if (opts.raft_applied_entry_marker != null or opts.ha_applied_lsn_marker != null) {
+        if (opts.raft_applied_entry_marker != null or opts.replication_applied_lsn_marker != null) {
             if (req.restore_staging.? == .finish and (req.restore_staging.?.finish.phase == .validated or req.restore_staging.?.finish.phase == .published)) {
                 if (!try self.prepareRestoreStagingIndexesStepLocal(self.alloc, req.restore_staging.?.finish.scope, true)) return error.RestoreProjectionCatchUpPending;
             }
         }
-        var mutation = if (opts.bypass_ha_write_gate) null else self.acquireHAMutationShared();
+        var mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
         defer if (mutation) |*lease| lease.release();
-        if (!opts.bypass_ha_write_gate) {
-            try self.enforceHAWriteGate();
-            try self.ensureDurableHAStartupBarrier();
-            try self.flushDurableHAOutboxes();
-            try self.preflightHABatchSyncCommit();
+        if (!opts.bypass_replication_write_gate) {
+            try self.enforceReplicationWriteGate();
+            try self.ensureDurableReplicationStartupBarrier();
+            try self.flushDurableReplicationOutboxes();
+            try self.preflightReplicationBatchSyncCommit();
         }
-        const payload = if (!opts.bypass_ha_write_gate and self.ha_async_batch_mirror != null)
-            try self.encodeRestoreStagingHAPayload(req, opts.raft_applied_entry_marker)
+        const payload = if (!opts.bypass_replication_write_gate and self.replication_async_batch_mirror != null)
+            try self.encodeRestoreStagingReplicationPayload(req, opts.raft_applied_entry_marker)
         else
             null;
         defer if (payload) |bytes| self.alloc.free(bytes);
         switch (req.restore_staging.?) {
-            .begin => |scope| try self.beginRestoreStagingWithMarker(self.alloc, scope, opts.raft_applied_entry_marker, opts.ha_applied_lsn_marker, payload),
-            .finish => |finish| _ = try self.finishRestoreStagingWithMarker(self.alloc, finish.scope, finish.phase, opts.raft_applied_entry_marker, opts.ha_applied_lsn_marker, payload),
-            .install_generation_admissions => |install| _ = try self.installRestoreGenerationAdmissionsWithMarker(self.alloc, install, opts.raft_applied_entry_marker, opts.ha_applied_lsn_marker, payload),
+            .begin => |scope| try self.beginRestoreStagingWithMarker(self.alloc, scope, opts.raft_applied_entry_marker, opts.replication_applied_lsn_marker, payload),
+            .finish => |finish| _ = try self.finishRestoreStagingWithMarker(self.alloc, finish.scope, finish.phase, opts.raft_applied_entry_marker, opts.replication_applied_lsn_marker, payload),
+            .install_generation_admissions => |install| _ = try self.installRestoreGenerationAdmissionsWithMarker(self.alloc, install, opts.raft_applied_entry_marker, opts.replication_applied_lsn_marker, payload),
             .import_page, .rewrite_page => unreachable,
         }
-        if (payload != null) try self.flushDurableHAOutboxes();
+        if (payload != null) try self.flushDurableReplicationOutboxes();
     }
 
     /// Authenticated HA resolution records carry final native effects, not
     /// participant commands. They may touch only this hidden owner's current
     /// claims/coverage; primary rows enter exclusively through import controls.
-    fn validateRestoreStagingHAEffects(self: *DB, alloc: Allocator, txn: anytype, req: types.BatchRequest) !void {
+    fn validateRestoreStagingReplicationEffects(self: *DB, alloc: Allocator, txn: anytype, req: types.BatchRequest) !void {
         if (req.relational_index_maintenance != null) return error.InvalidRestoreStagingCommand;
         const integrity = @import("relational_integrity.zig");
         const activation = @import("relational_integrity_activation.zig");
@@ -42592,7 +42551,7 @@ pub const DB = struct {
     /// as participant intents. Only the authenticated HA entrypoint supplies
     /// the applied-LSN capability. Recheck protected effects against this
     /// owner's immutable catalog; this is not an ordinary batch escape hatch.
-    fn validateLiveHAIntegrityEffects(self: *DB, alloc: Allocator, txn: anytype, req: types.BatchRequest) !void {
+    fn validateLiveReplicationIntegrityEffects(self: *DB, alloc: Allocator, txn: anytype, req: types.BatchRequest) !void {
         const integrity = @import("relational_integrity.zig");
         const activation = @import("relational_integrity_activation.zig");
         const retirement = @import("relational_integrity_retirement.zig");
@@ -42655,21 +42614,21 @@ pub const DB = struct {
         }
     }
 
-    fn stageRestoreStagingHAOutbox(self: *DB, txn: anytype, payload: ?[]const u8) !void {
+    fn stageRestoreStagingReplicationOutbox(self: *DB, txn: anytype, payload: ?[]const u8) !void {
         const bytes = payload orelse return;
-        const mirror = self.ha_async_batch_mirror orelse return error.HAMirrorUnavailable;
+        const mirror = self.replication_async_batch_mirror orelse return error.HAMirrorUnavailable;
         const from_lsn = mirror.publisher.nextLsn();
-        const encoded = try encodeDurableHAOutboxAlloc(self.alloc, from_lsn, bytes);
+        const encoded = try encodeDurableReplicationOutboxAlloc(self.alloc, from_lsn, bytes);
         defer self.alloc.free(encoded);
-        const outbox_key = try durableHAOutboxKeyAlloc(self.alloc, .restore_batch, from_lsn, self.core.root_generation, bytes);
+        const outbox_key = try durableReplicationOutboxKeyAlloc(self.alloc, .restore_batch, from_lsn, self.core.root_generation, bytes);
         defer self.alloc.free(outbox_key);
         try txn.put(outbox_key, encoded);
         // A failed transaction may leave a false positive, which the bounded
         // outbox scan clears. Never expose a committed obligation as absent.
-        self.durable_ha_outbox_maybe.store(true, .release);
+        self.durable_replication_outbox_maybe.store(true, .release);
     }
 
-    fn beginRestoreStagingWithMarker(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Scope, marker: ?RaftAppliedEntryIdentity, ha_lsn: ?u64, ha_payload: ?[]const u8) !void {
+    fn beginRestoreStagingWithMarker(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Scope, marker: ?RaftAppliedEntryIdentity, replication_lsn: ?u64, replication_payload: ?[]const u8) !void {
         const staging = @import("restore_staging.zig");
         try scope.validate();
         if (!scope.target_namespace.eql(self.core.identity_namespace)) return error.RestoreStagingScopeChanged;
@@ -42694,18 +42653,18 @@ pub const DB = struct {
             } else {
                 if (!std.mem.eql(u8, &scope.digest(), &existing.value.scope.digest())) return error.RestoreStagingScopeChanged;
                 if (existing.value.phase == .canceled) return error.RestoreStagingCanceled;
-                if (marker != null or ha_lsn != null or ha_payload != null) {
+                if (marker != null or replication_lsn != null or replication_payload != null) {
                     if (marker) |entry| {
                         var buffer: [raft_applied_entry_value_len]u8 = undefined;
                         const write = raftAppliedEntryWrite(entry, &buffer);
                         try txn.put(write.key, write.value);
                     }
-                    if (ha_lsn) |lsn| {
-                        var buffer: [ha_applied_lsn_value_len]u8 = undefined;
-                        const write = haAppliedReplicationLsnWrite(lsn, &buffer);
+                    if (replication_lsn) |lsn| {
+                        var buffer: [replication_applied_lsn_value_len]u8 = undefined;
+                        const write = replicationAppliedSequenceWrite(lsn, &buffer);
                         try txn.put(write.key, write.value);
                     }
-                    try self.stageRestoreStagingHAOutbox(&txn, ha_payload);
+                    try self.stageRestoreStagingReplicationOutbox(&txn, replication_payload);
                     try txn.commit();
                     txn_open = false;
                 }
@@ -42790,10 +42749,10 @@ pub const DB = struct {
         const initial = try (staging.Progress{ .scope = scope, .phase = if (scope.empty_generation) .imported else .importing, .source_generation_proofs_complete = !source_proofs_required, .rewrite = if (scope.rewrite) |rewrite| .{ .sequence = rewrite.retained_start } else null }).encode(alloc);
         defer alloc.free(initial);
         try txn.put(staging.key, initial);
-        try self.stageRestoreStagingHAOutbox(&txn, ha_payload);
-        if (ha_lsn) |lsn| {
-            var buffer: [ha_applied_lsn_value_len]u8 = undefined;
-            const write = haAppliedReplicationLsnWrite(lsn, &buffer);
+        try self.stageRestoreStagingReplicationOutbox(&txn, replication_payload);
+        if (replication_lsn) |lsn| {
+            var buffer: [replication_applied_lsn_value_len]u8 = undefined;
+            const write = replicationAppliedSequenceWrite(lsn, &buffer);
             try txn.put(write.key, write.value);
         }
         if (marker) |entry| {
@@ -43122,7 +43081,7 @@ pub const DB = struct {
         return self.finishRestoreStagingWithMarker(alloc, scope, phase, null, null, null);
     }
 
-    fn finishRestoreStagingWithMarker(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Digest, phase: @import("restore_staging.zig").Phase, marker: ?RaftAppliedEntryIdentity, ha_lsn: ?u64, ha_payload: ?[]const u8) !@import("restore_staging.zig").Digest {
+    fn finishRestoreStagingWithMarker(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Digest, phase: @import("restore_staging.zig").Phase, marker: ?RaftAppliedEntryIdentity, replication_lsn: ?u64, replication_payload: ?[]const u8) !@import("restore_staging.zig").Digest {
         const staging = @import("restore_staging.zig");
         if (phase != .validated and phase != .published and phase != .canceled) return error.InvalidRestoreStagingCommand;
         try self.lockApplyForPortableRuntime();
@@ -43150,20 +43109,20 @@ pub const DB = struct {
         if ((phase == .validated or phase == .published) and
             (next.phase == .imported or next.phase == .validated or next.phase == .published) and
             !try self.restoreStagingIndexesReadyAssumeApply(alloc))
-            return if (marker != null or ha_lsn != null) error.RestoreProjectionCatchUpPending else error.IndexRebuilding;
+            return if (marker != null or replication_lsn != null) error.RestoreProjectionCatchUpPending else error.IndexRebuilding;
         if (next.phase == phase) {
-            if (marker != null or ha_lsn != null or ha_payload != null) {
+            if (marker != null or replication_lsn != null or replication_payload != null) {
                 if (marker) |entry| {
                     var buffer: [raft_applied_entry_value_len]u8 = undefined;
                     const write = raftAppliedEntryWrite(entry, &buffer);
                     try txn.put(write.key, write.value);
                 }
-                if (ha_lsn) |lsn| {
-                    var buffer: [ha_applied_lsn_value_len]u8 = undefined;
-                    const write = haAppliedReplicationLsnWrite(lsn, &buffer);
+                if (replication_lsn) |lsn| {
+                    var buffer: [replication_applied_lsn_value_len]u8 = undefined;
+                    const write = replicationAppliedSequenceWrite(lsn, &buffer);
                     try txn.put(write.key, write.value);
                 }
-                try self.stageRestoreStagingHAOutbox(&txn, ha_payload);
+                try self.stageRestoreStagingReplicationOutbox(&txn, replication_payload);
                 try txn.commit();
                 txn_open = false;
             }
@@ -43188,11 +43147,11 @@ pub const DB = struct {
                 defer view.release();
                 if (view.validator()) |validator| if (validator.execution.checks != null) switch ((try relational_constraint_jobs.status(&txn, view)).state) {
                     .enforced => {},
-                    .validating => return if (marker != null or ha_lsn != null) error.RestoreProjectionCatchUpPending else error.ConstraintActivationInProgress,
-                    .invalid => return if (marker != null or ha_lsn != null) error.RestoreProjectionCorrupt else error.RelationalCheckViolation,
+                    .validating => return if (marker != null or replication_lsn != null) error.RestoreProjectionCatchUpPending else error.ConstraintActivationInProgress,
+                    .invalid => return if (marker != null or replication_lsn != null) error.RestoreProjectionCorrupt else error.RelationalCheckViolation,
                 };
             }
-            if (!try self.restoreStagingIndexesReadyAssumeApply(alloc)) return if (marker != null or ha_lsn != null) error.RestoreProjectionCatchUpPending else error.IndexRebuilding;
+            if (!try self.restoreStagingIndexesReadyAssumeApply(alloc)) return if (marker != null or replication_lsn != null) error.RestoreProjectionCatchUpPending else error.IndexRebuilding;
             // Hidden physical indexes were created empty before import and
             // receive the same PreparedRow writes. Seal their durable state
             // before acknowledging this owner's completion receipt.
@@ -43211,10 +43170,10 @@ pub const DB = struct {
         const encoded = try next.encode(alloc);
         defer alloc.free(encoded);
         try txn.put(staging.key, encoded);
-        try self.stageRestoreStagingHAOutbox(&txn, ha_payload);
-        if (ha_lsn) |lsn| {
-            var buffer: [ha_applied_lsn_value_len]u8 = undefined;
-            const write = haAppliedReplicationLsnWrite(lsn, &buffer);
+        try self.stageRestoreStagingReplicationOutbox(&txn, replication_payload);
+        if (replication_lsn) |lsn| {
+            var buffer: [replication_applied_lsn_value_len]u8 = undefined;
+            const write = replicationAppliedSequenceWrite(lsn, &buffer);
             try txn.put(write.key, write.value);
         }
         if (marker) |entry| {
@@ -62100,33 +62059,33 @@ fn storeHasUserDataBounded(store: *docstore_mod.DocStore) !bool {
 /// A physical maintenance mutation and its HA delivery obligation are one
 /// primary transaction. Projection replay alone cannot certify these effects.
 /// Every configured mirror uses a durable outbox, including asynchronous HA.
-const PrimaryHAEffect = struct {
+const PrimaryReplicationEffect = struct {
     payload: ?[]u8 = null,
     key: ?[]u8 = null,
     value: ?[]u8 = null,
 
     fn prepare(ctx: *const BatchExecutionContext, writes: []const docstore_mod.KVPair, deletes: []const []const u8, replay: []const u8) !@This() {
-        const mirror = ctx.ha_async_effect_mirror orelse return .{};
-        if (ctx.async_context) |async_ctx| if (async_ctx.primary_ha_append_pending.load(.acquire)) return error.HAMirrorUnavailable;
-        try preflightHAMirrorSyncCommitContext(ctx, mirror);
-        const payload = try ha_effects_mod.primary_effect.encodeAlloc(ctx.alloc, writes, deletes, replay);
+        const mirror = ctx.replication_async_effect_mirror orelse return .{};
+        if (ctx.async_context) |async_ctx| if (async_ctx.primary_replication_append_pending.load(.acquire)) return error.HAMirrorUnavailable;
+        try preflightReplicationMirrorSyncCommitContext(ctx, mirror);
+        const payload = try replication_effects_mod.primary_effect.encodeAlloc(ctx.alloc, writes, deletes, replay);
         return prepareEncoded(ctx, payload);
     }
 
-    fn prepareGraphRetirement(ctx: *const BatchExecutionContext, retirement: ha_effects_mod.primary_effect.GraphRetirement, replay: []const u8) !@This() {
-        const mirror = ctx.ha_async_effect_mirror orelse return .{};
-        try enforceHAWriteGateContext(ctx);
-        try preflightHAMirrorSyncCommitContext(ctx, mirror);
-        return prepareEncoded(ctx, try ha_effects_mod.primary_effect.encodeGraphRetirementAlloc(ctx.alloc, retirement, replay));
+    fn prepareGraphRetirement(ctx: *const BatchExecutionContext, retirement: replication_effects_mod.primary_effect.GraphRetirement, replay: []const u8) !@This() {
+        const mirror = ctx.replication_async_effect_mirror orelse return .{};
+        try enforceReplicationWriteGateContext(ctx);
+        try preflightReplicationMirrorSyncCommitContext(ctx, mirror);
+        return prepareEncoded(ctx, try replication_effects_mod.primary_effect.encodeGraphRetirementAlloc(ctx.alloc, retirement, replay));
     }
 
     fn prepareEncoded(ctx: *const BatchExecutionContext, payload: []u8) !@This() {
         errdefer ctx.alloc.free(payload);
-        const mirror = ctx.ha_async_effect_mirror orelse return error.HAMirrorUnavailable;
+        const mirror = ctx.replication_async_effect_mirror orelse return error.HAMirrorUnavailable;
         const from_lsn = mirror.publisher.nextLsn();
-        const key = try durableHAOutboxKeyAlloc(ctx.alloc, .primary_effect, from_lsn, ctx.root_generation, payload);
+        const key = try durableReplicationOutboxKeyAlloc(ctx.alloc, .primary_effect, from_lsn, ctx.root_generation, payload);
         errdefer ctx.alloc.free(key);
-        const value = try encodeDurableHAOutboxAlloc(ctx.alloc, from_lsn, payload);
+        const value = try encodeDurableReplicationOutboxAlloc(ctx.alloc, from_lsn, payload);
         return .{ .payload = payload, .key = key, .value = value };
     }
 
@@ -62139,19 +62098,19 @@ const PrimaryHAEffect = struct {
     fn stage(self: *const @This(), ctx: *const BatchExecutionContext, writes: *std.ArrayListUnmanaged(docstore_mod.KVPair)) !void {
         if (self.key) |key| {
             try writes.append(ctx.alloc, .{ .key = key, .value = self.value.? });
-            if (ctx.async_context) |async_ctx| async_ctx.primary_ha_outbox_pending.store(true, .release);
+            if (ctx.async_context) |async_ctx| async_ctx.primary_replication_outbox_pending.store(true, .release);
         }
     }
 
-    fn appendLocked(self: *const @This(), ctx: *const BatchExecutionContext) !?HADeferredCommitGate {
+    fn appendLocked(self: *const @This(), ctx: *const BatchExecutionContext) !?ReplicationDeferredCommitGate {
         const payload = self.payload orelse return null;
-        const mirror = ctx.ha_async_effect_mirror orelse return error.HAMirrorUnavailable;
+        const mirror = ctx.replication_async_effect_mirror orelse return error.HAMirrorUnavailable;
         lockAtomic(ctx.log_mutex);
         defer ctx.log_mutex.*.unlock();
         // A failed append keeps the outbox, even under asynchronous policy.
         const lsn = mirror.publisher.publish(mirror, .primary_effect, payload, ctx.identity_namespace) catch |err| {
-            if (ctx.async_context) |async_ctx| async_ctx.primary_ha_append_pending.store(true, .release);
-            noteHAMirrorFailure(mirror, "primary effect", err);
+            if (ctx.async_context) |async_ctx| async_ctx.primary_replication_append_pending.store(true, .release);
+            noteReplicationMirrorFailure(mirror, "primary effect", err);
             return err;
         };
         if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
@@ -62168,9 +62127,9 @@ const PrimaryHAEffect = struct {
 
 fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: []const []const u8, sync_level: types.SyncLevel, ttl_guard: ?TtlDeleteGuard) !u32 {
     if (candidate_keys.len == 0) return 0;
-    var ha_mutation = acquireHAMutationSharedContext(ctx);
-    defer if (ha_mutation) |*lease| lease.release();
-    try enforceHAWriteGateContext(ctx);
+    var replication_mutation = acquireReplicationMutationSharedContext(ctx);
+    defer if (replication_mutation) |*lease| lease.release();
+    try enforceReplicationWriteGateContext(ctx);
     var snapshot_mutation = acquireSnapshotMutationContext(ctx);
     defer if (snapshot_mutation) |*lease| lease.release();
     try lockApplyForPortableRuntimeContext(ctx);
@@ -62183,7 +62142,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
     // Expiration is a real write, not an exemption from transaction guards.
     // Check under the same apply fence as deletion. A locked parent must not
     // prevent unrelated expired rows in this bounded page from progressing.
-    try enforceHAWriteGateContext(ctx);
+    try enforceReplicationWriteGateContext(ctx);
     {
         var lifecycle = try ctx.store.beginReadTxn();
         defer lifecycle.abort();
@@ -62433,7 +62392,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
     }
     const replay_payload = try encodeChangeRecordPayload(ctx, derived_batch, sequence);
     defer ctx.alloc.free(replay_payload);
-    var primary_ha = try PrimaryHAEffect.prepare(ctx, store_writes.items, delete_keys.items, replay_payload);
+    var primary_ha = try PrimaryReplicationEffect.prepare(ctx, store_writes.items, delete_keys.items, replay_payload);
     defer primary_ha.deinit(ctx.alloc);
     try primary_ha.stage(ctx, &store_writes);
     var backlog_admission = try ctx.executor.admitBacklogBytes(@intCast(replay_payload.len));
@@ -62448,16 +62407,16 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
     if (pending_identity_visibility_summary) |summary| {
         if (ctx.identity_visibility) |visibility| visibility.publish(summary);
     }
-    var deferred_ha_gates = HADeferredCommitGates.begin(haTransitionMutexFromContext(ctx));
-    defer deferred_ha_gates.releaseTransition();
-    deferred_ha_gates.append(try primary_ha.appendLocked(ctx));
+    var deferred_replication_gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(ctx));
+    defer deferred_replication_gates.releaseTransition();
+    deferred_replication_gates.append(try primary_ha.appendLocked(ctx));
     ctx.apply_mutex.unlockExclusive();
     apply_mutex_held = false;
     if (snapshot_mutation) |*lease| lease.release();
     snapshot_mutation = null;
     DB.notifyQueryVisibilityTargetAdvancedScopedContext(ctx, sequence, sync_targets);
-    releaseHAMutationShared(&ha_mutation);
-    try deferred_ha_gates.waitForDurabilityAndAuthority(ctx.ha_write_gate);
+    releaseReplicationMutationShared(&replication_mutation);
+    try deferred_replication_gates.waitForDurabilityAndAuthority(ctx.replication_write_gate);
     try primary_ha.clear(ctx);
     try markPrecomputedEnrichmentAppliedForSyncContext(ctx, sync_level, sequence);
     try applyDerivedBacklogPressureContext(ctx, sequence, sync_level, sync_targets);
@@ -62713,9 +62672,9 @@ fn expireDirectGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: 
         !internal_keys.matchesGraphEdgeIndexName(candidate.artifact_key, candidate.index_name) or
         candidate.generation == 0 or candidate.deadline_ns == 0)
         return error.InvalidGraphTtlCandidate;
-    var ha_mutation = acquireHAMutationSharedContext(ctx);
-    defer if (ha_mutation) |*lease| lease.release();
-    try enforceHAWriteGateContext(ctx);
+    var replication_mutation = acquireReplicationMutationSharedContext(ctx);
+    defer if (replication_mutation) |*lease| lease.release();
+    try enforceReplicationWriteGateContext(ctx);
     var snapshot_mutation = acquireSnapshotMutationContext(ctx);
     defer if (snapshot_mutation) |*lease| lease.release();
     try lockApplyForPortableRuntimeContext(ctx);
@@ -62723,7 +62682,7 @@ fn expireDirectGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: 
     errdefer if (apply_mutex_held) ctx.apply_mutex.unlockExclusive();
     var graph_publication = ctx.index_manager.beginGraphPrimaryMutation();
     defer graph_publication.release();
-    try enforceHAWriteGateContext(ctx);
+    try enforceReplicationWriteGateContext(ctx);
     const graph_entry = ctx.index_manager.graphIndex(candidate.index_name) orelse {
         ctx.apply_mutex.unlockExclusive();
         return false;
@@ -62790,7 +62749,7 @@ fn expireDirectGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: 
     derived_batch.sequence = sequence;
     const replay_payload = try encodeChangeRecordPayload(ctx, derived_batch, sequence);
     defer ctx.alloc.free(replay_payload);
-    var primary_ha = try PrimaryHAEffect.prepare(ctx, &.{}, &.{ candidate.artifact_key, due_key }, replay_payload);
+    var primary_ha = try PrimaryReplicationEffect.prepare(ctx, &.{}, &.{ candidate.artifact_key, due_key }, replay_payload);
     defer primary_ha.deinit(ctx.alloc);
     var primary_writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty;
     defer primary_writes.deinit(ctx.alloc);
@@ -62825,16 +62784,16 @@ fn expireDirectGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: 
     };
     graph_publication.release();
     ctx.executor.commitBacklogAdmission(sequence, &backlog_admission);
-    var deferred_ha_gates = HADeferredCommitGates.begin(haTransitionMutexFromContext(ctx));
-    defer deferred_ha_gates.releaseTransition();
-    deferred_ha_gates.append(try primary_ha.appendLocked(ctx));
+    var deferred_replication_gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(ctx));
+    defer deferred_replication_gates.releaseTransition();
+    deferred_replication_gates.append(try primary_ha.appendLocked(ctx));
     ctx.apply_mutex.unlockExclusive();
     apply_mutex_held = false;
     if (snapshot_mutation) |*lease| lease.release();
     snapshot_mutation = null;
     DB.notifyQueryVisibilityTargetAdvancedScopedContext(ctx, sequence, sync_targets);
-    releaseHAMutationShared(&ha_mutation);
-    try deferred_ha_gates.waitForDurabilityAndAuthority(ctx.ha_write_gate);
+    releaseReplicationMutationShared(&replication_mutation);
+    try deferred_replication_gates.waitForDurabilityAndAuthority(ctx.replication_write_gate);
     try primary_ha.clear(ctx);
     try applyDerivedBacklogPressureContext(ctx, sequence, .full_index, sync_targets);
     if (ctx.executor.hasWorkers()) {
@@ -62857,9 +62816,9 @@ fn expireGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: GraphT
         !internal_keys.matchesGraphEdgeIndexName(candidate.edge_key, candidate.index_name) or
         candidate.generation == 0 or candidate.deadline_ns == 0)
         return error.InvalidGraphTtlCandidate;
-    var ha_mutation = acquireHAMutationSharedContext(ctx);
-    defer if (ha_mutation) |*lease| lease.release();
-    try enforceHAWriteGateContext(ctx);
+    var replication_mutation = acquireReplicationMutationSharedContext(ctx);
+    defer if (replication_mutation) |*lease| lease.release();
+    try enforceReplicationWriteGateContext(ctx);
     var snapshot_mutation = acquireSnapshotMutationContext(ctx);
     defer if (snapshot_mutation) |*lease| lease.release();
     try lockApplyForPortableRuntimeContext(ctx);
@@ -62867,7 +62826,7 @@ fn expireGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: GraphT
     errdefer if (apply_mutex_held) ctx.apply_mutex.unlockExclusive();
     var graph_publication = ctx.index_manager.beginGraphPrimaryMutation();
     defer graph_publication.release();
-    try enforceHAWriteGateContext(ctx);
+    try enforceReplicationWriteGateContext(ctx);
 
     const graph_entry = ctx.index_manager.graphIndex(candidate.index_name) orelse {
         ctx.apply_mutex.unlockExclusive();
@@ -63028,7 +62987,7 @@ fn expireGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: GraphT
     derived_batch.sequence = sequence;
     const replay_payload = try encodeChangeRecordPayload(ctx, derived_batch, sequence);
     defer ctx.alloc.free(replay_payload);
-    var primary_ha = try PrimaryHAEffect.prepareGraphRetirement(ctx, .{ .candidate = candidate, .source_digest = source_digest }, replay_payload);
+    var primary_ha = try PrimaryReplicationEffect.prepareGraphRetirement(ctx, .{ .candidate = candidate, .source_digest = source_digest }, replay_payload);
     defer primary_ha.deinit(ctx.alloc);
     var primary_writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty;
     defer primary_writes.deinit(ctx.alloc);
@@ -63054,16 +63013,16 @@ fn expireGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: GraphT
     };
     graph_publication.release();
     ctx.executor.commitBacklogAdmission(sequence, &backlog_admission);
-    var deferred_ha_gates = HADeferredCommitGates.begin(haTransitionMutexFromContext(ctx));
-    defer deferred_ha_gates.releaseTransition();
-    deferred_ha_gates.append(try primary_ha.appendLocked(ctx));
+    var deferred_replication_gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(ctx));
+    defer deferred_replication_gates.releaseTransition();
+    deferred_replication_gates.append(try primary_ha.appendLocked(ctx));
     ctx.apply_mutex.unlockExclusive();
     apply_mutex_held = false;
     if (snapshot_mutation) |*lease| lease.release();
     snapshot_mutation = null;
     DB.notifyQueryVisibilityTargetAdvancedScopedContext(ctx, sequence, sync_targets);
-    releaseHAMutationShared(&ha_mutation);
-    try deferred_ha_gates.waitForDurabilityAndAuthority(ctx.ha_write_gate);
+    releaseReplicationMutationShared(&replication_mutation);
+    try deferred_replication_gates.waitForDurabilityAndAuthority(ctx.replication_write_gate);
     try primary_ha.clear(ctx);
     try applyDerivedBacklogPressureContext(ctx, sequence, .full_index, sync_targets);
     if (ctx.executor.hasWorkers()) {
@@ -63122,9 +63081,9 @@ fn appendDerivedBatchRecordContextWithAdmissions(ctx: *const BatchExecutionConte
     if (work != null and unit_work != null) return error.InvalidBatchRequest;
     var sync_targets = try collectManagedSyncTargets(ctx.alloc, ctx.index_manager, batch);
     defer sync_targets.deinit(ctx.alloc);
-    var ha_mutation = acquireHAMutationSharedContext(ctx);
-    defer if (ha_mutation) |*lease| lease.release();
-    try enforceHAWriteGateContext(ctx);
+    var replication_mutation = acquireReplicationMutationSharedContext(ctx);
+    defer if (replication_mutation) |*lease| lease.release();
+    try enforceReplicationWriteGateContext(ctx);
     var snapshot_replay = try acquireSnapshotReplayContext(ctx);
     defer if (snapshot_replay) |*lease| lease.release();
     try lockApplyForPortableRuntimeContext(ctx);
@@ -63138,7 +63097,7 @@ fn appendDerivedBatchRecordContextWithAdmissions(ctx: *const BatchExecutionConte
         if (required.admission.jobs.len == 0 or batch.generated_enrichment_refs.len != 1 or
             !std.mem.eql(u8, batch.generated_enrichment_refs[0].doc_key, required.admission.page.document)) return error.InvalidBatchRequest;
     }
-    try enforceHAWriteGateContext(ctx);
+    try enforceReplicationWriteGateContext(ctx);
     const sequence = ctx.store.reserveNextReplaySequence(1);
     const payload = try encodeChangeRecordPayload(ctx, batch, sequence);
     defer ctx.alloc.free(payload);
@@ -63176,23 +63135,23 @@ fn appendDerivedBatchRecordContextWithAdmissions(ctx: *const BatchExecutionConte
         _ = try ctx.store.putBatchWithPromotionsReplayAndBuiltWrite(ctx.io, &.{}, &.{}, &.{}, .{ .sequence = sequence, .payload = payload }, null, .{ .ptr = &guard, .validate = Guard.validate });
     } else try appendReplayWithArtifactSourceRevisionsContext(ctx, payload, sequence);
     ctx.executor.commitBacklogAdmission(sequence, &backlog_admission);
-    var deferred_ha_gates = HADeferredCommitGates.begin(haTransitionMutexFromContext(ctx));
-    defer deferred_ha_gates.releaseTransition();
-    deferred_ha_gates.append(try appendHAReplayPayloadCommitLockedContext(ctx, payload));
+    var deferred_replication_gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(ctx));
+    defer deferred_replication_gates.releaseTransition();
+    deferred_replication_gates.append(try appendReplicationReplayPayloadCommitLockedContext(ctx, payload));
     ctx.apply_mutex.unlockExclusive();
     apply_mutex_held = false;
     if (snapshot_replay) |*lease| lease.release();
     snapshot_replay = null;
     DB.notifyQueryVisibilityTargetAdvancedScopedContext(ctx, sequence, sync_targets);
-    releaseHAMutationShared(&ha_mutation);
-    try deferred_ha_gates.waitForDurabilityAndAuthority(ctx.ha_write_gate);
+    releaseReplicationMutationShared(&replication_mutation);
+    try deferred_replication_gates.waitForDurabilityAndAuthority(ctx.replication_write_gate);
     return sequence;
 }
 
 /// Apply a primary-certified retirement to this replica's materialized view.
 /// Only the source revision is authoritative; local progress determines the
 /// count delta and fallback winner. No wall-clock TTL decision is repeated.
-fn prepareReplicatedGraphRetirement(ctx: *const BatchExecutionContext, retirement: ha_effects_mod.primary_effect.GraphRetirement) !GraphContenderMutation {
+fn prepareReplicatedGraphRetirement(ctx: *const BatchExecutionContext, retirement: replication_effects_mod.primary_effect.GraphRetirement) !GraphContenderMutation {
     const candidate = retirement.candidate;
     const entry = ctx.index_manager.graphIndex(candidate.index_name) orelse return error.IndexNotFound;
     if (entry.config.coverage_generation != candidate.generation or entry.ttl_duration_ns == 0) return error.InvalidGraphTtlCandidate;
@@ -63226,7 +63185,7 @@ fn prepareReplicatedGraphRetirement(ctx: *const BatchExecutionContext, retiremen
     return prepareGraphContenderReconcilePage(ctx.alloc, &.{candidate.edge_key}, &reconciled, &.{.{ .key = tombstone_key, .value = &tombstone }}, &.{ lifetime_key, due_key });
 }
 
-fn appendReplicatedHADerivedEffectContext(ctx: *const BatchExecutionContext, record: ha_replication_record_mod.RecordView) !u64 {
+fn appendReplicatedDerivedEffectContext(ctx: *const BatchExecutionContext, change: change_journal_mod.Record, primary: ?replication_effects_mod.primary_effect.View, applied_sequence: u64) !u64 {
     var snapshot_mutation = acquireSnapshotMutationContext(ctx);
     defer if (snapshot_mutation) |*lease| lease.release();
     var snapshot_replay = try acquireSnapshotReplayContext(ctx);
@@ -63235,17 +63194,14 @@ fn appendReplicatedHADerivedEffectContext(ctx: *const BatchExecutionContext, rec
     defer ctx.apply_mutex.unlockExclusive();
     // Receipt and authoritative effects commit together. Retrying a delivered
     // effect must never roll back newer contributor state or append replay twice.
-    if (record.lsn != 0 and try readHAAppliedReplicationLsn(ctx.alloc, ctx.store) >= record.lsn) return 0;
-    var primary = if (ha_effects_mod.primary_effect.isPrimaryEffect(record.payload)) try ha_effects_mod.primary_effect.decode(ctx.alloc, record.payload) else null;
-    defer if (primary) |*effect| effect.deinit();
+    if (applied_sequence != 0 and try readReplicationAppliedSequence(ctx.alloc, ctx.store) >= applied_sequence) return 0;
     var graph_publication = if (primary != null and ctx.index_manager.hasGraphIndexes()) ctx.index_manager.beginGraphPrimaryMutation() else null;
     defer if (graph_publication) |*lease| lease.release();
-    var decoded = try ha_effects_mod.decodeDerivedChangeRecord(ctx.alloc, record);
-    defer decoded.deinit();
+    var decoded_record = change;
 
     const sequence = ctx.store.reserveNextReplaySequence(1);
-    decoded.record.sequence = sequence;
-    const payload = try change_journal_mod.encodeRecord(ctx.alloc, decoded.record);
+    decoded_record.sequence = sequence;
+    const payload = try change_journal_mod.encodeRecord(ctx.alloc, decoded_record);
     defer ctx.alloc.free(payload);
 
     var backlog_admission = try ctx.executor.admitBacklogBytes(@intCast(payload.len));
@@ -63283,7 +63239,7 @@ fn appendReplicatedHADerivedEffectContext(ctx: *const BatchExecutionContext, rec
         // Retire its complete local owner state in the same receipt transaction.
         var artifact_deletes: std.ArrayListUnmanaged([]u8) = .empty;
         defer artifact_deletes.deinit(ctx.alloc);
-        for (decoded.record.deleted_doc_keys) |owner| try collectEnrichmentArtifactDeleteKeysForDocContext(ctx.alloc, ctx.store, owner, &deletes, &owned_deletes, &artifact_deletes);
+        for (decoded_record.deleted_doc_keys) |owner| try collectEnrichmentArtifactDeleteKeysForDocContext(ctx.alloc, ctx.store, owner, &deletes, &owned_deletes, &artifact_deletes);
         try appendAssetArtifactSourceIndexMutations(ctx.alloc, &writes, artifact_deletes.items, &deletes, &owned_keys, &owned_values, &owned_deletes);
         try appendRetiredDirectGraphTtlDueDeletes(ctx.alloc, ctx.store, ctx.index_manager, writes.items, deletes.items, &deletes, &owned_deletes);
     }
@@ -63293,8 +63249,8 @@ fn appendReplicatedHADerivedEffectContext(ctx: *const BatchExecutionContext, rec
     for (writes.items) |write| if (std.mem.eql(u8, write.key, table_catalog_mod.key)) {
         catalog = try table_catalog_mod.Catalog.decode(write.value);
     };
-    var marker: [ha_applied_lsn_value_len]u8 = undefined;
-    if (record.lsn != 0) try writes.append(ctx.alloc, haAppliedReplicationLsnWrite(record.lsn, &marker));
+    var marker: [replication_applied_lsn_value_len]u8 = undefined;
+    if (applied_sequence != 0) try writes.append(ctx.alloc, replicationAppliedSequenceWrite(applied_sequence, &marker));
     try ctx.store.putBatchWithReplay(ctx.io, writes.items, deletes.items, .{ .sequence = sequence, .payload = payload });
     if (graph_publication) |*lease| lease.release();
     if (summary) |value| if (ctx.identity_visibility) |visibility| visibility.publish(value);
@@ -63353,11 +63309,11 @@ fn encodeChangeRecordPayloadWithTargetHints(
     return try change_journal_mod.encodeRecord(ctx.alloc, record);
 }
 
-const enforceHAWriteGateOptional = ha_db_commit.enforceHAWriteGateOptional;
+const enforceReplicationWriteGateOptional = replication_commit.enforceReplicationWriteGateOptional;
 
-fn enforceHAWriteGateContext(ctx: *const BatchExecutionContext) !void {
-    try enforceHAWriteGateOptional(ctx.ha_write_gate);
-    if (ctx.async_context) |async_ctx| if (async_ctx.primary_ha_append_pending.load(.acquire)) return error.HAMirrorUnavailable;
+fn enforceReplicationWriteGateContext(ctx: *const BatchExecutionContext) !void {
+    try enforceReplicationWriteGateOptional(ctx.replication_write_gate);
+    if (ctx.async_context) |async_ctx| if (async_ctx.primary_replication_append_pending.load(.acquire)) return error.HAMirrorUnavailable;
 }
 
 fn enforcePortableRuntimeGateOptional(pending: ?*const std.atomic.Value(bool)) !void {
@@ -63386,12 +63342,12 @@ fn lockApplyForPortableRuntimeAsync(ctx: *const AsyncContext) !void {
     try enforcePortableRuntimeGateOptional(&ctx.portable_runtime_activation_pending);
 }
 
-fn haMutationBarrierFromContext(ctx: *const BatchExecutionContext) ?*HAMutationBarrier {
-    var barrier: ?*HAMutationBarrier = null;
+fn replicationMutationBarrierFromContext(ctx: *const BatchExecutionContext) ?*MutationBarrier {
+    var barrier: ?*MutationBarrier = null;
     const mirrors = .{
-        ctx.ha_async_effect_mirror,
-        ctx.ha_async_batch_mirror,
-        ctx.ha_async_metadata_mirror,
+        ctx.replication_async_effect_mirror,
+        ctx.replication_async_batch_mirror,
+        ctx.replication_async_metadata_mirror,
     };
     inline for (mirrors) |maybe_mirror| {
         if (maybe_mirror) |mirror| {
@@ -63407,12 +63363,12 @@ fn haMutationBarrierFromContext(ctx: *const BatchExecutionContext) ?*HAMutationB
     return barrier;
 }
 
-fn acquireHAMutationSharedContext(ctx: *const BatchExecutionContext) ?HAMutationBarrier.SharedLease {
-    const barrier = haMutationBarrierFromContext(ctx) orelse return null;
+fn acquireReplicationMutationSharedContext(ctx: *const BatchExecutionContext) ?MutationBarrier.SharedLease {
+    const barrier = replicationMutationBarrierFromContext(ctx) orelse return null;
     return barrier.acquireShared();
 }
 
-fn releaseHAMutationShared(lease: *?HAMutationBarrier.SharedLease) void {
+fn releaseReplicationMutationShared(lease: *?MutationBarrier.SharedLease) void {
     if (lease.*) |*held| held.release();
     lease.* = null;
 }
@@ -63438,12 +63394,12 @@ fn acquireSnapshotReplayAsyncContext(ctx: *const AsyncContext) !?snapshot_admiss
     return admission.acquireMutation();
 }
 
-fn haTransitionMutexFromContext(ctx: *const BatchExecutionContext) ?*std.atomic.Mutex {
+fn replicationTransitionMutexFromContext(ctx: *const BatchExecutionContext) ?*std.atomic.Mutex {
     var transition_mutex: ?*std.atomic.Mutex = null;
     const mirrors = .{
-        ctx.ha_async_effect_mirror,
-        ctx.ha_async_batch_mirror,
-        ctx.ha_async_metadata_mirror,
+        ctx.replication_async_effect_mirror,
+        ctx.replication_async_batch_mirror,
+        ctx.replication_async_metadata_mirror,
     };
     inline for (mirrors) |maybe_mirror| {
         if (maybe_mirror) |mirror| {
@@ -63459,107 +63415,107 @@ fn haTransitionMutexFromContext(ctx: *const BatchExecutionContext) ?*std.atomic.
     return transition_mutex;
 }
 
-const DurableHAOutboxKind = durable_outbox.Kind;
+const DurableReplicationOutboxKind = durable_outbox.Kind;
 
 /// Finish a crash-left local outbox without appending its non-idempotent
 /// mutation twice. The transition mutex serializes this lookup-and-append with
 /// every normal HA publisher, while `from_lsn` bounds the scan to records that
 /// could belong to this local commit. If retention has removed that boundary,
 /// Primary fails closed instead of guessing and duplicating the mutation.
-fn recoverDurableHAOutboxContext(
+fn recoverDurableReplicationOutboxContext(
     ctx: *const BatchExecutionContext,
-    mirror: HAAsyncEffectMirror,
-    outbox: DurableHAOutbox,
-    kind: DurableHAOutboxKind,
+    mirror: ReplicationAsyncEffectMirror,
+    outbox: DurableReplicationOutbox,
+    kind: DurableReplicationOutboxKind,
 ) !void {
-    try ha_db_commit.recoverDurableOutbox(.{
-        .transition_mutex = haTransitionMutexFromContext(ctx),
+    try replication_commit.recoverDurableOutbox(.{
+        .transition_mutex = replicationTransitionMutexFromContext(ctx),
         .log_mutex = ctx.log_mutex,
         .namespace = ctx.identity_namespace,
-        .write_gate = ctx.ha_write_gate,
+        .write_gate = ctx.replication_write_gate,
     }, mirror, outbox, kind);
 }
 
-fn mirrorHAReplayPayloadBestEffortContext(ctx: *const BatchExecutionContext, payload: []const u8) void {
-    const projected = haCommitContext(ctx);
-    return ha_db_commit.mirrorHAReplayPayloadBestEffortContext(&projected, payload);
+fn mirrorReplicationReplayPayloadBestEffortContext(ctx: *const BatchExecutionContext, payload: []const u8) void {
+    const projected = replicationCommitContext(ctx);
+    return replication_commit.mirrorReplicationReplayPayloadBestEffortContext(&projected, payload);
 }
 
-fn mirrorHAReplayPayloadCommitContext(ctx: *const BatchExecutionContext, payload: []const u8) !void {
-    const projected = haCommitContext(ctx);
-    return try ha_db_commit.mirrorHAReplayPayloadCommitContext(&projected, payload);
+fn mirrorReplicationReplayPayloadCommitContext(ctx: *const BatchExecutionContext, payload: []const u8) !void {
+    const projected = replicationCommitContext(ctx);
+    return try replication_commit.mirrorReplicationReplayPayloadCommitContext(&projected, payload);
 }
 
-fn appendHAReplayPayloadCommitLockedContext(ctx: *const BatchExecutionContext, payload: []const u8) !?HADeferredCommitGate {
-    const projected = haCommitContext(ctx);
-    return try ha_db_commit.appendHAReplayPayloadCommitLockedContext(&projected, payload);
+fn appendReplicationReplayPayloadCommitLockedContext(ctx: *const BatchExecutionContext, payload: []const u8) !?ReplicationDeferredCommitGate {
+    const projected = replicationCommitContext(ctx);
+    return try replication_commit.appendReplicationReplayPayloadCommitLockedContext(&projected, payload);
 }
 
-fn mirrorHABatchMutationBestEffortContext(ctx: *const BatchExecutionContext, request: types.BatchRequest) void {
-    const projected = haCommitContext(ctx);
-    return ha_db_commit.mirrorHABatchMutationBestEffortContext(&projected, request);
+fn mirrorReplicationBatchMutationBestEffortContext(ctx: *const BatchExecutionContext, request: types.BatchRequest) void {
+    const projected = replicationCommitContext(ctx);
+    return replication_commit.mirrorReplicationBatchMutationBestEffortContext(&projected, request);
 }
 
-fn mirrorHABatchMutationCommitContext(ctx: *const BatchExecutionContext, request: types.BatchRequest) !void {
-    const projected = haCommitContext(ctx);
-    return try ha_db_commit.mirrorHABatchMutationCommitContext(&projected, request);
+fn mirrorReplicationBatchMutationCommitContext(ctx: *const BatchExecutionContext, request: types.BatchRequest) !void {
+    const projected = replicationCommitContext(ctx);
+    return try replication_commit.mirrorReplicationBatchMutationCommitContext(&projected, request);
 }
 
-fn appendHABatchMutationCommitLockedContext(ctx: *const BatchExecutionContext, request: types.BatchRequest) !?HADeferredCommitGate {
-    const projected = haCommitContext(ctx);
-    return try ha_db_commit.appendHABatchMutationCommitLockedContext(&projected, request);
+fn appendReplicationBatchMutationCommitLockedContext(ctx: *const BatchExecutionContext, request: types.BatchRequest) !?ReplicationDeferredCommitGate {
+    const projected = replicationCommitContext(ctx);
+    return try replication_commit.appendReplicationBatchMutationCommitLockedContext(&projected, request);
 }
 
-fn mirrorHAEncodedBatchMutationCommitContext(ctx: *const BatchExecutionContext, payload: []const u8) !void {
-    const projected = haCommitContext(ctx);
-    return try ha_db_commit.mirrorHAEncodedBatchMutationCommitContext(&projected, payload);
+fn mirrorReplicationEncodedBatchMutationCommitContext(ctx: *const BatchExecutionContext, payload: []const u8) !void {
+    const projected = replicationCommitContext(ctx);
+    return try replication_commit.mirrorReplicationEncodedBatchMutationCommitContext(&projected, payload);
 }
 
-fn appendHAEncodedBatchMutationCommitLockedContext(ctx: *const BatchExecutionContext, payload: []const u8) !?HADeferredCommitGate {
-    const projected = haCommitContext(ctx);
-    return try ha_db_commit.appendHAEncodedBatchMutationCommitLockedContext(&projected, payload);
+fn appendReplicationEncodedBatchMutationCommitLockedContext(ctx: *const BatchExecutionContext, payload: []const u8) !?ReplicationDeferredCommitGate {
+    const projected = replicationCommitContext(ctx);
+    return try replication_commit.appendReplicationEncodedBatchMutationCommitLockedContext(&projected, payload);
 }
 
-fn appendHAEncodedBatchMutationCommitLockedContextStrict(ctx: *const BatchExecutionContext, payload: []const u8, strict_append: bool) !?HADeferredCommitGate {
-    const projected = haCommitContext(ctx);
-    return try ha_db_commit.appendHAEncodedBatchMutationCommitLockedContextStrict(&projected, payload, strict_append);
+fn appendReplicationEncodedBatchMutationCommitLockedContextStrict(ctx: *const BatchExecutionContext, payload: []const u8, strict_append: bool) !?ReplicationDeferredCommitGate {
+    const projected = replicationCommitContext(ctx);
+    return try replication_commit.appendReplicationEncodedBatchMutationCommitLockedContextStrict(&projected, payload, strict_append);
 }
 
-fn mirrorHASchemaMetadataBestEffortContext(
+fn mirrorReplicationSchemaMetadataBestEffortContext(
     ctx: *const BatchExecutionContext,
     table_schema: schema_mod.TableSchema,
     public_schema_json: ?[]const u8,
 ) void {
-    const projected = haCommitContext(ctx);
-    return ha_db_commit.mirrorHASchemaMetadataBestEffortContext(&projected, table_schema, public_schema_json);
+    const projected = replicationCommitContext(ctx);
+    return replication_commit.mirrorReplicationSchemaMetadataBestEffortContext(&projected, table_schema, public_schema_json);
 }
 
-fn appendHASchemaMetadataCommitLockedContext(
+fn appendReplicationSchemaMetadataCommitLockedContext(
     ctx: *const BatchExecutionContext,
     table_schema: schema_mod.TableSchema,
     public_schema_json: ?[]const u8,
-) !?HADeferredCommitGate {
-    const projected = haCommitContext(ctx);
-    return try ha_db_commit.appendHASchemaMetadataCommitLockedContext(&projected, table_schema, public_schema_json);
+) !?ReplicationDeferredCommitGate {
+    const projected = replicationCommitContext(ctx);
+    return try replication_commit.appendReplicationSchemaMetadataCommitLockedContext(&projected, table_schema, public_schema_json);
 }
 
-fn appendHAEncodedSchemaMetadataCommitLockedContext(
+fn appendReplicationEncodedSchemaMetadataCommitLockedContext(
     ctx: *const BatchExecutionContext,
     payload: []const u8,
-) !?HADeferredCommitGate {
-    const projected = haCommitContext(ctx);
-    return try ha_db_commit.appendHAEncodedSchemaMetadataCommitLockedContext(&projected, payload);
+) !?ReplicationDeferredCommitGate {
+    const projected = replicationCommitContext(ctx);
+    return try replication_commit.appendReplicationEncodedSchemaMetadataCommitLockedContext(&projected, payload);
 }
 
-fn preflightHAMirrorSyncCommitContext(ctx: *const BatchExecutionContext, mirror: ?HAAsyncEffectMirror) !void {
-    try ha_db_commit.preflight(mirror, ctx.log_mutex);
+fn preflightReplicationMirrorSyncCommitContext(ctx: *const BatchExecutionContext, mirror: ?ReplicationAsyncEffectMirror) !void {
+    try replication_commit.preflight(mirror, ctx.log_mutex);
 }
 
-const haMirrorSyncEnabled = ha_db_commit.haMirrorSyncEnabled;
+const replicationMirrorSyncEnabled = replication_commit.replicationMirrorSyncEnabled;
 
-const haMirrorRequiresDurableOutbox = ha_db_commit.haMirrorRequiresDurableOutbox;
+const replicationMirrorRequiresDurableOutbox = replication_commit.replicationMirrorRequiresDurableOutbox;
 
-const noteHAMirrorFailure = ha_db_commit.noteHAMirrorFailure;
+const noteReplicationMirrorFailure = replication_commit.noteReplicationMirrorFailure;
 
 fn applyDerivedBacklogPressureContext(ctx: *const BatchExecutionContext, sequence: u64, sync_level: types.SyncLevel, sync_targets: ManagedSyncTargets) !void {
     if (!syncLevelParticipatesInDerivedBacklogPressure(sync_level)) return;
@@ -64871,9 +64827,9 @@ fn commitArtifactUnitTurnFromEnrichment(ptr: *anyopaque, document: ?*const @impo
         if (selected.selected == null or !std.mem.eql(u8, &selected.selected.?, &turn.selected)) return error.InvalidBatchRequest;
     };
     var ctx = owner.batchContext();
-    var ha_mutation = acquireHAMutationSharedContext(&ctx);
-    defer if (ha_mutation) |*lease| lease.release();
-    try enforceHAWriteGateOptional(ctx.ha_write_gate);
+    var replication_mutation = acquireReplicationMutationSharedContext(&ctx);
+    defer if (replication_mutation) |*lease| lease.release();
+    try enforceReplicationWriteGateOptional(ctx.replication_write_gate);
     var snapshot_replay = try acquireSnapshotReplayContext(&ctx);
     defer if (snapshot_replay) |*lease| lease.release();
     try lockApplyForPortableRuntimeContext(&ctx);
@@ -64943,10 +64899,10 @@ fn publishResolutionHandoffContextWithSink(
     try lockApplyForPortableRuntimeContext(ctx);
     defer ctx.apply_mutex.unlockExclusive();
     try requireArtifactProducerMutableContext(ctx);
-    const transition_mutex = haTransitionMutexFromContext(ctx);
+    const transition_mutex = replicationTransitionMutexFromContext(ctx);
     if (transition_mutex) |mutex| lockAtomic(mutex);
     defer if (transition_mutex) |mutex| mutex.unlock();
-    try enforceHAWriteGateContext(ctx);
+    try enforceReplicationWriteGateContext(ctx);
     try sink.write(marker_writes, marker_deletes);
 }
 
@@ -65008,134 +64964,6 @@ test "db resolution handoff completion publishes fanout in one metadata batch" {
     }
 }
 
-test "storage.hot_standby resolution handoff fence rejects completion after durable HA replay" {
-    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
-
-    const alloc = std.heap.c_allocator;
-    var db_path_tmp = try TestDirectory.init("db");
-    defer db_path_tmp.cleanup();
-    const db_path = db_path_tmp.path().ptr;
-    defer cleanupTempDir(db_path);
-    var ha_log_path_tmp = try TestDirectory.init("db");
-    defer ha_log_path_tmp.cleanup();
-    const ha_log_path = ha_log_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_tmp = try TestDirectory.init("db");
-    defer ha_slots_path_tmp.cleanup();
-    const ha_slots_path = ha_slots_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_slots_path);
-
-    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
-        .cluster_id = 271,
-        .shard_id = 4,
-        .table_id = 10,
-        .timeline_id = 1,
-        .epoch = 1,
-    }, .{});
-    defer primary.close();
-
-    var public_gate = ha_public_gate_state_mod.State{};
-    public_gate.configurePrimary(&primary, false);
-    var transition_mutex: std.atomic.Mutex = .unlocked;
-    var barrier: HAMutationBarrier = .{};
-    var db = try DB.open(alloc, std.mem.span(db_path), .{
-        .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
-        .ha_async_effect_mirror = .{
-            .publisher = ha_publisher_adapter.bind(&primary),
-            .mutation_barrier = &barrier,
-            .transition_mutex = &transition_mutex,
-        },
-        .ha_write_gate = .{ .shared = .{ .state = public_gate.storageWriteState() } },
-        .start_index_workers = false,
-    });
-    defer db.close();
-
-    const PauseBeforePublish = struct {
-        io: std.Io,
-        entered: std.atomic.Value(bool) = .init(false),
-        reached: std.Io.Event = .unset,
-        release: std.Io.Event = .unset,
-
-        fn run(ptr: *anyopaque) void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.entered.store(true, .release);
-            self.reached.set(self.io);
-            self.release.waitUncancelable(self.io);
-        }
-    };
-    const WriteProbe = struct {
-        ctx: *EnrichmentAppendContext,
-        resolution_key: []const u8,
-        pause: *PauseBeforePublish,
-        result: std.atomic.Value(u8) = .init(0),
-
-        fn run(self: *@This()) void {
-            // Also wake the test if the writer fails before entering the hook,
-            // so a real regression reports its assertion instead of hanging.
-            defer self.pause.reached.set(self.pause.io);
-            const writes = [_]resolution_runtime_mod.ArtifactWrite{.{
-                .key = self.resolution_key,
-                .value = "{\"entities\":[\"durable\"]}",
-            }};
-            _ = appendResolutionRecordWithHook(self.ctx, .{
-                .batch = .{ .changed_artifact_keys = &.{self.resolution_key} },
-                .artifact_writes = &writes,
-                .publish_resolution_handoff = true,
-            }, ResolutionHandoffPublishHook{
-                .ptr = self.pause,
-                .run_fn = PauseBeforePublish.run,
-            }) catch |err| {
-                self.result.store(if (err == error.HAFencedPrimary) 1 else 2, .release);
-                return;
-            };
-            self.result.store(3, .release);
-        }
-    };
-
-    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:fenced", "resolution_v1");
-    defer alloc.free(resolution_key);
-    const marker_key = try resolution_handoff.keyAlloc(alloc, resolution_key);
-    defer alloc.free(marker_key);
-    var pause = PauseBeforePublish{ .io = std.testing.io };
-    var probe = WriteProbe{
-        .ctx = db.resolution_append_context.?,
-        .resolution_key = resolution_key,
-        .pause = &pause,
-    };
-    var thread = try std.testing.io.concurrent(WriteProbe.run, .{&probe});
-    var thread_joined = false;
-    errdefer {
-        pause.release.set(pause.io);
-        if (!thread_joined) thread.await(std.testing.io);
-    }
-
-    pause.reached.waitUncancelable(pause.io);
-    try std.testing.expect(pause.entered.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
-    try std.testing.expectEqual(@as(u64, 1), db.core.nextDerivedSequence());
-    const artifact = try db.core.store.get(alloc, resolution_key);
-    defer alloc.free(artifact);
-    try std.testing.expectEqualStrings("{\"entities\":[\"durable\"]}", artifact);
-    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, marker_key));
-    // Remote durability no longer retains the mutation lease. Capture can
-    // select the exact local-commit/HA-tail boundary before the unacknowledged
-    // handoff marker is published.
-    var capture_before_fence = barrier.tryAcquireExclusive() orelse return error.TestExpectedEqual;
-    capture_before_fence.release();
-
-    lockAtomic(&transition_mutex);
-    public_gate.publishPrimaryFence(true);
-    pause.release.set(pause.io);
-    transition_mutex.unlock();
-    thread.await(std.testing.io);
-    thread_joined = true;
-
-    try std.testing.expectEqual(@as(u8, 1), probe.result.load(.acquire));
-    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, marker_key));
-    var capture = barrier.tryAcquireExclusive() orelse return error.TestExpectedEqual;
-    capture.release();
-}
-
 const ResolutionHandoffPublishHook = struct {
     ptr: *anyopaque,
     run_fn: *const fn (ptr: *anyopaque) void,
@@ -65169,9 +64997,9 @@ fn appendResolutionRecordWithHook(
     }
 
     var batch_ctx = ctx.batchContext();
-    var ha_mutation = acquireHAMutationSharedContext(&batch_ctx);
-    defer if (ha_mutation) |*lease| lease.release();
-    try enforceHAWriteGateContext(&batch_ctx);
+    var replication_mutation = acquireReplicationMutationSharedContext(&batch_ctx);
+    defer if (replication_mutation) |*lease| lease.release();
+    try enforceReplicationWriteGateContext(&batch_ctx);
     var snapshot_replay = try acquireSnapshotReplayContext(&batch_ctx);
     defer if (snapshot_replay) |*lease| lease.release();
 
@@ -65185,7 +65013,7 @@ fn appendResolutionRecordWithHook(
     var apply_mutex_held = true;
     errdefer if (apply_mutex_held) batch_ctx.apply_mutex.unlockExclusive();
     try requireArtifactProducerMutableContext(&batch_ctx);
-    try enforceHAWriteGateContext(&batch_ctx);
+    try enforceReplicationWriteGateContext(&batch_ctx);
     const sequence = batch_ctx.store.reserveNextReplaySequence(1);
     const payload = try encodeChangeRecordPayloadWithTargetHints(
         &batch_ctx,
@@ -65204,17 +65032,17 @@ fn appendResolutionRecordWithHook(
     if (shouldAppendSplitDeltaForContext(&batch_ctx)) {
         try batch_ctx.shard_manager.appendSplitDelta(currentTimeNs(), store_writes, write.artifact_deletes);
     }
-    var deferred_ha_gates = HADeferredCommitGates.begin(haTransitionMutexFromContext(&batch_ctx));
-    defer deferred_ha_gates.releaseTransition();
-    deferred_ha_gates.append(try appendHAReplayPayloadCommitLockedContext(&batch_ctx, payload));
+    var deferred_replication_gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(&batch_ctx));
+    defer deferred_replication_gates.releaseTransition();
+    deferred_replication_gates.append(try appendReplicationReplayPayloadCommitLockedContext(&batch_ctx, payload));
     batch_ctx.apply_mutex.unlockExclusive();
     apply_mutex_held = false;
     snapshot_replay.?.release();
     snapshot_replay = null;
     DB.notifyQueryVisibilityTargetAdvancedContext(&batch_ctx, sequence);
-    releaseHAMutationShared(&ha_mutation);
+    releaseReplicationMutationShared(&replication_mutation);
 
-    try deferred_ha_gates.waitForDurabilityAndAuthority(batch_ctx.ha_write_gate);
+    try deferred_replication_gates.waitForDurabilityAndAuthority(batch_ctx.replication_write_gate);
     before_handoff_publish.run();
     try publishResolutionHandoffContext(&batch_ctx, write);
     notifyResolverReplayRuntimesForCatalog(ctx.index_manager, ctx.resolution_runtime, ctx.promotion_runtime, sequence);
@@ -65907,9 +65735,9 @@ fn appendGeneratedBatchFromEnrichment(
 
     const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
     var batch_ctx = ctx.batchContext();
-    var ha_mutation = acquireHAMutationSharedContext(&batch_ctx);
-    defer if (ha_mutation) |*lease| lease.release();
-    try enforceHAWriteGateContext(&batch_ctx);
+    var replication_mutation = acquireReplicationMutationSharedContext(&batch_ctx);
+    defer if (replication_mutation) |*lease| lease.release();
+    try enforceReplicationWriteGateContext(&batch_ctx);
     var snapshot_replay = try acquireSnapshotReplayContext(&batch_ctx);
     defer if (snapshot_replay) |*lease| lease.release();
     const replay_deleted_keys = try concatKeyViews(batch_ctx.alloc, batch.deleted_keys, artifact_delete_keys);
@@ -66004,7 +65832,7 @@ fn appendGeneratedBatchFromEnrichment(
     var apply_mutex_held = true;
     errdefer if (apply_mutex_held) batch_ctx.apply_mutex.unlockExclusive();
     try requireArtifactProducerMutableContext(&batch_ctx);
-    try enforceHAWriteGateContext(&batch_ctx);
+    try enforceReplicationWriteGateContext(&batch_ctx);
     const sequence = batch_ctx.store.reserveNextReplaySequence(1);
     const payload = try encodeChangeRecordPayload(&batch_ctx, replay_batch, sequence);
     defer batch_ctx.alloc.free(payload);
@@ -66184,16 +66012,16 @@ fn appendGeneratedBatchFromEnrichment(
         else => return err,
     };
     batch_ctx.executor.commitBacklogAdmission(sequence, &backlog_admission);
-    var deferred_ha_gates = HADeferredCommitGates.begin(haTransitionMutexFromContext(&batch_ctx));
-    defer deferred_ha_gates.releaseTransition();
-    deferred_ha_gates.append(try appendHAReplayPayloadCommitLockedContext(&batch_ctx, payload));
+    var deferred_replication_gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(&batch_ctx));
+    defer deferred_replication_gates.releaseTransition();
+    deferred_replication_gates.append(try appendReplicationReplayPayloadCommitLockedContext(&batch_ctx, payload));
     batch_ctx.apply_mutex.unlockExclusive();
     apply_mutex_held = false;
     snapshot_replay.?.release();
     snapshot_replay = null;
     DB.notifyQueryVisibilityTargetAdvancedScopedContext(&batch_ctx, sequence, sync_targets);
-    releaseHAMutationShared(&ha_mutation);
-    try deferred_ha_gates.waitForDurabilityAndAuthority(batch_ctx.ha_write_gate);
+    releaseReplicationMutationShared(&replication_mutation);
+    try deferred_replication_gates.waitForDurabilityAndAuthority(batch_ctx.replication_write_gate);
     notifyResolverReplayRuntimesForCatalog(ctx.index_manager, ctx.resolution_runtime, ctx.promotion_runtime, sequence);
     if (ctx.executor.hasWorkers()) {
         ctx.executor.forceSequence(sequence);
@@ -68961,7 +68789,7 @@ fn applyDerivedBatchToIndexContextProfiled(
     else
         null;
     defer if (graph_publication) |*lease| lease.release();
-    if (index_ref.kind == .graph and ctx.primary_ha_append_pending.load(.acquire)) return error.HAMirrorUnavailable;
+    if (index_ref.kind == .graph and ctx.primary_replication_append_pending.load(.acquire)) return error.HAMirrorUnavailable;
     var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
     defer index_apply_guard.unlock();
     if (index_ref.kind == .graph) {
@@ -76189,7 +76017,7 @@ fn markSplitOffDocumentArtifactChildRangesLocked(
     });
     self.executor.commitBacklogAdmission(sequence, &backlog_admission);
     DB.notifyQueryVisibilityTargetAdvanced(self.async_context, sequence);
-    self.mirrorHAReplayPayloadBestEffort(replay_payload);
+    self.mirrorReplicationReplayPayloadBestEffort(replay_payload);
     if (shouldAppendSplitDelta(self)) {
         try self.core.appendSplitDelta(currentTimeNs(), writes.items, &.{});
     }
@@ -79550,7 +79378,7 @@ const GateDenseEmbedder = struct {
     blocked_error: anyerror = error.EmbedRateLimited,
     blocked_event: ?*std.Io.Event = null,
 
-    fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    pub fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
         if (needle.len == 0) return true;
         if (needle.len > haystack.len) return false;
         var i: usize = 0;
@@ -79567,7 +79395,7 @@ const GateDenseEmbedder = struct {
         return false;
     }
 
-    fn vectorForText(text: []const u8) [3]f32 {
+    pub fn vectorForText(text: []const u8) [3]f32 {
         if (containsIgnoreCase(text, "alpha") or containsIgnoreCase(text, "concept")) {
             return .{ 1.0, 0.0, 0.0 };
         }
@@ -79580,7 +79408,7 @@ const GateDenseEmbedder = struct {
         return .{ 0.0, 0.0, 1.0 };
     }
 
-    fn embedDense(ptr: *anyopaque, alloc: Allocator, _: []const u8, text: []const u8, dims: u32) ![]f32 {
+    pub fn embedDense(ptr: *anyopaque, alloc: Allocator, _: []const u8, text: []const u8, dims: u32) ![]f32 {
         const self: *GateDenseEmbedder = @ptrCast(@alignCast(ptr));
         _ = self.total_requests.fetchAdd(1, .monotonic);
         const previous_successes = self.successful_requests.fetchAdd(1, .acq_rel);
@@ -79597,7 +79425,7 @@ const GateDenseEmbedder = struct {
         return vector;
     }
 
-    fn interface(self: *GateDenseEmbedder) embedder_mod.DenseEmbedder {
+    pub fn interface(self: *GateDenseEmbedder) embedder_mod.DenseEmbedder {
         return .{
             .ptr = self,
             .dense_embed_fn = embedDense,
@@ -79605,11 +79433,11 @@ const GateDenseEmbedder = struct {
         };
     }
 
-    fn allowAll(self: *GateDenseEmbedder) void {
+    pub fn allowAll(self: *GateDenseEmbedder) void {
         self.allowed_successes.store(std.math.maxInt(usize), .release);
     }
 
-    fn snapshot(self: *GateDenseEmbedder) struct {
+    pub fn snapshot(self: *GateDenseEmbedder) struct {
         total_requests: usize,
         blocked_requests: usize,
         successful_requests: usize,
@@ -86760,222 +86588,6 @@ test "row-policy backup checkpoint revokes a pre-policy export before its next b
     try std.testing.expectError(error.RowPolicyCatalogChanged, checkpoint.token().check());
 }
 
-test "row-policy Raft apply persists fail-closed intent and finalizes after restart" {
-    const alloc = std.testing.allocator;
-    var test_tmp = try TestDirectory.init("row-policy-pending");
-    defer test_tmp.cleanup();
-    const path = std.mem.span(test_tmp.path().ptr);
-    const namespace: DocIdentityNamespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 };
-    const options: OpenOptions = .{ .identity_namespace = namespace, .start_index_workers = false, .start_optional_runtimes = false };
-    const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
-    ;
-    var bundle_bytes: []u8 = undefined;
-    var request: @import("../../system_catalog/policies.zig").InstallRequest = undefined;
-    {
-        var db = try DB.open(alloc, path, options);
-        defer db.close();
-        try db.setSchemaJson(alloc, schema_json);
-        const schema = db.core.schema.?;
-        const schema_bytes = try schema_mod.serializeSchema(alloc, schema);
-        defer alloc.free(schema_bytes);
-        var schema_digest: [32]u8 = undefined;
-        std.crypto.hash.Blake3.hash(schema_bytes, &schema_digest, .{});
-        const policy: @import("../../system_catalog/policies.zig").Record = .{
-            .id = 1,
-            .generation = 1,
-            .table_id = namespace.table_id,
-            .schema_version = schema.version,
-            .schema_digest = schema_digest,
-            .name = "visible",
-            .commands = .{ .select = true },
-            .roles = &.{"PUBLIC"},
-            .using = .{ .instructions = &.{
-                .{ .type = .{ .kind = .boolean }, .operation = .{ .literal = .{ .bool = true } } },
-            }, .root = 0 },
-        };
-        bundle_bytes = try std.json.Stringify.valueAlloc(alloc, @import("../../system_catalog/policies.zig").InstallSnapshot{
-            .table_id = namespace.table_id,
-            .schema_version = schema.version,
-            .schema_digest = schema_digest,
-            .policy_generation = 1,
-            .catalog_epoch = 2,
-            .phase = .pending_install,
-            .records = &.{policy},
-            .settings = &.{},
-        }, .{});
-        const range = db.core.byteRange();
-        request = .{
-            .table_id = namespace.table_id,
-            .expected_generation = 1,
-            .expected_catalog_epoch = 2,
-            .expected_phase = .pending_install,
-            .owner_group_id = 17,
-            .expected_descriptor_digest = try (@import("../../system_catalog/policies.zig").OwnerDescriptor{
-                .table_id = namespace.table_id,
-                .group_id = 17,
-                .shard_id = namespace.shard_id,
-                .range_id = namespace.range_id,
-                .schema_version = schema.version,
-                .schema_digest = schema_digest,
-                .range_start = range.start,
-                .range_end = range.end,
-            }).digest(),
-        };
-        var old_reader = try db.row_policy_gate.enterRaw();
-        const delayed_scan = try db.openRelationalReadSession(alloc, "", "", .{ .relational_query = .{ .fields = &.{"id"} } });
-        try std.testing.expect((try db.applyReplicatedRowPolicyPublication(bundle_bytes, request, .{ .term = 3, .index = 11 })) == null);
-        try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.preparing, db.core.table_catalog.row_policy_phase);
-        try std.testing.expectError(error.RowPolicyAuthenticationRequired, db.row_policy_gate.enterRaw());
-        try std.testing.expectError(error.RowPolicyCatalogChanged, delayed_scan.nextTypedPage(alloc, null, .{}));
-        try std.testing.expectError(error.RowPolicyReadersActive, db.loadRowPolicyReceipt(1, .pending_install));
-        delayed_scan.deinit();
-        old_reader.release();
-        // The applied marker is already durable; reopening must retain the
-        // preparing barrier and complete only from the committed intent.
-    }
-    defer alloc.free(bundle_bytes);
-    {
-        var db = try DB.open(alloc, path, options);
-        defer db.close();
-        try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.preparing, db.row_policy_gate.currentPhase());
-        try std.testing.expectError(error.RowPolicyAuthenticationRequired, db.row_policy_gate.enterRaw());
-        const receipt = try db.loadRowPolicyReceipt(1, .pending_install);
-        try std.testing.expectEqual(@as(u64, 3), receipt.applied_term);
-        try std.testing.expectEqual(@as(u64, 11), receipt.applied_index);
-        try std.testing.expectEqualDeep(receipt, (try db.applyReplicatedRowPolicyPublication(bundle_bytes, request, .{ .term = 3, .index = 11 })).?);
-        var parsed = try std.json.parseFromSlice(@import("../../system_catalog/policies.zig").InstallSnapshot, alloc, bundle_bytes, .{});
-        defer parsed.deinit();
-        parsed.value.phase = .serving_install;
-        const serving_bytes = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
-        defer alloc.free(serving_bytes);
-        request.expected_phase = .serving_install;
-        try std.testing.expect((try db.applyReplicatedRowPolicyPublication(serving_bytes, request, .{ .term = 3, .index = 12 })) == null);
-        try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.preparing, db.row_policy_gate.currentPhase());
-        const serving_receipt = try db.loadRowPolicyReceipt(1, .serving_install);
-        try std.testing.expectEqual(@as(u64, 12), serving_receipt.applied_index);
-        try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.active, db.row_policy_gate.currentPhase());
-        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, row_policy_bundle_mod.pending_key));
-    }
-    {
-        var reopened = try DB.open(alloc, path, options);
-        defer reopened.close();
-        try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.active, reopened.row_policy_gate.currentPhase());
-        try std.testing.expect(reopened.row_policy_bundle != null);
-        try std.testing.expectError(error.RowPolicyAuthenticationRequired, reopened.row_policy_gate.enterRaw());
-    }
-    {
-        // A serving policy must survive a primary reopen with the ordered
-        // batch and metadata mirrors attached; raw callers remain denied.
-        var log_tmp = try TestDirectory.init("row-policy-ha-log");
-        defer log_tmp.cleanup();
-        var slots_tmp = try TestDirectory.init("row-policy-ha-slots");
-        defer slots_tmp.cleanup();
-        var primary = try ha_primary_mod.Primary.open(alloc, std.mem.span(log_tmp.path().ptr), std.mem.span(slots_tmp.path().ptr), .{
-            .cluster_id = 1,
-            .shard_id = namespace.shard_id,
-            .table_id = namespace.table_id,
-            .timeline_id = 1,
-            .epoch = 1,
-        }, .{});
-        defer primary.close();
-        var mirrored_options = options;
-        mirrored_options.ha_async_batch_mirror = .{ .publisher = ha_publisher_adapter.bind(&primary) };
-        mirrored_options.ha_async_metadata_mirror = .{ .publisher = ha_publisher_adapter.bind(&primary) };
-        var mirrored = try DB.open(alloc, path, mirrored_options);
-        defer mirrored.close();
-        try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.active, mirrored.row_policy_gate.currentPhase());
-        try std.testing.expectError(error.RowPolicyAuthenticationRequired, mirrored.row_policy_gate.enterRaw());
-    }
-    var follower_tmp = try TestDirectory.init("row-policy-follower");
-    defer follower_tmp.cleanup();
-    var follower = try DB.open(alloc, std.mem.span(follower_tmp.path().ptr), options);
-    defer follower.close();
-    try follower.setSchemaJson(alloc, schema_json);
-    var pending_request = request;
-    pending_request.expected_phase = .pending_install;
-    var follower_reader = try follower.row_policy_gate.enterRaw();
-    try std.testing.expect((try follower.applyReplicatedRowPolicyPublication(bundle_bytes, pending_request, .{ .term = 3, .index = 11 })) == null);
-    try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.preparing, follower.row_policy_gate.currentPhase());
-    var follower_bundle = try std.json.parseFromSlice(@import("../../system_catalog/policies.zig").InstallSnapshot, alloc, bundle_bytes, .{});
-    defer follower_bundle.deinit();
-    follower_bundle.value.phase = .serving_install;
-    const follower_serving_bytes = try std.json.Stringify.valueAlloc(alloc, follower_bundle.value, .{});
-    defer alloc.free(follower_serving_bytes);
-    pending_request.expected_phase = .serving_install;
-    try std.testing.expect((try follower.applyReplicatedRowPolicyPublication(follower_serving_bytes, pending_request, .{ .term = 3, .index = 12 })) == null);
-    // No receipt probe ran for pending_install on this follower. Catch-up
-    // must advance the committed fail-closed intent rather than stall Raft.
-    try std.testing.expectError(error.NotFound, follower.loadRowPolicyReceipt(1, .pending_install));
-    try std.testing.expectError(error.RowPolicyAuthenticationRequired, follower.get(alloc, "row:unseen"));
-    try std.testing.expectError(error.RowPolicyReadersActive, follower.loadRowPolicyReceipt(1, .serving_install));
-    follower_reader.release();
-    const follower_receipt = try follower.loadRowPolicyReceipt(1, .serving_install);
-    try std.testing.expectEqual(@as(u64, 12), follower_receipt.applied_index);
-    try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.active, follower.row_policy_gate.currentPhase());
-
-    var next_bundle = try std.json.parseFromSlice(@import("../../system_catalog/policies.zig").InstallSnapshot, alloc, bundle_bytes, .{});
-    defer next_bundle.deinit();
-    next_bundle.value.policy_generation = 2;
-    next_bundle.value.catalog_epoch = 3;
-    next_bundle.value.phase = .pending_disable;
-    const candidate_bytes = try std.json.Stringify.valueAlloc(alloc, next_bundle.value, .{});
-    defer alloc.free(candidate_bytes);
-    var candidate_request = request;
-    candidate_request.expected_generation = 2;
-    candidate_request.expected_catalog_epoch = 3;
-    candidate_request.expected_phase = .pending_disable;
-    {
-        var db = try DB.open(alloc, path, options);
-        defer db.close();
-        const candidate_receipt = (try db.applyReplicatedRowPolicyPublication(candidate_bytes, candidate_request, .{ .term = 3, .index = 13 })).?;
-        try std.testing.expectEqual(@as(u64, 13), candidate_receipt.applied_index);
-        try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.active, db.row_policy_gate.currentPhase());
-        try std.testing.expectEqual(@as(u64, 1), db.core.table_catalog.row_policy_generation);
-        try std.testing.expect(db.row_policy_bundle != null);
-    }
-    {
-        var db = try DB.open(alloc, path, options);
-        defer db.close();
-        // A staged candidate does not replace the serving policy on restart.
-        try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.active, db.row_policy_gate.currentPhase());
-        try std.testing.expectEqual(@as(u64, 1), db.row_policy_bundle.?.parsed.value.policy_generation);
-        const old_principal: row_policy_authority_mod.Payload = .{
-            .principal = "alice",
-            .roles = &.{},
-            .auth_revision = 1,
-            .table_id = namespace.table_id,
-            .table = "table:7",
-            .database = "main",
-            .policy_generation = 1,
-            .catalog_epoch = 2,
-            .access = .read,
-            .expires = 130,
-        };
-        var old_reader = try db.row_policy_gate.enterVerifiedPrincipal(&old_principal, 100);
-        try old_reader.checkAt(100);
-        next_bundle.value.phase = .serving_disable;
-        const serving_bytes = try std.json.Stringify.valueAlloc(alloc, next_bundle.value, .{});
-        defer alloc.free(serving_bytes);
-        candidate_request.expected_phase = .serving_disable;
-        try std.testing.expect((try db.applyReplicatedRowPolicyPublication(serving_bytes, candidate_request, .{ .term = 3, .index = 14 })) == null);
-        try std.testing.expectError(error.RowPolicyCatalogChanged, old_reader.checkAt(100));
-        try std.testing.expectError(error.RowPolicyReadersActive, db.loadRowPolicyReceipt(2, .serving_disable));
-        old_reader.release();
-        _ = try db.loadRowPolicyReceipt(2, .serving_disable);
-        try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.preparing, db.row_policy_gate.currentPhase());
-        next_bundle.value.phase = .disabled;
-        const disabled_bytes = try std.json.Stringify.valueAlloc(alloc, next_bundle.value, .{});
-        defer alloc.free(disabled_bytes);
-        candidate_request.expected_phase = .disabled;
-        try std.testing.expect((try db.applyReplicatedRowPolicyPublication(disabled_bytes, candidate_request, .{ .term = 3, .index = 15 })) == null);
-        _ = try db.loadRowPolicyReceipt(2, .disabled);
-        try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.disabled, db.row_policy_gate.currentPhase());
-        var raw = try db.row_policy_gate.enterRawRead();
-        raw.release();
-    }
-}
-
 test "db relational mode stores authoritative packed rows across reopen scan and delete" {
     const alloc = std.testing.allocator;
 
@@ -93553,137 +93165,6 @@ test "graph rerank read pins apply across retirement seal admission" {
     const anchor: u8 = 0;
     request.graph_query_transport = .{ .dialect = .canonical, .operations_json = "{}", .admitted_operations_ptr = &anchor, .admitted_operations_len = 0 };
     try std.testing.expect(!DB.publishedDenseRequestEligible(request));
-}
-
-test "storage.hot_standby graph retirement seal replays exact Raft receipt and rejects missing marker" {
-    const alloc = std.testing.allocator;
-    const ha_effects = @import("../hot_standby/effects.zig");
-    const seal = @import("graph_retirement_seal.zig");
-    var path_tmp = try TestDirectory.init("graph-retirement-ha-replay");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-    defer cleanupTempDir(path);
-    const namespace: doc_identity.Namespace = .{ .table_id = 9, .shard_id = 301, .range_id = 301 };
-    var db = try DB.open(alloc, std.mem.span(path), .{ .identity_namespace = namespace, .start_index_workers = false, .start_optional_runtimes = false });
-    var db_open = true;
-    defer if (db_open) db.close();
-    try db.setSchemaJson(alloc,
-        \\{"version":0,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
-    );
-    try db.addIndex(.{ .name = "links", .kind = .graph, .config_json = "{}", .coverage_generation = 1 });
-    const graph_digest = (try db.core.index_manager.graphRetirementConfigDigest(alloc)) orelse return error.TestUnexpectedResult;
-    const catalog = try db.core.store.get(alloc, @import("relational_integrity_catalog.zig").key);
-    defer alloc.free(catalog);
-    var catalog_digest: [32]u8 = undefined;
-    std.crypto.hash.Blake3.hash(catalog, &catalog_digest, .{});
-    const scope: seal.Scope = .{
-        .fence = .{ .role = .rewrite_source, .transition_id = 7, .attempt = 1, .admission_epoch = 1, .peer_group_id = 401, .owner_group_id = 301, .namespace = namespace, .catalog_digest = catalog_digest },
-        .plan_id = @splat(1),
-        .plan_digest = @splat(2),
-        .target_table_id = 10,
-        .graph_config_digest = graph_digest,
-    };
-    const begin_req: types.BatchRequest = .{ .relational_topology = .{ .action = .begin, .fence = scope.fence, .graph_retirement = scope } };
-    const begin_payload = try ha_effects.encodeBatchMutationRequestAlloc(alloc, begin_req);
-    defer alloc.free(begin_payload);
-    var record: ha_replication_record_mod.RecordView = .{
-        .kind = .batch_mutation,
-        .payload_codec = .json,
-        .cluster_id = 1,
-        .timeline_id = 1,
-        .epoch = 1,
-        .lsn = 1,
-        .previous_lsn = 0,
-        .table_id = namespace.table_id,
-        .shard_id = namespace.shard_id,
-        .payload = begin_payload,
-    };
-    try db.applyHAReplicationRecord(record);
-    try std.testing.expect(!db.core.index_manager.graphRetirementAdmissionOpen());
-    try std.testing.expectError(error.IntegrityTopologyBusy, db.findKShortestPaths(alloc, "links", "a", "b", 2, &.{}, .out, .min_hops, 4, null, null));
-    try std.testing.expectError(error.IntegrityTopologyBusy, db.matchPattern(alloc, "links", &.{"a"}, &.{}, 1, &.{}));
-    try std.testing.expectError(error.IntegrityTopologyBusy, db.search(alloc, .{
-        .graph_metric_queries = &.{.{ .name = "metric", .query = .{ .index_name = "links", .metric_name = "rank" } }},
-    }));
-    try std.testing.expectError(error.IntegrityTopologyBusy, db.search(alloc, .{
-        .graph_metric_rerank = .{ .index_name = "links", .metric_name = "rank" },
-    }));
-    try std.testing.expectError(error.IntegrityTopologyBusy, db.batch(.{
-        .graph_writes = &.{.{ .index_name = "links", .source = "a", .target = "b", .edge_type = "related", .weight = 1.0 }},
-    }));
-    try std.testing.expectError(error.IntegrityTopologyBusy, db.runGraphMetricMaintenanceForIdle());
-    // The begin intent alone must rehydrate the closed gate before optional
-    // graph runtimes start. No seal receipt exists yet, so restart cannot
-    // accidentally treat the owner as either unguarded or completed.
-    db.close();
-    db_open = false;
-    db = try DB.open(alloc, std.mem.span(path), .{ .identity_namespace = namespace, .start_index_workers = false, .start_optional_runtimes = false });
-    db_open = true;
-    try std.testing.expect(!db.core.index_manager.graphRetirementAdmissionOpen());
-    {
-        var read = try db.core.store.beginReadTxn();
-        defer read.abort();
-        const status = try seal.status(&read);
-        try std.testing.expect(status.intent.?.eql(scope));
-        try std.testing.expect(status.receipt == null);
-    }
-    try std.testing.expectError(error.IntegrityTopologyBusy, db.search(alloc, .{
-        .graph_metric_rerank = .{ .index_name = "links", .metric_name = "rank" },
-    }));
-    const seal_req: types.BatchRequest = .{ .relational_topology = .{ .action = .seal_graph_retirement, .fence = scope.fence, .graph_retirement = scope } };
-    try std.testing.expectError(error.InvalidBatchRequest, db.applyRelationalTopologyControlWithHA(
-        .{ .action = .seal_graph_retirement, .fence = scope.fence },
-        .{ .term = 5, .index = 8 },
-        null,
-        null,
-        null,
-        null,
-    ));
-    const missing_marker = try std.json.Stringify.valueAlloc(alloc, ha_effects.BatchMutationPayload{ .schema_version = 9, .request = seal_req }, .{});
-    defer alloc.free(missing_marker);
-    record.lsn = 2;
-    record.previous_lsn = 1;
-    record.payload = missing_marker;
-    try std.testing.expectError(error.InvalidGraphRetirementSeal, db.applyHAReplicationRecord(record));
-    const invalid_marker = try std.json.Stringify.valueAlloc(alloc, ha_effects.BatchMutationPayload{ .schema_version = 9, .request = seal_req, .graph_retirement_raft_entry = .{ .term = 0, .index = 8 } }, .{});
-    defer alloc.free(invalid_marker);
-    record.payload = invalid_marker;
-    try std.testing.expectError(error.InvalidGraphRetirementSeal, db.applyHAReplicationRecord(record));
-    const sealed_payload = try ha_effects.encodeGraphRetirementSealMutationRequestAlloc(alloc, seal_req, .{ .term = 5, .index = 8 });
-    defer alloc.free(sealed_payload);
-    record.payload = sealed_payload;
-    db.core.index_manager.graph_metric_schedule_pins.store(1, .release);
-    try std.testing.expectError(error.StorageBusy, db.applyHAReplicationRecord(record));
-    {
-        var read = try db.core.store.beginReadTxn();
-        defer read.abort();
-        try std.testing.expect((try seal.status(&read)).receipt == null);
-    }
-    db.core.index_manager.graph_metric_schedule_pins.store(0, .release);
-    try db.applyHAReplicationRecord(record);
-    try db.applyHAReplicationRecord(record);
-    {
-        var read = try db.core.store.beginReadTxn();
-        defer read.abort();
-        const status = try seal.status(&read);
-        try std.testing.expect(status.intent.?.eql(scope));
-        try std.testing.expectEqual(@as(u64, 5), status.receipt.?.applied_term);
-        try std.testing.expectEqual(@as(u64, 8), status.receipt.?.applied_index);
-        try std.testing.expectEqualDeep(try scope.sealDigest(), status.receipt.?.digest);
-    }
-    try std.testing.expect(!db.core.index_manager.graphRetirementAdmissionOpen());
-    db.close();
-    db_open = false;
-    db = try DB.open(alloc, std.mem.span(path), .{ .identity_namespace = namespace, .start_index_workers = false, .start_optional_runtimes = false });
-    db_open = true;
-    try std.testing.expect(!db.core.index_manager.graphRetirementAdmissionOpen());
-    {
-        var read = try db.core.store.beginReadTxn();
-        defer read.abort();
-        const status = try seal.status(&read);
-        try std.testing.expect(status.intent.?.eql(scope));
-        try std.testing.expectEqualDeep(try scope.sealDigest(), status.receipt.?.digest);
-    }
 }
 
 test "db _edges writes record graph artifacts in the replay stream instead of graph payload replay" {
@@ -113528,930 +113009,6 @@ test "db reopen replays pending derived embeddings from durable log" {
     try std.testing.expectEqual(appended_sequence, applied);
 }
 
-test "storage.hot_standby db mirrors appended derived replay records into HA stream" {
-    const alloc = std.testing.allocator;
-
-    var db_path_tmp = try TestDirectory.init("db");
-    defer db_path_tmp.cleanup();
-    const db_path = db_path_tmp.path().ptr;
-    defer cleanupTempDir(db_path);
-    var ha_log_path_tmp = try TestDirectory.init("db");
-    defer ha_log_path_tmp.cleanup();
-    const ha_log_path = ha_log_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_tmp = try TestDirectory.init("db");
-    defer ha_slots_path_tmp.cleanup();
-    const ha_slots_path = ha_slots_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_slots_path);
-
-    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
-        .cluster_id = 200,
-        .shard_id = 3,
-        .table_id = 9,
-        .timeline_id = 1,
-        .epoch = 1,
-    }, .{});
-    defer primary.close();
-
-    var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-    var failures = @import("antfly_platform").atomic.Value(u64).init(0);
-    const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "graph_v1", "mentions", "doc:b");
-    defer alloc.free(artifact_key);
-    {
-        var db = try DB.open(alloc, std.mem.span(db_path), .{
-            .identity_namespace = .{ .shard_id = 3, .table_id = 9 },
-            .ha_async_effect_mirror = .{
-                .publisher = ha_publisher_adapter.bind(&primary),
-                .last_lsn = &last_lsn,
-                .failure_count = &failures,
-            },
-        });
-        defer db.close();
-
-        const changed_artifact_keys = [_][]const u8{artifact_key};
-        const sequence = try appendDerivedBatchRecord(&db, .{
-            .changed_artifact_keys = changed_artifact_keys[0..],
-        });
-        try std.testing.expectEqual(@as(u64, 1), sequence);
-    }
-
-    try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 0), failures.load(.acquire));
-
-    var entry = (try primary.log.entryAt(alloc, 1)) orelse return error.TestExpectedEqual;
-    defer entry.deinit(alloc);
-    try std.testing.expectEqual(@as(@TypeOf(entry.record.kind), .derived_effect), entry.record.kind);
-    try std.testing.expectEqual(@as(u64, 200), entry.record.cluster_id);
-    try std.testing.expectEqual(@as(u64, 3), entry.record.shard_id);
-    try std.testing.expectEqual(@as(u64, 9), entry.record.table_id);
-
-    var decoded = try ha_effects_mod.decodeDerivedChangeRecord(alloc, entry.record);
-    defer decoded.deinit();
-    try std.testing.expectEqual(@as(u64, 1), decoded.record.sequence);
-    try std.testing.expectEqualStrings(artifact_key, decoded.record.changed_artifact_keys[0]);
-    try std.testing.expectEqual(change_journal_mod.TargetHint.graph, decoded.record.target_hints[0]);
-}
-
-test "storage.hot_standby db waits for remote apply before completing derived enrichment" {
-    const alloc = std.testing.allocator;
-
-    var db_path_tmp = try TestDirectory.init("db");
-    defer db_path_tmp.cleanup();
-    const db_path = db_path_tmp.path().ptr;
-    defer cleanupTempDir(db_path);
-    var ha_log_path_tmp = try TestDirectory.init("db");
-    defer ha_log_path_tmp.cleanup();
-    const ha_log_path = ha_log_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_tmp = try TestDirectory.init("db");
-    defer ha_slots_path_tmp.cleanup();
-    const ha_slots_path = ha_slots_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_slots_path);
-
-    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
-        .cluster_id = 201,
-        .shard_id = 3,
-        .table_id = 9,
-        .timeline_id = 1,
-        .epoch = 1,
-    }, .{});
-    defer primary.close();
-    try primary.createSlot("standby-a", 0);
-
-    const SyncWait = struct {
-        calls: u64 = 0,
-
-        fn wait(ctx: *anyopaque, primary_arg_ctx: *anyopaque, target_lsn: u64, policy: ha_primary_mod.SyncPolicy) !void {
-            const primary_arg: *ha_primary_mod.Primary = @ptrCast(@alignCast(primary_arg_ctx));
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.calls += 1;
-            try std.testing.expectEqual(ha_primary_mod.DurabilityMode.remote_apply, policy.mode);
-            try primary_arg.standbyStatusUpdate("standby-a", primary_arg.identity.timeline_id, target_lsn, target_lsn);
-        }
-    };
-
-    var wait_state = SyncWait{};
-    var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-    var gate_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-    var gate_action = std.atomic.Value(u8).init(255);
-    var waits = @import("antfly_platform").atomic.Value(u64).init(0);
-    const standby_names = [_][]const u8{"standby-a"};
-    var db = try DB.open(alloc, std.mem.span(db_path), .{
-        .identity_namespace = .{ .shard_id = 3, .table_id = 9 },
-        .ha_async_effect_mirror = .{
-            .publisher = ha_publisher_adapter.bind(&primary),
-            .last_lsn = &last_lsn,
-            .sync_policy = .{
-                .mode = .remote_apply,
-                .standby_names = &standby_names,
-                .failure_policy = .block,
-            },
-            .sync_wait_ctx = &wait_state,
-            .sync_wait_fn = SyncWait.wait,
-            .last_gate_lsn = &gate_lsn,
-            .last_gate_action = &gate_action,
-            .sync_wait_count = &waits,
-        },
-        .start_index_workers = false,
-    });
-    defer db.close();
-
-    const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "graph_v1", "mentions", "doc:b");
-    defer alloc.free(artifact_key);
-    const changed_artifact_keys = [_][]const u8{artifact_key};
-    const sequence = try appendDerivedBatchRecord(&db, .{
-        .changed_artifact_keys = changed_artifact_keys[0..],
-    });
-
-    try std.testing.expectEqual(@as(u64, 1), sequence);
-    try std.testing.expectEqual(@as(u64, 1), wait_state.calls);
-    try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
-    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
-    const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
-    try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
-}
-
-test "storage.hot_standby db mirrors committed batch mutations into HA stream for standby apply" {
-    const alloc = std.testing.allocator;
-
-    var primary_db_path_tmp = try TestDirectory.init("db");
-    defer primary_db_path_tmp.cleanup();
-    const primary_db_path = primary_db_path_tmp.path().ptr;
-    defer cleanupTempDir(primary_db_path);
-    var standby_db_path_tmp = try TestDirectory.init("db");
-    defer standby_db_path_tmp.cleanup();
-    const standby_db_path = standby_db_path_tmp.path().ptr;
-    defer cleanupTempDir(standby_db_path);
-    var ha_log_path_tmp = try TestDirectory.init("db");
-    defer ha_log_path_tmp.cleanup();
-    const ha_log_path = ha_log_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_tmp = try TestDirectory.init("db");
-    defer ha_slots_path_tmp.cleanup();
-    const ha_slots_path = ha_slots_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_slots_path);
-    var standby_log_path_tmp = try TestDirectory.init("db");
-    defer standby_log_path_tmp.cleanup();
-    const standby_log_path = standby_log_path_tmp.path().ptr;
-    defer cleanupTempDir(standby_log_path);
-    var standby_progress_path_tmp = try TestDirectory.init("db");
-    defer standby_progress_path_tmp.cleanup();
-    const standby_progress_path = standby_progress_path_tmp.path().ptr;
-    defer cleanupTempDir(standby_progress_path);
-
-    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
-        .cluster_id = 250,
-        .shard_id = 4,
-        .table_id = 10,
-        .timeline_id = 1,
-        .epoch = 1,
-    }, .{});
-    defer primary.close();
-
-    var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, .{
-        .cluster_id = 250,
-        .shard_id = 4,
-        .table_id = 10,
-        .timeline_id = 1,
-        .epoch = 1,
-    }, .{});
-    defer standby.close();
-
-    var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-    var failures = @import("antfly_platform").atomic.Value(u64).init(0);
-    {
-        var db = try DB.open(alloc, std.mem.span(primary_db_path), .{
-            .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
-            .ha_async_batch_mirror = .{
-                .publisher = ha_publisher_adapter.bind(&primary),
-                .last_lsn = &last_lsn,
-                .failure_count = &failures,
-            },
-            .start_index_workers = false,
-        });
-        defer db.close();
-
-        try db.batch(.{
-            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
-            .deletes = &.{"doc:old"},
-            .timestamp_ns = 123,
-            .sync_level = .write,
-        });
-    }
-
-    try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 0), failures.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
-
-    var entry = (try primary.log.entryAt(alloc, 1)) orelse return error.TestExpectedEqual;
-    defer entry.deinit(alloc);
-    try std.testing.expectEqual(@as(@TypeOf(entry.record.kind), .batch_mutation), entry.record.kind);
-    try std.testing.expectEqual(@as(u64, 250), entry.record.cluster_id);
-    try std.testing.expectEqual(@as(u64, 4), entry.record.shard_id);
-    try std.testing.expectEqual(@as(u64, 10), entry.record.table_id);
-
-    var decoded = try ha_effects_mod.decodeBatchMutationRequest(alloc, entry.record);
-    defer decoded.deinit();
-    try std.testing.expectEqual(@as(usize, 1), decoded.value.request.writes.len);
-    try std.testing.expectEqualStrings("doc:a", decoded.value.request.writes[0].key);
-    try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", decoded.value.request.writes[0].value);
-    try std.testing.expectEqual(@as(usize, 1), decoded.value.request.deletes.len);
-    try std.testing.expectEqualStrings("doc:old", decoded.value.request.deletes[0]);
-    try std.testing.expectEqual(@as(u64, 123), decoded.value.request.timestamp_ns);
-
-    var standby_db = try DB.open(alloc, std.mem.span(standby_db_path), .{
-        .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
-        .ha_write_gate = .{ .standby = ha_write_gate_adapter.bindStandby(&standby) },
-        .ha_async_batch_mirror = .{
-            .publisher = ha_publisher_adapter.bind(&primary),
-            .last_lsn = &last_lsn,
-            .failure_count = &failures,
-        },
-    });
-    defer standby_db.close();
-
-    try standby_db.batchReplicatedApply(decoded.value.request);
-    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
-    var found = (try standby_db.lookup(alloc, "doc:a", .{})) orelse return error.TestExpectedEqual;
-    defer found.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", found.json);
-}
-
-test "storage.hot_standby seed capture barrier prevents local commit without matching wal" {
-    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
-
-    const alloc = std.heap.c_allocator;
-
-    var db_path_tmp = try TestDirectory.init("db");
-    defer db_path_tmp.cleanup();
-    const db_path = db_path_tmp.path().ptr;
-    defer cleanupTempDir(db_path);
-    var ha_log_path_tmp = try TestDirectory.init("db");
-    defer ha_log_path_tmp.cleanup();
-    const ha_log_path = ha_log_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_tmp = try TestDirectory.init("db");
-    defer ha_slots_path_tmp.cleanup();
-    const ha_slots_path = ha_slots_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_slots_path);
-
-    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
-        .cluster_id = 251,
-        .shard_id = 4,
-        .table_id = 10,
-        .timeline_id = 1,
-        .epoch = 1,
-    }, .{});
-    defer primary.close();
-
-    var barrier: HAMutationBarrier = .{};
-    var db = try DB.open(alloc, std.mem.span(db_path), .{
-        .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
-        .ha_async_batch_mirror = .{
-            .publisher = ha_publisher_adapter.bind(&primary),
-            .mutation_barrier = &barrier,
-        },
-        .start_index_workers = false,
-    });
-    defer db.close();
-
-    var capture = barrier.acquireExclusive();
-    var write_probe = ConcurrentWriteProbe{ .db = &db };
-    var write_thread = try std.testing.io.concurrent(ConcurrentWriteProbe.runBatch, .{&write_probe});
-    errdefer {
-        capture.release();
-        write_thread.await(std.testing.io);
-    }
-
-    try std.testing.expect(waitForAtomicFlag(&write_probe.started, 1, 10_000));
-    var attempts: usize = 0;
-    while (attempts < 10_000) : (attempts += 1) {
-        if (barrier.pendingSharedAcquisitions() > 0) break;
-        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
-    }
-
-    try std.testing.expect(barrier.pendingSharedAcquisitions() > 0);
-    try std.testing.expectEqual(@as(u8, 0), write_probe.done.load(.monotonic));
-    try std.testing.expectEqual(@as(u8, 0), write_probe.failed.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 0), primary.lastLsn());
-    try std.testing.expect((try db.get(alloc, "doc:b")) == null);
-
-    capture.release();
-    write_thread.await(std.testing.io);
-    try std.testing.expectEqual(@as(u8, 0), write_probe.failed.load(.monotonic));
-    try std.testing.expectEqual(@as(u8, 1), write_probe.done.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
-    const stored = (try db.get(alloc, "doc:b")) orelse return error.TestExpectedEqual;
-    defer alloc.free(stored);
-    try std.testing.expectEqualStrings("{\"title\":\"bravo\"}", stored);
-}
-
-test "storage.hot_standby seed snapshot predrains enrichment before exclusive capture" {
-    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
-
-    const alloc = std.testing.allocator;
-    var db_path_tmp = try TestDirectory.init("db");
-    defer db_path_tmp.cleanup();
-    const db_path = db_path_tmp.path().ptr;
-    defer cleanupTempDir(db_path);
-    defer {
-        var snapshots_buf: [512]u8 = undefined;
-        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(db_path)})) |snapshots| {
-            std.Io.Dir.cwd().deleteTree(std.testing.io, snapshots) catch {};
-        } else |_| {}
-    }
-    var ha_log_path_tmp = try TestDirectory.init("db");
-    defer ha_log_path_tmp.cleanup();
-    const ha_log_path = ha_log_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_tmp = try TestDirectory.init("db");
-    defer ha_slots_path_tmp.cleanup();
-    const ha_slots_path = ha_slots_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_slots_path);
-
-    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
-        .cluster_id = 252,
-        .shard_id = 5,
-        .table_id = 11,
-        .timeline_id = 1,
-        .epoch = 1,
-    }, .{});
-    defer primary.close();
-
-    var gated = GateDenseEmbedder{
-        .allowed_successes = .init(0),
-        .blocked_error = error.ResourceTemporarilyUnavailable,
-    };
-    var barrier: HAMutationBarrier = .{};
-    var db = try DB.open(alloc, std.mem.span(db_path), .{
-        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
-        .identity_namespace = .{ .shard_id = 5, .table_id = 11 },
-        .enrichment = .{
-            .owner_id = "worker-a",
-            .dense_embedder = gated.interface(),
-            .inline_retry_max_attempts = 1,
-        },
-        .ha_async_batch_mirror = .{
-            .publisher = ha_publisher_adapter.bind(&primary),
-            .mutation_barrier = &barrier,
-        },
-    });
-    defer db.close();
-
-    try db.addIndex(.{
-        .name = "semantic_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"semantic_idx\"}}",
-    });
-    try db.batch(.{
-        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha concept overview\"}" }},
-        .sync_level = .write,
-    });
-
-    var attempts: usize = 0;
-    while (attempts < default_test_wait_attempts) : (attempts += 1) {
-        if (gated.blocked_requests.load(.acquire) > 0) break;
-        sleepNs(10 * std.time.ns_per_ms);
-    }
-    try std.testing.expect(gated.blocked_requests.load(.acquire) > 0);
-
-    // This is the production deadlock ordering: capture has frozen durable
-    // mutations while enrichment still needs a shared lease to publish its
-    // result. The final verification must return within its budget, never wait
-    // forever with HA state locked.
-    // Match production's injected deadline clock: native POSIX monotonic time
-    // and std.Io's awake clock need not have the same epoch on every platform.
-    const maintenance_clock = db.backend_runtime.monotonicClock();
-    {
-        var premature_capture = barrier.acquireExclusive();
-        defer premature_capture.release();
-        gated.allowAll();
-        const premature_started_ns = maintenance_clock.nowRealtimeNs();
-        if (db.snapshotHASeed("premature", premature_started_ns +| 50 * std.time.ns_per_ms)) |_| {
-            return error.TestExpectedSeedSnapshotRuntimeBusy;
-        } else |err| {
-            try std.testing.expect(err == error.EnrichmentWaitTimeout or err == error.EnrichmentRetryInProgress);
-        }
-        try std.testing.expect(maintenance_clock.nowRealtimeNs() -| premature_started_ns < std.time.ns_per_s);
-    }
-
-    // Production performs this drain before taking the exclusive barrier.
-    try db.prepareHASeedSnapshot(maintenance_clock.nowRealtimeNs() +| 10 * std.time.ns_per_s);
-    var capture = barrier.acquireExclusive();
-    defer capture.release();
-    const snapshot_size = try db.snapshotHASeed(
-        "predrained",
-        maintenance_clock.nowRealtimeNs() +| std.time.ns_per_s,
-    );
-    try std.testing.expect(snapshot_size > 0);
-}
-
-test "storage.hot_standby fence cannot strand a local commit beyond the HA tail" {
-    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
-
-    const alloc = std.heap.c_allocator;
-    var db_path_tmp = try TestDirectory.init("db");
-    defer db_path_tmp.cleanup();
-    const db_path = db_path_tmp.path().ptr;
-    defer cleanupTempDir(db_path);
-    var ha_log_path_tmp = try TestDirectory.init("db");
-    defer ha_log_path_tmp.cleanup();
-    const ha_log_path = ha_log_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_tmp = try TestDirectory.init("db");
-    defer ha_slots_path_tmp.cleanup();
-    const ha_slots_path = ha_slots_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_slots_path);
-
-    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
-        .cluster_id = 251,
-        .shard_id = 4,
-        .table_id = 10,
-        .timeline_id = 1,
-        .epoch = 1,
-    }, .{});
-    defer primary.close();
-    var public_gate = ha_public_gate_state_mod.State{};
-    public_gate.configurePrimary(&primary, false);
-    var transition_mutex: std.atomic.Mutex = .unlocked;
-    var barrier: HAMutationBarrier = .{};
-    var db = try DB.open(alloc, std.mem.span(db_path), .{
-        .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
-        .ha_async_batch_mirror = .{
-            .publisher = ha_publisher_adapter.bind(&primary),
-            .mutation_barrier = &barrier,
-            .transition_mutex = &transition_mutex,
-        },
-        .ha_write_gate = .{ .shared = .{ .state = public_gate.storageWriteState() } },
-        .start_index_workers = false,
-    });
-    defer db.close();
-
-    lockAtomic(&transition_mutex);
-    var transition_locked = true;
-    var write_probe = ConcurrentWriteProbe{ .db = &db };
-    var write_thread = try std.testing.io.concurrent(ConcurrentWriteProbe.runBatch, .{&write_probe});
-    var thread_joined = false;
-    errdefer {
-        if (transition_locked) transition_mutex.unlock();
-        if (!thread_joined) write_thread.await(std.testing.io);
-    }
-    try std.testing.expect(waitForAtomicFlag(&write_probe.started, 1, 10_000));
-    var local_commit_observed = false;
-    for (0..10_000) |_| {
-        if (try db.get(alloc, "doc:b")) |stored| {
-            alloc.free(stored);
-            local_commit_observed = true;
-            break;
-        }
-        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
-    }
-    try std.testing.expect(local_commit_observed);
-    try std.testing.expectEqual(@as(u64, 0), primary.lastLsn());
-
-    public_gate.publishPrimaryFence(true);
-    transition_mutex.unlock();
-    transition_locked = false;
-    write_thread.await(std.testing.io);
-    thread_joined = true;
-
-    try std.testing.expectEqual(@as(u8, 1), write_probe.failed.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
-    const stored = (try db.get(alloc, "doc:b")) orelse return error.TestExpectedEqual;
-    defer alloc.free(stored);
-    try std.testing.expectEqualStrings("{\"title\":\"bravo\"}", stored);
-}
-
-test "storage.hot_standby schema json mutation does not reacquire shared barrier behind queued capture" {
-    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
-
-    const alloc = std.testing.allocator;
-    var db_path_tmp = try TestDirectory.init("db");
-    defer db_path_tmp.cleanup();
-    const db_path = db_path_tmp.path().ptr;
-    defer cleanupTempDir(db_path);
-    var ha_log_path_tmp = try TestDirectory.init("db");
-    defer ha_log_path_tmp.cleanup();
-    const ha_log_path = ha_log_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_tmp = try TestDirectory.init("db");
-    defer ha_slots_path_tmp.cleanup();
-    const ha_slots_path = ha_slots_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_slots_path);
-
-    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
-        .cluster_id = 253,
-        .shard_id = 6,
-        .table_id = 12,
-        .timeline_id = 1,
-        .epoch = 1,
-    }, .{});
-    defer primary.close();
-    var barrier: HAMutationBarrier = .{};
-    var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-    var failures = @import("antfly_platform").atomic.Value(u64).init(0);
-    var db = try DB.open(alloc, std.mem.span(db_path), .{
-        .identity_namespace = .{ .shard_id = 6, .table_id = 12 },
-        .ha_async_metadata_mirror = .{
-            .publisher = ha_publisher_adapter.bind(&primary),
-            .mutation_barrier = &barrier,
-            .last_lsn = &last_lsn,
-            .failure_count = &failures,
-        },
-        .start_index_workers = false,
-    });
-    defer db.close();
-
-    const CaptureProbe = struct {
-        barrier: *HAMutationBarrier,
-        started: std.atomic.Value(u8) = .init(0),
-        acquired: std.atomic.Value(u8) = .init(0),
-        release: std.atomic.Value(u8) = .init(0),
-
-        fn run(self: *@This()) void {
-            self.started.store(1, .release);
-            var capture = self.barrier.acquireExclusive();
-            self.acquired.store(1, .release);
-            while (self.release.load(.acquire) == 0) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
-            capture.release();
-        }
-    };
-
-    var outer = barrier.acquireShared();
-    var probe = CaptureProbe{ .barrier = &barrier };
-    var capture_thread = try std.testing.io.concurrent(CaptureProbe.run, .{&probe});
-    errdefer {
-        outer.release();
-        probe.release.store(1, .release);
-        capture_thread.await(std.testing.io);
-    }
-    try std.testing.expect(waitForAtomicFlag(&probe.started, 1, 10_000));
-    var capture_queued = false;
-    for (0..10_000) |_| {
-        if (barrier.pendingExclusiveAcquisitions() != 0) {
-            capture_queued = true;
-            break;
-        }
-        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
-    }
-    try std.testing.expect(capture_queued);
-
-    const schema_json =
-        \\{"version":1,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true}}}}
-    ;
-    try db.setSchemaJson(alloc, schema_json);
-    outer.release();
-    try std.testing.expect(waitForAtomicFlag(&probe.acquired, 1, 10_000));
-    probe.release.store(1, .release);
-    capture_thread.await(std.testing.io);
-
-    const stored = (try db.getSchemaJson(alloc)) orelse return error.TestExpectedEqual;
-    defer alloc.free(stored);
-    try std.testing.expectEqualStrings(schema_json, stored);
-    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
-}
-
-test "storage.hot_standby db evaluates sync commit gate for mirrored batch mutations" {
-    const alloc = std.testing.allocator;
-
-    var db_path_tmp = try TestDirectory.init("db");
-    defer db_path_tmp.cleanup();
-    const db_path = db_path_tmp.path().ptr;
-    defer cleanupTempDir(db_path);
-    var ha_log_path_tmp = try TestDirectory.init("db");
-    defer ha_log_path_tmp.cleanup();
-    const ha_log_path = ha_log_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_tmp = try TestDirectory.init("db");
-    defer ha_slots_path_tmp.cleanup();
-    const ha_slots_path = ha_slots_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_slots_path);
-
-    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
-        .cluster_id = 253,
-        .shard_id = 4,
-        .table_id = 10,
-        .timeline_id = 1,
-        .epoch = 1,
-    }, .{});
-    defer primary.close();
-    try primary.createSlot("standby-a", 0);
-
-    var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-    var gate_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-    var gate_action = std.atomic.Value(u8).init(255);
-    var degraded = @import("antfly_platform").atomic.Value(u64).init(0);
-    const standby_names = [_][]const u8{"standby-a"};
-    {
-        var db = try DB.open(alloc, std.mem.span(db_path), .{
-            .ha_async_batch_mirror = .{
-                .publisher = ha_publisher_adapter.bind(&primary),
-                .last_lsn = &last_lsn,
-                .sync_policy = .{
-                    .mode = .remote_write,
-                    .standby_names = &standby_names,
-                    .failure_policy = .degrade_to_async,
-                },
-                .last_gate_lsn = &gate_lsn,
-                .last_gate_action = &gate_action,
-                .sync_degraded_count = &degraded,
-            },
-            .start_index_workers = false,
-        });
-        defer db.close();
-
-        try db.batch(.{
-            .writes = &.{.{ .key = "doc:sync", .value = "{\"title\":\"sync\"}" }},
-            .sync_level = .write,
-        });
-        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, ha_batch_outbox_key));
-    }
-
-    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
-    try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
-    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.acknowledge_degraded), gate_action.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 1), degraded.load(.acquire));
-}
-
-test "storage.hot_standby db block sync policy waits for standby acknowledgement" {
-    const alloc = std.testing.allocator;
-
-    var db_path_tmp = try TestDirectory.init("db");
-    defer db_path_tmp.cleanup();
-    const db_path = db_path_tmp.path().ptr;
-    defer cleanupTempDir(db_path);
-    var ha_log_path_tmp = try TestDirectory.init("db");
-    defer ha_log_path_tmp.cleanup();
-    const ha_log_path = ha_log_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_tmp = try TestDirectory.init("db");
-    defer ha_slots_path_tmp.cleanup();
-    const ha_slots_path = ha_slots_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_slots_path);
-
-    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
-        .cluster_id = 255,
-        .shard_id = 4,
-        .table_id = 10,
-        .timeline_id = 1,
-        .epoch = 1,
-    }, .{});
-    defer primary.close();
-    try primary.createSlot("standby-a", 0);
-
-    const SyncWait = struct {
-        calls: u64 = 0,
-
-        fn wait(ctx: *anyopaque, primary_arg_ctx: *anyopaque, target_lsn: u64, policy: ha_primary_mod.SyncPolicy) !void {
-            const primary_arg: *ha_primary_mod.Primary = @ptrCast(@alignCast(primary_arg_ctx));
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.calls += 1;
-            try std.testing.expectEqual(ha_primary_mod.DurabilityMode.remote_write, policy.mode);
-            try primary_arg.standbyStatusUpdate("standby-a", primary_arg.identity.timeline_id, target_lsn, 0);
-        }
-    };
-
-    var wait_state = SyncWait{};
-    var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-    var gate_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-    var gate_action = std.atomic.Value(u8).init(255);
-    var waits = @import("antfly_platform").atomic.Value(u64).init(0);
-    const standby_names = [_][]const u8{"standby-a"};
-    var db = try DB.open(alloc, std.mem.span(db_path), .{
-        .ha_async_batch_mirror = .{
-            .publisher = ha_publisher_adapter.bind(&primary),
-            .last_lsn = &last_lsn,
-            .sync_policy = .{
-                .mode = .remote_write,
-                .standby_names = &standby_names,
-                .failure_policy = .block,
-            },
-            .sync_wait_ctx = &wait_state,
-            .sync_wait_fn = SyncWait.wait,
-            .last_gate_lsn = &gate_lsn,
-            .last_gate_action = &gate_action,
-            .sync_wait_count = &waits,
-        },
-        .start_index_workers = false,
-    });
-    defer db.close();
-
-    try db.batch(.{
-        .writes = &.{.{ .key = "doc:block", .value = "{\"title\":\"block\"}" }},
-        .sync_level = .write,
-    });
-    try std.testing.expectEqual(@as(u64, 1), wait_state.calls);
-    try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
-    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
-    var found = (try db.lookup(alloc, "doc:block", .{})) orelse return error.TestExpectedEqual;
-    defer found.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"title\":\"block\"}", found.json);
-}
-
-test "storage.hot_standby synchronous waits pipeline later commits by lsn" {
-    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
-
-    const alloc = std.heap.c_allocator;
-    var db_path_tmp = try TestDirectory.init("db");
-    defer db_path_tmp.cleanup();
-    const db_path = db_path_tmp.path().ptr;
-    defer cleanupTempDir(db_path);
-    var ha_log_path_tmp = try TestDirectory.init("db");
-    defer ha_log_path_tmp.cleanup();
-    const ha_log_path = ha_log_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_tmp = try TestDirectory.init("db");
-    defer ha_slots_path_tmp.cleanup();
-    const ha_slots_path = ha_slots_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_slots_path);
-
-    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
-        .cluster_id = 255,
-        .shard_id = 4,
-        .table_id = 10,
-        .timeline_id = 1,
-        .epoch = 1,
-    }, .{});
-    defer primary.close();
-    try primary.createSlot("standby-a", 0);
-
-    var io_impl = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(2) });
-    defer io_impl.deinit();
-    const io = io_impl.io();
-
-    const SyncWait = struct {
-        io: std.Io,
-        first_waiting: std.atomic.Value(u8) = .init(0),
-        second_acknowledged: std.atomic.Value(u8) = .init(0),
-
-        fn wait(ctx: *anyopaque, primary_arg_ctx: *anyopaque, target_lsn: u64, _: ha_primary_mod.SyncPolicy) !void {
-            const primary_arg: *ha_primary_mod.Primary = @ptrCast(@alignCast(primary_arg_ctx));
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            if (target_lsn == 1) {
-                self.first_waiting.store(1, .release);
-                const deadline = monotonicTimeNs() +| 5 * std.time.ns_per_s;
-                while (self.second_acknowledged.load(.acquire) == 0 and monotonicTimeNs() < deadline)
-                    try self.io.sleep(.fromMilliseconds(1), .awake);
-                if (self.second_acknowledged.load(.acquire) == 0) return error.TestExpectedSecondCommitToPipeline;
-                return;
-            }
-            try std.testing.expectEqual(@as(u64, 2), target_lsn);
-            try primary_arg.standbyStatusUpdate("standby-a", primary_arg.identity.timeline_id, target_lsn, target_lsn);
-            self.second_acknowledged.store(1, .release);
-        }
-    };
-    const Write = struct {
-        db: *DB,
-        key: []const u8,
-        value: []const u8,
-        failed: std.atomic.Value(u8) = .init(0),
-
-        fn run(self: *@This()) void {
-            self.db.batch(.{
-                .writes = &.{.{ .key = self.key, .value = self.value }},
-                .sync_level = .write,
-            }) catch {
-                self.failed.store(1, .release);
-            };
-        }
-    };
-
-    var wait_state = SyncWait{ .io = io };
-    var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-    const standby_names = [_][]const u8{"standby-a"};
-    var db = try DB.open(alloc, std.mem.span(db_path), .{
-        .ha_async_batch_mirror = .{
-            .publisher = ha_publisher_adapter.bind(&primary),
-            .last_lsn = &last_lsn,
-            .sync_policy = .{
-                .mode = .remote_write,
-                .standby_names = &standby_names,
-                .failure_policy = .block,
-            },
-            .sync_wait_ctx = &wait_state,
-            .sync_wait_fn = SyncWait.wait,
-        },
-        .start_index_workers = false,
-    });
-    defer db.close();
-
-    var first = Write{ .db = &db, .key = "doc:first", .value = "{\"title\":\"first\"}" };
-    var first_future = std.Io.async(io, Write.run, .{&first});
-    var first_awaited = false;
-    defer if (!first_awaited) first_future.await(io);
-    for (0..10_000) |_| {
-        if (wait_state.first_waiting.load(.acquire) == 1) break;
-        try io.sleep(.fromMilliseconds(1), .awake);
-    }
-    try std.testing.expectEqual(@as(u8, 1), wait_state.first_waiting.load(.acquire));
-
-    var second = Write{ .db = &db, .key = "doc:second", .value = "{\"title\":\"second\"}" };
-    var second_future = std.Io.async(io, Write.run, .{&second});
-    second_future.await(io);
-    first_future.await(io);
-    first_awaited = true;
-
-    try std.testing.expectEqual(@as(u8, 0), first.failed.load(.acquire));
-    try std.testing.expectEqual(@as(u8, 0), second.failed.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
-    try std.testing.expectEqual(@as(u64, 2), last_lsn.load(.acquire));
-    const first_value = (try db.get(alloc, "doc:first")) orelse return error.TestExpectedEqual;
-    defer alloc.free(first_value);
-    const second_value = (try db.get(alloc, "doc:second")) orelse return error.TestExpectedEqual;
-    defer alloc.free(second_value);
-}
-
-test "storage.hot_standby durable outbox recovery does not duplicate an appended batch" {
-    const alloc = std.testing.allocator;
-
-    var db_path_tmp = try TestDirectory.init("db");
-    defer db_path_tmp.cleanup();
-    const db_path = db_path_tmp.path().ptr;
-    defer cleanupTempDir(db_path);
-    var ha_log_path_tmp = try TestDirectory.init("db");
-    defer ha_log_path_tmp.cleanup();
-    const ha_log_path = ha_log_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_tmp = try TestDirectory.init("db");
-    defer ha_slots_path_tmp.cleanup();
-    const ha_slots_path = ha_slots_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_slots_path);
-
-    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
-        .cluster_id = 256,
-        .shard_id = 4,
-        .table_id = 10,
-        .timeline_id = 1,
-        .epoch = 1,
-    }, .{});
-    defer primary.close();
-    try primary.createSlot("standby-a", 0);
-
-    const SyncWait = struct {
-        calls: usize = 0,
-
-        fn wait(ctx: *anyopaque, primary_arg_ctx: *anyopaque, target_lsn: u64, _: ha_primary_mod.SyncPolicy) !void {
-            const primary_arg: *ha_primary_mod.Primary = @ptrCast(@alignCast(primary_arg_ctx));
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.calls += 1;
-            try primary_arg.standbyStatusUpdate("standby-a", primary_arg.identity.timeline_id, target_lsn, target_lsn);
-        }
-    };
-    var wait_state = SyncWait{};
-    var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-    const standby_names = [_][]const u8{"standby-a"};
-    var db = try DB.open(alloc, std.mem.span(db_path), .{
-        .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
-        .ha_async_batch_mirror = .{
-            .publisher = ha_publisher_adapter.bind(&primary),
-            .last_lsn = &last_lsn,
-            .sync_policy = .{
-                .mode = .remote_write,
-                .standby_names = &standby_names,
-                .failure_policy = .block,
-            },
-            .sync_wait_ctx = &wait_state,
-            .sync_wait_fn = SyncWait.wait,
-        },
-        .start_index_workers = false,
-    });
-    defer db.close();
-
-    const request = types.BatchRequest{
-        .writes = &.{.{ .key = "doc:recovered", .value = "{\"title\":\"recovered\"}" }},
-        .sync_level = .write,
-    };
-    const payload = try ha_effects_mod.encodeBatchMutationRequestAlloc(alloc, request);
-    defer alloc.free(payload);
-    const from_lsn = primary.nextLsn();
-    const outbox = try encodeDurableHAOutboxAlloc(alloc, from_lsn, payload);
-    defer alloc.free(outbox);
-    try db.core.store.putBatch(&.{.{ .key = ha_batch_outbox_key, .value = outbox }}, &.{});
-    // Direct fixture insertion bypasses the normal writer publication fence.
-    db.durable_ha_outbox_maybe.store(true, .release);
-
-    // Model a crash after the HA append succeeds but before the local outbox
-    // delete commits. Recovery must acknowledge this exact record, not append
-    // the non-idempotent request a second time.
-    const appended_lsn = try @import("../hot_standby/effects.zig").appendEncodedBatchMutationRequest(&primary, payload, .{
-        .shard_id = 4,
-        .table_id = 10,
-    });
-    try std.testing.expectEqual(@as(u64, 1), appended_lsn);
-    try db.flushDurableHAOutboxes();
-
-    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
-    try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 1), wait_state.calls);
-    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, ha_batch_outbox_key));
-}
-
 test "storage.hot_standby durable outbox cleanup is mutation scoped" {
     const alloc = std.testing.allocator;
     var db_path_tmp = try TestDirectory.init("db");
@@ -114461,14 +113018,14 @@ test "storage.hot_standby durable outbox cleanup is mutation scoped" {
     var db = try DB.open(alloc, std.mem.span(db_path), .{ .start_index_workers = false });
     defer db.close();
 
-    const key_a = try durableHAOutboxKeyAlloc(alloc, .batch, 1, 7, "a");
+    const key_a = try durableReplicationOutboxKeyAlloc(alloc, .batch, 1, 7, "a");
     defer alloc.free(key_a);
-    const key_b = try durableHAOutboxKeyAlloc(alloc, .batch, 1, 7, "b");
+    const key_b = try durableReplicationOutboxKeyAlloc(alloc, .batch, 1, 7, "b");
     defer alloc.free(key_b);
     try std.testing.expect(!std.mem.eql(u8, key_a, key_b));
-    const value_a = try encodeDurableHAOutboxAlloc(alloc, 1, "a");
+    const value_a = try encodeDurableReplicationOutboxAlloc(alloc, 1, "a");
     defer alloc.free(value_a);
-    const value_b = try encodeDurableHAOutboxAlloc(alloc, 1, "b");
+    const value_b = try encodeDurableReplicationOutboxAlloc(alloc, 1, "b");
     defer alloc.free(value_b);
     try db.core.store.putBatch(&.{
         .{ .key = key_a, .value = value_a },
@@ -114477,908 +113034,11 @@ test "storage.hot_standby durable outbox cleanup is mutation scoped" {
 
     // Model request A completing after request B has committed its outbox.
     // A may remove only the record named by its own mutation identity.
-    try db.clearDurableHAOutbox(key_a);
+    try db.clearDurableReplicationOutbox(key_a);
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, key_a));
     const surviving = try db.core.store.get(alloc, key_b);
     defer alloc.free(surviving);
-    try std.testing.expectEqualStrings("b", (try decodeDurableHAOutbox(surviving)).payload);
-}
-
-test "storage.hot_standby db session sync wait satisfies remote apply through standby DB apply" {
-    const alloc = std.testing.allocator;
-
-    var primary_db_path_tmp = try TestDirectory.init("db");
-    defer primary_db_path_tmp.cleanup();
-    const primary_db_path = primary_db_path_tmp.path().ptr;
-    defer cleanupTempDir(primary_db_path);
-    var standby_db_path_tmp = try TestDirectory.init("db");
-    defer standby_db_path_tmp.cleanup();
-    const standby_db_path = standby_db_path_tmp.path().ptr;
-    defer cleanupTempDir(standby_db_path);
-    var ha_log_path_tmp = try TestDirectory.init("db");
-    defer ha_log_path_tmp.cleanup();
-    const ha_log_path = ha_log_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_tmp = try TestDirectory.init("db");
-    defer ha_slots_path_tmp.cleanup();
-    const ha_slots_path = ha_slots_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_slots_path);
-    var standby_log_path_tmp = try TestDirectory.init("db");
-    defer standby_log_path_tmp.cleanup();
-    const standby_log_path = standby_log_path_tmp.path().ptr;
-    defer cleanupTempDir(standby_log_path);
-    var standby_progress_path_tmp = try TestDirectory.init("db");
-    defer standby_progress_path_tmp.cleanup();
-    const standby_progress_path = standby_progress_path_tmp.path().ptr;
-    defer cleanupTempDir(standby_progress_path);
-
-    const identity = ha_standby_mod.Identity{
-        .cluster_id = 257,
-        .shard_id = 4,
-        .table_id = 10,
-        .timeline_id = 1,
-        .epoch = 1,
-    };
-    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, identity, .{});
-    defer primary.close();
-    try primary.createSlot("standby-a", 0);
-
-    var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, identity, .{});
-    defer standby.close();
-
-    var standby_db = try DB.open(alloc, std.mem.span(standby_db_path), .{
-        .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
-        .ha_write_gate = .{ .standby = ha_write_gate_adapter.bindStandby(&standby) },
-        .start_index_workers = false,
-    });
-    defer standby_db.close();
-
-    var wait_state = HASessionSyncWait{
-        .alloc = alloc,
-        .slot_name = "standby-a",
-        .standby = &standby,
-        .apply_ctx = &standby_db,
-        .apply_fn = DB.applyHAReplicationRecordCallback,
-    };
-    var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-    var gate_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-    var gate_action = std.atomic.Value(u8).init(255);
-    var waits = @import("antfly_platform").atomic.Value(u64).init(0);
-    const standby_names = [_][]const u8{"standby-a"};
-    var primary_db = try DB.open(alloc, std.mem.span(primary_db_path), .{
-        .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
-        .ha_async_batch_mirror = .{
-            .publisher = ha_publisher_adapter.bind(&primary),
-            .last_lsn = &last_lsn,
-            .sync_policy = .{
-                .mode = .remote_apply,
-                .standby_names = &standby_names,
-                .failure_policy = .block,
-            },
-            .sync_wait_ctx = &wait_state,
-            .sync_wait_fn = HASessionSyncWait.wait,
-            .last_gate_lsn = &gate_lsn,
-            .last_gate_action = &gate_action,
-            .sync_wait_count = &waits,
-        },
-        .start_index_workers = false,
-    });
-    defer primary_db.close();
-
-    try primary_db.batch(.{
-        .writes = &.{.{ .key = "doc:remote-apply", .value = "{\"title\":\"remote-apply\"}" }},
-        .sync_level = .write,
-    });
-
-    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
-    try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
-    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
-    const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
-    try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
-    try std.testing.expectEqual(@as(u64, 1), try standby_db.haAppliedReplicationLsn());
-
-    var found = (try standby_db.lookup(alloc, "doc:remote-apply", .{})) orelse return error.TestExpectedEqual;
-    defer found.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"title\":\"remote-apply\"}", found.json);
-}
-
-test "storage.hot_standby db allows progress but rejects acknowledgement when fenced during remote apply wait" {
-    const alloc = std.testing.allocator;
-
-    var primary_db_path_tmp = try TestDirectory.init("db");
-    defer primary_db_path_tmp.cleanup();
-    const primary_db_path = primary_db_path_tmp.path().ptr;
-    defer cleanupTempDir(primary_db_path);
-    var standby_db_path_tmp = try TestDirectory.init("db");
-    defer standby_db_path_tmp.cleanup();
-    const standby_db_path = standby_db_path_tmp.path().ptr;
-    defer cleanupTempDir(standby_db_path);
-    var ha_log_path_tmp = try TestDirectory.init("db");
-    defer ha_log_path_tmp.cleanup();
-    const ha_log_path = ha_log_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_tmp = try TestDirectory.init("db");
-    defer ha_slots_path_tmp.cleanup();
-    const ha_slots_path = ha_slots_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_slots_path);
-    var standby_log_path_tmp = try TestDirectory.init("db");
-    defer standby_log_path_tmp.cleanup();
-    const standby_log_path = standby_log_path_tmp.path().ptr;
-    defer cleanupTempDir(standby_log_path);
-    var standby_progress_path_tmp = try TestDirectory.init("db");
-    defer standby_progress_path_tmp.cleanup();
-    const standby_progress_path = standby_progress_path_tmp.path().ptr;
-    defer cleanupTempDir(standby_progress_path);
-
-    const identity = ha_standby_mod.Identity{
-        .cluster_id = 262,
-        .shard_id = 4,
-        .table_id = 10,
-        .timeline_id = 1,
-        .epoch = 1,
-    };
-    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, identity, .{});
-    defer primary.close();
-    try primary.createSlot("standby-a", 0);
-
-    var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, identity, .{});
-    defer standby.close();
-    var standby_db = try DB.open(alloc, std.mem.span(standby_db_path), .{
-        .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
-        .ha_write_gate = .{ .standby = ha_write_gate_adapter.bindStandby(&standby) },
-        .start_index_workers = false,
-    });
-    defer standby_db.close();
-
-    var public_gate = ha_public_gate_state_mod.State{};
-    public_gate.configurePrimary(&primary, false);
-
-    var transition_mutex: std.atomic.Mutex = .unlocked;
-    var mutation_barrier: HAMutationBarrier = .{};
-    const FencingRemoteApplyWait = struct {
-        session: HASessionSyncWait,
-        transition_mutex: *std.atomic.Mutex,
-        mutation_barrier: *HAMutationBarrier,
-        public_gate: *ha_public_gate_state_mod.State,
-        primary_db: ?*DB = null,
-        calls: u64 = 0,
-
-        fn wait(ctx: *anyopaque, primary_arg_ctx: *anyopaque, target_lsn: u64, policy: ha_primary_mod.SyncPolicy) !void {
-            const primary_arg: *ha_primary_mod.Primary = @ptrCast(@alignCast(primary_arg_ctx));
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.calls += 1;
-            // Remote progress must be able to enter while the client waits;
-            // authority is serialized again for the final acknowledgement.
-            try std.testing.expect(self.transition_mutex.tryLock());
-            self.transition_mutex.unlock();
-            const db = self.primary_db orelse return error.TestUnexpectedResult;
-            // Point reads must remain live while the client acknowledgement
-            // waits on remote durability. Holding the exclusive apply lock
-            // here starves every reader behind an unavailable standby.
-            try std.testing.expect(db.core.apply_mutex.tryLockShared());
-            db.core.apply_mutex.unlockShared();
-            // A replacement seed capture must be able to freeze the exact
-            // local commit/HA-tail pair while this client waits for the missing
-            // standby. Holding the mutation lease here deadlocks the operation
-            // that can restore remote durability.
-            var capture = self.mutation_barrier.tryAcquireExclusive() orelse
-                return error.HASeedCaptureBlockedByRemoteDurabilityWait;
-            capture.release();
-            try HASessionSyncWait.wait(&self.session, primary_arg, target_lsn, policy);
-            // Fence only after remote apply. The final client gate must observe
-            // this transition after reacquiring the same mutex.
-            lockAtomic(self.transition_mutex);
-            self.public_gate.publishPrimaryFence(true);
-            self.transition_mutex.unlock();
-        }
-    };
-    var wait_state = FencingRemoteApplyWait{
-        .session = .{
-            .alloc = alloc,
-            .slot_name = "standby-a",
-            .standby = &standby,
-            .apply_ctx = &standby_db,
-            .apply_fn = DB.applyHAReplicationRecordCallback,
-        },
-        .transition_mutex = &transition_mutex,
-        .mutation_barrier = &mutation_barrier,
-        .public_gate = &public_gate,
-    };
-    const standby_names = [_][]const u8{"standby-a"};
-    var primary_db = try DB.open(alloc, std.mem.span(primary_db_path), .{
-        .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
-        .ha_async_batch_mirror = .{
-            .publisher = ha_publisher_adapter.bind(&primary),
-            .transition_mutex = &transition_mutex,
-            .mutation_barrier = &mutation_barrier,
-            .sync_policy = .{
-                .mode = .remote_apply,
-                .standby_names = &standby_names,
-                .failure_policy = .block,
-            },
-            .sync_wait_ctx = &wait_state,
-            .sync_wait_fn = FencingRemoteApplyWait.wait,
-        },
-        .ha_write_gate = .{ .shared = .{ .state = public_gate.storageWriteState() } },
-        .start_index_workers = false,
-    });
-    defer primary_db.close();
-    wait_state.primary_db = &primary_db;
-
-    try std.testing.expectError(error.HAFencedPrimary, primary_db.batch(.{
-        .writes = &.{.{ .key = "doc:authority-expired", .value = "{\"title\":\"replicated-but-not-acknowledged\"}" }},
-        .sync_level = .write,
-    }));
-    try std.testing.expectEqual(@as(u64, 1), wait_state.calls);
-
-    // The mutation committed locally and reached remote apply before fencing,
-    // but the stale client receives an error rather than success.
-    var local = (try primary_db.lookup(alloc, "doc:authority-expired", .{})) orelse return error.TestExpectedEqual;
-    defer local.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"title\":\"replicated-but-not-acknowledged\"}", local.json);
-    var remote = (try standby_db.lookup(alloc, "doc:authority-expired", .{})) orelse return error.TestExpectedEqual;
-    defer remote.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"title\":\"replicated-but-not-acknowledged\"}", remote.json);
-    try std.testing.expectEqual(@as(u64, 1), try standby_db.haAppliedReplicationLsn());
-}
-
-test "storage.hot_standby db session sync wait remote write acknowledges durable receive despite apply failure" {
-    const alloc = std.testing.allocator;
-
-    var primary_db_path_tmp = try TestDirectory.init("db");
-    defer primary_db_path_tmp.cleanup();
-    const primary_db_path = primary_db_path_tmp.path().ptr;
-    defer cleanupTempDir(primary_db_path);
-    var ha_log_path_tmp = try TestDirectory.init("db");
-    defer ha_log_path_tmp.cleanup();
-    const ha_log_path = ha_log_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_tmp = try TestDirectory.init("db");
-    defer ha_slots_path_tmp.cleanup();
-    const ha_slots_path = ha_slots_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_slots_path);
-    var standby_log_path_tmp = try TestDirectory.init("db");
-    defer standby_log_path_tmp.cleanup();
-    const standby_log_path = standby_log_path_tmp.path().ptr;
-    defer cleanupTempDir(standby_log_path);
-    var standby_progress_path_tmp = try TestDirectory.init("db");
-    defer standby_progress_path_tmp.cleanup();
-    const standby_progress_path = standby_progress_path_tmp.path().ptr;
-    defer cleanupTempDir(standby_progress_path);
-
-    const identity = ha_standby_mod.Identity{
-        .cluster_id = 258,
-        .shard_id = 4,
-        .table_id = 10,
-        .timeline_id = 1,
-        .epoch = 1,
-    };
-    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, identity, .{});
-    defer primary.close();
-    try primary.createSlot("standby-a", 0);
-
-    var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, identity, .{});
-    defer standby.close();
-
-    const ApplyFailure = struct {
-        calls: u64 = 0,
-
-        fn apply(ctx: *anyopaque, _: ha_replication_record_mod.RecordView) anyerror!void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.calls += 1;
-            return error.IntentionalApplyFailure;
-        }
-    };
-
-    var apply_failure = ApplyFailure{};
-    var wait_state = HASessionSyncWait{
-        .alloc = alloc,
-        .slot_name = "standby-a",
-        .standby = &standby,
-        .apply_ctx = &apply_failure,
-        .apply_fn = ApplyFailure.apply,
-    };
-    var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-    var gate_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-    var gate_action = std.atomic.Value(u8).init(255);
-    var waits = @import("antfly_platform").atomic.Value(u64).init(0);
-    const standby_names = [_][]const u8{"standby-a"};
-    var primary_db = try DB.open(alloc, std.mem.span(primary_db_path), .{
-        .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
-        .ha_async_batch_mirror = .{
-            .publisher = ha_publisher_adapter.bind(&primary),
-            .last_lsn = &last_lsn,
-            .sync_policy = .{
-                .mode = .remote_write,
-                .standby_names = &standby_names,
-                .failure_policy = .block,
-            },
-            .sync_wait_ctx = &wait_state,
-            .sync_wait_fn = HASessionSyncWait.wait,
-            .last_gate_lsn = &gate_lsn,
-            .last_gate_action = &gate_action,
-            .sync_wait_count = &waits,
-        },
-        .start_index_workers = false,
-    });
-    defer primary_db.close();
-
-    try primary_db.batch(.{
-        .writes = &.{.{ .key = "doc:remote-write", .value = "{\"title\":\"remote-write\"}" }},
-        .sync_level = .write,
-    });
-
-    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
-    try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
-    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 1), apply_failure.calls);
-    const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
-    try std.testing.expectEqual(@as(u64, 0), slot.applied_lsn);
-    try std.testing.expectEqualStrings("IntentionalApplyFailure", slot.last_error.?);
-
-    var found = (try primary_db.lookup(alloc, "doc:remote-write", .{})) orelse return error.TestExpectedEqual;
-    defer found.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"title\":\"remote-write\"}", found.json);
-}
-
-test "storage.hot_standby db primary progress sync wait observes reported remote apply ack" {
-    const alloc = std.testing.allocator;
-
-    var db_path_tmp = try TestDirectory.init("db");
-    defer db_path_tmp.cleanup();
-    const db_path = db_path_tmp.path().ptr;
-    defer cleanupTempDir(db_path);
-    var ha_log_path_tmp = try TestDirectory.init("db");
-    defer ha_log_path_tmp.cleanup();
-    const ha_log_path = ha_log_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_tmp = try TestDirectory.init("db");
-    defer ha_slots_path_tmp.cleanup();
-    const ha_slots_path = ha_slots_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_slots_path);
-
-    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
-        .cluster_id = 259,
-        .shard_id = 4,
-        .table_id = 10,
-        .timeline_id = 1,
-        .epoch = 1,
-    }, .{});
-    defer primary.close();
-    try primary.createSlot("standby-a", 0);
-
-    const RemoteAck = struct {
-        calls: usize = 0,
-
-        fn poll(ctx: *anyopaque, primary_arg: *ha_primary_mod.Primary, target_lsn: u64, policy: ha_primary_mod.SyncPolicy, round: usize) !void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.calls += 1;
-            try std.testing.expectEqual(ha_primary_mod.DurabilityMode.remote_apply, policy.mode);
-            try std.testing.expectEqual(self.calls - 1, round);
-            if (self.calls == 1) {
-                try primary_arg.standbyStatusUpdate("standby-a", primary_arg.identity.timeline_id, target_lsn, 0);
-            } else {
-                try primary_arg.standbyStatusUpdate("standby-a", primary_arg.identity.timeline_id, target_lsn, target_lsn);
-            }
-        }
-    };
-
-    var remote_ack = RemoteAck{};
-    var wait_state = HAPrimaryProgressSyncWait{
-        .max_rounds = 3,
-        .poll_ctx = &remote_ack,
-        .poll_fn = RemoteAck.poll,
-    };
-    var gate_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-    var gate_action = std.atomic.Value(u8).init(255);
-    var waits = @import("antfly_platform").atomic.Value(u64).init(0);
-    const standby_names = [_][]const u8{"standby-a"};
-    var db = try DB.open(alloc, std.mem.span(db_path), .{
-        .ha_async_batch_mirror = .{
-            .publisher = ha_publisher_adapter.bind(&primary),
-            .sync_policy = .{
-                .mode = .remote_apply,
-                .standby_names = &standby_names,
-                .failure_policy = .block,
-            },
-            .sync_wait_ctx = &wait_state,
-            .sync_wait_fn = HAPrimaryProgressSyncWait.wait,
-            .last_gate_lsn = &gate_lsn,
-            .last_gate_action = &gate_action,
-            .sync_wait_count = &waits,
-        },
-        .start_index_workers = false,
-    });
-    defer db.close();
-
-    try db.batch(.{
-        .writes = &.{.{ .key = "doc:progress-wait", .value = "{\"title\":\"progress-wait\"}" }},
-        .sync_level = .write,
-    });
-
-    try std.testing.expectEqual(@as(usize, 2), remote_ack.calls);
-    try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
-    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
-    const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
-    try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
-}
-
-test "storage.hot_standby primary progress sync wait fast fails without enough eligible candidates" {
-    const alloc = std.testing.allocator;
-
-    var ha_log_path_tmp = try TestDirectory.init("db");
-    defer ha_log_path_tmp.cleanup();
-    const ha_log_path = ha_log_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_tmp = try TestDirectory.init("db");
-    defer ha_slots_path_tmp.cleanup();
-    const ha_slots_path = ha_slots_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_slots_path);
-
-    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
-        .cluster_id = 260,
-        .shard_id = 4,
-        .table_id = 11,
-        .timeline_id = 2,
-        .epoch = 2,
-    }, .{});
-    defer primary.close();
-    const target_lsn = try primary.append(.{ .payload = "locally-committed-after-promotion" });
-
-    const Poll = struct {
-        calls: usize = 0,
-
-        fn poll(ctx: *anyopaque, _: *ha_primary_mod.Primary, _: u64, _: ha_primary_mod.SyncPolicy, round: usize) !void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            try std.testing.expectEqual(self.calls, round);
-            self.calls += 1;
-        }
-    };
-
-    var poll = Poll{};
-    var wait_state = HAPrimaryProgressSyncWait{
-        .max_rounds = 200,
-        .poll_ctx = &poll,
-        .poll_fn = Poll.poll,
-    };
-    const standby_names = [_][]const u8{"former-primary"};
-    try std.testing.expectError(
-        error.HASyncCommitWouldBlock,
-        HAPrimaryProgressSyncWait.wait(&wait_state, &primary, target_lsn, .{
-            .mode = .remote_apply,
-            .standby_names = &standby_names,
-            .failure_policy = .block,
-        }),
-    );
-    try std.testing.expectEqual(@as(usize, 1), poll.calls);
-}
-
-test "storage.hot_standby db primary progress sync wait returns would block without reported ack" {
-    const alloc = std.testing.allocator;
-
-    var db_path_tmp = try TestDirectory.init("db");
-    defer db_path_tmp.cleanup();
-    const db_path = db_path_tmp.path().ptr;
-    defer cleanupTempDir(db_path);
-    var ha_log_path_tmp = try TestDirectory.init("db");
-    defer ha_log_path_tmp.cleanup();
-    const ha_log_path = ha_log_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_tmp = try TestDirectory.init("db");
-    defer ha_slots_path_tmp.cleanup();
-    const ha_slots_path = ha_slots_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_slots_path);
-
-    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
-        .cluster_id = 260,
-        .shard_id = 4,
-        .table_id = 10,
-        .timeline_id = 1,
-        .epoch = 1,
-    }, .{});
-    defer primary.close();
-    try primary.createSlot("standby-a", 0);
-
-    var wait_state = HAPrimaryProgressSyncWait{ .max_rounds = 1 };
-    var gate_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-    var gate_action = std.atomic.Value(u8).init(255);
-    var waits = @import("antfly_platform").atomic.Value(u64).init(0);
-    const standby_names = [_][]const u8{"standby-a"};
-    var db = try DB.open(alloc, std.mem.span(db_path), .{
-        .ha_async_batch_mirror = .{
-            .publisher = ha_publisher_adapter.bind(&primary),
-            .sync_policy = .{
-                .mode = .remote_write,
-                .standby_names = &standby_names,
-                .failure_policy = .block,
-            },
-            .sync_wait_ctx = &wait_state,
-            .sync_wait_fn = HAPrimaryProgressSyncWait.wait,
-            .last_gate_lsn = &gate_lsn,
-            .last_gate_action = &gate_action,
-            .sync_wait_count = &waits,
-        },
-        .start_index_workers = false,
-    });
-    defer db.close();
-
-    try std.testing.expectError(error.HASyncCommitWouldBlock, db.batch(.{
-        .writes = &.{.{ .key = "doc:progress-timeout", .value = "{\"title\":\"progress-timeout\"}" }},
-        .sync_level = .write,
-    }));
-
-    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
-    try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
-    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.wait_for_standby), gate_action.load(.acquire));
-    const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(u64, 0), slot.received_lsn);
-}
-
-test "storage.hot_standby pending acknowledgement preserves batch and replay tail order" {
-    const alloc = std.testing.allocator;
-
-    var db_path_tmp = try TestDirectory.init("db");
-    defer db_path_tmp.cleanup();
-    const db_path = db_path_tmp.path().ptr;
-    defer cleanupTempDir(db_path);
-    var ha_log_path_tmp = try TestDirectory.init("db");
-    defer ha_log_path_tmp.cleanup();
-    const ha_log_path = ha_log_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_tmp = try TestDirectory.init("db");
-    defer ha_slots_path_tmp.cleanup();
-    const ha_slots_path = ha_slots_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_slots_path);
-
-    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
-        .cluster_id = 264,
-        .shard_id = 4,
-        .table_id = 10,
-        .timeline_id = 1,
-        .epoch = 1,
-    }, .{});
-    defer primary.close();
-    try primary.createSlot("standby-a", 0);
-
-    var wait_state = HAPrimaryProgressSyncWait{ .max_rounds = 1 };
-    const standby_names = [_][]const u8{"standby-a"};
-    const mirror = HAAsyncEffectMirror{
-        .publisher = ha_publisher_adapter.bind(&primary),
-        .sync_policy = .{
-            .mode = .remote_write,
-            .standby_names = &standby_names,
-            .failure_policy = .block,
-        },
-        .sync_wait_ctx = &wait_state,
-        .sync_wait_fn = HAPrimaryProgressSyncWait.wait,
-    };
-    var batch_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-    var replay_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-    var db = try DB.open(alloc, std.mem.span(db_path), .{
-        .ha_async_batch_mirror = blk: {
-            var configured = mirror;
-            configured.last_lsn = &batch_lsn;
-            break :blk configured;
-        },
-        .ha_async_effect_mirror = blk: {
-            var configured = mirror;
-            configured.last_lsn = &replay_lsn;
-            break :blk configured;
-        },
-        .start_index_workers = false,
-    });
-    defer db.close();
-
-    try std.testing.expectError(error.HASyncCommitWouldBlock, db.batch(.{
-        .writes = &.{.{ .key = "doc:pending-tail", .value = "{\"title\":\"pending-tail\"}" }},
-        .sync_level = .write,
-    }));
-
-    // A pending client result cannot omit the replay/effect record for a local
-    // commit. Both records are appended in commit order before either remote
-    // gate is allowed to wait or fail.
-    try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
-    try std.testing.expectEqual(@as(u64, 1), batch_lsn.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 2), replay_lsn.load(.acquire));
-    var local = (try db.lookup(alloc, "doc:pending-tail", .{})) orelse return error.TestExpectedEqual;
-    defer local.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"title\":\"pending-tail\"}", local.json);
-}
-
-test "db transaction HA retry drains durable mirror outbox" {
-    const alloc = std.testing.allocator;
-    var db_path_tmp = try TestDirectory.init("db");
-    defer db_path_tmp.cleanup();
-    const db_path = db_path_tmp.path().ptr;
-    defer cleanupTempDir(db_path);
-    var ha_log_path_tmp = try TestDirectory.init("db");
-    defer ha_log_path_tmp.cleanup();
-    const ha_log_path = ha_log_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_tmp = try TestDirectory.init("db");
-    defer ha_slots_path_tmp.cleanup();
-    const ha_slots_path = ha_slots_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_slots_path);
-
-    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
-        .cluster_id = 263,
-        .shard_id = 4,
-        .table_id = 10,
-        .timeline_id = 1,
-        .epoch = 1,
-    }, .{});
-    defer primary.close();
-    try primary.createSlot("standby-a", 0);
-    const AckOnRetry = struct {
-        calls: usize = 0,
-        fn wait(ctx: *anyopaque, active_primary_ctx: *anyopaque, target_lsn: u64, _: ha_primary_mod.SyncPolicy) !void {
-            const active_primary: *ha_primary_mod.Primary = @ptrCast(@alignCast(active_primary_ctx));
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.calls += 1;
-            if (self.calls == 1) return error.InjectedMirrorWaitFailure;
-            try active_primary.standbyStatusUpdate("standby-a", 1, target_lsn, target_lsn);
-        }
-    };
-    var ack = AckOnRetry{};
-    const standby_names = [_][]const u8{"standby-a"};
-    var db = try DB.open(alloc, std.mem.span(db_path), .{
-        .ha_async_batch_mirror = .{
-            .publisher = ha_publisher_adapter.bind(&primary),
-            .sync_policy = .{
-                .mode = .remote_write,
-                .standby_names = &standby_names,
-                .failure_policy = .block,
-            },
-            .sync_wait_ctx = &ack,
-            .sync_wait_fn = AckOnRetry.wait,
-        },
-        .start_index_workers = false,
-    });
-    defer db.close();
-
-    const txn_id = try db.beginTransaction(20_000);
-    try db.writeTransaction(txn_id, .{ .writes = &.{.{
-        .key = "doc:ha-txn",
-        .value = "{\"title\":\"committed\"}",
-    }} });
-    try std.testing.expectError(error.InjectedMirrorWaitFailure, db.commitTransaction(txn_id, 20_001));
-    try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(txn_id));
-    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
-
-    const configured_mirror = db.ha_async_batch_mirror;
-    db.ha_async_batch_mirror = null;
-    try std.testing.expectError(error.HAMirrorUnavailable, db.commitTransaction(txn_id, 20_001));
-    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
-    db.ha_async_batch_mirror = configured_mirror;
-
-    try db.commitTransaction(txn_id, 20_001);
-    try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
-    try db.commitTransaction(txn_id, 20_001);
-    try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
-}
-
-test "storage.hot_standby db primary progress sync wait survives primary restart before ack" {
-    const alloc = std.testing.allocator;
-
-    var db_path_tmp = try TestDirectory.init("db");
-    defer db_path_tmp.cleanup();
-    const db_path = db_path_tmp.path().ptr;
-    defer cleanupTempDir(db_path);
-    var ha_log_path_tmp = try TestDirectory.init("db");
-    defer ha_log_path_tmp.cleanup();
-    const ha_log_path = ha_log_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_tmp = try TestDirectory.init("db");
-    defer ha_slots_path_tmp.cleanup();
-    const ha_slots_path = ha_slots_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_slots_path);
-
-    const identity = ha_primary_mod.Identity{
-        .cluster_id = 261,
-        .shard_id = 4,
-        .table_id = 10,
-        .timeline_id = 1,
-        .epoch = 1,
-    };
-    const standby_names = [_][]const u8{"standby-a"};
-    const policy = ha_primary_mod.SyncPolicy{
-        .mode = .remote_apply,
-        .standby_names = &standby_names,
-        .failure_policy = .block,
-    };
-
-    var target_lsn: u64 = 0;
-    {
-        var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, identity, .{});
-        defer primary.close();
-        try primary.createSlot("standby-a", 0);
-
-        var wait_state = HAPrimaryProgressSyncWait{ .max_rounds = 1 };
-        var gate_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-        var gate_action = std.atomic.Value(u8).init(255);
-        var waits = @import("antfly_platform").atomic.Value(u64).init(0);
-        var db = try DB.open(alloc, std.mem.span(db_path), .{
-            .ha_async_batch_mirror = .{
-                .publisher = ha_publisher_adapter.bind(&primary),
-                .sync_policy = policy,
-                .sync_wait_ctx = &wait_state,
-                .sync_wait_fn = HAPrimaryProgressSyncWait.wait,
-                .last_gate_lsn = &gate_lsn,
-                .last_gate_action = &gate_action,
-                .sync_wait_count = &waits,
-            },
-            .start_index_workers = false,
-        });
-        defer db.close();
-
-        try std.testing.expectError(error.HASyncCommitWouldBlock, db.batch(.{
-            .writes = &.{.{ .key = "doc:restart-before-ack", .value = "{\"title\":\"restart-before-ack\"}" }},
-            .sync_level = .write,
-        }));
-        target_lsn = primary.lastLsn();
-        try std.testing.expectEqual(@as(u64, 1), target_lsn);
-        try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
-        try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.wait_for_standby), gate_action.load(.acquire));
-
-        const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
-        try std.testing.expectEqual(@as(u64, 0), slot.received_lsn);
-        try std.testing.expectEqual(@as(u64, 0), slot.applied_lsn);
-    }
-
-    {
-        var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, identity, .{});
-        defer primary.close();
-        try std.testing.expectEqual(target_lsn, primary.lastLsn());
-
-        var wait_state = HAPrimaryProgressSyncWait{ .max_rounds = 1 };
-        try std.testing.expectError(
-            error.HASyncCommitWouldBlock,
-            HAPrimaryProgressSyncWait.wait(&wait_state, &primary, target_lsn, policy),
-        );
-
-        try primary.standbyStatusUpdate("standby-a", identity.timeline_id, target_lsn, target_lsn);
-        try HAPrimaryProgressSyncWait.wait(&wait_state, &primary, target_lsn, policy);
-
-        const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
-        try std.testing.expectEqual(target_lsn, slot.received_lsn);
-        try std.testing.expectEqual(target_lsn, slot.applied_lsn);
-    }
-}
-
-test "storage.hot_standby db block sync policy surfaces wait provider errors" {
-    const alloc = std.testing.allocator;
-
-    var db_path_tmp = try TestDirectory.init("db");
-    defer db_path_tmp.cleanup();
-    const db_path = db_path_tmp.path().ptr;
-    defer cleanupTempDir(db_path);
-    var ha_log_path_tmp = try TestDirectory.init("db");
-    defer ha_log_path_tmp.cleanup();
-    const ha_log_path = ha_log_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_tmp = try TestDirectory.init("db");
-    defer ha_slots_path_tmp.cleanup();
-    const ha_slots_path = ha_slots_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_slots_path);
-
-    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
-        .cluster_id = 256,
-        .shard_id = 4,
-        .table_id = 10,
-        .timeline_id = 1,
-        .epoch = 1,
-    }, .{});
-    defer primary.close();
-    try primary.createSlot("standby-a", 0);
-
-    const SyncWait = struct {
-        calls: u64 = 0,
-
-        fn timeout(ctx: *anyopaque, _: *anyopaque, _: u64, _: ha_primary_mod.SyncPolicy) !void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.calls += 1;
-            return error.HASyncCommitWaitTimeout;
-        }
-    };
-
-    var wait_state = SyncWait{};
-    var gate_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-    var gate_action = std.atomic.Value(u8).init(255);
-    var waits = @import("antfly_platform").atomic.Value(u64).init(0);
-    const standby_names = [_][]const u8{"standby-a"};
-    var db = try DB.open(alloc, std.mem.span(db_path), .{
-        .ha_async_batch_mirror = .{
-            .publisher = ha_publisher_adapter.bind(&primary),
-            .sync_policy = .{
-                .mode = .remote_apply,
-                .standby_names = &standby_names,
-                .failure_policy = .block,
-            },
-            .sync_wait_ctx = &wait_state,
-            .sync_wait_fn = SyncWait.timeout,
-            .last_gate_lsn = &gate_lsn,
-            .last_gate_action = &gate_action,
-            .sync_wait_count = &waits,
-        },
-        .start_index_workers = false,
-    });
-    defer db.close();
-
-    try std.testing.expectError(error.HASyncCommitWaitTimeout, db.batch(.{
-        .writes = &.{.{ .key = "doc:timeout", .value = "{\"title\":\"timeout\"}" }},
-        .sync_level = .write,
-    }));
-    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
-    try std.testing.expectEqual(@as(u64, 1), wait_state.calls);
-    try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
-    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.wait_for_standby), gate_action.load(.acquire));
-}
-
-test "storage.hot_standby db fail-closed sync policy rejects before local batch commit" {
-    const alloc = std.testing.allocator;
-
-    var db_path_tmp = try TestDirectory.init("db");
-    defer db_path_tmp.cleanup();
-    const db_path = db_path_tmp.path().ptr;
-    defer cleanupTempDir(db_path);
-    var ha_log_path_tmp = try TestDirectory.init("db");
-    defer ha_log_path_tmp.cleanup();
-    const ha_log_path = ha_log_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_tmp = try TestDirectory.init("db");
-    defer ha_slots_path_tmp.cleanup();
-    const ha_slots_path = ha_slots_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_slots_path);
-
-    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
-        .cluster_id = 254,
-        .shard_id = 4,
-        .table_id = 10,
-        .timeline_id = 1,
-        .epoch = 1,
-    }, .{});
-    defer primary.close();
-    try primary.createSlot("standby-a", 0);
-
-    var gate_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-    var gate_action = std.atomic.Value(u8).init(255);
-    var rejected = @import("antfly_platform").atomic.Value(u64).init(0);
-    const standby_names = [_][]const u8{"standby-a"};
-    var db = try DB.open(alloc, std.mem.span(db_path), .{
-        .ha_async_batch_mirror = .{
-            .publisher = ha_publisher_adapter.bind(&primary),
-            .sync_policy = .{
-                .mode = .remote_write,
-                .standby_names = &standby_names,
-                .failure_policy = .fail_closed,
-            },
-            .last_gate_lsn = &gate_lsn,
-            .last_gate_action = &gate_action,
-            .sync_reject_count = &rejected,
-        },
-        .start_index_workers = false,
-    });
-    defer db.close();
-
-    try std.testing.expectError(error.SyncPolicyUnsatisfied, db.batch(.{
-        .writes = &.{.{ .key = "doc:rejected", .value = "{\"title\":\"rejected\"}" }},
-        .sync_level = .write,
-    }));
-    try std.testing.expectEqual(@as(u64, 0), primary.lastLsn());
-    try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
-    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.reject), gate_action.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 1), rejected.load(.acquire));
-    try std.testing.expect((try db.lookup(alloc, "doc:rejected", .{})) == null);
+    try std.testing.expectEqualStrings("b", (try decodeDurableReplicationOutbox(surviving)).payload);
 }
 
 test "db transaction recovery identity context owns schema generations" {
@@ -115416,504 +113076,6 @@ test "db transaction recovery identity context owns schema generations" {
     try std.testing.expectEqual(@as(u32, 2), ctx.relational_schema_version);
 }
 
-test "storage.hot_standby schema wait failure reports unknown after durable local commit" {
-    const alloc = std.testing.allocator;
-    const public_schema_json =
-        \\{"version":7,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
-    ;
-
-    var db_path_tmp = try TestDirectory.init("db");
-    defer db_path_tmp.cleanup();
-    const db_path = db_path_tmp.path().ptr;
-    defer cleanupTempDir(db_path);
-    var ha_log_path_tmp = try TestDirectory.init("db");
-    defer ha_log_path_tmp.cleanup();
-    const ha_log_path = ha_log_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_tmp = try TestDirectory.init("db");
-    defer ha_slots_path_tmp.cleanup();
-    const ha_slots_path = ha_slots_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_slots_path);
-
-    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
-        .cluster_id = 265,
-        .shard_id = 5,
-        .table_id = 12,
-        .timeline_id = 1,
-        .epoch = 1,
-    }, .{});
-    defer primary.close();
-    try primary.createSlot("standby-a", 0);
-
-    const FailOnceWait = struct {
-        calls: usize = 0,
-
-        fn wait(ctx: *anyopaque, active_primary_ctx: *anyopaque, target_lsn: u64, _: ha_primary_mod.SyncPolicy) !void {
-            const active_primary: *ha_primary_mod.Primary = @ptrCast(@alignCast(active_primary_ctx));
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.calls += 1;
-            if (self.calls == 1) return error.InjectedSchemaMirrorWaitFailure;
-            try active_primary.standbyStatusUpdate("standby-a", active_primary.identity.timeline_id, target_lsn, target_lsn);
-        }
-    };
-    var wait_state = FailOnceWait{};
-    const standby_names = [_][]const u8{"standby-a"};
-    var db = try DB.open(alloc, std.mem.span(db_path), .{
-        .identity_namespace = .{ .shard_id = 5, .table_id = 12 },
-        .ha_async_metadata_mirror = .{
-            .publisher = ha_publisher_adapter.bind(&primary),
-            .sync_policy = .{
-                .mode = .remote_apply,
-                .standby_names = &standby_names,
-                .failure_policy = .block,
-            },
-            .sync_wait_ctx = &wait_state,
-            .sync_wait_fn = FailOnceWait.wait,
-        },
-        .start_index_workers = false,
-    });
-    defer db.close();
-
-    try std.testing.expectError(error.DurabilityOutcomeUnknown, db.setSchemaJson(alloc, public_schema_json));
-    try std.testing.expectEqual(@as(usize, 1), wait_state.calls);
-    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
-
-    const stored = (try db.getSchemaJson(alloc)) orelse return error.TestExpectedEqual;
-    defer alloc.free(stored);
-    try std.testing.expectEqualStrings(public_schema_json, stored);
-    const loaded_schema = (try schema_mod.loadSchema(db.core.store, alloc)) orelse return error.TestExpectedEqual;
-    defer schema_mod.freeSchema(alloc, loaded_schema);
-    try std.testing.expectEqual(@as(u32, 7), loaded_schema.version);
-
-    const pending = try db.core.store.scanPrefixPage(alloc, ha_outbox_v2_prefix, null, 2);
-    defer docstore_mod.DocStore.freeResults(alloc, pending);
-    try std.testing.expectEqual(@as(usize, 1), pending.len);
-    try std.testing.expectEqual(DurableHAOutboxKind.schema, try durableHAOutboxKindFromKey(pending[0].key));
-
-    // Recovery recognizes the already-appended schema record, obtains the
-    // missing acknowledgement, and clears the exact mutation-scoped outbox.
-    try db.flushDurableHAOutboxes();
-    try std.testing.expectEqual(@as(usize, 2), wait_state.calls);
-    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
-    const remaining = try db.core.store.scanPrefixPage(alloc, ha_outbox_v2_prefix, null, 2);
-    defer docstore_mod.DocStore.freeResults(alloc, remaining);
-    try std.testing.expectEqual(@as(usize, 0), remaining.len);
-}
-
-test "storage.hot_standby db mirrors and applies schema metadata mutation records" {
-    const alloc = std.testing.allocator;
-    const public_schema_json =
-        \\{"version":12,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","enum":["active"]}},"required":["id","status"],"additionalProperties":false}}}}
-    ;
-
-    var primary_db_path_tmp = try TestDirectory.init("db");
-    defer primary_db_path_tmp.cleanup();
-    const primary_db_path = primary_db_path_tmp.path().ptr;
-    defer cleanupTempDir(primary_db_path);
-    var standby_db_path_tmp = try TestDirectory.init("db");
-    defer standby_db_path_tmp.cleanup();
-    const standby_db_path = standby_db_path_tmp.path().ptr;
-    defer cleanupTempDir(standby_db_path);
-    var ha_log_path_tmp = try TestDirectory.init("db");
-    defer ha_log_path_tmp.cleanup();
-    const ha_log_path = ha_log_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_tmp = try TestDirectory.init("db");
-    defer ha_slots_path_tmp.cleanup();
-    const ha_slots_path = ha_slots_path_tmp.path().ptr;
-    defer cleanupTempDir(ha_slots_path);
-    var standby_log_path_tmp = try TestDirectory.init("db");
-    defer standby_log_path_tmp.cleanup();
-    const standby_log_path = standby_log_path_tmp.path().ptr;
-    defer cleanupTempDir(standby_log_path);
-    var standby_progress_path_tmp = try TestDirectory.init("db");
-    defer standby_progress_path_tmp.cleanup();
-    const standby_progress_path = standby_progress_path_tmp.path().ptr;
-    defer cleanupTempDir(standby_progress_path);
-
-    const identity = ha_standby_mod.Identity{
-        .cluster_id = 252,
-        .shard_id = 5,
-        .table_id = 11,
-        .timeline_id = 1,
-        .epoch = 1,
-    };
-    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, identity, .{});
-    defer primary.close();
-    var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, identity, .{});
-    defer standby.close();
-
-    var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-    var failures = @import("antfly_platform").atomic.Value(u64).init(0);
-    {
-        var db = try DB.open(alloc, std.mem.span(primary_db_path), .{
-            .identity_namespace = .{ .shard_id = 5, .table_id = 11 },
-            .ha_async_metadata_mirror = .{
-                .publisher = ha_publisher_adapter.bind(&primary),
-                .last_lsn = &last_lsn,
-                .failure_count = &failures,
-            },
-            .start_index_workers = false,
-        });
-        defer db.close();
-
-        try db.setSchemaJson(alloc, public_schema_json);
-    }
-
-    try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 0), failures.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
-
-    var entry = (try primary.log.entryAt(alloc, 1)) orelse return error.TestExpectedEqual;
-    defer entry.deinit(alloc);
-    try std.testing.expectEqual(@as(@TypeOf(entry.record.kind), .metadata_mutation), entry.record.kind);
-    try std.testing.expectEqual(@as(u64, 252), entry.record.cluster_id);
-    try std.testing.expectEqual(@as(u64, 5), entry.record.shard_id);
-    try std.testing.expectEqual(@as(u64, 11), entry.record.table_id);
-
-    var standby_db = try DB.open(alloc, std.mem.span(standby_db_path), .{
-        .identity_namespace = .{ .shard_id = 5, .table_id = 11 },
-        .ha_write_gate = .{ .standby = ha_write_gate_adapter.bindStandby(&standby) },
-        .start_index_workers = false,
-    });
-    defer standby_db.close();
-
-    try std.testing.expectError(error.HAReadOnlyStandby, standby_db.setSchema(.{ .version = 99 }));
-    try standby_db.applyHAReplicationRecord(entry.record);
-    try std.testing.expectEqual(@as(u64, 1), try standby_db.haAppliedReplicationLsn());
-
-    const replicated_schema = (try schema_mod.loadSchema(standby_db.core.store, alloc)).?;
-    defer schema_mod.freeSchema(alloc, replicated_schema);
-    try std.testing.expectEqual(@as(u32, 12), replicated_schema.version);
-    try std.testing.expectEqualStrings("row", replicated_schema.default_type);
-    try std.testing.expectEqual(schema_mod.StorageMode.relational, replicated_schema.storage_mode);
-    const replicated_public_schema = (try standby_db.getSchemaJson(alloc)) orelse return error.TestExpectedEqual;
-    defer alloc.free(replicated_public_schema);
-    try std.testing.expectEqualStrings(public_schema_json, replicated_public_schema);
-
-    // Promotion must preserve public constraints, not merely the physical row
-    // codec. Removing the test-only standby gate models the authority handoff.
-    standby_db.ha_write_gate = null;
-    try std.testing.expectError(error.InvalidBatchRequest, standby_db.batch(.{
-        .writes = &.{.{
-            .key = "row:invalid",
-            .value = "{\"id\":\"invalid\",\"status\":\"inactive\"}",
-        }},
-    }));
-    try standby_db.batch(.{
-        .writes = &.{.{
-            .key = "row:valid",
-            .value = "{\"id\":\"valid\",\"status\":\"active\"}",
-        }},
-    });
-
-    try standby_db.applyHAReplicationRecord(entry.record);
-    try std.testing.expectEqual(@as(u64, 1), try standby_db.haAppliedReplicationLsn());
-}
-
-test "storage.hot_standby row policy metadata publication replays with its exact Raft cut" {
-    const alloc = std.testing.allocator;
-    var primary_tmp = try TestDirectory.init("ha-policy-primary");
-    defer primary_tmp.cleanup();
-    var replica_tmp = try TestDirectory.init("ha-policy-replica");
-    defer replica_tmp.cleanup();
-    var log_tmp = try TestDirectory.init("ha-policy-log");
-    defer log_tmp.cleanup();
-    var slots_tmp = try TestDirectory.init("ha-policy-slots");
-    defer slots_tmp.cleanup();
-    const identity = ha_standby_mod.Identity{ .cluster_id = 421, .shard_id = 8, .table_id = 7, .timeline_id = 1, .epoch = 1 };
-    var primary = try ha_primary_mod.Primary.open(alloc, std.mem.span(log_tmp.path().ptr), std.mem.span(slots_tmp.path().ptr), identity, .{});
-    defer primary.close();
-    var mutation_barrier = HAMutationBarrier{};
-    const namespace: DocIdentityNamespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 };
-    var owner = try DB.open(alloc, std.mem.span(primary_tmp.path().ptr), .{
-        .identity_namespace = namespace,
-        .ha_async_batch_mirror = .{ .publisher = ha_publisher_adapter.bind(&primary), .mutation_barrier = &mutation_barrier },
-        .ha_async_metadata_mirror = .{ .publisher = ha_publisher_adapter.bind(&primary), .mutation_barrier = &mutation_barrier },
-        .start_index_workers = false,
-        .start_optional_runtimes = false,
-    });
-    var owner_open = true;
-    defer if (owner_open) owner.close();
-    const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
-    ;
-    try owner.setSchemaJson(alloc, schema_json);
-    var replica = try DB.open(alloc, std.mem.span(replica_tmp.path().ptr), .{ .identity_namespace = namespace, .start_index_workers = false, .start_optional_runtimes = false });
-    defer replica.close();
-    var schema_entry = (try primary.log.entryAt(alloc, 1)) orelse return error.TestExpectedEqual;
-    defer schema_entry.deinit(alloc);
-    try replica.applyHAReplicationRecord(schema_entry.record);
-    try owner.batch(.{ .writes = &.{.{ .key = "row:a", .value = "{\"id\":\"a\"}" }} });
-    var row_entry = (try primary.log.entryAt(alloc, 2)) orelse return error.TestExpectedEqual;
-    defer row_entry.deinit(alloc);
-    try std.testing.expectEqual(ha_replication_record_mod.RecordKind.batch_mutation, row_entry.record.kind);
-    try replica.applyHAReplicationRecord(row_entry.record);
-    const schema_bytes = try schema_mod.serializeSchema(alloc, owner.core.schema.?);
-    defer alloc.free(schema_bytes);
-    var schema_digest: [32]u8 = undefined;
-    std.crypto.hash.Blake3.hash(schema_bytes, &schema_digest, .{});
-    const policy: @import("../../system_catalog/policies.zig").Record = .{
-        .id = 1,
-        .generation = 1,
-        .table_id = 7,
-        .schema_version = 1,
-        .schema_digest = schema_digest,
-        .name = "visible",
-        .commands = .{ .select = true },
-        .roles = &.{"PUBLIC"},
-        .using = .{ .instructions = &.{.{ .type = .{ .kind = .boolean }, .operation = .{ .literal = .{ .bool = true } } }}, .root = 0 },
-    };
-    const bundle = try std.json.Stringify.valueAlloc(alloc, @import("../../system_catalog/policies.zig").InstallSnapshot{
-        .table_id = 7,
-        .schema_version = 1,
-        .schema_digest = schema_digest,
-        .policy_generation = 1,
-        .catalog_epoch = 2,
-        .phase = .pending_install,
-        .records = &.{policy},
-        .settings = &.{},
-    }, .{});
-    defer alloc.free(bundle);
-    const range = owner.core.byteRange();
-    var request: @import("../../system_catalog/policies.zig").InstallRequest = .{
-        .table_id = 7,
-        .expected_generation = 1,
-        .expected_catalog_epoch = 2,
-        .expected_phase = .pending_install,
-        .owner_group_id = 17,
-        .expected_descriptor_digest = try (@import("../../system_catalog/policies.zig").OwnerDescriptor{
-            .table_id = 7,
-            .group_id = 17,
-            .shard_id = 8,
-            .range_id = 9,
-            .schema_version = 1,
-            .schema_digest = schema_digest,
-            .range_start = range.start,
-            .range_end = range.end,
-        }).digest(),
-    };
-    try std.testing.expect((try owner.applyReplicatedRowPolicyPublication(bundle, request, .{ .term = 3, .index = 11 })) == null);
-    try std.testing.expectEqual(@as(u64, 3), primary.lastLsn());
-    var policy_entry = (try primary.log.entryAt(alloc, 3)) orelse return error.TestExpectedEqual;
-    defer policy_entry.deinit(alloc);
-    try std.testing.expectEqual(ha_replication_record_mod.RecordKind.metadata_mutation, policy_entry.record.kind);
-    try replica.applyHAReplicationRecord(policy_entry.record);
-    try replica.applyHAReplicationRecord(policy_entry.record);
-    try std.testing.expectEqual(@as(u64, 3), try replica.haAppliedReplicationLsn());
-    try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.preparing, replica.row_policy_gate.currentPhase());
-    try std.testing.expectError(error.RowPolicyAuthenticationRequired, replica.get(alloc, "unseen"));
-    const receipt = try replica.loadRowPolicyReceipt(1, .pending_install);
-    try std.testing.expectEqual(@as(u64, 11), receipt.applied_index);
-    try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.preparing, replica.row_policy_gate.currentPhase());
-
-    var serving = try std.json.parseFromSlice(@import("../../system_catalog/policies.zig").InstallSnapshot, alloc, bundle, .{});
-    defer serving.deinit();
-    serving.value.phase = .serving_install;
-    const serving_bundle = try std.json.Stringify.valueAlloc(alloc, serving.value, .{});
-    defer alloc.free(serving_bundle);
-    request.expected_phase = .serving_install;
-    try std.testing.expect((try owner.applyReplicatedRowPolicyPublication(serving_bundle, request, .{ .term = 3, .index = 12 })) == null);
-    _ = try owner.loadRowPolicyReceipt(1, .serving_install);
-    try std.testing.expectEqual(@as(u64, 4), primary.lastLsn());
-    var serving_entry = (try primary.log.entryAt(alloc, 4)) orelse return error.TestExpectedEqual;
-    defer serving_entry.deinit(alloc);
-    try replica.applyHAReplicationRecord(serving_entry.record);
-    _ = try replica.loadRowPolicyReceipt(1, .serving_install);
-    try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.active, replica.row_policy_gate.currentPhase());
-    try std.testing.expectEqual(@as(u64, 4), try replica.haAppliedReplicationLsn());
-
-    // Simulate a crash after the exact policy WAL append but before local
-    // outbox deletion. Reopen must reconcile, not duplicate, that record.
-    const from_lsn = serving_entry.record.lsn;
-    const outbox_bytes = try encodeDurableHAOutboxAlloc(alloc, from_lsn, serving_entry.record.payload);
-    defer alloc.free(outbox_bytes);
-    const outbox_key = try durableHAOutboxKeyAlloc(alloc, .row_policy, from_lsn, owner.core.root_generation, serving_entry.record.payload);
-    defer alloc.free(outbox_key);
-    try owner.core.store.put(outbox_key, outbox_bytes);
-    owner.close();
-    owner_open = false;
-    var reopened = try DB.open(alloc, std.mem.span(primary_tmp.path().ptr), .{
-        .identity_namespace = namespace,
-        .ha_async_batch_mirror = .{ .publisher = ha_publisher_adapter.bind(&primary), .mutation_barrier = &mutation_barrier },
-        .ha_async_metadata_mirror = .{ .publisher = ha_publisher_adapter.bind(&primary), .mutation_barrier = &mutation_barrier },
-        .start_index_workers = false,
-        .start_optional_runtimes = false,
-    });
-    defer reopened.close();
-    try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.active, reopened.row_policy_gate.currentPhase());
-    try reopened.ensureDurableHAStartupBarrier();
-    try std.testing.expectEqual(@as(u64, 4), primary.lastLsn());
-    try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, outbox_key));
-}
-
-test "storage.hot_standby db applies batch mutation records through replication session callback" {
-    const alloc = std.testing.allocator;
-
-    var standby_db_path_tmp = try TestDirectory.init("db");
-    defer standby_db_path_tmp.cleanup();
-    const standby_db_path = standby_db_path_tmp.path().ptr;
-    defer cleanupTempDir(standby_db_path);
-    var primary_log_path_tmp = try TestDirectory.init("db");
-    defer primary_log_path_tmp.cleanup();
-    const primary_log_path = primary_log_path_tmp.path().ptr;
-    defer cleanupTempDir(primary_log_path);
-    var primary_slots_path_tmp = try TestDirectory.init("db");
-    defer primary_slots_path_tmp.cleanup();
-    const primary_slots_path = primary_slots_path_tmp.path().ptr;
-    defer cleanupTempDir(primary_slots_path);
-    var standby_log_path_tmp = try TestDirectory.init("db");
-    defer standby_log_path_tmp.cleanup();
-    const standby_log_path = standby_log_path_tmp.path().ptr;
-    defer cleanupTempDir(standby_log_path);
-    var standby_progress_path_tmp = try TestDirectory.init("db");
-    defer standby_progress_path_tmp.cleanup();
-    const standby_progress_path = standby_progress_path_tmp.path().ptr;
-    defer cleanupTempDir(standby_progress_path);
-
-    const identity = ha_standby_mod.Identity{
-        .cluster_id = 251,
-        .shard_id = 4,
-        .table_id = 10,
-        .timeline_id = 1,
-        .epoch = 1,
-    };
-    var primary = try ha_primary_mod.Primary.open(alloc, primary_log_path, primary_slots_path, identity, .{});
-    defer primary.close();
-    var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, identity, .{});
-    defer standby.close();
-    try primary.createSlot("standby-a", 0);
-
-    _ = try @import("../hot_standby/effects.zig").appendBatchMutationRequest(alloc, &primary, .{
-        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"replicated-session\"}" }},
-        .sync_level = .full_index,
-    }, .{});
-    _ = try primary.append(.{
-        .kind = .backup_start,
-        .payload_codec = .json,
-        .payload = "{\"manifest_id\":\"base-session\"}",
-    });
-    _ = try @import("../hot_standby/effects.zig").appendDerivedChangeRecord(alloc, &primary, .{
-        .sequence = 1,
-        .changed_doc_keys = &.{"doc:a"},
-        .target_hints = &.{.full_text},
-    }, .{});
-
-    var standby_db = try DB.open(alloc, std.mem.span(standby_db_path), .{
-        .ha_write_gate = .{ .standby = ha_write_gate_adapter.bindStandby(&standby) },
-        .start_index_workers = false,
-    });
-    defer standby_db.close();
-
-    const result = try ha_session_mod.replicateAvailable(
-        alloc,
-        &primary,
-        "standby-a",
-        &standby,
-        &standby_db,
-        DB.applyHAReplicationRecordCallback,
-    );
-    try std.testing.expectEqual(@as(usize, 3), result.received_count);
-    try std.testing.expectEqual(@as(usize, 3), result.applied_count);
-    try std.testing.expectEqual(@as(u64, 3), result.progress.received_lsn);
-    try std.testing.expectEqual(@as(u64, 3), result.progress.applied_lsn);
-
-    const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(u64, 3), slot.received_lsn);
-    try std.testing.expectEqual(@as(u64, 3), slot.applied_lsn);
-    try std.testing.expectEqual(@as(u64, 3), try standby_db.haAppliedReplicationLsn());
-
-    var found = (try standby_db.lookup(alloc, "doc:a", .{})) orelse return error.TestExpectedEqual;
-    defer found.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"title\":\"replicated-session\"}", found.json);
-
-    const replay_entries = try replay_stream_mod.iterateFrom(alloc, standby_db.core.store, 1);
-    defer {
-        for (replay_entries) |*entry| entry.deinit(alloc);
-        alloc.free(replay_entries);
-    }
-    try std.testing.expectEqual(@as(usize, 2), replay_entries.len);
-    try std.testing.expectEqual(@as(u64, 1), replay_entries[0].sequence);
-    try std.testing.expectEqual(@as(u64, 2), replay_entries[1].sequence);
-
-    var replicated_effect_record = try change_journal_mod.decodeRecord(alloc, replay_entries[1].payload);
-    defer replicated_effect_record.deinit();
-    try std.testing.expectEqual(@as(u64, 2), replicated_effect_record.record.sequence);
-    try std.testing.expectEqualStrings("doc:a", replicated_effect_record.record.changed_doc_keys[0]);
-    try std.testing.expectEqual(@as(usize, 1), replicated_effect_record.record.target_hints.len);
-    try std.testing.expectEqual(change_journal_mod.TargetHint.full_text, replicated_effect_record.record.target_hints[0]);
-
-    var duplicate_batch = (try primary.log.entryAt(alloc, 1)) orelse return error.TestExpectedEqual;
-    defer duplicate_batch.deinit(alloc);
-    try standby_db.applyHAReplicationRecord(duplicate_batch.record);
-    var duplicate_derived = (try primary.log.entryAt(alloc, 3)) orelse return error.TestExpectedEqual;
-    defer duplicate_derived.deinit(alloc);
-    try standby_db.applyHAReplicationRecord(duplicate_derived.record);
-    try std.testing.expectEqual(@as(u64, 3), try standby_db.haAppliedReplicationLsn());
-
-    const replay_after_duplicates = try replay_stream_mod.iterateFrom(alloc, standby_db.core.store, 1);
-    defer {
-        for (replay_after_duplicates) |*entry| entry.deinit(alloc);
-        alloc.free(replay_after_duplicates);
-    }
-    try std.testing.expectEqual(@as(usize, 2), replay_after_duplicates.len);
-}
-
-test "storage.hot_standby db persists applied replication marker across reopen" {
-    const alloc = std.testing.allocator;
-
-    var db_path_tmp = try TestDirectory.init("db");
-    defer db_path_tmp.cleanup();
-    const db_path = db_path_tmp.path().ptr;
-    defer cleanupTempDir(db_path);
-    var primary_log_path_tmp = try TestDirectory.init("db");
-    defer primary_log_path_tmp.cleanup();
-    const primary_log_path = primary_log_path_tmp.path().ptr;
-    defer cleanupTempDir(primary_log_path);
-    var primary_slots_path_tmp = try TestDirectory.init("db");
-    defer primary_slots_path_tmp.cleanup();
-    const primary_slots_path = primary_slots_path_tmp.path().ptr;
-    defer cleanupTempDir(primary_slots_path);
-
-    const identity = ha_standby_mod.Identity{
-        .cluster_id = 252,
-        .shard_id = 4,
-        .table_id = 10,
-        .timeline_id = 1,
-        .epoch = 1,
-    };
-    var primary = try ha_primary_mod.Primary.open(alloc, primary_log_path, primary_slots_path, identity, .{});
-    defer primary.close();
-
-    _ = try @import("../hot_standby/effects.zig").appendBatchMutationRequest(alloc, &primary, .{
-        .writes = &.{.{ .key = "doc:persisted-marker", .value = "{\"title\":\"persisted\"}" }},
-        .sync_level = .write,
-    }, .{});
-    var entry = (try primary.log.entryAt(alloc, 1)) orelse return error.TestExpectedEqual;
-    defer entry.deinit(alloc);
-
-    {
-        var db = try DB.open(alloc, std.mem.span(db_path), .{ .start_index_workers = false });
-        defer db.close();
-        try db.applyHAReplicationRecord(entry.record);
-        try std.testing.expectEqual(@as(u64, 1), try db.haAppliedReplicationLsn());
-    }
-
-    var reopened = try DB.open(alloc, std.mem.span(db_path), .{ .start_index_workers = false });
-    defer reopened.close();
-    try std.testing.expectEqual(@as(u64, 1), try reopened.haAppliedReplicationLsn());
-    try reopened.applyHAReplicationRecord(entry.record);
-    try std.testing.expectEqual(@as(u64, 1), try reopened.haAppliedReplicationLsn());
-
-    const replay_entries = try replay_stream_mod.iterateFrom(alloc, reopened.core.store, 1);
-    defer {
-        for (replay_entries) |*replay_entry| replay_entry.deinit(alloc);
-        alloc.free(replay_entries);
-    }
-    try std.testing.expectEqual(@as(usize, 1), replay_entries.len);
-    try std.testing.expectEqual(@as(u64, 1), replay_entries[0].sequence);
-}
-
 test "storage.hot_standby db applies timeline switch as durable replication boundary" {
     const alloc = std.testing.allocator;
 
@@ -115922,7 +113084,7 @@ test "storage.hot_standby db applies timeline switch as durable replication boun
     const db_path = db_path_tmp.path().ptr;
     defer cleanupTempDir(db_path);
 
-    const switch_record = ha_replication_record_mod.RecordView{
+    const switch_record = replication_record_mod.RecordView{
         .kind = .timeline_switch,
         .payload_codec = .json,
         .cluster_id = 252,
@@ -115940,195 +113102,15 @@ test "storage.hot_standby db applies timeline switch as durable replication boun
     {
         var db = try DB.open(alloc, std.mem.span(db_path), .{ .start_index_workers = false });
         defer db.close();
-        try db.applyHAReplicationRecord(switch_record);
-        try std.testing.expectEqual(@as(u64, 7), try db.haAppliedReplicationLsn());
+        try replication_ingress.applyRecord(&db, switch_record);
+        try std.testing.expectEqual(@as(u64, 7), try db.replicationAppliedSequence());
     }
 
     var reopened = try DB.open(alloc, std.mem.span(db_path), .{ .start_index_workers = false });
     defer reopened.close();
-    try std.testing.expectEqual(@as(u64, 7), try reopened.haAppliedReplicationLsn());
-    try reopened.applyHAReplicationRecord(switch_record);
-    try std.testing.expectEqual(@as(u64, 7), try reopened.haAppliedReplicationLsn());
-}
-
-test "storage.hot_standby db write gate rejects client writes on standby but allows replicated apply" {
-    const alloc = std.testing.allocator;
-
-    var db_path_tmp = try TestDirectory.init("db");
-    defer db_path_tmp.cleanup();
-    const db_path = db_path_tmp.path().ptr;
-    defer cleanupTempDir(db_path);
-    var standby_log_path_tmp = try TestDirectory.init("db");
-    defer standby_log_path_tmp.cleanup();
-    const standby_log_path = standby_log_path_tmp.path().ptr;
-    defer cleanupTempDir(standby_log_path);
-    var standby_progress_path_tmp = try TestDirectory.init("db");
-    defer standby_progress_path_tmp.cleanup();
-    const standby_progress_path = standby_progress_path_tmp.path().ptr;
-    defer cleanupTempDir(standby_progress_path);
-
-    var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, .{
-        .cluster_id = 300,
-        .shard_id = 0,
-        .table_id = 0,
-        .timeline_id = 1,
-        .epoch = 1,
-    }, .{});
-    defer standby.close();
-
-    var db = try DB.open(alloc, std.mem.span(db_path), .{
-        .ha_write_gate = .{ .standby = ha_write_gate_adapter.bindStandby(&standby) },
-        .start_index_workers = false,
-    });
-    defer db.close();
-
-    try std.testing.expectError(error.HAReadOnlyStandby, db.batch(.{
-        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"client\"}" }},
-    }));
-    try std.testing.expectError(error.HAReadOnlyStandby, db.beginBulkIngestSession());
-    try std.testing.expectError(error.HAReadOnlyStandby, db.beginDenseAutoBulkIngestSession());
-    try std.testing.expectError(error.HAReadOnlyStandby, db.beginPrimaryStoreAutoBulkIngestSession());
-    try std.testing.expectError(
-        error.HAReadOnlyStandby,
-        db.finishBulkIngestSessionWithOptions(.{}),
-    );
-    try std.testing.expectError(
-        error.HAReadOnlyStandby,
-        db.finishDenseAutoBulkIngestSessionWithOptions(.{}),
-    );
-    try std.testing.expectError(
-        error.HAReadOnlyStandby,
-        db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(.{}),
-    );
-    try std.testing.expectError(
-        error.HAReadOnlyStandby,
-        db.updateRange(.{ .start = "doc:a", .end = "doc:z" }),
-    );
-
-    try db.batchReplicatedApply(.{
-        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"replicated\"}" }},
-    });
-    var found = (try db.lookup(alloc, "doc:a", .{})) orelse return error.TestExpectedEqual;
-    defer found.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"title\":\"replicated\"}", found.json);
-}
-
-test "storage.hot_standby db write gate rejects fenced former primary writes" {
-    const alloc = std.testing.allocator;
-
-    var db_path_tmp = try TestDirectory.init("db");
-    defer db_path_tmp.cleanup();
-    const db_path = db_path_tmp.path().ptr;
-    defer cleanupTempDir(db_path);
-    var primary_log_path_tmp = try TestDirectory.init("db");
-    defer primary_log_path_tmp.cleanup();
-    const primary_log_path = primary_log_path_tmp.path().ptr;
-    defer cleanupTempDir(primary_log_path);
-    var primary_slots_path_tmp = try TestDirectory.init("db");
-    defer primary_slots_path_tmp.cleanup();
-    const primary_slots_path = primary_slots_path_tmp.path().ptr;
-    defer cleanupTempDir(primary_slots_path);
-    var fence_path_tmp = try TestDirectory.init("db");
-    defer fence_path_tmp.cleanup();
-    const fence_path = fence_path_tmp.path().ptr;
-    defer cleanupTempDir(fence_path);
-
-    const identity = ha_primary_mod.Identity{
-        .cluster_id = 301,
-        .shard_id = 0,
-        .table_id = 0,
-        .timeline_id = 1,
-        .epoch = 1,
-    };
-    var primary = try ha_primary_mod.Primary.open(alloc, primary_log_path, primary_slots_path, identity, .{});
-    defer primary.close();
-    _ = try primary.append(.{ .payload = "before-fence" });
-
-    var fence_store = try ha_fencing_mod.Store.open(alloc, fence_path, .{});
-    defer fence_store.close();
-    const receipt = try fence_store.acquirePromotionFence(.{
-        .identity = identity,
-        .old_primary_id = "primary-a",
-        .promoted_node_id = "standby-a",
-        .new_timeline_id = 2,
-        .new_epoch = 2,
-        .generation = 1,
-        .required_lsn = 1,
-        .observed_lsn = 1,
-        .reason = "db-write-gate-test",
-    });
-    defer ha_fencing_mod.freeReceipt(alloc, receipt);
-
-    var db = try DB.open(alloc, std.mem.span(db_path), .{
-        .ha_write_gate = .{ .fenced_primary = ha_write_gate_adapter.bindFencedPrimary(.{
-            .primary = &primary,
-            .fence_store = &fence_store,
-            .node_id = "primary-a",
-        }) },
-        .start_index_workers = false,
-    });
-    defer db.close();
-
-    try std.testing.expectError(error.HAFencedPrimary, db.batch(.{
-        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"blocked\"}" }},
-    }));
-
-    const gate = db.ha_write_gate orelse return error.TestExpectedEqual;
-    switch (gate) {
-        .fenced_primary => |fenced| {
-            const decision = try ha_write_gate_mod.evaluateFencedPrimary(try ha_write_gate_mod.runtimeFencedPrimary(fenced), .{});
-            try std.testing.expectEqual(ha_write_gate_mod.Action.reject_fenced_primary, decision.action);
-        },
-        else => return error.TestExpectedEqual,
-    }
-}
-
-test "storage.hot_standby db standby role suppresses mutating background runtimes" {
-    const alloc = std.testing.allocator;
-
-    var db_path_tmp = try TestDirectory.init("db");
-    defer db_path_tmp.cleanup();
-    const db_path = db_path_tmp.path().ptr;
-    defer cleanupTempDir(db_path);
-    var standby_log_path_tmp = try TestDirectory.init("db");
-    defer standby_log_path_tmp.cleanup();
-    const standby_log_path = standby_log_path_tmp.path().ptr;
-    defer cleanupTempDir(standby_log_path);
-    var standby_progress_path_tmp = try TestDirectory.init("db");
-    defer standby_progress_path_tmp.cleanup();
-    const standby_progress_path = standby_progress_path_tmp.path().ptr;
-    defer cleanupTempDir(standby_progress_path);
-
-    var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, .{
-        .cluster_id = 301,
-        .shard_id = 0,
-        .table_id = 0,
-        .timeline_id = 1,
-        .epoch = 1,
-    }, .{});
-    defer standby.close();
-
-    var db = try DB.open(alloc, std.mem.span(db_path), .{
-        .ha_write_gate = .{ .standby = ha_write_gate_adapter.bindStandby(&standby) },
-        .start_index_workers = true,
-        .start_optional_runtimes = true,
-        .enrichment = .{ .enable_without_producers = true },
-        .ttl_cleanup = .{ .enabled = true },
-        .transaction_recovery = .{ .enabled = true },
-        .text_merge = .{ .enabled = true },
-        .sparse_compaction = .{ .enabled = true },
-    });
-    defer db.close();
-
-    try std.testing.expect(!db.start_index_workers);
-    try std.testing.expect(!db.executor.hasWorkers());
-    try std.testing.expect(db.enrichment_runtime == null);
-    try std.testing.expect(db.resolution_runtime == null);
-    try std.testing.expect(db.promotion_runtime == null);
-    try std.testing.expect(db.ttl_runtime == null);
-    try std.testing.expect(db.transaction_runtime == null);
-    try std.testing.expect(db.text_merge_runtime == null);
-    try std.testing.expect(db.sparse_compaction_runtime == null);
+    try std.testing.expectEqual(@as(u64, 7), try reopened.replicationAppliedSequence());
+    try replication_ingress.applyRecord(&reopened, switch_record);
+    try std.testing.expectEqual(@as(u64, 7), try reopened.replicationAppliedSequence());
 }
 
 test "db reopen replays pending derived embeddings with durable lsm primary backend" {
@@ -119319,7 +116301,7 @@ const ConcurrentWriteProbe = struct {
     done: std.atomic.Value(u8) = .init(0),
     failed: std.atomic.Value(u8) = .init(0),
 
-    fn runBatch(self: *@This()) void {
+    pub fn runBatch(self: *@This()) void {
         self.started.store(1, .monotonic);
         self.db.batch(.{
             .writes = &.{
@@ -120589,7 +117571,7 @@ const GraphPrimaryPublicationTest = struct {
         }
     };
 
-    fn run(pending: *Pending) !void {
+    pub fn run(pending: *Pending) !void {
         test_before_graph_contender_commit = .{ .ctx = pending, .call = Pending.pause };
         defer test_before_graph_contender_commit = null;
         const worker = try std.Thread.spawn(.{}, Pending.worker, .{pending});
@@ -120617,11 +117599,11 @@ const GraphPrimaryPublicationTest = struct {
         if (pending.writer_failure) |err| return err;
     }
 
-    fn seed(db: *DB, timed: bool) ![]u8 {
+    pub fn seed(db: *DB, timed: bool) ![]u8 {
         return seedWithGeneration(db, timed, 0);
     }
 
-    fn seedWithGeneration(db: *DB, timed: bool, generation: u64) ![]u8 {
+    pub fn seedWithGeneration(db: *DB, timed: bool, generation: u64) ![]u8 {
         const alloc = std.testing.allocator;
         try db.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
         try db.addIndex(.{ .name = "g", .kind = .graph, .coverage_generation = generation, .config_json = if (timed)
@@ -120636,7 +117618,7 @@ const GraphPrimaryPublicationTest = struct {
         return key;
     }
 
-    fn expectCount(db: *DB, expected: usize) !void {
+    pub fn expectCount(db: *DB, expected: usize) !void {
         const alloc = std.testing.allocator;
         const key = try internal_keys.graphEdgeContenderCountKeyAlloc(alloc, "doc:a", "g");
         defer alloc.free(key);
@@ -120688,209 +117670,6 @@ test "db graph ttl document and relational cleanup retire all graph deadlines" {
         defer docstore_mod.DocStore.freeResults(alloc, reopened);
         try std.testing.expectEqual(@as(usize, 0), reopened.len);
     }
-}
-
-test "db graph ttl HA carries primary effects and duplicate receipt across reopen" {
-    const alloc = std.testing.allocator;
-    var primary_tmp = try TestDirectory.init("db-graph-review-ha-primary");
-    defer primary_tmp.cleanup();
-    var replica_tmp = try TestDirectory.init("db-graph-review-ha-replica");
-    defer replica_tmp.cleanup();
-    var log_tmp = try TestDirectory.init("db-graph-review-ha-log");
-    defer log_tmp.cleanup();
-    var slots_tmp = try TestDirectory.init("db-graph-review-ha-slots");
-    defer slots_tmp.cleanup();
-    var stream = try ha_primary_mod.Primary.open(alloc, log_tmp.path().ptr, slots_tmp.path().ptr, .{
-        .cluster_id = 200,
-        .shard_id = 3,
-        .table_id = 9,
-        .timeline_id = 1,
-        .epoch = 1,
-    }, .{});
-    defer stream.close();
-    try stream.createSlot("standby-a", 0);
-    const Wait = struct {
-        fail: bool = false,
-        fn wait(ptr: *anyopaque, active_ctx: *anyopaque, target: u64, _: ha_primary_mod.SyncPolicy) !void {
-            const active: *ha_primary_mod.Primary = @ptrCast(@alignCast(active_ctx));
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (self.fail) return error.InjectedTtlHAWait;
-            try active.standbyStatusUpdate("standby-a", active.identity.timeline_id, target, target);
-        }
-    };
-    var wait = Wait{};
-    const names = [_][]const u8{"standby-a"};
-    var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-    const primary_opts: OpenOptions = .{
-        .start_optional_runtimes = false,
-        .ha_async_effect_mirror = .{
-            .publisher = ha_publisher_adapter.bind(&stream),
-            .last_lsn = &last_lsn,
-            .sync_policy = .{ .mode = .remote_apply, .standby_names = &names, .failure_policy = .block },
-            .sync_wait_ctx = &wait,
-            .sync_wait_fn = Wait.wait,
-        },
-    };
-    var primary = try DB.open(alloc, primary_tmp.path(), primary_opts);
-    defer primary.close();
-    var replica = try DB.open(alloc, replica_tmp.path(), .{ .start_optional_runtimes = false });
-    defer replica.close();
-    // Bootstrap the standby with the primary index incarnation and physical
-    // source state, matching HA metadata/base-backup semantics.
-    const primary_key = try GraphPrimaryPublicationTest.seed(&primary, true);
-    defer alloc.free(primary_key);
-    const replica_key = try GraphPrimaryPublicationTest.seedWithGeneration(&replica, true, primary.core.index_manager.graphIndex("g").?.config.coverage_generation);
-    defer alloc.free(replica_key);
-    _ = try applyDerivedBatchToIndexAsync(primary.async_context, .{ .changed_artifact_keys = &.{primary_key} }, .{ .name = "g", .kind = .graph }, .{});
-    const owner_prefix = try internal_keys.documentExactPrefixAlloc(alloc, "doc:a");
-    defer alloc.free(owner_prefix);
-    const bootstrap = try primary.core.store.scanPrefix(alloc, owner_prefix);
-    defer docstore_mod.DocStore.freeResults(alloc, bootstrap);
-    for (bootstrap) |row| try replica.core.store.put(row.key, row.value);
-    const bootstrap_due = try primary.core.store.scanPrefix(alloc, &internal_keys.graph_edge_expiration_index_prefix);
-    defer docstore_mod.DocStore.freeResults(alloc, bootstrap_due);
-    for (bootstrap_due) |row| try replica.core.store.put(row.key, row.value);
-    _ = try applyDerivedBatchToIndexAsync(replica.async_context, .{ .changed_artifact_keys = &.{replica_key} }, .{ .name = "g", .kind = .graph }, .{});
-    try GraphPrimaryPublicationTest.expectCount(&primary, 1);
-    try GraphPrimaryPublicationTest.expectCount(&replica, 1);
-    const due = try primary.core.store.scanPrefix(alloc, &internal_keys.graph_edge_expiration_index_prefix);
-    defer docstore_mod.DocStore.freeResults(alloc, due);
-    const candidate = (try graph_edge_ttl_expiration.decodeDue(due[0].value)).source;
-    var clock = platform_clock.ManualClock{};
-    clock.setRealtimeNs(candidate.deadline_ns + 1);
-    var ttl = TtlCleanupContext{ .batch = primary.batchContext(), .grace_period_ns = 0, .clock = clock.clock() };
-    wait.fail = true;
-    try std.testing.expectError(error.InjectedTtlHAWait, expireGraphTtlCandidateContext(&ttl, candidate));
-    const pending = try primary.core.store.scanPrefix(alloc, ha_outbox_v2_prefix);
-    defer docstore_mod.DocStore.freeResults(alloc, pending);
-    try std.testing.expectEqual(@as(usize, 1), pending.len);
-    const logged = stream.lastLsn();
-    primary.close();
-    wait.fail = false;
-    primary = try DB.open(alloc, primary_tmp.path(), primary_opts);
-    try primary.flushDurableHAOutboxes();
-    try primary.flushDurableHAOutboxes();
-    try std.testing.expectEqual(logged, stream.lastLsn());
-    const recovered = try primary.core.store.scanPrefix(alloc, ha_outbox_v2_prefix);
-    defer docstore_mod.DocStore.freeResults(alloc, recovered);
-    try std.testing.expectEqual(@as(usize, 0), recovered.len);
-    try GraphPrimaryPublicationTest.expectCount(&primary, 0);
-    var effect = (try stream.log.entryAt(alloc, last_lsn.load(.acquire))) orelse return error.TestUnexpectedResult;
-    defer effect.deinit(alloc);
-    _ = try replica.applyHADerivedEffectRecord(effect.record);
-    try replica.runUntilIdle();
-    try GraphPrimaryPublicationTest.expectCount(&replica, 0);
-    const remaining_due = try replica.core.store.scanPrefix(alloc, &internal_keys.graph_edge_expiration_index_prefix);
-    defer docstore_mod.DocStore.freeResults(alloc, remaining_due);
-    try std.testing.expectEqual(@as(usize, 0), remaining_due.len);
-    const tomb_key = try internal_keys.graphEdgeTtlTombstoneKeyAlloc(alloc, candidate.edge_key, "g", candidate.generation, candidate.state_key);
-    defer alloc.free(tomb_key);
-    const tomb = try replica.core.store.get(alloc, tomb_key);
-    defer alloc.free(tomb);
-    const primary_tomb = try primary.core.store.get(alloc, tomb_key);
-    defer alloc.free(primary_tomb);
-    try std.testing.expectEqualSlices(u8, primary_tomb, tomb);
-    try replica.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "doc:a", .target = "doc:c", .edge_type = "links" }}, .sync_level = .full_index });
-    try GraphPrimaryPublicationTest.expectCount(&replica, 1);
-    replica.close();
-    replica = try DB.open(alloc, replica_tmp.path(), .{ .start_optional_runtimes = false });
-    const tip = replica.core.store.nextReplaySequence(1);
-    try std.testing.expectEqual(@as(u64, 0), try replica.applyHADerivedEffectRecord(effect.record));
-    try std.testing.expectEqual(tip, replica.core.store.nextReplaySequence(1));
-    try GraphPrimaryPublicationTest.expectCount(&replica, 1);
-}
-
-test "db graph ttl HA replicates direct expiration and document relational withdrawal" {
-    const alloc = std.testing.allocator;
-    for ([_]bool{ false, true }) |relational| for ([_]bool{ false, true }) |owner_expiration| {
-        var primary_tmp = try TestDirectory.init("db-ttl-ha-direct-primary");
-        defer primary_tmp.cleanup();
-        var replica_tmp = try TestDirectory.init("db-ttl-ha-direct-replica");
-        defer replica_tmp.cleanup();
-        var log_tmp = try TestDirectory.init("db-ttl-ha-direct-log");
-        defer log_tmp.cleanup();
-        var slots_tmp = try TestDirectory.init("db-ttl-ha-direct-slots");
-        defer slots_tmp.cleanup();
-        var stream = try ha_primary_mod.Primary.open(alloc, log_tmp.path().ptr, slots_tmp.path().ptr, .{ .cluster_id = 200, .shard_id = 3, .table_id = 9, .timeline_id = 1, .epoch = 1 }, .{});
-        defer stream.close();
-        var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-        var primary = try DB.open(alloc, primary_tmp.path(), .{ .start_optional_runtimes = false, .ha_async_batch_mirror = .{ .publisher = ha_publisher_adapter.bind(&stream) }, .ha_async_effect_mirror = .{ .publisher = ha_publisher_adapter.bind(&stream), .last_lsn = &last_lsn } });
-        defer primary.close();
-        var replica = try DB.open(alloc, replica_tmp.path(), .{ .start_optional_runtimes = false });
-        defer replica.close();
-        for ([_]*DB{ &primary, &replica }) |database| {
-            try database.setSchema(.{
-                .version = 1,
-                .storage_mode = if (relational) .relational else .document,
-                .relational_columns = if (relational) &.{.{ .name = "title", .path = "title", .column_type = .string }} else &.{},
-            });
-            try database.addIndex(.{ .name = "direct", .kind = .graph, .config_json = "{\"ttl\":{\"duration\":\"1h\"}}" });
-            try database.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"keep\"}" }}, .graph_writes = &.{.{ .index_name = "direct", .source = "doc:a", .target = "doc:b", .edge_type = "links" }}, .sync_level = .full_index });
-        }
-        const prefix = try internal_keys.documentExactPrefixAlloc(alloc, "doc:a");
-        defer alloc.free(prefix);
-        const bootstrap = try primary.core.store.scanPrefix(alloc, prefix);
-        defer docstore_mod.DocStore.freeResults(alloc, bootstrap);
-        for (bootstrap) |row| try replica.core.store.put(row.key, row.value);
-        const replica_due = try replica.core.store.scanPrefix(alloc, &internal_keys.graph_edge_expiration_index_prefix);
-        defer docstore_mod.DocStore.freeResults(alloc, replica_due);
-        for (replica_due) |row| try replica.core.store.delete(row.key);
-        const due = try primary.core.store.scanPrefix(alloc, &internal_keys.graph_edge_expiration_index_prefix);
-        defer docstore_mod.DocStore.freeResults(alloc, due);
-        for (due) |row| try replica.core.store.put(row.key, row.value);
-        const candidate = (try graph_edge_ttl_expiration.decodeDue(due[0].value)).direct;
-        var clock = platform_clock.ManualClock{};
-        clock.setRealtimeNs(candidate.deadline_ns + 1);
-        var ttl = TtlCleanupContext{ .batch = primary.batchContext(), .grace_period_ns = 0, .clock = clock.clock() };
-        var effect_lsn: u64 = 0;
-        if (owner_expiration) {
-            try std.testing.expectEqual(@as(u32, 1), try executeDeleteBatchContext(&ttl.batch, &.{"doc:a"}, .full_index, null));
-        } else if (!relational) {
-            // Fail in the HA encoder after the guarded primary commit. The
-            // asynchronous mirror must retain an obligation and recover it
-            // ahead of the next ordinary primary mutation.
-            const before_lsn = stream.lastLsn();
-            const stream_alloc = stream.alloc;
-            var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
-            stream.alloc = failing.allocator();
-            defer stream.alloc = stream_alloc;
-            try std.testing.expectError(error.OutOfMemory, expireDirectGraphTtlCandidateContext(&ttl, candidate));
-            try std.testing.expectEqual(before_lsn, stream.lastLsn());
-            try std.testing.expect(primary.async_context.primary_ha_append_pending.load(.acquire));
-            try std.testing.expectError(error.HAMirrorUnavailable, primary.addEnrichment(.{ .name = "blocked", .kind = .asset, .field = "title", .content_type = "text/plain" }));
-            try std.testing.expectError(error.HAMirrorUnavailable, appendDerivedBatchRecordContext(&ttl.batch, .{ .changed_artifact_keys = &.{candidate.artifact_key} }));
-            stream.alloc = stream_alloc;
-            try primary.batch(.{ .writes = &.{.{ .key = "doc:z", .value = "{\"title\":\"later\"}" }}, .sync_level = .full_index });
-            try std.testing.expect(!primary.async_context.primary_ha_append_pending.load(.acquire));
-            effect_lsn = before_lsn + 1;
-            const pending = try primary.core.store.scanPrefix(alloc, ha_outbox_v2_prefix);
-            defer docstore_mod.DocStore.freeResults(alloc, pending);
-            try std.testing.expectEqual(@as(usize, 0), pending.len);
-            var later = (try stream.log.entryAt(alloc, effect_lsn + 1)) orelse return error.TestUnexpectedResult;
-            defer later.deinit(alloc);
-            try std.testing.expectEqual(ha_replication_record_mod.RecordKind.batch_mutation, later.record.kind);
-        } else try std.testing.expect(try expireDirectGraphTtlCandidateContext(&ttl, candidate));
-        if (effect_lsn == 0) effect_lsn = last_lsn.load(.acquire);
-        var effect = (try stream.log.entryAt(alloc, effect_lsn)) orelse return error.TestUnexpectedResult;
-        try std.testing.expect(ha_effects_mod.primary_effect.isPrimaryEffect(effect.record.payload));
-        defer effect.deinit(alloc);
-        try replica.applyHAReplicationRecord(effect.record);
-        try replica.runUntilIdle();
-        try std.testing.expectError(error.NotFound, replica.core.store.get(alloc, candidate.artifact_key));
-        const deadlines = try replica.core.store.scanPrefix(alloc, &internal_keys.graph_edge_expiration_index_prefix);
-        defer docstore_mod.DocStore.freeResults(alloc, deadlines);
-        try std.testing.expectEqual(@as(usize, 0), deadlines.len);
-        const edges = try replica.getEdges(alloc, "direct", "doc:a", "links", .out);
-        defer graph_mod.GraphIndex.freeEdges(alloc, edges);
-        try std.testing.expectEqual(@as(usize, 0), edges.len);
-        const doc = try replica.get(alloc, "doc:a");
-        defer if (doc) |value| alloc.free(value);
-        try std.testing.expectEqual(!owner_expiration, doc != null);
-        if (owner_expiration) {
-            try std.testing.expectEqual(@as(u64, 0), replica.core.identity_visibility.summary.?.live_ordinals);
-            try std.testing.expectEqual(@as(u64, 0), replica.core.table_catalog.row_count);
-        }
-    };
 }
 
 test "db graph primary publication serializes ordinary writes with source accounting" {
@@ -142741,7 +139520,7 @@ test "db raced replicated transaction completion persists receipt and participan
         .timestamp_ns = 25_000,
         .sync_level = .write,
     }, null, .{
-        .bypass_ha_write_gate = true,
+        .bypass_replication_write_gate = true,
         .raft_applied_entry_marker = resolve_entry,
         .transaction_resolution = .{
             .txn_id = txn_id,
@@ -148798,11 +145577,11 @@ fn testScopedNativeArtifactRestore(standby: bool, replace_generated: bool, unver
         defer page.deinit();
         const batch = page.batch orelse break;
         if (standby) {
-            const payload = try ha_effects_mod.encodeBatchMutationRequestAlloc(alloc, batch);
+            const payload = try replication_effects_mod.encodeBatchMutationRequestAlloc(alloc, batch);
             defer alloc.free(payload);
-            const record: ha_replication_record_mod.RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = index_number, .previous_lsn = index_number - 1, .payload = payload };
-            try target.applyHAReplicationRecord(record);
-            try target.applyHAReplicationRecord(record);
+            const record: replication_record_mod.RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = index_number, .previous_lsn = index_number - 1, .payload = payload };
+            try replication_ingress.applyRecord(&target, record);
+            try replication_ingress.applyRecord(&target, record);
         } else {
             try target.batchRaftReplicatedApply(batch, .{ .term = 1, .index = index_number });
             // Lost acknowledgements replay without mutating the next page.
@@ -152758,190 +149537,6 @@ test "db empty-generation install receipt survives hidden to public owner reopen
     try std.testing.expectEqual(@as(u64, 11), (parsed.value orelse return error.GenerationHandoffInstallMissing).applied_index);
 }
 
-test "db ordered artifact inventory reconciles committed receiver catalog before atomic admission" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const reference_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/artifact-reference", .{tmp.sub_path});
-    defer alloc.free(reference_path);
-    const follower_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/artifact-follower", .{tmp.sub_path});
-    defer alloc.free(follower_path);
-    const options: OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
-    var reference = try DB.open(alloc, reference_path, options);
-    defer reference.close();
-    try reference.setSchemaJson(alloc, "{}");
-    try reference.addIndex(.{ .name = "expected", .kind = .full_text, .config_json = "{}" });
-    var command = try reference.artifactInventoryCommand(alloc);
-    defer command.catalogs.deinit(alloc);
-    var follower = try DB.open(alloc, follower_path, options);
-    defer follower.close();
-    try follower.setSchemaJson(alloc, "{}");
-    try follower.updateRange(.{ .start = "m", .end = "z" });
-    try follower.batch(.{ .writes = &.{.{ .key = "n", .value = "{\"body\":\"receiver alpha\"}" }}, .sync_level = .write });
-    try follower.addIndex(.{ .name = "stale", .kind = .full_text, .config_json = "{}" });
-    try follower.core.addResolver(.{ .name = "stale-resolver", .table = "entities", .source_artifact = "relations", .resolution_artifact = "resolved", .key_template = "{{ _entity.label }}", .config_generation = 1 });
-    for (0..129) |i| {
-        const doc = try std.fmt.allocPrint(alloc, "row-{d:0>4}", .{i});
-        defer alloc.free(doc);
-        const artifact = try internal_keys.resolutionArtifactKeyAlloc(alloc, doc, "resolved");
-        defer alloc.free(artifact);
-        try follower.core.store.put(artifact, "{}");
-    }
-    var obsolete = obsolete: {
-        var read = try follower.core.store.beginReadTxn();
-        defer read.abort();
-        break :obsolete .{ .catalogs = try @import("artifact_inventory.zig").copyCatalogs(alloc, &read) };
-    };
-    defer obsolete.catalogs.deinit(alloc);
-    const invalid_scope: @import("online_source_contract.zig").Scope = .{
-        .fence = .{ .admission_epoch = 1, .attempt = 1, .transition_id = 9, .owner_group_id = 2, .peer_group_id = 3, .role = .merge_source, .namespace = options.identity_namespace.?, .catalog_digest = @splat(99) },
-        .receiver_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 },
-        .consumer_epoch = 1,
-        .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
-    };
-    try std.testing.expectError(error.IntegrityCatalogChanged, follower.batchRaftReplicatedApply(.{ .artifact_catalog = command, .online_source = .{ .admit = .{ .scope = invalid_scope, .artifact_catalog = command.binding } } }, .{ .term = 1, .index = 1 }));
-    try std.testing.expect(follower.hasIndex("stale"));
-    {
-        var read = try follower.core.store.beginReadTxn();
-        defer read.abort();
-        try std.testing.expect((try @import("artifact_reconcile_intent.zig").load(alloc, &read)) == null);
-    }
-    // An independently built donor has a distinct physical generation but the
-    // same definition. The receiver repairs to its own ordered generation.
-    const donor_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/artifact-independent-donor", .{tmp.sub_path});
-    defer alloc.free(donor_path);
-    var donor = try DB.open(alloc, donor_path, options);
-    defer donor.close();
-    try donor.setSchemaJson(alloc, "{}");
-    try donor.addIndex(.{ .name = "expected", .kind = .full_text, .config_json = "{}" });
-    var donor_command = try donor.artifactInventoryCommand(alloc);
-    defer donor_command.catalogs.deinit(alloc);
-    const donor_binding = donor_command.binding;
-    try std.testing.expect(!std.mem.eql(u8, &donor_binding.digest, &command.binding.digest));
-    try std.testing.expect(donor_binding.compatible(command.binding));
-    const request: types.BatchRequest = .{ .artifact_catalog = command, .merge_replication = .{ .transition_id = 10, .donor_group_id = 3, .receiver_group_id = 2, .identity_namespace = options.identity_namespace.?, .copy_attempt = .{} }, .merge_checkpoint = .{ .kind = .accept, .transition_id = 10, .donor_group_id = 3, .receiver_group_id = 2, .receiver_base_start = "m", .receiver_base_end = "z", .merged_start = "a", .merged_end = "z", .page_receiver_namespace = options.identity_namespace, .page_source = .{ .namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .pin_digest = @splat(5), .applied_index = 4, .retention = .{ .epoch = 1, .after_sequence = 0 }, .artifact_catalog = donor_binding } } };
-    var retries: usize = 0;
-    var saved_context: ?@import("artifact_reconcile_intent.zig").Context = null;
-    var restarted_cleanup = false;
-    var saw_pending_repair = false;
-    var standby_gate: @import("../hot_standby/public_gate_state.zig").State = .{};
-    standby_gate.role.store(@intFromEnum(@import("../hot_standby/public_gate_state.zig").Role.standby), .release);
-    const ha_payload = try ha_effects_mod.encodeArtifactCatalogMutationRequestAlloc(alloc, request, .{ .term = 1, .index = 1 });
-    defer alloc.free(ha_payload);
-    const ha_record: ha_replication_record_mod.RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = ha_payload };
-    while (true) {
-        follower.ha_write_gate = .{ .shared = .{ .state = standby_gate.storageWriteState() } };
-        follower.applyHAReplicationRecord(ha_record) catch |err| {
-            follower.ha_write_gate = null;
-            if (err != error.ArtifactCatalogDrift) return err;
-            retries += 1;
-            try std.testing.expect(retries <= 32);
-            try std.testing.expect((try follower.raftAppliedEntry()) == null);
-            try std.testing.expect((try follower.artifactInventoryStatus()).ordered == null);
-            {
-                var read = try follower.core.store.beginReadTxn();
-                defer read.abort();
-                const intent = (try @import("artifact_reconcile_intent.zig").load(alloc, &read)).?;
-                defer intent.deinit();
-                saved_context = .{ .token = intent.value.token };
-                try std.testing.expectError(error.ArtifactCatalogEpochChanged, @import("artifact_reconcile_intent.zig").requireContext(alloc, &read, .{ .token = @splat(0) }));
-                if (follower.hasIndex("expected")) {
-                    try std.testing.expectError(error.IntegrityTopologyBusy, @import("artifact_reconcile_intent.zig").permitCatalog(alloc, &read, @import("artifact_inventory.zig").index_key, ""));
-                    try std.testing.expectError(error.IntegrityTopologyBusy, @import("artifact_reconcile_intent.zig").permitCatalog(alloc, &read, @import("artifact_inventory.zig").index_key, obsolete.catalogs.indexes));
-                }
-            }
-            try std.testing.expectError(error.IntegrityTopologyBusy, follower.setSchemaJson(alloc, "{\"version\":2}"));
-            try std.testing.expectError(error.IntegrityTopologyBusy, follower.addIndex(.{ .name = "unrelated", .kind = .full_text, .config_json = "{}" }));
-            var partial_archive: std.ArrayList(u8) = .empty;
-            defer partial_archive.deinit(alloc);
-            try std.testing.expectError(error.IntegrityTopologyBusy, portable_backup.exportPortable(alloc, follower.core.store, &partial_archive));
-            try std.testing.expectError(error.IntegrityTopologyBusy, follower.snapshotNative("pending-artifacts"));
-            try std.testing.expectError(error.IntegrityTopologyBusy, follower.isPortableImportTargetEmpty(alloc));
-            {
-                var rejected = try follower.core.store.beginWriteTxn();
-                defer rejected.abort();
-                try std.testing.expectError(error.IntegrityTopologyBusy, @import("relational_integrity_topology.zig").stageCancel(&rejected, invalid_scope.fence));
-                try std.testing.expectError(error.IntegrityTopologyBusy, @import("relational_integrity_topology.zig").stageAbortTransition(&rejected, invalid_scope.fence));
-            }
-            const producer_base = follower.batchContext();
-            var producer: EnrichmentAppendContext = .{
-                .alloc = alloc,
-                .store = producer_base.store,
-                .applied_sequence_checkpoint_path = producer_base.applied_sequence_checkpoint_path,
-                .shard_manager = producer_base.shard_manager,
-                .index_manager = producer_base.index_manager,
-                .apply_mutex = producer_base.apply_mutex,
-                .change_journal = producer_base.change_journal,
-                .replay_source = producer_base.replay_source,
-                .executor = producer_base.executor,
-                .async_context = follower.async_context,
-                .log_mutex = producer_base.log_mutex,
-            };
-            const late_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "a-behind-cursor", "resolved");
-            defer alloc.free(late_key);
-            const late_write: resolution_runtime_mod.RecordWrite = .{ .batch = .{}, .artifact_writes = &.{.{ .key = late_key, .value = "{}" }}, .publish_resolution_handoff = true };
-            try std.testing.expectError(error.IntegrityTopologyBusy, appendResolutionRecord(&producer, late_write));
-            try std.testing.expectError(error.IntegrityTopologyBusy, publishResolutionHandoffContext(&producer_base, late_write));
-            try std.testing.expectError(error.NotFound, follower.core.store.get(alloc, late_key));
-            if (!restarted_cleanup) if (try follower.core.getStoreValue(alloc, @import("artifact_reconcile_intent.zig").resolver_cursor_key)) |cursor_before| {
-                defer alloc.free(cursor_before);
-                follower.close();
-                follower = try DB.open(alloc, follower_path, options);
-                const cursor_after = try follower.core.store.get(alloc, @import("artifact_reconcile_intent.zig").resolver_cursor_key);
-                defer alloc.free(cursor_after);
-                try std.testing.expectEqualSlices(u8, cursor_before, cursor_after);
-                var resumed = try follower.artifactInventoryCommand(alloc);
-                defer resumed.catalogs.deinit(alloc);
-                try std.testing.expectEqualDeep(command.binding, resumed.binding);
-                restarted_cleanup = true;
-            };
-            if (follower.hasIndex("expected") and follower.core.index_manager.hasRepairUnavailableIndexes()) {
-                saw_pending_repair = true;
-                var repairs = try follower.loadIndexRepairState(alloc);
-                defer repairs.deinit(alloc);
-                follower.ha_write_gate = .{ .shared = .{ .state = standby_gate.storageWriteState() } };
-                defer follower.ha_write_gate = null;
-                for (repairs.entries.items) |repair| if (repair.intent.phase != .terminal) {
-                    _ = try follower.advanceIndexRepairIntent(alloc, repair.intent.repair_id, .{});
-                };
-            }
-            continue;
-        };
-        follower.ha_write_gate = null;
-        break;
-    }
-    try std.testing.expect(retries >= 2);
-    try std.testing.expect(restarted_cleanup);
-    try std.testing.expect(saw_pending_repair);
-    try std.testing.expect((try follower.artifactInventoryStatus()).ready);
-    try std.testing.expect(follower.hasIndex("expected"));
-    try std.testing.expect(!follower.hasIndex("stale"));
-    var rebuilt_rows = try follower.search(alloc, .{ .index_name = "expected", .full_text = .{ .match = .{ .field = "body", .text = "alpha" } } });
-    defer rebuilt_rows.deinit();
-    try std.testing.expectEqual(@as(u32, 1), rebuilt_rows.total_hits);
-    const resolution_rows = try follower.core.store.scanPrefixKeysPage(alloc, &.{internal_keys.user_namespace}, null, 256);
-    defer {
-        for (resolution_rows) |key| alloc.free(key);
-        alloc.free(resolution_rows);
-    }
-    for (resolution_rows) |key| {
-        if (try internal_keys.parseResolutionArtifactKeyAlloc(alloc, key)) |resolution| {
-            alloc.free(resolution.doc_key);
-            alloc.free(resolution.artifact_name);
-            return error.TestUnexpectedResult;
-        }
-    }
-    try std.testing.expectEqual(@as(u64, 1), (try follower.raftAppliedEntry()).?.index);
-    {
-        var read = try follower.core.store.beginReadTxn();
-        defer read.abort();
-        try std.testing.expect((try @import("artifact_reconcile_intent.zig").load(alloc, &read)) == null);
-        try std.testing.expectError(error.ArtifactCatalogEpochChanged, @import("artifact_reconcile_intent.zig").requireContext(alloc, &read, saved_context.?));
-        try std.testing.expectError(error.NotFound, read.get(@import("artifact_reconcile_intent.zig").resolver_cursor_key));
-    }
-    try std.testing.expectError(error.IntegrityTopologyBusy, follower.addIndex(.{ .name = "late", .kind = .full_text, .config_json = "{}" }));
-}
-
 test "db ordered artifact inventory staged generations resume and switch snapshot visibility atomically" {
     const alloc = std.testing.allocator;
     const generations = @import("artifact_chunk_generation.zig");
@@ -156239,223 +152834,48 @@ test "db transaction integrity contention precedes stale claim semantics" {
     }
 }
 
-test "db graph ttl HA retirement preserves different replay progress" {
-    const Case = struct { shared_edge: bool, ahead: bool, changed_revision: bool = false, owner_expiration: bool = false, delayed_source: bool = false };
-    for ([_]Case{
-        .{ .shared_edge = false, .ahead = true },
-        .{ .shared_edge = true, .ahead = true },
-        .{ .shared_edge = false, .ahead = false },
-        .{ .shared_edge = true, .ahead = false },
-        .{ .shared_edge = true, .ahead = true, .changed_revision = true },
-        .{ .shared_edge = true, .ahead = false, .changed_revision = true },
-        .{ .shared_edge = false, .ahead = true, .owner_expiration = true },
-        .{ .shared_edge = true, .ahead = true, .owner_expiration = true },
-        .{ .shared_edge = false, .ahead = false, .owner_expiration = true },
-        .{ .shared_edge = false, .ahead = true, .delayed_source = true },
-    }) |case| {
-        const alloc = std.testing.allocator;
-        var primary_tmp = try TestDirectory.init("review-ttl-primary");
-        defer primary_tmp.cleanup();
-        var replica_tmp = try TestDirectory.init("review-ttl-replica");
-        defer replica_tmp.cleanup();
-        var log_tmp = try TestDirectory.init("review-ttl-log");
-        defer log_tmp.cleanup();
-        var slots_tmp = try TestDirectory.init("review-ttl-slots");
-        defer slots_tmp.cleanup();
-        var stream = try ha_primary_mod.Primary.open(alloc, log_tmp.path().ptr, slots_tmp.path().ptr, .{ .cluster_id = 200, .shard_id = 3, .table_id = 9, .timeline_id = 1, .epoch = 1 }, .{});
-        defer stream.close();
-        var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-        var primary = try DB.open(alloc, primary_tmp.path(), .{ .start_index_workers = false, .start_optional_runtimes = false, .ha_async_effect_mirror = .{ .publisher = ha_publisher_adapter.bind(&stream), .last_lsn = &last_lsn } });
-        defer primary.close();
-        var replica = try DB.open(alloc, replica_tmp.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
-        defer replica.close();
-        for ([_]*DB{ &primary, &replica }) |db| {
-            try db.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
-            try db.addEnrichment(.{ .name = "relations_v2", .kind = .asset, .field = "relations", .content_type = "application/json" });
-            try db.addIndex(.{ .name = "g", .kind = .graph, .coverage_generation = 7, .config_json = "{\"ttl\":{\"duration\":\"1h\"},\"max_edges_per_document\":2,\"sources\":[{\"artifact\":\"relations_v1\"},{\"artifact\":\"relations_v2\"}]}" });
-            try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{}" }}, .sync_level = .full_index });
-        }
-        const a = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
-        defer alloc.free(a);
-        const b = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", if (case.changed_revision) "relations_v1" else "relations_v2");
-        defer alloc.free(b);
-        for ([_]*DB{ &primary, &replica }) |db| try db.core.store.put(a, "{\"type\":\"links\",\"target\":{\"document_id\":\"doc:b\"}}");
-        _ = try applyDerivedBatchToIndexAsync(primary.async_context, .{ .changed_artifact_keys = &.{a} }, .{ .name = "g", .kind = .graph }, .{});
-        const prefix = try internal_keys.documentExactPrefixAlloc(alloc, "doc:a");
-        defer alloc.free(prefix);
-        const due = try primary.core.store.scanPrefix(alloc, &internal_keys.graph_edge_expiration_index_prefix);
-        defer docstore_mod.DocStore.freeResults(alloc, due);
-        // Materialize independently: matching revisions can have different
-        // server-assigned lifetimes and therefore different local due keys.
-        if (!case.delayed_source) {
-            _ = try applyDerivedBatchToIndexAsync(replica.async_context, .{ .changed_artifact_keys = &.{a} }, .{ .name = "g", .kind = .graph }, .{});
-            const local_due = try replica.core.store.scanPrefix(alloc, &internal_keys.graph_edge_expiration_index_prefix);
-            defer docstore_mod.DocStore.freeResults(alloc, local_due);
-            try std.testing.expectEqual(@as(usize, 1), local_due.len);
-            try std.testing.expect(!std.mem.eql(u8, due[0].key, local_due[0].key));
-        }
-        // Model an existing overdue source on both nodes before the update.
-        if (case.changed_revision) {
-            const old = (try graph_edge_ttl_expiration.decodeDue(due[0].value)).source;
-            for ([_]*DB{ &primary, &replica }) |db| {
-                const global_key = try internal_keys.graphGlobalEdgeContenderKeyAlloc(alloc, "g", 7, old.edge_key, old.source_priority, old.state_key);
-                defer alloc.free(global_key);
-                const global_raw = try db.core.store.get(alloc, global_key);
-                defer alloc.free(global_raw);
-                const view = (try graph_edge_contender.decode(global_raw, 7)).?;
-                var decoded_edge = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, view.payload);
-                defer decoded_edge.deinit(alloc);
-                const expired_payload = try enrichment_artifact_codec.encodeGraphEdgeWithTtlAlloc(alloc, null, 7, decoded_edge.weight, decoded_edge.created_at, decoded_edge.updated_at, 1, decoded_edge.metadata_json);
-                defer alloc.free(expired_payload);
-                const contender = try graph_edge_contender.encodeAlloc(alloc, 7, old.source_priority, old.edge_key, old.state_key, expired_payload);
-                defer alloc.free(contender);
-                const local_key = try internal_keys.graphEdgeContenderKeyAlloc(alloc, "doc:a", "g", old.edge_key, old.state_key);
-                defer alloc.free(local_key);
-                const life_key = try internal_keys.graphEdgeTtlLifetimeKeyAlloc(alloc, old.edge_key, "g", 7, old.state_key);
-                defer alloc.free(life_key);
-                var life: [8]u8 = undefined;
-                std.mem.writeInt(u64, &life, 1, .big);
-                var overdue = old;
-                overdue.deadline_ns = 1 + std.time.ns_per_hour;
-                GraphTtlSha256.hash(contender, &overdue.contender_digest, .{});
-                const overdue_key = try graph_edge_ttl_expiration.indexKeyAlloc(alloc, overdue.deadline_ns, global_key);
-                defer alloc.free(overdue_key);
-                const overdue_value = try graph_edge_ttl_expiration.encodeAlloc(alloc, overdue);
-                defer alloc.free(overdue_value);
-                const prior_due = try db.core.store.scanPrefix(alloc, &internal_keys.graph_edge_expiration_index_prefix);
-                defer docstore_mod.DocStore.freeResults(alloc, prior_due);
-                try db.core.store.putBatch(&.{ .{ .key = global_key, .value = contender }, .{ .key = local_key, .value = contender }, .{ .key = old.edge_key, .value = expired_payload }, .{ .key = life_key, .value = &life }, .{ .key = overdue_key, .value = overdue_value } }, &.{prior_due[0].key});
-            }
-        }
-        // This source write precedes expiration in the primary/HA order. Only the
-        // standby has completed source replay when the primary expires source A.
-        const next_source = if (case.changed_revision) "{\"type\":\"links\",\"weight\":17,\"target\":{\"document_id\":\"doc:b\"}}" else if (case.shared_edge) "{\"type\":\"links\",\"target\":{\"document_id\":\"doc:b\"}}" else "{\"type\":\"links\",\"target\":{\"document_id\":\"doc:c\"}}";
-        for ([_]*DB{ &primary, &replica }) |db| try db.core.store.put(b, next_source);
-        _ = try appendDerivedBatchRecord(&primary, .{ .changed_artifact_keys = &.{b} });
-        var source_record = (try stream.log.entryAt(alloc, last_lsn.load(.acquire))) orelse return error.TestUnexpectedResult;
-        defer source_record.deinit(alloc);
-        _ = try replica.applyHADerivedEffectRecord(source_record.record);
-        if (case.ahead) try replica.runUntilIdle();
-        try GraphPrimaryPublicationTest.expectCount(&primary, 1);
-        const initial_count_key = try internal_keys.graphEdgeContenderCountKeyAlloc(alloc, "doc:a", "g");
-        defer alloc.free(initial_count_key);
-        const initial_count = try replica.core.store.get(alloc, initial_count_key);
-        defer alloc.free(initial_count);
-        try std.testing.expectEqual(@as(usize, if (case.ahead and !case.shared_edge and !case.delayed_source) 2 else 1), (try graph_edge_contender.decodeVisibleCount(initial_count, 7)).?);
-        const current_due = try primary.core.store.scanPrefix(alloc, &internal_keys.graph_edge_expiration_index_prefix);
-        defer docstore_mod.DocStore.freeResults(alloc, current_due);
-        const candidate = (try graph_edge_ttl_expiration.decodeDue(current_due[0].value)).source;
-        var clock = platform_clock.ManualClock{};
-        clock.setRealtimeNs(candidate.deadline_ns + 1);
-        var ttl = TtlCleanupContext{ .batch = primary.batchContext(), .grace_period_ns = 0, .clock = clock.clock() };
-        if (case.owner_expiration) {
-            try std.testing.expectEqual(@as(u32, 1), try executeDeleteBatchContext(&ttl.batch, &.{"doc:a"}, .full_index, null));
-        } else {
-            // Earlier source replay must finish before retirement is certified.
-            const before_lsn = last_lsn.load(.acquire);
-            try std.testing.expect(!try expireGraphTtlCandidateContext(&ttl, candidate));
-            try std.testing.expectEqual(before_lsn, last_lsn.load(.acquire));
-            try primary.runUntilIdle();
-            if (case.changed_revision) {
-                try std.testing.expect(!try expireGraphTtlCandidateContext(&ttl, candidate));
-                const refreshed = try primary.core.store.scanPrefix(alloc, &internal_keys.graph_edge_expiration_index_prefix);
-                defer docstore_mod.DocStore.freeResults(alloc, refreshed);
-                try std.testing.expectEqual(@as(usize, 1), refreshed.len);
-                const current = (try graph_edge_ttl_expiration.decodeDue(refreshed[0].value)).source;
-                try std.testing.expectEqual(candidate.deadline_ns, current.deadline_ns);
-                try std.testing.expect(try expireGraphTtlCandidateContext(&ttl, current));
-            } else {
-                try std.testing.expect(try expireGraphTtlCandidateContext(&ttl, candidate));
-            }
-        }
-        var expiration_record = (try stream.log.entryAt(alloc, last_lsn.load(.acquire))) orelse return error.TestUnexpectedResult;
-        defer expiration_record.deinit(alloc);
-        _ = try replica.applyHADerivedEffectRecord(expiration_record.record);
-        if (case.changed_revision) {
-            const retired_key = try internal_keys.graphEdgeTtlTombstoneKeyAlloc(alloc, candidate.edge_key, candidate.index_name, candidate.generation, candidate.state_key);
-            defer alloc.free(retired_key);
-            const retired = try replica.core.store.get(alloc, retired_key);
-            defer alloc.free(retired);
-            try std.testing.expectEqual(candidate.deadline_ns, (try graph_edge_ttl_tombstone.Tombstone.decode(retired)).deadline_ns);
-        }
-        try replica.runUntilIdle();
-        if (case.delayed_source) _ = try applyDerivedBatchToIndexAsync(replica.async_context, .{ .changed_artifact_keys = &.{a} }, .{ .name = "g", .kind = .graph }, .{});
-        if (!case.owner_expiration and !case.changed_revision) {
-            _ = try applyDerivedBatchToIndexAsync(primary.async_context, .{ .changed_artifact_keys = &.{b} }, .{ .name = "g", .kind = .graph }, .{});
-            try GraphPrimaryPublicationTest.expectCount(&primary, 1);
-        }
-        const global_prefix = try internal_keys.graphGlobalEdgeContenderRootPrefixAlloc(alloc, "doc:a");
-        defer alloc.free(global_prefix);
-        const survivors = try replica.core.store.scanPrefix(alloc, global_prefix);
-        defer docstore_mod.DocStore.freeResults(alloc, survivors);
-        const expected: usize = if (case.owner_expiration or case.changed_revision) 0 else 1;
-        try std.testing.expectEqual(expected, survivors.len);
-        const surviving_due = try replica.core.store.scanPrefix(alloc, &internal_keys.graph_edge_expiration_index_prefix);
-        defer docstore_mod.DocStore.freeResults(alloc, surviving_due);
-        try std.testing.expectEqual(expected, surviving_due.len);
-        if (!case.owner_expiration and !case.changed_revision) try GraphPrimaryPublicationTest.expectCount(&replica, 1);
-        const edges = try replica.getEdges(alloc, "g", "doc:a", "links", .out);
-        defer graph_mod.GraphIndex.freeEdges(alloc, edges);
-        try std.testing.expectEqual(expected, edges.len);
-        if (!case.owner_expiration and !case.changed_revision) try std.testing.expectEqualStrings(if (case.shared_edge) "doc:b" else "doc:c", edges[0].target);
-
-        if (case.owner_expiration) {
-            try std.testing.expectError(error.NotFound, replica.core.store.get(alloc, "doc:a"));
-            const remaining_due = try replica.core.store.scanPrefix(alloc, &internal_keys.graph_edge_expiration_index_prefix);
-            defer docstore_mod.DocStore.freeResults(alloc, remaining_due);
-            try std.testing.expectEqual(@as(usize, 0), remaining_due.len);
-            const remaining_owner = try replica.core.store.scanPrefix(alloc, prefix);
-            defer docstore_mod.DocStore.freeResults(alloc, remaining_owner);
-            try std.testing.expectEqual(@as(usize, 0), remaining_owner.len);
-        }
-        const tip = replica.core.store.nextReplaySequence(1);
-        try std.testing.expectEqual(@as(u64, 0), try replica.applyHADerivedEffectRecord(expiration_record.record));
-        try std.testing.expectEqual(tip, replica.core.store.nextReplaySequence(1));
-        replica.close();
-        replica = try DB.open(alloc, replica_tmp.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
-        if (!case.owner_expiration and !case.changed_revision) try GraphPrimaryPublicationTest.expectCount(&replica, 1);
-        const reopened_edges = try replica.getEdges(alloc, "g", "doc:a", "links", .out);
-        defer graph_mod.GraphIndex.freeEdges(alloc, reopened_edges);
-        try std.testing.expectEqual(expected, reopened_edges.len);
-        if (case.changed_revision) {
-            const after_retirement = "{\"type\":\"links\",\"weight\":23,\"target\":{\"document_id\":\"doc:b\"}}";
-            for ([_]*DB{ &primary, &replica }) |db| try db.core.store.put(a, after_retirement);
-            _ = try appendDerivedBatchRecord(&primary, .{ .changed_artifact_keys = &.{a} });
-            var new_record = (try stream.log.entryAt(alloc, last_lsn.load(.acquire))) orelse return error.TestUnexpectedResult;
-            defer new_record.deinit(alloc);
-            _ = try replica.applyHADerivedEffectRecord(new_record.record);
-            for ([_]*DB{ &primary, &replica }) |db| {
-                try db.runUntilIdle();
-                const renewed = try db.getEdges(alloc, "g", "doc:a", "links", .out);
-                defer graph_mod.GraphIndex.freeEdges(alloc, renewed);
-                try std.testing.expectEqual(@as(usize, 1), renewed.len);
-                try std.testing.expectEqual(@as(f64, 23), renewed[0].weight);
-                const new_due = try db.core.store.scanPrefix(alloc, &internal_keys.graph_edge_expiration_index_prefix);
-                defer docstore_mod.DocStore.freeResults(alloc, new_due);
-                try std.testing.expectEqual(@as(usize, 1), new_due.len);
-                try std.testing.expect((try graph_edge_ttl_expiration.decodeDue(new_due[0].value)).source.deadline_ns > candidate.deadline_ns);
-            }
-            // A duplicate retirement cannot overwrite this newer lifecycle.
-            try std.testing.expectEqual(@as(u64, 0), try replica.applyHADerivedEffectRecord(expiration_record.record));
-            const renewed = try replica.getEdges(alloc, "g", "doc:a", "links", .out);
-            defer graph_mod.GraphIndex.freeEdges(alloc, renewed);
-            try std.testing.expectEqual(@as(usize, 1), renewed.len);
-        }
-    }
-}
-
 /// Project the borrowed replication controls without giving the HA owner
 /// access to database state, stores, caches, or the mutation executor.
-fn haCommitContext(ctx: *const BatchExecutionContext) ha_db_commit.CommitContext {
+fn replicationCommitContext(ctx: *const BatchExecutionContext) replication_commit.CommitContext {
     return .{
         .alloc = ctx.alloc,
         .identity_namespace = ctx.identity_namespace,
-        .transition_mutex = haTransitionMutexFromContext(ctx),
+        .transition_mutex = replicationTransitionMutexFromContext(ctx),
         .log_mutex = ctx.log_mutex,
-        .ha_write_gate = ctx.ha_write_gate,
-        .ha_async_effect_mirror = ctx.ha_async_effect_mirror,
-        .ha_async_batch_mirror = ctx.ha_async_batch_mirror,
-        .ha_async_metadata_mirror = ctx.ha_async_metadata_mirror,
-        .append_pending = if (ctx.async_context) |async_ctx| &async_ctx.primary_ha_append_pending else null,
+        .replication_write_gate = ctx.replication_write_gate,
+        .replication_async_effect_mirror = ctx.replication_async_effect_mirror,
+        .replication_async_batch_mirror = ctx.replication_async_batch_mirror,
+        .replication_async_metadata_mirror = ctx.replication_async_metadata_mirror,
+        .append_pending = if (ctx.async_context) |async_ctx| &async_ctx.primary_replication_append_pending else null,
     };
 }
+
+// White-box hooks for server integration fixtures; absent from production builds.
+const fixture_owner = @This();
+pub const test_support = if (builtin.is_test) struct {
+    pub const default_test_wait_attempts = fixture_owner.default_test_wait_attempts;
+    pub const executeDeleteBatchContext = fixture_owner.executeDeleteBatchContext;
+    pub const expireDirectGraphTtlCandidateContext = fixture_owner.expireDirectGraphTtlCandidateContext;
+    pub const expireGraphTtlCandidateContext = fixture_owner.expireGraphTtlCandidateContext;
+    pub const ConcurrentWriteProbe = fixture_owner.ConcurrentWriteProbe;
+    pub const EnrichmentAppendContext = fixture_owner.EnrichmentAppendContext;
+    pub const GateDenseEmbedder = fixture_owner.GateDenseEmbedder;
+    pub const GraphPrimaryPublicationTest = fixture_owner.GraphPrimaryPublicationTest;
+    pub const ResolutionHandoffPublishHook = fixture_owner.ResolutionHandoffPublishHook;
+    pub const TtlCleanupContext = fixture_owner.TtlCleanupContext;
+    pub const appendDerivedBatchRecord = fixture_owner.appendDerivedBatchRecord;
+    pub const appendDerivedBatchRecordContext = fixture_owner.appendDerivedBatchRecordContext;
+    pub const appendResolutionRecord = fixture_owner.appendResolutionRecord;
+    pub const appendResolutionRecordWithHook = fixture_owner.appendResolutionRecordWithHook;
+    pub const applyDerivedBatchToIndexAsync = fixture_owner.applyDerivedBatchToIndexAsync;
+    pub const cleanupTempDir = fixture_owner.cleanupTempDir;
+    pub const lockAtomic = fixture_owner.lockAtomic;
+    pub const monotonicTimeNs = fixture_owner.monotonicTimeNs;
+    pub const publishResolutionHandoffContext = fixture_owner.publishResolutionHandoffContext;
+    pub const sleepNs = fixture_owner.sleepNs;
+    pub const waitForAtomicFlag = fixture_owner.waitForAtomicFlag;
+    pub const batchContext = DB.batchContext;
+    pub const applyRelationalTopologyControlWithReplication = DB.applyRelationalTopologyControlWithReplication;
+    pub const ensureDurableReplicationStartupBarrier = DB.ensureDurableReplicationStartupBarrier;
+    pub const flushDurableReplicationOutboxes = DB.flushDurableReplicationOutboxes;
+} else struct {};

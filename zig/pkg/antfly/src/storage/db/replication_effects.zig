@@ -22,10 +22,10 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const change_journal = @import("derived/change_journal.zig");
-pub const primary_effect = @import("../hot_standby/primary_effect.zig");
+pub const primary_effect = @import("primary_effect.zig");
 const db_types = @import("types.zig");
 
-const replication_record = @import("../hot_standby/replication_record.zig");
+const replication_record = @import("replication_record.zig");
 const schema_mod = @import("../schema.zig");
 
 pub const AppendDerivedEffectOptions = struct {
@@ -994,11 +994,28 @@ pub fn decodeMetadataMutation(
     return parsed;
 }
 
+/// Borrowed schema mutation executed by DB; decoding owns its backing storage.
+pub const SchemaMutation = struct {
+    schema: schema_mod.TableSchema,
+    public_schema_json: ?[]const u8,
+    published_child: ?PublishedChildSchema,
+};
+
+pub const RowPolicyMutation = struct {
+    bundle: []const u8,
+    request: @import("../../system_catalog/policies.zig").InstallRequest,
+    entry: db_types.RaftAppliedEntryIdentity,
+};
+
 pub const DecodedSchemaMetadataMutation = struct {
     alloc: Allocator,
     schema: schema_mod.TableSchema,
     public_schema_json: ?[]u8,
     published_child: ?PublishedChildSchema,
+
+    pub fn view(self: *const DecodedSchemaMetadataMutation) SchemaMutation {
+        return .{ .schema = self.schema, .public_schema_json = self.public_schema_json, .published_child = self.published_child };
+    }
 
     pub fn deinit(self: *DecodedSchemaMetadataMutation) void {
         schema_mod.freeSchema(self.alloc, self.schema);

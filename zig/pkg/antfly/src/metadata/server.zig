@@ -1737,7 +1737,7 @@ test "metadata server can expose admin listener endpoints" {
 
     // Exercise the real host router: a correctly signed setting grant cannot
     // substitute for the independently authenticated internal-service token.
-    const setting_call = @import("../system_catalog/domain.zig").Call{ .setting_snapshot = .{ .principal = "alice", .database = "main" } };
+    const setting_call = @import("../system_catalog/server_call.zig").Call{ .setting_snapshot = .{ .principal = "alice", .database = "main" } };
     const setting_body = try std.json.Stringify.valueAlloc(std.heap.page_allocator, setting_call, .{});
     defer std.heap.page_allocator.free(setting_body);
     const now_seconds: i64 = @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s));
@@ -1766,7 +1766,7 @@ test "metadata server can expose admin listener endpoints" {
     // A policy-status read does not need the separate setting grant, but the
     // real host must reject missing and forged service credentials before the
     // contextual catalog handler can grant its narrow read capability.
-    const policy_status_body = try std.json.Stringify.valueAlloc(std.heap.page_allocator, @import("../system_catalog/domain.zig").Call{ .policy_publication_status = 77 }, .{});
+    const policy_status_body = try std.json.Stringify.valueAlloc(std.heap.page_allocator, @import("../system_catalog/server_call.zig").Call{ .policy_publication_status = 77 }, .{});
     defer std.heap.page_allocator.free(policy_status_body);
     var missing_policy_service = try executor.executor().execute(std.heap.page_allocator, .{
         .method = .POST,

@@ -233,18 +233,18 @@ pub const VersionedResponse = struct {
     }
 };
 
-fn haSeedRequest(operation: abi.HASeedOperation, request_json: []const u8) abi.HASeedJsonRequest {
+fn hotStandbySeedRequest(operation: abi.HASeedOperation, request_json: []const u8) abi.HASeedJsonRequest {
     return .{
         .operation = operation,
         .request_json = .fromSlice(request_json),
     };
 }
 
-pub fn haSeedActivate(request_json: []const u8) !Response {
+pub fn hotStandbySeedActivate(request_json: []const u8) !Response {
     var response: Response = .{};
     var failure: abi.FailureIdentity = .{};
     const status = abi.antfly_storage_hot_standby_seed_activate_json(
-        &haSeedRequest(.activate, request_json),
+        &hotStandbySeedRequest(.activate, request_json),
         &response.buffer,
         &failure,
     );
@@ -252,11 +252,11 @@ pub fn haSeedActivate(request_json: []const u8) !Response {
     return response;
 }
 
-pub fn haSeedValidateActivatedGeneration(request_json: []const u8) !u64 {
+pub fn hotStandbySeedValidateActivatedGeneration(request_json: []const u8) !u64 {
     var result: abi.HASeedValidationResult = .{};
     var failure: abi.FailureIdentity = .{};
     const status = abi.antfly_storage_hot_standby_seed_validate_json(
-        &haSeedRequest(.validate_activated_generation, request_json),
+        &hotStandbySeedRequest(.validate_activated_generation, request_json),
         &result,
         &failure,
     );
@@ -266,11 +266,11 @@ pub fn haSeedValidateActivatedGeneration(request_json: []const u8) !u64 {
     return result.checkpoint_lsn;
 }
 
-pub fn haSeedPruneActivatedGenerations(request_json: []const u8) !Response {
+pub fn hotStandbySeedPruneActivatedGenerations(request_json: []const u8) !Response {
     var response: Response = .{};
     var failure: abi.FailureIdentity = .{};
     const status = abi.antfly_storage_hot_standby_seed_prune_json(
-        &haSeedRequest(.prune_activated_generations, request_json),
+        &hotStandbySeedRequest(.prune_activated_generations, request_json),
         &response.buffer,
         &failure,
     );
@@ -577,10 +577,10 @@ pub const Owner = struct {
         ));
     }
 
-    pub fn applyHAReplicationRecord(
+    pub fn applyHotStandbyReplicationRecord(
         self: *Owner,
         table_name: []const u8,
-        record: HAReplicationRecord,
+        record: HotStandbyReplicationRecord,
     ) !void {
         try statusToError(abi.antfly_storage_owner_apply_ha_replication_record(
             self.handle,
@@ -1026,7 +1026,7 @@ pub const Owner = struct {
         return result;
     }
 
-    pub fn captureHASeedSnapshot(self: *Owner, table_name: []const u8, token: []const u8, destination: []const u8) !void {
+    pub fn captureHotStandbySeedSnapshot(self: *Owner, table_name: []const u8, token: []const u8, destination: []const u8) !void {
         var result: abi.MaintenanceResult = .{};
         try statusToError(abi.antfly_storage_owner_maintenance(self.handle, &.{
             .action = @intFromEnum(abi.MaintenanceAction.capture_ha_seed_snapshot),
@@ -1037,7 +1037,7 @@ pub const Owner = struct {
         if (result.version != abi.abi_version) return error.InvalidAbiVersion;
     }
 
-    pub fn prepareHASeedSnapshot(
+    pub fn prepareHotStandbySeedSnapshot(
         self: *Owner,
         table_name: []const u8,
         deadline_ns: u64,
@@ -1056,7 +1056,7 @@ pub const Owner = struct {
     }
 };
 
-pub const HAReplicationRecord = struct {
+pub const HotStandbyReplicationRecord = struct {
     record_kind: u16,
     payload_codec: u16,
     flags: u32 = 0,

@@ -31,8 +31,8 @@ pub const sql_document_row = @import("sql/document_row.zig");
 pub const storage_row_identity = @import("storage/row_identity.zig");
 pub const storage_range_protection = @import("storage/range_protection.zig");
 pub const storage_coordinated_ttl = @import("storage/coordinated_ttl.zig");
-pub const storage_metadata_ha_port = @import("storage/metadata_ha_port.zig");
-pub const storage_hot_standby_replication_record = @import("storage/hot_standby/replication_record.zig");
+pub const storage_metadata_hot_standby_port = @import("storage/metadata_hot_standby_port.zig");
+pub const storage_hot_standby_replication_record = @import("storage/db/replication_record.zig");
 pub const storage_docstore = @import("storage/docstore.zig");
 pub const metadata_restore_staging = @import("metadata/restore_staging.zig");
 pub const metadata_storage_raft_apply_store = @import("metadata/storage/raft_apply_store.zig");
@@ -65,3 +65,5 @@ pub const common_topology_records = @import("common/topology_records.zig");
 pub const raft_read_gate = @import("raft/read_gate.zig");
 pub const storage_db_relational_transition_contract = @import("storage/db/relational_transition_contract.zig");
 pub const storage_db_relational_integrity_json = @import("storage/db/relational_integrity_json.zig");
+
+pub const storage_db_replication_ingress = @import("storage/db/replication_ingress.zig");
