@@ -371,6 +371,13 @@ const SnapshotBuildWorker = struct {
         return !self.stopping and !self.running and self.pending == null and self.result == null;
     }
 
+    fn isBuildingGroup(self: *@This(), group_id: core.types.GroupId, incarnation: u64) bool {
+        const io = self.io_impl.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.running_group_id == group_id and self.running_incarnation == incarnation;
+    }
+
     fn submit(self: *@This(), request: SnapshotBuildRequest) bool {
         const io = self.io_impl.io();
         self.mutex.lockUncancelable(io);
@@ -442,8 +449,6 @@ const SnapshotBuildWorker = struct {
 
             self.mutex.lockUncancelable(io);
             self.running_source = null;
-            self.running_group_id = null;
-            self.running_incarnation = 0;
             self.mutex.unlock(io);
             request.source.deinit();
             request.source = undefined;
@@ -467,6 +472,8 @@ const SnapshotBuildWorker = struct {
 
             self.mutex.lockUncancelable(io);
             self.running = false;
+            self.running_group_id = null;
+            self.running_incarnation = 0;
             std.debug.assert(self.result == null);
             self.result = result;
             self.mutex.unlock(io);
@@ -735,6 +742,20 @@ pub const MultiRaft = struct {
         // teardown so a catalog I/O failure leaves the hosted replica intact and
         // visible to the next reconciliation pass.
         if (self.hooks.replica_catalog) |catalog| _ = try catalog.removeReplica(group_id);
+        std.debug.assert(self.removeGroup(group_id));
+        if (self.hooks.state_machine) |state_machine| state_machine.retireGroup(group_id);
+        if (self.hooks.group_storage) |group_storage| group_storage.retireGroup(group_id);
+    }
+
+    /// Exact physical-retirement journals remove catalog discovery only after
+    /// durable unlink. Stop this replica without changing that catalog proof.
+    /// A canceled snapshot worker must finish before its root can be renamed.
+    pub fn retireReplicaPreservingCatalog(self: *MultiRaft, group_id: core.types.GroupId) !void {
+        const incarnation = self.group_incarnations.get(group_id) orelse return;
+        if (self.snapshot_worker) |worker| {
+            worker.retireGroup(group_id, incarnation);
+            if (worker.isBuildingGroup(group_id, incarnation)) return error.ReplicaRetirementSnapshotBusy;
+        }
         std.debug.assert(self.removeGroup(group_id));
         if (self.hooks.state_machine) |state_machine| state_machine.retireGroup(group_id);
         if (self.hooks.group_storage) |group_storage| group_storage.retireGroup(group_id);

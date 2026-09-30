@@ -123,9 +123,17 @@ pub const TailChunk = struct {
     total: u32,
     offset: u32,
     data: []const u8,
+    frame_format: enum { contiguous, chunked } = .contiguous,
+    /// Authenticated ordinal/chunk directory, sent only with the first slice.
+    descriptor: ?[]const u8 = null,
 
     pub fn validate(self: TailChunk) !void {
-        if (self.sequence == 0 or self.total == 0 or self.total > 16 * 1024 * 1024 or self.offset >= self.total or
+        const limit: u32 = if (self.frame_format == .chunked) @import("../retained_frame.zig").max_logical_bytes else 16 * 1024 * 1024;
+        if ((self.frame_format == .contiguous and self.descriptor != null) or
+            (self.frame_format == .chunked and self.offset == 0 and self.descriptor == null) or
+            (self.offset != 0 and self.descriptor != null)) return error.InvalidRestoreStagingCommand;
+        if (self.descriptor) |bytes| if (bytes.len > 272 * 1024) return error.InvalidRestoreStagingCommand;
+        if (self.sequence == 0 or self.total == 0 or self.total > limit or self.offset >= self.total or
             self.data.len == 0 or self.data.len > 64 * 1024 or self.data.len > self.total - self.offset or
             std.mem.allEqual(u8, &self.pin, 0) or std.mem.allEqual(u8, &self.frame_digest, 0)) return error.InvalidRestoreStagingCommand;
     }
@@ -150,7 +158,7 @@ pub const Progress = struct {
         if (self.sequence < binding.retained_start or
             ((self.frame_offset == 0) != (self.frame_remaining == 0)) or
             ((self.frame_offset == 0) != std.mem.allEqual(u8, &self.frame_digest, 0)) or
-            self.frame_offset > 16 * 1024 * 1024 or self.frame_remaining > 65536 or
+            self.frame_offset > @import("../retained_frame.zig").max_logical_bytes or self.frame_remaining > 65536 or
             (!self.snapshot_complete and (self.sequence != binding.retained_start or self.frame_offset != 0 or self.final_cut != null))) return error.InvalidRestoreStagingCommand;
         if (self.final_cut) |cut| if (!self.snapshot_complete or self.frame_offset != 0 or cut.sequence != self.sequence or
             cut.applied_index < binding.source_applied_index or std.mem.allEqual(u8, &cut.digest, 0)) return error.InvalidRestoreStagingCommand;

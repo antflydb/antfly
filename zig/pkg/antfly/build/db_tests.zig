@@ -29,10 +29,32 @@ pub const AddTestsResult = struct {
 
 pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
+    const direct_vector_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "online direct vector", "online graph snapshot", "retained transaction vector", "api module compiles", "metadata module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-online-direct-vector-test", "Run ordered direct vector snapshot, retention, and repair regressions")
+        .dependOn(&addFilteredTestRunArtifact(b, direct_vector_tests).step);
+    const retirement_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "db cold initial FK retirement", "api module compiles", "metadata module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-cold-fk-retirement-test", "Run terminal local publication cancellation durability tests")
+        .dependOn(&addFilteredTestRunArtifact(b, retirement_tests).step);
+    const ordered_artifact_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "ordered artifact inventory", "storage.db.derived.apply_state", "artifact footprint", "artifact publication upload", "artifact publication compact transport", "db derived coverage snapshot", "db dense target reads atomic outcome and source coverage snapshot", "online admission facts are unbound", "native source admission", "api module compiles", "metadata module compiles", "db lookup includes chunk artifacts", "db search includes chunk artifacts", "db scan includes chunk artifacts", "db lookup does not load chunks", "db lookup loads chunks" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-ordered-artifact-test", "Run ordered artifact inventory, wire, and durable owner regressions")
+        .dependOn(&addFilteredTestRunArtifact(b, ordered_artifact_tests).step);
     const repair_activation_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{
             "db repair activation",
+            "storage.db.derived.index_repair_state",
             "db dense shadow activation rejects surplus candidate coverage",
             "db paused dense repair resumes its durable candidate after restart",
         },

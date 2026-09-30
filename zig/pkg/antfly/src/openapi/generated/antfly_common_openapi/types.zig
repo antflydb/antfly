@@ -292,6 +292,7 @@ pub const Config = struct {
     admission: ?AdmissionConfig = null,
     graph_execution: ?GraphExecutionConfig = null,
     mcp: ?McpConfig = null,
+    pgwire: ?PgwireConfig = null,
     backup: ?BackupConfig = null,
     secrets: ?SecretsConfig = null,
     storage: ?StorageConfig = null,
@@ -352,6 +353,7 @@ pub const Config = struct {
         .{ "admission", "admission", true },
         .{ "graph_execution", "graph_execution", true },
         .{ "mcp", "mcp", true },
+        .{ "pgwire", "pgwire", true },
         .{ "backup", "backup", true },
         .{ "secrets", "secrets", true },
         .{ "storage", "storage", true },
@@ -423,6 +425,10 @@ pub const Config = struct {
         }
         if (self.mcp) |value| {
             try jw.objectField("mcp");
+            try jw.write(value);
+        }
+        if (self.pgwire) |value| {
+            try jw.objectField("pgwire");
             try jw.write(value);
         }
         if (self.backup) |value| {
@@ -1947,6 +1953,58 @@ pub const ObjectStorageLocation = struct {
         }
         if (self.prefix) |value| {
             try jw.objectField("prefix");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Optional PostgreSQL wire listener. Requires authentication. Transactions remain unsupported. Remote bindings require externally protected transport.
+pub const PgwireConfig = struct {
+    enabled: ?bool = null,
+    bind_host: ?[]const u8 = null,
+    bind_port: ?i64 = null,
+    max_connections: ?i64 = null,
+    /// Acknowledges that a TLS proxy or authenticated private transport protects a non-loopback listener. Does not enable native TLS.
+    externally_protected_transport: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "enabled", "enabled", true },
+        .{ "bind_host", "bind_host", true },
+        .{ "bind_port", "bind_port", true },
+        .{ "max_connections", "max_connections", true },
+        .{ "externally_protected_transport", "externally_protected_transport", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.enabled) |value| {
+            try jw.objectField("enabled");
+            try jw.write(value);
+        }
+        if (self.bind_host) |value| {
+            try jw.objectField("bind_host");
+            try jw.write(value);
+        }
+        if (self.bind_port) |value| {
+            try jw.objectField("bind_port");
+            try jw.write(value);
+        }
+        if (self.max_connections) |value| {
+            try jw.objectField("max_connections");
+            try jw.write(value);
+        }
+        if (self.externally_protected_transport) |value| {
+            try jw.objectField("externally_protected_transport");
             try jw.write(value);
         }
         try jw.endObject();

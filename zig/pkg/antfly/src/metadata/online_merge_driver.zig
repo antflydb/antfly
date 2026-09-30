@@ -27,6 +27,20 @@ const http = @import("../common/http/http_common.zig");
 const operation = @import("../api/operation.zig");
 const Allocator = std.mem.Allocator;
 
+fn artifactCatalogsCompatible(donor: ?@import("../storage/db/artifact_inventory.zig").Binding, receiver: ?@import("../storage/db/artifact_inventory.zig").Binding) bool {
+    const source_binding = donor orelse return false;
+    const target_binding = receiver orelse return false;
+    return source_binding.compatible(target_binding);
+}
+
+test "metadata ordered artifact inventory admission requires matching catalogs on both owners" {
+    const binding: @import("../storage/db/artifact_inventory.zig").Binding = .{ .epoch = 1, .digest = @splat(1), .semantic_digest = @splat(3) };
+    try std.testing.expect(!artifactCatalogsCompatible(null, binding));
+    try std.testing.expect(!artifactCatalogsCompatible(binding, null));
+    try std.testing.expect(!artifactCatalogsCompatible(binding, .{ .epoch = 2, .digest = @splat(2), .semantic_digest = @splat(4) }));
+    try std.testing.expect(artifactCatalogsCompatible(binding, .{ .epoch = 2, .digest = @splat(2), .semantic_digest = binding.semantic_digest }));
+}
+
 pub const Context = struct {
     record: state_mod.MergeTransitionRecord,
     donor: ?table.RangeRecord,
@@ -86,7 +100,14 @@ fn validatePrepared(state: online.State, operation_kind: @FieldType(io_contract.
         if ((actual.kind == .accept or actual.kind == .rollback) and std.meta.eql(actual.copy_attempt, types.MergeCopyAttempt{})) expected.copy_attempt = .{};
         if (!std.meta.eql(actual.copy_attempt, types.MergeCopyAttempt{}) and !std.meta.eql(actual.copy_attempt, state.scope.copy_attempt)) return error.OnlineMergeReceiptMismatch;
         inline for (std.meta.fields(types.MergeReplicationCheckpoint)) |field| {
-            if (comptime field.type == []const u8) {
+            if (comptime std.mem.eql(u8, field.name, "page_source_catalogs")) {
+                if ((actual.page_source_catalogs == null) != (expected.page_source_catalogs == null)) return error.OnlineMergeReceiptMismatch;
+                if (actual.page_source_catalogs) |left| {
+                    const right = expected.page_source_catalogs.?;
+                    if (!std.mem.eql(u8, left.indexes, right.indexes) or !std.mem.eql(u8, left.enrichments, right.enrichments) or
+                        !std.mem.eql(u8, left.resolvers, right.resolvers)) return error.OnlineMergeReceiptMismatch;
+                }
+            } else if (comptime field.type == []const u8) {
                 if (!std.mem.eql(u8, @field(actual, field.name), @field(expected, field.name))) return error.OnlineMergeReceiptMismatch;
             } else if (!std.meta.eql(@field(actual, field.name), @field(expected, field.name))) return error.OnlineMergeReceiptMismatch;
         }
@@ -202,6 +223,11 @@ fn Adapter(comptime Service: type) type {
             const receiver = try self.fetch(io_contract.AdmissionFacts, owned, initial, .{ .admission = .receiver });
             if (!donor.namespace.eql(initial.scope.fence.namespace) or !receiver.namespace.eql(initial.scope.receiver_namespace)) return error.OnlineMergeReceiptMismatch;
             if (!donor.eligible or !receiver.eligible) return null;
+            // Older owners can report row-derived eligibility but cannot
+            // manufacture the ordered inventory proof added by protocol 13.
+            if (!artifactCatalogsCompatible(donor.artifact_catalog, receiver.artifact_catalog)) return null;
+            initial.artifact_catalog = donor.artifact_catalog;
+            initial.receiver_artifact_catalog = receiver.artifact_catalog;
             const coordinated = context.record.table_contract.integrity_protocol != .none;
             if (coordinated != (donor.integrity != null) or coordinated != (receiver.integrity != null)) return null;
             if (coordinated) {
@@ -300,7 +326,28 @@ fn Adapter(comptime Service: type) type {
             // effect; a stale scheduler never invents a new copy attempt.
             _ = try @import("service.zig").onlineMergeContext(self.service, owned.arena.allocator(), state, owned.request);
             const alloc = owned.arena.allocator();
-            const body = try @import("../api/batch.zig").encodeBatchRequest(alloc, batch);
+            var proposed = batch;
+            if (proposed.merge_checkpoint) |*checkpoint_value| if (checkpoint_value.page_source) |source_identity| if (source_identity.artifact_catalog) |binding| {
+                if (binding.effect_protocol == 15 and checkpoint_value.page_source_catalogs == null) {
+                    const catalogs = try self.fetch(@import("../storage/db/artifact_inventory.zig").Catalogs, owned, state, .source_catalog);
+                    if (!std.mem.eql(u8, &catalogs.digest(), &binding.digest)) return error.OnlineMergeArtifactCatalogChanged;
+                    checkpoint_value.page_source_catalogs = catalogs;
+                }
+            };
+            const install_side: ?io_contract.Side = if (batch.online_source) |command| (if (command == .admit and state.artifact_catalog != null) .donor else null) else if (batch.merge_checkpoint) |control| (if (control.kind == .accept and state.receiver_artifact_catalog != null) .receiver else null) else null;
+            if (install_side) |side| {
+                var unbound = state;
+                unbound.scope.consumer_epoch = 0;
+                unbound.scope.copy_attempt = .{};
+                unbound.scope.fence.attempt = 0;
+                unbound.scope.fence.admission_epoch = 0;
+                unbound.scope.fence.catalog_digest = @splat(0);
+                const catalog = try self.fetch(@import("../storage/db/artifact_inventory.zig").Command, owned, unbound, .{ .artifact_catalog = side });
+                const expected = if (side == .donor) state.artifact_catalog else state.receiver_artifact_catalog;
+                if (!std.meta.eql(@as(?@import("../storage/db/artifact_inventory.zig").Binding, catalog.binding), expected)) return error.OnlineMergeArtifactCatalogChanged;
+                proposed.artifact_catalog = catalog;
+            }
+            const body = try @import("../api/batch.zig").encodeBatchRequest(alloc, proposed);
             var transport = self.client(alloc);
             var cancellation: http.RequestCancellation = .{ .borrowed_context = owned.request.cancellation.ptr, .borrowed_is_cancelled = owned.request.cancellation.is_cancelled_fn };
             const timeout_ms = try timeout(owned.request);
@@ -359,13 +406,21 @@ fn Adapter(comptime Service: type) type {
             // identity. No native raw-identity reassignment is requested: the
             // row-derived-only page applier assigns target-local identities.
             const source_identity = if (state.certificate != null) try state.sourceIdentity() else null;
-            const bind_source = kind == .begin_copy or (kind == .accept and source_identity != null and source_identity.?.integrity != null);
+            const bind_source = kind == .begin_copy or (kind == .accept and source_identity != null and (source_identity.?.integrity != null or source_identity.?.artifact_catalog != null));
             if (bind_source and source_identity == null) return error.OnlineMergeReceiptMismatch;
             return .{ .kind = kind, .transition_id = state.scope.fence.transition_id, .donor_group_id = state.scope.fence.owner_group_id, .receiver_group_id = state.scope.fence.peer_group_id, .receiver_base_start = receiver.start_key, .receiver_base_end = receiver_end, .merged_start = if (donor_first) donor.start_key else receiver.start_key, .merged_end = if (donor_first) receiver_end else donor_end, .bootstrap_applied_index = if (kind == .bootstrap_complete or kind == .finalize) state.final_applied_index else 0, .copy_attempt = state.scope.copy_attempt, .page_source = if (bind_source) source_identity else null, .page_receiver_namespace = if (bind_source) state.scope.receiver_namespace else null };
         }
         fn prepared(self: *Self, owned: Owned, state: online.State, operation_kind: @FieldType(io_contract.Request, "operation")) !void {
-            const result = try self.fetch(io_contract.Prepared, owned, state, operation_kind);
-            try validatePrepared(state, operation_kind, result);
+            var prepared_operation = operation_kind;
+            if (prepared_operation == .checkpoint) if (prepared_operation.checkpoint.page_source) |source_identity| if (source_identity.artifact_catalog) |binding| {
+                if (binding.effect_protocol == 15) {
+                    const catalogs = try self.fetch(@import("../storage/db/artifact_inventory.zig").Catalogs, owned, state, .source_catalog);
+                    if (!std.mem.eql(u8, &catalogs.digest(), &binding.digest)) return error.OnlineMergeArtifactCatalogChanged;
+                    prepared_operation.checkpoint.page_source_catalogs = catalogs;
+                }
+            };
+            const result = try self.fetch(io_contract.Prepared, owned, state, prepared_operation);
+            try validatePrepared(state, prepared_operation, result);
             if (result.request) |request| {
                 try self.submit(owned, state, state.scope.fence.peer_group_id, request);
             }

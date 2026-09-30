@@ -14,6 +14,14 @@
 
 const std = @import("std");
 
+pub const sql_max_request_body_bytes: usize = 4 << 20;
+
+/// Transport admission shared by native and linked-kernel registrars. Resolve
+/// before buffering so a SQL request cannot consume the much larger batch cap.
+pub fn publicPostBodyLimit(path: []const u8) ?usize {
+    return if (std.mem.eql(u8, path, "/db/v1/sql") or std.mem.startsWith(u8, path, "/db/v1/sql/prepared")) sql_max_request_body_bytes else null;
+}
+
 pub const Routes = struct {
     pub const healthz = "/healthz";
     pub const readyz = "/readyz";
@@ -91,6 +99,11 @@ pub const Routes = struct {
     pub const backup_suffix = "/backup";
     pub const backup_shard_suffix = "/backup-shard";
     pub const restore_owner_suffix = "/restore-owner";
+    pub const restore_parent_activation_suffix = "/restore-parent-activation";
+    pub const fk_generation_parent_suffix = "/fk-generation-parent";
+    pub const fk_generation_source_suffix = "/fk-generation-source";
+    pub const fk_initial_child_suffix = "/fk-initial-child";
+    pub const row_policy_install_suffix = "/row-policy-install";
     pub const restore_suffix = "/restore";
     pub const destination_authorization_suffix = "/destination-authorization";
     pub const query_suffix = "/query";

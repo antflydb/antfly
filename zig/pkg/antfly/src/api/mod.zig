@@ -17,11 +17,19 @@ const document_mapper = @import("../storage/db/document_mapper.zig");
 
 pub const cluster = @import("cluster.zig");
 pub const operation = @import("operation.zig");
+const sql_execution = @import("sql_execution.zig");
+const sql_pgwire = @import("sql_pgwire.zig");
+const sql_session = @import("sql_session.zig");
 pub const probe_operations = @import("probe_operations.zig");
 pub const storage_maintenance_operations = @import("storage_maintenance_operations.zig");
 pub const batch = @import("batch.zig");
 pub const backups = @import("backups.zig");
 pub const restore_owner = @import("restore_owner.zig");
+pub const restore_parent_activation = @import("restore_parent_activation.zig");
+pub const relational_fk_generation_publication = @import("relational_fk_generation_publication.zig");
+pub const row_policy_install = @import("row_policy_install.zig");
+pub const row_policy_publication_coordinator = @import("row_policy_publication_coordinator.zig");
+pub const fk_generation_publication_coordinator = @import("fk_generation_publication_coordinator.zig");
 pub const linear_merge = @import("linear_merge.zig");
 pub const query = @import("query.zig");
 pub const query_contract = @import("query_contract.zig");
@@ -78,6 +86,7 @@ pub const kernel_bridge = @import("kernel_bridge.zig");
 const kernel_abi = @import("kernel_abi.zig");
 pub const http_client = @import("http_client.zig");
 pub const httpx_handler = @import("httpx_handler.zig");
+pub const store_root_enrollment_http = @import("store_root_enrollment_http.zig");
 pub const connections = @import("connections.zig");
 const protocol_adapters = @import("protocol_adapters.zig");
 
@@ -102,6 +111,7 @@ pub const TableWriteSource = table_writes.TableWriteSource;
 pub const BoundTableWriteSource = table_writes.BoundTableWriteSource;
 pub const ProvisionedTableWriteCache = table_writes.ProvisionedTableWriteCache;
 pub const ProvisionedTableWriteSource = table_writes.ProvisionedTableWriteSource;
+pub const InitialChildRetirementObservation = table_writes.InitialChildRetirementObservation;
 pub const ProvisionedKernelOwnerSource = kernel_owner_source.ProvisionedKernelOwnerSource;
 pub const HostedProvisionedTableWriteSource = table_writes.HostedProvisionedTableWriteSource;
 pub const HostedGroupRouter = table_router.HostedGroupRouter;
@@ -231,6 +241,14 @@ test "join inequality: incomparable types return 0" {
 }
 
 test "api module compiles" {
+    _ = @import("sql_truncate.zig");
+    _ = @import("sql_policy_ddl.zig");
+    _ = sql_execution;
+    _ = @import("sql_schema_cache.zig");
+    _ = sql_pgwire;
+    _ = sql_session;
+    _ = @import("sql_connection_record.zig");
+    _ = @import("sql_connections.zig");
     _ = cluster;
     _ = batch;
     _ = backups;
@@ -278,6 +296,7 @@ test "api module compiles" {
     _ = kernel_bridge;
     _ = http_client;
     _ = httpx_handler;
+    _ = store_root_enrollment_http;
     _ = connections;
     _ = ClusterHealth;
     _ = ClusterStatus;

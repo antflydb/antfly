@@ -129,9 +129,20 @@ pub fn prepare(alloc: std.mem.Allocator, reader: anytype, request: types.BatchRe
         }
         @memcpy(row[@intCast(chunk.offset)..], chunk.data);
         if (!std.mem.eql(u8, &checksum(row), &chunk.row_digest)) return error.InvalidMergePage;
-        const writes = try owned.alloc(types.BatchWrite, 1);
-        writes[0] = .{ .key = chunk.row_key, .value = row };
-        result.request.writes = writes;
+        if (chunk.payload == .provenance) {
+            const effects = try owned.alloc(pages.IntegrityEffect, 1);
+            effects[0] = .{ .key = chunk.row_key, .value = row };
+            result.request.merge_page.?.provenance_effects = effects;
+        } else if (chunk.payload == .artifact) {
+            try pages.validateArtifactEffect(request.merge_page.?.source, chunk.row_key, row);
+            const effects = try owned.alloc(pages.IntegrityEffect, 1);
+            effects[0] = .{ .key = chunk.row_key, .value = row };
+            result.request.merge_page.?.artifact_effects = effects;
+        } else {
+            const writes = try owned.alloc(types.BatchWrite, 1);
+            writes[0] = .{ .key = chunk.row_key, .value = row };
+            result.request.writes = writes;
+        }
         const deletes = try owned.alloc([]const u8, @as(usize, allocated_slots) + 1);
         for (deletes[0..allocated_slots], 0..) |*key, i| key.* = try slotKey(owned, @intCast(i));
         deletes[allocated_slots] = manifest_key;
