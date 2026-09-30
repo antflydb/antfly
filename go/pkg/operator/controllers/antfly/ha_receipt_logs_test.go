@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -93,8 +94,14 @@ func TestHAReceiptLogContract(t *testing.T) {
 }
 
 func TestHAReceiptLogRecoveryDoesNotRerunActivation(t *testing.T) {
-	for _, valid := range []bool{false, true} {
-		t.Run(fmt.Sprint(valid), func(t *testing.T) {
+	for _, tt := range []struct {
+		valid bool
+		ttl   *int32
+	}{
+		{false, nil}, {true, nil}, {false, new(int32)}, {true, new(int32)},
+	} {
+		valid := tt.valid
+		t.Run(fmt.Sprintf("valid=%v/ttl=%v", valid, tt.ttl != nil), func(t *testing.T) {
 			ctx := context.Background()
 			action, body := activationLogFixture(t)
 			if !valid {
@@ -121,7 +128,7 @@ func TestHAReceiptLogRecoveryDoesNotRerunActivation(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: action.AdminJobName, Namespace: cluster.Namespace}}
+			job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: action.AdminJobName, Namespace: cluster.Namespace}, Spec: batchv1.JobSpec{TTLSecondsAfterFinished: tt.ttl}}
 			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "activation-pod", Namespace: cluster.Namespace, Labels: map[string]string{"job-name": action.AdminJobName}}, Status: corev1.PodStatus{Phase: corev1.PodSucceeded}}
 			pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: action.TargetPVCName, Namespace: cluster.Namespace, UID: types.UID(action.TargetPVCUID)}}
 			sourcePVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "primary-data", Namespace: cluster.Namespace, UID: "primary-pvc-uid"}}
@@ -209,5 +216,59 @@ func TestHAReceiptLogRecoveryDoesNotRerunActivation(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Exercise the planner that normal reconciliation runs before Job recovery.
+func TestHAReceiptRecoverySurvivesNormalReplanning(t *testing.T) {
+	cluster := startupGatedStandaloneControllerCluster(true)
+	cluster.Spec.HighAvailability.Standbys[0].Desired = nil
+	artifact := cluster.Spec.HighAvailability.Standbys[0].SeedArtifact
+	artifact.TopologyID = "test-standalone"
+	artifact.TopologyGeneration = 3
+	artifact.NodeID = "standby-a"
+	artifact.TargetPVCUID = "pvc-uid-1"
+	artifact.SourcePVC = &antflyv1.HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/source"}
+	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{ExecutePlannedActions: true}
+	cluster.Status.HAStatus = &antflyv1.HAStatus{PrimaryLSN: 10}
+	r := &AntflyClusterReconciler{}
+	r.updateHAStatusAndConditions(cluster)
+	pending := 0
+	for i := range cluster.Status.HAStatus.PlannedActions {
+		action := &cluster.Status.HAStatus.PlannedActions[i]
+		if !haActionRequiresSeedArtifactReceipt(haActionKind(action.Kind)) {
+			continue
+		}
+		action.AdminJobName = fmt.Sprintf("completed-seed-%d", i)
+		action.AdminJobPhase = haAdminJobPhaseSucceeded
+		action.AttemptCount = 1
+		pending++
+	}
+	if pending == 0 {
+		t.Fatal("fixture did not plan portable seed actions")
+	}
+	previous := cluster.Status.HAStatus.DeepCopy()
+	cluster.Status.HAStatus.PrimaryLSN = 20
+	r.updateHAStatusAndConditions(cluster)
+	for _, before := range previous.PlannedActions {
+		if before.AdminJobName == "" {
+			continue
+		}
+		found := false
+		for _, after := range cluster.Status.HAStatus.PlannedActions {
+			if after.OperationID != before.OperationID {
+				continue
+			}
+			found = true
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("replanning lost or retargeted completed attempt: before=%#v after=%#v", before, after)
+			}
+			if haAdminActionSucceededWithEvidence(after) {
+				t.Fatal("missing receipt became success evidence")
+			}
+		}
+		if !found {
+			t.Fatalf("replanning discarded completed operation %s", before.Kind)
+		}
 	}
 }
