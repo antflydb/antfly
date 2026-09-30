@@ -747,6 +747,168 @@ const MutableSlice = struct {
     oversized_single_grants: u64 = 0,
 };
 
+fn replayEscalationEnvU64(name: [:0]const u8, default: u64) u64 {
+    const raw_z = if (builtin.link_libc) std.c.getenv(name) else null;
+    const raw = std.mem.span(raw_z orelse return default);
+    if (raw.len == 0) return default;
+    return std.fmt.parseUnsigned(u64, raw, 10) catch default;
+}
+
+// catch_up_policy.RecoverableRetryBackoff's delay doubles from 10ms and caps
+// at 250ms after the 6th attempt (10+20+40+80+160+250 = 560ms), so every
+// retry after that adds a flat 250ms. 1200 retries is therefore about
+// 560ms + 1194 * 250ms =~ 299s, five minutes. Ordinary replay-visibility lag
+// between a primary-store commit and the derived journal record landing is
+// sub-second to low seconds even under heavy write pressure; a document
+// still missing after five full minutes of continuous retrying is not a
+// transient commit-ordering race, it is a document that is never going to
+// gain content (issue #938's `_edges`-only shape, or another producer like
+// #928's never-written chunk). Minutes, not seconds, so a slow but honest
+// catch-up window is never mistaken for one of these.
+const replay_document_not_visible_default_max_retries: u64 = 1200;
+
+fn replayDocumentNotVisibleMaxRetries() u32 {
+    const configured = replayEscalationEnvU64(
+        "ANTFLY_REPLAY_DOCUMENT_NOT_VISIBLE_MAX_RETRIES",
+        replay_document_not_visible_default_max_retries,
+    );
+    return @intCast(@min(configured, std.math.maxInt(u32)));
+}
+
+/// One index's replay-visibility tracking: how many consecutive times its
+/// current stuck window has retried, and how many documents it has ever
+/// given up on entirely.
+const ReplayWindowState = struct {
+    sequence: u64 = 0,
+    consecutive_failures: u32 = 0,
+    /// Cumulative documents this index has given up on across every window
+    /// that has ever escalated. Never reset by recordSuccess -- this is the
+    /// operator-visible "documents given up on" count, not a liveness signal.
+    skipped_total: u64 = 0,
+};
+
+/// One index's cumulative replay-document-not-visible skip count, as
+/// returned by `snapshotSkipped` for /metrics. The caller owns `index_name`.
+pub const IndexReplayDocumentNotVisibleSkipped = struct {
+    index_name: []u8,
+    count: u64,
+};
+
+/// Bounds how long the derived full-text/algebraic/dense/sparse replay
+/// workers retry `error.ReplayDocumentNotVisible` for the same replay
+/// window, tracked independently per index, before giving up on the
+/// still-missing documents there and letting the window advance without
+/// them.
+///
+/// Without this, a document that will never gain visible content wedges the
+/// worker -- and anything waiting on it to drain, such as Lite's
+/// run_until_idle() -- forever. Issue #938 is one concrete trigger (a
+/// document whose only content was `_edges` was reconstructed by the replay
+/// window as a synthetic full-text candidate with no primary row to find);
+/// this is the backstop for that whole class of bug, not a fix for one shape
+/// of document. Tracking is per index name (not one shared slot) so two
+/// indexes stuck on unrelated windows at the same time cannot reset each
+/// other's retry counts.
+pub const ReplayNotVisibleTracker = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    windows: std.StringHashMapUnmanaged(ReplayWindowState) = .empty,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        lockAtomic(&self.mutex);
+        var it = self.windows.keyIterator();
+        while (it.next()) |key_ptr| alloc.free(@constCast(key_ptr.*));
+        self.windows.deinit(alloc);
+        self.windows = .empty;
+        self.mutex.unlock();
+    }
+
+    fn getOrPutLocked(self: *@This(), alloc: std.mem.Allocator, index_name: []const u8) ?*ReplayWindowState {
+        const gop = self.windows.getOrPut(alloc, index_name) catch return null;
+        if (!gop.found_existing) {
+            gop.key_ptr.* = alloc.dupe(u8, index_name) catch {
+                _ = self.windows.remove(index_name);
+                return null;
+            };
+            gop.value_ptr.* = .{};
+        }
+        return gop.value_ptr;
+    }
+
+    /// Records one more failed attempt at `index_name`'s replay window ending
+    /// at `sequence` and reports whether that index has now retried more
+    /// than `max_retries` times in a row without making progress. A
+    /// different window on the SAME index (a new sequence) resets that
+    /// index's count; a different index is tracked entirely independently.
+    fn recordFailure(self: *@This(), alloc: std.mem.Allocator, index_name: []const u8, sequence: u64, max_retries: u32) bool {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const state = self.getOrPutLocked(alloc, index_name) orelse return false;
+        if (state.sequence != sequence) {
+            state.sequence = sequence;
+            state.consecutive_failures = 0;
+        }
+        state.consecutive_failures +|= 1;
+        return state.consecutive_failures > max_retries;
+    }
+
+    /// Clears the tracked window once it makes progress, so a later stall on
+    /// the same (index, sequence) pair is not mistaken for a continuation of
+    /// an already-escalated stall. The cumulative skipped_total is untouched.
+    fn recordSuccess(self: *@This(), index_name: []const u8, sequence: u64) void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const state = self.windows.getPtr(index_name) orelse return;
+        if (state.sequence == sequence) state.consecutive_failures = 0;
+    }
+
+    /// Records that one document in `index_name` was given up on (its
+    /// content will never arrive) rather than indexed, for operator
+    /// visibility through index status and /metrics.
+    fn recordSkipped(self: *@This(), alloc: std.mem.Allocator, index_name: []const u8) void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const state = self.getOrPutLocked(alloc, index_name) orelse return;
+        state.skipped_total +|= 1;
+    }
+
+    fn skippedTotal(self: *@This(), index_name: []const u8) u64 {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const state = self.windows.getPtr(index_name) orelse return 0;
+        return state.skipped_total;
+    }
+
+    fn skippedTotalAll(self: *@This()) u64 {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        var total: u64 = 0;
+        var it = self.windows.valueIterator();
+        while (it.next()) |state| total +|= state.skipped_total;
+        return total;
+    }
+
+    /// Snapshots every index with a nonzero skipped count. The caller frees
+    /// each entry's `index_name` and the returned slice.
+    fn snapshotSkipped(self: *@This(), alloc: std.mem.Allocator) ![]IndexReplayDocumentNotVisibleSkipped {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        var out = std.ArrayListUnmanaged(IndexReplayDocumentNotVisibleSkipped).empty;
+        errdefer {
+            for (out.items) |item| alloc.free(item.index_name);
+            out.deinit(alloc);
+        }
+        var it = self.windows.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.skipped_total == 0) continue;
+            try out.append(alloc, .{
+                .index_name = try alloc.dupe(u8, entry.key_ptr.*),
+                .count = entry.value_ptr.skipped_total,
+            });
+        }
+        return try out.toOwnedSlice(alloc);
+    }
+};
+
 const MutableMemory = struct {
     budget: Budget = .{},
     used_bytes: u64 = 0,
@@ -915,6 +1077,7 @@ pub const ResourceManager = struct {
     query_embedding_max_inflight: usize,
     index_repair_activation: IndexRepairActivationStats = .{},
     derived_recoverable_retry_counters: DerivedRecoverableRetryCounters = .{},
+    replay_not_visible_tracker: ReplayNotVisibleTracker = .{},
     capacity_source: ?CapacitySource = null,
     identity_allocator: std.mem.Allocator,
     next_identity: u64 = 1,
@@ -1507,6 +1670,48 @@ pub const ResourceManager = struct {
         return self.derived_recoverable_retry_counters.snapshot();
     }
 
+    /// Reports whether replay of `index_name`'s window ending at `sequence`
+    /// has now failed with `error.ReplayDocumentNotVisible` more times in a
+    /// row than `ANTFLY_REPLAY_DOCUMENT_NOT_VISIBLE_MAX_RETRIES` allows. The
+    /// caller is expected to treat this as "stop waiting for the still-missing
+    /// documents in this window" rather than retrying again -- see
+    /// ReplayNotVisibleTracker's doc comment.
+    pub fn shouldEscalateReplayDocumentNotVisible(self: *ResourceManager, index_name: []const u8, sequence: u64) bool {
+        return self.replay_not_visible_tracker.recordFailure(self.identity_allocator, index_name, sequence, replayDocumentNotVisibleMaxRetries());
+    }
+
+    /// Clears escalation tracking for `index_name`'s window ending at
+    /// `sequence` once it has actually applied successfully.
+    pub fn clearReplayDocumentNotVisibleEscalation(self: *ResourceManager, index_name: []const u8, sequence: u64) void {
+        self.replay_not_visible_tracker.recordSuccess(index_name, sequence);
+    }
+
+    /// Records that one document in `index_name` was given up on by replay
+    /// (its content will never arrive) rather than indexed. Surfaced through
+    /// `replayDocumentNotVisibleSkippedTotal`/`...All`/`snapshotReplayDocumentNotVisibleSkipped`
+    /// for index status and /metrics.
+    pub fn recordReplayDocumentNotVisibleSkipped(self: *ResourceManager, index_name: []const u8) void {
+        self.replay_not_visible_tracker.recordSkipped(self.identity_allocator, index_name);
+    }
+
+    /// Cumulative documents `index_name` has ever given up on via bounded
+    /// replay-document-not-visible escalation.
+    pub fn replayDocumentNotVisibleSkippedTotal(self: *ResourceManager, index_name: []const u8) u64 {
+        return self.replay_not_visible_tracker.skippedTotal(index_name);
+    }
+
+    /// Sum of `replayDocumentNotVisibleSkippedTotal` across every index,
+    /// for a single process-wide /metrics counter.
+    pub fn replayDocumentNotVisibleSkippedTotalAll(self: *ResourceManager) u64 {
+        return self.replay_not_visible_tracker.skippedTotalAll();
+    }
+
+    /// Per-index breakdown for a labeled /metrics sample. The caller frees
+    /// each entry's `index_name` and the returned slice.
+    pub fn snapshotReplayDocumentNotVisibleSkipped(self: *ResourceManager, alloc: std.mem.Allocator) ![]IndexReplayDocumentNotVisibleSkipped {
+        return self.replay_not_visible_tracker.snapshotSkipped(alloc);
+    }
+
     /// Install the capacity source for this manager's storage domain.
     ///
     /// A source is part of the manager's lifetime contract: DBs copy the
@@ -1588,6 +1793,8 @@ pub const ResourceManager = struct {
         self.batch_reservation_identities = .empty;
         self.observer_identities.deinit(self.identity_allocator);
         self.observer_identities = .empty;
+        self.replay_not_visible_tracker.deinit(self.identity_allocator);
+        self.replay_not_visible_tracker = .{};
     }
 
     pub fn reserveCapacity(
@@ -5644,4 +5851,92 @@ test "resource manager records index repair activation pause separately from cle
     try std.testing.expectEqual(@as(u64, 30 * std.time.ns_per_ms), stats.last_pause_ns);
     try std.testing.expectEqual(@as(u64, 30 * std.time.ns_per_ms), stats.max_pause_ns);
     try std.testing.expectEqual(@as(u64, 25 * std.time.ns_per_ms), stats.last_budget_ns);
+}
+
+test "resource manager escalates replay-document-not-visible only after bounded retries on one window" {
+    var manager = ResourceManager.init(.{});
+
+    var attempt: u64 = 0;
+    while (attempt < replay_document_not_visible_default_max_retries) : (attempt += 1) {
+        try std.testing.expect(!manager.shouldEscalateReplayDocumentNotVisible("full_text_index_v0", 7));
+    }
+    // One more consecutive failure on the SAME (index, sequence) window
+    // finally escalates -- this is the bounded backstop for issue #938's
+    // whole class of bug: a document that will never gain visible content
+    // must not wedge the replay worker (and anything waiting for it to
+    // drain, like Lite's run_until_idle()) forever.
+    try std.testing.expect(manager.shouldEscalateReplayDocumentNotVisible("full_text_index_v0", 7));
+
+    // A different sequence is a different window: it starts back at zero.
+    try std.testing.expect(!manager.shouldEscalateReplayDocumentNotVisible("full_text_index_v0", 8));
+
+    // A different index is tracked independently too.
+    try std.testing.expect(!manager.shouldEscalateReplayDocumentNotVisible("other_index", 7));
+}
+
+test "resource manager clears replay-document-not-visible escalation once a window succeeds" {
+    var manager = ResourceManager.init(.{});
+
+    var attempt: u64 = 0;
+    while (attempt <= replay_document_not_visible_default_max_retries) : (attempt += 1) {
+        _ = manager.shouldEscalateReplayDocumentNotVisible("full_text_index_v0", 7);
+    }
+    manager.clearReplayDocumentNotVisibleEscalation("full_text_index_v0", 7);
+
+    // A later stall that happens to land on the same window starts counting
+    // from zero again instead of escalating immediately.
+    try std.testing.expect(!manager.shouldEscalateReplayDocumentNotVisible("full_text_index_v0", 7));
+}
+
+test "resource manager tracks replay-document-not-visible escalation independently per index" {
+    var manager = ResourceManager.init(.{});
+
+    // Drive two different indexes' windows in lockstep. Per-index tracking
+    // (not one shared slot) means interleaving one index's failures must not
+    // reset or otherwise perturb the other's count.
+    var attempt: u64 = 0;
+    while (attempt < replay_document_not_visible_default_max_retries) : (attempt += 1) {
+        try std.testing.expect(!manager.shouldEscalateReplayDocumentNotVisible("index_a", 1));
+        try std.testing.expect(!manager.shouldEscalateReplayDocumentNotVisible("index_b", 1));
+    }
+    // Both failed exactly as many times, so both cross their threshold on
+    // the same next attempt -- neither is ahead of or behind the other.
+    try std.testing.expect(manager.shouldEscalateReplayDocumentNotVisible("index_a", 1));
+    try std.testing.expect(manager.shouldEscalateReplayDocumentNotVisible("index_b", 1));
+}
+
+test "resource manager records and snapshots replay-document-not-visible skips per index" {
+    var manager = ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+    defer manager.deinit(std.testing.allocator);
+
+    manager.recordReplayDocumentNotVisibleSkipped("full_text_index_v0");
+    manager.recordReplayDocumentNotVisibleSkipped("full_text_index_v0");
+    manager.recordReplayDocumentNotVisibleSkipped("other_index");
+
+    // A skipped document is not silently lost: it is counted per index...
+    try std.testing.expectEqual(@as(u64, 2), manager.replayDocumentNotVisibleSkippedTotal("full_text_index_v0"));
+    try std.testing.expectEqual(@as(u64, 1), manager.replayDocumentNotVisibleSkippedTotal("other_index"));
+    try std.testing.expectEqual(@as(u64, 0), manager.replayDocumentNotVisibleSkippedTotal("never_skipped"));
+    // ...and summed for the single process-wide /metrics counter.
+    try std.testing.expectEqual(@as(u64, 3), manager.replayDocumentNotVisibleSkippedTotalAll());
+
+    const snapshot = try manager.snapshotReplayDocumentNotVisibleSkipped(std.testing.allocator);
+    defer {
+        for (snapshot) |entry| std.testing.allocator.free(entry.index_name);
+        std.testing.allocator.free(snapshot);
+    }
+    try std.testing.expectEqual(@as(usize, 2), snapshot.len);
+    var saw_full_text = false;
+    var saw_other = false;
+    for (snapshot) |entry| {
+        if (std.mem.eql(u8, entry.index_name, "full_text_index_v0")) {
+            try std.testing.expectEqual(@as(u64, 2), entry.count);
+            saw_full_text = true;
+        } else if (std.mem.eql(u8, entry.index_name, "other_index")) {
+            try std.testing.expectEqual(@as(u64, 1), entry.count);
+            saw_other = true;
+        }
+    }
+    try std.testing.expect(saw_full_text);
+    try std.testing.expect(saw_other);
 }

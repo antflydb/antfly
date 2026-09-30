@@ -2745,7 +2745,14 @@ pub const HealthSource = struct {
             &async_indexing_stats,
             self.data_server.provisioned_storage.resource_manager.derivedRecoverableRetryStats(),
         );
-        try writeAsyncIndexingMetrics(writer, async_indexing_stats);
+        async_indexing_stats.derived_workers.replay_document_not_visible_skipped_total =
+            self.data_server.provisioned_storage.resource_manager.replayDocumentNotVisibleSkippedTotalAll();
+        const replay_not_visible_skipped_by_index = try self.data_server.provisioned_storage.resource_manager.snapshotReplayDocumentNotVisibleSkipped(self.data_server.alloc);
+        defer {
+            for (replay_not_visible_skipped_by_index) |entry| self.data_server.alloc.free(entry.index_name);
+            self.data_server.alloc.free(replay_not_visible_skipped_by_index);
+        }
+        try writeAsyncIndexingMetrics(writer, async_indexing_stats, replay_not_visible_skipped_by_index);
         try antfly.db.query_metrics.writePrometheus(writer);
         try antfly.db.enrichment_utf8_text.writePrometheus(writer);
     }
@@ -3231,7 +3238,11 @@ const AsyncMutexMetricField = enum {
     max_hold_ns,
 };
 
-fn writeAsyncIndexingMetrics(writer: *std.Io.Writer, stats: antfly.db.types.AsyncIndexingStats) !void {
+fn writeAsyncIndexingMetrics(
+    writer: *std.Io.Writer,
+    stats: antfly.db.types.AsyncIndexingStats,
+    replay_not_visible_skipped_by_index: []const resource_manager_mod.IndexReplayDocumentNotVisibleSkipped,
+) !void {
     try health_metrics.appendPromMetric(writer, "antfly_async_index_workers", "gauge", "Derived-index workers running across cached writable tables", stats.derived_workers.workers);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_workers_with_replay_debt", "gauge", "Derived-index workers whose target sequence is ahead of their applied sequence", stats.derived_workers.workers_with_replay_debt);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_max_replay_lag_sequences", "gauge", "Largest target-minus-applied sequence lag across derived-index workers", stats.derived_workers.max_replay_lag_sequences);
@@ -3241,6 +3252,15 @@ fn writeAsyncIndexingMetrics(writer: *std.Io.Writer, stats: antfly.db.types.Asyn
     try appendDerivedRetrySample(writer, "replay_document_not_visible", stats.derived_workers.replay_document_not_visible_retries);
     try appendDerivedRetrySample(writer, "artifact_repair_required", stats.derived_workers.artifact_repair_required_retries);
     try appendDerivedRetrySample(writer, "not_found", stats.derived_workers.not_found_retries);
+    try health_metrics.appendPromMetric(writer, "antfly_replay_document_not_visible_skipped_total", "counter", "Documents given up on by derived replay after bounded error.ReplayDocumentNotVisible retries, summed across indexes", stats.derived_workers.replay_document_not_visible_skipped_total);
+    if (replay_not_visible_skipped_by_index.len > 0) {
+        try health_metrics.appendPromMetricHeader(writer, "antfly_replay_document_not_visible_skipped_by_index_total", "counter", "Documents given up on by derived replay after bounded error.ReplayDocumentNotVisible retries, labeled by index");
+        for (replay_not_visible_skipped_by_index) |entry| {
+            try health_metrics.appendPromSampleLabeled(writer, "antfly_replay_document_not_visible_skipped_by_index_total", &.{
+                .{ .name = "index", .value = entry.index_name },
+            }, entry.count);
+        }
+    }
 
     try writeAsyncMutexMetricFamily(writer, stats, .lock_calls, "antfly_async_index_mutex_lock_calls_total", "counter", "Async indexing mutex lock attempts");
     try writeAsyncMutexMetricFamily(writer, stats, .contended_calls, "antfly_async_index_mutex_contended_calls_total", "counter", "Async indexing mutex lock attempts that encountered contention");

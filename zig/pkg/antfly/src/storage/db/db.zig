@@ -1171,6 +1171,12 @@ pub const DerivedReplayDebtStatus = struct {
     applied_sequence: u64,
     target_sequence: u64,
     catch_up_required: bool,
+    /// Documents this index has given up indexing after bounded
+    /// error.ReplayDocumentNotVisible retries (see
+    /// ResourceManager.shouldEscalateReplayDocumentNotVisible). Nonzero here
+    /// means the index is missing content it will never retry for on its
+    /// own -- an operator-visible signal distinct from ordinary catch-up lag.
+    replay_document_not_visible_skipped: u64 = 0,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(@constCast(self.index_name));
@@ -34993,6 +34999,10 @@ pub const DB = struct {
                 .applied_sequence = applied_sequence,
                 .target_sequence = target_sequence,
                 .catch_up_required = applied_sequence < target_sequence,
+                .replay_document_not_visible_skipped = if (self.core.index_manager.resource_manager) |manager|
+                    manager.replayDocumentNotVisibleSkippedTotal(index_ref.name)
+                else
+                    0,
             };
             initialized += 1;
             transferred_names += 1;
@@ -70030,6 +70040,17 @@ fn applyDerivedBatchToIndexContextProfiled(
         };
         var publication_context = try ctx.index_manager.acquireTextPublicationContext(ctx.alloc, index_ref.name);
         defer publication_context.deinit();
+        // A document that can never gain visible content (issue #938: an
+        // `_edges`-only document reconstructed by replay as a synthetic
+        // full-text candidate) would otherwise make this exact window retry
+        // error.ReplayDocumentNotVisible forever. Past a bounded number of
+        // consecutive failures here, give up on the still-missing documents
+        // in this window instead of blocking the worker -- and anything
+        // waiting on it to drain, like Lite's run_until_idle() -- forever.
+        const tolerate_missing_replay_documents = if (ctx.index_manager.resource_manager) |manager|
+            manager.shouldEscalateReplayDocumentNotVisible(index_ref.name, batch.sequence)
+        else
+            false;
         var collected = try collectTextDocumentWritesForIndex(
             ctx.alloc,
             ctx.store,
@@ -70041,10 +70062,13 @@ fn applyDerivedBatchToIndexContextProfiled(
             .{
                 .prefer_inline_when_store_tip_matches_sequence = batch.sequence,
                 .relational_base_rows = ctx.relational_base_rows,
+                .tolerate_missing_replay_documents = tolerate_missing_replay_documents,
             },
         );
         defer collected.deinit();
         if (collected.missing_required != 0) return error.ReplayDocumentNotVisible;
+        if (ctx.index_manager.resource_manager) |manager|
+            manager.clearReplayDocumentNotVisibleEscalation(index_ref.name, batch.sequence);
 
         const reservation_limit = if (ctx.text_merge_runtime) |runtime| runtime.producerSegmentReservationLimit() else std.math.maxInt(usize);
         var write_start: usize = 0;
@@ -71067,6 +71091,12 @@ const OwnedSparseEmbeddingWrites = struct {
 const CollectTextDocumentWritesOptions = struct {
     prefer_inline_when_store_tip_matches_sequence: ?u64 = null,
     relational_base_rows: bool = false,
+    /// Set once replay of this window has retried error.ReplayDocumentNotVisible
+    /// past the bounded limit (see ResourceManager.shouldEscalateReplayDocumentNotVisible).
+    /// A document that is still missing is then skipped and logged once
+    /// instead of counted toward missing_required, so the window can advance
+    /// instead of retrying forever.
+    tolerate_missing_replay_documents: bool = false,
 };
 
 const CollectDocumentWritesOptions = struct {
@@ -71636,6 +71666,14 @@ fn collectTextDocumentWritesForIndex(
     for (pending.items, 0..) |item, i| {
         const value = read_values[i] orelse item.inline_value orelse {
             if (try replayDocumentIsDurablyDeleted(alloc, &txn, item.doc_key)) continue;
+            if (opts.tolerate_missing_replay_documents) {
+                std.log.warn(
+                    "full-text replay giving up on a document with no visible content after bounded retries index={s} key={s}",
+                    .{ index_name, item.doc_key },
+                );
+                if (index_manager.resource_manager) |manager| manager.recordReplayDocumentNotVisibleSkipped(index_name);
+                continue;
+            }
             result.missing_required += 1;
             continue;
         };
@@ -120617,6 +120655,82 @@ test "db run_until_idle does not hang on a document whose only content is graph 
     const b_value = (try db.get(alloc, "node:b")).?;
     defer alloc.free(b_value);
     try std.testing.expect(std.mem.indexOf(u8, b_value, "\"b\"") != null);
+}
+
+test "collectTextDocumentWritesForIndex tolerates a missing document only when told to give up" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+
+    // "doc:never" is targeted for full-text replay but was never written --
+    // the same shape a thin-replay-reconstructed synthetic upsert has for an
+    // `_edges`-only document (issue #938): no primary row will ever appear
+    // for it. Without tolerate_missing_replay_documents this is the ordinary
+    // "not visible yet, retry" signal; with it (set only after bounded
+    // retries on this exact window have been exhausted) it must be a no-op
+    // skip instead.
+    const documents = [_]derived_types.DerivedDocument{.{
+        .key = "doc:never",
+        .targets = &.{.{ .kind = .full_text, .index_name = "ft_v1" }},
+    }};
+
+    {
+        var collected = try collectTextDocumentWritesForIndex(
+            alloc,
+            db.core.store,
+            db.core.index_manager,
+            &documents,
+            "ft_v1",
+            false,
+            db.core.index_manager.byte_range,
+            .{},
+        );
+        defer collected.deinit();
+        try std.testing.expectEqual(@as(usize, 1), collected.missing_required);
+        try std.testing.expectEqual(@as(usize, 0), collected.docs.items.len);
+    }
+
+    {
+        var collected = try collectTextDocumentWritesForIndex(
+            alloc,
+            db.core.store,
+            db.core.index_manager,
+            &documents,
+            "ft_v1",
+            false,
+            db.core.index_manager.byte_range,
+            .{ .tolerate_missing_replay_documents = true },
+        );
+        defer collected.deinit();
+        try std.testing.expectEqual(@as(usize, 0), collected.missing_required);
+        try std.testing.expectEqual(@as(usize, 0), collected.docs.items.len);
+    }
+
+    // A skipped document is not silently lost: it is counted per index, both
+    // directly and through the same status listDerivedReplayDebt surfaces.
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        db.core.index_manager.resource_manager.?.replayDocumentNotVisibleSkippedTotal("ft_v1"),
+    );
+    const debt = try db.listDerivedReplayDebt(alloc);
+    defer {
+        for (debt) |*status| status.deinit(alloc);
+        alloc.free(debt);
+    }
+    var saw_ft_v1 = false;
+    for (debt) |status| {
+        if (!std.mem.eql(u8, status.index_name, "ft_v1")) continue;
+        try std.testing.expectEqual(@as(u64, 1), status.replay_document_not_visible_skipped);
+        saw_ft_v1 = true;
+    }
+    try std.testing.expect(saw_ft_v1);
 }
 
 test "db thin replay marks artifact-derived target hints" {

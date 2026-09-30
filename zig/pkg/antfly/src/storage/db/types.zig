@@ -4758,6 +4758,10 @@ pub const DerivedWorkerStats = struct {
     replay_document_not_visible_retries: u64 = 0,
     artifact_repair_required_retries: u64 = 0,
     not_found_retries: u64 = 0,
+    /// Documents given up on by bounded replay-document-not-visible
+    /// escalation, summed across every index (see
+    /// ResourceManager.replayDocumentNotVisibleSkippedTotalAll).
+    replay_document_not_visible_skipped_total: u64 = 0,
 };
 
 pub const BulkCoalescingStats = struct {
@@ -4909,6 +4913,7 @@ pub fn accumulateAsyncIndexingStats(dst: *AsyncIndexingStats, src: AsyncIndexing
     dst.derived_workers.replay_document_not_visible_retries += src.derived_workers.replay_document_not_visible_retries;
     dst.derived_workers.artifact_repair_required_retries += src.derived_workers.artifact_repair_required_retries;
     dst.derived_workers.not_found_retries += src.derived_workers.not_found_retries;
+    dst.derived_workers.replay_document_not_visible_skipped_total += src.derived_workers.replay_document_not_visible_skipped_total;
 }
 
 pub fn freeResolverReplayDiagnostics(alloc: Allocator, stats: ResolverReplayDiagnostics) void {
