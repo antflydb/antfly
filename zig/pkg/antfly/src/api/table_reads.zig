@@ -7099,6 +7099,11 @@ pub const HostedProvisionedTableReadSource = struct {
                 else => return err,
             }
         }
+        // Exhausting replicas is not a ReadIndex absence proof. An unmarked
+        // HTTP miss or a failed endpoint can occur while a published owner is
+        // still converging. Keep that uncertainty on the availability path so
+        // callers re-resolve their fenced route within the existing budget.
+        if (consistency == .read_index) return error.StorageReadTemporarilyUnavailable;
         return null;
     }
 
@@ -17257,6 +17262,9 @@ fn consumerTests() type {
                     if (!self.remote) return error.UnexpectedReplicaRead;
                     return try alloc.dupe(u8, "http://worker");
                 }
+                fn groupNodeIds(_: *anyopaque, alloc: std.mem.Allocator, _: u64, _: table_router.RouteBudget) ![]u64 {
+                    return try alloc.dupe(u64, &.{ 2, 3 });
+                }
                 fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
                     return error.UnexpectedPlacementRefresh;
                 }
@@ -17340,6 +17348,28 @@ fn consumerTests() type {
             fixture.absence = "1";
             fixture.status = 500;
             try std.testing.expectError(error.UnexpectedPlacementRefresh, hosted.source().lookup(std.testing.allocator, "rows", "absent", .{}, .read_index));
+
+            // A bounded placement list can be exhausted successfully while
+            // every endpoint returns an unproved miss or server failure. That
+            // must not turn into a public 404 after publication.
+            var bounded_vtable = router.vtable.*;
+            bounded_vtable.group_node_ids = Fixture.groupNodeIds;
+            var bounded_router = router;
+            bounded_router.vtable = &bounded_vtable;
+            hosted.router = bounded_router;
+            fixture.absence = "";
+            inline for (.{ @as(u16, 404), @as(u16, 500) }) |status| {
+                fixture.status = status;
+                fixture.reads = 0;
+                try std.testing.expectError(error.StorageReadTemporarilyUnavailable, hosted.source().lookup(std.testing.allocator, "rows", "absent", .{}, .read_index));
+                try std.testing.expectEqual(@as(usize, 2), fixture.reads);
+            }
+            fixture.status = 404;
+            fixture.absence = "1";
+            fixture.reads = 0;
+            try std.testing.expect((try hosted.source().lookup(std.testing.allocator, "rows", "absent", .{}, .read_index)) == null);
+            try std.testing.expectEqual(@as(usize, 1), fixture.reads);
+            hosted.router = router;
 
             // A raw client must not accept even valid headers for a stale
             // request, or an absence marker without its route ACK.

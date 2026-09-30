@@ -45,6 +45,18 @@ handoffs under the same strict ReadIndex gate as empty-generation handoffs.
 Public restore-job listings independently own response strings before releasing
 their parsed records. The final Debug smoke passed all three #919 selectors.
 
+The v20 soak reproduced a post-publication 404 while the rewrite job was already
+succeeded. Strict lookup fallback previously returned null after exhausting
+replicas with unproved HTTP misses or server failures. Exhaustion now returns
+availability unless a native strict-barrier read or authenticated receipt proves
+absence. The existing request budget bounds re-resolution; successful-absence
+reads still return immediately. Regression coverage exhausts a bounded peer list
+with unmarked 404 and 500 responses, and preserves certified absence. The E2E
+failure now captures exact frontend, key, job result and metadata snapshots for
+HTTP failures as well as transport failures. This concrete false-absence defect
+is fixed; the retained cluster does not establish which endpoint returned the
+unproved miss, so final qualification must include the publication path.
+
 Qualification of the final merged executable remains pending; earlier frozen
 600/600 recovery runs do not qualify these subsequent architectural changes.
 

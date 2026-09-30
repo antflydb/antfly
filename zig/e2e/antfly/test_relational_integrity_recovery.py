@@ -717,7 +717,14 @@ def test_schema_rewrite_recovers_dependency_cohort(
                         f"metadata_snapshots={json.dumps(snapshots, default=str)}\n"
                         f"{cluster.debug_logs()}"
                     )
-                assert response.status_code == 200, response.text
+                if response.status_code != 200:
+                    snapshots = cluster.metadata_snapshots(request_timeout_s=1)
+                    pytest.fail(
+                        f"post-publication read returned {response.status_code} "
+                        f"base={base} table={parent} key={key} job={completed}: "
+                        f"{response.text}\nmetadata_snapshots="
+                        f"{json.dumps(snapshots, default=str)}\n{cluster.debug_logs()}"
+                    )
                 assert response.json()["g"] == row["x"] * 3, response.text
         timings.mark("verify.generated_rows_all_frontends")
         backups._assert_constraint_rejected(
