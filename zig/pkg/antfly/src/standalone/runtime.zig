@@ -11791,6 +11791,9 @@ fn exerciseStandaloneFkPublicationMode(ordinary: bool, truncate_after: bool) !vo
     const alloc = std.testing.allocator;
     const publication = @import("../metadata/fk_generation_publication.zig");
     const control = antfly.public_api.relational_fk_generation_publication;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
     var tmp = std.testing.tmpDir(.{});
     var preserve = false;
     defer if (!preserve) tmp.cleanup();
@@ -11820,7 +11823,18 @@ fn exerciseStandaloneFkPublicationMode(ordinary: bool, truncate_after: bool) !vo
         metadata.deinit();
     };
     try std.testing.expect(metadata.localFkPublicationSupported());
-    if (ordinary) try server.initApiServer();
+    if (ordinary) {
+        try server.initApiServer();
+        // The data server's control round schedules session maintenance in
+        // the background, which independently drives the same FK generation
+        // publication via advanceFkGenerationPublicationBackgroundOnce. Left
+        // unpaused, it races the explicit FkGenerationPublicationTestDriver
+        // steps below and can finish installing the child schema before the
+        // loop observes .installing_child to inject the second reply loss,
+        // failing the `lost_install_reply` assertion. Pause it, matching the
+        // hosted FK fault-injection e2e tests.
+        try antfly.public_api.ApiHttpServer.FkGenerationPublicationTestDriver.pauseBackground(&server.http_server.?, io);
+    }
     const logical_schema =
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"self_fk","child_columns":["parent_id"],"parent_table":"nodes","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent_id":{"type":"integer"}},"additionalProperties":false}}}}
     ;
@@ -11927,7 +11941,13 @@ fn exerciseStandaloneFkPublicationMode(ordinary: bool, truncate_after: bool) !vo
             metadata.data_server = &server;
             try std.testing.expect(metadata.localFkPublicationSupported());
             opened = true;
-            if (ordinary) try server.initApiServer();
+            if (ordinary) {
+                try server.initApiServer();
+                // A fresh http_server starts with its background scheduler
+                // unpaused; re-pause before the generation-publication round
+                // loop below single-steps it.
+                try antfly.public_api.ApiHttpServer.FkGenerationPublicationTestDriver.pauseBackground(&server.http_server.?, io);
+            }
         }
     }
     try std.testing.expectEqual(@as(usize, 4), receipts);
@@ -11984,6 +12004,9 @@ fn exerciseStandaloneFkPublicationMode(ordinary: bool, truncate_after: bool) !vo
                 metadata.data_server = &server;
                 opened = true;
                 try server.initApiServer();
+                // Re-pause the fresh http_server's background scheduler; see
+                // the comment at the earlier initApiServer() calls above.
+                try antfly.public_api.ApiHttpServer.FkGenerationPublicationTestDriver.pauseBackground(&server.http_server.?, io);
             }
         }
         const published = (try metadata.resolveSystemCatalogLocked(.{ .table = "nodes" })).?;
