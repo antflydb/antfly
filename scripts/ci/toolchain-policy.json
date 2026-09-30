@@ -6,7 +6,7 @@
     "ruffTarget": "py311"
   },
   "go": {
-    "version": "1.26.4"
+    "version": "1.27.1"
   },
   "npm": {
     "version": "11.19.1"
