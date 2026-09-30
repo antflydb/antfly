@@ -329,7 +329,14 @@ const assets_replay_cursor_scope = scope_name ++ ".assets";
 const dense_replay_cursor_scope = scope_name ++ ".dense";
 const writer_locked_retry_count: usize = 1000;
 const writer_locked_retry_sleep_ns: u64 = 100_000;
-const generated_replay_default_window_items: usize = 2048;
+/// Matches `generated_preparation_default_window_items` below: a backlog
+/// smaller than one window previously published nothing until the window
+/// fully drained, making a healthy small-to-medium backlog (most interactive
+/// workloads) look frozen for as long as it takes to work through it.
+/// `ANTFLY_ENRICHMENT_WINDOW_ITEMS` remains available to raise this back up
+/// for throughput-sensitive deployments that would rather amortize publish
+/// overhead over a larger window.
+const generated_replay_default_window_items: usize = 64;
 /// Bound source preparation independently from the larger derived-record
 /// publication window. Preparing an entire corpus before the first provider
 /// batch delays queryability after restart and retains one request plan and

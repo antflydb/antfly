@@ -132,6 +132,14 @@ boundary once 64 deferred provider requests have been queued, executes full
 provider batches, publishes that partial output
 durably, and releases the request/chunk caches before inspecting more source
 documents. `ANTFLY_ENRICHMENT_PREPARATION_WINDOW_ITEMS` can tune this quantum.
+
+The derived-record publication window itself defaults to 64 items
+(`ANTFLY_ENRICHMENT_WINDOW_ITEMS`), matching the preparation quantum above, so
+status (`total_indexed`, coverage) advances within a few seconds instead of
+only at the end of one large window. Raise it for throughput-sensitive
+deployments that would rather amortize publish overhead over a larger batch
+of derived records; the total time to drain a given backlog is unaffected by
+this knob, only how often progress becomes visible while draining it.
 Deferred asset work retains lightweight request references, not materialized
 documents or provider payloads. The execution lane materializes compatible
 batches bounded by both item count and retained bytes (including raw documents,

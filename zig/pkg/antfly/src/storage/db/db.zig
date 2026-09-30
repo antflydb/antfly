@@ -11649,6 +11649,24 @@ pub const DB = struct {
         };
         defer if (preprepared_generated) |*generated| generated.deinit(preparation_alloc);
         defer if (preprepared_generated_plan) |*plan| plan.deinit();
+        // Document-mode analogue of the relational hoist below: extraction and
+        // generated-enrichment precompute (asset/chunk/embedding requests) run
+        // here, before the exclusive apply lock, instead of unconditionally
+        // in-lock. `preprepared_document_generated` is reused under the lock
+        // only if the catalog generation this precompute observed is still
+        // current (`document_generated_write_plan_generation`) and this
+        // batch's own write keys have not been touched by another commit
+        // since (`generated_precompute_snapshot`, validated unconditionally
+        // alongside `transform_snapshot` below). Either check failing forces
+        // `PreparedGenerationChanged`/`PreparedReadSetChanged`, which the
+        // existing bounded retry in `batchInternalWithPreparationAllocator`
+        // already handles by recomputing from a fresh snapshot -- never by
+        // silently reusing stale precompute.
+        var preprepared_document_generated: ?PrecomputedGeneratedBatch = null;
+        defer if (preprepared_document_generated) |*generated| generated.deinit(preparation_alloc);
+        var document_generated_write_plan_generation: ?u64 = null;
+        var generated_precompute_snapshot: TransformReadSnapshot = .{};
+        defer generated_precompute_snapshot.deinit(preparation_alloc);
         if (request_schema_view) |view| if (view.storageMode() == .relational) {
             var stable_keys = std.StringHashMapUnmanaged(void).empty;
             defer stable_keys.deinit(preparation_alloc);
@@ -11815,6 +11833,63 @@ pub const DB = struct {
                 }
             }
         };
+        // Document-mode tables have no `PreparedRelationalWrite`/write-plan
+        // row encoding to hoist, but generated-enrichment precompute (asset
+        // extraction, chunking, embedding) for `.enrichments`/`.full_index`/
+        // `.full_text` sync levels is exactly as safe to run before the lock:
+        // it only needs this write's own submitted value, the enrichment
+        // catalog, and a handful of read-only store lookups (existing
+        // asset/chunk state used to skip unchanged work). The catalog-epoch
+        // and per-key version guards below make stale precompute retry
+        // instead of silently committing.
+        if (!(if (request_schema_view) |view| view.storageMode() == .relational else false)) {
+            const requires_inline_generated =
+                (effective_req.sync_level == .full_text or effective_req.sync_level == .enrichments or effective_req.sync_level == .full_index) or
+                splitShadowRequiresMaterializedDerivedBatch(self);
+            if (requires_inline_generated and effective_req.writes.len > 0) {
+                const precompute_generated_start_ns = monotonicTimeNs();
+                generated_precompute_snapshot = try self.captureWriteKeyVersionSnapshot(preparation_alloc, effective_req.writes);
+                // Pinned before prepareGeneratedEnrichments runs (which may
+                // take slightly longer than this read), so any catalog
+                // publication racing with this precompute is also caught as
+                // a generation change under the lock, never silently used.
+                document_generated_write_plan_generation = self.core.index_manager.writePlanGeneration();
+                const extracted_rows = try preparation_alloc.alloc(mapper.ExtractedWrite, effective_req.writes.len);
+                var extracted_rows_initialized: usize = 0;
+                defer {
+                    for (extracted_rows[0..extracted_rows_initialized]) |*item| item.deinit(preparation_alloc);
+                    preparation_alloc.free(extracted_rows);
+                }
+                for (effective_req.writes, 0..) |write, i| {
+                    if (isMetadataKey(write.key)) {
+                        extracted_rows[i] = .{
+                            .cleaned_value = null,
+                            .graph_writes = &.{},
+                            .mentioned_graph_indexes = &.{},
+                            .dense_embeddings = &.{},
+                            .sparse_embeddings = &.{},
+                        };
+                        extracted_rows_initialized += 1;
+                        continue;
+                    }
+                    extracted_rows[i] = try mapper.extractWrite(preparation_alloc, write.key, write.value);
+                    extracted_rows_initialized += 1;
+                    try augmentExtractedWriteWithGraphFieldEdges(self, preparation_alloc, write.key, write.value, &extracted_rows[i]);
+                    try self.core.index_manager.appendIndexFieldEmbeddingsToExtractedWrite(preparation_alloc, write.key, write.value, &extracted_rows[i]);
+                }
+                preprepared_document_generated = try prepareGeneratedEnrichments(
+                    self,
+                    preparation_alloc,
+                    effective_req,
+                    extracted_rows[0..extracted_rows_initialized],
+                    generatedPrecomputeModeForSyncLevel(effective_req.sync_level),
+                    opts.force_generated_artifact_names,
+                    null,
+                    generated_memo,
+                );
+                if (profile) |active_profile| recordProfileNs(profile, &active_profile.precompute_generated_ns, precompute_generated_start_ns);
+            }
+        }
 
         // HA encoding is a pure function of the admitted request and can be
         // proportional to the entire batch. Prepare it before the serialized
@@ -12212,6 +12287,14 @@ pub const DB = struct {
         // request from a freshly pinned immutable schema/catalog generation.
         if (preprepared_rows != null and !use_preprepared_rows)
             return error.PreparedGenerationChanged;
+        // Same fence for document-mode's pre-lock generated-enrichment
+        // precompute: a catalog publication (new/changed enrichment, index)
+        // between the pre-lock read and this lock acquisition invalidates it.
+        const use_preprepared_document_generated = preprepared_document_generated != null and
+            document_generated_write_plan_generation != null and
+            self.core.index_manager.writePlanGeneration() == document_generated_write_plan_generation.?;
+        if (preprepared_document_generated != null and !use_preprepared_document_generated)
+            return error.PreparedGenerationChanged;
         // Transform expansion or an epoch/index-plan race invalidates the
         // speculative rows. Pin the currently published epoch once for the
         // serialized fallback; AROW v2 never encodes without its compiled
@@ -12254,6 +12337,13 @@ pub const DB = struct {
             try self.core.checkOrdinaryWriteConflicts(effective_ops.writes, effective_ops.deletes);
         }
         try self.validateTransformReadSnapshot(transform_snapshot);
+        // Catches a concurrent commit to one of this batch's own write keys
+        // between the pre-lock precompute read and this lock acquisition --
+        // the race the catalog-generation check above cannot see, since it
+        // only tracks schema/enrichment catalog changes, not per-document
+        // data changes. use_preprepared_document_generated already forced a
+        // retry on a stale catalog; this call does the same for a stale key.
+        if (use_preprepared_document_generated) try self.validateTransformReadSnapshot(generated_precompute_snapshot);
 
         if (effective_req.predicates.len > 0) {
             const predicates_start_ns = monotonicTimeNs();
@@ -12932,6 +13022,17 @@ pub const DB = struct {
 
         var precomputed_generated: PrecomputedGeneratedBatch = .{};
         defer precomputed_generated.deinit(preparation_alloc);
+        // Whether this batch's own rows needed nothing further from the
+        // enrichment runtime: every generated-enrichment request for them was
+        // precomputed and folded into store_writes above, under this same
+        // apply-lock hold. Set after the precompute block below, before
+        // precomputed_generated.generated_enrichment_refs is transferred into
+        // materialized_derived_batch (which zeroes it). A sync_level
+        // .enrichments write with this true does not owe the enrichment
+        // runtime anything from its own commit, so it can skip waiting on the
+        // table-wide applied watermark below -- unrelated backlog queued
+        // ahead of this write's sequence is not this write's debt to drain.
+        var enrichment_fully_precomputed = false;
         var remote_child_range_dispatches = std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup).empty;
         defer {
             for (remote_child_range_dispatches.items) |*dispatch| dispatch.deinit(preparation_alloc);
@@ -12952,6 +13053,9 @@ pub const DB = struct {
             if (use_preprepared_rows and preprepared_generated != null) {
                 precomputed_generated = preprepared_generated.?;
                 preprepared_generated = null;
+            } else if (use_preprepared_document_generated) {
+                precomputed_generated = preprepared_document_generated.?;
+                preprepared_document_generated = null;
             } else {
                 precomputed_generated = try prepareGeneratedEnrichments(
                     self,
@@ -12983,6 +13087,8 @@ pub const DB = struct {
                 }
             }
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.precompute_generated_ns, precompute_generated_start_ns);
+            enrichment_fully_precomputed = effective_req.sync_level == .enrichments and
+                precomputed_generated.generated_enrichment_refs.len == 0;
         }
         if (req.merge_artifacts.len > 0 or (if (req.merge_page) |page| page.artifact_effects.len != 0 else false) or explicit_embedding_artifact_writes.items.len > 0 or
             explicit_graph_artifact_writes.items.len > 0 or
@@ -13789,7 +13895,7 @@ pub const DB = struct {
         if (append_derived_replay and self.executor.hasWorkers()) {
             if (opts.wait_for_sync_level) {
                 const sync_wait_start_ns = monotonicTimeNs();
-                try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation);
+                try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation, enrichment_fully_precomputed);
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
             }
         } else if (append_derived_replay) {
@@ -13804,7 +13910,7 @@ pub const DB = struct {
             }
             if (opts.wait_for_sync_level) {
                 const sync_wait_start_ns = monotonicTimeNs();
-                try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation);
+                try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation, enrichment_fully_precomputed);
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
             }
         }
@@ -15207,6 +15313,56 @@ pub const DB = struct {
             };
             initialized += 1;
             result.positions.putAssumeCapacity(key, index);
+        }
+        result.entries = entries;
+        return result;
+    }
+
+    /// Read-set predicate for pre-lock generated-enrichment precompute
+    /// (document-mode `preprepared_document_generated` in
+    /// `batchInternalPrepared`). Unlike `captureTransformReadSnapshot`, this
+    /// captures every write key unconditionally and never fetches the prior
+    /// value: the precompute it guards only reads a key's existing
+    /// asset/chunk *state* to decide whether prior derived work is reusable,
+    /// never the prior document value itself, so a version-only predicate is
+    /// enough to detect "another commit touched this key since". Validated
+    /// through the same `validateTransformReadSnapshot` /
+    /// `PreparedReadSetChanged` path the transform-base snapshot already
+    /// uses, so a real race forces the existing bounded retry rather than a
+    /// silent stale reuse.
+    fn captureWriteKeyVersionSnapshot(
+        self: *DB,
+        alloc: Allocator,
+        writes: []const types.BatchWrite,
+    ) !TransformReadSnapshot {
+        var result = TransformReadSnapshot{};
+        errdefer result.deinit(alloc);
+        if (writes.len == 0) return result;
+
+        var read_txn = try self.core.store.beginReadTxn();
+        defer read_txn.abort();
+
+        const entries = try alloc.alloc(TransformReadSnapshot.Entry, writes.len);
+        errdefer alloc.free(entries);
+        try result.positions.ensureTotalCapacity(alloc, std.math.cast(u32, writes.len) orelse
+            return error.InvalidBatchRequest);
+        for (writes, 0..) |write, index| {
+            const expected_version = if (internal_keys.isInternalUserKey(write.key))
+                0
+            else blk: {
+                const timestamp_key = try makeTimestampKey(alloc, write.key);
+                defer alloc.free(timestamp_key);
+                const timestamp = read_txn.get(timestamp_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                break :blk if (timestamp) |bytes|
+                    if (bytes.len >= @sizeOf(u64)) std.mem.readInt(u64, bytes[0..8], .little) else 0
+                else
+                    0;
+            };
+            entries[index] = .{ .key = write.key, .value = null, .expected_version = expected_version };
+            result.positions.putAssumeCapacity(write.key, index);
         }
         result.entries = entries;
         return result;
@@ -36045,7 +36201,7 @@ pub const DB = struct {
         if (self.executor.hasWorkers()) {
             notifyExecutorForSyncLevelWithDenseBulkDeferral(self.async_context, self.executor, sync_level, sequence, sync_targets);
         }
-        try self.waitForSyncLevelWithCancellation(sync_level, sequence, sync_targets, cancellation);
+        try self.waitForSyncLevelWithCancellation(sync_level, sequence, sync_targets, cancellation, false);
     }
 
     fn waitForResolvedTransactionSync(self: *DB, sync_level: types.SyncLevel, sequence: u64) !void {
@@ -36066,7 +36222,7 @@ pub const DB = struct {
         }
         if (self.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
         self.notifyResolverReplayRuntimes(sequence);
-        try self.waitForSyncLevelWithCancellation(sync_level, sequence, sync_targets, cancellation);
+        try self.waitForSyncLevelWithCancellation(sync_level, sequence, sync_targets, cancellation, false);
         if (sync_level == .full_index and self.text_merge_runtime == null) {
             try self.drainScheduledTextMerges();
         }
@@ -40434,10 +40590,23 @@ pub const DB = struct {
     }
 
     fn waitForSyncLevel(self: *DB, sync_level: types.SyncLevel, sequence: u64, sync_targets: ManagedSyncTargets) !void {
-        try self.waitForSyncLevelWithCancellation(sync_level, sequence, sync_targets, .none);
+        try self.waitForSyncLevelWithCancellation(sync_level, sequence, sync_targets, .none, false);
     }
 
-    fn waitForSyncLevelWithCancellation(self: *DB, sync_level: types.SyncLevel, sequence: u64, sync_targets: ManagedSyncTargets, cancellation: types.CancellationToken) !void {
+    /// `skip_enrichment_runtime_wait` lets a caller that already knows this
+    /// commit's own rows needed nothing further from the enrichment runtime
+    /// (every generated-enrichment request for them was precomputed and
+    /// committed synchronously, see `enrichment_fully_precomputed` in
+    /// `batchInternalPrepared`) skip the `.enrichments` wait below. Without
+    /// it, a `sync_level: .enrichments` write blocks on
+    /// `applied_sequence >= sequence`, which is the whole table's enrichment
+    /// watermark: a tiny write queued behind an unrelated backlog would wait
+    /// for that backlog to drain even though it owes the runtime nothing.
+    /// This does not change `.full_text`/`.full_index` behavior (untouched
+    /// branches below) or the watermark-advance logic itself
+    /// (`markPrecomputedEnrichmentAppliedForSync` stays exactly as
+    /// conservative as before).
+    fn waitForSyncLevelWithCancellation(self: *DB, sync_level: types.SyncLevel, sequence: u64, sync_targets: ManagedSyncTargets, cancellation: types.CancellationToken, skip_enrichment_runtime_wait: bool) !void {
         const timeout_ms = if (self.enrichment_runtime) |runtime|
             runtime.syncWaitTimeoutMs()
         else
@@ -40454,7 +40623,8 @@ pub const DB = struct {
             .propose, .write => try self.executor.failIfUnhealthy(),
             .enrichments => {
                 try self.executor.failIfUnhealthy();
-                try self.runEnrichmentUntilWithVisibilityDeadline(sequence, cancellation, deadline_ns);
+                if (!skip_enrichment_runtime_wait)
+                    try self.runEnrichmentUntilWithVisibilityDeadline(sequence, cancellation, deadline_ns);
             },
             .full_text => {
                 try self.runDerivedUntilTargetsWithVisibilityWait(sequence, sync_targets.full_text_indexes, wait);
@@ -54435,6 +54605,229 @@ fn documentUnitChunkEmbeddingArtifactsPresent(
     return true;
 }
 
+/// One provider-embedding enrichment (a `kind == .embedding` entry) consuming
+/// chunks from a document unit's chunker, accumulated across the whole unit
+/// so the provider is called in batches honoring generatedEmbedBatchItems()/
+/// generatedEmbedBatchBytes() instead of once per chunk. Mirrors the batching
+/// the generic chunk-embedding path (computeDenseRequestImpl) already does
+/// for non-document-extraction chunk/embedding enrichments.
+const PendingDocumentUnitDenseChunkEmbedding = struct {
+    embedding_name: []const u8,
+    source_field: []const u8,
+    expected_dims: u32,
+    producer_json: []const u8,
+    consumer_indexes: [][]u8,
+    sources: std.ArrayListUnmanaged(ChunkEmbeddingSource) = .empty,
+    chunk_texts: std.ArrayListUnmanaged([]const u8) = .empty,
+    source_indexes: std.ArrayListUnmanaged(usize) = .empty,
+    batch_source_bytes: usize = 0,
+
+    fn deinit(self: *PendingDocumentUnitDenseChunkEmbedding, alloc: Allocator) void {
+        clearChunkEmbeddingSourceList(alloc, &self.sources);
+        self.sources.deinit(alloc);
+        self.chunk_texts.deinit(alloc);
+        self.source_indexes.deinit(alloc);
+        for (self.consumer_indexes) |name| alloc.free(name);
+        alloc.free(self.consumer_indexes);
+    }
+};
+
+const PendingDocumentUnitSparseChunkEmbedding = struct {
+    embedding_name: []const u8,
+    producer_json: []const u8,
+    consumer_indexes: [][]u8,
+    sources: std.ArrayListUnmanaged(ChunkEmbeddingSource) = .empty,
+    chunk_texts: std.ArrayListUnmanaged([]const u8) = .empty,
+    source_indexes: std.ArrayListUnmanaged(usize) = .empty,
+    batch_source_bytes: usize = 0,
+
+    fn deinit(self: *PendingDocumentUnitSparseChunkEmbedding, alloc: Allocator) void {
+        clearChunkEmbeddingSourceList(alloc, &self.sources);
+        self.sources.deinit(alloc);
+        self.chunk_texts.deinit(alloc);
+        self.source_indexes.deinit(alloc);
+        for (self.consumer_indexes) |name| alloc.free(name);
+        alloc.free(self.consumer_indexes);
+    }
+};
+
+fn collectPendingDocumentUnitDenseChunkEmbeddings(
+    alloc: Allocator,
+    db: *DB,
+    chunk_artifact_name: []const u8,
+    out: *std.ArrayListUnmanaged(PendingDocumentUnitDenseChunkEmbedding),
+) !void {
+    const runtime = db.enrichment_runtime orelse return;
+    const dense_embedder = runtime.config.dense_embedder;
+    if (dense_embedder == null) return;
+    for (db.core.index_manager.enrichments.items) |embed_entry| {
+        if (embed_entry.kind != .embedding) continue;
+        if (!std.mem.eql(u8, embed_entry.source_artifact_name, chunk_artifact_name)) continue;
+        if (embed_entry.expected_dims == 0) continue;
+
+        const consumer_indexes = try db.core.index_manager.denseIndexesForEmbedding(alloc, embed_entry.name, embed_entry.expected_dims);
+        if (consumer_indexes.len == 0) {
+            alloc.free(consumer_indexes);
+            continue;
+        }
+        try out.append(alloc, .{
+            .embedding_name = embed_entry.name,
+            .source_field = embed_entry.source_field,
+            .expected_dims = embed_entry.expected_dims,
+            .producer_json = embed_entry.producer_json,
+            .consumer_indexes = consumer_indexes,
+        });
+    }
+}
+
+fn collectPendingDocumentUnitSparseChunkEmbeddings(
+    alloc: Allocator,
+    db: *DB,
+    chunk_artifact_name: []const u8,
+    out: *std.ArrayListUnmanaged(PendingDocumentUnitSparseChunkEmbedding),
+) !void {
+    const runtime = db.enrichment_runtime orelse return;
+    const sparse_embedder = runtime.config.sparse_embedder;
+    if (sparse_embedder == null) return;
+    for (db.core.index_manager.enrichments.items) |embed_entry| {
+        if (embed_entry.kind != .embedding) continue;
+        if (!std.mem.eql(u8, embed_entry.source_artifact_name, chunk_artifact_name)) continue;
+        if (embed_entry.expected_dims != 0) continue;
+
+        const consumer_indexes = try db.core.index_manager.sparseIndexesForEmbedding(alloc, embed_entry.name);
+        if (consumer_indexes.len == 0) {
+            alloc.free(consumer_indexes);
+            continue;
+        }
+        try out.append(alloc, .{
+            .embedding_name = embed_entry.name,
+            .producer_json = embed_entry.producer_json,
+            .consumer_indexes = consumer_indexes,
+        });
+    }
+}
+
+fn appendChunkToPendingDenseChunkEmbedding(
+    alloc: Allocator,
+    runtime: *enrichment_runtime_mod.EnrichmentRuntime,
+    dense_embedder: embedder_mod.DenseEmbedder,
+    doc_key: []const u8,
+    chunk_key: []const u8,
+    chunk_text: []const u8,
+    pending: *PendingDocumentUnitDenseChunkEmbedding,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
+) !void {
+    const max_batch_items = generatedEmbedBatchItems();
+    const max_batch_bytes = generatedEmbedBatchBytes();
+    if (pending.chunk_texts.items.len > 0 and
+        (pending.chunk_texts.items.len >= max_batch_items or pending.batch_source_bytes + chunk_text.len > max_batch_bytes))
+    {
+        try flushPendingDenseChunkEmbedding(alloc, runtime, dense_embedder, doc_key, pending, artifact_writes, dense_embeddings);
+    }
+    const source_index = pending.sources.items.len;
+    try pending.sources.append(alloc, .{
+        .key = try alloc.dupe(u8, chunk_key),
+        .text = try alloc.dupe(u8, chunk_text),
+    });
+    try pending.chunk_texts.append(alloc, pending.sources.items[source_index].text);
+    try pending.source_indexes.append(alloc, source_index);
+    pending.batch_source_bytes += chunk_text.len;
+    if (pending.chunk_texts.items.len >= max_batch_items or pending.batch_source_bytes >= max_batch_bytes) {
+        try flushPendingDenseChunkEmbedding(alloc, runtime, dense_embedder, doc_key, pending, artifact_writes, dense_embeddings);
+    }
+}
+
+fn flushPendingDenseChunkEmbedding(
+    alloc: Allocator,
+    runtime: *enrichment_runtime_mod.EnrichmentRuntime,
+    dense_embedder: embedder_mod.DenseEmbedder,
+    doc_key: []const u8,
+    pending: *PendingDocumentUnitDenseChunkEmbedding,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
+) !void {
+    if (pending.chunk_texts.items.len == 0) return;
+    const synthetic_request: enrichment_types.GeneratedEnrichmentRequest = .{
+        .kind = .dense_embedding,
+        .index_name = "",
+        .doc_key = doc_key,
+        .source_field = pending.source_field,
+        .expected_dims = pending.expected_dims,
+        .producer_json = pending.producer_json,
+    };
+    try flushGeneratedDenseChunkBatch(
+        alloc,
+        runtime,
+        dense_embedder,
+        pending.embedding_name,
+        synthetic_request,
+        artifact_writes,
+        dense_embeddings,
+        pending.sources.items,
+        &pending.source_indexes,
+        &pending.chunk_texts,
+        pending.consumer_indexes,
+        appendDerivedDenseEmbeddingForConsumers,
+    );
+    pending.batch_source_bytes = 0;
+}
+
+fn appendChunkToPendingSparseChunkEmbedding(
+    alloc: Allocator,
+    runtime: *enrichment_runtime_mod.EnrichmentRuntime,
+    sparse_embedder: embedder_mod.SparseEmbedder,
+    chunk_key: []const u8,
+    chunk_text: []const u8,
+    pending: *PendingDocumentUnitSparseChunkEmbedding,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
+) !void {
+    const max_batch_items = generatedEmbedBatchItems();
+    const max_batch_bytes = generatedEmbedBatchBytes();
+    if (pending.chunk_texts.items.len > 0 and
+        (pending.chunk_texts.items.len >= max_batch_items or pending.batch_source_bytes + chunk_text.len > max_batch_bytes))
+    {
+        try flushPendingSparseChunkEmbedding(alloc, runtime, sparse_embedder, pending, artifact_writes, sparse_embeddings);
+    }
+    const source_index = pending.sources.items.len;
+    try pending.sources.append(alloc, .{
+        .key = try alloc.dupe(u8, chunk_key),
+        .text = try alloc.dupe(u8, chunk_text),
+    });
+    try pending.chunk_texts.append(alloc, pending.sources.items[source_index].text);
+    try pending.source_indexes.append(alloc, source_index);
+    pending.batch_source_bytes += chunk_text.len;
+    if (pending.chunk_texts.items.len >= max_batch_items or pending.batch_source_bytes >= max_batch_bytes) {
+        try flushPendingSparseChunkEmbedding(alloc, runtime, sparse_embedder, pending, artifact_writes, sparse_embeddings);
+    }
+}
+
+fn flushPendingSparseChunkEmbedding(
+    alloc: Allocator,
+    runtime: *enrichment_runtime_mod.EnrichmentRuntime,
+    sparse_embedder: embedder_mod.SparseEmbedder,
+    pending: *PendingDocumentUnitSparseChunkEmbedding,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
+) !void {
+    if (pending.chunk_texts.items.len == 0) return;
+    try flushGeneratedSparseChunkBatch(
+        alloc,
+        runtime,
+        sparse_embedder,
+        pending.embedding_name,
+        pending.producer_json,
+        artifact_writes,
+        sparse_embeddings,
+        pending.sources.items,
+        &pending.source_indexes,
+        &pending.chunk_texts,
+        pending.consumer_indexes,
+    );
+    pending.batch_source_bytes = 0;
+}
+
 fn appendDocumentUnitChunkWrites(
     alloc: Allocator,
     db: *DB,
@@ -54469,6 +54862,27 @@ fn appendDocumentUnitChunkWrites(
             for (text_indexes) |name| alloc.free(name);
             alloc.free(text_indexes);
         }
+
+        // Resolve, once per chunk-producing entry rather than once per chunk,
+        // which embedding enrichments consume these chunks. The per-chunk
+        // loop below only appends chunk text to these accumulators; the
+        // provider is invoked in batches as thresholds are crossed and once
+        // more after the loop for any remainder.
+        var dense_pending = std.ArrayListUnmanaged(PendingDocumentUnitDenseChunkEmbedding).empty;
+        defer {
+            for (dense_pending.items) |*pending| pending.deinit(alloc);
+            dense_pending.deinit(alloc);
+        }
+        try collectPendingDocumentUnitDenseChunkEmbeddings(alloc, db, entry.name, &dense_pending);
+        var sparse_pending = std.ArrayListUnmanaged(PendingDocumentUnitSparseChunkEmbedding).empty;
+        defer {
+            for (sparse_pending.items) |*pending| pending.deinit(alloc);
+            sparse_pending.deinit(alloc);
+        }
+        try collectPendingDocumentUnitSparseChunkEmbeddings(alloc, db, entry.name, &sparse_pending);
+        const runtime = db.enrichment_runtime;
+        const dense_embedder = if (runtime) |rt| rt.config.dense_embedder else null;
+        const sparse_embedder = if (runtime) |rt| rt.config.sparse_embedder else null;
 
         var arena_state = std.heap.ArenaAllocator.init(alloc);
         defer arena_state.deinit();
@@ -54507,97 +54921,28 @@ fn appendDocumentUnitChunkWrites(
                 });
             }
 
-            try appendDocumentUnitChunkDenseEmbeddingWrites(alloc, db, doc_key, chunk_key, entry.name, entry.source_field, chunk, artifact_writes, dense_embeddings);
-            try appendDocumentUnitChunkSparseEmbeddingWrites(alloc, db, chunk_key, entry.name, chunk, artifact_writes, sparse_embeddings);
+            if (chunk.text) |chunk_text| {
+                if (dense_embedder) |embedder| {
+                    for (dense_pending.items) |*pending| {
+                        try appendChunkToPendingDenseChunkEmbedding(alloc, runtime.?, embedder, doc_key, chunk_key, chunk_text, pending, artifact_writes, dense_embeddings);
+                    }
+                }
+                if (sparse_embedder) |embedder| {
+                    for (sparse_pending.items) |*pending| {
+                        try appendChunkToPendingSparseChunkEmbedding(alloc, runtime.?, embedder, chunk_key, chunk_text, pending, artifact_writes, sparse_embeddings);
+                    }
+                }
+            }
 
             _ = arena_state.reset(.retain_capacity);
         }
-    }
-}
 
-fn appendDocumentUnitChunkDenseEmbeddingWrites(
-    alloc: Allocator,
-    db: *DB,
-    doc_key: []const u8,
-    chunk_key: []const u8,
-    chunk_artifact_name: []const u8,
-    source_field: []const u8,
-    chunk: chunker_mod.Chunk,
-    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
-    dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
-) !void {
-    const chunk_text = chunk.text orelse return;
-    const runtime = db.enrichment_runtime orelse return;
-    const dense_embedder = runtime.config.dense_embedder orelse return;
-
-    for (db.core.index_manager.enrichments.items) |entry| {
-        if (entry.kind != .embedding) continue;
-        if (!std.mem.eql(u8, entry.source_artifact_name, chunk_artifact_name)) continue;
-        if (entry.expected_dims == 0) continue;
-
-        const consumer_indexes = try db.core.index_manager.denseIndexesForEmbedding(alloc, entry.name, entry.expected_dims);
-        defer {
-            for (consumer_indexes) |name| alloc.free(name);
-            alloc.free(consumer_indexes);
+        for (dense_pending.items) |*pending| {
+            try flushPendingDenseChunkEmbedding(alloc, runtime.?, dense_embedder.?, doc_key, pending, artifact_writes, dense_embeddings);
         }
-        if (consumer_indexes.len == 0) continue;
-
-        const vector = try enrichment_runtime_mod.embedDenseTracked(runtime, consumer_indexes, alloc, dense_embedder, entry.name, chunk_text, entry.expected_dims);
-        defer alloc.free(vector);
-        const artifact_key = try appendEmbeddingArtifactWrite(
-            alloc,
-            artifact_writes,
-            chunk_key,
-            doc_key,
-            entry.name,
-            source_field,
-            chunk_key,
-            .{ .generated = enrichment_artifact_codec.hashSource(chunk_text) },
-            vector,
-        );
-        defer alloc.free(artifact_key);
-        try appendDerivedDenseEmbeddingForConsumers(alloc, dense_embeddings, chunk_key, doc_key, artifact_key, vector, consumer_indexes);
-    }
-}
-
-fn appendDocumentUnitChunkSparseEmbeddingWrites(
-    alloc: Allocator,
-    db: *DB,
-    chunk_key: []const u8,
-    chunk_artifact_name: []const u8,
-    chunk: chunker_mod.Chunk,
-    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
-    sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
-) !void {
-    const chunk_text = chunk.text orelse return;
-    const runtime = db.enrichment_runtime orelse return;
-    const sparse_embedder = runtime.config.sparse_embedder orelse return;
-
-    for (db.core.index_manager.enrichments.items) |entry| {
-        if (entry.kind != .embedding) continue;
-        if (!std.mem.eql(u8, entry.source_artifact_name, chunk_artifact_name)) continue;
-        if (entry.expected_dims != 0) continue;
-
-        const consumer_indexes = try db.core.index_manager.sparseIndexesForEmbedding(alloc, entry.name);
-        defer {
-            for (consumer_indexes) |name| alloc.free(name);
-            alloc.free(consumer_indexes);
+        for (sparse_pending.items) |*pending| {
+            try flushPendingSparseChunkEmbedding(alloc, runtime.?, sparse_embedder.?, pending, artifact_writes, sparse_embeddings);
         }
-        if (consumer_indexes.len == 0) continue;
-
-        var sparse = try enrichment_runtime_mod.embedSparseTracked(runtime, consumer_indexes, alloc, sparse_embedder, entry.name, chunk_text);
-        defer sparse.deinit(alloc);
-        const artifact_key = try appendSparseEmbeddingArtifactWrite(
-            alloc,
-            artifact_writes,
-            chunk_key,
-            entry.name,
-            .{ .generated = enrichment_artifact_codec.hashSource(chunk_text) },
-            sparse.indices,
-            sparse.values,
-        );
-        defer alloc.free(artifact_key);
-        try appendDerivedSparseEmbeddingForConsumers(alloc, sparse_embeddings, chunk_key, artifact_key, sparse.indices, sparse.values, consumer_indexes);
     }
 }
 
@@ -105219,6 +105564,416 @@ test "db document extraction chunks units through source artifact enrichment" {
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, dense_artifact_key));
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, sparse_artifact_key));
     try std.testing.expectEqual(@as(u64, 0), db.core.index_manager.denseIndex("document_vectors").?.index.metadata.active_count);
+}
+
+test "db sync_level enrichments precompute for document-mode writes does not hold the apply lock" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var slow_asset = SlowGatedAssetProducer{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = slow_asset.interface(),
+            .inline_retry_max_attempts = 1,
+        },
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    defer slow_asset.allow();
+
+    try db.addEnrichment(.{
+        .name = "summary_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+    });
+
+    const Writer = struct {
+        db: *DB,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.db.batch(.{
+                .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha summary source\"}" }},
+                .sync_level = .enrichments,
+            }) catch |err| {
+                self.err = err;
+            };
+        }
+    };
+    var writer = Writer{ .db = &db };
+    const writer_thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});
+    var joined = false;
+    defer if (!joined) {
+        slow_asset.allow();
+        writer_thread.join();
+    };
+
+    // Wait until the asset producer is actually invoked: this batch's
+    // generated-enrichment precompute is in flight, ahead of the apply lock.
+    var attempts: usize = 0;
+    while (attempts < slow_test_wait_attempts) : (attempts += 1) {
+        if (slow_asset.started.load(.acquire)) break;
+        sleepPollInterval();
+    }
+    try std.testing.expect(slow_asset.started.load(.acquire));
+    try std.testing.expect(!slow_asset.finished.load(.acquire));
+
+    // A concurrent reader must not queue behind the in-flight precompute.
+    // Before this fix, sync_level: .enrichments precompute for document-mode
+    // writes ran entirely under the exclusive apply lock, so this probe
+    // (which only takes the shared apply lock) would have blocked for as
+    // long as the asset producer stayed parked.
+    const probe_start_ns = monotonicTimeNs();
+    _ = db.lsmMaintenanceScore();
+    const probe_elapsed_ns = monotonicTimeNs() - probe_start_ns;
+    try std.testing.expect(!slow_asset.finished.load(.acquire));
+    try std.testing.expect(probe_elapsed_ns < 500 * std.time.ns_per_ms);
+
+    slow_asset.allow();
+    writer_thread.join();
+    joined = true;
+    try std.testing.expectEqual(@as(?anyerror, null), writer.err);
+
+    const artifact_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "summary_v1");
+    defer alloc.free(artifact_key);
+    const artifact_value = try db.core.store.get(alloc, artifact_key);
+    defer alloc.free(artifact_value);
+    try std.testing.expectEqualStrings("asset:alpha summary source", artifact_value);
+}
+
+test "db document extraction concurrent same-key writes converge without stale precompute" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
+    var deterministic_sparse = embedder_mod.DeterministicSparseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic_dense.interface(),
+            .sparse_embedder = deterministic_sparse.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 256,
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunk_dense_v1",
+        .kind = .embedding,
+        .field = "text",
+        .source_artifact_name = "document_chunks_v1",
+        .expected_dims = 3,
+    });
+    try db.addIndex(.{
+        .name = "document_vectors",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}",
+    });
+
+    var hook = PortableRuntimeBatchPrelockTestHook{};
+    test_portable_runtime_batch_prelock_hook = &hook;
+    defer test_portable_runtime_batch_prelock_hook = null;
+
+    // doc:a does not exist yet: thread_a's pre-lock precompute (hoisted by
+    // this change) reads that absence and plans a from_generation: 0 commit,
+    // then parks at the prelock test hook, just before the apply lock.
+    const Writer = struct {
+        db: *DB,
+        value: []const u8,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.db.batch(.{
+                .writes = &.{.{ .key = "doc:a", .value = self.value }},
+                .sync_level = .enrichments,
+            }) catch |err| {
+                self.err = err;
+            };
+        }
+    };
+    var writer_a = Writer{
+        .db = &db,
+        .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\",\"text\":\"decoy\"}",
+    };
+    const thread_a = try std.Thread.spawn(.{}, Writer.run, .{&writer_a});
+    var joined_a = false;
+    defer if (!joined_a) {
+        hook.release.store(true, .release);
+        thread_a.join();
+    };
+
+    const prelock_deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
+    while (!hook.entered.load(.acquire) and monotonicTimeNs() < prelock_deadline) {
+        @import("antfly_platform").time.yieldNow();
+    }
+    try std.testing.expect(hook.entered.load(.acquire));
+
+    // Commit different content for the same key while thread_a is parked.
+    // Clear the hook first so this write is not itself gated by it.
+    test_portable_runtime_batch_prelock_hook = null;
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YmV0YSBnYW1tYSBkZWx0YQ==\",\"text\":\"decoy\"}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    // Release thread_a. Its stale pre-lock precompute (built against a
+    // nonexistent prior document) must be detected and retried against the
+    // now-current state, not silently committed on top of it -- which would
+    // either corrupt the generation counter or leave orphaned chunk/embedding
+    // artifacts from the intermediate commit.
+    hook.release.store(true, .release);
+    thread_a.join();
+    joined_a = true;
+    try std.testing.expectEqual(@as(?anyerror, null), writer_a.err);
+
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "document_units_v1");
+    defer alloc.free(manifest_key);
+    const manifest = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"generation\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"from_generation\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"to_generation\":2") != null);
+
+    const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "document_chunks_v1");
+    defer alloc.free(chunk_prefix);
+    const chunk_entries = try db.core.store.scanPrefix(alloc, chunk_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, chunk_entries);
+    var chunk_count: usize = 0;
+    var last_chunk_payload: []const u8 = "";
+    for (chunk_entries) |entry| if (internal_keys.isChunkArtifactRecordKey(entry.key)) {
+        chunk_count += 1;
+        last_chunk_payload = entry.value;
+    };
+    // Exactly one surviving chunk, matching thread_a's final ("alpha beta
+    // gamma") content -- no orphaned chunk from the intermediate ("beta
+    // gamma delta") generation this write raced against.
+    try std.testing.expectEqual(@as(usize, 1), chunk_count);
+    try std.testing.expect(std.mem.indexOf(u8, last_chunk_payload, "alpha beta gamma") != null);
+}
+
+test "db document extraction unit chunks embed in provider batches, not per chunk" {
+    const alloc = std.testing.allocator;
+    const BatchProbe = struct {
+        deterministic: embedder_mod.DeterministicDenseEmbedder = .{},
+        batch_calls: usize = 0,
+        items: usize = 0,
+
+        fn embedDense(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn embedDenseBatch(
+            raw: *anyopaque,
+            batch_alloc: Allocator,
+            embedding_name: []const u8,
+            texts: []const []const u8,
+            dims: u32,
+        ) ![]const []const f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.batch_calls += 1;
+            self.items += texts.len;
+            const vectors = try batch_alloc.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (vectors[0..initialized]) |vector| batch_alloc.free(@constCast(vector));
+                batch_alloc.free(vectors);
+            }
+            for (texts, vectors) |text, *vector| {
+                vector.* = try embedder_mod.DeterministicDenseEmbedder.embedDense(
+                    &self.deterministic,
+                    batch_alloc,
+                    embedding_name,
+                    text,
+                    dims,
+                );
+                initialized += 1;
+            }
+            return vectors;
+        }
+
+        fn interface(self: *@This()) embedder_mod.DenseEmbedder {
+            return .{
+                .ptr = self,
+                .dense_embed_fn = embedDense,
+                .dense_embed_batch_fn = embedDenseBatch,
+                .deinit_fn = null,
+            };
+        }
+    };
+
+    const c = struct {
+        extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const batch_items_env = "ANTFLY_ENRICHMENT_EMBED_BATCH_ITEMS";
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(batch_items_env, "3", 1));
+    defer _ = c.unsetenv(batch_items_env);
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var probe = BatchProbe{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{ .owner_id = "worker-a", .dense_embedder = probe.interface() },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 256,
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunk_dense_v1",
+        .kind = .embedding,
+        .field = "text",
+        .source_artifact_name = "document_chunks_v1",
+        .expected_dims = 3,
+    });
+    try db.addIndex(.{
+        .name = "document_vectors",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}",
+    });
+
+    // ~2.5 KB of text, base64-encoded, so chunk_size: 256 produces well over
+    // one provider batch (batch items pinned to 3 above) from a single
+    // document_extraction unit.
+    const doc_value = "{\"url\":\"data:text/plain;base64," ++
+        "YWxwaGEgYmV0YSBnYW1tYSBkZWx0YSBlcHNpbG9uIHpldGEgZXRhIHRoZXRhIGlvdGEga2FwcGEgbGFtYmRhIG11IG51IHhpIG9taWNyb24gcGkgcmhvIHNpZ21hIHRhdSB1cHNpbG9uIHBoaSBjaGkgcHNpIG9tZWdhLiBhbHBoYSBiZXRhIGdhbW1hIGRlbHRhIGVwc2lsb24gemV0YSBldGEgdGhldGEgaW90YSBrYXBwYSBsYW1iZGEgbXUgbnUgeGkgb21pY3JvbiBwaSByaG8gc2lnbWEgdGF1IHVwc2lsb24gcGhpIGNoaSBwc2kgb21lZ2EuIGFscGhhIGJldGEgZ2FtbWEgZGVsdGEgZXBzaWxvbiB6ZXRhIGV0YSB0aGV0YSBpb3RhIGthcHBhIGxhbWJkYSBtdSBudSB4aSBvbWljcm9uIHBpIHJobyBzaWdtYSB0YXUgdXBzaWxvbiBwaGkgY2hpIHBzaSBvbWVnYS4gYWxwaGEgYmV0YSBnYW1tYSBkZWx0YSBlcHNpbG9uIHpldGEgZXRhIHRoZXRhIGlvdGEga2FwcGEgbGFtYmRhIG11IG51IHhpIG9taWNyb24gcGkgcmhvIHNpZ21hIHRhdSB1cHNpbG9uIHBoaSBjaGkgcHNpIG9tZWdhLiBhbHBoYSBiZXRhIGdhbW1hIGRlbHRhIGVwc2lsb24gemV0YSBldGEgdGhldGEgaW90YSBrYXBwYSBsYW1iZGEgbXUgbnUgeGkgb21pY3JvbiBwaSByaG8gc2lnbWEgdGF1IHVwc2lsb24gcGhpIGNoaSBwc2kgb21lZ2EuIGFscGhhIGJldGEgZ2FtbWEgZGVsdGEgZXBzaWxvbiB6ZXRhIGV0YSB0aGV0YSBpb3RhIGthcHBhIGxhbWJkYSBtdSBudSB4aSBvbWljcm9uIHBpIHJobyBzaWdtYSB0YXUgdXBzaWxvbiBwaGkgY2hpIHBzaSBvbWVnYS4gYWxwaGEgYmV0YSBnYW1tYSBkZWx0YSBlcHNpbG9uIHpldGEgZXRhIHRoZXRhIGlvdGEga2FwcGEgbGFtYmRhIG11IG51IHhpIG9taWNyb24gcGkgcmhvIHNpZ21hIHRhdSB1cHNpbG9uIHBoaSBjaGkgcHNpIG9tZWdhLiBhbHBoYSBiZXRhIGdhbW1hIGRlbHRhIGVwc2lsb24gemV0YSBldGEgdGhldGEgaW90YSBrYXBwYSBsYW1iZGEgbXUgbnUgeGkgb21pY3JvbiBwaSByaG8gc2lnbWEgdGF1IHVwc2lsb24gcGhpIGNoaSBwc2kgb21lZ2EuIGFscGhhIGJldGEgZ2FtbWEgZGVsdGEgZXBzaWxvbiB6ZXRhIGV0YSB0aGV0YSBpb3RhIGthcHBhIGxhbWJkYSBtdSBudSB4aSBvbWljcm9uIHBpIHJobyBzaWdtYSB0YXUgdXBzaWxvbiBwaGkgY2hpIHBzaSBvbWVnYS4gYWxwaGEgYmV0YSBnYW1tYSBkZWx0YSBlcHNpbG9uIHpldGEgZXRhIHRoZXRhIGlvdGEga2FwcGEgbGFtYmRhIG11IG51IHhpIG9taWNyb24gcGkgcmhvIHNpZ21hIHRhdSB1cHNpbG9uIHBoaSBjaGkgcHNpIG9tZWdhLiBhbHBoYSBiZXRhIGdhbW1hIGRlbHRhIGVwc2lsb24gemV0YSBldGEgdGhldGEgaW90YSBrYXBwYSBsYW1iZGEgbXUgbnUgeGkgb21pY3JvbiBwaSByaG8gc2lnbWEgdGF1IHVwc2lsb24gcGhpIGNoaSBwc2kgb21lZ2EuIGFscGhhIGJldGEgZ2FtbWEgZGVsdGEgZXBzaWxvbiB6ZXRhIGV0YSB0aGV0YSBpb3RhIGthcHBhIGxhbWJkYSBtdSBudSB4aSBvbWljcm9uIHBpIHJobyBzaWdtYSB0YXUgdXBzaWxvbiBwaGkgY2hpIHBzaSBvbWVnYS4gYWxwaGEgYmV0YSBnYW1tYSBkZWx0YSBlcHNpbG9uIHpldGEgZXRhIHRoZXRhIGlvdGEga2FwcGEgbGFtYmRhIG11IG51IHhpIG9taWNyb24gcGkgcmhvIHNpZ21hIHRhdSB1cHNpbG9uIHBoaSBjaGkgcHNpIG9tZWdhLiBhbHBoYSBiZXRhIGdhbW1hIGRlbHRhIGVwc2lsb24gemV0YSBldGEgdGhldGEgaW90YSBrYXBwYSBsYW1iZGEgbXUgbnUgeGkgb21pY3JvbiBwaSByaG8gc2lnbWEgdGF1IHVwc2lsb24gcGhpIGNoaSBwc2kgb21lZ2EuIGFscGhhIGJldGEgZ2FtbWEgZGVsdGEgZXBzaWxvbiB6ZXRhIGV0YSB0aGV0YSBpb3RhIGthcHBhIGxhbWJkYSBtdSBudSB4aSBvbWljcm9uIHBpIHJobyBzaWdtYSB0YXUgdXBzaWxvbiBwaGkgY2hpIHBzaSBvbWVnYS4gYWxwaGEgYmV0YSBnYW1tYSBkZWx0YSBlcHNpbG9uIHpldGEgZXRhIHRoZXRhIGlvdGEga2FwcGEgbGFtYmRhIG11IG51IHhpIG9taWNyb24gcGkgcmhvIHNpZ21hIHRhdSB1cHNpbG9uIHBoaSBjaGkgcHNpIG9tZWdhLiBhbHBoYSBiZXRhIGdhbW1hIGRlbHRhIGVwc2lsb24gemV0YSBldGEgdGhldGEgaW90YSBrYXBwYSBsYW1iZGEgbXUgbnUgeGkgb21pY3JvbiBwaSByaG8gc2lnbWEgdGF1IHVwc2lsb24gcGhpIGNoaSBwc2kgb21lZ2EuIGFscGhhIGJldGEgZ2FtbWEgZGVsdGEgZXBzaWxvbiB6ZXRhIGV0YSB0aGV0YSBpb3RhIGthcHBhIGxhbWJkYSBtdSBudSB4aSBvbWljcm9uIHBpIHJobyBzaWdtYSB0YXUgdXBzaWxvbiBwaGkgY2hpIHBzaSBvbWVnYS4gYWxwaGEgYmV0YSBnYW1tYSBkZWx0YSBlcHNpbG9uIHpldGEgZXRhIHRoZXRhIGlvdGEga2FwcGEgbGFtYmRhIG11IG51IHhpIG9taWNyb24gcGkgcmhvIHNpZ21hIHRhdSB1cHNpbG9uIHBoaSBjaGkgcHNpIG9tZWdhLiBhbHBoYSBiZXRhIGdhbW1hIGRlbHRhIGVwc2lsb24gemV0YSBldGEgdGhldGEgaW90YSBrYXBwYSBsYW1iZGEgbXUgbnUgeGkgb21pY3JvbiBwaSByaG8gc2lnbWEgdGF1IHVwc2lsb24gcGhpIGNoaSBwc2kgb21lZ2EuIGFscGhhIGJldGEgZ2FtbWEgZGVsdGEgZXBzaWxvbiB6ZXRhIGV0YSB0aGV0YSBpb3RhIGthcHBhIGxhbWJkYSBtdSBudSB4aSBvbWljcm9uIHBpIHJobyBzaWdtYSB0YXUgdXBzaWxvbiBwaGkgY2hpIHBzaSBvbWVnYS4g" ++
+        "\"}";
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = doc_value }},
+        .sync_level = .enrichments,
+    });
+
+    // Well more than one provider batch's worth of chunks, but far fewer
+    // batch calls than chunks: the old per-chunk path would have called the
+    // single-item embedDense (which always errors here) once per chunk.
+    try std.testing.expect(probe.items >= 8);
+    try std.testing.expect(probe.batch_calls < probe.items);
+    const max_batch_items = generatedEmbedBatchItems();
+    const expected_batch_calls = (probe.items + max_batch_items - 1) / max_batch_items;
+    try std.testing.expectEqual(expected_batch_calls, probe.batch_calls);
+
+    // Every chunk this document produced has its own derived dense embedding
+    // artifact -- batching the provider calls did not drop or misattribute
+    // any chunk's embedding.
+    const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "document_chunks_v1");
+    defer alloc.free(chunk_prefix);
+    const chunk_entries = try db.core.store.scanPrefix(alloc, chunk_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, chunk_entries);
+    var chunk_count: usize = 0;
+    for (chunk_entries) |entry| {
+        if (!internal_keys.isChunkArtifactRecordKey(entry.key)) continue;
+        chunk_count += 1;
+        const dense_artifact_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, entry.key, "document_chunk_dense_v1");
+        defer alloc.free(dense_artifact_key);
+        const dense_artifact_payload = try db.core.store.get(alloc, dense_artifact_key);
+        alloc.free(dense_artifact_payload);
+    }
+    try std.testing.expectEqual(probe.items, chunk_count);
+}
+
+test "db sync_level enrichments returns without waiting on an unrelated enrichment backlog" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var slow_asset = SlowGatedAssetProducer{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = slow_asset.interface(),
+            .inline_retry_max_attempts = 1,
+        },
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    defer slow_asset.allow();
+
+    try db.addEnrichment(.{
+        .name = "summary_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+    });
+
+    // sync_level: .write defers this document's asset enrichment to the
+    // background runtime, which picks it up and parks in the producer.
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:backlog", .value = "{\"body\":\"alpha summary source\"}" }},
+        .sync_level = .write,
+    });
+
+    var attempts: usize = 0;
+    while (attempts < slow_test_wait_attempts) : (attempts += 1) {
+        if (slow_asset.started.load(.acquire)) break;
+        sleepPollInterval();
+    }
+    try std.testing.expect(slow_asset.started.load(.acquire));
+    try std.testing.expect(!slow_asset.finished.load(.acquire));
+
+    // This row has no value in the enrichment's source field, so its own
+    // sync_level: .enrichments precompute needs nothing from the producer
+    // (generated_enrichment_refs stays empty) and must not wait for
+    // db.enrichment_runtime's applied_sequence to catch up to -- let alone
+    // past -- the backlogged "doc:backlog" commit still parked ahead of it.
+    const wait_start_ns = monotonicTimeNs();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:tiny", .value = "{\"other\":\"no body field\"}" }},
+        .sync_level = .enrichments,
+    });
+    const wait_elapsed_ns = monotonicTimeNs() - wait_start_ns;
+    try std.testing.expect(!slow_asset.finished.load(.acquire));
+    try std.testing.expect(wait_elapsed_ns < 5 * std.time.ns_per_s);
+
+    slow_asset.allow();
 }
 
 fn testLargeHtmlDataUrlAlloc(alloc: Allocator, version: []const u8, unique_token: []const u8, paragraph_count: usize) ![]u8 {
