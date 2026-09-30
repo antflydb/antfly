@@ -3281,7 +3281,9 @@ pub fn encodeQueryRequestWithGraphWireMode(
     }
     if (req.hierarchy_children != null or
         req.hierarchy_grouped_matches or
-        req.hierarchy_group_level == .unit)
+        req.hierarchy_group_level == .unit or
+        req.hierarchy_include_source or
+        req.hierarchy_include_unit)
     {
         try appendQueryHierarchyField(alloc, &out, &first, req);
     }
@@ -3820,19 +3822,34 @@ pub fn appendQueryHierarchyField(
         try appendJsonString(alloc, out, children.parent_id);
         try out.appendSlice(alloc, "},\"level\":\"unit\"}");
     } else {
-        try out.appendSlice(alloc, "\"group_by\":{\"level\":");
-        try appendJsonString(alloc, out, @tagName(req.hierarchy_group_level));
-        if (req.hierarchy_grouped_matches) {
-            try out.appendSlice(alloc, ",\"matches\":{");
-            try out.appendSlice(alloc, "\"limit\":");
-            try out.print(alloc, "{d}", .{req.max_chunks_per_parent});
-            try out.appendSlice(alloc, ",\"fields\":");
-            try appendJsonStringArray(alloc, out, req.hierarchy_match_fields);
+        // `group_by` is its own opt-in control (grouped matches, or explicit
+        // unit-level grouping); `ancestors` (hydrating a chunk hit's source/
+        // unit document, independent of any grouping) is a second, separate
+        // opt-in. Only emit each clause when the caller actually asked for
+        // it - unconditionally writing `group_by` here previously forced a
+        // stray `"group_by":{"level":"source"}` onto every ancestors-only
+        // request once this function started being called for that case
+        // too, which flips the reparsed request's return_mode from member to
+        // parent on the internal wire hop (issue #930).
+        const needs_group_by = req.hierarchy_grouped_matches or req.hierarchy_group_level == .unit;
+        var wrote_group_by = false;
+        if (needs_group_by) {
+            try out.appendSlice(alloc, "\"group_by\":{\"level\":");
+            try appendJsonString(alloc, out, @tagName(req.hierarchy_group_level));
+            if (req.hierarchy_grouped_matches) {
+                try out.appendSlice(alloc, ",\"matches\":{");
+                try out.appendSlice(alloc, "\"limit\":");
+                try out.print(alloc, "{d}", .{req.max_chunks_per_parent});
+                try out.appendSlice(alloc, ",\"fields\":");
+                try appendJsonStringArray(alloc, out, req.hierarchy_match_fields);
+                try out.append(alloc, '}');
+            }
             try out.append(alloc, '}');
+            wrote_group_by = true;
         }
-        try out.append(alloc, '}');
         if (req.hierarchy_include_source or req.hierarchy_include_unit) {
-            try out.appendSlice(alloc, ",\"ancestors\":{");
+            if (wrote_group_by) try out.append(alloc, ',');
+            try out.appendSlice(alloc, "\"ancestors\":{");
             var first_ancestor = true;
             if (req.hierarchy_include_source) {
                 try out.appendSlice(alloc, "\"source\":{\"fields\":");
