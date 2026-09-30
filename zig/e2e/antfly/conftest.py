@@ -1834,19 +1834,32 @@ class OpenAiEmbeddingServer:
         response_delay_s: float = 0.0,
         rate_limit_after_requests: int | None = None,
     ):
-        port = find_free_port()
-        self.url = f"http://{host}:{port}"
         self.response_delay_s = response_delay_s
         self.rate_limit_after_requests = rate_limit_after_requests
         self.rate_limit_input_substring: str | None = None
         self._request_count = 0
         self._request_lock = threading.Lock()
+        self._accepted_requests = 0
+        self._completed_requests = 0
+        self._active_requests: dict[int, float] = {}
         self._allow_rate_limited_requests = threading.Event()
 
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self) -> None:  # noqa: N802
+                with outer._request_lock:
+                    outer._accepted_requests += 1
+                    request_id = outer._accepted_requests
+                    outer._active_requests[request_id] = time.monotonic()
+                try:
+                    self._embedding_response()
+                finally:
+                    with outer._request_lock:
+                        outer._active_requests.pop(request_id, None)
+                        outer._completed_requests += 1
+
+            def _embedding_response(self) -> None:
                 if self.path != "/v1/embeddings":
                     self.send_error(404)
                     return
@@ -1927,7 +1940,8 @@ class OpenAiEmbeddingServer:
                 _ = format
                 _ = args
 
-        self._server = ThreadingHTTPServer((host, port), Handler)
+        self._server = ThreadingHTTPServer((host, 0), Handler)
+        self.url = f"http://{host}:{self._server.server_port}"
         self._thread = start_http_server(self._server)
         if not wait_for_listener(self.url):
             raise RuntimeError(f"OpenAI embedding server failed to start at {self.url}")
@@ -1958,6 +1972,20 @@ class OpenAiEmbeddingServer:
 
     def allow_rate_limited_requests(self) -> None:
         self._allow_rate_limited_requests.set()
+
+    def stats(self) -> dict[str, object]:
+        with self._request_lock:
+            now = time.monotonic()
+            return {
+                "accepted_requests": self._accepted_requests,
+                "decoded_requests": self._request_count,
+                "completed_requests": self._completed_requests,
+                "active_request_ages_s": [
+                    round(now - started, 3)
+                    for started in self._active_requests.values()
+                ],
+                "rate_limit_after_requests": self.rate_limit_after_requests,
+            }
 
     def stop(self) -> None:
         self.allow_rate_limited_requests()

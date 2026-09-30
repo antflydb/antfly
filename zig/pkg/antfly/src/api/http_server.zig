@@ -1399,6 +1399,9 @@ pub const ApiHttpServerConfig = struct {
     shard_ops: ?raft_mod.ShardOperationAdapter = null,
     shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
     routed_raft_batch_writer: ?internal_group_operations.RoutedRaftBatchWriter = null,
+    /// Borrowed metadata receipt/topology notification generation. It affects
+    /// only scheduling; every resumed owner operation revalidates its fences.
+    restore_owner_progress_generation: ?*const std.atomic.Value(u64) = null,
     restore_owner: ?@import("restore_owner.zig").Port = null,
     online_merge_io: ?@import("online_merge_io.zig").Port = null,
     secret_store: ?*common_secrets.FileStore = null,
@@ -3462,6 +3465,7 @@ pub const ApiHttpServer = struct {
     restore_job_owner_id: std.atomic.Value(u64) = .init(0),
     restore_retry_wakeup_in_flight: std.atomic.Value(bool) = .init(false),
     restore_retry_wakeup_generation: std.atomic.Value(u64) = .init(0),
+    observed_restore_owner_progress_generation: std.atomic.Value(u64) = .init(0),
     restore_retry_wakeup_event: std.Io.Event = .unset,
     restore_backoff_waiters: [max_concurrent_restore_jobs]?*std.Io.Event =
         .{null} ** max_concurrent_restore_jobs,
@@ -12169,6 +12173,9 @@ pub const ApiHttpServer = struct {
         const prepared = &retained_preparation.*.?;
         ensureTableOperationActive(request) catch |err| return if (err == error.DeadlineExceeded) error.PreDecisionDeadlineExceeded else err;
         try self.authorizeIntegrityMutations(request, prepared.tables);
+        if (request.relational_recovery == .none) {
+            integrity.rejectDefiniteConflicts(alloc, reader, snapshot.tables, snapshot.ranges, prepared.tables, preparation_request) catch |err| return integrity.preparationError(err);
+        }
         return source.commitBatchWithCancellation(alloc, prepared.tables, sync_level, request.cancellation);
     }
 
@@ -16238,7 +16245,8 @@ pub const ApiHttpServer = struct {
             return (self.server.restore_job_store.attemptState(self.server.alloc, self.restore.job_id, self.restore.attempt_id) catch return true) == .fenced;
         }
         fn context(self: *const @This()) api_operation.RequestContext {
-            return .{ .deadline_ns = platform_time.monotonicNs() + 30 * std.time.ns_per_s, .cancellation = .{ .ptr = self, .is_cancelled_fn = canceled } };
+            const io = self.server.sharedApiIo();
+            return .{ .deadline_ns = platform_time.monotonicNs() + 30 * std.time.ns_per_s, .cancellation = .{ .ptr = self, .is_cancelled_fn = canceled }, .fanout_io = if (io) |value| @import("../runtime_io_abi.zig").Borrow.init(&value) else null };
         }
     };
 
@@ -16355,29 +16363,24 @@ pub const ApiHttpServer = struct {
         const context = control.context();
         var phase = job.value.state;
         var owner_cursor: usize = if (worker_state.value.staging_owner_phase == @intFromEnum(phase)) worker_state.value.staging_owner_cursor else 0;
-        var saved_owner_cursor = owner_cursor;
-        var saved_owner_phase = phase;
+        const saved_owner_cursor = owner_cursor;
+        const saved_owner_phase = phase;
         var begun_group: ?u64 = null;
         var validation_session: ?*@import("restore_catalog.zig").ValidationSession = null;
         defer if (validation_session) |session| session.deinit();
         var slices: usize = 0;
         const work_slice_deadline = platform_time.monotonicNs() +| 250 * std.time.ns_per_ms;
         while (slices < 64) : (slices += 1) {
-            // Persist only verified prefix progress. The phase is that of the
-            // receipt, even if its final acknowledgement advanced metadata.
-            if (owner_cursor != saved_owner_cursor or phase != saved_owner_phase) {
-                const checkpoint = try self.restore_job_store.recordStagingOwner(self.alloc, restore.job_id, restore.attempt_id, @intFromEnum(phase), @intCast(owner_cursor));
-                self.alloc.free(checkpoint);
-                saved_owner_cursor = owner_cursor;
-                saved_owner_phase = phase;
+            // Scheduling cursors are recoverable from durable owner receipts.
+            // Save a verified prefix at the slice boundary, rather than adding
+            // a metadata commit after every independent owner operation.
+            if (slices != 0 and platform_time.monotonicNs() >= work_slice_deadline) {
+                if (owner_cursor != saved_owner_cursor or phase != saved_owner_phase) {
+                    const checkpoint = try self.restore_job_store.recordStagingOwner(self.alloc, restore.job_id, restore.attempt_id, @intFromEnum(phase), @intCast(owner_cursor));
+                    self.alloc.free(checkpoint);
+                }
+                return error.RestoreStagingYield;
             }
-            // All phases share the cooperative budget. Validation, cutover and
-            // owner publication also perform durable RPCs; a count-only bound
-            // can exhaust the request deadline and misclassify steady progress
-            // as a failed attempt (with exponential backoff). Check AFTER the
-            // acknowledged prefix is saved, and always allow one step so slow
-            // storage cannot starve a job. A single RPC retains its hard deadline.
-            if (slices != 0 and platform_time.monotonicNs() >= work_slice_deadline) return error.RestoreStagingYield;
             try context.ensureActive();
             const attempt_state = try self.restore_job_store.attemptState(self.alloc, restore.job_id, restore.attempt_id);
             if (attempt_state == .fenced) return error.RestoreJobFenced;
@@ -16400,6 +16403,21 @@ pub const ApiHttpServer = struct {
                 // not after every successful, durably checkpointed owner step.
                 if (driver.completedPendingPass(before, worker_state.value.rewrite_progress)) return error.RestoreStagingYield;
                 continue;
+            }
+            if (phase == .published) {
+                const published = self.publishRestoreOwnerWindow(job.value, owner_cursor, context) catch |err| {
+                    // A later failed receipt must not discard the completed
+                    // prefix of this slice. Replay only its unfinished window.
+                    if (owner_cursor != saved_owner_cursor or phase != saved_owner_phase) {
+                        const checkpoint = try self.restore_job_store.recordStagingOwner(self.alloc, restore.job_id, restore.attempt_id, @intFromEnum(phase), @intCast(owner_cursor));
+                        self.alloc.free(checkpoint);
+                    }
+                    return err;
+                };
+                if (published) |advanced| {
+                    owner_cursor += advanced;
+                    continue;
+                }
             }
             if (is_rewrite and phase == .canceling and job.value.plan.preparing_sources) {
                 // A pre-pin draft has no target owner to contact. Cancellation
@@ -16576,6 +16594,52 @@ pub const ApiHttpServer = struct {
             self.alloc.free(checkpoint);
         }
         return error.RestoreStagingYield;
+    }
+
+    /// Publication remains a cohort barrier. Only independent owner RPCs
+    /// overlap; completion is acknowledged after the entire wave is joined.
+    fn publishRestoreOwnerWindow(self: *ApiHttpServer, job: @import("../metadata/restore_staging.zig").Job, cursor: usize, context: api_operation.RequestContext) !?usize {
+        const stages = @import("../metadata/restore_staging.zig");
+        const owner_contract = @import("restore_owner_contract.zig");
+        const Slot = struct {
+            arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
+            target: stages.Target,
+            range: metadata_table_manager.RangeRecord,
+            failure: ?anyerror = null,
+            fn run(slot: *@This(), server: *ApiHttpServer, plan: stages.Plan, digest: [32]u8, control: api_operation.RequestContext) void {
+                slot.execute(server, plan, digest, control) catch |err| {
+                    slot.failure = err;
+                };
+            }
+            fn execute(slot: *@This(), server: *ApiHttpServer, plan: stages.Plan, digest: [32]u8, control: api_operation.RequestContext) !void {
+                const alloc = slot.arena.allocator();
+                const scope = try stages.ownerScope(alloc, plan, digest, slot.target, slot.range);
+                const response = try server.executeRestoreOwner(alloc, slot.target.table.name, slot.range.group_id, owner_contract.Request{ .scope = scope, .action = .publish }, control);
+                if (response.phase != .published) return error.RestoreStagingScopeChanged;
+            }
+        };
+        var slots: [4]Slot = undefined;
+        var count: usize = 0;
+        var ordinal: usize = 0;
+        const capability = context.fanout_io orelse context.deadline_io;
+        for (job.plan.targets) |target| for (target.ranges) |range| {
+            defer ordinal += 1;
+            if (ordinal < cursor or count == (if (capability != null) @as(usize, 4) else 1)) continue;
+            slots[count] = .{ .target = target, .range = range };
+            count += 1;
+        };
+        if (count == 0) return null;
+        defer for (slots[0..count]) |*slot| slot.arena.deinit();
+        if (capability) |borrow| {
+            var receiver = try borrow.receive();
+            const io = receiver.io();
+            var tasks: std.Io.Group = .init;
+            for (slots[0..count]) |*slot| tasks.async(io, Slot.run, .{ slot, self, job.plan, job.plan_digest, context });
+            tasks.await(io) catch return error.Cancelled;
+        } else Slot.run(&slots[0], self, job.plan, job.plan_digest, context);
+        try context.ensureActive();
+        for (slots[0..count]) |slot| if (slot.failure) |err| return err;
+        return count;
     }
 
     pub fn executeRestoreOwner(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("restore_owner.zig").Request, context: api_operation.RequestContext) !@import("restore_owner.zig").Response {
@@ -19804,6 +19868,13 @@ pub const ApiHttpServer = struct {
     /// not O(retained history). It retries transient dispatch failures without
     /// requiring another client request.
     pub fn pollRestoreJobsOnce(self: *ApiHttpServer) !void {
+        if (self.cfg.restore_owner_progress_generation) |generation| {
+            const current = generation.load(.acquire);
+            if (self.observed_restore_owner_progress_generation.swap(current, .acq_rel) != current) {
+                self.restore_job_store.wakeCooperativeContinuations();
+                self.signalRestoreRetryWakeup();
+            }
+        }
         try self.schedulePendingRestoreJobs();
         try self.ensureRestoreRetryWakeup();
     }

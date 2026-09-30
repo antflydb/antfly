@@ -16889,11 +16889,24 @@ pub const DataServer = struct {
         // Claim the work before collecting the report. A mutation racing with
         // collection sets the bit again and is therefore published by a later
         // round; clearing at the end would lose that notification.
-        _ = self.store_status_dirty.swap(false, .acq_rel);
+        const claimed_dirty = self.store_status_dirty.swap(false, .acq_rel);
         errdefer if (!handed_off) self.store_status_dirty.store(true, .release);
         const claimed_activity = self.embedding_activity_status_dirty.swap(false, .acq_rel);
         errdefer if (!handed_off and claimed_activity) self.embedding_activity_status_dirty.store(true, .release);
-        var snapshot = try remote_metadata.fetchSnapshot();
+        // A dirty local topology report is an observation, not a write
+        // authorization. Reuse the immutable control view recently reconciled
+        // by this process; per-group generation and reporter incarnation still
+        // fence publication. Baseline/recovery and periodic full refreshes keep
+        // their fresh metadata barrier, and an expired view falls back to it.
+        const has_baseline = baseline: {
+            if (!self.store_report_publish_mutex.tryLock()) break :baseline false;
+            defer self.store_report_publish_mutex.unlock(remote_metadata.io);
+            break :baseline self.store_report_publisher.cursor != null;
+        };
+        var snapshot = if (claimed_dirty and has_baseline)
+            (try remote_metadata.cachedSnapshotWithin(metadata_snapshot_cache_ttl_ms)) orelse try remote_metadata.fetchSnapshot()
+        else
+            try remote_metadata.fetchSnapshot();
         defer if (!handed_off) freeAdminSnapshotOwned(self.alloc, &snapshot);
         self.provisioned_storage.setDenseNativeAuthorityPermitted(
             snapshot.status.dense_native_storage_protocol_activated_version >=
@@ -23207,9 +23220,21 @@ const RemoteMetadataSource = struct {
     }
 
     fn cachedSnapshotView(self: *RemoteMetadataSource, comptime peers: bool) !?antfly.metadata_api.AdminSnapshot {
+        return self.cachedSnapshotViewWithin(peers, null);
+    }
+
+    fn cachedSnapshotWithin(self: *RemoteMetadataSource, max_age_ms: u64) !?antfly.metadata_api.AdminSnapshot {
+        return self.cachedSnapshotViewWithin(false, max_age_ms);
+    }
+
+    fn cachedSnapshotViewWithin(self: *RemoteMetadataSource, comptime peers: bool, max_age_ms: ?u64) !?antfly.metadata_api.AdminSnapshot {
         lockAtomic(&self.cache_mutex);
         const compact = peers and self.cached_peer_snapshot != null;
         const snapshot = if (compact) self.cached_peer_snapshot else self.cached_snapshot;
+        if (max_age_ms) |age| if (self.awakeMs() -| self.cached_snapshot_at_ms > age) {
+            self.cache_mutex.unlock();
+            return null;
+        };
         if (snapshot == null or (!peers and (snapshot.?.peer_view or snapshot.?.planning_view))) {
             self.cache_mutex.unlock();
             return null;
@@ -27367,6 +27392,7 @@ fn dataRaftLocalStatusFingerprint(
         };
         hashU64(&hasher, 1);
         hashU64(&hasher, status.id);
+        hashU64(&hasher, status.hard.current_term);
         hashU64(&hasher, @intFromEnum(status.soft.role));
         if (status.soft.leader_id) |leader_id| {
             hashU64(&hasher, 1);
@@ -27378,6 +27404,10 @@ fn dataRaftLocalStatusFingerprint(
         for (status.conf_state.voters) |node_id| hashU64(&hasher, node_id);
         hashU64(&hasher, status.conf_state.voters_outgoing.len);
         for (status.conf_state.voters_outgoing) |node_id| hashU64(&hasher, node_id);
+        hashU64(&hasher, status.conf_state.learners.len);
+        for (status.conf_state.learners) |node_id| hashU64(&hasher, node_id);
+        hashU64(&hasher, status.conf_state.learners_next.len);
+        for (status.conf_state.learners_next) |node_id| hashU64(&hasher, node_id);
     }
     return hasher.final();
 }
@@ -41378,7 +41408,7 @@ fn consumerTests() type {
             second_reader.release();
             var server: DataServer = undefined;
             server.data_raft = null;
-            server.backend_runtime = null;
+            server.backend_runtime = backend_runtime.ptr();
             server.remote_metadata = &source;
             const forwarding_clone_count = source.test_faults.snapshot_result_clones;
             // The production preflight only needs peer freshness and a control
@@ -41486,6 +41516,12 @@ fn consumerTests() type {
             try std.testing.expectEqual(catalog_at, source.cached_snapshot_at_ms);
             var retained_catalog = (try source.cachedSnapshot()).?;
             defer freeAdminSnapshotOwned(alloc, &retained_catalog);
+            var report_view = (try source.cachedSnapshotWithin(metadata_snapshot_cache_ttl_ms)).?;
+            defer freeAdminSnapshotOwned(alloc, &report_view);
+            try std.testing.expectEqualStrings("catalog", report_view.tables[0].name);
+            source.cached_snapshot_at_ms = 0;
+            try std.testing.expect((try source.cachedSnapshotWithin(0)) == null);
+            source.cached_snapshot_at_ms = catalog_at;
             var latest_compact = (try source.cachedPeerSnapshot()).?;
             defer freeAdminSnapshotOwned(alloc, &latest_compact);
             try std.testing.expectEqualStrings("{}", retained_catalog.tables[0].schema_json);

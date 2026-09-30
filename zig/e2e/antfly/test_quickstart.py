@@ -1201,7 +1201,12 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
             break
         __import__("time").sleep(0.05)
     assert partial_status is not None, __import__("json").dumps(
-        observed_states, indent=2, sort_keys=True
+        {
+            "index_observations": observed_states,
+            "provider": progressive_openai_embedder.stats(),
+        },
+        indent=2,
+        sort_keys=True,
     )
     time_to_first_artifact_s = __import__("time").monotonic() - started
     assert time_to_first_artifact_s < 30.0
