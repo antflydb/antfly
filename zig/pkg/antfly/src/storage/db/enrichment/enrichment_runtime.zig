@@ -2061,6 +2061,19 @@ fn effectiveRequestEmbedBatchItems(runtime: *EnrichmentRuntime, request: enrichm
     return @min(configured, recoveryBatchCap(runtime, recovery_key));
 }
 
+const DocumentExtractionBudgetDenial = error{ DocumentExtractionWorkingSetTooLarge, ResourceTemporarilyUnavailable };
+
+/// DocumentExtractionWorkingSetTooLarge is terminal, so reserve it for a
+/// document whose own demand exceeds the shared working-set slice. A denial
+/// caused by other concurrent extractions holding the slice is contention and
+/// retries like any other ResourceTemporarilyUnavailable.
+pub fn documentExtractionBudgetDenialError(budgeted: *const resource_manager_mod.BudgetedAllocator) DocumentExtractionBudgetDenial {
+    return if (budgeted.deniedByOwnDemand())
+        error.DocumentExtractionWorkingSetTooLarge
+    else
+        error.ResourceTemporarilyUnavailable;
+}
+
 const EnrichmentErrorDisposition = enum {
     retryable_request,
     terminal_request,
@@ -10809,7 +10822,7 @@ const PreparedDocumentSourceCache = struct {
         self.lockAllocator();
         defer self.allocator_mutex.unlock();
         if (err == error.OutOfMemory and self.budgeted != null and self.budgeted.?.denied())
-            return error.DocumentExtractionWorkingSetTooLarge;
+            return documentExtractionBudgetDenialError(&self.budgeted.?);
         return err;
     }
 
@@ -10916,7 +10929,7 @@ test "shared PDF coordinator state is admitted separately from render windows" {
     try std.testing.expect(manager.sliceStats(.document_extraction_working_set).used_bytes >= state.len);
     try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, PdfWindowCompositeLease.create(alloc, alloc, &manager, 1, 32 * 1024, 1));
     try std.testing.expectError(error.OutOfMemory, coordinator.reservation.allocator().alloc(u8, 32 * 1024));
-    try std.testing.expect(coordinator.allocationDenied());
+    try std.testing.expect(coordinator.allocationDeniedError() != null);
 }
 
 test "prepared document source cache isolates credentials and reuses bytes" {
@@ -12625,7 +12638,7 @@ fn processDocumentExtractionAsset(
     ) catch |raw_err| {
         const err: anyerror = if (raw_err == error.OutOfMemory and
             prepared_sources.budgeted != null and prepared_sources.budgeted.?.denied())
-            error.DocumentExtractionWorkingSetTooLarge
+            documentExtractionBudgetDenialError(&prepared_sources.budgeted.?)
         else
             raw_err;
         if (shouldYieldRequestError(runtime, err)) return err;
@@ -12869,11 +12882,14 @@ fn processDocumentExtractionAsset(
         collect_ctx.releasePdfCoordinator();
         config.pdf_decode_limits = configured_pdf_decode_limits;
         config.pdf_render_max_inflight_bytes = configured_pdf_render_inflight_bytes;
-        const err: anyerror = if (raw_err == error.OutOfMemory and
-            ((collection_budgeted != null and collection_budgeted.?.denied()) or
-                (prepared_sources.budgeted != null and prepared_sources.budgeted.?.denied()) or
-                pdf_inspection_reservation.limit_exceeded))
+        const err: anyerror = if (raw_err != error.OutOfMemory)
+            raw_err
+        else if (pdf_inspection_reservation.limit_exceeded)
             error.DocumentExtractionWorkingSetTooLarge
+        else if (collection_budgeted != null and collection_budgeted.?.denied())
+            documentExtractionBudgetDenialError(&collection_budgeted.?)
+        else if (prepared_sources.budgeted != null and prepared_sources.budgeted.?.denied())
+            documentExtractionBudgetDenialError(&prepared_sources.budgeted.?)
         else
             raw_err;
         if (shouldYieldRequestError(runtime, err)) return err;
@@ -12914,14 +12930,14 @@ fn processDocumentExtractionAsset(
 
     const desired_unit_descriptors = documentExtractionUnitDescriptorsFromKeysAlloc(collection_alloc, desired_unit_keys.items, desired_unit_fingerprints.items) catch |err| {
         if (err == error.OutOfMemory and collection_budgeted != null and collection_budgeted.?.denied())
-            return error.DocumentExtractionWorkingSetTooLarge;
+            return documentExtractionBudgetDenialError(&collection_budgeted.?);
         return err;
     };
     defer collection_alloc.free(desired_unit_descriptors);
 
     const navigation_digest = hierarchy_navigation.artifactDigestAlloc(collection_alloc, desired_unit_descriptors) catch |err| {
         if (err == error.OutOfMemory and collection_budgeted != null and collection_budgeted.?.denied())
-            return error.DocumentExtractionWorkingSetTooLarge;
+            return documentExtractionBudgetDenialError(&collection_budgeted.?);
         return err;
     };
     defer collection_alloc.free(navigation_digest);
@@ -12940,7 +12956,7 @@ fn processDocumentExtractionAsset(
         true,
     ) catch |err| {
         if (err == error.OutOfMemory and collection_budgeted != null and collection_budgeted.?.denied())
-            return error.DocumentExtractionWorkingSetTooLarge;
+            return documentExtractionBudgetDenialError(&collection_budgeted.?);
         return err;
     };
     defer collection_alloc.free(new_state);
@@ -12994,25 +13010,25 @@ fn processDocumentExtractionAsset(
 
     var desired_unit_key_set = borrowedRuntimeKeySet(collection_alloc, desired_unit_keys.items) catch |err| {
         if (err == error.OutOfMemory and collection_budgeted != null and collection_budgeted.?.denied())
-            return error.DocumentExtractionWorkingSetTooLarge;
+            return documentExtractionBudgetDenialError(&collection_budgeted.?);
         return err;
     };
     defer desired_unit_key_set.deinit(collection_alloc);
     var desired_chunk_key_set = borrowedRuntimeKeySet(collection_alloc, desired_chunk_keys.items) catch |err| {
         if (err == error.OutOfMemory and collection_budgeted != null and collection_budgeted.?.denied())
-            return error.DocumentExtractionWorkingSetTooLarge;
+            return documentExtractionBudgetDenialError(&collection_budgeted.?);
         return err;
     };
     defer desired_chunk_key_set.deinit(collection_alloc);
     var previous_unit_key_set = borrowedRuntimeKeySet(collection_alloc, previous_state.unit_keys) catch |err| {
         if (err == error.OutOfMemory and collection_budgeted != null and collection_budgeted.?.denied())
-            return error.DocumentExtractionWorkingSetTooLarge;
+            return documentExtractionBudgetDenialError(&collection_budgeted.?);
         return err;
     };
     defer previous_unit_key_set.deinit(collection_alloc);
     var previous_chunk_key_set = borrowedRuntimeKeySet(collection_alloc, previous_state.chunk_keys) catch |err| {
         if (err == error.OutOfMemory and collection_budgeted != null and collection_budgeted.?.denied())
-            return error.DocumentExtractionWorkingSetTooLarge;
+            return documentExtractionBudgetDenialError(&collection_budgeted.?);
         return err;
     };
     defer previous_chunk_key_set.deinit(collection_alloc);
@@ -13934,13 +13950,13 @@ const RuntimePdfOcrCoordinator = struct {
             config.pdf_decode_limits,
             self.deadline.probe(),
         ) catch |err| {
-            if (self.allocationDenied()) return error.DocumentExtractionWorkingSetTooLarge;
+            if (self.allocationDeniedError()) |denial| return denial;
             return err;
         };
         self.session_initialized = true;
         errdefer self.session.deinit();
         self.session.prepareForBatchRendering() catch |err| {
-            if (self.allocationDenied()) return error.DocumentExtractionWorkingSetTooLarge;
+            if (self.allocationDeniedError()) |denial| return denial;
             return err;
         };
         try self.configureRenderBudget(config);
@@ -13969,7 +13985,7 @@ const RuntimePdfOcrCoordinator = struct {
             source,
             self.deadline.probe(),
         ) catch |err| {
-            if (self.allocationDenied()) return error.DocumentExtractionWorkingSetTooLarge;
+            if (self.allocationDeniedError()) |denial| return denial;
             return err;
         };
         self.session_initialized = true;
@@ -13988,8 +14004,10 @@ const RuntimePdfOcrCoordinator = struct {
         }
     }
 
-    fn allocationDenied(self: *const @This()) bool {
-        return self.reservation.limit_exceeded or (if (self.budgeted) |*budgeted| budgeted.denied() else false);
+    fn allocationDeniedError(self: *const @This()) ?DocumentExtractionBudgetDenial {
+        if (self.reservation.limit_exceeded) return error.DocumentExtractionWorkingSetTooLarge;
+        if (self.budgeted) |*budgeted| if (budgeted.denied()) return documentExtractionBudgetDenialError(budgeted);
+        return null;
     }
 
     fn configureRenderBudget(self: *@This(), config: document_extraction_mod.Config) !void {
@@ -15066,10 +15084,10 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithBackingAllocator(
         pdf_coordinator,
     ) catch |err| {
         if (pdf_coordinator) |coordinator| {
-            if (coordinator.allocationDenied()) return error.DocumentExtractionWorkingSetTooLarge;
+            if (coordinator.allocationDeniedError()) |denial| return denial;
         }
         if (budgeted_allocator) |*budgeted| {
-            if (budgeted.denied()) return error.DocumentExtractionWorkingSetTooLarge;
+            if (budgeted.denied()) return documentExtractionBudgetDenialError(budgeted);
         }
         return err;
     };
@@ -18964,7 +18982,13 @@ const RuntimeDocumentReplaySegmentLease = struct {
                 .document_extraction_working_set,
                 runtime_document_replay_segment_memory_bytes,
             ) catch |err| switch (err) {
-                error.ResourceBudgetExceeded => return error.DocumentExtractionWorkingSetTooLarge,
+                error.ResourceBudgetExceeded => {
+                    const hard_limit = resource_manager.sliceStats(.document_extraction_working_set).hard_limit_bytes;
+                    return if (hard_limit > 0 and runtime_document_replay_segment_memory_bytes > hard_limit)
+                        error.DocumentExtractionWorkingSetTooLarge
+                    else
+                        error.ResourceTemporarilyUnavailable;
+                },
                 else => return err,
             };
         }
@@ -19141,7 +19165,7 @@ const RuntimeDocumentUnitSpool = struct {
         const unit_alloc = if (budgeted) |*allocator| allocator.allocator() else self.runtime_alloc;
         replayEncodedWithAllocator(unit_alloc, encoded, sink) catch |err| {
             if (err == error.OutOfMemory and budgeted != null and budgeted.?.denied())
-                return error.DocumentExtractionWorkingSetTooLarge;
+                return documentExtractionBudgetDenialError(&budgeted.?);
             return err;
         };
     }
@@ -20170,7 +20194,10 @@ const RuntimeDocumentExtractionResourceTracker = struct {
             return error.DocumentExtractionWorkingSetTooLarge;
         }
         manager.adjustUsage(.document_extraction_working_set, &self.current_bytes, next) catch |err| switch (err) {
-            error.ResourceBudgetExceeded => return error.DocumentExtractionWorkingSetTooLarge,
+            // The own-demand check above already rejected `next` exceeding
+            // the hard limit, so this failure means other owners hold the
+            // slice: retryable contention.
+            error.ResourceBudgetExceeded => return error.ResourceTemporarilyUnavailable,
             else => return err,
         };
     }
@@ -20202,6 +20229,28 @@ test "document extraction working set accounts generated unit cache bytes" {
 
     try tracker.updateWorkingSet(40, 0, &writes, &deletes, &window);
     try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, tracker.updateWorkingSet(40, 60, &writes, &deletes, &window));
+}
+
+test "document extraction working set contention is retryable while own oversize stays terminal" {
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+        .soft_limit_bytes = 0,
+        .hard_limit_bytes = 100,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var other = RuntimeDocumentExtractionResourceTracker{ .manager = &manager };
+    defer other.deinit();
+    try other.setBytes(60);
+
+    var tracker = RuntimeDocumentExtractionResourceTracker{ .manager = &manager };
+    defer tracker.deinit();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, tracker.setBytes(50));
+    try std.testing.expect(isRetryableEnrichmentError(error.ResourceTemporarilyUnavailable));
+    try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, tracker.setBytes(101));
+    try std.testing.expect(!isRetryableEnrichmentError(error.DocumentExtractionWorkingSetTooLarge));
+
+    try other.setBytes(0);
+    try tracker.setBytes(50);
 }
 
 test "budgeted document download composes with materialization accounting" {
@@ -20679,7 +20728,7 @@ const RuntimeDocumentExtractionMaterializeContext = struct {
         return self.onUnitWithAllocator(working_alloc, unit) catch |err| {
             if (err == error.OutOfMemory) {
                 if (budgeted) |*allocator| if (allocator.denied())
-                    return error.DocumentExtractionWorkingSetTooLarge;
+                    return documentExtractionBudgetDenialError(allocator);
             }
             return err;
         };
@@ -25019,7 +25068,7 @@ fn processPdfPageImageEmbedding(
     defer if (metadata_budgeted) |*budgeted| budgeted.deinit();
     const metadata_alloc = if (metadata_budgeted) |*budgeted| budgeted.allocator() else runtime.alloc;
     processPdfPageImageEmbeddingWithAllocator(runtime, metadata_alloc, request, dense_embedder, consumer_indexes, prepared_sources, window) catch |err| {
-        if (err == error.OutOfMemory and metadata_budgeted != null and metadata_budgeted.?.denied()) return error.DocumentExtractionWorkingSetTooLarge;
+        if (err == error.OutOfMemory and metadata_budgeted != null and metadata_budgeted.?.denied()) return documentExtractionBudgetDenialError(&metadata_budgeted.?);
         return err;
     };
 }

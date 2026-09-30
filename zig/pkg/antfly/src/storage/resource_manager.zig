@@ -3519,6 +3519,26 @@ pub const BudgetedAllocator = struct {
         return self.budget_denied;
     }
 
+    /// True when the latest denial would also happen with this allocator as
+    /// the slice's sole owner: its own live bytes plus the failed request
+    /// exceed what a sole owner may reserve. False means other owners' usage
+    /// filled the slice, which is transient contention rather than evidence
+    /// that the operation itself is oversized.
+    pub fn deniedByOwnDemand(self: *const BudgetedAllocator) bool {
+        std.debug.assert(self.budget_denied);
+        const failure = self.last_allocation_failure orelse return true;
+        if (failure.cause != .admission) return true;
+        const limit = failure.slice_limit_bytes;
+        if (limit == 0) return true;
+        const sole_owner_limit = if (self.max_hard_limit_multiple <= 1)
+            limit
+        else
+            std.math.mul(u64, limit, self.max_hard_limit_multiple) catch std.math.maxInt(u64);
+        const requested = std.math.cast(u64, failure.requested_bytes) orelse return true;
+        const own_need = std.math.add(u64, failure.live_bytes, requested) catch return true;
+        return own_need > sole_owner_limit;
+    }
+
     /// Distinguish a new admission failure from backing-allocator resize or
     /// remap refusal without clearing the operation's sticky denied flag.
     pub fn denialGeneration(self: *const BudgetedAllocator) u64 {
@@ -3628,7 +3648,10 @@ pub const BudgetedAllocator = struct {
     ) bool {
         const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
         const growth = new_len -| memory.len;
-        if (growth > 0 and !self.reserveGrowth(growth)) return false;
+        if (growth > 0 and !self.reserveGrowth(growth)) {
+            self.recordAllocationFailure(.admission, growth, ret_addr);
+            return false;
+        }
         if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) {
             if (growth > 0) self.releaseBytes(growth);
             return false;
@@ -3646,7 +3669,10 @@ pub const BudgetedAllocator = struct {
     ) ?[*]u8 {
         const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
         const growth = new_len -| memory.len;
-        if (growth > 0 and !self.reserveGrowth(growth)) return null;
+        if (growth > 0 and !self.reserveGrowth(growth)) {
+            self.recordAllocationFailure(.admission, growth, ret_addr);
+            return null;
+        }
         const ptr = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse {
             if (growth > 0) self.releaseBytes(growth);
             return null;
@@ -3702,6 +3728,28 @@ test "source vector payloads scratch admission accounts credits and records deni
     try std.testing.expectError(error.OutOfMemory, denied_backing.threadSafeAllocator().alloc(u8, 1));
     try std.testing.expect(denied_backing.allocationFailureThreadSafe().?.cause == .backing);
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.dense_source_payload_state).used_bytes);
+}
+
+test "budgeted allocator denial separates slice contention from own oversize demand" {
+    const alloc = std.testing.allocator;
+    var budgets = Options.defaultBudgets();
+    budgets[@intFromEnum(Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = 4096 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+
+    var other = try manager.reserve(.document_extraction_working_set, 3900);
+    var contended = BudgetedAllocator.init(&manager, .document_extraction_working_set, alloc, 1);
+    defer contended.deinit();
+    try std.testing.expectError(error.OutOfMemory, contended.threadSafeAllocator().alloc(u8, 512));
+    try std.testing.expect(contended.denied());
+    try std.testing.expect(!contended.deniedByOwnDemand());
+    other.release();
+
+    var oversized = BudgetedAllocator.init(&manager, .document_extraction_working_set, alloc, 1);
+    defer oversized.deinit();
+    try std.testing.expectError(error.OutOfMemory, oversized.threadSafeAllocator().alloc(u8, 4097));
+    try std.testing.expect(oversized.denied());
+    try std.testing.expect(oversized.deniedByOwnDemand());
 }
 
 test "default tokenizer cache budget is aligned with its resource slice" {

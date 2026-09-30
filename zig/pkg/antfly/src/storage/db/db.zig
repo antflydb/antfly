@@ -53145,7 +53145,7 @@ fn computeDocumentExtractionAssetRequestDerived(
         source_url,
         if (config.credentials.len > 0) config.credentials else null,
     ) catch |err| switch (err) {
-        error.OutOfMemory => if (extraction_budgeted != null and extraction_budgeted.?.denied()) return error.DocumentExtractionWorkingSetTooLarge else return err,
+        error.OutOfMemory => if (extraction_budgeted != null and extraction_budgeted.?.denied()) return enrichment_runtime_mod.documentExtractionBudgetDenialError(&extraction_budgeted.?) else return err,
         else => {
             if (!document_extraction_mod.remoteContentErrorIsPermanent(err)) return err;
             try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(err), "remote content download failed", "remote_content_download", artifact_writes);
@@ -53185,7 +53185,12 @@ fn computeDocumentExtractionAssetRequestDerived(
     }
     var extraction_failure: runtime_failure_abi.FailureIdentity = .{};
     var extraction = extractDocumentDownloadedAlloc(document_extraction_alloc, downloaded_mut, source_url, extraction_config, config_json, doc_value, &extraction_failure) catch |err| switch (err) {
-        error.OutOfMemory => if ((extraction_budgeted != null and extraction_budgeted.?.denied()) or pdf_inspection_reservation.limit_exceeded) return error.DocumentExtractionWorkingSetTooLarge else return err,
+        error.OutOfMemory => if (pdf_inspection_reservation.limit_exceeded)
+            return error.DocumentExtractionWorkingSetTooLarge
+        else if (extraction_budgeted != null and extraction_budgeted.?.denied())
+            return enrichment_runtime_mod.documentExtractionBudgetDenialError(&extraction_budgeted.?)
+        else
+            return err,
         else => {
             const exact_error_name = boundaryFailureErrorName(&extraction_failure, err);
             try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, exact_error_name, "document extraction failed", document_extraction_mod.failureStageFromErrorName(exact_error_name, "document_extraction"), artifact_writes);
