@@ -160,7 +160,7 @@ pub fn buildPlan(arena: std.mem.Allocator, id: staging.Id, cohort_digest: stagin
         if (manifest.format == .portable) {
             var source_schema = try @import("../schema/mod.zig").parseValidatedTableSchema(arena, manifest.schema_json);
             defer source_schema.deinit(arena);
-            if ((source.seals.len != 0 or source_schema.storage_mode == .relational) and
+            if (source_schema.storage_mode == .relational and
                 (manifest.shards.len == 0 or manifest.shards[0].accepted_generation_summary_digest == null))
                 return error.RestoreSourceProofMissing;
         }
