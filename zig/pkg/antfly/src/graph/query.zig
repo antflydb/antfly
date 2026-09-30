@@ -2449,16 +2449,8 @@ fn algebraicShortestPathResultNodeAlloc(
         }
         const index = match_index orelse return null;
         const next_key = provenanceEdgeNextNode(params.direction, current, match_edge) orelse return null;
-        const weight = (try resolveUniqueGraphEdgeWeight(alloc, graph_index, current, match_edge, params.direction)) orelse return null;
-
-        path_edges[path_edge_count] = .{
-            .source = try alloc.dupe(u8, match_edge.source),
-            .target = try alloc.dupe(u8, match_edge.target),
-            .edge_type = try alloc.dupe(u8, match_edge.edge_type),
-            .edge_id = try alloc.dupe(u8, match_edge.edge_id),
-            .owner_document = try alloc.dupe(u8, match_edge.owner_document),
-            .weight = weight,
-        };
+        const path_edge = (try resolveUniqueGraphPathEdge(alloc, graph_index, current, match_edge, params.direction)) orelse return null;
+        path_edges[path_edge_count] = path_edge;
         path_edge_count += 1;
 
         path_nodes[path_node_count] = try alloc.dupe(u8, next_key);
@@ -2540,26 +2532,41 @@ fn provenanceEdgeNextNode(direction: graph_mod.EdgeDirection, current: []const u
     };
 }
 
-fn resolveUniqueGraphEdgeWeight(
+fn resolveUniqueGraphPathEdge(
     alloc: Allocator,
     graph_index: *graph_mod.GraphIndex,
     current: []const u8,
     provenance_edge: ParsedProvenanceEdge,
     direction: graph_mod.EdgeDirection,
-) !?f64 {
+) !?PathEdgeInfo {
     const edges = try graph_index.getEdges(alloc, current, "", direction);
     defer graph_mod.GraphIndex.freeEdges(alloc, edges);
 
-    var found: ?f64 = null;
+    var found: ?graph_mod.Edge = null;
     for (edges) |edge| {
         if (!std.mem.eql(u8, edge.source, provenance_edge.source)) continue;
         if (!std.mem.eql(u8, edge.target, provenance_edge.target)) continue;
         if (!std.mem.eql(u8, edge.edge_type, provenance_edge.edge_type)) continue;
         if (!std.mem.eql(u8, edge.edge_id, provenance_edge.edge_id) or !std.mem.eql(u8, edge.owner_document, provenance_edge.owner_document)) continue;
         if (found != null) return null;
-        found = edge.weight;
+        found = edge;
     }
-    return found;
+    const edge = found orelse return null;
+    const traversal_direction: ?graph_mod.EdgeDirection = switch (direction) {
+        .out => .out,
+        .in => .in,
+        .both => if (std.mem.eql(u8, edge.source, edge.target)) null else if (std.mem.eql(u8, current, edge.source)) .out else .in,
+    };
+    return try pathEdgeInfoFromPathEdge(alloc, .{
+        .source = edge.source,
+        .target = edge.target,
+        .edge_type = edge.edge_type,
+        .edge_id = edge.edge_id,
+        .owner_document = edge.owner_document,
+        .weight = edge.weight,
+        .metadata = edge.metadata,
+        .traversal_direction = traversal_direction,
+    });
 }
 
 fn cloneProvenanceLabelsAlloc(alloc: Allocator, labels: []const []const u8) ![][]u8 {

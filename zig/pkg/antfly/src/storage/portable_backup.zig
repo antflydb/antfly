@@ -331,7 +331,12 @@ pub fn exportPortableToWriterWithOptions(
         .mode = snapshot_mode,
         .parent_manifest_sha256 = parent_manifest_sha256,
         .created_at_unix_ns = options.created_at_unix_ns,
-        .compatibility = .{ .storage_engine = "logical" },
+        .compatibility = .{
+            .storage_engine = "logical",
+            .min_afb_reader = for (objects.items) |object| {
+                if (object.block_type == .graph_relationship_batch) break backup_bundle.relationship_reader_version;
+            } else 2,
+        },
         .objects = descriptors,
         .blobs = blob_descriptors,
     });
@@ -523,6 +528,10 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
     defer deinitKeyValueBatch(alloc, &artifact_batch);
     var artifact_batch_bytes: usize = 0;
 
+    var relationship_batch = std.ArrayListUnmanaged(backup_codec.KeyValueEntry).empty;
+    defer deinitKeyValueBatch(alloc, &relationship_batch);
+    var relationship_batch_bytes: usize = 0;
+
     var resolution_batch = std.ArrayListUnmanaged(backup_codec.KeyValueEntry).empty;
     defer deinitKeyValueBatch(alloc, &resolution_batch);
     var resolution_batch_bytes: usize = 0;
@@ -667,11 +676,20 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
                 try collectEmbedding(alloc, &emb_batches, &sparse_batches, kv.key, kv.value);
                 derived_batch_bytes += kv.key.len + kv.value.len;
             } else if (internal_keys.isGraphEdgeArtifactKey(kv.key)) {
-                try collectGraphEdgeArtifact(alloc, &edge_batches, kv.key, kv.value);
+                if (try appendRelationshipArtifactEntry(alloc, &relationship_batch, kv.key, kv.value)) {
+                    relationship_batch_bytes += kv.key.len + kv.value.len;
+                    counts.edges += 1;
+                } else try collectGraphEdgeArtifact(alloc, &edge_batches, kv.key, kv.value);
                 derived_batch_bytes += kv.key.len + kv.value.len;
             } else if (try parseStandaloneGraphIndexEdgeKeyAlloc(alloc, kv.key)) |parsed| {
                 defer parsed.deinit(alloc);
-                try appendEdgeBatchEntry(alloc, &edge_batches, parsed.index_name, parsed.source, parsed.target, parsed.edge_type, kv.value);
+                if (parsed.edge_id.len > 0) {
+                    const artifact_key = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, if (parsed.owner_document.len > 0) parsed.owner_document else parsed.source, parsed.index_name, parsed.edge_type, parsed.target, parsed.source, parsed.edge_id);
+                    defer alloc.free(artifact_key);
+                    _ = try appendRelationshipArtifactEntry(alloc, &relationship_batch, artifact_key, kv.value);
+                    relationship_batch_bytes += artifact_key.len + kv.value.len;
+                    counts.edges += 1;
+                } else try appendEdgeBatchEntry(alloc, &edge_batches, parsed.index_name, parsed.source, parsed.target, parsed.edge_type, kv.value);
                 derived_batch_bytes += kv.key.len + kv.value.len;
             } else if (try appendResolutionArtifactEntry(alloc, &resolution_batch, kv.key, kv.value)) {
                 resolution_batch_bytes += kv.key.len + kv.value.len;
@@ -685,6 +703,10 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
                     try flushKeyValueBlock(alloc, out, &artifact_batch, .artifact_batch);
                     artifact_batch_bytes = 0;
                 }
+            }
+            if (relationship_batch_bytes >= batch_target_bytes) {
+                try flushKeyValueBlock(alloc, out, &relationship_batch, .graph_relationship_batch);
+                relationship_batch_bytes = 0;
             }
             if (derived_batch_bytes >= batch_target_bytes) {
                 try flushDerivedBatches(alloc, out, &emb_batches, &sparse_batches, &edge_batches, &counts);
@@ -728,6 +750,7 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
         try flushKeyValueBlock(alloc, out, &resolution_batch, .resolution_batch);
     }
 
+    if (relationship_batch.items.len > 0) try flushKeyValueBlock(alloc, out, &relationship_batch, .graph_relationship_batch);
     try flushDerivedBatches(alloc, out, &emb_batches, &sparse_batches, &edge_batches, &counts);
 
     // Shard footer
@@ -869,12 +892,16 @@ fn flushDerivedBatches(
 }
 
 const ParsedStandaloneGraphEdgeKey = struct {
+    edge_id: []u8,
+    owner_document: []u8,
     source: []u8,
     index_name: []u8,
     edge_type: []u8,
     target: []u8,
 
     fn deinit(self: ParsedStandaloneGraphEdgeKey, alloc: Allocator) void {
+        alloc.free(self.edge_id);
+        alloc.free(self.owner_document);
         alloc.free(self.source);
         alloc.free(self.index_name);
         alloc.free(self.edge_type);
@@ -912,15 +939,21 @@ fn parseStandaloneGraphIndexEdgeKeyAlloc(alloc: Allocator, key: []const u8) !?Pa
     pos = edge_type_term + 2;
 
     const target_term = internal_keys.findComponentTerminator(key, pos) orelse return null;
-    if (target_term + 2 != key.len) return null;
+    const identity = internal_keys.parseGraphRelationshipSuffix(key, target_term + 2) orelse return null;
     const target = try internal_keys.decodeBodyAlloc(alloc, key[pos..target_term]);
     errdefer alloc.free(target);
 
+    const edge_id = try internal_keys.decodeBodyAlloc(alloc, identity.edge_id);
+    errdefer alloc.free(edge_id);
+    const owner_document = try internal_keys.decodeBodyAlloc(alloc, identity.owner_document);
+    errdefer alloc.free(owner_document);
     source_owned = false;
     index_owned = false;
     edge_type_owned = false;
 
     return .{
+        .edge_id = edge_id,
+        .owner_document = owner_document,
         .source = source,
         .index_name = index_name,
         .edge_type = edge_type,
@@ -1247,6 +1280,27 @@ fn appendSparseEmbedding(
         .indices = owned_sparse.indices,
         .values = owned_sparse.values,
     });
+}
+
+/// Preserve the exact owner-scoped identity rather than flattening it into
+/// the legacy edge tuple. Only explicit identities need the reader-v3 block.
+fn appendRelationshipArtifactEntry(alloc: Allocator, entries: *std.ArrayListUnmanaged(backup_codec.KeyValueEntry), key: []const u8, value: []const u8) !bool {
+    const parsed = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(alloc, key)) orelse return error.InvalidBackupRequest;
+    defer {
+        alloc.free(parsed.doc_key);
+        alloc.free(parsed.index_name);
+        alloc.free(parsed.edge_type);
+        alloc.free(parsed.target_doc_key);
+        alloc.free(parsed.edge_id);
+        alloc.free(parsed.logical_source);
+    }
+    if (parsed.edge_id.len == 0) return false;
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    const portable_value = try graphArtifactValueFromPortableEdgeValueAlloc(alloc, value);
+    errdefer alloc.free(portable_value);
+    try entries.append(alloc, .{ .key = owned_key, .value = portable_value });
+    return true;
 }
 
 fn collectGraphEdgeArtifact(
@@ -1899,6 +1953,7 @@ fn validateAndImportPortableStagingReader(
             .embedding_batch => if (opts.import_derived_indexes) try importEmbeddingBatch(alloc, store, block.payload, opts.embedding_source_fields),
             .sparse_batch => if (opts.import_derived_indexes) try importSparseBatch(alloc, store, block.payload, opts.embedding_source_fields),
             .edge_batch => if (opts.import_derived_indexes) try importEdgeBatch(alloc, store, block.payload),
+            .graph_relationship_batch => if (opts.import_derived_indexes) try importRelationshipBatch(alloc, store, block.payload),
             .shard_header, .shard_footer, .file_footer => try validatePortableImportBlockPayload(alloc, block.block_type, block.payload, opts, &archive),
             .bundle_manifest, .cluster_manifest, .table_manifest, .summary_batch, .transaction_batch => {},
             else => {},
@@ -1970,6 +2025,7 @@ fn importPortableDerivedBlocks(alloc: Allocator, store: *DocStore, reader: anyty
             .embedding_batch => try importEmbeddingBatch(alloc, store, block.payload, opts.embedding_source_fields),
             .sparse_batch => try importSparseBatch(alloc, store, block.payload, opts.embedding_source_fields),
             .edge_batch => try importEdgeBatch(alloc, store, block.payload),
+            .graph_relationship_batch => try importRelationshipBatch(alloc, store, block.payload),
             else => {},
         }
     }
@@ -2349,6 +2405,7 @@ fn validatePortableImportBlockPayload(
         .embedding_batch => if (opts.import_derived_indexes) try validateEmbeddingBatchPayload(alloc, payload),
         .sparse_batch => if (opts.import_derived_indexes) try validateSparseBatchPayload(alloc, payload),
         .edge_batch => if (opts.import_derived_indexes) try validateEdgeBatchPayload(alloc, payload),
+        .graph_relationship_batch => if (opts.import_derived_indexes) try validateRelationshipBatchPayload(alloc, payload),
         .shard_header => {
             const header = try backup_codec.decodeShardHeader(alloc, payload);
             alloc.free(header.table_name);
@@ -3049,6 +3106,36 @@ fn embeddingSourceHashForDocument(
         else => return null,
     };
     return enrichment_artifact_codec.hashSource(source_text);
+}
+
+fn validateRelationshipBatchPayload(alloc: Allocator, payload: []const u8) !void {
+    const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
+    defer freeKeyValueEntries(alloc, entries);
+    for (entries) |entry| {
+        const parsed = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(alloc, entry.key)) orelse return error.InvalidBackupRequest;
+        defer {
+            alloc.free(parsed.doc_key);
+            alloc.free(parsed.index_name);
+            alloc.free(parsed.edge_type);
+            alloc.free(parsed.target_doc_key);
+            alloc.free(parsed.edge_id);
+            alloc.free(parsed.logical_source);
+        }
+        if (parsed.edge_id.len == 0 or !enrichment_artifact_codec.isPortableUnboundGraphEdge(entry.value)) return error.InvalidBackupRequest;
+        var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, entry.value);
+        defer decoded.deinit(alloc);
+    }
+}
+
+fn importRelationshipBatch(alloc: Allocator, store: *DocStore, payload: []const u8) !void {
+    // Staging imports also validate records before publishing any identity.
+    try validateRelationshipBatchPayload(alloc, payload);
+    const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
+    defer freeKeyValueEntries(alloc, entries);
+    const writes = try alloc.alloc(KVPair, entries.len);
+    defer alloc.free(writes);
+    for (entries, 0..) |entry, i| writes[i] = .{ .key = entry.key, .value = entry.value };
+    if (writes.len > 0) try store.putBatch(writes, &.{});
 }
 
 fn importEdgeBatch(alloc: Allocator, store: *DocStore, payload: []const u8) !void {
@@ -4521,6 +4608,15 @@ test "export and import graph edge artifacts round trip with arbitrary ids" {
     var out: ArrayList(u8) = .empty;
     defer out.deinit(alloc);
     try exportPortable(alloc, &src, &out);
+    {
+        var reader = backup_codec.SliceReader.init(out.items);
+        _ = try reader.readHeader();
+        const block = try reader.readBlock(alloc);
+        defer alloc.free(block.payload);
+        var manifest = try backup_bundle.parseManifest(alloc, block.payload);
+        defer manifest.deinit();
+        try std.testing.expectEqual(@as(u32, 2), manifest.value.compatibility.min_afb_reader);
+    }
 
     // Import into fresh store
     var tmp_dst = std.testing.tmpDir(.{});
@@ -4739,5 +4835,54 @@ test "export skips derived data" {
             else => return err,
         };
         try std.testing.expectEqual(null, val);
+    }
+}
+
+test "portable relationships preserve parallel identities and arbitrary endpoints" {
+    const alloc = std.testing.allocator;
+    var tmp_src = std.testing.tmpDir(.{});
+    defer tmp_src.cleanup();
+    var src = try openTestStore(alloc, &tmp_src);
+    defer src.close();
+    const owners = [_][]const u8{ "a", "a", "fact:one", "fact:two" };
+    const ids = [_][]const u8{ "inline-one", "inline-two", "fact-one\x00\xff", "fact-one\x00\xff" };
+    var keys: [4][]u8 = undefined;
+    var initialized: usize = 0;
+    defer for (keys[0..initialized]) |key| alloc.free(key);
+    const value = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 7, 2.5, 11, 22, "{\"fact\":true}");
+    defer alloc.free(value);
+    for (owners, ids, 0..) |owner, id, i| {
+        keys[i] = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, owner, "facts", "RELATES_TO", "b", "a", id);
+        initialized += 1;
+        try src.putBatch(&.{.{ .key = keys[i], .value = value }}, &.{});
+    }
+    var out: ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try exportPortable(alloc, &src, &out);
+    {
+        var reader = backup_codec.SliceReader.init(out.items);
+        _ = try reader.readHeader();
+        const block = try reader.readBlock(alloc);
+        defer alloc.free(block.payload);
+        var manifest = try backup_bundle.parseManifest(alloc, block.payload);
+        defer manifest.deinit();
+        try std.testing.expectEqual(@as(u32, 3), manifest.value.compatibility.min_afb_reader);
+    }
+
+    for ([_]bool{ false, true }) |staged| {
+        var tmp_dst = std.testing.tmpDir(.{});
+        defer tmp_dst.cleanup();
+        var dst = try openTestStore(alloc, &tmp_dst);
+        defer dst.close();
+        try importPortableWithOptions(alloc, &dst, out.items, .{ .unpublished_staging = staged });
+        for (keys) |key| {
+            const restored = try dst.get(alloc, key);
+            defer alloc.free(restored);
+            try std.testing.expect(enrichment_artifact_codec.isPortableUnboundGraphEdge(restored));
+            var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, restored);
+            defer decoded.deinit(alloc);
+            try std.testing.expectEqual(@as(f64, 2.5), decoded.weight);
+            try std.testing.expectEqualStrings("{\"fact\":true}", decoded.metadata_json);
+        }
     }
 }

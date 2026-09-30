@@ -171,6 +171,7 @@ const OwnedEdgeInfo = struct {
     edge_type: []const u8,
     weight: f64,
     metadata: []const u8 = "",
+    traversal_direction: ?EdgeDirection = null,
 };
 
 fn destroyPathNode(alloc: Allocator, node: *PathNode) void {
@@ -219,6 +220,10 @@ fn createPathNode(
             .owner_document = owner_document,
             .weight = value.weight,
             .metadata = metadata,
+            .traversal_direction = if (parent) |previous|
+                if (std.mem.eql(u8, value.source, value.target)) null else if (std.mem.eql(u8, previous.key, value.source)) .out else .in
+            else
+                null,
         };
     } else null;
     node.* = .{

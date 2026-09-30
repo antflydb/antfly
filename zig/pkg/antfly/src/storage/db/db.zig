@@ -24886,7 +24886,8 @@ pub const DB = struct {
         if (source.len == 0 or target.len == 0) return null;
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
-        if (!options.edge_filter.active() and options.node_admission == null and options.work_budget == null) {
+        // The algebraic shortcut cannot represent a custom frontier limit.
+        if (!options.edge_filter.active() and options.node_admission == null and options.work_budget == null and options.max_intermediate_states == (paths_mod.PathFindOptions{}).max_intermediate_states) {
             if (try self.findAlgebraicShortestPath(alloc, index_name, source, target, options.edge_types, options.direction, options.weight_mode, options.max_depth, options.min_weight, options.max_weight)) |path| return path;
         }
         const entry = self.core.index_manager.graphIndex(index_name) orelse {
@@ -25012,20 +25013,11 @@ pub const DB = struct {
             }
             alloc.free(edges);
         }
-        var total_weight: f64 = 0;
         for (edge_path, 0..) |item, i| {
-            edges[i] = .{
-                .source = try alloc.dupe(u8, item.source),
-                .target = try alloc.dupe(u8, item.target),
-                .edge_type = try alloc.dupe(u8, item.edge_type),
-                .edge_id = if (item.edge_id.len > 0) try alloc.dupe(u8, item.edge_id) else "",
-                .owner_document = if (item.owner_document.len > 0) try alloc.dupe(u8, item.owner_document) else "",
-                .weight = item.weight,
-                .metadata = if (item.metadata.len > 0) try alloc.dupe(u8, item.metadata) else "",
-            };
+            edges[i] = try paths_mod.clonePathEdge(alloc, item);
             initialized_edges += 1;
-            total_weight += item.weight;
         }
+        const total_weight = try paths_mod.sumPathEdgeWeights(edges);
 
         return .{
             .nodes = nodes,
@@ -128560,4 +128552,28 @@ test "db graph stale generation cleanup retires the exact fact identity" {
     defer graph_mod.GraphIndex.freeEdges(alloc, remaining);
     try std.testing.expectEqual(@as(usize, 1), remaining.len);
     try std.testing.expectEqualStrings("", remaining[0].edge_id);
+}
+
+test "db algebraic path conversion preserves provenance under allocation failures" {
+    const edge = graph_query_mod.PathEdgeInfo{
+        .source = "a",
+        .target = "b",
+        .edge_type = "R",
+        .edge_id = "one",
+        .owner_document = "fact:one",
+        .weight = 2,
+        .metadata = "{\"fact\":1}",
+        .traversal_direction = .in,
+    };
+    const Case = struct {
+        fn convert(alloc: Allocator, item: graph_query_mod.PathEdgeInfo) !void {
+            const path = (try DB.graphResultNodePathAlloc(alloc, .{ .key = "b", .depth = 1, .distance = 1, .path = &.{ "a", "b" }, .path_edges = &.{item} })).?;
+            defer paths_mod.freePath(alloc, path);
+            try std.testing.expectEqualStrings(item.metadata, path.edges[0].metadata);
+            try std.testing.expectEqualStrings(item.edge_id, path.edges[0].edge_id);
+            try std.testing.expectEqualStrings(item.owner_document, path.edges[0].owner_document);
+            try std.testing.expectEqual(item.traversal_direction, path.edges[0].traversal_direction);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.convert, .{edge});
 }

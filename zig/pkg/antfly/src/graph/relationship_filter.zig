@@ -234,6 +234,7 @@ pub fn parsePublicAlloc(alloc: Allocator, value: anytype) !Filter {
     defer alloc.free(raw);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
     defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRelationshipFilter;
     const root = parsed.value.object;
     var result = Filter{};
     if (root.get("valid_at")) |at| {
@@ -315,4 +316,12 @@ test "relationship predicates reject invalid query values and clone ownership" {
     try std.testing.expectError(error.InvalidRelationshipFilter, parsePublicAlloc(alloc, .{ .properties = .{.{ .field = "/metadata/x", .op = "eq", .value = @as(?u8, null) }} }));
     try std.testing.expectError(error.InvalidRelationshipFilter, parsePublicAlloc(alloc, .{ .properties = .{.{ .field = "/metadata/x", .op = "is_null", .value = 1 }} }));
     try std.testing.expectError(error.InvalidRelationshipFilter, parsePublicAlloc(alloc, .{ .properties = .{.{ .field = "/metadata/x~2", .op = "eq", .value = 1 }} }));
+}
+
+test "relationship predicate roots reject every nonobject JSON type" {
+    for ([_][]const u8{ "null", "true", "42", "\"x\"", "[]" }) |json| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.InvalidRelationshipFilter, parsePublicAlloc(std.testing.allocator, parsed.value));
+    }
 }

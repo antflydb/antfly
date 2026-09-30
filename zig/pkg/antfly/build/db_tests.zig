@@ -30,6 +30,10 @@ pub const AddTestsResult = struct {
 pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
     const relationship_identity_filters = [_][]const u8{
+        "graph replay truncated relationship fields release all allocations",
+        "db algebraic path conversion preserves provenance under allocation failures",
+        "portable relationships preserve parallel identities and arbitrary endpoints",
+        "relationship predicate roots reject every nonobject JSON type",
         "db graph stale generation cleanup retires the exact fact identity",
         "db graph fact documents project arbitrary endpoints and retain parallel facts",
         "db graph fact projections survive logical snapshot restore and reopen",
