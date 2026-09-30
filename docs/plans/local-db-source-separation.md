@@ -44,7 +44,10 @@ remote acknowledgement waits.
 
 Runtime names use `hot_standby_*` or `HotStandby*`; engine contracts use generic
 replication names. Existing persisted key bytes, record encodings, error names,
-and C ABI symbols/tags remain compatible. Server runtime integration tests
+and public C ABI symbols remain compatible. Private maintenance enum values
+remain unchanged. The private storage-provider apply symbol is
+`antfly_storage_owner_apply_hot_standby_replication_record`; provider and consumer
+archives compile against that name together. Server runtime integration tests
 live under `storage/hot_standby`, with test-only hooks for white-box engine
 assertions. Production DB sources do not import those fixtures or runtimes.
 
