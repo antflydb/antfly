@@ -22,7 +22,7 @@ import pytest
 import requests
 import test_backup_restore as backups
 import test_online_merge_recovery as merge_faults
-from helpers import wait_until
+from helpers import PhaseTimings, wait_until
 
 three_by_three_backup_cluster = backups.three_by_three_backup_cluster
 owner_link_fault = merge_faults.owner_link_fault
@@ -537,6 +537,7 @@ def test_schema_rewrite_recovers_dependency_cohort(
 ):
     """Recover an admitted online rewrite, not a synthetic staging-only restore."""
     cluster, fault = integrity_cluster, owner_link_fault
+    timings = PhaseTimings(f"schema_rewrite:{crash}")
     fault.heal()
     parent, child = (f"rewrite_{kind}_{time.time_ns()}" for kind in ("p", "c"))
     source = _schema()
@@ -565,10 +566,15 @@ def test_schema_rewrite_recovers_dependency_cohort(
             backups._create_cluster_table_when_admitted(
                 cluster, session, table, {"num_shards": 3, "schema": schema}
             )
+            timings.mark(f"{'parent' if table == parent else 'child'}.create")
             assert wait_until(
                 lambda table=table: cluster.fully_replicated_topology(table),
                 timeout_s=90,
             ), cluster.debug_logs()
+
+            timings.mark(
+                f"{'parent' if table == parent else 'child'}.replicated_topology"
+            )
 
             def enforced(table=table):
                 response = session.get(
@@ -581,6 +587,9 @@ def test_schema_rewrite_recovers_dependency_cohort(
                 )
 
             assert wait_until(enforced, timeout_s=90), cluster.debug_logs()
+            timings.mark(
+                f"{'parent' if table == parent else 'child'}.constraints_enforced"
+            )
         rows = {
             f"{prefix}:parent": {"id": i, "x": i + 10}
             for i, prefix in enumerate(("0", "8", "z"), 1)
@@ -590,12 +599,15 @@ def test_schema_rewrite_recovers_dependency_cohort(
             for key, value in rows.items()
         }
         backups._seed_cluster_docs_when_writable(cluster, session, parent, rows)
+        timings.mark("parent.seed")
         backups._seed_cluster_docs_when_writable(cluster, session, child, children)
+        timings.mark("child.seed")
         with fault.lock:
             fault.healed = False
             fault.hits.clear()
         leader_id = cluster.metadata_stable_leader_id(timeout_s=30)
         assert leader_id is not None
+        timings.mark("rewrite.discover_metadata_leader")
         admitted = session.patch(
             f"{cluster.metadata_public_urls[leader_id - 1]}/tables/{parent}/schema",
             params={"rewrite": "true"},
@@ -604,14 +616,17 @@ def test_schema_rewrite_recovers_dependency_cohort(
             timeout=30,
         )
         assert admitted.status_code == 202, f"{admitted.text}\n{cluster.debug_logs()}"
+        timings.mark("rewrite.admission")
         job_id = admitted.json()["job_id"]
         assert wait_until(fault.observed, timeout_s=90), cluster.debug_logs()
+        timings.mark("rewrite.wait_publication_blocked")
         # Writes acknowledged while the immutable cut is held must survive the
         # generation switch, and must be recomputed with the target expression.
         rows["0:parent"]["x"] = 41
         backups._seed_cluster_docs_when_writable(
             cluster, session, parent, {"0:parent": rows["0:parent"]}
         )
+        timings.mark("rewrite.retained_tail_write")
         for key, row in rows.items():
             response = session.get(
                 f"{cluster.data_api_urls[0]}/tables/{parent}/documents/{key}", timeout=5
@@ -619,6 +634,7 @@ def test_schema_rewrite_recovers_dependency_cohort(
             assert response.status_code == 200, response.text
             assert response.json()["g"] == row["x"] + 1, response.text
 
+        timings.mark("rewrite.verify_old_generation")
         if crash == "reply_loss":
             fault.heal_with_lost_reply()
             assert fault.reply_dropped.wait(30), "no accepted publication reply dropped"
@@ -647,7 +663,9 @@ def test_schema_rewrite_recovers_dependency_cohort(
                 cluster.restart_crashed_node(metadata=True, index=leader_id - 1)
                 fault.heal()
 
+        timings.mark("rewrite.inject_reply_loss_or_restart")
         observations = {}
+        last_progress = {}
 
         def terminal():
             cluster.assert_processes_alive()
@@ -659,6 +677,21 @@ def test_schema_rewrite_recovers_dependency_cohort(
                 observations[base] = response.text[:4096]
                 if response.status_code == 200:
                     job = response.json()
+                    result = job.get("result") or {}
+                    progress = (
+                        job.get("phase"),
+                        job.get("attempt_id"),
+                        result.get("committed_table_count"),
+                    )
+                    if last_progress.get(base) != progress:
+                        last_progress[base] = progress
+                        timings.observe(
+                            "rewrite.job_progress",
+                            frontend=base,
+                            job_phase=progress[0],
+                            attempt_id=progress[1],
+                            committed_table_count=progress[2],
+                        )
                     if job.get("phase") in ("succeeded", "failed", "cancelled"):
                         return job
             return None
@@ -669,6 +702,7 @@ def test_schema_rewrite_recovers_dependency_cohort(
             f"owner_failures={fault.failed_responses()}\n{cluster.debug_logs()}"
         )
         assert completed["result"]["committed_table_count"] == 2, completed
+        timings.mark("rewrite.wait_cohort_published")
         for base in cluster.data_api_urls:
             for key, row in rows.items():
                 try:
@@ -685,6 +719,7 @@ def test_schema_rewrite_recovers_dependency_cohort(
                     )
                 assert response.status_code == 200, response.text
                 assert response.json()["g"] == row["x"] * 3, response.text
+        timings.mark("verify.generated_rows_all_frontends")
         backups._assert_constraint_rejected(
             cluster,
             session,
@@ -692,6 +727,7 @@ def test_schema_rewrite_recovers_dependency_cohort(
             {"8:orphan": {"id": 999}},
             "ForeignKeyParentMissing",
         )
+        timings.mark("verify.orphan_rejection")
         backups._assert_constraint_rejected(
             cluster,
             session,
@@ -699,9 +735,12 @@ def test_schema_rewrite_recovers_dependency_cohort(
             {"8:duplicate": {"id": 1, "x": 2}},
             "UniqueConstraintViolation",
         )
+        timings.mark("verify.unique_rejection")
         backups._batch_cluster_docs_when_writable(
             cluster, session, parent, deletes=("0:parent",)
         )
+
+        timings.mark("verify.post_cutover_delete")
 
         def cascade_visible():
             # An unknown parent-delete outcome is observed, never replayed.
@@ -719,3 +758,4 @@ def test_schema_rewrite_recovers_dependency_cohort(
             return True
 
         assert wait_until(cascade_visible, timeout_s=60), cluster.debug_logs()
+        timings.mark("verify.cascade_all_frontends")

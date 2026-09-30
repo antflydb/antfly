@@ -26,6 +26,29 @@ This runs 200 invocations per selector and retains one XML report per invocation
 plus bounded failure roots. Sandbox attempts that cannot bind fixture ports
 are infrastructure errors and must not be counted as completed invocations.
 
+The recovery scenarios emit JSON `E2E phase` milestones when
+`ANTFLY_E2E_PHASE_TIMINGS=1` (enabled by the regression loop). `seconds` measures
+wall time since the previous milestone, including requests and polling sleeps;
+`elapsed_seconds` measures time since the test body started. Pytest's
+`--durations=10` separately reports fixture setup and teardown. `E2E observation`
+records publication-job or merge-phase changes without resetting the phase
+clock. These diagnostics do not change deadlines, retry policy, or assertions.
+
+For a short profile, use the same command with one worker, three repeats, and a
+new report directory. Compare topology/constraint readiness, corpus seeding,
+fault recovery, publication completion, and final reads/claim/cascade checks.
+Runs overlapping another soak measure contention as well as scenario latency;
+repeat without competing workers before attributing a delay to production.
+
+A three-repeat profile of each recovery selector against the frozen Debug
+binary, alongside the four-worker soak, passed all six invocations. Schema
+rewrite spent 16.3–20.4 seconds waiting for cohort publication after reply loss
+and 6.4–10.6 seconds checking the two tables' replicated topology. FK merge spent
+5.4–8.2 seconds waiting for the donor successor, 9.5–11.4 seconds completing the
+merge after restart, and 9.1–13.7 seconds independently probing all 47 UNIQUE
+claims with three workers. These identify phases to investigate, not the exact
+server-side cause of the delay or unloaded latency.
+
 ## 2026-09-25: progressive activation observations during admission maintenance
 
 [Main job 108330133910](https://github.com/antflydb/antfly/actions/runs/36213445604/job/108330133910)
