@@ -623,9 +623,16 @@ test "opaque owner relational handoff preserves binary proofs across the compile
     const topology = @import("db/relational_integrity_topology_contract.zig");
     const handoff = @import("db/relational_integrity_handoff_contract.zig");
     const contract = @import("db/relational_transition_contract.zig");
-    const path = "/tmp/antfly-kernel-relational-handoff";
-    cleanup(path);
-    defer cleanup(path);
+    // A fixed /tmp literal collides with any other process (including a
+    // concurrent test run) that opens the same path, surfacing spurious
+    // GenerationTransitionActive failures. Use a per-run unique directory
+    // like the rest of this file's tests.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const path = try std.fmt.allocPrint(alloc, "{s}/relational-handoff", .{root});
+    defer alloc.free(path);
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"uq","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"string"}},"additionalProperties":false}}}}
     ;
