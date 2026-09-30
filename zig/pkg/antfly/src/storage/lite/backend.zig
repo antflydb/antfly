@@ -385,7 +385,7 @@ pub const Handle = struct {
         );
         defer self.allocator.free(key);
 
-        if (try store.file.getCatalogRecordAlloc(self.allocator, key)) |raw| {
+        if (try store.getCatalogRecordAlloc(self.allocator, key)) |raw| {
             defer self.allocator.free(raw);
             if (raw.len != @sizeOf(u128)) return error.InvalidLiteRootIncarnation;
             const incarnation = std.mem.readInt(u128, raw[0..@sizeOf(u128)], .little);
@@ -403,7 +403,7 @@ pub const Handle = struct {
         if (incarnation == 0) incarnation = 1;
         var encoded: [@sizeOf(u128)]u8 = undefined;
         std.mem.writeInt(u128, &encoded, incarnation, .little);
-        try store.file.putCatalogRecord(key, &encoded);
+        try store.putCatalogRecord(key, &encoded);
         return incarnation;
     }
 
@@ -427,7 +427,7 @@ pub const Handle = struct {
         if (self.namespace_runtimes.get(canonical)) |runtime| {
             if (runtime.key_prefix.len != 0) return error.LiteNamespaceAlreadyOpened;
         }
-        try self.native_docstore.?.file.putCatalogRecord(root_namespace_alias_catalog_key, canonical);
+        try self.native_docstore.?.putCatalogRecord(root_namespace_alias_catalog_key, canonical);
         self.root_namespace_alias = canonical;
     }
 
@@ -439,7 +439,7 @@ pub const Handle = struct {
     pub fn markEmbeddedArtifact(self: *Handle) !void {
         if (self.engine != .native_single_file) return error.InvalidArgument;
         if (try self.isEmbeddedArtifact()) return;
-        try self.native_docstore.?.file.putCatalogRecord(artifact_profile_catalog_key, embedded_artifact_profile);
+        try self.native_docstore.?.putCatalogRecord(artifact_profile_catalog_key, embedded_artifact_profile);
     }
 
     pub fn isEmbeddedArtifact(self: *const Handle) !bool {
@@ -449,7 +449,7 @@ pub const Handle = struct {
     pub fn markStandaloneArtifact(self: *Handle) !void {
         if (self.engine != .native_single_file) return error.InvalidArgument;
         if (try self.isStandaloneArtifact()) return;
-        try self.native_docstore.?.file.putCatalogRecord(artifact_profile_catalog_key, standalone_artifact_profile);
+        try self.native_docstore.?.putCatalogRecord(artifact_profile_catalog_key, standalone_artifact_profile);
     }
 
     pub fn isStandaloneArtifact(self: *const Handle) !bool {
@@ -458,7 +458,7 @@ pub const Handle = struct {
 
     fn artifactHasProfile(self: *const Handle, expected: []const u8) !bool {
         if (self.engine != .native_single_file) return false;
-        const value = (try self.native_docstore.?.file.getCatalogRecordAlloc(self.allocator, artifact_profile_catalog_key)) orelse return false;
+        const value = (try self.native_docstore.?.getCatalogRecordAlloc(self.allocator, artifact_profile_catalog_key)) orelse return false;
         defer self.allocator.free(value);
         return std.mem.eql(u8, value, expected);
     }
@@ -506,7 +506,7 @@ pub const Handle = struct {
                     .replay_layout = "native_replay_lanes_in_document_catalog",
                     .index_layout = native_index_layout,
                     .index_namespace = native_index_base_path,
-                    .format_version = native.format_version,
+                    .format_version = if (file.header.indexed_reclamation) 4 else native.format_version,
                     .page_size = file.header.page_size,
                     .active_checkpoint = file.header.active_checkpoint,
                     .checkpoint_sequence = checkpoint.commit_sequence,
@@ -1176,7 +1176,7 @@ test "lite backend reports native storage status from active checkpoint" {
     try std.testing.expectEqualStrings("native_replay_lanes_in_document_catalog", status.replay_layout);
     try std.testing.expectEqualStrings(native_index_layout, status.index_layout);
     try std.testing.expectEqualStrings(native_index_base_path, status.index_namespace.?);
-    try std.testing.expectEqual(native.format_version, status.format_version.?);
+    try std.testing.expectEqual(@as(u32, 4), status.format_version.?);
     try std.testing.expectEqual(native.default_page_size, status.page_size.?);
     try std.testing.expectEqual(handle.native_docstore.?.file.header.active_checkpoint, status.active_checkpoint.?);
     try std.testing.expectEqual(checkpoint.commit_sequence, status.checkpoint_sequence.?);
@@ -1651,7 +1651,13 @@ test "lite backend recovers vector crash orphans only on writer reopen" {
             try storage.writeFileAbsolute(orphan, "orphan");
             try storage.writeFileAbsolute(root ++ "/unmanaged", "keep");
             try storage.writeFileAbsolute(unrelated, "keep");
-            sequence = handle.native_docstore.?.file.activeCheckpoint().commit_sequence;
+        }
+        // Closing joins maintenance; measure the checkpoint after its final
+        // retirement publication so the read-only reopen is the only activity.
+        {
+            var snapshot = try @import("native.zig").NativeFile.open(alloc, fixture.path(), true);
+            defer snapshot.close();
+            sequence = snapshot.activeCheckpoint().commit_sequence;
         }
         for ([_]db_mod.OpenOptions.OpenMode{ .query_readonly, .writer }) |mode| {
             var db = try Connection.open(alloc, fixture.path(), mode);

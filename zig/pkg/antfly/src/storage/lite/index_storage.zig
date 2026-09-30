@@ -769,7 +769,7 @@ test "lite native index storage handles large files rename and delete tree" {
     defer allocator.free(large);
     for (large, 0..) |*byte, i| byte.* = @intCast(i % 251);
 
-    var docs = try docstore.Store.create(allocator, path, true);
+    var docs = try docstore.Store.createWithOptions(allocator, path, .{ .exclusive = true, .reclamation = .{ .page_reuse = false } });
     defer docs.close();
     var index_store = Store.init(allocator, &docs);
     const storage = index_store.storage();
@@ -915,7 +915,7 @@ test "lite native index storage recovers previous checkpoint after interrupted u
     defer allocator.free(path);
 
     {
-        var docs = try docstore.Store.create(allocator, path, true);
+        var docs = try docstore.Store.createWithOptions(allocator, path, .{ .exclusive = true, .reclamation = .{ .page_reuse = false } });
         defer docs.close();
         var index_store = Store.init(allocator, &docs);
         const storage = index_store.storage();
@@ -979,8 +979,10 @@ test "lite native directory operations seek bounded prefixes independent of cata
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "catalog-directory-seek.aflite");
     defer alloc.free(path);
-    var docs = try docstore.Store.create(alloc, path, true);
+    var docs = try docstore.Store.createWithOptions(alloc, path, .{ .exclusive = true, .reclamation = .{ .retirement_work_pages = 1 } });
     defer docs.close();
+    // Isolate query I/O from background retirement; foreground reuse stays on.
+    docs.maintenance_cancel.request();
     var indexes = Store.init(alloc, &docs);
     const storage = indexes.storage();
     for (0..1000) |i| {
@@ -1013,7 +1015,7 @@ test "lite native directory operations seek bounded prefixes independent of cata
     try std.testing.expectError(error.FileNotFound, storage.fileSize("/a/sub/two"));
     try std.testing.expectEqual(@as(u64, 8), try storage.fileSize("/a-other/keep"));
     try std.testing.expectEqual(@as(u64, 1), try storage.fileSize("/unrelated/00000000"));
-    try std.testing.expect((try docs.file.check()).valid);
+    try std.testing.expect((try docs.checkWithCancel(null)).valid);
 }
 
 test "lite native staged atomic writes bound heap and survive concurrent commits and vacuum" {
@@ -1027,7 +1029,7 @@ test "lite native staged atomic writes bound heap and survive concurrent commits
     for (expected, 0..) |*byte, i| byte.* = @intCast(i % 251);
     var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = alloc, .limit = 512 * 1024 };
     {
-        var docs = try docstore.Store.createWithOptions(budget.allocator(), path, .{ .no_sync = true, .io = std.testing.io });
+        var docs = try docstore.Store.createWithOptions(budget.allocator(), path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = std.testing.io });
         defer docs.close();
         docs.file.page_cache_enabled.store(false, .monotonic);
         var indexes = Store.init(budget.allocator(), &docs);
@@ -1080,7 +1082,7 @@ test "lite native staged atomic writes bound heap and survive concurrent commits
         try std.testing.expectEqualSlices(u8, expected, actual);
         // Full integrity checking maintains a separate page reachability set.
         budget.limit = std.math.maxInt(usize);
-        try std.testing.expect((try docs.file.check()).valid);
+        try std.testing.expect((try docs.checkWithCancel(null)).valid);
     }
     try std.testing.expectEqual(@as(usize, 0), budget.live);
     var reopened = try docstore.Store.open(alloc, path, true);
@@ -1134,7 +1136,7 @@ test "lite native staged atomic writes discard failed imports and poisoned sourc
     const value = try storage.readFileAlloc(alloc, "/stable", bytes.len);
     defer alloc.free(value);
     try std.testing.expectEqualSlices(u8, &bytes, value);
-    try std.testing.expect((try docs.file.check()).valid);
+    try std.testing.expect((try docs.checkWithCancel(null)).valid);
 }
 
 test "lite native atomic writes spill with long database basenames" {
@@ -1316,7 +1318,7 @@ test "lite native atomic imports batch writes and preserve publication on failed
     defer alloc.free(bytes);
     for (bytes, 0..) |*byte, i| byte.* = @intCast(i % 251);
     {
-        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
+        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = std.testing.io });
         defer docs.close();
         var indexes = Store.init(alloc, &docs);
         const storage = indexes.storage();
@@ -1487,7 +1489,7 @@ test "lite subtree deletion bounds heap across private batches and preserves sna
         const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/bounded-delete.aflite", .{tmp.sub_path});
         defer a.free(path);
         var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
-        var docs = try docstore.Store.createWithOptions(budget.allocator(), path, .{ .no_sync = true, .io = std.testing.io });
+        var docs = try docstore.Store.createWithOptions(budget.allocator(), path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = std.testing.io });
         defer docs.close();
         docs.file.page_cache_enabled.store(false, .monotonic);
         var arena = std.heap.ArenaAllocator.init(a);
@@ -1522,7 +1524,7 @@ test "lite subtree deletion bounds heap across private batches and preserves sna
         const neighbor = (try docs.file.getIndexCatalogRecordAlloc(a, "/scope-other/keep")).?;
         defer a.free(neighbor);
         try std.testing.expectEqualStrings("neighbor", neighbor);
-        try std.testing.expect((try docs.file.check()).valid);
+        try std.testing.expect((try docs.checkWithCancel(null)).valid);
     }
 }
 
@@ -1532,7 +1534,7 @@ test "lite subtree deletion rolls back earlier private batches on failure" {
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/delete-rollback.aflite", .{tmp.sub_path});
     defer a.free(path);
-    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = std.testing.io });
     defer docs.close();
     docs.file.page_cache_enabled.store(false, .monotonic);
     var arena = std.heap.ArenaAllocator.init(a);
@@ -1553,7 +1555,7 @@ test "lite subtree deletion rolls back earlier private batches on failure" {
     try std.testing.expect(docs.file.test_page_writes.load(.monotonic) > before);
     try std.testing.expectEqual(pinned.index_catalog_root_page, docs.file.activeCheckpoint().index_catalog_root_page);
     try std.testing.expectEqual(size, (try docs.file.file.stat(std.testing.io)).size);
-    try std.testing.expect((try docs.file.check()).valid);
+    try std.testing.expect((try docs.checkWithCancel(null)).valid);
     const retained = (try docs.file.getIndexCatalogRecordAlloc(a, mutations[0].key)).?;
     defer a.free(retained);
     try std.testing.expectEqualStrings("original", retained);
@@ -1568,12 +1570,12 @@ test "lite subtree deletion rolls back earlier private batches on failure" {
         try std.testing.expectError(error.OutOfMemory, result);
         try std.testing.expectEqual(pinned.index_catalog_root_page, docs.file.activeCheckpoint().index_catalog_root_page);
         try std.testing.expectEqual(size, (try docs.file.file.stat(std.testing.io)).size);
-        try std.testing.expect((try docs.file.check()).valid);
+        try std.testing.expect((try docs.checkWithCancel(null)).valid);
     }
     try store.storage().deleteTree("/scope");
     try std.testing.expectEqual(pinned.commit_sequence + 1, docs.file.activeCheckpoint().commit_sequence);
     var cursor = try docs.file.indexCatalogCursor(docs.file.activeCheckpoint(), "/scope/");
     defer cursor.deinit();
     try std.testing.expect((try cursor.next()) == null);
-    try std.testing.expect((try docs.file.check()).valid);
+    try std.testing.expect((try docs.checkWithCancel(null)).valid);
 }

@@ -1871,6 +1871,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lite-storage-test", "Run all Lite storage tests without unrelated imported suites").dependOn(&addFilteredTestRunArtifact(b, lite_storage_tests).step);
+    const lite_allocator_tests = b.addTest(.{
+        .root_module = lite_native_test_mod,
+        .filters = &.{ "lite allocator v4", "lite reclamation", "lite group commit", "lite online vacuum" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("lite-allocator-test", "Qualify revision-4 ownership, retirement and independent page reuse").dependOn(&addFilteredTestRunArtifact(b, lite_allocator_tests).step);
     const lite_reclamation_tests = b.addTest(.{
         .root_module = lite_native_test_mod,
         .filters = &.{ "lite reclamation", "lite group commit", "lite online vacuum" },

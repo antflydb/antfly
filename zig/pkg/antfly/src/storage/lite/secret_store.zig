@@ -175,6 +175,7 @@ pub const Store = struct {
         defer self.docs.mutex.unlock();
         // Index writers can publish while wrapping; use their latest checkpoint.
         if (try self.head() != previous) return error.Conflict;
+        try self.docs.refreshAdmissionAssumeLocked();
         self.docs.file.putCatalogBatch(&.{
             .{ .key = &entry_key, .value = indexed orelse "", .is_delete = value == null },
             .{ .key = &(self.prefix ++ "head".*), .value = &head_bytes },

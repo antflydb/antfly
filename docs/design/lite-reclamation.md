@@ -2,28 +2,32 @@
 
 Issue: [#939](https://github.com/antflydb/antfly/issues/939).
 
-## Decision and implementation boundary
+## Decision
 
-Native Lite owns reclamation, maintenance scheduling, publication, and reader
-retention accounting. Applications supply budgets; they do not close/reopen the
-database or start a second writer to maintain it.
+Native Lite owns incremental retirement, page reuse, maintenance scheduling,
+shrinking, atomic publication, and retained-reader accounting. Applications supply
+budgets; ordinary overwrite workloads do not require a full rewrite.
 
-The current implementation supplies an automatic owner-managed generation rewrite
-for existing revision-3 files. It does **not** implement the revision-4 allocator
-described below. In revision 3, rewriting provides both reclamation and shrinking;
-disabling automatic rewriting therefore disables automatic reclamation too.
+The owner creates revision-4 files (`AFLITE\x04P`) by default. Writable revision-3
+owners migrate through an explicitly identified compact image and atomic generation
+adoption. Read-only opens preserve revision 3. Raw native format primitives retain
+their revision-3 default for compatibility; `CreateOptions.indexed_reclamation`
+selects revision 4. Older binaries reject the new signature. `page_reuse = false`
+opts out of creating/migrating revision 4; an existing revision-4 file still uses
+its required ownership machinery.
 
-The permanent architecture is indexed copy-on-write storage with incremental
-retirement, generation-aware reuse, and a persistent extent allocator. A full
-rewrite remains useful for migration, repacking sparse record bundles, and returning
-capacity to the filesystem. It must not be required to bound ordinary overwrite
-history once the new allocator is qualified.
+The implementation uses journaled ownership counters and a hierarchical free-page
+bitmap. This replaces the proposed free-extent tree: dense counters also represent
+shared value ownership and packed-slot occupancy, and a bitmap remains compact
+under arbitrary fragmentation. Allocation prefers the lowest free page, naturally
+consuming contiguous runs, with eight summary levels rather than a file scan.
+Journal replay and periodic metadata checkpoints supply durable free capacity;
+commits do not serialize the entire free set or traverse historical records.
 
-No implementation can be called maximally efficient without measured workload and
-latency constraints. The design minimizes asymptotic foreground work and makes the
-remaining tradeoffs measurable.
+This is an asymptotic design choice, not a claim of globally optimal measured
+latency. The memory/write tradeoff and qualification requirements are below.
 
-## Revision-3 owner policy
+## Owner policy and independent shrinking
 
 `storage/lite/reclamation.zig` contains the policy; `docstore.Store` owns its task,
 cancel token, snapshots, resource admission, and result. Options propagate through
@@ -52,7 +56,7 @@ exceeds twice estimated compact size and estimated savings reach 256 MiB. These
 are provisional, configurable defaults; sustained benchmark qualification must
 precede a release-level numerical performance promise.
 
-The task is lazy: small files do not consume a concurrency lane. Mutations signal
+The task is lazy: files without retirement debt or eligible shrinking do not consume a concurrency lane. Mutations signal
 one owner task and requests coalesce. Busy publication and resource deferral retry
 after the configured interval. Read-only handles perform no maintenance. Writable
 reopen assesses outstanding debt synchronously, preventing repeated short CLI
@@ -95,132 +99,131 @@ it conservatively overstates age when its first reader has exited but later
 overlapping readers remain. External-process readers are not counted by the
 in-process registry. Filesystem available capacity still reflects their retention.
 
-## Why a freelist alone cannot fix revision 3
+## Revision-4 ownership and retirement
 
-Current ordered document and catalog indexes accelerate lookup, but global and
-namespace record chains remain authoritative for other operations and integrity
-coverage. Superseded records remain reachable. A periodic mark/sweep can release
-superseded index paths, but it cannot release all old records while these chains
-are retained. The current one-page free map also cannot represent arbitrary free
-capacity. Both issues need explicit structural changes.
+Ordered document, metadata, and artifact indexes are authoritative for point
+lookups, scans, backup, vacuum, and integrity. Document history and namespace-head
+roots are zero. Catalog descriptors contain only the ordered-index root; records
+have zero predecessor links. Deletes remove the index entry without creating a
+history tombstone. Namespace range scans use document-index prefix bounds.
 
-Never reinterpret old chain pointers as non-owning in place: an older reader or
-binary can still traverse them. Upgrade by building an explicitly identified new
-format and atomically adopting it through the database owner.
+Each logical record owns one occupancy count on its physical packed page and one
+reference to its external value root. Packed slots retire independently; the page
+becomes free only after its last slot retires. Long keys occupy independently
+typed immutable key pages. Index nodes own their key references; leaf updates
+retain the existing key identity, so an internal separator cannot retain an old
+record/value payload merely to borrow its key bytes.
 
-## Revision-4 durable structures
+Immutable value nodes own their child edges once. Records, append roots, and
+renamed values can share roots or subtrees. Retiring a value decrements that
+reference; only the final owner queues child decrements. Temporary builder roots
+are either adopted by a parent/record or queued as orphans, including intermediate
+append frontiers. Streaming vacuum catch-up transfers the same ownership and
+builder-root accounting into the unpublished image.
 
-1. **Authoritative ordered indexes.** Document, metadata, and derived-artifact
-   lookup, scans, backup, vacuum, and integrity use their ordered indexes. Deletes
-   remove entries. Global history and namespace-head chains no longer retain old
-   records. Namespace listing is a separate catalog; document ranges use the
-   document index prefix bounds.
-2. **Independent key ownership.** Long separator keys must not borrow entire
-   obsolete document/value records. Store immutable key objects independently,
-   with explicit ownership when shared by leaves and separators. Inline short
-   keys remain inline. This prevents an updated document's old payload from
-   surviving solely because its key remains an internal separator.
-3. **Packed-record ownership.** Retirement applies to slots within a bundle;
-   reuse applies to physical pages. A page becomes reusable only when no live
-   root, retained snapshot, recovery slot, or key object owns any slot. Partially
-   live bundles become candidates for bounded repacking, not freelist pages.
-4. **Persistent free extents.** Replace the one-page free vector with a
-   copy-on-write extent tree, coalescing adjacent free runs and splitting on
-   allocation. Keep a bounded in-memory allocation cache. Consume only changed
-   paths; never serialize the whole free set on every small commit. Prefer
-   contiguous runs for streamed values and retain existing extent-tree locality.
-5. **Persistent retirement queue.** Publish retired pages/slots/subtrees tagged
-   with their last visible checkpoint sequence in the same transaction as the
-   replacement roots. Drain incrementally under byte/time/page budgets. Large
-   deleted values enqueue subtree work rather than synchronously traversing all
-   payload pages on a foreground delete.
-6. **Root identity and sharing.** Appended values share immutable extent subtrees;
-   renames can transfer ownership. Retirement must describe removed ownership,
-   not assume every page beneath an old root is dead. Persistent ownership
-   accounting or a validated old/new structural diff must cover extent subtrees,
-   independent keys and packed slots before publishing free capacity.
+COW index edits queue only replaced/pruned physical nodes and changed records.
+Unchanged index subtrees remain owned. A delete queues its old record in constant
+payload work; retirement subsequently discovers value children in bounded batches.
+The default budget is 128 graph objects per mutation/service iteration, configured
+by `retirement_work_pages`. One extent node can queue at most 64 children. The
+budget counts graph objects, including logical slots; it is not a hard time limit.
 
-The sharing representation is an implementation gate, not an unspecified detail:
-choose and benchmark explicit ownership counts against structural diff retirement
-using real append/rename/delete workloads before accepting format-4 encoding.
-Changing opaque internal external-value references must preserve or explicitly
-restrict shared ownership; a format writer must never infer uniqueness.
+The durable queue is ordered by retirement epoch and event ID. Children inherit
+the parent's epoch, so newly eligible work cannot starve behind newer unsafe
+retirements. Pending events are capped at 1,048,576; admissions fail with
+`LiteRetirementBacklogExceeded` when readers or insufficient service prevent
+progress. The file-byte budget independently bounds retained data and workspace.
+The owner services idle debt and advances fallback checkpoints even when
+`reclamation.enabled = false`. That option controls optional physical shrinking.
 
-## Visibility, crash safety, and reader generations
+## Durable allocator encoding
 
-The safe reuse frontier is constrained by **all** recoverable checkpoint slots,
-active snapshots, and retained durable roots behind unsynced commits. Retiring a
-page after replacing the active root is insufficient while the fallback recovery
-slot still owns it. Free-space and retirement metadata belong to checkpoint roots
-and follow exactly the same durability barriers as data roots.
+The checkpoint's allocator root is a checksummed `free_map` page containing
+`AFL4ALOC`, version 1, and snapshot, pending-queue, and delta-log roots, next event
+ID, covered physical page count, and accumulated delta bytes. Child pages have the
+separate `allocator` page kind. Integers are little endian.
 
-For each commit:
+- `L4SS`: counter snapshot chunks, first physical page and packed 32-bit counts.
+- `L4RQ`: retirement snapshot chunks, 48-byte events (ID, epoch, reference,
+  value length, and kind).
+- `L4DL`: 56-byte tagged counter updates, new retirement events, and completed IDs.
 
-1. Allocate private pages only from durable, validated free extents or the tail.
-2. Build changed data/index/allocator paths and retirement entries privately.
-3. Sync new data and metadata according to the existing durability contract.
-4. Publish the next complete checksummed checkpoint; then publish its selection.
-5. Advance retirement only past the oldest retained recovery/read frontier.
+A counter is an ownership count, zero for reserved allocator metadata, or
+`0x80000000` for a reusable page. Counter changes and queue deltas append per
+publication. Once encoded deltas reach the larger of 256 KiB or twice the counter
+and queue snapshot size, the next publication checkpoints only allocator metadata.
+Previous metadata itself retires behind the same visibility frontier. It does not
+rewrite live document/value bytes. Metadata reservations consume free bits before
+serialization, preventing the allocator from advertising its own pages as free.
 
-An aborted transaction restores allocator roots. A crash before publication may
-leak unreachable tail pages, but cannot make a referenced page free. A crash after
-publication recovers the complete new allocator/data roots together. Opening an
-uncertain owner fences mutations until recovery; it cannot continue from an
-unverified in-memory frontier. Deferred-sync writes must preserve the last durable
-allocator roots as well as data roots.
+Memory is approximately four bytes per physical page plus bitmap summaries (about
+0.1% of file capacity at 4 KiB pages), current delta maps, and the bounded pending
+queue/heap. This deliberately trades a dense ownership table for low lookup cost.
+It is not a constant-memory allocator for arbitrarily large files. At very large
+capacities, paged counter caching or a sparse representation would require a
+separate measured implementation; no such capability is implied by this version.
+Metadata checkpoint work is amortized across accumulated changes; an individual
+checkpoint can still perform work proportional to allocator metadata size.
 
-In-process readers register checkpoint/epoch pins. Reuse need not wait for all
-readers to disappear: pages older than every relevant pin can be reused while
-newer readers continue. External-process readers require a cross-process pin
-protocol, or the documented conservative shared-file-lock fallback. Avoid claiming
-per-reader reclamation with the existing whole-file shared lock. Shared page caches
-must invalidate reused page IDs, including decoded index views and cached links;
-epoch/generation identity belongs to any cache shared between descriptors.
+## Checkpoint, reader, and crash safety
 
-Generation replacement retires the old inode and keeps its descriptors until the
-last snapshot exits. Old inode bytes remain part of total storage pressure even
-when `stat(database_path)` reports the new, smaller file.
+Reuse waits for both valid recovery slots, durable roots retained behind unsynced
+commits, and the oldest in-process reader epoch. Retirement is stamped with the
+actual transaction's next publication epoch, including multiple private index
+materializations. Data and allocator roots use the same sync and checksummed slot
+publication barriers. Failed transactions reload the previous ledger; partial
+private tail pages never enter the committed free bitmap. An uncertain publication
+fences mutations until recovery.
 
-## Separate shrinking policy
+In-process readers use a generation-local intrusive epoch list. Pinning and
+removing an arbitrary reader, and finding the oldest epoch, take constant time.
+The owner invalidates both writer and generation-reader caches before reusing a
+physical ID, including decoded views and cached links. It can reuse pages older
+than all pins while newer readers remain active.
 
-With routine reuse qualified, shrink defaults to a conservative optional policy
-using free-capacity ratio, absolute savings, and hysteresis. Reuse remains enabled
-when automatic shrink is disabled. First truncate already-free tail extents when
-reader/recovery safety permits. Relocate or rewrite to shrink internal holes only
-when expected savings justify I/O and temporary capacity. Do not move pages on
-every commit merely to minimize pathname size. Request coalescing, resource
-admission, cancellation and owner adoption remain shared with the initial policy.
+External readers retain the conservative whole-file shared lock. If the owner
+cannot acquire the exclusive rewrite lock, allocations append while the durable
+free bitmap remains intact. This preserves external snapshots without pretending
+to provide cross-process epoch registration. Generation rewrites keep old inode
+descriptors alive until their final reader exits; those bytes remain charged to
+the aggregate storage budget.
 
-## Growth envelope and qualification
+Opening an allocator verifies root bounds and checks metadata checksums, cycles,
+queue IDs, and counter encoding. Before first reuse, a protected-graph validation
+checks both recovery slots and reconstructs ownership from current indexes plus
+pending retirement. Explicit integrity checks use the same proof. This one-time
+open/reuse proof can read retained values; routine mutations and service never
+perform a whole-file trace. Private vacuum publication rebases retirement epochs
+and writes a metadata checkpoint when discarding earlier private recovery roots.
 
-For rewrite-based reclamation, if successful service starts within D, bounded
-append rate is R and the largest transaction appends B bytes, current-file peak
-is at most the measured trigger envelope plus R*D+B. Charge replacement workspace
-and retained generations separately. This is conditional on successful service;
-disabled/unavailable concurrency, retained generations, capacity pressure and
-repeated busy capture are observable exceptions.
+## Shrinking
 
-For incremental reuse, the target envelope is live pages plus index/key/allocator
-overhead, packed-page slack, recovery generations, reader-retained pages and
-bounded retirement debt. A bounded live key count alone is insufficient when
-reader retention or allowed retirement debt is unbounded. Set high/low pressure
-watermarks and enforce admission when debt cannot be drained within its budget.
+Page reuse is the routine mechanism. Optional automatic shrinking retains the
+owner's conservative amplification, absolute-savings, hysteresis, resource,
+cancellation, and publication policy. Explicit vacuum is also available. Shrinking
+rewrites live indexed data into a compact revision-4 generation, bootstraps its
+ownership ledger once, streams concurrent changes, and atomically adopts it.
+It therefore returns internal holes and packed-page slack to the filesystem
+independently of routine retirement. This implementation uses generation rewriting
+for shrinking; it does not implement an in-place tail-truncation/relocation protocol.
 
-Required qualification includes mixed-size overwrite/delete/reinsert workloads,
-metadata and index churn, value append/rename/subtree deletion, packed records,
-long separator keys, multiple snapshots, overlapping reader epochs, both recovery
-slots, deferred-sync commits, repeated short sessions, cancellation and crashes
-around every allocator/publication boundary. Reopen and validate data and indexes.
+## Status and qualification
 
-Report physical/live/retired/temporary bytes over time, bytes written, foreground
-page work, throughput, latency percentiles, maintenance CPU/I/O/time, and peak
-memory. Compare automatic rewrite, manual rewrite, maintenance disabled, and
-incremental reuse with full vacuum disabled. A plateau test must span multiple
-service cycles, not one successful vacuum. Set numerical latency/I/O gates from
-the application's baseline; the RFC's size thresholds are not benchmark results.
+Status exposes reusable pages, pending retirement objects and pending data objects,
+reused pages, and serviced objects alongside current/retired/workspace bytes,
+reader retention, shrinking state, estimates, and errors. Reuse/service counters
+are scoped to the currently loaded ledger, rather than lifetime-persisted metrics.
 
-Implementation sequence: qualify the revision-3 owner policy; finalize shared
-ownership and format-4 encoding; migrate and validate authoritative indexes;
-integrate retirement and extent allocation; qualify reuse with rewriting disabled;
-then enable independent shrinking defaults. Existing files stay readable, and an
-old binary must reject the new format rather than follow stale historical links.
+The expected growth envelope is live data plus index/key/allocator metadata,
+packed-page slack, both recovery generations, reader-retained pages, and bounded
+retirement debt. Long-lived readers can retain substantial space; a bounded live
+key count alone cannot imply bounded physical space.
+
+Qualification covers overwrite/reopen plateaus with full vacuum disabled, large
+free sets, long keys and splits, packed-slot deletion, shared append/rename graphs,
+bounded retirement batches, concurrent readers, external-lock fallback, unsynced
+commits, fallback recovery, transaction abort, legacy migration, online copy and
+catch-up, allocator corruption, and allocation failures. Full storage suites
+exercise existing backup/import/encryption/replay/resource contracts. Numerical
+throughput, latency-percentile, and I/O promises require workload benchmarks;
+correctness tests and structural page-growth bounds do not establish those claims.

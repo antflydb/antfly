@@ -1,13 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 // Licensed under the Elastic License 2.0 (ELv2).
 
-//! Mechanism-independent owner maintenance policy. Current native files use
-//! generation rewrites for reclamation; shrinking cannot yet be disabled
-//! independently of reclamation. No integrity walk belongs on the commit path.
+//! Owner shrinking policy and storage admission. Revision 4 retires/reuses pages
+//! independently of optional generation shrinking. No integrity walk belongs
+//! on the routine commit path.
 const std = @import("std");
 
 pub const Options = struct {
+    /// Optional physical shrinking. Logical reuse remains independently enabled.
     enabled: bool = true,
+    page_reuse: bool = true,
+    retirement_work_pages: usize = 128,
     assessment_bytes: u64 = 64 * 1024 * 1024,
     minimum_reclaim_bytes: u64 = 256 * 1024 * 1024,
     amplification: u32 = 2,
@@ -22,7 +25,7 @@ pub const Options = struct {
 
     pub fn validate(self: Options) !void {
         if (self.assessment_bytes == 0 or self.minimum_reclaim_bytes == 0 or
-            self.amplification < 2 or self.retry_ms == 0 or
+            self.amplification < 2 or self.retry_ms == 0 or self.retirement_work_pages == 0 or
             (self.max_storage_bytes != 0 and self.max_storage_bytes < 4096)) return error.InvalidLiteMaintenanceOptions;
     }
 };
@@ -39,6 +42,13 @@ pub const Status = struct {
     state: State = .idle,
     reason: Reason = .none,
     current_file_bytes: u64 = 0,
+    allocator_enabled: bool = false,
+    shrinking_enabled: bool = false,
+    reusable_pages: u64 = 0,
+    pending_retirement_objects: u64 = 0,
+    pending_data_retirement_objects: u64 = 0,
+    reused_pages: u64 = 0,
+    retired_objects_serviced: u64 = 0,
     retired_file_bytes: u64 = 0,
     retired_generations: u64 = 0,
     retained_readers: u64 = 0,
