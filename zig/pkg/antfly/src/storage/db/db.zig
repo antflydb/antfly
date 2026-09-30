@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const ha_write_gate_adapter = @import("../hot_standby/write_gate.zig");
 const std = @import("std");
 const GraphTtlSha256 = @import("antfly_hash").Sha256;
 const ha_contract = @import("ha_contract.zig");
@@ -20,7 +21,8 @@ const durable_outbox = @import("durable_outbox.zig");
 const durable_outbox_store = @import("durable_outbox_store.zig");
 const apply_receipts = @import("apply_receipts.zig");
 const ha_sync_wait = @import("../hot_standby/sync_wait.zig");
-const ha_db_commit = @import("../hot_standby/db_commit.zig");
+const ha_db_commit = @import("commit_integration.zig");
+const ha_publisher_adapter = @import("../hot_standby/db_commit.zig");
 const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
 const ant_json = @import("antfly-json");
 const vector_mod = @import("antfly_vector").vector;
@@ -99,7 +101,7 @@ test {
 }
 
 const change_journal_mod = @import("derived/change_journal.zig");
-const ha_effects_mod = @import("../hot_standby/effects.zig");
+const ha_effects_mod = @import("replication_effects.zig");
 const ha_commit_gate_mod = @import("../hot_standby/commit_gate.zig");
 const ha_fencing_mod = @import("../hot_standby/fencing.zig");
 const ha_mutation_barrier_mod = @import("../hot_standby/mutation_barrier.zig");
@@ -796,15 +798,13 @@ test "uninstalled enrichment config releases owned chunk provider routing" {
 pub const HAAsyncEffectMirror = ha_contract.AsyncEffectMirror;
 pub const HASyncWaitFn = ha_contract.SyncWaitFn;
 
-pub const HAProgressPollFn = ha_sync_wait.HAProgressPollFn;
-
 const HADeferredCommitGate = ha_db_commit.HADeferredCommitGate;
 
 const HADeferredCommitGates = ha_db_commit.HADeferredCommitGates;
 
-pub const HAPrimaryProgressSyncWait = ha_sync_wait.HAPrimaryProgressSyncWait;
+const HAPrimaryProgressSyncWait = ha_sync_wait.HAPrimaryProgressSyncWait;
 
-pub const HASessionSyncWait = ha_sync_wait.HASessionSyncWait;
+const HASessionSyncWait = ha_sync_wait.HASessionSyncWait;
 
 pub const HAAsyncBatchMirror = ha_contract.AsyncBatchMirror;
 pub const HAAsyncMetadataMirror = ha_contract.AsyncMetadataMirror;
@@ -9861,7 +9861,7 @@ pub const DB = struct {
         if (ha_lsn) |lsn| try metadata_writes.append(self.alloc, haAppliedReplicationLsnWrite(lsn, &ha_marker_buf));
         if (ha_payload) |payload| {
             const mirror = self.ha_async_batch_mirror orelse return error.HAMirrorUnavailable;
-            const from_lsn = mirror.primary.nextLsn();
+            const from_lsn = mirror.publisher.nextLsn();
             outbox_value = try encodeDurableHAOutboxAlloc(self.alloc, from_lsn, payload);
             outbox_key = try durableHAOutboxKeyAlloc(self.alloc, .restore_batch, from_lsn, self.core.root_generation, payload);
             try metadata_writes.append(self.alloc, .{ .key = outbox_key.?, .value = outbox_value.? });
@@ -10174,7 +10174,7 @@ pub const DB = struct {
             // This is a WAL search lower bound, not an LSN reservation.
             // Recovery matches the exact payload and owner identity under the
             // transition/log locks even if another publisher appended first.
-            const from_lsn = self.ha_async_metadata_mirror.?.primary.nextLsn();
+            const from_lsn = self.ha_async_metadata_mirror.?.publisher.nextLsn();
             const encoded = try encodeDurableHAOutboxAlloc(self.alloc, from_lsn, payload);
             errdefer self.alloc.free(encoded);
             const key = try durableHAOutboxKeyAlloc(self.alloc, .row_policy, from_lsn, self.core.root_generation, payload);
@@ -12986,7 +12986,7 @@ pub const DB = struct {
         if (!opts.bypass_ha_write_gate and (opts.transaction_resolution == null or scoped_restore_ha)) {
             if (self.ha_async_batch_mirror) |mirror| if (scoped_restore_ha or haMirrorRequiresDurableOutbox(mirror)) {
                 const payload = preencoded_ha_batch_payload orelse return error.HAMirrorUnavailable;
-                const from_lsn = mirror.primary.nextLsn();
+                const from_lsn = mirror.publisher.nextLsn();
                 const outbox = try encodeDurableHAOutboxAlloc(self.alloc, from_lsn, payload);
                 owned_store_values.append(self.alloc, outbox) catch |err| {
                     self.alloc.free(outbox);
@@ -13008,7 +13008,7 @@ pub const DB = struct {
                 durable_ha_batch_outbox_key = outbox_key;
             };
             if (append_derived_replay and !scoped_restore_ha) if (self.ha_async_effect_mirror) |mirror| if (haMirrorRequiresDurableOutbox(mirror)) {
-                const from_lsn = mirror.primary.nextLsn();
+                const from_lsn = mirror.publisher.nextLsn();
                 const outbox = try encodeDurableHAOutboxAlloc(self.alloc, from_lsn, replay_payload);
                 owned_store_values.append(self.alloc, outbox) catch |err| {
                     self.alloc.free(outbox);
@@ -28338,7 +28338,7 @@ pub const DB = struct {
             null;
         defer if (durable_ha_schema_payload) |payload| self.alloc.free(payload);
         const durable_ha_schema_lsn = if (durable_ha_schema_payload != null)
-            self.ha_async_metadata_mirror.?.primary.nextLsn()
+            self.ha_async_metadata_mirror.?.publisher.nextLsn()
         else
             null;
         const durable_ha_schema_outbox = if (durable_ha_schema_payload) |payload|
@@ -28748,7 +28748,7 @@ pub const DB = struct {
         }
         const ha_outbox = if (ha_payload) |payload| blk: {
             const mirror = self.ha_async_batch_mirror orelse return error.HAMirrorUnavailable;
-            const from_lsn = mirror.primary.nextLsn();
+            const from_lsn = mirror.publisher.nextLsn();
             const encoded = try encodeDurableHAOutboxAlloc(self.alloc, from_lsn, payload);
             const key = try durableHAOutboxKeyAlloc(self.alloc, .restore_batch, from_lsn, self.core.root_generation, payload);
             break :blk .{ .key = key, .value = encoded };
@@ -29078,7 +29078,7 @@ pub const DB = struct {
         else
             null;
         const durable_ha_schema_lsn = if (durable_ha_schema_payload != null)
-            self.ha_async_metadata_mirror.?.primary.nextLsn()
+            self.ha_async_metadata_mirror.?.publisher.nextLsn()
         else
             null;
         const durable_ha_schema_outbox = if (durable_ha_schema_payload) |payload|
@@ -42659,7 +42659,7 @@ pub const DB = struct {
     fn stageRestoreStagingHAOutbox(self: *DB, txn: anytype, payload: ?[]const u8) !void {
         const bytes = payload orelse return;
         const mirror = self.ha_async_batch_mirror orelse return error.HAMirrorUnavailable;
-        const from_lsn = mirror.primary.nextLsn();
+        const from_lsn = mirror.publisher.nextLsn();
         const encoded = try encodeDurableHAOutboxAlloc(self.alloc, from_lsn, bytes);
         defer self.alloc.free(encoded);
         const outbox_key = try durableHAOutboxKeyAlloc(self.alloc, .restore_batch, from_lsn, self.core.root_generation, bytes);
@@ -62124,7 +62124,7 @@ const PrimaryHAEffect = struct {
     fn prepareEncoded(ctx: *const BatchExecutionContext, payload: []u8) !@This() {
         errdefer ctx.alloc.free(payload);
         const mirror = ctx.ha_async_effect_mirror orelse return error.HAMirrorUnavailable;
-        const from_lsn = mirror.primary.nextLsn();
+        const from_lsn = mirror.publisher.nextLsn();
         const key = try durableHAOutboxKeyAlloc(ctx.alloc, .primary_effect, from_lsn, ctx.root_generation, payload);
         errdefer ctx.alloc.free(key);
         const value = try encodeDurableHAOutboxAlloc(ctx.alloc, from_lsn, payload);
@@ -62150,10 +62150,7 @@ const PrimaryHAEffect = struct {
         lockAtomic(ctx.log_mutex);
         defer ctx.log_mutex.*.unlock();
         // A failed append keeps the outbox, even under asynchronous policy.
-        const lsn = ha_effects_mod.appendEncodedDerivedChangeRecord(mirror.primary, payload, .{
-            .shard_id = ctx.identity_namespace.shard_id,
-            .table_id = ctx.identity_namespace.table_id,
-        }) catch |err| {
+        const lsn = mirror.publisher.publish(mirror, .primary_effect, payload, ctx.identity_namespace) catch |err| {
             if (ctx.async_context) |async_ctx| async_ctx.primary_ha_append_pending.store(true, .release);
             noteHAMirrorFailure(mirror, "primary effect", err);
             return err;
@@ -65045,11 +65042,11 @@ test "storage.hot_standby resolution handoff fence rejects completion after dura
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
         .ha_async_effect_mirror = .{
-            .primary = &primary,
+            .publisher = ha_publisher_adapter.bind(&primary),
             .mutation_barrier = &barrier,
             .transition_mutex = &transition_mutex,
         },
-        .ha_write_gate = .{ .shared = .{ .state = &public_gate } },
+        .ha_write_gate = .{ .shared = .{ .state = public_gate.storageWriteState() } },
         .start_index_workers = false,
     });
     defer db.close();
@@ -86884,8 +86881,8 @@ test "row-policy Raft apply persists fail-closed intent and finalizes after rest
         }, .{});
         defer primary.close();
         var mirrored_options = options;
-        mirrored_options.ha_async_batch_mirror = .{ .primary = &primary };
-        mirrored_options.ha_async_metadata_mirror = .{ .primary = &primary };
+        mirrored_options.ha_async_batch_mirror = .{ .publisher = ha_publisher_adapter.bind(&primary) };
+        mirrored_options.ha_async_metadata_mirror = .{ .publisher = ha_publisher_adapter.bind(&primary) };
         var mirrored = try DB.open(alloc, path, mirrored_options);
         defer mirrored.close();
         try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.active, mirrored.row_policy_gate.currentPhase());
@@ -113565,7 +113562,7 @@ test "storage.hot_standby db mirrors appended derived replay records into HA str
         var db = try DB.open(alloc, std.mem.span(db_path), .{
             .identity_namespace = .{ .shard_id = 3, .table_id = 9 },
             .ha_async_effect_mirror = .{
-                .primary = &primary,
+                .publisher = ha_publisher_adapter.bind(&primary),
                 .last_lsn = &last_lsn,
                 .failure_count = &failures,
             },
@@ -113625,7 +113622,8 @@ test "storage.hot_standby db waits for remote apply before completing derived en
     const SyncWait = struct {
         calls: u64 = 0,
 
-        fn wait(ctx: *anyopaque, primary_arg: *ha_primary_mod.Primary, target_lsn: u64, policy: ha_primary_mod.SyncPolicy) !void {
+        fn wait(ctx: *anyopaque, primary_arg_ctx: *anyopaque, target_lsn: u64, policy: ha_primary_mod.SyncPolicy) !void {
+            const primary_arg: *ha_primary_mod.Primary = @ptrCast(@alignCast(primary_arg_ctx));
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.calls += 1;
             try std.testing.expectEqual(ha_primary_mod.DurabilityMode.remote_apply, policy.mode);
@@ -113642,7 +113640,7 @@ test "storage.hot_standby db waits for remote apply before completing derived en
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .identity_namespace = .{ .shard_id = 3, .table_id = 9 },
         .ha_async_effect_mirror = .{
-            .primary = &primary,
+            .publisher = ha_publisher_adapter.bind(&primary),
             .last_lsn = &last_lsn,
             .sync_policy = .{
                 .mode = .remote_apply,
@@ -113729,7 +113727,7 @@ test "storage.hot_standby db mirrors committed batch mutations into HA stream fo
         var db = try DB.open(alloc, std.mem.span(primary_db_path), .{
             .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
             .ha_async_batch_mirror = .{
-                .primary = &primary,
+                .publisher = ha_publisher_adapter.bind(&primary),
                 .last_lsn = &last_lsn,
                 .failure_count = &failures,
             },
@@ -113767,9 +113765,9 @@ test "storage.hot_standby db mirrors committed batch mutations into HA stream fo
 
     var standby_db = try DB.open(alloc, std.mem.span(standby_db_path), .{
         .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
-        .ha_write_gate = .{ .standby = &standby },
+        .ha_write_gate = .{ .standby = ha_write_gate_adapter.bindStandby(&standby) },
         .ha_async_batch_mirror = .{
-            .primary = &primary,
+            .publisher = ha_publisher_adapter.bind(&primary),
             .last_lsn = &last_lsn,
             .failure_count = &failures,
         },
@@ -113814,7 +113812,7 @@ test "storage.hot_standby seed capture barrier prevents local commit without mat
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
         .ha_async_batch_mirror = .{
-            .primary = &primary,
+            .publisher = ha_publisher_adapter.bind(&primary),
             .mutation_barrier = &barrier,
         },
         .start_index_workers = false,
@@ -113898,7 +113896,7 @@ test "storage.hot_standby seed snapshot predrains enrichment before exclusive ca
             .inline_retry_max_attempts = 1,
         },
         .ha_async_batch_mirror = .{
-            .primary = &primary,
+            .publisher = ha_publisher_adapter.bind(&primary),
             .mutation_barrier = &barrier,
         },
     });
@@ -113984,11 +113982,11 @@ test "storage.hot_standby fence cannot strand a local commit beyond the HA tail"
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
         .ha_async_batch_mirror = .{
-            .primary = &primary,
+            .publisher = ha_publisher_adapter.bind(&primary),
             .mutation_barrier = &barrier,
             .transition_mutex = &transition_mutex,
         },
-        .ha_write_gate = .{ .shared = .{ .state = &public_gate } },
+        .ha_write_gate = .{ .shared = .{ .state = public_gate.storageWriteState() } },
         .start_index_workers = false,
     });
     defer db.close();
@@ -114059,7 +114057,7 @@ test "storage.hot_standby schema json mutation does not reacquire shared barrier
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .identity_namespace = .{ .shard_id = 6, .table_id = 12 },
         .ha_async_metadata_mirror = .{
-            .primary = &primary,
+            .publisher = ha_publisher_adapter.bind(&primary),
             .mutation_barrier = &barrier,
             .last_lsn = &last_lsn,
             .failure_count = &failures,
@@ -114151,7 +114149,7 @@ test "storage.hot_standby db evaluates sync commit gate for mirrored batch mutat
     {
         var db = try DB.open(alloc, std.mem.span(db_path), .{
             .ha_async_batch_mirror = .{
-                .primary = &primary,
+                .publisher = ha_publisher_adapter.bind(&primary),
                 .last_lsn = &last_lsn,
                 .sync_policy = .{
                     .mode = .remote_write,
@@ -114209,7 +114207,8 @@ test "storage.hot_standby db block sync policy waits for standby acknowledgement
     const SyncWait = struct {
         calls: u64 = 0,
 
-        fn wait(ctx: *anyopaque, primary_arg: *ha_primary_mod.Primary, target_lsn: u64, policy: ha_primary_mod.SyncPolicy) !void {
+        fn wait(ctx: *anyopaque, primary_arg_ctx: *anyopaque, target_lsn: u64, policy: ha_primary_mod.SyncPolicy) !void {
+            const primary_arg: *ha_primary_mod.Primary = @ptrCast(@alignCast(primary_arg_ctx));
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.calls += 1;
             try std.testing.expectEqual(ha_primary_mod.DurabilityMode.remote_write, policy.mode);
@@ -114225,7 +114224,7 @@ test "storage.hot_standby db block sync policy waits for standby acknowledgement
     const standby_names = [_][]const u8{"standby-a"};
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .ha_async_batch_mirror = .{
-            .primary = &primary,
+            .publisher = ha_publisher_adapter.bind(&primary),
             .last_lsn = &last_lsn,
             .sync_policy = .{
                 .mode = .remote_write,
@@ -114292,7 +114291,8 @@ test "storage.hot_standby synchronous waits pipeline later commits by lsn" {
         first_waiting: std.atomic.Value(u8) = .init(0),
         second_acknowledged: std.atomic.Value(u8) = .init(0),
 
-        fn wait(ctx: *anyopaque, primary_arg: *ha_primary_mod.Primary, target_lsn: u64, _: ha_primary_mod.SyncPolicy) !void {
+        fn wait(ctx: *anyopaque, primary_arg_ctx: *anyopaque, target_lsn: u64, _: ha_primary_mod.SyncPolicy) !void {
+            const primary_arg: *ha_primary_mod.Primary = @ptrCast(@alignCast(primary_arg_ctx));
             const self: *@This() = @ptrCast(@alignCast(ctx));
             if (target_lsn == 1) {
                 self.first_waiting.store(1, .release);
@@ -114328,7 +114328,7 @@ test "storage.hot_standby synchronous waits pipeline later commits by lsn" {
     const standby_names = [_][]const u8{"standby-a"};
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .ha_async_batch_mirror = .{
-            .primary = &primary,
+            .publisher = ha_publisher_adapter.bind(&primary),
             .last_lsn = &last_lsn,
             .sync_policy = .{
                 .mode = .remote_write,
@@ -114397,7 +114397,8 @@ test "storage.hot_standby durable outbox recovery does not duplicate an appended
     const SyncWait = struct {
         calls: usize = 0,
 
-        fn wait(ctx: *anyopaque, primary_arg: *ha_primary_mod.Primary, target_lsn: u64, _: ha_primary_mod.SyncPolicy) !void {
+        fn wait(ctx: *anyopaque, primary_arg_ctx: *anyopaque, target_lsn: u64, _: ha_primary_mod.SyncPolicy) !void {
+            const primary_arg: *ha_primary_mod.Primary = @ptrCast(@alignCast(primary_arg_ctx));
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.calls += 1;
             try primary_arg.standbyStatusUpdate("standby-a", primary_arg.identity.timeline_id, target_lsn, target_lsn);
@@ -114409,7 +114410,7 @@ test "storage.hot_standby durable outbox recovery does not duplicate an appended
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
         .ha_async_batch_mirror = .{
-            .primary = &primary,
+            .publisher = ha_publisher_adapter.bind(&primary),
             .last_lsn = &last_lsn,
             .sync_policy = .{
                 .mode = .remote_write,
@@ -114439,7 +114440,7 @@ test "storage.hot_standby durable outbox recovery does not duplicate an appended
     // Model a crash after the HA append succeeds but before the local outbox
     // delete commits. Recovery must acknowledge this exact record, not append
     // the non-idempotent request a second time.
-    const appended_lsn = try ha_effects_mod.appendEncodedBatchMutationRequest(&primary, payload, .{
+    const appended_lsn = try @import("../hot_standby/effects.zig").appendEncodedBatchMutationRequest(&primary, payload, .{
         .shard_id = 4,
         .table_id = 10,
     });
@@ -114528,7 +114529,7 @@ test "storage.hot_standby db session sync wait satisfies remote apply through st
 
     var standby_db = try DB.open(alloc, std.mem.span(standby_db_path), .{
         .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
-        .ha_write_gate = .{ .standby = &standby },
+        .ha_write_gate = .{ .standby = ha_write_gate_adapter.bindStandby(&standby) },
         .start_index_workers = false,
     });
     defer standby_db.close();
@@ -114548,7 +114549,7 @@ test "storage.hot_standby db session sync wait satisfies remote apply through st
     var primary_db = try DB.open(alloc, std.mem.span(primary_db_path), .{
         .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
         .ha_async_batch_mirror = .{
-            .primary = &primary,
+            .publisher = ha_publisher_adapter.bind(&primary),
             .last_lsn = &last_lsn,
             .sync_policy = .{
                 .mode = .remote_apply,
@@ -114628,7 +114629,7 @@ test "storage.hot_standby db allows progress but rejects acknowledgement when fe
     defer standby.close();
     var standby_db = try DB.open(alloc, std.mem.span(standby_db_path), .{
         .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
-        .ha_write_gate = .{ .standby = &standby },
+        .ha_write_gate = .{ .standby = ha_write_gate_adapter.bindStandby(&standby) },
         .start_index_workers = false,
     });
     defer standby_db.close();
@@ -114646,7 +114647,8 @@ test "storage.hot_standby db allows progress but rejects acknowledgement when fe
         primary_db: ?*DB = null,
         calls: u64 = 0,
 
-        fn wait(ctx: *anyopaque, primary_arg: *ha_primary_mod.Primary, target_lsn: u64, policy: ha_primary_mod.SyncPolicy) !void {
+        fn wait(ctx: *anyopaque, primary_arg_ctx: *anyopaque, target_lsn: u64, policy: ha_primary_mod.SyncPolicy) !void {
+            const primary_arg: *ha_primary_mod.Primary = @ptrCast(@alignCast(primary_arg_ctx));
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.calls += 1;
             // Remote progress must be able to enter while the client waits;
@@ -114690,7 +114692,7 @@ test "storage.hot_standby db allows progress but rejects acknowledgement when fe
     var primary_db = try DB.open(alloc, std.mem.span(primary_db_path), .{
         .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
         .ha_async_batch_mirror = .{
-            .primary = &primary,
+            .publisher = ha_publisher_adapter.bind(&primary),
             .transition_mutex = &transition_mutex,
             .mutation_barrier = &mutation_barrier,
             .sync_policy = .{
@@ -114701,7 +114703,7 @@ test "storage.hot_standby db allows progress but rejects acknowledgement when fe
             .sync_wait_ctx = &wait_state,
             .sync_wait_fn = FencingRemoteApplyWait.wait,
         },
-        .ha_write_gate = .{ .shared = .{ .state = &public_gate } },
+        .ha_write_gate = .{ .shared = .{ .state = public_gate.storageWriteState() } },
         .start_index_workers = false,
     });
     defer primary_db.close();
@@ -114788,7 +114790,7 @@ test "storage.hot_standby db session sync wait remote write acknowledges durable
     var primary_db = try DB.open(alloc, std.mem.span(primary_db_path), .{
         .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
         .ha_async_batch_mirror = .{
-            .primary = &primary,
+            .publisher = ha_publisher_adapter.bind(&primary),
             .last_lsn = &last_lsn,
             .sync_policy = .{
                 .mode = .remote_write,
@@ -114880,7 +114882,7 @@ test "storage.hot_standby db primary progress sync wait observes reported remote
     const standby_names = [_][]const u8{"standby-a"};
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .ha_async_batch_mirror = .{
-            .primary = &primary,
+            .publisher = ha_publisher_adapter.bind(&primary),
             .sync_policy = .{
                 .mode = .remote_apply,
                 .standby_names = &standby_names,
@@ -114993,7 +114995,7 @@ test "storage.hot_standby db primary progress sync wait returns would block with
     const standby_names = [_][]const u8{"standby-a"};
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .ha_async_batch_mirror = .{
-            .primary = &primary,
+            .publisher = ha_publisher_adapter.bind(&primary),
             .sync_policy = .{
                 .mode = .remote_write,
                 .standby_names = &standby_names,
@@ -115051,7 +115053,7 @@ test "storage.hot_standby pending acknowledgement preserves batch and replay tai
     var wait_state = HAPrimaryProgressSyncWait{ .max_rounds = 1 };
     const standby_names = [_][]const u8{"standby-a"};
     const mirror = HAAsyncEffectMirror{
-        .primary = &primary,
+        .publisher = ha_publisher_adapter.bind(&primary),
         .sync_policy = .{
             .mode = .remote_write,
             .standby_names = &standby_names,
@@ -115119,7 +115121,8 @@ test "db transaction HA retry drains durable mirror outbox" {
     try primary.createSlot("standby-a", 0);
     const AckOnRetry = struct {
         calls: usize = 0,
-        fn wait(ctx: *anyopaque, active_primary: *ha_primary_mod.Primary, target_lsn: u64, _: ha_primary_mod.SyncPolicy) !void {
+        fn wait(ctx: *anyopaque, active_primary_ctx: *anyopaque, target_lsn: u64, _: ha_primary_mod.SyncPolicy) !void {
+            const active_primary: *ha_primary_mod.Primary = @ptrCast(@alignCast(active_primary_ctx));
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.calls += 1;
             if (self.calls == 1) return error.InjectedMirrorWaitFailure;
@@ -115130,7 +115133,7 @@ test "db transaction HA retry drains durable mirror outbox" {
     const standby_names = [_][]const u8{"standby-a"};
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .ha_async_batch_mirror = .{
-            .primary = &primary,
+            .publisher = ha_publisher_adapter.bind(&primary),
             .sync_policy = .{
                 .mode = .remote_write,
                 .standby_names = &standby_names,
@@ -115206,7 +115209,7 @@ test "storage.hot_standby db primary progress sync wait survives primary restart
         var waits = @import("antfly_platform").atomic.Value(u64).init(0);
         var db = try DB.open(alloc, std.mem.span(db_path), .{
             .ha_async_batch_mirror = .{
-                .primary = &primary,
+                .publisher = ha_publisher_adapter.bind(&primary),
                 .sync_policy = policy,
                 .sync_wait_ctx = &wait_state,
                 .sync_wait_fn = HAPrimaryProgressSyncWait.wait,
@@ -115281,7 +115284,7 @@ test "storage.hot_standby db block sync policy surfaces wait provider errors" {
     const SyncWait = struct {
         calls: u64 = 0,
 
-        fn timeout(ctx: *anyopaque, _: *ha_primary_mod.Primary, _: u64, _: ha_primary_mod.SyncPolicy) !void {
+        fn timeout(ctx: *anyopaque, _: *anyopaque, _: u64, _: ha_primary_mod.SyncPolicy) !void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.calls += 1;
             return error.HASyncCommitWaitTimeout;
@@ -115295,7 +115298,7 @@ test "storage.hot_standby db block sync policy surfaces wait provider errors" {
     const standby_names = [_][]const u8{"standby-a"};
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .ha_async_batch_mirror = .{
-            .primary = &primary,
+            .publisher = ha_publisher_adapter.bind(&primary),
             .sync_policy = .{
                 .mode = .remote_apply,
                 .standby_names = &standby_names,
@@ -115354,7 +115357,7 @@ test "storage.hot_standby db fail-closed sync policy rejects before local batch 
     const standby_names = [_][]const u8{"standby-a"};
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .ha_async_batch_mirror = .{
-            .primary = &primary,
+            .publisher = ha_publisher_adapter.bind(&primary),
             .sync_policy = .{
                 .mode = .remote_write,
                 .standby_names = &standby_names,
@@ -115446,7 +115449,8 @@ test "storage.hot_standby schema wait failure reports unknown after durable loca
     const FailOnceWait = struct {
         calls: usize = 0,
 
-        fn wait(ctx: *anyopaque, active_primary: *ha_primary_mod.Primary, target_lsn: u64, _: ha_primary_mod.SyncPolicy) !void {
+        fn wait(ctx: *anyopaque, active_primary_ctx: *anyopaque, target_lsn: u64, _: ha_primary_mod.SyncPolicy) !void {
+            const active_primary: *ha_primary_mod.Primary = @ptrCast(@alignCast(active_primary_ctx));
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.calls += 1;
             if (self.calls == 1) return error.InjectedSchemaMirrorWaitFailure;
@@ -115458,7 +115462,7 @@ test "storage.hot_standby schema wait failure reports unknown after durable loca
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .identity_namespace = .{ .shard_id = 5, .table_id = 12 },
         .ha_async_metadata_mirror = .{
-            .primary = &primary,
+            .publisher = ha_publisher_adapter.bind(&primary),
             .sync_policy = .{
                 .mode = .remote_apply,
                 .standby_names = &standby_names,
@@ -115546,7 +115550,7 @@ test "storage.hot_standby db mirrors and applies schema metadata mutation record
         var db = try DB.open(alloc, std.mem.span(primary_db_path), .{
             .identity_namespace = .{ .shard_id = 5, .table_id = 11 },
             .ha_async_metadata_mirror = .{
-                .primary = &primary,
+                .publisher = ha_publisher_adapter.bind(&primary),
                 .last_lsn = &last_lsn,
                 .failure_count = &failures,
             },
@@ -115570,7 +115574,7 @@ test "storage.hot_standby db mirrors and applies schema metadata mutation record
 
     var standby_db = try DB.open(alloc, std.mem.span(standby_db_path), .{
         .identity_namespace = .{ .shard_id = 5, .table_id = 11 },
-        .ha_write_gate = .{ .standby = &standby },
+        .ha_write_gate = .{ .standby = ha_write_gate_adapter.bindStandby(&standby) },
         .start_index_workers = false,
     });
     defer standby_db.close();
@@ -115625,8 +115629,8 @@ test "storage.hot_standby row policy metadata publication replays with its exact
     const namespace: DocIdentityNamespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 };
     var owner = try DB.open(alloc, std.mem.span(primary_tmp.path().ptr), .{
         .identity_namespace = namespace,
-        .ha_async_batch_mirror = .{ .primary = &primary, .mutation_barrier = &mutation_barrier },
-        .ha_async_metadata_mirror = .{ .primary = &primary, .mutation_barrier = &mutation_barrier },
+        .ha_async_batch_mirror = .{ .publisher = ha_publisher_adapter.bind(&primary), .mutation_barrier = &mutation_barrier },
+        .ha_async_metadata_mirror = .{ .publisher = ha_publisher_adapter.bind(&primary), .mutation_barrier = &mutation_barrier },
         .start_index_workers = false,
         .start_optional_runtimes = false,
     });
@@ -115732,8 +115736,8 @@ test "storage.hot_standby row policy metadata publication replays with its exact
     owner_open = false;
     var reopened = try DB.open(alloc, std.mem.span(primary_tmp.path().ptr), .{
         .identity_namespace = namespace,
-        .ha_async_batch_mirror = .{ .primary = &primary, .mutation_barrier = &mutation_barrier },
-        .ha_async_metadata_mirror = .{ .primary = &primary, .mutation_barrier = &mutation_barrier },
+        .ha_async_batch_mirror = .{ .publisher = ha_publisher_adapter.bind(&primary), .mutation_barrier = &mutation_barrier },
+        .ha_async_metadata_mirror = .{ .publisher = ha_publisher_adapter.bind(&primary), .mutation_barrier = &mutation_barrier },
         .start_index_workers = false,
         .start_optional_runtimes = false,
     });
@@ -115781,7 +115785,7 @@ test "storage.hot_standby db applies batch mutation records through replication 
     defer standby.close();
     try primary.createSlot("standby-a", 0);
 
-    _ = try ha_effects_mod.appendBatchMutationRequest(alloc, &primary, .{
+    _ = try @import("../hot_standby/effects.zig").appendBatchMutationRequest(alloc, &primary, .{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"replicated-session\"}" }},
         .sync_level = .full_index,
     }, .{});
@@ -115790,14 +115794,14 @@ test "storage.hot_standby db applies batch mutation records through replication 
         .payload_codec = .json,
         .payload = "{\"manifest_id\":\"base-session\"}",
     });
-    _ = try ha_effects_mod.appendDerivedChangeRecord(alloc, &primary, .{
+    _ = try @import("../hot_standby/effects.zig").appendDerivedChangeRecord(alloc, &primary, .{
         .sequence = 1,
         .changed_doc_keys = &.{"doc:a"},
         .target_hints = &.{.full_text},
     }, .{});
 
     var standby_db = try DB.open(alloc, std.mem.span(standby_db_path), .{
-        .ha_write_gate = .{ .standby = &standby },
+        .ha_write_gate = .{ .standby = ha_write_gate_adapter.bindStandby(&standby) },
         .start_index_workers = false,
     });
     defer standby_db.close();
@@ -115882,7 +115886,7 @@ test "storage.hot_standby db persists applied replication marker across reopen" 
     var primary = try ha_primary_mod.Primary.open(alloc, primary_log_path, primary_slots_path, identity, .{});
     defer primary.close();
 
-    _ = try ha_effects_mod.appendBatchMutationRequest(alloc, &primary, .{
+    _ = try @import("../hot_standby/effects.zig").appendBatchMutationRequest(alloc, &primary, .{
         .writes = &.{.{ .key = "doc:persisted-marker", .value = "{\"title\":\"persisted\"}" }},
         .sync_level = .write,
     }, .{});
@@ -115974,7 +115978,7 @@ test "storage.hot_standby db write gate rejects client writes on standby but all
     defer standby.close();
 
     var db = try DB.open(alloc, std.mem.span(db_path), .{
-        .ha_write_gate = .{ .standby = &standby },
+        .ha_write_gate = .{ .standby = ha_write_gate_adapter.bindStandby(&standby) },
         .start_index_workers = false,
     });
     defer db.close();
@@ -116057,11 +116061,11 @@ test "storage.hot_standby db write gate rejects fenced former primary writes" {
     defer ha_fencing_mod.freeReceipt(alloc, receipt);
 
     var db = try DB.open(alloc, std.mem.span(db_path), .{
-        .ha_write_gate = .{ .fenced_primary = .{
+        .ha_write_gate = .{ .fenced_primary = ha_write_gate_adapter.bindFencedPrimary(.{
             .primary = &primary,
             .fence_store = &fence_store,
             .node_id = "primary-a",
-        } },
+        }) },
         .start_index_workers = false,
     });
     defer db.close();
@@ -116073,7 +116077,7 @@ test "storage.hot_standby db write gate rejects fenced former primary writes" {
     const gate = db.ha_write_gate orelse return error.TestExpectedEqual;
     switch (gate) {
         .fenced_primary => |fenced| {
-            const decision = try ha_write_gate_mod.evaluateFencedPrimary(fenced, .{});
+            const decision = try ha_write_gate_mod.evaluateFencedPrimary(try ha_write_gate_mod.runtimeFencedPrimary(fenced), .{});
             try std.testing.expectEqual(ha_write_gate_mod.Action.reject_fenced_primary, decision.action);
         },
         else => return error.TestExpectedEqual,
@@ -116106,7 +116110,7 @@ test "storage.hot_standby db standby role suppresses mutating background runtime
     defer standby.close();
 
     var db = try DB.open(alloc, std.mem.span(db_path), .{
-        .ha_write_gate = .{ .standby = &standby },
+        .ha_write_gate = .{ .standby = ha_write_gate_adapter.bindStandby(&standby) },
         .start_index_workers = true,
         .start_optional_runtimes = true,
         .enrichment = .{ .enable_without_producers = true },
@@ -120708,7 +120712,8 @@ test "db graph ttl HA carries primary effects and duplicate receipt across reope
     try stream.createSlot("standby-a", 0);
     const Wait = struct {
         fail: bool = false,
-        fn wait(ptr: *anyopaque, active: *ha_primary_mod.Primary, target: u64, _: ha_primary_mod.SyncPolicy) !void {
+        fn wait(ptr: *anyopaque, active_ctx: *anyopaque, target: u64, _: ha_primary_mod.SyncPolicy) !void {
+            const active: *ha_primary_mod.Primary = @ptrCast(@alignCast(active_ctx));
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.fail) return error.InjectedTtlHAWait;
             try active.standbyStatusUpdate("standby-a", active.identity.timeline_id, target, target);
@@ -120720,7 +120725,7 @@ test "db graph ttl HA carries primary effects and duplicate receipt across reope
     const primary_opts: OpenOptions = .{
         .start_optional_runtimes = false,
         .ha_async_effect_mirror = .{
-            .primary = &stream,
+            .publisher = ha_publisher_adapter.bind(&stream),
             .last_lsn = &last_lsn,
             .sync_policy = .{ .mode = .remote_apply, .standby_names = &names, .failure_policy = .block },
             .sync_wait_ctx = &wait,
@@ -120810,7 +120815,7 @@ test "db graph ttl HA replicates direct expiration and document relational withd
         var stream = try ha_primary_mod.Primary.open(alloc, log_tmp.path().ptr, slots_tmp.path().ptr, .{ .cluster_id = 200, .shard_id = 3, .table_id = 9, .timeline_id = 1, .epoch = 1 }, .{});
         defer stream.close();
         var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-        var primary = try DB.open(alloc, primary_tmp.path(), .{ .start_optional_runtimes = false, .ha_async_batch_mirror = .{ .primary = &stream }, .ha_async_effect_mirror = .{ .primary = &stream, .last_lsn = &last_lsn } });
+        var primary = try DB.open(alloc, primary_tmp.path(), .{ .start_optional_runtimes = false, .ha_async_batch_mirror = .{ .publisher = ha_publisher_adapter.bind(&stream) }, .ha_async_effect_mirror = .{ .publisher = ha_publisher_adapter.bind(&stream), .last_lsn = &last_lsn } });
         defer primary.close();
         var replica = try DB.open(alloc, replica_tmp.path(), .{ .start_optional_runtimes = false });
         defer replica.close();
@@ -152826,7 +152831,7 @@ test "db ordered artifact inventory reconciles committed receiver catalog before
     defer alloc.free(ha_payload);
     const ha_record: ha_replication_record_mod.RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = ha_payload };
     while (true) {
-        follower.ha_write_gate = .{ .shared = .{ .state = &standby_gate } };
+        follower.ha_write_gate = .{ .shared = .{ .state = standby_gate.storageWriteState() } };
         follower.applyHAReplicationRecord(ha_record) catch |err| {
             follower.ha_write_gate = null;
             if (err != error.ArtifactCatalogDrift) return err;
@@ -152895,7 +152900,7 @@ test "db ordered artifact inventory reconciles committed receiver catalog before
                 saw_pending_repair = true;
                 var repairs = try follower.loadIndexRepairState(alloc);
                 defer repairs.deinit(alloc);
-                follower.ha_write_gate = .{ .shared = .{ .state = &standby_gate } };
+                follower.ha_write_gate = .{ .shared = .{ .state = standby_gate.storageWriteState() } };
                 defer follower.ha_write_gate = null;
                 for (repairs.entries.items) |repair| if (repair.intent.phase != .terminal) {
                     _ = try follower.advanceIndexRepairIntent(alloc, repair.intent.repair_id, .{});
@@ -156261,7 +156266,7 @@ test "db graph ttl HA retirement preserves different replay progress" {
         var stream = try ha_primary_mod.Primary.open(alloc, log_tmp.path().ptr, slots_tmp.path().ptr, .{ .cluster_id = 200, .shard_id = 3, .table_id = 9, .timeline_id = 1, .epoch = 1 }, .{});
         defer stream.close();
         var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-        var primary = try DB.open(alloc, primary_tmp.path(), .{ .start_index_workers = false, .start_optional_runtimes = false, .ha_async_effect_mirror = .{ .primary = &stream, .last_lsn = &last_lsn } });
+        var primary = try DB.open(alloc, primary_tmp.path(), .{ .start_index_workers = false, .start_optional_runtimes = false, .ha_async_effect_mirror = .{ .publisher = ha_publisher_adapter.bind(&stream), .last_lsn = &last_lsn } });
         defer primary.close();
         var replica = try DB.open(alloc, replica_tmp.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
         defer replica.close();

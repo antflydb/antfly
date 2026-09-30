@@ -16,6 +16,7 @@
 //! Transactional source retention lifecycle. Exactly sixteen reusable catalog
 //! slots bound metadata growth; the retained journal's epoch high-watermark
 //! prevents old admissions from resurrecting after a terminal slot is reused.
+const ha_publisher_adapter = @import("../hot_standby/db_commit.zig");
 const std = @import("std");
 const retained = @import("../retained_effects.zig");
 const topology = @import("relational_integrity_topology.zig");
@@ -625,7 +626,8 @@ fn sourceOutboxRecovery(native_authority: bool) !void {
     try primary.createSlot("standby", 0);
     const Ack = struct {
         calls: usize = 0,
-        fn wait(ptr: *anyopaque, stream: *primary_mod.Primary, lsn: u64, _: primary_mod.SyncPolicy) !void {
+        fn wait(ptr: *anyopaque, stream_ctx: *anyopaque, lsn: u64, _: primary_mod.SyncPolicy) !void {
+            const stream: *primary_mod.Primary = @ptrCast(@alignCast(stream_ctx));
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
             if (self.calls == 1) return error.InjectedSourceMirrorWaitFailure;
@@ -647,7 +649,7 @@ fn sourceOutboxRecovery(native_authority: bool) !void {
             .consumer_epoch = 1,
             .copy_attempt = .{ .donor_term = if (native_authority) 0 else 1, .sequence = 1 },
         };
-        db.ha_async_batch_mirror = .{ .primary = &primary, .sync_policy = .{ .mode = .remote_write, .standby_names = &.{"standby"}, .failure_policy = .block }, .sync_wait_ctx = &ack, .sync_wait_fn = Ack.wait };
+        db.ha_async_batch_mirror = .{ .publisher = ha_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .remote_write, .standby_names = &.{"standby"}, .failure_policy = .block }, .sync_wait_ctx = &ack, .sync_wait_fn = Ack.wait };
         const request: @import("types.zig").BatchRequest = .{ .online_source = .{ .admit = .{ .scope = scope } } };
         try std.testing.expectError(error.InjectedSourceMirrorWaitFailure, if (native_authority) db.batch(request) else db.batchRaftReplicatedApply(request, .{ .term = 1, .index = 11 }));
         try std.testing.expectEqual(@as(u64, if (native_authority) 1 else 11), (try db.onlineSourceStatus(scope)).admitted_applied_index);
@@ -659,7 +661,7 @@ fn sourceOutboxRecovery(native_authority: bool) !void {
     {
         var db = try db_mod.DB.open(alloc, path, options);
         defer db.close();
-        db.ha_async_batch_mirror = .{ .primary = &primary, .sync_policy = .{ .mode = .remote_write, .standby_names = &.{"standby"}, .failure_policy = .block }, .sync_wait_ctx = &ack, .sync_wait_fn = Ack.wait };
+        db.ha_async_batch_mirror = .{ .publisher = ha_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .remote_write, .standby_names = &.{"standby"}, .failure_policy = .block }, .sync_wait_ctx = &ack, .sync_wait_fn = Ack.wait };
         const request: @import("types.zig").BatchRequest = .{ .online_source = .{ .admit = .{ .scope = scope } } };
         if (native_authority) try db.batch(request) else try db.batchRaftReplicatedApply(request, .{ .term = 1, .index = 11 });
         try std.testing.expect(ack.calls >= 2);

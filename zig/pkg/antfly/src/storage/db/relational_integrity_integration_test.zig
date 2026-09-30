@@ -13,6 +13,8 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const ha_publisher_adapter = @import("../hot_standby/db_commit.zig");
+const ha_write_gate_adapter = @import("../hot_standby/write_gate.zig");
 const std = @import("std");
 const db_mod = @import("db.zig");
 const integrity = @import("relational_integrity.zig");
@@ -1345,7 +1347,7 @@ test "relational integrity restore follower repairs projection and CHECK debt be
         const encoded = try @import("../schema.zig").serializeSchema(owned, target.core.schema.?);
         const scope: restore.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = source_options.identity_namespace.?, .target_namespace = options.identity_namespace.?, .target_schema_digest = restore.digest(encoded) };
         try target.reserveRestoreStagingScoped(alloc, scope);
-        if (ha) target.ha_write_gate = .{ .shared = .{ .state = &gate } };
+        if (ha) target.ha_write_gate = .{ .shared = .{ .state = gate.storageWriteState() } };
         try applyRestoreReplica(&target, .{ .restore_staging = .{ .begin = scope } }, 1, ha);
         var index: u64 = 2;
         var crashed = false;
@@ -1360,7 +1362,7 @@ test "relational integrity restore follower repairs projection and CHECK debt be
                     open = false;
                     target = try db_mod.DB.open(alloc, path, options);
                     open = true;
-                    if (ha) target.ha_write_gate = .{ .shared = .{ .state = &gate } };
+                    if (ha) target.ha_write_gate = .{ .shared = .{ .state = gate.storageWriteState() } };
                     try applyRestoreReplica(&target, batch, index, ha);
                     // Model the last physical projection watermark being
                     // lost at the crash cut while the primary Raft/HA receipt
@@ -1750,7 +1752,7 @@ test "relational integrity scoped two phase resolution mirrors binary claims thr
     const slots_path = try std.fmt.allocPrintSentinel(owned, ".zig-cache/tmp/{s}/ha-2pc-slots", .{tmp.sub_path}, 0);
     var primary = try primary_mod.Primary.open(alloc, log_path, slots_path, .{ .cluster_id = 1, .timeline_id = 1, .epoch = 1, .table_id = 10, .shard_id = 11 }, .{});
     defer primary.close();
-    target.ha_async_batch_mirror = .{ .primary = &primary, .sync_policy = .{ .mode = .async } };
+    target.ha_async_batch_mirror = .{ .publisher = ha_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .async } };
     defer target.ha_async_batch_mirror = null;
     var view = target.core.acquireSchemaView().?;
     defer view.release();
@@ -1805,7 +1807,7 @@ test "relational integrity live two phase HA replay preserves rows and binary cl
     const slots_path = try std.fmt.allocPrintSentinel(owned, ".zig-cache/tmp/{s}/live-slots", .{tmp.sub_path}, 0);
     var primary = try primary_mod.Primary.open(alloc, log_path, slots_path, .{ .cluster_id = 1, .timeline_id = 1, .epoch = 1, .table_id = 10, .shard_id = 11 }, .{});
     defer primary.close();
-    db.ha_async_batch_mirror = .{ .primary = &primary, .sync_policy = .{ .mode = .async } };
+    db.ha_async_batch_mirror = .{ .publisher = ha_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .async } };
     defer db.ha_async_batch_mirror = null;
     var view = db.core.acquireSchemaView().?;
     defer view.release();
@@ -2268,7 +2270,7 @@ fn testMergeIntegrityHandoff(comptime rollback: bool, comptime empty: bool, comp
     var primary: @import("../hot_standby/primary.zig").Primary = if (ha) try @import("../hot_standby/primary.zig").Primary.open(alloc, try std.fmt.allocPrintSentinel(owned, ".zig-cache/tmp/{s}/ha-log", .{tmp.sub_path}, 0), try std.fmt.allocPrintSentinel(owned, ".zig-cache/tmp/{s}/ha-slots", .{tmp.sub_path}, 0), .{ .cluster_id = 901, .timeline_id = 1, .epoch = 1 }, .{}) else undefined;
     defer if (ha) primary.close();
     const source_options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 900, .shard_id = 901 }, .primary_backend = .{ .lsm = .{} } };
-    const destination_options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 900, .shard_id = 902 }, .primary_backend = .{ .lsm = .{} }, .ha_async_batch_mirror = if (ha) .{ .primary = &primary } else null, .ha_write_gate = if (ha) .{ .primary = &primary } else null };
+    const destination_options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 900, .shard_id = 902 }, .primary_backend = .{ .lsm = .{} }, .ha_async_batch_mirror = if (ha) .{ .publisher = ha_publisher_adapter.bind(&primary) } else null, .ha_write_gate = if (ha) .{ .primary = ha_write_gate_adapter.bindPrimary(&primary) } else null };
     var source = try db_mod.DB.open(alloc, source_path, source_options);
     defer source.close();
     var destination = try db_mod.DB.open(alloc, destination_path, destination_options);

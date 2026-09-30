@@ -13,6 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const ha_publisher_adapter = @import("../storage/hot_standby/db_commit.zig");
 const std = @import("std");
 const store_report_update = @import("../metadata/store_report_update.zig");
 const store_report_baseline = @import("../metadata/store_report_baseline.zig");
@@ -4433,10 +4434,10 @@ pub const HASyncWaitConfig = struct {
     max_rounds: usize = 200,
     sleep_ns: u64 = 10 * std.time.ns_per_ms,
     poll_ctx: ?*anyopaque = null,
-    poll_fn: ?antfly.db.HAProgressPollFn = null,
+    poll_fn: ?antfly.hot_standby.sync_wait.HAProgressPollFn = null,
 };
 
-fn haPrimarySyncWaitFromConfig(cfg: HASyncWaitConfig) antfly.db.HAPrimaryProgressSyncWait {
+fn haPrimarySyncWaitFromConfig(cfg: HASyncWaitConfig) antfly.hot_standby.sync_wait.HAPrimaryProgressSyncWait {
     return .{
         .max_rounds = cfg.max_rounds,
         .sleep_ns = cfg.sleep_ns,
@@ -5720,7 +5721,7 @@ pub const DataServer = struct {
     ha_internal_server: ?antfly.hot_standby.http_internal.Server = null,
     ha_standby_replication_http_executor: ?antfly.common.http.StdHttpExecutor = null,
     ha_promoted_primary: ?antfly.hot_standby.primary.Primary = null,
-    ha_primary_sync_wait: antfly.db.HAPrimaryProgressSyncWait = .{},
+    ha_primary_sync_wait: antfly.hot_standby.sync_wait.HAPrimaryProgressSyncWait = .{},
     ha_primary_mirror_last_lsn: std.atomic.Value(u64) = .init(0),
     ha_primary_mirror_failure_count: std.atomic.Value(u64) = .init(0),
     ha_primary_mirror_last_gate_lsn: std.atomic.Value(u64) = .init(0),
@@ -7141,17 +7142,17 @@ pub const DataServer = struct {
         const generation = self.ha_public_gate_state.currentGeneration();
         try self.ha_public_gate_state.checkWrite(generation);
         const mirror = self.haPrimaryMirror() orelse return error.HACatalogReplicationUnavailable;
-        if (mirror.primary.identity.table_id != 0 or mirror.primary.identity.shard_id != 0)
+        if (mirror.publisher.identity().table_id != 0 or mirror.publisher.identity().shard_id != 0)
             return error.HACatalogRequiresWholeInstance;
         errdefer self.ha_public_gate_state.publishPrimaryFence(true);
-        const lsn = try mirror.primary.append(.{
+        const lsn = try (try ha_publisher_adapter.runtimePrimary(mirror)).append(.{
             .kind = .metadata_mutation,
             .payload_codec = .json,
             .table_id = 0,
             .shard_id = 0,
             .payload = payload,
         });
-        try mirror.primary.log.wal.sync(true);
+        try (try ha_publisher_adapter.runtimePrimary(mirror)).log.wal.sync(true);
         self.ha_primary_mirror_last_lsn.store(lsn, .release);
         return .{ .mirror = mirror, .generation = generation, .lsn = lsn };
     }
@@ -7166,9 +7167,9 @@ pub const DataServer = struct {
             const generation = self.ha_public_gate_state.currentGeneration();
             try self.ha_public_gate_state.checkWrite(generation);
             const mirror = self.haPrimaryMirror() orelse return error.HACatalogReplicationUnavailable;
-            if (mirror.primary.identity.table_id != 0 or mirror.primary.identity.shard_id != 0)
+            if (mirror.publisher.identity().table_id != 0 or mirror.publisher.identity().shard_id != 0)
                 return error.HACatalogRequiresWholeInstance;
-            break :blk .{ .mirror = mirror, .generation = generation, .lsn = mirror.primary.lastLsn() };
+            break :blk .{ .mirror = mirror, .generation = generation, .lsn = (try ha_publisher_adapter.runtimePrimary(mirror)).lastLsn() };
         };
         try self.acknowledgeHACatalogCreate(commit);
     }
@@ -7180,12 +7181,12 @@ pub const DataServer = struct {
         const mirror = commit.mirror;
         // Do not hold the transition mutex while waiting for receiver acks.
         if (mirror.sync_wait_fn) |wait| {
-            try wait(mirror.sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.primary, commit.lsn, mirror.sync_policy);
+            try wait(mirror.sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.publisher.ptr, commit.lsn, mirror.sync_policy);
         }
         platform_sync.lockYielding(&self.ha_state_mutex);
         defer self.ha_state_mutex.unlock();
         try self.ha_public_gate_state.checkWrite(commit.generation);
-        const gate = try antfly.hot_standby.commit_gate.evaluate(mirror.primary, commit.lsn, mirror.sync_policy);
+        const gate = try antfly.hot_standby.commit_gate.evaluate(try ha_publisher_adapter.runtimePrimary(mirror), commit.lsn, mirror.sync_policy);
         if (!gate.shouldAcknowledge()) return error.SyncPolicyUnsatisfied;
     }
 
@@ -7869,7 +7870,7 @@ pub const DataServer = struct {
     fn haWriteGate(self: *DataServer) ?antfly.db.HAWriteGate {
         const ctx = self.ha_cfg.admin_context orelse return null;
         if (ctx.standby != null or ctx.primary != null) return .{ .shared = .{
-            .state = &self.ha_public_gate_state,
+            .state = self.ha_public_gate_state.storageWriteState(),
         } };
         return null;
     }
@@ -7885,7 +7886,7 @@ pub const DataServer = struct {
 
     fn haPrimaryMirrorFor(self: *DataServer, primary: *antfly.hot_standby.primary.Primary) antfly.db.HAAsyncEffectMirror {
         var mirror = antfly.db.HAAsyncEffectMirror{
-            .primary = primary,
+            .publisher = ha_publisher_adapter.bind(primary),
             .mutation_barrier = &self.ha_mutation_barrier,
             .transition_mutex = &self.ha_state_mutex,
             .last_lsn = &self.ha_primary_mirror_last_lsn,
@@ -7899,7 +7900,7 @@ pub const DataServer = struct {
         };
         if (mirror.sync_policy.mode != .async and mirror.sync_policy.failure_policy == .block) {
             mirror.sync_wait_ctx = &self.ha_primary_sync_wait;
-            mirror.sync_wait_fn = antfly.db.HAPrimaryProgressSyncWait.wait;
+            mirror.sync_wait_fn = antfly.hot_standby.sync_wait.HAPrimaryProgressSyncWait.wait;
         }
         return mirror;
     }
@@ -11417,7 +11418,7 @@ pub const DataServer = struct {
             if (self.ha_cfg.internal_primary) |primary| {
                 const admin = self.ha_cfg.admin_context orelse return error.RowPolicyUnsupported;
                 const mirror = self.write_source.ha_async_mirror orelse return error.RowPolicyUnsupported;
-                if (admin.standby != null or admin.primary != primary or mirror.primary != primary or
+                if (admin.standby != null or admin.primary != primary or mirror.publisher.ptr != @as(*anyopaque, @ptrCast(primary)) or
                     primary.identity.table_id != 0 or primary.identity.shard_id != 0)
                     return error.RowPolicyUnsupported;
                 try self.ha_public_gate_state.checkWrite(self.ha_public_gate_state.currentGeneration());
@@ -41721,7 +41722,7 @@ fn consumerTests() type {
             const source_gate = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;
             switch (source_gate) {
                 .shared => |gate| {
-                    try std.testing.expect(gate.state == &server.ha_public_gate_state);
+                    try std.testing.expect(gate.state.ptr == @as(*const anyopaque, @ptrCast(&server.ha_public_gate_state)));
                     try std.testing.expect(gate.generation == null);
                 },
                 .primary, .fenced_primary, .standby => return error.TestExpectedEqual,
@@ -47182,7 +47183,7 @@ fn implementationTests() type {
             defer server.ha_state_mutex.unlock();
             try server.rewireHAPromotionMirrors();
             try std.testing.expectEqual(@as(usize, 1), probe.bound);
-            try std.testing.expect(server.write_source.ha_async_mirror.?.primary == &primary);
+            try std.testing.expect(server.write_source.ha_async_mirror.?.publisher.ptr == @as(*anyopaque, @ptrCast(&primary)));
         }
 
         test "data runtime private cancel proof recovers a restarted native terminal owner" {
@@ -55089,12 +55090,12 @@ fn implementationTests() type {
             try server.initApiServer();
 
             const source_mirror = server.write_source.ha_async_mirror orelse return error.TestExpectedEqual;
-            try std.testing.expect(source_mirror.primary == &primary);
+            try std.testing.expect(source_mirror.publisher.ptr == @as(*anyopaque, @ptrCast(&primary)));
             const owner_mirror = if (comptime linked_storage)
                 server.kernel_owner_source.?.ha_async_mirror orelse return error.TestExpectedEqual
             else
                 server.provisioned_storage.write_cache.ha_async_mirror orelse return error.TestExpectedEqual;
-            try std.testing.expect(owner_mirror.primary == &primary);
+            try std.testing.expect(owner_mirror.publisher.ptr == @as(*anyopaque, @ptrCast(&primary)));
 
             _ = try server.write_source.source().batch(alloc, "docs", .{
                 .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
@@ -55216,7 +55217,7 @@ fn implementationTests() type {
             const source_gate = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;
             switch (source_gate) {
                 .shared => |gate| {
-                    try std.testing.expect(gate.state == &server.ha_public_gate_state);
+                    try std.testing.expect(gate.state.ptr == @as(*const anyopaque, @ptrCast(&server.ha_public_gate_state)));
                     try std.testing.expect(gate.generation == null);
                 },
                 .standby, .fenced_primary, .primary => return error.TestExpectedEqual,
@@ -55225,7 +55226,7 @@ fn implementationTests() type {
             const cache_gate = server.provisioned_storage.write_cache.ha_write_gate orelse return error.TestExpectedEqual;
             switch (cache_gate) {
                 .shared => |gate| {
-                    try std.testing.expect(gate.state == &server.ha_public_gate_state);
+                    try std.testing.expect(gate.state.ptr == @as(*const anyopaque, @ptrCast(&server.ha_public_gate_state)));
                     try std.testing.expect(gate.generation == null);
                 },
                 .standby, .fenced_primary, .primary => return error.TestExpectedEqual,

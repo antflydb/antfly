@@ -14,6 +14,7 @@
 // limitations.
 
 //! End-to-end LSM lifecycle and standby contracts, plus reproducible work counts.
+const ha_publisher_adapter = @import("../hot_standby/db_commit.zig");
 const std = @import("std");
 const db_mod = @import("mod.zig");
 const rows = @import("relational_rows.zig");
@@ -952,7 +953,7 @@ test "relational index system restore receipts require local coverage through fa
             try std.testing.expectEqual(.building, (try target.relationalIndexBuildStatus("tenant_id")).state);
             try std.testing.expectError(error.IndexRebuilding, target.finishRestoreStaging(alloc, scope.digest(), phase));
             if (trial == 1) {
-                target.ha_write_gate = .{ .shared = .{ .state = &standby_gate } };
+                target.ha_write_gate = .{ .shared = .{ .state = standby_gate.storageWriteState() } };
                 try std.testing.expectError(error.HAReadOnlyStandby, target.prepareRestoreStagingIndexesStep(alloc, scope.digest()));
             }
             const request: db_mod.types.BatchRequest = .{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = phase } } };
@@ -985,7 +986,7 @@ test "relational index system restore receipts require local coverage through fa
     try resetRestoreIndexCoverage(&target, false);
     target.close();
     target = try db_mod.DB.open(alloc, target_directory.path(), target_options);
-    target.ha_write_gate = .{ .shared = .{ .state = &standby_gate } };
+    target.ha_write_gate = .{ .shared = .{ .state = standby_gate.storageWriteState() } };
     // Superseded entries and an unrelated scope must not perform maintenance
     // against the current generation, even when its local coverage is missing.
     try target.batchRaftReplicatedApply(.{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .validated } } }, .{ .index = 2, .term = 1 });
@@ -2434,8 +2435,8 @@ test "relational index system standby replays schema churn and rebuilds ready ge
     var last_lsn = std.atomic.Value(u64).init(0);
     var failures = std.atomic.Value(u64).init(0);
     var mirrored = options;
-    mirrored.ha_async_metadata_mirror = .{ .primary = &primary, .last_lsn = &last_lsn, .failure_count = &failures };
-    mirrored.ha_async_batch_mirror = .{ .primary = &primary, .sync_policy = .{ .mode = .async } };
+    mirrored.ha_async_metadata_mirror = .{ .publisher = ha_publisher_adapter.bind(&primary), .last_lsn = &last_lsn, .failure_count = &failures };
+    mirrored.ha_async_batch_mirror = .{ .publisher = ha_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .async } };
     var source = try db_mod.DB.open(alloc, source_path, mirrored);
     defer source.close();
     var replica = try db_mod.DB.open(alloc, replica_path, options);

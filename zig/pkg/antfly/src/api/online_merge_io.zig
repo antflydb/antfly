@@ -71,7 +71,7 @@ test "online merge private standalone rewrite port pins authority and never fabr
     var state: gate_mod.State = .{};
     var probe: Probe = .{ .state = &state };
     const port: Port = .{ .ptr = &probe, .execute_fn = Probe.execute };
-    const gate: @import("../storage/db/ha_contract.zig").WriteGate = .{ .shared = .{ .state = &state } };
+    const gate: @import("../storage/db/ha_contract.zig").WriteGate = .{ .shared = .{ .state = state.storageWriteState() } };
     var request: contract.Request = .{
         .scope = .{
             .fence = .{ .transition_id = 1, .attempt = 0, .admission_epoch = 0, .owner_group_id = 2, .peer_group_id = 3, .role = .rewrite_source, .namespace = .{ .table_id = 1, .shard_id = 12, .range_id = 22 }, .catalog_digest = @splat(0) },

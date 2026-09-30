@@ -121,6 +121,7 @@ comptime {
     _ = @import("db/column_scan_plan.zig");
     _ = @import("db/config.zig");
     _ = @import("db/db.zig");
+    _ = @import("db/commit_integration.zig");
     _ = @import("db/dense_exact.zig");
     _ = @import("db/derived/apply_state.zig");
     _ = @import("db/derived/backlog_tracker.zig");

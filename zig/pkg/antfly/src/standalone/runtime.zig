@@ -13,6 +13,8 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const ha_publisher_adapter = @import("../storage/hot_standby/db_commit.zig");
+const ha_write_gate_adapter = @import("../storage/hot_standby/write_gate.zig");
 const std = @import("std");
 const system_catalog = @import("../system_catalog/domain.zig");
 const ha_wal = @import("../storage/wal_runtime.zig");
@@ -1239,7 +1241,7 @@ const LocalStandaloneMetadata = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         if (self.ha_gate) |gate| gate.check() catch return null;
-        return if (self.ha_mirror) |mirror| mirror.primary.identity.epoch else if (self.coordinated_lifecycle_allowed) 1 else null;
+        return if (self.ha_mirror) |mirror| mirror.publisher.identity().epoch else if (self.coordinated_lifecycle_allowed) 1 else null;
     }
     fn restoreTermCurrent(ptr: *anyopaque, term: u64) bool {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
@@ -1330,7 +1332,7 @@ const LocalStandaloneMetadata = struct {
         self.durable_revision = self.epoch;
     }
     fn requireRestoreJobTermLocked(self: *LocalStandaloneMetadata, term: u64) !void {
-        const current = if (self.ha_mirror) |mirror| mirror.primary.identity.epoch else @as(u64, 1);
+        const current = if (self.ha_mirror) |mirror| mirror.publisher.identity().epoch else @as(u64, 1);
         if (term != current) return error.NotLeader;
     }
     fn restoreJobsPut(ptr: *anyopaque, key: []const u8, value: []const u8, term: u64) !void {
@@ -2080,7 +2082,7 @@ const LocalStandaloneMetadata = struct {
         const owner_mirror = server.write_source.ha_async_mirror orelse return false;
         const admin = server.ha_cfg.admin_context orelse return false;
         if (self.ha_catalog_server != server or admin.standby != null or admin.primary != primary or
-            metadata_mirror.primary != primary or owner_mirror.primary != primary or
+            metadata_mirror.publisher.ptr != @as(*anyopaque, @ptrCast(primary)) or owner_mirror.publisher.ptr != @as(*anyopaque, @ptrCast(primary)) or
             primary.identity.table_id != 0 or primary.identity.shard_id != 0) return false;
         server.ha_public_gate_state.checkWrite(server.ha_public_gate_state.currentGeneration()) catch return false;
         return true;
@@ -12483,7 +12485,7 @@ test "standalone catalog remote apply outage preserves committed creation and re
         }
     };
     var failure_context: u8 = 0;
-    const mirror: antfly.db.HAAsyncEffectMirror = .{ .primary = &primary, .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &failure_context, .sync_wait_fn = Failure.wait };
+    const mirror: antfly.db.HAAsyncEffectMirror = .{ .publisher = ha_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &failure_context, .sync_wait_fn = Failure.wait };
     var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, runtime.ptr(), null, .local);
     var metadata_open = true;
     defer if (metadata_open) metadata.deinit();
@@ -12686,12 +12688,12 @@ test "standalone shared restore HA policy mirrors mixed publication and durable 
     defer metadata.deinit();
     const baseline = try metadata.lifecycle_store.?.exportHACheckpoint(std.testing.io, checkpoint);
     var barrier: antfly.db.HAMutationBarrier = .{};
-    const mirror: antfly.db.HAAsyncEffectMirror = .{ .primary = &primary, .mutation_barrier = &barrier };
+    const mirror: antfly.db.HAAsyncEffectMirror = .{ .publisher = ha_publisher_adapter.bind(&primary), .mutation_barrier = &barrier };
     try LocalStandaloneMetadata.bindHAMetadata(&metadata, .{ .primary = &primary }, mirror);
     try @import("../api/restore_worker_fixture.zig").runWithPolicy(antfly.public_api.http_server.RestoreWorkerTestDriver, false, metadata.statusSource(), metadata.restorePersistence(), .{
         .failover_safe = true,
         .guard = .{ .ptr = &metadata, .is_current = LocalStandaloneMetadata.restoreTermCurrent },
-        .gate = .{ .primary = &primary },
+        .gate = .{ .primary = ha_write_gate_adapter.bindPrimary(&primary) },
         .mirror = mirror,
     });
     const standby_root = try std.fmt.allocPrint(alloc, "{s}/standby-metadata", .{root});

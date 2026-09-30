@@ -122,19 +122,36 @@ dependency layers move):
 - `storage/db/durable_outbox_store.zig` owns bounded pending-page reads,
   rolling-upgrade singleton reads, and exact-key clearing. Publication cannot
   reach arbitrary internal KV keys through this interface.
-- `storage/hot_standby/sync_wait.zig` owns progress and session waits. Physical
-  DB and control facades alias the same implementation, including fast failure
-  when too few eligible standby candidates exist.
-- `storage/hot_standby/db_commit.zig` owns preflight, effect publication,
-  record matching during recovery, acknowledgement decisions, metrics, and
-  transition-lock completion. It takes projected borrowed controls, not a DB
-  or store handle. DB retains the local commit order and apply-lock lifetime.
+- `storage/db/ha_contract.zig` owns borrowed publisher and write-admission
+  interfaces. DB options hold no concrete primary, standby, or fence-store
+  handles. Publishers report live identity rather than copying epoch state.
+- `storage/db/replication_policy.zig` owns policy data and enums; the HA primary
+  reexports the same declarations so callbacks retain one type identity.
+- `storage/db/replication_effects.zig` owns portable mutation codecs. The HA
+  effects adapter reexports those declarations and owns runtime log appends.
+- `storage/db/commit_integration.zig` owns local publication lock ordering,
+  pending-record recovery sequencing, and final authority rechecks. Durability
+  waits run after releasing local log and transition locks; acknowledgement
+  requires reacquiring the transition fence and checking the pinned authority.
+- `storage/hot_standby/db_commit.zig` implements the borrowed publisher using
+  the primary log, record matching, durability decisions, and metrics. Server
+  integrations explicitly validate this adapter before accessing its concrete
+  primary. It receives no DB or store handle.
+- `storage/hot_standby/sync_wait.zig` owns progress and session waits. Server
+  consumers import it directly; the DB/control public facades no longer expose
+  runtime wait implementations. DB integration tests may still use them.
 
-The new owners preserve their extracted Apache license. They remain reachable
-from the embedded build while DB still directly binds HA implementations;
-this extraction does not yet justify removing their Apache source exceptions.
-The next step replaces those direct bindings with engine contracts implemented
-by the server adapter, before moving replay and seed dispatch.
+Borrowed runtime state must outlive the DB and its in-flight operations. The
+interfaces add no allocation and preserve copied option lifetimes. Existing
+Apache headers are preserved on extracted code; this phase does not relicense
+server coordination. Portable codec and commit-ordering tests run alongside
+existing HA integration regressions.
+
+Remaining work includes replay and snapshot/seed adapters, moving server HA
+fixtures out of the physical DB source, and the final package source move.
+The physical DB still imports portable replication wire/receipt formats and
+contains replicated replay entry points; this phase does not claim that an
+Apache-only source build can yet omit the entire HA directory.
 
 The intended dependency direction is server replication adapter -> embedded
 storage operations. The local DB must not import HA sessions, primary/standby

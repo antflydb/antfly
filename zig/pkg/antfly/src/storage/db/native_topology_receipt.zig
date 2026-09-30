@@ -15,6 +15,7 @@
 
 //! Bounded native topology-control deduplication. One slot per role/action
 //! retains the latest fence; the effect, slot and native clock share a txn.
+const ha_publisher_adapter = @import("../hot_standby/db_commit.zig");
 const std = @import("std");
 const topology = @import("relational_integrity_topology_contract.zig");
 const position = @import("receipt_position.zig");
@@ -140,7 +141,7 @@ test "native topology receipts survive restart and exact standby replay without 
     const ns: @import("doc_identity_namespace.zig").Namespace = .{ .table_id = 11, .shard_id = 12, .range_id = 13 };
     const options: db_mod.OpenOptions = .{ .identity_namespace = ns, .online_source_authority = .native, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
     var primary_options = options;
-    primary_options.ha_async_batch_mirror = .{ .primary = &stream };
+    primary_options.ha_async_batch_mirror = .{ .publisher = ha_publisher_adapter.bind(&stream) };
     var primary = try db_mod.DB.open(alloc, primary_path, primary_options);
     var primary_open = true;
     defer if (primary_open) primary.close();

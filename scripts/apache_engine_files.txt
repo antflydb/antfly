@@ -422,6 +422,7 @@ zig/pkg/antfly/src/storage/db/catalog/text_index_maintenance.zig
 zig/pkg/antfly/src/storage/db/column_payloads.zig
 zig/pkg/antfly/src/storage/db/column_read_cache.zig
 zig/pkg/antfly/src/storage/db/column_scan_plan.zig
+zig/pkg/antfly/src/storage/db/commit_integration.zig
 zig/pkg/antfly/src/storage/db/config.zig
 zig/pkg/antfly/src/storage/db/control_root.zig
 zig/pkg/antfly/src/storage/db/core.zig
@@ -575,6 +576,8 @@ zig/pkg/antfly/src/storage/db/relational_row_transform.zig
 zig/pkg/antfly/src/storage/db/relational_rows.zig
 zig/pkg/antfly/src/storage/db/relational_store.zig
 zig/pkg/antfly/src/storage/db/relational_transition_contract.zig
+zig/pkg/antfly/src/storage/db/replication_effects.zig
+zig/pkg/antfly/src/storage/db/replication_policy.zig
 zig/pkg/antfly/src/storage/db/resolution_handoff.zig
 zig/pkg/antfly/src/storage/db/resolution_runtime.zig
 zig/pkg/antfly/src/storage/db/restore_generation_admissions.zig

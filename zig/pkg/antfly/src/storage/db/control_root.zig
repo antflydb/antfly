@@ -21,7 +21,6 @@ const runtime_preflight = @import("runtime_preflight.zig");
 const runtime_callbacks = @import("runtime_callbacks.zig");
 const structured_filter_validation = @import("query/structured_filter_validation.zig");
 const ha_contract = @import("ha_contract.zig");
-const ha_sync_wait = @import("../hot_standby/sync_wait.zig");
 const document_artifact_child_range = @import("document_artifact_child_range.zig");
 
 pub const types = @import("types.zig");
@@ -53,8 +52,7 @@ pub const HAAsyncMetadataMirror = ha_contract.AsyncMetadataMirror;
 pub const HAMutationBarrier = @import("../hot_standby/mutation_barrier.zig").MutationBarrier;
 pub const HASyncWaitFn = ha_contract.SyncWaitFn;
 pub const HAWriteGate = ha_contract.WriteGate;
-pub const HAProgressPollFn = ha_sync_wait.HAProgressPollFn;
-pub const HAPrimaryProgressSyncWait = ha_sync_wait.HAPrimaryProgressSyncWait;
+
 pub const DocumentArtifactChildRangeApplyBatch = document_artifact_child_range.ApplyBatch;
 pub const TextMemoryAttributionStats = @import("text_memory_stats.zig").TextMemoryAttributionStats;
 pub const TextFieldStats = @import("../../search/distributed_stats.zig").TextFieldStats;

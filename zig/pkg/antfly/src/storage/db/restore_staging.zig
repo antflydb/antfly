@@ -16,6 +16,7 @@
 //! Durable authority for an unpublished restore owner. Logical primary rows
 //! and native generated-artifact caches cross the source/target boundary;
 //! identities and constraints are allocated by the target schema/row pipeline.
+const ha_publisher_adapter = @import("../hot_standby/db_commit.zig");
 const std = @import("std");
 const identity = @import("doc_identity.zig");
 const activation = @import("relational_integrity_activation.zig");
@@ -365,7 +366,8 @@ test "relational integrity restore staging Raft controls retain HA append obliga
         try primary.createSlot("standby", 0);
         const Ack = struct {
             calls: usize = 0,
-            fn wait(ptr: *anyopaque, stream: *primary_mod.Primary, lsn: u64, _: primary_mod.SyncPolicy) !void {
+            fn wait(ptr: *anyopaque, stream_ctx: *anyopaque, lsn: u64, _: primary_mod.SyncPolicy) !void {
+                const stream: *primary_mod.Primary = @ptrCast(@alignCast(stream_ctx));
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 self.calls += 1;
                 if (self.calls == 1) return error.InjectedRestoreMirrorWaitFailure;
@@ -396,7 +398,7 @@ test "relational integrity restore staging Raft controls retain HA append obliga
             try std.testing.expectEqualStrings("docs", stored_bootstrap.value.table_name);
         }
         target.ha_async_batch_mirror = .{
-            .primary = &primary,
+            .publisher = ha_publisher_adapter.bind(&primary),
             .sync_policy = .{ .mode = if (synchronous) .remote_write else .async, .standby_names = &.{"standby"}, .failure_policy = .block },
             .sync_wait_ctx = &ack,
             .sync_wait_fn = Ack.wait,

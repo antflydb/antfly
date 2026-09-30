@@ -37,7 +37,8 @@ pub const HAPrimaryProgressSyncWait = struct {
     poll_ctx: ?*anyopaque = null,
     poll_fn: ?HAProgressPollFn = null,
 
-    pub fn wait(ctx: *anyopaque, primary: *ha_primary_mod.Primary, target_lsn: u64, policy: ha_primary_mod.SyncPolicy) !void {
+    pub fn wait(ctx: *anyopaque, primary_ctx: *anyopaque, target_lsn: u64, policy: ha_primary_mod.SyncPolicy) !void {
+        const primary: *ha_primary_mod.Primary = @ptrCast(@alignCast(primary_ctx));
         const self: *@This() = @ptrCast(@alignCast(ctx));
         if (policy.mode == .async) return;
         if (self.max_rounds == 0) return error.HASyncCommitWaitLimitExceeded;
@@ -76,7 +77,8 @@ pub const HASessionSyncWait = struct {
     apply_fn: ha_standby_mod.ApplyFn,
     max_rounds: usize = 8,
 
-    pub fn wait(ctx: *anyopaque, primary: *ha_primary_mod.Primary, target_lsn: u64, policy: ha_primary_mod.SyncPolicy) !void {
+    pub fn wait(ctx: *anyopaque, primary_ctx: *anyopaque, target_lsn: u64, policy: ha_primary_mod.SyncPolicy) !void {
+        const primary: *ha_primary_mod.Primary = @ptrCast(@alignCast(primary_ctx));
         const self: *@This() = @ptrCast(@alignCast(ctx));
         if (policy.mode == .async) return;
         if (!haSyncPolicyIncludesStandby(policy, self.slot_name)) return error.HASyncCommitWaitStandbyNotInPolicy;

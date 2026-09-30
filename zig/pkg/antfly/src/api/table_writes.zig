@@ -13,6 +13,8 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const ha_publisher_adapter = @import("../storage/hot_standby/db_commit.zig");
+const ha_write_gate_adapter = @import("../storage/hot_standby/write_gate.zig");
 const local_write_contract = @import("local_write_contract.zig");
 const physical_local_write = @import("local_table_writes.zig").physical_local_write;
 
@@ -2628,14 +2630,14 @@ pub const ProvisionedTableWriteCache = struct {
         if (a == null or b == null) return a == null and b == null;
         return switch (a.?) {
             .primary => |left| switch (b.?) {
-                .primary => |right| left == right,
+                .primary => |right| left.ptr == right.ptr and left.check_fn == right.check_fn,
                 .fenced_primary => false,
                 .standby => false,
                 .shared => false,
             },
             .fenced_primary => |left| switch (b.?) {
                 .primary => false,
-                .fenced_primary => |right| left.primary == right.primary and
+                .fenced_primary => |right| left.check_fn == right.check_fn and left.primary == right.primary and
                     left.fence_store == right.fence_store and
                     std.mem.eql(u8, left.node_id, right.node_id),
                 .standby => false,
@@ -2644,12 +2646,12 @@ pub const ProvisionedTableWriteCache = struct {
             .standby => |left| switch (b.?) {
                 .primary => false,
                 .fenced_primary => false,
-                .standby => |right| left == right,
+                .standby => |right| left.ptr == right.ptr and left.check_fn == right.check_fn,
                 .shared => false,
             },
             .shared => |left| switch (b.?) {
                 .primary, .fenced_primary, .standby => false,
-                .shared => |right| left.state == right.state and left.generation == right.generation,
+                .shared => |right| left.state.ptr == right.state.ptr and left.state.vtable == right.state.vtable and left.generation == right.generation,
             },
         };
     }
@@ -2681,7 +2683,9 @@ pub const ProvisionedTableWriteCache = struct {
         if (a == null or b == null) return a == null and b == null;
         const left = a.?;
         const right = b.?;
-        return left.primary == right.primary and
+        return left.publisher.ptr == right.publisher.ptr and left.publisher.vtable == right.publisher.vtable and
+            left.mutation_barrier == right.mutation_barrier and
+            left.transition_mutex == right.transition_mutex and
             left.last_lsn == right.last_lsn and
             left.failure_count == right.failure_count and
             syncPoliciesEqual(left.sync_policy, right.sync_policy) and
@@ -22521,7 +22525,7 @@ pub const ProvisionedTableWriteSource = struct {
             // commit, after this preflight and any cache/open work.
             if (self.ha_async_mirror) |mirror| {
                 if (self.ha_write_gate == null) return error.RowPolicyUnsupported;
-                if (mirror.primary.identity.table_id != 0 or mirror.primary.identity.shard_id != 0)
+                if (mirror.publisher.identity().table_id != 0 or mirror.publisher.identity().shard_id != 0)
                     return error.RowPolicyUnsupported;
             }
             try enforceHAWriteGateOptional(self.ha_write_gate);
@@ -45936,7 +45940,7 @@ fn implementationTests() type {
             source.markWriteCacheDirty("docs");
 
             var gate_state = ha_public_gate_state_mod.State{};
-            const gate: db_mod.HAWriteGate = .{ .shared = .{ .state = &gate_state } };
+            const gate: db_mod.HAWriteGate = .{ .shared = .{ .state = gate_state.storageWriteState() } };
             _ = try source.withHAWriteGate(gate);
 
             try std.testing.expectEqual(@as(usize, 0), write_cache.table_metadata.items.len);
@@ -45972,7 +45976,7 @@ fn implementationTests() type {
 
                 fn run(self: *@This()) void {
                     self.started.store(true, .release);
-                    _ = self.source.withHAWriteGate(.{ .shared = .{ .state = self.gate_state } }) catch |err| {
+                    _ = self.source.withHAWriteGate(.{ .shared = .{ .state = self.gate_state.storageWriteState() } }) catch |err| {
                         self.err = err;
                         return;
                     };
@@ -53791,7 +53795,7 @@ fn implementationTests() type {
                 .applied_lsn = 0,
                 .safe_read_lsn = 0,
             });
-            _ = try source.withHAWriteGate(.{ .shared = .{ .state = &gate_state } });
+            _ = try source.withHAWriteGate(.{ .shared = .{ .state = gate_state.storageWriteState() } });
 
             const ha_effects = @import("../storage/hot_standby/effects.zig");
             const payload = try ha_effects.encodeBatchMutationRequestAlloc(alloc, .{
@@ -57482,7 +57486,7 @@ fn implementationTests() type {
             var gate_state = ha_public_gate_state_mod.State{};
             failing.fail_index = failing.alloc_index;
             failing.resize_fail_index = failing.resize_index;
-            _ = try source.withHAWriteGate(.{ .shared = .{ .state = &gate_state } });
+            _ = try source.withHAWriteGate(.{ .shared = .{ .state = gate_state.storageWriteState() } });
             try std.testing.expect(source.ha_write_gate != null);
             try std.testing.expect(write_cache.ha_write_gate != null);
             try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
@@ -60089,7 +60093,7 @@ fn implementationTests() type {
             }, .{});
             defer primary.close();
 
-            try write_cache.setHAWriteGate(.{ .primary = &primary });
+            try write_cache.setHAWriteGate(.{ .primary = ha_write_gate_adapter.bindPrimary(&primary) });
             try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
             try std.testing.expectEqual(@as(usize, 0), write_cache.closing_entries.items.len);
         }
@@ -60170,7 +60174,7 @@ fn implementationTests() type {
 
             var write_cache = ProvisionedTableWriteCache.init(alloc);
             defer write_cache.deinit();
-            try write_cache.setHAWriteGate(.{ .shared = .{ .state = &state } });
+            try write_cache.setHAWriteGate(.{ .shared = .{ .state = state.storageWriteState() } });
 
             var standby_cached = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
             standby_cached.deinit(alloc);
@@ -61295,7 +61299,7 @@ fn implementationTests() type {
             defer primary.close();
             var mutation_barrier: ha_mutation_barrier_mod.MutationBarrier = .{};
             source.ha_async_mirror = .{
-                .primary = &primary,
+                .publisher = ha_publisher_adapter.bind(&primary),
                 .mutation_barrier = &mutation_barrier,
             };
             write_cache.ha_async_mirror = source.ha_async_mirror;
@@ -62420,3 +62424,53 @@ pub const executeBackupPinControl = @import("../storage/db/backup_pin_control.zi
 pub const RestoreTerminalAdmission = local_write_contract.RestoreTerminalAdmission;
 
 pub const exportPortableBackupShardWithSeal = @import("local_table_writes.zig").exportPortableBackupShardWithSeal;
+
+test "storage.hot_standby writer cache distinguishes borrowed publisher callbacks and synchronization" {
+    const contract = @import("../storage/db/ha_contract.zig");
+    const outbox = @import("../storage/db/durable_outbox.zig");
+    const Namespace = @import("../storage/db/doc_identity_namespace.zig").Namespace;
+    const Stub = struct {
+        fn next(_: *anyopaque) u64 {
+            return 0;
+        }
+        fn identity(_: *anyopaque) contract.Publisher.Identity {
+            return .{ .table_id = 0, .shard_id = 0, .timeline_id = 0, .epoch = 0 };
+        }
+        fn publish(_: contract.AsyncEffectMirror, _: outbox.Kind, _: []const u8, _: Namespace) !u64 {
+            return error.UnexpectedPublication;
+        }
+        fn recover(_: contract.AsyncEffectMirror, _: outbox.Kind, _: outbox.DurableHAOutbox, _: Namespace) !u64 {
+            return error.UnexpectedRecovery;
+        }
+        fn preflight(_: contract.AsyncEffectMirror, _: bool) !void {
+            return error.UnexpectedAdmission;
+        }
+        fn complete(_: contract.AsyncEffectMirror, _: u64) !void {
+            return error.UnexpectedCompletion;
+        }
+        fn allow(_: *const anyopaque) !void {}
+        fn reject(_: *const anyopaque) !void {
+            return error.HAFencedPrimary;
+        }
+        const vtable: contract.Publisher.VTable = .{ .next_lsn = next, .identity = identity, .publish = publish, .recover = recover, .preflight = preflight, .complete = complete };
+    };
+    var context: u8 = 0;
+    var mirror: contract.AsyncEffectMirror = .{ .publisher = .{ .ptr = &context, .vtable = &Stub.vtable } };
+    const original = mirror;
+    try std.testing.expect(ProvisionedTableWriteCache.haAsyncMirrorsEqual(original, mirror));
+    var transition: std.atomic.Mutex = .unlocked;
+    mirror.transition_mutex = &transition;
+    try std.testing.expect(!ProvisionedTableWriteCache.haAsyncMirrorsEqual(original, mirror));
+    mirror = original;
+    var barrier: ha_mutation_barrier_mod.MutationBarrier = .{};
+    mirror.mutation_barrier = &barrier;
+    try std.testing.expect(!ProvisionedTableWriteCache.haAsyncMirrorsEqual(original, mirror));
+    mirror = original;
+    var alternate_vtable = Stub.vtable;
+    mirror.publisher.vtable = &alternate_vtable;
+    try std.testing.expect(!ProvisionedTableWriteCache.haAsyncMirrorsEqual(original, mirror));
+    const allowed: db_mod.HAWriteGate = .{ .primary = .{ .ptr = &context, .check_fn = Stub.allow } };
+    const rejected: db_mod.HAWriteGate = .{ .primary = .{ .ptr = &context, .check_fn = Stub.reject } };
+    try std.testing.expect(!ProvisionedTableWriteCache.haWriteGatesEqual(allowed, rejected));
+    try std.testing.expect(ProvisionedTableWriteCache.haWriteGatesEqual(allowed, allowed));
+}
