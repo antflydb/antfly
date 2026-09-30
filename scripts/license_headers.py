@@ -48,10 +48,14 @@ ELV2_FILES = {
     "zig/lib/runtime/src/runtime_error_abi.zig",
     "zig/lib/runtime/src/runtime_http_abi.zig",
     "zig/lib/runtime/src/runtime_http_bridge.zig",
+    "zig/lib/runtime/src/runtime_io_abi.zig",
+    "zig/lib/runtime/src/runtime_native_abi.zig",
     "zig/lib/runtime/src/threaded_io_limits.zig",
     "zig/pkg/inference/src/host/bridge.zig",
+    "zig/pkg/inference/src/host/embedding_wire.zig",
     "zig/pkg/inference/src/host/execution_control.zig",
     "zig/pkg/inference/src/host/host.zig",
+    "zig/pkg/inference/src/host/provider_failure.zig",
     "zig/pkg/inference/src/host/request_types.zig",
     "zig/pkg/inference/src/host/runtime_paths.zig",
     "zig/pkg/inference/src/host/sparse_embedding.zig",
@@ -60,6 +64,7 @@ ELV2_FILES = {
     "zig/pkg/inference/src/host/worker.zig",
     "zig/pkg/inference/src/host/worker_rpc.zig",
     "zig/pkg/inference/src/host/worker_wire.zig",
+
 }
 
 APACHE_ROOTS = (
