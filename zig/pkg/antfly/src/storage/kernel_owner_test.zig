@@ -2422,7 +2422,7 @@ test "opaque storage owner validates ABI and destruction is idempotent" {
     invalid_ha.version = abi.abi_version + 1;
     try std.testing.expectEqual(
         abi.Status.invalid_abi,
-        abi.antfly_storage_owner_apply_ha_replication_record(null, &invalid_ha),
+        abi.antfly_storage_owner_apply_hot_standby_replication_record(null, &invalid_ha),
     );
     var invalid_backup: abi.BackupRequest = .{};
     invalid_backup.version = abi.abi_version + 1;

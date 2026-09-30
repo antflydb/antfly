@@ -148,7 +148,7 @@ comptime {
     exportInternal(&storage_kernel_exports.storageOwnerNativeFkGenerationControlJson, "antfly_storage_owner_native_fk_generation_control_json");
     exportInternal(&storage_kernel_exports.storageOwnerTransactionStatus, "antfly_storage_owner_transaction_status");
     exportInternal(&storage_kernel_exports.storageOwnerWaitForSync, "antfly_storage_owner_wait_for_sync");
-    exportInternal(&storage_kernel_exports.storageOwnerApplyHAReplicationRecord, "antfly_storage_owner_apply_ha_replication_record");
+    exportInternal(&storage_kernel_exports.storageOwnerApplyHotStandbyReplicationRecord, "antfly_storage_owner_apply_hot_standby_replication_record");
     exportInternal(&storage_kernel_exports.storageOwnerBackupJson, "antfly_storage_owner_backup_json");
     exportInternal(&storage_kernel_exports.storageOwnerBackupPinControlJson, "antfly_storage_owner_backup_pin_control_json");
     exportInternal(&storage_kernel_exports.storageOwnerSourcePinPublicationJson, "antfly_storage_owner_source_pin_publication_json");
