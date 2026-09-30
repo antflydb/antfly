@@ -171,6 +171,15 @@ ANTFLY_ANTENNA_DATA=<cache> python distill_pool.py --upstream <GLiNER2> --output
   --source squad=40000 --source dbpedia=25000 --source openjev=40000
 ```
 
+`init_decision_head.py` builds a Laya-format checkpoint from an Antenna
+student (its encoder, a fresh decision head) for
+`antfly-inference finetune train laya` with `"freeze_layers":
+<num_hidden_layers + 1>`, which trains the head on the frozen trunk:
+
+```sh
+python init_decision_head.py --student <antenna student> --laya <prepared laya dir> --output <dir>
+```
+
 `gap_probe.py` measures where a distilled student departs from its teacher:
 the distillation loss's z-space error per evaluation dataset (own and
 pool-style schemas) and pool, word rows and marker rows apart:

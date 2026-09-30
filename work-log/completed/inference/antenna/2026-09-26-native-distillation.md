@@ -261,9 +261,40 @@ limit. Rows sharing a text stay in one split. The pool has 252,352 training
 rows, 43% classification with 795 task names and 1,138 labels; run19 distills
 on it with run17's settings.
 
+### A Laya decision head on the Antenna trunk
+
+`scripts/antenna/init_decision_head.py` builds a Laya-format checkpoint from
+the run17 student: its `encoder.*` tensors copy across unchanged (the names
+already match Laya's), the GLiNER heads and neck are dropped, and a fresh
+decision head (`type_emb`, `scorer`, `act_head`, two `head.layers`) is
+initialized at width 768 as upstream Laya's modules initialize it, with the
+released checkpoint's decision settings. Laya's loader, trainer and
+evaluator take it unchanged. `freeze_layers = num_hidden_layers + 1` now
+freezes the whole encoder, final norm included (without a new job field, so
+existing Laya run identities hold), so only the head trains and the trunk
+stays exact for the GLiNER heads; the exported encoder tensors are
+bit-identical to the source's.
+
+Accuracy on Laya's step-0 eval split (760 typed decisions), RLCD, head
+learning rate 1e-4, batch 1, resident Metal:
+
+| | Overall | Choice | Score | Yes/no |
+| --- | --- | --- | --- | --- |
+| untrained head | 0.286 | | | |
+| released Laya (ModernBERT-large, not fine-tuned) | 0.387 | 0.34 | 0.35 | 0.48 |
+| step-0 split, 2,000 decisions, 3 epochs (15 min) | 0.434 | 0.39 | 0.34 | 0.61 |
+| plus Open-Jev (64,450 decisions), 1 epoch (4 h) | 0.404 | 0.41 | 0.25 | 0.61 |
+
+A head on the frozen base-size trunk beats released Laya-large, but trails
+Laya's full step-0 fine-tune (about 0.62, encoder trained). Open-Jev hurts
+score questions here, as it left Laya's own eval unchanged (LAYA.md,
+"Scaling packed training on Open-Jev").
+
 ## Next
 
 - Evaluate run19 and its stage 3 against run18.
+- Decision head: Open-Jev first, then the in-domain split for several
+  epochs; a decision head on run19's trunk.
 - Classification markers are the remaining gap. The mixed pool has 216 real
   class names and fills the rest of each label list from entity types; add
   many real label sets (intents, topics, sentiment and stance scales,

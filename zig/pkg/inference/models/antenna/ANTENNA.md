@@ -617,6 +617,12 @@ different sizes; see the report for caveats).
   0.723 / 0.624: NER matches, and classification trails by 0.07-0.10. The
   probe `scripts/antenna/gap_probe.py` places the remaining gap in the
   classification label markers; the next pool adds real label sets.
+- **Decision head:** a Laya decision head trained on the frozen Antenna trunk
+  (`scripts/antenna/init_decision_head.py`, `freeze_layers` set to the layer
+  count plus one) scores 0.434 on Laya's step-0 typed-decision eval, against
+  0.387 for released Laya-large and about 0.62 for Laya's full step-0
+  fine-tune. The trunk stays bit-identical, so it keeps serving the GLiNER
+  heads.
 
 ### Step 2: fused ModernBERT training attention (done)
 
