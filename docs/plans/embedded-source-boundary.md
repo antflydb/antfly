@@ -42,7 +42,9 @@ formats, and WASM behavior remain the same.
 3. Extract storage and local API owners into `antfly-embedded`, replacing
    relative server-to-engine imports with explicit module imports. Move the
    DB-backed managed embedder and shared configuration/template contracts with
-   their embedded owners. Keep backup/restore and the C ABI there.
+   their embedded owners. Keep backup/restore and the C ABI there. Split the
+   Raft and hot-standby integrations out of `storage/db/db.zig` before moving
+   the local DB owner, as described below.
 4. Extract the Apache raft and metadata contracts needed by the local engine.
    Server raft, placement, and metadata control stay in `antfly`.
 5. Give `antfly-embedded` an independent build graph for Lite, C ABI, and
@@ -98,6 +100,116 @@ observer in `lib/raft`, and portable filesystem helpers in `lib/runtime`. The
 remaining local metadata and backup implementations still depend on Apache
 storage/API files under `pkg/antfly`; those dependencies must move before their
 consumers can.
+
+## DB and hot-standby separation
+
+The first extraction is implemented on this branch; the complete dependency
+boundary remains in progress. Moving `db.zig` as a whole would still move both
+the engine and its replication integrations. Its `ha_contract.zig` still
+imports concrete `Primary` and `Standby` types, and DB still owns recovery
+scheduling, replication-record dispatch, and HA seed entry points. These must
+be separated alongside Raft.
+
+Current implementation owners (still under `pkg/antfly` until their storage
+dependency layers move):
+
+- `storage/db/apply_receipts.zig` owns Raft and HA receipt persistence helpers
+  and replay disposition. Mutations still commit their receipt writes under
+  their existing apply fence.
+- `storage/db/durable_outbox.zig` owns persisted keys, explicit kind tags,
+  mutation identity, framing, and checksums. It imports no HA runtime or wire
+  record owner.
+- `storage/db/durable_outbox_store.zig` owns bounded pending-page reads,
+  rolling-upgrade singleton reads, and exact-key clearing. Publication cannot
+  reach arbitrary internal KV keys through this interface.
+- `storage/hot_standby/sync_wait.zig` owns progress and session waits. Physical
+  DB and control facades alias the same implementation, including fast failure
+  when too few eligible standby candidates exist.
+- `storage/hot_standby/db_commit.zig` owns preflight, effect publication,
+  record matching during recovery, acknowledgement decisions, metrics, and
+  transition-lock completion. It takes projected borrowed controls, not a DB
+  or store handle. DB retains the local commit order and apply-lock lifetime.
+
+The new owners preserve their extracted Apache license. They remain reachable
+from the embedded build while DB still directly binds HA implementations;
+this extraction does not yet justify removing their Apache source exceptions.
+The next step replaces those direct bindings with engine contracts implemented
+by the server adapter, before moving replay and seed dispatch.
+
+The intended dependency direction is server replication adapter -> embedded
+storage operations. The local DB must not import HA sessions, primary/standby
+runtimes, lease watchdogs, or failover coordination. Extracting these owners
+does not make HA orchestration part of the embedded package or change its
+license. Preserve existing Apache owners for reusable storage contracts; keep
+server orchestration ELv2.
+
+### Embedded storage owner
+
+- One mutation executor serves native writes, committed replay, and restore
+  import through distinct typed entry points. A trusted replay entry point
+  must not become a client-controlled `bypass_ha_write_gate` flag.
+- Storage owns atomic persistence of mutations, applied receipts, and pending
+  replication effects. Extract codecs and storage operations for the existing
+  durable outbox without changing its keys, framing, checksum, or legacy-record
+  recovery. Expose typed pending-effect operations rather than unrestricted
+  internal KV writes to adapters.
+- Keep Raft entry identities, HA applied LSNs, and native operation identities
+  separate. Recheck applied receipts under the mutation lock, and persist
+  receipts in the same commit as their corresponding durable effects. Do not
+  synthesize Raft identities for native writes.
+- Storage owns coherent snapshot capture, staged-generation import, validation,
+  and local publication. The seed adapter chooses the replication checkpoint
+  and supplies its typed manifest/provenance; local backup remains usable
+  without an HA runtime.
+- Replace concrete HA handles in DB options with a narrow commit integration:
+  write admission, a mutation/capture lease, publication of committed pending
+  effects, and completion/acknowledgement. Preserve ownership and close-time
+  barriers for borrowed callbacks. Engine code must neither inspect standby
+  slots nor drive transport to satisfy acknowledgement.
+
+### Server hot-standby owner
+
+Place the DB adapter with the existing server hot-standby implementation,
+rather than creating another engine package:
+
+- Move `HAPrimaryProgressSyncWait` and `HASessionSyncWait` out of DB; retain
+  primary progress evaluation, standby selection, bounded polling, and session
+  replication with the HA runtime.
+- Move `applyHAReplicationRecord` decoding and dispatch into the adapter. It
+  calls typed engine operations for batch/schema/policy/derived effects and
+  applied progress. Keep restore and online-source completion repair on an
+  already-applied retry before acknowledging it.
+- The HA owner publishes pending effects into its replication log, matches
+  previously appended records during recovery, and drives paged retries. The
+  engine deletes an exact pending-effect key only after successful publication;
+  unavailable or incompatible HA ownership must not silently drop it.
+- Keep promotion/demotion, fencing, synchronous durability policy, replication
+  transport, slot management, rejoin, timeline changes, seed orchestration,
+  Kubernetes leases, and administrative routes with the server runtime.
+
+### Commit ordering and migration
+
+Preserve the current ordering: validate write authority and serialize the local
+commit with promotion fencing; persist mutations and pending effects; publish
+the ordered replication record; release the DB apply lock and transition lock
+before waiting for remote durability; revalidate authority under the transition
+lock before reporting success. Do not hold DB locks across network waits or
+reduce this protocol to a best-effort post-commit callback. A missing required
+mirror remains an error, and incomplete publication continues to gate writes.
+
+Extract receipts/outbox storage first, then the commit integration and HA wait
+adapters, then replay dispatch, then snapshot/seed adapters. Move the local DB
+only after its imports no longer pull replication runtimes into the engine.
+Use the same storage operations from the Raft adapter, without duplicating
+mutation, schema, transaction, or restore logic. Keep recovery scheduling and
+adapter shutdown explicit so pending work cannot outlive the DB handle.
+
+Validation must cover crash/reopen between local commit and log publication,
+idempotent publication and exact-key deletion, legacy and paged outbox recovery,
+duplicate replay with unfinished restore/source-pin work, concurrent replay
+receipt validation, slow or unavailable standbys, fencing during a synchronous
+wait, coherent seed capture during mutations, and DB close during recovery.
+Native Lite/C API/WASM builds must succeed without the server HA source tree.
 
 ## OpenAPI ownership
 
