@@ -11842,7 +11842,12 @@ pub const DB = struct {
         // asset/chunk state used to skip unchanged work). The catalog-epoch
         // and per-key version guards below make stale precompute retry
         // instead of silently committing.
-        if (!(if (request_schema_view) |view| view.storageMode() == .relational else false)) {
+        // Transaction resolution publishes keys that still carry their
+        // prepared intents; those reads are only valid under the apply lock,
+        // so resolution keeps the in-lock precompute path.
+        if (opts.transaction_resolution == null and
+            !(if (request_schema_view) |view| view.storageMode() == .relational else false))
+        {
             const requires_inline_generated =
                 (effective_req.sync_level == .full_text or effective_req.sync_level == .enrichments or effective_req.sync_level == .full_index) or
                 splitShadowRequiresMaterializedDerivedBatch(self);
