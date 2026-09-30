@@ -42077,12 +42077,33 @@ pub const DB = struct {
         runtime_stats.text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStatsSnapshot();
     }
 
+    /// A contended apply lock skips the live per-index refresh below, but the
+    /// durable per-index status snapshot (`saveIndexStatusSnapshots`) is
+    /// written on every applied update as part of the ordinary replay/apply
+    /// commit path, independent of this lock. Read it as a lock-free floor so
+    /// a sustained backfill or schema migration, which keeps the writer-
+    /// preferring apply lock busy, does not leave doc_count frozen at
+    /// whatever the last successful live sample happened to observe. Only
+    /// raise the value: a durable snapshot can itself lag a live sample that
+    /// did succeed, and this is strictly a fallback for when the live sample
+    /// could not run at all.
+    fn refreshIndexDocCountsFromDurableSnapshotBestEffort(self: *DB, alloc: Allocator, runtime_stats: *types.DBStats) void {
+        for (runtime_stats.indexes) |*item| {
+            const status_snapshot = (self.loadIndexStatusSnapshot(alloc, item.name) catch continue) orelse continue;
+            if (status_snapshot.kind != item.kind) continue;
+            if (status_snapshot.doc_count > item.doc_count) item.doc_count = status_snapshot.doc_count;
+        }
+    }
+
     /// Return whether lifecycle and physical index facts were refreshed under
     /// one apply-lock boundary. On contention, only readiness-neutral runtime
     /// diagnostics are overlaid and existing blockers remain intact.
     pub fn overlayRuntimeStatusBestEffort(self: *DB, stats_alloc: Allocator, runtime_stats: *types.DBStats) bool {
         self.overlayRuntimeStatusRuntimeBestEffort(runtime_stats);
-        if (!self.core.tryLockApplyShared()) return false;
+        if (!self.core.tryLockApplyShared()) {
+            self.refreshIndexDocCountsFromDurableSnapshotBestEffort(stats_alloc, runtime_stats);
+            return false;
+        }
         defer self.core.unlockApplyShared();
         self.overlayRuntimeStatusLifecycleFromSnapshot(runtime_stats);
         self.overlayRuntimeStatusIndexesLocked(stats_alloc, runtime_stats) catch {
