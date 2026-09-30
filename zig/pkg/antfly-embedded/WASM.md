@@ -32,14 +32,14 @@ Primary exports:
 Current implementation note:
 
 - this package targets
-  [root.zig](../antfly/src/embedded/root.zig)
+  [root.zig](src/engine/root.zig)
   as the canonical shared embedded module entrypoint
 - [embedded_root.zig](../antfly/src/embedded_root.zig)
   is a compatibility shim
 
 The shared embedded module sits on the normal storage DB engine path:
 
-- [db.zig](../antfly/src/embedded/db.zig)
+- [db.zig](src/engine/db.zig)
   wraps [mod.zig](../antfly/src/storage/db/mod.zig)
 - query execution comes from:
   - [search_exec.zig](../antfly/src/storage/db/query/search_exec.zig)
@@ -74,7 +74,7 @@ The embedded API currently exposes:
 - `listEnrichmentsJson`
 - `openHosted`
 
-`embedded/db.zig` has two execution profiles:
+`src/engine/db.zig` has two execution profiles:
 
 - `native`
   - the default shared DB wrapper with native background runtimes
@@ -148,11 +148,11 @@ Available building blocks:
   - `HostObjectStorage`
 - [host_environment.zig](../antfly/src/storage/host_environment.zig)
   - bundle exposing both host-facing contracts
-- [api.zig](../antfly/src/embedded/api.zig)
+- [api.zig](src/engine/api.zig)
   - embedded function-call surface over `DB`
   - intended for JS/WASM bindings that want direct calls instead of a local
     HTTP server
-- [db.zig](../antfly/src/embedded/db.zig)
+- [db.zig](src/engine/db.zig)
   - includes `openHosted(...)`
 - [antfly_wasm.zig](../../examples/antfly_wasm.zig)
   - runnable shared embedded WASM example using `Api.openHosted(...)`

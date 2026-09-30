@@ -27,10 +27,10 @@ const build_options = @import("build_options");
 const storage_source_options = @import("storage_source_options");
 const openapi_specs = @import("antfly_openapi_specs");
 const scraping = @import("antfly_scraping");
-const fs_paths = @import("../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const common_secrets = @import("../common/secrets.zig");
 const index_repair_status = @import("../common/index_repair_status.zig");
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const api_operation = @import("operation.zig");
 const backup_cohort_driver = @import("backup_cohort_driver.zig");
 const search_pattern_filter = @import("../search/pattern_filter.zig");
@@ -102,7 +102,7 @@ const ha_http_operation = @import("../storage/hot_standby/http_operation.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
 const public_search_request = @import("public_search_request.zig");
-const public_limits = @import("public_limits.zig");
+const public_limits = @import("antfly_public_limits");
 const query_builder_agent = @import("query_builder_agent.zig");
 const request_admission_policy = @import("request_admission_policy.zig");
 const retrieval_agent = @import("retrieval_agent.zig");
@@ -138,10 +138,10 @@ const metadata_table_topology_mutations = @import("../metadata/table_topology_mu
 const raft_mutation_forwarding = @import("raft_mutation_forwarding.zig");
 const metadata_server = @import("../metadata/server.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
-const query_embedding_cache = @import("../inference/query_embedding_cache.zig");
+const query_embedding_cache = @import("antfly_inference_query_embedding_cache");
 const sql_plan_cache = @import("../sql/plan_cache.zig");
 const sql_schema_cache = @import("sql_schema_cache.zig");
-const cache_budget = @import("../common/cache_budget.zig");
+const cache_budget = @import("antfly_cache_budget");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
 const connections_api = @import("connections.zig");
 const common_config = @import("../common/config.zig");
@@ -149,6 +149,8 @@ const generating_runtime = @import("../generating/mod.zig");
 const usermgr = @import("../usermgr/mod.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
+const metadata_server_openapi = @import("antfly_metadata_server_openapi");
+const usermgr_server_openapi = @import("antfly_usermgr_server_openapi");
 const casbin = @import("antfly_casbin");
 const httpx = @import("httpx");
 const mcp = @import("antfly_mcp");
@@ -224,12 +226,12 @@ test "OCC version zero matches only an absent document" {
 
 fn parsePublicGlobalQueryBody(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(metadata_openapi.GlobalStatefulQueryRequest) {
     try query_contract.validatePublicQuerySortTupleContract(alloc, body);
-    return metadata_openapi.server.parseGlobalQueryBody(alloc, body);
+    return metadata_server_openapi.server.parseGlobalQueryBody(alloc, body);
 }
 
 fn parsePublicTableQueryBody(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(metadata_openapi.StatefulQueryRequest) {
     try query_contract.validatePublicQuerySortTupleContract(alloc, body);
-    return metadata_openapi.server.parseQueryTableBody(alloc, body);
+    return metadata_server_openapi.server.parseQueryTableBody(alloc, body);
 }
 
 fn isNdjsonContentType(content_type: ?[]const u8) bool {
@@ -4894,7 +4896,7 @@ pub const ApiHttpServer = struct {
         return .{
             .ptr = self,
             .require_authoritative_routing = true,
-            .fanout_io = if (self.sharedApiIo()) |io| @import("../runtime_io_abi.zig").Borrow.init(&io) else null,
+            .fanout_io = if (self.sharedApiIo()) |io| @import("antfly_runtime_abi").io_abi.Borrow.init(&io) else null,
             .vtable = &join_context_vtable,
             .lifecycle_hook = self.cfg.distributed_join_lifecycle_hook,
         };
@@ -8306,7 +8308,7 @@ pub const ApiHttpServer = struct {
         request_context: managed_embedder.RequestContext,
     ) !contextual_operations.OwnedResponse {
         try request_context.check();
-        var parsed = metadata_openapi.server.parseQueryBuilderAgentBody(self.alloc, body) catch
+        var parsed = metadata_server_openapi.server.parseQueryBuilderAgentBody(self.alloc, body) catch
             return try contextual_operations.jsonErrorAlloc(self.alloc, 400, "invalid query builder request");
         defer parsed.deinit();
         if (parsed.value.intent.len == 0)
@@ -13123,7 +13125,7 @@ pub const ApiHttpServer = struct {
     pub fn preparePublicCommitWithIntegrity(self: *ApiHttpServer, alloc: std.mem.Allocator, tables: []const distributed_txn.TableCommitRequest, request: api_operation.RequestContext) !@import("relational_integrity_commit.zig").Prepared {
         const integrity = @import("relational_integrity_commit.zig");
         var preparation_request = request;
-        if (self.sharedApiIo()) |io| preparation_request.fanout_io = @import("../runtime_io_abi.zig").Borrow.init(&io);
+        if (self.sharedApiIo()) |io| preparation_request.fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io);
         const selected = (try self.selectIntegritySnapshot(alloc, tables, request)) orelse
             return .{ .arena = std.heap.ArenaAllocator.init(alloc), .tables = tables };
         var snapshot = selected.snapshot;
@@ -13353,7 +13355,7 @@ pub const ApiHttpServer = struct {
             return .{ .committed = .{ .participant_count = 0 } };
         }
         var preparation_request = request;
-        if (self.sharedApiIo()) |io| preparation_request.fanout_io = @import("../runtime_io_abi.zig").Borrow.init(&io);
+        if (self.sharedApiIo()) |io| preparation_request.fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io);
         retained_preparation.* = if (request.relational_recovery == .repair)
             integrity.prepareRepair(alloc, reader, snapshot.tables, snapshot.ranges, tables[0], preparation_request) catch |err| return if (err == error.DeadlineExceeded) error.PreDecisionDeadlineExceeded else err
         else blk: {
@@ -26973,7 +26975,7 @@ pub const OwnedCreateApiKeyRequest = struct {
 };
 
 pub fn parseCreateUserRequest(alloc: std.mem.Allocator, body: []const u8, path_username: []const u8) !OwnedCreateUserRequest {
-    var parsed = try usermgr_openapi.server.parseCreateUserBody(alloc, body);
+    var parsed = try usermgr_server_openapi.server.parseCreateUserBody(alloc, body);
     defer parsed.deinit();
     if (parsed.value.password.len == 0) return error.InvalidCreateUserRequest;
 
@@ -27001,14 +27003,14 @@ pub fn parseCreateUserRequest(alloc: std.mem.Allocator, body: []const u8, path_u
 }
 
 pub fn parsePasswordUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
-    var parsed = try usermgr_openapi.server.parseUpdateUserPasswordBody(alloc, body);
+    var parsed = try usermgr_server_openapi.server.parseUpdateUserPasswordBody(alloc, body);
     defer parsed.deinit();
     if (parsed.value.new_password.len == 0) return error.InvalidPasswordUpdateRequest;
     return try alloc.dupe(u8, parsed.value.new_password);
 }
 
 pub fn parseCreateApiKeyRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedCreateApiKeyRequest {
-    var parsed = try usermgr_openapi.server.parseCreateApiKeyBody(alloc, body);
+    var parsed = try usermgr_server_openapi.server.parseCreateApiKeyBody(alloc, body);
     defer parsed.deinit();
     if (parsed.value.name.len == 0) return error.InvalidApiKeyRequest;
     const name = try alloc.dupe(u8, parsed.value.name);
@@ -27034,13 +27036,13 @@ pub fn parseCreateApiKeyRequest(alloc: std.mem.Allocator, body: []const u8) !Own
 }
 
 pub fn parsePermissionBody(alloc: std.mem.Allocator, body: []const u8) !usermgr.Permission {
-    var parsed = try usermgr_openapi.server.parseAddPermissionToUserBody(alloc, body);
+    var parsed = try usermgr_server_openapi.server.parseAddPermissionToUserBody(alloc, body);
     defer parsed.deinit();
     return try permissionFromOpenApi(alloc, parsed.value);
 }
 
 pub fn parseRoleAssignmentBody(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
-    var parsed = try usermgr_openapi.server.parseAddRoleToUserBody(alloc, body);
+    var parsed = try usermgr_server_openapi.server.parseAddRoleToUserBody(alloc, body);
     defer parsed.deinit();
     if (parsed.value.role.len == 0) return error.InvalidRole;
     return try alloc.dupe(u8, parsed.value.role);
@@ -27138,7 +27140,7 @@ fn cloneRowFiltersFromOpenApi(
     return out;
 }
 
-fn parseRemovePermissionFromUserParams(alloc: std.mem.Allocator, query: []const u8) !usermgr_openapi.server.RemovePermissionFromUserParams {
+fn parseRemovePermissionFromUserParams(alloc: std.mem.Allocator, query: []const u8) !usermgr_server_openapi.server.RemovePermissionFromUserParams {
     const resource = (try parseSimpleQueryParamDecodedAlloc(alloc, query, "resource")) orelse return error.MissingResource;
     const resource_type = (try parseSimpleQueryParamDecodedAlloc(alloc, query, "resourceType")) orelse return error.MissingResourceType;
     _ = usermgr.ResourceType.fromSlice(resource_type) catch return error.InvalidResourceType;
@@ -27148,7 +27150,7 @@ fn parseRemovePermissionFromUserParams(alloc: std.mem.Allocator, query: []const 
     };
 }
 
-fn parseRemoveRoleFromUserParams(alloc: std.mem.Allocator, query: []const u8) !usermgr_openapi.server.RemoveRoleFromUserParams {
+fn parseRemoveRoleFromUserParams(alloc: std.mem.Allocator, query: []const u8) !usermgr_server_openapi.server.RemoveRoleFromUserParams {
     const role = (try parseSimpleQueryParamDecodedAlloc(alloc, query, "role")) orelse return error.MissingRole;
     if (role.len == 0) return error.MissingRole;
     return .{ .role = role };
@@ -27192,7 +27194,7 @@ fn parseRestoreJobListOptions(alloc: std.mem.Allocator, query: []const u8) !ApiH
     return .{ .limit = limit, .cursor = cursor, .phase = phase, .scope = scope };
 }
 
-fn parseListTablesParams(alloc: std.mem.Allocator, query: []const u8) !metadata_openapi.server.ListTablesParams {
+fn parseListTablesParams(alloc: std.mem.Allocator, query: []const u8) !metadata_server_openapi.server.ListTablesParams {
     return .{
         .prefix = try parseSimpleQueryParamDecodedAlloc(alloc, query, "prefix"),
         .pattern = try parseSimpleQueryParamDecodedAlloc(alloc, query, "pattern"),
@@ -55029,7 +55031,7 @@ test "system catalog binds primary and nested joins once without conflating lite
 
 test "system catalog row filter path decoding preserves exact star and escaped percent" {
     const alloc = std.testing.allocator;
-    const params = usermgr_openapi.server.SetRowFilterParams{ .database = "default", .namespace = "public" };
+    const params = usermgr_server_openapi.server.SetRowFilterParams{ .database = "default", .namespace = "public" };
     const star = try scopedRowFilterKeyAlloc(alloc, "%2A", params);
     defer alloc.free(star);
     const escaped = try scopedRowFilterKeyAlloc(alloc, "%252A", params);
@@ -55447,7 +55449,7 @@ test "system catalog identity failures remain unavailable across status adapters
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source, null, null);
     defer server.deinit();
     for ([_]anyerror{ error.MetadataIncarnationUnavailable, error.InvalidMetadataIncarnation, error.MetadataIncarnationMismatch }) |err| {
-        fixture.err = @import("../runtime_error_abi.zig").errorFromStatus(@import("../runtime_error_abi.zig").statusFromError(err));
+        fixture.err = @import("antfly_runtime_abi").error_abi.errorFromStatus(@import("antfly_runtime_abi").error_abi.statusFromError(err));
         try std.testing.expectEqual(err, fixture.err);
         try std.testing.expectError(error.CatalogRoutingUnavailable, source.systemCatalog(std.testing.allocator, .{}, .snapshot));
         try std.testing.expectEqual(@as(u16, 503), system_catalog.httpStatus(error.CatalogRoutingUnavailable));

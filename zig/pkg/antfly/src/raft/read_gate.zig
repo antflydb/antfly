@@ -15,7 +15,7 @@
 const std = @import("std");
 const raft_engine = @import("raft_engine");
 const db_types = @import("../storage/db/types.zig");
-const read_state_observer_mod = @import("state_machine/read_state_observer.zig");
+const read_state_observer_mod = @import("antfly_read_state_observer");
 
 /// Tracks quorum ReadIndex requests until the matching ReadState has crossed
 /// this replica's state-machine apply boundary. Registration is request
@@ -252,7 +252,7 @@ pub const ReadSafetyBarrier = struct {
     pub const VTable = struct {
         wait_read_safe: *const fn (ptr: *anyopaque, group_id: u64, request_ctx: []const u8) anyerror!void,
         capture_frozen: ?*const fn (*anyopaque, u64) anyerror!FrozenProof = null,
-        validate_frozen: ?*const fn (*anyopaque, u64, FrozenProof, ?u64, @import("../common/cancellation.zig").CancellationToken) anyerror!void = null,
+        validate_frozen: ?*const fn (*anyopaque, u64, FrozenProof, ?u64, @import("antfly_cancellation").CancellationToken) anyerror!void = null,
     };
 
     pub const FrozenProof = struct {

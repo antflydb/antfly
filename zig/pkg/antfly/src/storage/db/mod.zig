@@ -106,8 +106,7 @@ pub const HAAsyncEffectMirror = @import("antfly_source_root").antfly_sources.phy
 pub const HAAsyncBatchMirror = @import("antfly_source_root").antfly_sources.physical_db.HAAsyncBatchMirror;
 pub const HAAsyncMetadataMirror = @import("antfly_source_root").antfly_sources.physical_db.HAAsyncMetadataMirror;
 pub const HAMutationBarrier = @import("antfly_source_root").antfly_sources.physical_db.HAMutationBarrier;
-pub const HAProgressPollFn = @import("antfly_source_root").antfly_sources.physical_db.HAProgressPollFn;
-pub const HAPrimaryProgressSyncWait = @import("antfly_source_root").antfly_sources.physical_db.HAPrimaryProgressSyncWait;
+
 pub const HAWriteGate = @import("antfly_source_root").antfly_sources.physical_db.HAWriteGate;
 pub const SchemaBeforeIndexLoad = @import("antfly_source_root").antfly_sources.physical_db.SchemaBeforeIndexLoad;
 pub const HAReplicationRecordView = @import("../hot_standby/replication_record.zig").RecordView;

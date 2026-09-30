@@ -30,7 +30,7 @@ const httpx = @import("httpx");
 const system_catalog = @import("../system_catalog/domain.zig");
 const system_catalog_routes = @import("../system_catalog/routes.zig");
 const system_catalog_http = @import("system_catalog_http.zig");
-const runtime_http_bridge = @import("../runtime_http_bridge.zig");
+const runtime_http_bridge = @import("antfly_runtime_abi").http_bridge;
 const inference_connection_abi = @import("../inference_connection_abi.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
@@ -109,6 +109,8 @@ const builtin = @import("builtin");
 const db_mod = @import("../storage/db/selected_root.zig").db;
 const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
+const metadata_server_openapi = @import("antfly_metadata_server_openapi");
+const usermgr_server_openapi = @import("antfly_usermgr_server_openapi");
 const routes = @import("http_routes.zig").Routes;
 const request_admission_policy = @import("request_admission_policy.zig");
 const admin_routes = @import("../admin/routes.zig");
@@ -166,7 +168,7 @@ const ResumeRaftQuarantineRequest = struct {
 
 fn parseGlobalQueryTable(alloc: std.mem.Allocator, body: []const u8) !ParsedGlobalQueryTable {
     try query_contract.validatePublicQuerySortTupleContract(alloc, body);
-    var parsed = metadata_openapi.server.parseGlobalQueryBody(alloc, body) catch return error.InvalidQueryRequest;
+    var parsed = metadata_server_openapi.server.parseGlobalQueryBody(alloc, body) catch return error.InvalidQueryRequest;
     errdefer parsed.deinit();
     const table_name = parsed.value.table orelse return error.InvalidQueryRequest;
     if (table_name.len == 0) return error.InvalidQueryRequest;
@@ -1298,9 +1300,9 @@ pub const AntflyApiHandler = struct {
         include_contextual: bool,
         include_probes: bool,
     ) !void {
-        const metadata_router = metadata_openapi.server.ServerRouter(AntflyApiHandler).init(self);
+        const metadata_router = metadata_server_openapi.server.ServerRouter(AntflyApiHandler).init(self);
         try metadata_router.register(public_server);
-        const usermgr_router = usermgr_openapi.server.ServerRouter(AntflyApiHandler).init(self);
+        const usermgr_router = usermgr_server_openapi.server.ServerRouter(AntflyApiHandler).init(self);
         try usermgr_router.register(root_server);
         if (include_contextual) {
             try self.registerContextualRoutes(root_server, include_probes);
@@ -1898,7 +1900,7 @@ pub const AntflyApiHandler = struct {
                 }.call,
             } else .none,
             .deadline_ns = ctx.application_deadline_ns,
-            .deadline_io = if (ctx.application_deadline_io) |io| @import("../runtime_io_abi.zig").Borrow.init(&io) else null,
+            .deadline_io = if (ctx.application_deadline_io) |io| @import("antfly_runtime_abi").io_abi.Borrow.init(&io) else null,
             .request_id = ctx.header("x-request-id") orelse "",
             .principal = if (identity) |authenticated| .{
                 .kind = .user,
@@ -3995,7 +3997,7 @@ pub const AntflyApiHandler = struct {
         return ctx.openApiJson(topology);
     }
 
-    pub fn listConnections(self: *AntflyApiHandler, ctx: *httpx.Context, params: metadata_openapi.server.ListConnectionsParams) !httpx.Response {
+    pub fn listConnections(self: *AntflyApiHandler, ctx: *httpx.Context, params: metadata_server_openapi.server.ListConnectionsParams) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
@@ -4097,7 +4099,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid secret request");
         };
-        var parsed = metadata_openapi.server.parsePutSecretBody(alloc, body_data) catch {
+        var parsed = metadata_server_openapi.server.parsePutSecretBody(alloc, body_data) catch {
             _ = ctx.status(400);
             return ctx.text("invalid secret request");
         };
@@ -4444,7 +4446,7 @@ pub const AntflyApiHandler = struct {
         return ctx.openApiJson(response);
     }
 
-    pub fn cleanupTransactionSessions(self: *AntflyApiHandler, ctx: *httpx.Context, params: metadata_openapi.server.CleanupTransactionSessionsParams) !httpx.Response {
+    pub fn cleanupTransactionSessions(self: *AntflyApiHandler, ctx: *httpx.Context, params: metadata_server_openapi.server.CleanupTransactionSessionsParams) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
@@ -5352,7 +5354,7 @@ pub const AntflyApiHandler = struct {
         return try self.restoreJob(ctx, job_id_raw, true);
     }
 
-    pub fn listRestoreJobs(self: *AntflyApiHandler, ctx: *httpx.Context, params: metadata_openapi.server.ListRestoreJobsParams) !httpx.Response {
+    pub fn listRestoreJobs(self: *AntflyApiHandler, ctx: *httpx.Context, params: metadata_server_openapi.server.ListRestoreJobsParams) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
@@ -5395,7 +5397,7 @@ pub const AntflyApiHandler = struct {
         return respondOwnedContextualResponse(ctx, &resp, self.api_server.alloc);
     }
 
-    pub fn listBackups(self: *AntflyApiHandler, ctx: *httpx.Context, params: metadata_openapi.server.ListBackupsParams) !httpx.Response {
+    pub fn listBackups(self: *AntflyApiHandler, ctx: *httpx.Context, params: metadata_server_openapi.server.ListBackupsParams) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
@@ -5957,7 +5959,7 @@ pub const AntflyApiHandler = struct {
         const body_data = (try ctx.body()) orelse {
             return jsonErrorResponse(ctx, 400, "invalid eval request");
         };
-        var parsed = metadata_openapi.server.parseEvaluateBody(alloc, body_data) catch {
+        var parsed = metadata_server_openapi.server.parseEvaluateBody(alloc, body_data) catch {
             return jsonErrorResponse(ctx, 400, "invalid eval request");
         };
         defer parsed.deinit();
@@ -6705,7 +6707,7 @@ pub const AntflyApiHandler = struct {
         return self.repairIndex(ctx, table_name, index_name);
     }
 
-    pub fn listNamespaceTables(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, params: metadata_openapi.server.ListNamespaceTablesParams) !httpx.Response {
+    pub fn listNamespaceTables(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, params: metadata_server_openapi.server.ListNamespaceTablesParams) !httpx.Response {
         _ = database_name;
         _ = namespace_name;
         return self.listTables(ctx, .{ .prefix = params.prefix, .limit = params.limit, .cursor = params.cursor });
@@ -6741,7 +6743,7 @@ pub const AntflyApiHandler = struct {
         return self.batchWrite(ctx, table_name);
     }
 
-    pub fn lookupNamespaceTableDocument(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8, params: metadata_openapi.server.LookupNamespaceTableDocumentParams) !httpx.Response {
+    pub fn lookupNamespaceTableDocument(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8, params: metadata_server_openapi.server.LookupNamespaceTableDocumentParams) !httpx.Response {
         _ = database_name;
         _ = namespace_name;
         return self.lookupKey(ctx, table_name, key, .{ .fields = params.fields, .consistency = params.consistency });
@@ -6873,7 +6875,7 @@ pub const AntflyApiHandler = struct {
         return self.catalogResource(ctx, .rename);
     }
 
-    pub fn listTables(self: *AntflyApiHandler, ctx: *httpx.Context, params: metadata_openapi.server.ListTablesParams) !httpx.Response {
+    pub fn listTables(self: *AntflyApiHandler, ctx: *httpx.Context, params: metadata_server_openapi.server.ListTablesParams) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
@@ -7628,11 +7630,11 @@ pub const AntflyApiHandler = struct {
         return respondOwnedContextualResponse(ctx, &resp, self.api_server.alloc);
     }
 
-    pub fn updateSchema(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, _: metadata_openapi.server.UpdateSchemaParams) !httpx.Response {
+    pub fn updateSchema(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, _: metadata_server_openapi.server.UpdateSchemaParams) !httpx.Response {
         return self.mutateSchema(ctx, table_name, .replace);
     }
 
-    pub fn patchSchema(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, _: metadata_openapi.server.PatchSchemaParams) !httpx.Response {
+    pub fn patchSchema(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, _: metadata_server_openapi.server.PatchSchemaParams) !httpx.Response {
         return self.mutateSchema(ctx, table_name, .merge_patch);
     }
 
@@ -8098,7 +8100,7 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
-    pub fn lookupKey(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: metadata_openapi.server.LookupKeyParams) !httpx.Response {
+    pub fn lookupKey(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: metadata_server_openapi.server.LookupKeyParams) !httpx.Response {
         return self.lookupKeyImpl(ctx, table_name, key, params) catch |err| {
             switch (err) {
                 error.RowPolicyAuthenticationRequired, error.RowPolicyDenied => return textResponse(ctx, 403, "row policy authentication required"),
@@ -8111,7 +8113,7 @@ pub const AntflyApiHandler = struct {
         };
     }
 
-    fn lookupKeyImpl(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: metadata_openapi.server.LookupKeyParams) !httpx.Response {
+    fn lookupKeyImpl(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: metadata_server_openapi.server.LookupKeyParams) !httpx.Response {
         _ = params;
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
@@ -8245,7 +8247,7 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
-    pub fn getDocumentArtifactManifest(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8, params: metadata_openapi.server.GetDocumentArtifactManifestParams) !httpx.Response {
+    pub fn getDocumentArtifactManifest(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8, params: metadata_server_openapi.server.GetDocumentArtifactManifestParams) !httpx.Response {
         _ = params;
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
@@ -8275,7 +8277,7 @@ pub const AntflyApiHandler = struct {
         return respondOwnedApiResponse(ctx, &resp);
     }
 
-    pub fn listDocumentArtifactManifests(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: metadata_openapi.server.ListDocumentArtifactManifestsParams) !httpx.Response {
+    pub fn listDocumentArtifactManifests(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: metadata_server_openapi.server.ListDocumentArtifactManifestsParams) !httpx.Response {
         _ = params;
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
@@ -8846,7 +8848,7 @@ pub const AntflyApiHandler = struct {
         return ctx.openApiJson(.{ .message = "Permission added successfully" });
     }
 
-    pub fn removePermissionFromUser(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8, params: usermgr_openapi.server.RemovePermissionFromUserParams) !httpx.Response {
+    pub fn removePermissionFromUser(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8, params: usermgr_server_openapi.server.RemovePermissionFromUserParams) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
@@ -8928,7 +8930,7 @@ pub const AntflyApiHandler = struct {
         return ctx.openApiJson(.{ .message = "Role added successfully" });
     }
 
-    pub fn removeRoleFromUser(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8, params: usermgr_openapi.server.RemoveRoleFromUserParams) !httpx.Response {
+    pub fn removeRoleFromUser(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8, params: usermgr_server_openapi.server.RemoveRoleFromUserParams) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
@@ -8990,7 +8992,7 @@ pub const AntflyApiHandler = struct {
         return ctx.openApiJson(generated);
     }
 
-    pub fn getRowFilter(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8, literal_table: []const u8, params: usermgr_openapi.server.GetRowFilterParams) !httpx.Response {
+    pub fn getRowFilter(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8, literal_table: []const u8, params: usermgr_server_openapi.server.GetRowFilterParams) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
@@ -9018,7 +9020,7 @@ pub const AntflyApiHandler = struct {
         return ctx.openApiJson(generated);
     }
 
-    pub fn setRowFilter(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8, literal_table: []const u8, params: usermgr_openapi.server.SetRowFilterParams) !httpx.Response {
+    pub fn setRowFilter(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8, literal_table: []const u8, params: usermgr_server_openapi.server.SetRowFilterParams) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
@@ -9032,7 +9034,7 @@ pub const AntflyApiHandler = struct {
         const body_data = (try ctx.body()) orelse {
             return jsonErrorResponse(ctx, 400, "invalid row filter");
         };
-        var parsed_filter = usermgr_openapi.server.parseSetRowFilterBody(alloc, body_data) catch {
+        var parsed_filter = usermgr_server_openapi.server.parseSetRowFilterBody(alloc, body_data) catch {
             return jsonErrorResponse(ctx, 400, "invalid row filter");
         };
         defer parsed_filter.deinit();
@@ -9059,7 +9061,7 @@ pub const AntflyApiHandler = struct {
         return ctx.openApiJson(generated);
     }
 
-    pub fn removeRowFilter(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8, literal_table: []const u8, params: usermgr_openapi.server.RemoveRowFilterParams) !httpx.Response {
+    pub fn removeRowFilter(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8, literal_table: []const u8, params: usermgr_server_openapi.server.RemoveRowFilterParams) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
@@ -9101,7 +9103,7 @@ pub const AntflyApiHandler = struct {
         return ctx.openApiJson(generated);
     }
 
-    pub fn getSubjectRowFilter(self: *AntflyApiHandler, ctx: *httpx.Context, subject: []const u8, literal_table: []const u8, params: usermgr_openapi.server.GetSubjectRowFilterParams) !httpx.Response {
+    pub fn getSubjectRowFilter(self: *AntflyApiHandler, ctx: *httpx.Context, subject: []const u8, literal_table: []const u8, params: usermgr_server_openapi.server.GetSubjectRowFilterParams) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
@@ -9129,7 +9131,7 @@ pub const AntflyApiHandler = struct {
         return ctx.openApiJson(generated);
     }
 
-    pub fn setSubjectRowFilter(self: *AntflyApiHandler, ctx: *httpx.Context, subject: []const u8, literal_table: []const u8, params: usermgr_openapi.server.SetSubjectRowFilterParams) !httpx.Response {
+    pub fn setSubjectRowFilter(self: *AntflyApiHandler, ctx: *httpx.Context, subject: []const u8, literal_table: []const u8, params: usermgr_server_openapi.server.SetSubjectRowFilterParams) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
@@ -9143,7 +9145,7 @@ pub const AntflyApiHandler = struct {
         const body_data = (try ctx.body()) orelse {
             return jsonErrorResponse(ctx, 400, "invalid row filter");
         };
-        var parsed_filter = usermgr_openapi.server.parseSetSubjectRowFilterBody(alloc, body_data) catch {
+        var parsed_filter = usermgr_server_openapi.server.parseSetSubjectRowFilterBody(alloc, body_data) catch {
             return jsonErrorResponse(ctx, 400, "invalid row filter");
         };
         defer parsed_filter.deinit();
@@ -9164,7 +9166,7 @@ pub const AntflyApiHandler = struct {
         return ctx.openApiJson(generated);
     }
 
-    pub fn removeSubjectRowFilter(self: *AntflyApiHandler, ctx: *httpx.Context, subject: []const u8, literal_table: []const u8, params: usermgr_openapi.server.RemoveSubjectRowFilterParams) !httpx.Response {
+    pub fn removeSubjectRowFilter(self: *AntflyApiHandler, ctx: *httpx.Context, subject: []const u8, literal_table: []const u8, params: usermgr_server_openapi.server.RemoveSubjectRowFilterParams) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;

@@ -20,6 +20,7 @@
 //! instead of writing through the standby receive/apply object.
 
 const std = @import("std");
+const storage_contract = @import("../db/ha_contract.zig");
 const fencing = @import("fencing.zig");
 const primary_mod = @import("primary.zig");
 const replication_record = @import("replication_record.zig");
@@ -363,4 +364,46 @@ test "storage.hot_standby write gate rejects standby until promotion handoff is 
     try std.testing.expectEqual(Action.open_promoted_primary, completed_handoff.action);
     try std.testing.expectEqual(handoff.switch_lsn, completed_handoff.durable_lsn);
     try std.testing.expect(completed_handoff.promotion_handoff != null);
+}
+
+/// Borrowed storage admission adapters. Engine callers can check admission but
+/// cannot reach the primary log, mutable standby, or promotion/fence store.
+pub fn bindPrimary(primary: *const primary_mod.Primary) storage_contract.BorrowedWriteGate {
+    return .{ .ptr = primary, .check_fn = checkPrimary };
+}
+
+pub fn bindStandby(standby: *standby_mod.Standby) storage_contract.BorrowedWriteGate {
+    return .{ .ptr = standby, .check_fn = checkStandby };
+}
+
+pub fn bindFencedPrimary(gate: FencedPrimary) storage_contract.FencedWriteGate {
+    return .{ .primary = gate.primary, .fence_store = gate.fence_store, .node_id = gate.node_id, .check_fn = checkFenced };
+}
+
+pub fn runtimeFencedPrimary(gate: storage_contract.FencedWriteGate) !FencedPrimary {
+    if (gate.check_fn != checkFenced) return error.UnsupportedReplicationWriteGate;
+    return .{ .primary = @ptrCast(@alignCast(gate.primary)), .fence_store = @ptrCast(@alignCast(gate.fence_store)), .node_id = gate.node_id };
+}
+
+fn checkPrimary(ptr: *const anyopaque) !void {
+    const primary: *const primary_mod.Primary = @ptrCast(@alignCast(ptr));
+    try requireWrite(try evaluatePrimary(primary, .{}));
+}
+
+fn checkStandby(ptr: *const anyopaque) !void {
+    const standby: *standby_mod.Standby = @ptrCast(@alignCast(@constCast(ptr)));
+    try requireWrite(try evaluateStandby(standby, .{}));
+}
+
+fn checkFenced(gate: storage_contract.FencedWriteGate) !void {
+    try requireWrite(try evaluateFencedPrimary(try runtimeFencedPrimary(gate), .{}));
+}
+
+fn requireWrite(decision: Decision) !void {
+    switch (decision.action) {
+        .allow_write => {},
+        .reject_read_only_standby => return error.HAReadOnlyStandby,
+        .open_promoted_primary => return error.HAPromotedStandbyRequiresPrimaryOpen,
+        .reject_fenced_primary => return error.HAFencedPrimary,
+    }
 }

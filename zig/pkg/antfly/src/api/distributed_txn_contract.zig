@@ -35,7 +35,7 @@ pub const PreDecisionContext = struct {
     restore_staging_scope: ?[32]u8 = null,
     restore_staging_plan_id: ?[16]u8 = null,
     deadline_ns: ?u64 = null,
-    deadline_io: ?@import("../runtime_io_abi.zig").Borrow = null,
+    deadline_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
     cancellation: db_types.CancellationToken = .none,
 };
 

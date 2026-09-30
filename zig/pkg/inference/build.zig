@@ -299,9 +299,28 @@ pub fn build(b: *std.Build) void {
     const onnx = runtime_graph.onnx;
     const pjrt_mod = runtime_graph.pjrt_mod;
     const httpx_mod = runtime_graph.httpx_mod;
+    const worker_rpc_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/host/worker_rpc.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    worker_rpc_tests_mod.addImport("httpx", httpx_mod);
+    const worker_rpc_tests = b.addTest(.{ .root_module = worker_rpc_tests_mod });
+    b.step("worker-rpc-test", "Run inference worker RPC framing and admission tests")
+        .dependOn(&b.addRunArtifact(worker_rpc_tests).step);
     const antfly_scraping_mod = runtime_graph.scraping_mod;
     const antfly_jsonschema_mod = runtime_graph.jsonschema_mod;
     const antfly_image_mod = runtime_graph.image_mod;
+    const host_work_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/host/work.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    host_work_tests_mod.addImport("antfly_scraping", antfly_scraping_mod);
+    host_work_tests_mod.addImport("antfly_image", antfly_image_mod);
+    const host_work_tests = b.addTest(.{ .root_module = host_work_tests_mod });
+    b.step("host-work-test", "Run inference host work and resource admission tests")
+        .dependOn(&b.addRunArtifact(host_work_tests).step);
     const prometheus_mod = runtime_graph.prometheus_mod;
     const structlog_mod = runtime_graph.structlog_mod;
     const inference_api_mod = runtime_graph.inference_api_mod;

@@ -129,7 +129,7 @@ fn ensureSource(alloc: std.mem.Allocator, env: Environment, input: Request, owne
         const portable_marker = try std.fmt.allocPrint(alloc, "{s}/restore-source.scope", .{files});
         defer alloc.free(portable_marker);
         _ = try native_backup.writeFileDurable(env.io, portable_marker, &input.scope.digest());
-        try @import("../common/fs_paths.zig").syncDirPortable(env.io, files);
+        try @import("antfly_runtime_fs").fs_paths.syncDirPortable(env.io, files);
         try context.ensureActive();
         try materialization.installDurableTree(alloc, env.io, work_path, durable_stage, input.scope);
         if (@import("builtin").is_test and test_fail_after_source_stage_rename) {
@@ -155,7 +155,7 @@ fn ensureSource(alloc: std.mem.Allocator, env: Environment, input: Request, owne
             const candidate_marker = try std.fmt.allocPrint(alloc, "{s}/restore-source.scope", .{files});
             defer alloc.free(candidate_marker);
             _ = try native_backup.writeFileDurable(env.io, candidate_marker, &input.scope.digest());
-            try @import("../common/fs_paths.zig").syncDirPortable(env.io, files);
+            try @import("antfly_runtime_fs").fs_paths.syncDirPortable(env.io, files);
         }
         try context.ensureActive();
         try materialization.installDurableTree(alloc, env.io, work_path, durable_stage, input.scope);
@@ -256,7 +256,7 @@ fn releaseSourceAt(alloc: std.mem.Allocator, env: Environment, scope: staging.Sc
     }
     var candidate = try transition.beginStaging();
     defer candidate.deinit();
-    try @import("../common/fs_paths.zig").createDirPathPortable(env.io, candidate.path());
+    try @import("antfly_runtime_fs").fs_paths.createDirPathPortable(env.io, candidate.path());
     const candidate_marker = try std.fmt.allocPrint(alloc, "{s}/restore-source.released", .{candidate.path()});
     defer alloc.free(candidate_marker);
     _ = try native_backup.writeFileDurable(env.io, candidate_marker, &scope.digest());

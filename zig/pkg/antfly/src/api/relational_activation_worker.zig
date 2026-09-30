@@ -24,7 +24,7 @@ const records = @import("../common/topology_records.zig");
 const contract = @import("distributed_txn_contract.zig");
 const Allocator = std.mem.Allocator;
 const RequestContext = @import("operation.zig").RequestContext;
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const time = @import("antfly_platform").time;
 
 const Attempt = enum { idle, progressed, shrink };

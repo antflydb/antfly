@@ -21,9 +21,6 @@ const runtime_callbacks = @import("runtime_callbacks.zig");
 const structured_filter_validation = @import("query/structured_filter_validation.zig");
 const ha_contract = @import("ha_contract.zig");
 const document_artifact_child_range = @import("document_artifact_child_range.zig");
-const ha_commit_gate = @import("../hot_standby/commit_gate.zig");
-const ha_primary = @import("../hot_standby/primary.zig");
-const platform_time = @import("antfly_platform").time;
 
 pub const types = @import("types.zig");
 pub const coordinated_ttl = @import("../coordinated_ttl.zig");
@@ -54,40 +51,7 @@ pub const HAAsyncMetadataMirror = ha_contract.AsyncMetadataMirror;
 pub const HAMutationBarrier = @import("../hot_standby/mutation_barrier.zig").MutationBarrier;
 pub const HASyncWaitFn = ha_contract.SyncWaitFn;
 pub const HAWriteGate = ha_contract.WriteGate;
-pub const HAProgressPollFn = *const fn (
-    ctx: *anyopaque,
-    primary: *ha_primary.Primary,
-    target_lsn: u64,
-    policy: ha_primary.SyncPolicy,
-    round: usize,
-) anyerror!void;
-pub const HAPrimaryProgressSyncWait = struct {
-    max_rounds: usize = 64,
-    sleep_ns: u64 = 0,
-    poll_ctx: ?*anyopaque = null,
-    poll_fn: ?HAProgressPollFn = null,
 
-    pub fn wait(ctx: *anyopaque, primary: *ha_primary.Primary, target_lsn: u64, policy: ha_primary.SyncPolicy) !void {
-        const self: *@This() = @ptrCast(@alignCast(ctx));
-        if (policy.mode == .async) return;
-        if (self.max_rounds == 0) return error.HASyncCommitWaitLimitExceeded;
-
-        var round: usize = 0;
-        while (round < self.max_rounds) : (round += 1) {
-            if (self.poll_fn) |poll| {
-                const poll_ctx = self.poll_ctx orelse return error.HASyncCommitWaitMissingContext;
-                try poll(poll_ctx, primary, target_lsn, policy, round);
-            }
-
-            const gate = try ha_commit_gate.evaluate(primary, target_lsn, policy);
-            if (gate.shouldAcknowledge()) return;
-            if (gate.action == .reject) return error.SyncPolicyUnsatisfied;
-            if (self.sleep_ns > 0) platform_time.sleepNs(self.sleep_ns);
-        }
-
-        return error.HASyncCommitWouldBlock;
-    }
-};
 pub const DocumentArtifactChildRangeApplyBatch = document_artifact_child_range.ApplyBatch;
 pub const TextMemoryAttributionStats = @import("text_memory_stats.zig").TextMemoryAttributionStats;
 pub const TextFieldStats = @import("../../search/distributed_stats.zig").TextFieldStats;

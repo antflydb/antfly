@@ -12,6 +12,8 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const ha_write_gate_adapter = @import("hot_standby/write_gate.zig");
+const ha_publisher_adapter = @import("hot_standby/db_commit.zig");
 const std = @import("std");
 const abi = @import("kernel_owner_abi");
 const error_identity = @import("kernel_error_identity");
@@ -3185,7 +3187,7 @@ test "opaque metadata HA callback preserves lost ack replay and full checkpoint 
     const initial = "{\"job_id\":42,\"phase\":\"queued\"}";
     const updated = "{\"job_id\":42,\"phase\":\"importing\"}";
     const Failure = struct {
-        fn wait(_: *anyopaque, _: *primary_mod.Primary, _: u64, _: primary_mod.SyncPolicy) !void {
+        fn wait(_: *anyopaque, _: *anyopaque, _: u64, _: primary_mod.SyncPolicy) !void {
             return error.HASyncCommitWouldBlock;
         }
     };
@@ -3198,7 +3200,7 @@ test "opaque metadata HA callback preserves lost ack replay and full checkpoint 
         // An opaque owner cannot retain a pointer to this stack-local Port;
         // only its heap-owned creator adapter survives each completed bind.
         try std.testing.expect(transition.tryLock());
-        try source.bindHA(.{ .primary = &primary }, .{ .primary = &primary, .transition_mutex = &transition });
+        try source.bindHA(.{ .primary = ha_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = ha_publisher_adapter.bind(&primary), .transition_mutex = &transition });
         transition.unlock();
         try std.testing.expectError(error.MetadataHAMigrationAfterBinding, source.migrateStandaloneRestoreJobs(&.{}));
         try source.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = key, .value = initial } });
@@ -3209,7 +3211,7 @@ test "opaque metadata HA callback preserves lost ack replay and full checkpoint 
         const actual = (try target.getRestoreJobValue(alloc, group, key)).?;
         defer alloc.free(actual);
         try std.testing.expectEqualStrings(initial, actual);
-        try source.bindHA(.{ .primary = &primary }, .{ .primary = &primary, .transition_mutex = &transition, .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &wait_ctx, .sync_wait_fn = Failure.wait });
+        try source.bindHA(.{ .primary = ha_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = ha_publisher_adapter.bind(&primary), .transition_mutex = &transition, .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &wait_ctx, .sync_wait_fn = Failure.wait });
         try std.testing.expectError(error.HASyncCommitWouldBlock, source.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = key, .value = updated } }));
         try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
         try std.testing.expectError(error.MetadataHAOutboxPending, source.exportHACheckpoint(io, root ++ "/checkpoint"));
@@ -3219,7 +3221,7 @@ test "opaque metadata HA callback preserves lost ack replay and full checkpoint 
     {
         var source = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = root ++ "/source" });
         defer source.deinit();
-        try source.bindHA(.{ .primary = &primary }, .{ .primary = &primary, .transition_mutex = &transition });
+        try source.bindHA(.{ .primary = ha_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = ha_publisher_adapter.bind(&primary), .transition_mutex = &transition });
         try source.flushHAOutbox();
         try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
         const checkpoint = try source.exportHACheckpoint(io, root ++ "/checkpoint");
@@ -3240,7 +3242,7 @@ test "opaque metadata HA callback preserves lost ack replay and full checkpoint 
         try std.testing.expect(revision > 0);
         try std.testing.expectError(error.TableLifecycleConflict, source.replaceStandaloneCatalog(group, revision - 1, &.{}, &.{}, "{}"));
         try std.testing.expectEqual(revision, try source.standaloneRevision());
-        try source.bindHA(.{ .primary = &primary }, .{ .primary = &primary, .transition_mutex = &transition, .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &wait_ctx, .sync_wait_fn = Failure.wait });
+        try source.bindHA(.{ .primary = ha_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = ha_publisher_adapter.bind(&primary), .transition_mutex = &transition, .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &wait_ctx, .sync_wait_fn = Failure.wait });
         try std.testing.expectError(error.MetadataMutationOutcomeUnknown, source.replaceStandaloneCatalog(group, revision, &.{}, &.{}, "{}"));
         try std.testing.expectEqual(revision + 1, try source.standaloneRevision());
         const catalog = (try source.loadStandaloneCatalog(alloc)).?;
@@ -3267,7 +3269,8 @@ test "opaque metadata standby acknowledgement cannot retire an outbox across pro
         gate: *gate_mod.State,
         transition: *std.atomic.Mutex,
 
-        fn wait(ptr: *anyopaque, owner: *primary_mod.Primary, lsn: u64, _: primary_mod.SyncPolicy) !void {
+        fn wait(ptr: *anyopaque, owner_ctx: *anyopaque, lsn: u64, _: primary_mod.SyncPolicy) !void {
+            const owner: *primary_mod.Primary = @ptrCast(@alignCast(owner_ctx));
             const self: *@This() = @ptrCast(@alignCast(ptr));
             // Remote acknowledgement waits must not retain the promotion
             // lock. Simulate a new authority generation before returning.
@@ -3280,8 +3283,8 @@ test "opaque metadata standby acknowledgement cannot retire an outbox across pro
     var promote: Promote = .{ .gate = &gate, .transition = &transition };
     var source = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = root ++ "/source" });
     defer source.deinit();
-    try source.bindHA(.{ .shared = .{ .state = &gate } }, .{
-        .primary = &primary,
+    try source.bindHA(.{ .shared = .{ .state = gate.storageWriteState() } }, .{
+        .publisher = ha_publisher_adapter.bind(&primary),
         .transition_mutex = &transition,
         .sync_policy = .{ .mode = .remote_apply, .standby_names = &.{"standby-a"} },
         .sync_wait_ctx = &promote,
@@ -3296,7 +3299,7 @@ test "opaque metadata standby acknowledgement cannot retire an outbox across pro
     try std.testing.expect(transition.tryLock());
     transition.unlock();
     const prior_lsn = primary.lastLsn();
-    try source.bindHA(.{ .shared = .{ .state = &gate } }, .{ .primary = &primary, .transition_mutex = &transition });
+    try source.bindHA(.{ .shared = .{ .state = gate.storageWriteState() } }, .{ .publisher = ha_publisher_adapter.bind(&primary), .transition_mutex = &transition });
     try source.flushHAOutbox();
     try std.testing.expectEqual(prior_lsn, primary.lastLsn());
     _ = try source.exportHACheckpoint(std.testing.io, root ++ "/checkpoint");
@@ -3704,7 +3707,7 @@ test "opaque metadata listener boundary preserves incarnation commit ordering" {
 
 test "storage kernel status registry is unique and lossless" {
     try error_identity.validateForTest();
-    const runtime_error = @import("../runtime_error_abi.zig");
+    const runtime_error = @import("antfly_runtime_abi").error_abi;
     for ([_]anyerror{ error.IndexRebuilding, error.IncompletePublishedSnapshot, error.DistributedQueryUnavailable, error.TableTopologyProtocolUpgradeRequired, error.StorageReadTemporarilyUnavailable }) |expected| {
         const failure = error_identity.failureFromError(
             expected,

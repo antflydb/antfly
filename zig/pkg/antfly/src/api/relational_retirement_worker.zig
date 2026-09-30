@@ -558,7 +558,7 @@ fn testRetirementDrain(pressure: RetirementPressure) !void {
         fn batch(_: *anyopaque, _: Allocator, _: []const u8, _: types.BatchRequest) !?void {
             return error.UnexpectedCall;
         }
-        fn commitBatch(ptr: *anyopaque, allocator: Allocator, requests: []const contract.TableCommitRequest, _: types.SyncLevel, cancellation: @import("../common/cancellation.zig").CancellationToken) !?contract.CommitOutcome {
+        fn commitBatch(ptr: *anyopaque, allocator: Allocator, requests: []const contract.TableCommitRequest, _: types.SyncLevel, cancellation: @import("antfly_cancellation").CancellationToken) !?contract.CommitOutcome {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try cancellation.check();
             try std.testing.expectEqual(@as(usize, 1), requests.len);

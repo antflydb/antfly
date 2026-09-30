@@ -27,7 +27,7 @@ const external_source_manifest = @import("external_source_manifest.zig");
 pub const PublishOptions = struct {
     artifact_name: []const u8 = &.{},
     previous_artifacts: []const @import("../manifest/artifact_ref.zig").ArtifactRef = &.{},
-    cancellation: @import("../../common/cancellation.zig").CancellationToken = .none,
+    cancellation: @import("antfly_cancellation").CancellationToken = .none,
 };
 
 pub const PublishResult = struct {

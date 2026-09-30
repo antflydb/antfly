@@ -26,11 +26,11 @@ const table_create_contract = @import("table_create_contract.zig");
 const backup_contract = @import("backup_contract.zig");
 const distributed_txn = @import("distributed_txn_contract.zig");
 const metadata_topology_protocol = @import("../metadata/topology_protocol.zig");
-const metadata_api = @import("../metadata/api.zig");
+const metadata_api = @import("../metadata/catalog_mutation_stamp.zig");
 const runtime_status = @import("runtime_status.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
-const runtime_error_abi = @import("../runtime_error_abi.zig");
-const runtime_native_abi = @import("../runtime_native_abi.zig");
+const runtime_error_abi = @import("antfly_runtime_abi").error_abi;
+const runtime_native_abi = @import("antfly_runtime_abi").native_abi;
 
 pub const LocalStructuralReconcileState = enum {
     complete,

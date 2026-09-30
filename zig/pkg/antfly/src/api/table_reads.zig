@@ -29,14 +29,14 @@ const metadata_api = @import("../metadata/api.zig");
 const metadata_mod = @import("../metadata/domain.zig");
 const metadata_reconciler = @import("../metadata/reconciler.zig");
 const common_secrets = @import("../common/secrets.zig");
-const threaded_io_limits = @import("../common/threaded_io_limits.zig");
+const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_table_provisioner = @import("../metadata/table_provisioner.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
-const remote_capabilities = @import("../inference/remote_capabilities.zig");
-const execution_context = @import("../inference/execution_context.zig");
-const inference_request_context = @import("../inference/execution_context.zig");
+const remote_capabilities = @import("antfly_inference_remote_capabilities");
+const execution_context = @import("antfly_inference_execution_context");
+const inference_request_context = @import("antfly_inference_execution_context");
 const raft_mod = @import("../raft/mod.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = if (control_only_storage_sources)
@@ -81,7 +81,7 @@ const table_router = @import("table_router.zig");
 const tables_api = @import("tables.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
-const public_limits = @import("public_limits.zig");
+const public_limits = @import("antfly_public_limits");
 const distributed_graph = @import("distributed_graph.zig");
 const runtime_status = @import("runtime_status.zig");
 const table_read_source = @import("table_read_source.zig");
@@ -2619,7 +2619,7 @@ pub const BoundTableReadSource = struct {
         snapshots: []@import("../storage/statement_read_fence.zig").Snapshot,
         table: []u8,
         schema_version: u32,
-        cancellation: ?@import("../common/cancellation.zig").CancellationToken,
+        cancellation: ?@import("antfly_cancellation").CancellationToken,
         deadline_ns: ?u64,
         opened: usize = 0,
 
@@ -2686,7 +2686,7 @@ pub const BoundTableReadSource = struct {
         snapshot: db_mod.DB.RelationalStatementSnapshot,
         schema_version: u32,
         consistency: raft_mod.ReadConsistency,
-        cancellation: ?@import("../common/cancellation.zig").CancellationToken,
+        cancellation: ?@import("antfly_cancellation").CancellationToken,
         deadline_ns: ?u64,
         opened: usize = 0,
 
@@ -2723,7 +2723,7 @@ pub const BoundTableReadSource = struct {
         }
     };
 
-    fn openRelationalStatementSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, schema_version: u32, consistency: raft_mod.ReadConsistency, cancellation: ?@import("../common/cancellation.zig").CancellationToken, deadline_ns: ?u64) !@import("table_read_source.zig").RelationalStatementSnapshot {
+    fn openRelationalStatementSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, schema_version: u32, consistency: raft_mod.ReadConsistency, cancellation: ?@import("antfly_cancellation").CancellationToken, deadline_ns: ?u64) !@import("table_read_source.zig").RelationalStatementSnapshot {
         const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table)) return error.TableNotFound;
         if (consistency != .read_index) return error.SqlStatementSnapshotRequired;
@@ -3432,7 +3432,7 @@ pub const ProvisionedTableReadSource = struct {
 
     fn distributedInternalExecutor(self: *ProvisionedTableReadSource) http_common.RequestExecutor {
         std.debug.assert(self.distributed_executor != null);
-        return .{ .ptr = self, .clock_io = if (self.io_impl) |*owner| @import("../runtime_io_abi.zig").Borrow.init(&owner.backend) else self.distributed_executor.?.clock_io, .vtable = &.{ .execute = executeDistributedInternalRequest } };
+        return .{ .ptr = self, .clock_io = if (self.io_impl) |*owner| @import("antfly_runtime_abi").io_abi.Borrow.init(&owner.backend) else self.distributed_executor.?.clock_io, .vtable = &.{ .execute = executeDistributedInternalRequest } };
     }
 
     /// Reuse the production hosted-route implementation for public operations
@@ -3830,7 +3830,7 @@ pub const ProvisionedTableReadSource = struct {
         };
     }
 
-    fn openRelationalStatementSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, schema_version: u32, consistency: raft_mod.ReadConsistency, cancellation: ?@import("../common/cancellation.zig").CancellationToken, deadline_ns: ?u64) !@import("table_read_source.zig").RelationalStatementSnapshot {
+    fn openRelationalStatementSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, schema_version: u32, consistency: raft_mod.ReadConsistency, cancellation: ?@import("antfly_cancellation").CancellationToken, deadline_ns: ?u64) !@import("table_read_source.zig").RelationalStatementSnapshot {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
         if (self.local_read_source == null) return error.SqlStatementSnapshotRequired;
@@ -18496,7 +18496,7 @@ fn consumerTests() type {
             const catalog = table_catalog.CatalogSource{
                 .ptr = undefined,
                 .vtable = undefined,
-                .io = @import("../runtime_io_abi.zig").Borrow.init(&routing_io.io()),
+                .io = @import("antfly_runtime_abi").io_abi.Borrow.init(&routing_io.io()),
             };
             const native_deadline = platform_time.monotonicNs() + 5 * ns;
             const req = db_mod.types.SearchRequest{ .execution_deadline_ns = native_deadline };
@@ -18514,7 +18514,7 @@ fn consumerTests() type {
             defer request_io.deinit();
             const opts = db_mod.types.LookupOptions{
                 .execution_deadline_ns = 8 * ns,
-                .execution_io = @import("../runtime_io_abi.zig").Borrow.init(&request_io.io()),
+                .execution_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&request_io.io()),
             };
             try std.testing.expectEqual(routing_now + ns, lookupRoutingDeadline(catalog, opts).?);
             var fence = metadata_api.CatalogRouteFence{
@@ -21234,7 +21234,7 @@ fn consumerTests() type {
                     scores[1] = 0.9;
                     return scores;
                 }
-                fn capabilities(_: *anyopaque, _: std.mem.Allocator, _: []const u8, task: @import("../inference/work.zig").Task) anyerror!@import("../inference/work.zig").InferenceCapabilities {
+                fn capabilities(_: *anyopaque, _: std.mem.Allocator, _: []const u8, task: @import("antfly_inference_work").Task) anyerror!@import("antfly_inference_work").InferenceCapabilities {
                     return .{ .task = task, .input_modalities = .{ .text = true, .image = true }, .input_granularity = .item, .output = .ranked_items, .result_cardinality = .one_per_request };
                 }
             };
@@ -32660,7 +32660,7 @@ fn implementationTests() type {
                     model: []const u8,
                     roles: []const []const u8,
                     contents: []const []const u8,
-                    _: @import("../inference/types.zig").GenerationOptions,
+                    _: @import("antfly_inference_types").GenerationOptions,
                 ) anyerror![]u8 {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.calls += 1;

@@ -16,7 +16,7 @@ const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const contract = @import("secret_contract.zig");
-const fs_paths = @import("fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 
 const c_env = if (builtin.link_libc and builtin.os.tag != .windows) struct {

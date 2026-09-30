@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const platform_time = @import("antfly_platform").time;
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const metadata_state = @import("state.zig");
 const metadata_reconciler = @import("reconciler.zig");
 const extension_domain = @import("../extensions/mod.zig");
@@ -26,25 +26,15 @@ const transition_state = @import("transition_state.zig");
 const metadata_incarnation = @import("incarnation.zig");
 const reallocation_request = @import("reallocation_request.zig");
 
-pub const MetadataClusterIncarnation = metadata_incarnation.MetadataClusterIncarnation;
+pub const MetadataClusterIncarnation = @import("catalog_mutation_stamp.zig").MetadataClusterIncarnation;
+
 pub const MetadataRaftVoterSetFingerprint = [table_manager.voter_set_fingerprint_len * 2]u8;
 
 /// Authoritative ordering stamp for one consensus-committed catalog mutation.
 /// The Raft log index is comparable only inside the same metadata namespace;
 /// carrying that namespace with the receipt prevents delayed callbacks from a
 /// replaced metadata group from superseding current control-plane work.
-pub const CatalogMutationStamp = struct {
-    metadata_group_id: u64,
-    metadata_incarnation: MetadataClusterIncarnation,
-    term: u64,
-    index: u64,
-
-    pub fn eql(lhs: CatalogMutationStamp, rhs: CatalogMutationStamp) bool {
-        return lhs.metadata_group_id == rhs.metadata_group_id and
-            std.mem.eql(u8, &lhs.metadata_incarnation, &rhs.metadata_incarnation) and
-            lhs.term == rhs.term and lhs.index == rhs.index;
-    }
-};
+pub const CatalogMutationStamp = @import("catalog_mutation_stamp.zig").CatalogMutationStamp;
 
 /// Allocation-free subset of `/status` used by rolling-upgrade admission
 /// probes. Keeping this separate from MetadataStatus avoids parsing and
@@ -432,7 +422,7 @@ pub const CatalogRouteFence = struct {
     /// excluded from the wire representation: monotonic clocks and borrowed
     /// cancellation callbacks are process-local capabilities.
     admission_deadline_ns: ?u64 = null,
-    admission_deadline_io: ?@import("../runtime_io_abi.zig").Borrow = null,
+    admission_deadline_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
     admission_cancellation: CancellationToken = .none,
 
     const Wire = struct {

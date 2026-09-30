@@ -45,7 +45,7 @@ pub const ShardOperationAdapter = struct {
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     pub const VTable = struct {
-        topology_read: ?*const fn (ptr: *anyopaque, context_id: u64, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: TopologyReadRequest, cancellation: @import("../common/cancellation.zig").CancellationToken) anyerror![]u8 = null,
+        topology_read: ?*const fn (ptr: *anyopaque, context_id: u64, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: TopologyReadRequest, cancellation: @import("antfly_cancellation").CancellationToken) anyerror![]u8 = null,
         observe_split: *const fn (ptr: *anyopaque, context_id: u64, record: metadata_state.SplitTransitionRecord) anyerror!metadata_state.SplitObservation,
         observe_merge: *const fn (ptr: *anyopaque, context_id: u64, record: metadata_state.MergeTransitionRecord) anyerror!metadata_state.MergeObservation,
         prepare_split_source: *const fn (ptr: *anyopaque, context_id: u64, op: PrepareSplitSource) anyerror!void,
@@ -62,7 +62,7 @@ pub const ShardOperationAdapter = struct {
 
     const BoundaryAbi = @import("../runtime_callback_abi.zig").Boundary(VTable);
 
-    pub fn topologyRead(self: ShardOperationAdapter, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: TopologyReadRequest, cancellation: @import("../common/cancellation.zig").CancellationToken) ![]u8 {
+    pub fn topologyRead(self: ShardOperationAdapter, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: TopologyReadRequest, cancellation: @import("antfly_cancellation").CancellationToken) ![]u8 {
         const callback = self.vtable.topology_read orelse return error.UnsupportedOperation;
         return BoundaryAbi.call("topology_read", self.boundary_dispatch, callback, .{ self.ptr, self.context_id, alloc, group_id, table_name, request, cancellation });
     }
@@ -379,7 +379,7 @@ pub const OwnedShardOperationAdapter = struct {
         return try lease.state.downstream.observeSplit(record);
     }
 
-    fn topologyRead(ptr: *anyopaque, context_id: u64, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: TopologyReadRequest, cancellation: @import("../common/cancellation.zig").CancellationToken) ![]u8 {
+    fn topologyRead(ptr: *anyopaque, context_id: u64, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: TopologyReadRequest, cancellation: @import("antfly_cancellation").CancellationToken) ![]u8 {
         var lease = try acquireRegistered(ptr, context_id);
         defer lease.deinit();
         return lease.state.downstream.topologyRead(alloc, group_id, table_name, request, cancellation);
@@ -492,7 +492,7 @@ test "shard operation adapter metadata runtime dispatches actions" {
             };
         }
 
-        fn topologyRead(_: *anyopaque, _: u64, _: std.mem.Allocator, _: u64, _: []const u8, _: TopologyReadRequest, _: @import("../common/cancellation.zig").CancellationToken) ![]u8 {
+        fn topologyRead(_: *anyopaque, _: u64, _: std.mem.Allocator, _: u64, _: []const u8, _: TopologyReadRequest, _: @import("antfly_cancellation").CancellationToken) ![]u8 {
             return error.GroupLeaderUnavailable;
         }
 
@@ -572,7 +572,7 @@ test "shard operation adapter metadata runtime dispatches actions" {
     // Force the same checked transport used when provider and consumer are
     // separately compiled; same-unit direct callbacks remain supported.
     const Foreign = struct {
-        fn dispatch(contract: *const @import("../runtime_native_abi.zig").CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) @import("../runtime_error_abi.zig").Status {
+        fn dispatch(contract: *const @import("antfly_runtime_abi").native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
             return ShardOperationAdapter.BoundaryAbi.local_dispatch(contract, callback, args, output);
         }
     };

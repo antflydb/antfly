@@ -19,6 +19,7 @@
 //! can close the standby without leaving request paths with borrowed pointers.
 
 const std = @import("std");
+const storage_contract = @import("../db/ha_contract.zig");
 const platform_time = @import("antfly_platform").time;
 const primary_mod = @import("primary.zig");
 const read_gate = @import("read_gate.zig");
@@ -39,6 +40,31 @@ pub const Role = enum(u8) {
 };
 
 pub const State = struct {
+    pub fn storageWriteState(self: *const State) storage_contract.PublishedWriteState {
+        return .{ .ptr = self, .vtable = &storage_write_vtable };
+    }
+
+    const storage_write_vtable: storage_contract.PublishedWriteState.VTable = .{
+        .check = checkStorageWrite,
+        .generation = storageGeneration,
+        .is_standby = storageIsStandby,
+    };
+
+    fn checkStorageWrite(ptr: *const anyopaque, generation: ?u64) !void {
+        const self: *const State = @ptrCast(@alignCast(ptr));
+        try self.checkWrite(generation);
+    }
+
+    fn storageGeneration(ptr: *const anyopaque) u64 {
+        const self: *const State = @ptrCast(@alignCast(ptr));
+        return self.currentGeneration();
+    }
+
+    fn storageIsStandby(ptr: *const anyopaque) bool {
+        const self: *const State = @ptrCast(@alignCast(ptr));
+        return self.isStandbyRole();
+    }
+
     role: std.atomic.Value(u8) = .init(@intFromEnum(Role.disabled)),
     generation: @import("antfly_platform").atomic.Value(u64) = .init(1),
     progress_sequence: @import("antfly_platform").atomic.Value(u64) = .init(0),

@@ -2605,7 +2605,7 @@ test "SQL direct conflict scalar uses one guarded native cut through owner and c
             }
             return .{ .ptr = self, .views = self.views[0..scans.len], .vtable = &.{ .close = close, .range_proofs = proofs } };
         }
-        fn openSnapshot(ptr: *anyopaque, _: std.mem.Allocator, table: []const u8, _: u32, _: @import("../raft/read_gate.zig").ReadConsistency, _: ?@import("../common/cancellation.zig").CancellationToken, _: ?u64) !reads.RelationalStatementSnapshot {
+        fn openSnapshot(ptr: *anyopaque, _: std.mem.Allocator, table: []const u8, _: u32, _: @import("../raft/read_gate.zig").ReadConsistency, _: ?@import("antfly_cancellation").CancellationToken, _: ?u64) !reads.RelationalStatementSnapshot {
             const self: *Self = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("physical_usage", table);
             self.captures += 1;

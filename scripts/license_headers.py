@@ -35,6 +35,33 @@ ELV2_ROOTS = (
     "zig/e2e/antfly",
 )
 
+# Source moves preserve the original license until the licensing PR lands.
+ELV2_FILES = {
+    "zig/build_support/openapi.zig",
+    "zig/build_support/openapi_exact_sort_test.zig",
+    "zig/build_support/openapi_split_test.zig",
+    "zig/lib/raft/src/read_state_observer.zig",
+    "zig/lib/runtime/src/cache_budget.zig",
+    "zig/lib/runtime/src/cancellation.zig",
+    "zig/lib/runtime/src/fs_paths.zig",
+    "zig/lib/runtime/src/private_error_diagnostics.zig",
+    "zig/lib/runtime/src/runtime_error_abi.zig",
+    "zig/lib/runtime/src/runtime_http_abi.zig",
+    "zig/lib/runtime/src/runtime_http_bridge.zig",
+    "zig/lib/runtime/src/threaded_io_limits.zig",
+    "zig/pkg/inference/src/host/bridge.zig",
+    "zig/pkg/inference/src/host/execution_control.zig",
+    "zig/pkg/inference/src/host/host.zig",
+    "zig/pkg/inference/src/host/request_types.zig",
+    "zig/pkg/inference/src/host/runtime_paths.zig",
+    "zig/pkg/inference/src/host/sparse_embedding.zig",
+    "zig/pkg/inference/src/host/types.zig",
+    "zig/pkg/inference/src/host/work.zig",
+    "zig/pkg/inference/src/host/worker.zig",
+    "zig/pkg/inference/src/host/worker_rpc.zig",
+    "zig/pkg/inference/src/host/worker_wire.zig",
+}
+
 APACHE_ROOTS = (
     "zig/build.zig",
     "zig/build.zig.zon",
@@ -191,7 +218,9 @@ def excluded(path: str) -> bool:
 
 def group_for(path: str, selected_group: str) -> str | None:
     group: str | None = None
-    if path in APACHE_FILES:
+    if path in ELV2_FILES:
+        group = "elv2"
+    elif path in APACHE_FILES:
         group = "apache"
     elif is_under(path, ELV2_ROOTS):
         group = "elv2"

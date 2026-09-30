@@ -21,8 +21,8 @@
 //! deferred runtime-repair restore path.
 
 const std = @import("std");
-const fs_paths = @import("../../common/fs_paths.zig");
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const native_artifact_sink = @import("../native_artifact_sink.zig");
 const lsm_backend = @import("../lsm_backend/mod.zig");
 

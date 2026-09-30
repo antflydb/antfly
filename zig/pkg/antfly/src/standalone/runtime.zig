@@ -12,6 +12,8 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const ha_publisher_adapter = @import("../storage/hot_standby/db_commit.zig");
+const ha_write_gate_adapter = @import("../storage/hot_standby/write_gate.zig");
 const std = @import("std");
 const system_catalog = @import("../system_catalog/domain.zig");
 const ha_wal = @import("../storage/wal_runtime.zig");
@@ -23,24 +25,24 @@ const platform_clock = @import("antfly_platform").clock;
 const httpx = @import("httpx");
 const antfly = @import("runtime_root.zig");
 const group_ids = @import("../common/group_ids.zig");
-const threaded_io_limits = @import("../common/threaded_io_limits.zig");
-const fs_paths = @import("../common/fs_paths.zig");
+const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const process_memory_budget = @import("../common/process_memory_budget.zig");
 const preload_model_spec = @import("../common/preload_model_spec.zig");
 const platform_time = @import("antfly_platform").time;
 const platform = @import("antfly_platform");
-const inference_bridge = @import("inference_bridge.zig");
+const inference_bridge = @import("antfly_inference_bridge");
 const inference_connection_abi = @import("../inference_connection_abi.zig");
 const internal_service_auth = @import("../api/internal_service_auth.zig");
-const runtime_http_abi = @import("../runtime_http_abi.zig");
+const runtime_http_abi = @import("antfly_runtime_abi").http_abi;
 const kernel_owner_client = @import("../storage/kernel_owner_client.zig");
 const storage_source_options = @import("storage_source_options");
 const control_only_storage_sources = storage_source_options.control_only;
 const LegacyLiteHandle = if (control_only_storage_sources) struct {} else antfly.lite.backend.Handle;
 const LegacyAuthBackend = if (control_only_storage_sources) struct {} else antfly.lsm_backend.BackendHandle;
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const inline_inference_codegen = builtin.is_test;
-const inference_host = if (inline_inference_codegen) @import("inference_host.zig") else struct {};
+const inference_host = if (inline_inference_codegen) @import("antfly_inference_host") else struct {};
 const inference_chunker = @import("inference_chunker");
 const chunking_types = @import("../chunking/types.zig");
 
@@ -1238,7 +1240,7 @@ const LocalStandaloneMetadata = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         if (self.ha_gate) |gate| gate.check() catch return null;
-        return if (self.ha_mirror) |mirror| mirror.primary.identity.epoch else if (self.coordinated_lifecycle_allowed) 1 else null;
+        return if (self.ha_mirror) |mirror| mirror.publisher.identity().epoch else if (self.coordinated_lifecycle_allowed) 1 else null;
     }
     fn restoreTermCurrent(ptr: *anyopaque, term: u64) bool {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
@@ -1329,7 +1331,7 @@ const LocalStandaloneMetadata = struct {
         self.durable_revision = self.epoch;
     }
     fn requireRestoreJobTermLocked(self: *LocalStandaloneMetadata, term: u64) !void {
-        const current = if (self.ha_mirror) |mirror| mirror.primary.identity.epoch else @as(u64, 1);
+        const current = if (self.ha_mirror) |mirror| mirror.publisher.identity().epoch else @as(u64, 1);
         if (term != current) return error.NotLeader;
     }
     fn restoreJobsPut(ptr: *anyopaque, key: []const u8, value: []const u8, term: u64) !void {
@@ -2079,7 +2081,7 @@ const LocalStandaloneMetadata = struct {
         const owner_mirror = server.write_source.ha_async_mirror orelse return false;
         const admin = server.ha_cfg.admin_context orelse return false;
         if (self.ha_catalog_server != server or admin.standby != null or admin.primary != primary or
-            metadata_mirror.primary != primary or owner_mirror.primary != primary or
+            metadata_mirror.publisher.ptr != @as(*anyopaque, @ptrCast(primary)) or owner_mirror.publisher.ptr != @as(*anyopaque, @ptrCast(primary)) or
             primary.identity.table_id != 0 or primary.identity.shard_id != 0) return false;
         server.ha_public_gate_state.checkWrite(server.ha_public_gate_state.currentGeneration()) catch return false;
         return true;
@@ -5807,7 +5809,7 @@ fn linkedInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
         .authorization = runtime_http_abi.OptionalBytes.init(context.request.headers.get("Authorization")),
         .content_type = runtime_http_abi.OptionalBytes.init(context.request.headers.get("Content-Type")),
     };
-    var transport = @import("../runtime_http_bridge.zig").Outbound{ .context = context };
+    var transport = @import("antfly_runtime_abi").http_bridge.Outbound{ .context = context };
     const body_source = if (route.request_body == .buffered) transport.bodySource() else runtime_http_abi.RequestBodySource{};
     var response_handle: ?*anyopaque = null;
     var response_view: runtime_http_abi.HttpResponseView = undefined;
@@ -8834,7 +8836,7 @@ test "standalone encoded reader ABI round trips borrowed payloads" {
     var fake = FakeReader{ .first_ptr = png[0..].ptr, .second_ptr = jpeg[0..].ptr };
     var state = inference_host.LinkedInferenceState{
         .alloc = alloc,
-        .executor = try @import("../runtime_io_abi.zig").Borrow.init(&std.testing.io).receive(),
+        .executor = try @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io).receive(),
         .io = std.testing.io,
         .node = undefined, // The model-free override must not enter Node.
         .warm_models = undefined,
@@ -8966,7 +8968,7 @@ test "standalone raster reader ABI preserves borrowed strided pages and identity
     var fake = FakeReader{ .expected = .{ first[0..].ptr, second[0..].ptr } };
     var state = inference_host.LinkedInferenceState{
         .alloc = alloc,
-        .executor = try @import("../runtime_io_abi.zig").Borrow.init(&std.testing.io).receive(),
+        .executor = try @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io).receive(),
         .io = std.testing.io,
         .node = undefined, // The model-free override must not enter Node.
         .warm_models = undefined,
@@ -12482,7 +12484,7 @@ test "standalone catalog remote apply outage preserves committed creation and re
         }
     };
     var failure_context: u8 = 0;
-    const mirror: antfly.db.HAAsyncEffectMirror = .{ .primary = &primary, .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &failure_context, .sync_wait_fn = Failure.wait };
+    const mirror: antfly.db.HAAsyncEffectMirror = .{ .publisher = ha_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &failure_context, .sync_wait_fn = Failure.wait };
     var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, runtime.ptr(), null, .local);
     var metadata_open = true;
     defer if (metadata_open) metadata.deinit();
@@ -12685,12 +12687,12 @@ test "standalone shared restore HA policy mirrors mixed publication and durable 
     defer metadata.deinit();
     const baseline = try metadata.lifecycle_store.?.exportHACheckpoint(std.testing.io, checkpoint);
     var barrier: antfly.db.HAMutationBarrier = .{};
-    const mirror: antfly.db.HAAsyncEffectMirror = .{ .primary = &primary, .mutation_barrier = &barrier };
+    const mirror: antfly.db.HAAsyncEffectMirror = .{ .publisher = ha_publisher_adapter.bind(&primary), .mutation_barrier = &barrier };
     try LocalStandaloneMetadata.bindHAMetadata(&metadata, .{ .primary = &primary }, mirror);
     try @import("../api/restore_worker_fixture.zig").runWithPolicy(antfly.public_api.http_server.RestoreWorkerTestDriver, false, metadata.statusSource(), metadata.restorePersistence(), .{
         .failover_safe = true,
         .guard = .{ .ptr = &metadata, .is_current = LocalStandaloneMetadata.restoreTermCurrent },
-        .gate = .{ .primary = &primary },
+        .gate = .{ .primary = ha_write_gate_adapter.bindPrimary(&primary) },
         .mirror = mirror,
     });
     const standby_root = try std.fmt.allocPrint(alloc, "{s}/standby-metadata", .{root});

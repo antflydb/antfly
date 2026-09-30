@@ -2165,7 +2165,7 @@ pub const MetadataHttpServer = struct {
 
     fn systemCatalogRequestContext(ctx: *httpx.Context, remaining_ms: u32) operation.RequestContext {
         var context = requestContext(ctx);
-        context.deadline_io = if (ctx.application_deadline_io) |io| @import("../runtime_io_abi.zig").Borrow.init(&io) else null;
+        context.deadline_io = if (ctx.application_deadline_io) |io| @import("antfly_runtime_abi").io_abi.Borrow.init(&io) else null;
         const clock = api_table_catalog.RoutingBudget.initIo(null, ctx.io);
         const forwarded_deadline = clock.nowNs() +| @as(u64, remaining_ms) * std.time.ns_per_ms;
         const admitted = clock.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io });

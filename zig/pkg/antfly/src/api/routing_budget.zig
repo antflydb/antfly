@@ -1,0 +1,77 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+pub const std = @import("std");
+pub const platform_clock = @import("antfly_platform").clock;
+pub const platform_time = @import("antfly_platform").time;
+pub const runtime_io_abi = @import("antfly_runtime_abi").io_abi;
+
+/// One absolute monotonic budget shared by snapshot capture and all CPU-side
+/// routing work that follows it. The periodic checkpoint keeps large catalog
+/// scans interruptible without putting a clock read on every range.
+pub const RoutingBudget = struct {
+    deadline_ns: ?u64 = null,
+    io: ?runtime_io_abi.Borrow = null,
+
+    const checkpoint_stride: usize = 64;
+
+    pub fn init(deadline_ns: ?u64) RoutingBudget {
+        return .{ .deadline_ns = deadline_ns };
+    }
+
+    pub fn initIo(deadline_ns: ?u64, io: ?std.Io) RoutingBudget {
+        return .{ .deadline_ns = deadline_ns, .io = if (io) |value| runtime_io_abi.Borrow.init(&value) else null };
+    }
+
+    pub fn nowNs(self: RoutingBudget) u64 {
+        const borrow = self.io orelse return platform_time.monotonicNs();
+        var receiver = borrow.receive() catch @panic("incompatible routing clock ABI");
+        return @intCast(@max(0, std.Io.Clock.now(.awake, receiver.io()).nanoseconds));
+    }
+
+    /// Translate a deadline into this budget's clock without extending it.
+    /// Threaded .awake and native MONOTONIC have different epochs on Darwin.
+    pub fn deadlineFrom(self: RoutingBudget, source: RoutingBudget) ?u64 {
+        const deadline = source.deadline_ns orelse return null;
+        if (self.io) |target| {
+            if (source.io) |origin| {
+                if (target.userdata == origin.userdata and target.vtable == origin.vtable and target.dispatch == origin.dispatch)
+                    return deadline;
+            }
+        } else if (source.io == null) return deadline;
+        // Sample the destination first so time spent translating cannot
+        // extend the caller's budget. Expired budgets remain expired.
+        const target_now = self.nowNs();
+        return target_now +| (deadline -| source.nowNs());
+    }
+
+    pub fn sleepNs(self: RoutingBudget, duration_ns: u64) !void {
+        if (self.io) |borrow| {
+            var receiver = try borrow.receive();
+            try receiver.io().sleep(.fromNanoseconds(duration_ns), .awake);
+        } else {
+            platform_clock.Clock.real().sleepMs(@max(@as(u64, 1), duration_ns / std.time.ns_per_ms));
+        }
+    }
+
+    pub fn checkpoint(self: RoutingBudget) !void {
+        if (self.deadline_ns) |deadline| {
+            if (self.nowNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+        }
+    }
+
+    pub fn checkpointIndex(self: RoutingBudget, index: usize) !void {
+        if (index % checkpoint_stride == 0) try self.checkpoint();
+    }
+};

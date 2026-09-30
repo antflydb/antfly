@@ -14,8 +14,8 @@
 
 const std = @import("std");
 const Crc32 = @import("antfly_hash").Crc32;
-const fs_paths = @import("../../common/fs_paths.zig");
-const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
+const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const raft_engine = @import("raft_engine");
 const storage_mod = @import("mod.zig");
 const snapshot_payload_store = @import("snapshot_payload_store.zig");

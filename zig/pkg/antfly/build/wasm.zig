@@ -19,7 +19,7 @@ const platform_build = @import("../../../lib/platform/build_support.zig");
 const image_build = @import("../../../lib/image/build_support.zig");
 const pdf_build = @import("../../../lib/pdf/build_support.zig");
 const tokenizer_build = @import("../../../lib/tokenizer/build_support.zig");
-const codegen = @import("codegen.zig");
+const codegen = @import("../../../build_support/openapi.zig");
 const configureEmbeddedModule = @import("embedded.zig").configureModule;
 const addSnowballModule = @import("snowball.zig").addSnowballModule;
 
@@ -44,7 +44,9 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     const httpx_mod = b.createModule(.{ .root_source_file = b.path("lib/httpx/src/httpx.zig"), .target = wasm_target, .optimize = optimize });
     httpx_mod.addImport("antfly-json", json_mod);
     const api = codegen.createCommittedModules(b, .{
-        .root = b.path("pkg/antfly/src/openapi/generated"),
+        .root = b.path("pkg/antfly-embedded/src/openapi/generated"),
+        .client_root = b.path("pkg/antfly-client/src/openapi/generated"),
+        .server_root = b.path("pkg/antfly-server-api/src/openapi/generated"),
         .target = wasm_target,
         .optimize = optimize,
         .json = json_mod,
@@ -161,6 +163,48 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     });
     const wasm_storage_boundary = @import("storage_boundary.zig").create(b, b.path("pkg/antfly/src"), wasm_target, optimize);
     @call(.auto, configureEmbeddedModule, .{ b, wasm_storage_boundary, embedded_support_wasm_mod } ++ embedded_wasm_deps ++ .{addSnowballModule});
+    const wasm_cancellation_mod = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/cancellation.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    embedded_support_wasm_mod.addImport("antfly_cancellation", wasm_cancellation_mod);
+    const wasm_cache_budget_mod = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/cache_budget.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    wasm_cache_budget_mod.addImport("antfly_platform", wasm_platform_mod);
+    embedded_support_wasm_mod.addImport("antfly_cache_budget", wasm_cache_budget_mod);
+    const wasm_runtime_abi_mod = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/root.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    wasm_runtime_abi_mod.addImport("httpx", httpx_mod);
+    embedded_support_wasm_mod.addImport("antfly_runtime_abi", wasm_runtime_abi_mod);
+    const wasm_runtime_fs_mod = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/fs.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    wasm_runtime_fs_mod.addImport("antfly_platform", wasm_platform_mod);
+    embedded_support_wasm_mod.addImport("antfly_runtime_fs", wasm_runtime_fs_mod);
+    embedded_support_wasm_mod.addImport("antfly_public_limits", b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/api/public_limits.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    }));
+    embedded_support_wasm_mod.addImport("antfly_template_content", b.createModule(.{
+        .root_source_file = b.path("lib/template/src/content_part.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    }));
+    embedded_support_wasm_mod.addImport("antfly_sparse_embedding", b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/sparse_embedding.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    }));
     const wasm_matcher_mod = b.createModule(.{
         .root_source_file = b.path("lib/matcher/src/mod.zig"),
         .target = wasm_target,
@@ -174,11 +218,48 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     wasm_resolver_mod.addImport("antfly_matcher", wasm_matcher_mod);
     embedded_support_wasm_mod.addImport("antfly_resolver", wasm_resolver_mod);
     embedded_support_wasm_mod.addImport("antfly_matcher", wasm_matcher_mod);
-    embedded_support_wasm_mod.addImport("antfly_data_uri", b.createModule(.{
+    const wasm_data_uri_mod = b.createModule(.{
         .root_source_file = b.path("lib/scraping/src/data_uri.zig"),
         .target = wasm_target,
         .optimize = optimize,
-    }));
+    });
+    embedded_support_wasm_mod.addImport("antfly_data_uri", wasm_data_uri_mod);
+    const inference_work_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/work.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    inference_work_mod.addImport("antfly_data_uri", wasm_data_uri_mod);
+    inference_work_mod.addImport("antfly_image", wasm_image_mod);
+    embedded_support_wasm_mod.addImport("antfly_inference_work", inference_work_mod);
+    const inference_remote_capabilities_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/inference/remote_capabilities.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    inference_remote_capabilities_mod.addImport("antfly_platform", wasm_platform_mod);
+    inference_remote_capabilities_mod.addImport("httpx", httpx_mod);
+    inference_remote_capabilities_mod.addImport("antfly_inference_work", inference_work_mod);
+    inference_remote_capabilities_mod.addImport("antfly_cancellation", wasm_cancellation_mod);
+    embedded_support_wasm_mod.addImport("antfly_inference_remote_capabilities", inference_remote_capabilities_mod);
+    const inference_execution_control_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/execution_control.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    inference_execution_control_mod.addImport("antfly_platform", wasm_platform_mod);
+    inference_execution_control_mod.addImport("antfly_cancellation", wasm_cancellation_mod);
+    const inference_execution_context_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/inference/execution_context.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    inference_execution_context_mod.addImport("antfly_platform", wasm_platform_mod);
+    inference_execution_context_mod.addImport("httpx", httpx_mod);
+    inference_execution_context_mod.addImport("antfly_inference_remote_capabilities", inference_remote_capabilities_mod);
+    inference_execution_context_mod.addImport("antfly_cancellation", wasm_cancellation_mod);
+    inference_execution_context_mod.addImport("antfly_inference_execution_control", inference_execution_control_mod);
+    embedded_support_wasm_mod.addImport("antfly_inference_execution_context", inference_execution_context_mod);
     embedded_support_wasm_mod.addImport("antfly_reader_config", b.createModule(.{
         .root_source_file = b.path("lib/readers/src/config.zig"),
         .target = wasm_target,
@@ -186,21 +267,21 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     }));
 
     const embedded_wasm_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/embedded/root.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/engine/root.zig"),
         .target = wasm_target,
         .optimize = optimize,
     });
     embedded_wasm_mod.addImport("embedded_support", embedded_support_wasm_mod);
 
     const embedded_db_wasm_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/embedded/db.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/engine/db.zig"),
         .target = wasm_target,
         .optimize = optimize,
     });
     embedded_db_wasm_mod.addImport("embedded_support", embedded_support_wasm_mod);
 
     const embedded_api_wasm_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/embedded/api.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/engine/api.zig"),
         .target = wasm_target,
         .optimize = optimize,
     });

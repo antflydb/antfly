@@ -16,7 +16,7 @@
 //! permit bounded reclamation only after exact native owner cleanup completes.
 const std = @import("std");
 const lsm = @import("../lsm_backend.zig");
-const fs = @import("../../common/fs_paths.zig");
+const fs = @import("antfly_runtime_fs").fs_paths;
 const record_mod = @import("replication_record.zig");
 pub const replay_floor = @import("replay_floor.zig");
 const ns: @import("../backend_types.zig").Namespace = .{ .name = "restore-terminal" };

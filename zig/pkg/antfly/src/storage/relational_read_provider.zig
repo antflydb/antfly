@@ -5,9 +5,9 @@
 //! Every archive is linked by one compiler invocation; calls still validate
 //! signature/layout contracts and translate error identities at the boundary.
 const std = @import("std");
-const native = @import("../runtime_native_abi.zig");
+const native = @import("antfly_runtime_abi").native_abi;
 const callbacks = @import("../runtime_callback_abi.zig");
-const errors = @import("../runtime_error_abi.zig");
+const errors = @import("antfly_runtime_abi").error_abi;
 const types = @import("db/types.zig");
 pub const View = @import("relational_read_view.zig").View;
 pub const Fence = @import("statement_read_fence.zig").Fence;

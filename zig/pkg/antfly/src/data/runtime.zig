@@ -12,12 +12,13 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const ha_publisher_adapter = @import("../storage/hot_standby/db_commit.zig");
 const std = @import("std");
 const store_report_update = @import("../metadata/store_report_update.zig");
 const store_report_baseline = @import("../metadata/store_report_baseline.zig");
 const report_collection = @import("../metadata/report_collection.zig");
 const system_catalog = @import("../system_catalog/domain.zig");
-const runtime_io_abi = @import("../runtime_io_abi.zig");
+const runtime_io_abi = @import("antfly_runtime_abi").io_abi;
 const ant_json = @import("antfly-json");
 const httpx = @import("httpx");
 const platform_sync = @import("antfly_platform").sync;
@@ -28,7 +29,7 @@ const antfly = @import("runtime_root.zig");
 const indexes_api = @import("../api/indexes.zig");
 const json_helpers = @import("../api/json_helpers.zig");
 const internal_service_auth = @import("../api/internal_service_auth.zig");
-const fs_paths = @import("../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const process_memory_budget = @import("../common/process_memory_budget.zig");
 const runtime_status = @import("../api/runtime_status.zig");
 const artifact_publication_dispatch = @import("../storage/artifact_publication_dispatch.zig");
@@ -4432,10 +4433,10 @@ pub const HASyncWaitConfig = struct {
     max_rounds: usize = 200,
     sleep_ns: u64 = 10 * std.time.ns_per_ms,
     poll_ctx: ?*anyopaque = null,
-    poll_fn: ?antfly.db.HAProgressPollFn = null,
+    poll_fn: ?antfly.hot_standby.sync_wait.HAProgressPollFn = null,
 };
 
-fn haPrimarySyncWaitFromConfig(cfg: HASyncWaitConfig) antfly.db.HAPrimaryProgressSyncWait {
+fn haPrimarySyncWaitFromConfig(cfg: HASyncWaitConfig) antfly.hot_standby.sync_wait.HAPrimaryProgressSyncWait {
     return .{
         .max_rounds = cfg.max_rounds,
         .sleep_ns = cfg.sleep_ns,
@@ -5719,7 +5720,7 @@ pub const DataServer = struct {
     ha_internal_server: ?antfly.hot_standby.http_internal.Server = null,
     ha_standby_replication_http_executor: ?antfly.common.http.StdHttpExecutor = null,
     ha_promoted_primary: ?antfly.hot_standby.primary.Primary = null,
-    ha_primary_sync_wait: antfly.db.HAPrimaryProgressSyncWait = .{},
+    ha_primary_sync_wait: antfly.hot_standby.sync_wait.HAPrimaryProgressSyncWait = .{},
     ha_primary_mirror_last_lsn: std.atomic.Value(u64) = .init(0),
     ha_primary_mirror_failure_count: std.atomic.Value(u64) = .init(0),
     ha_primary_mirror_last_gate_lsn: std.atomic.Value(u64) = .init(0),
@@ -7140,17 +7141,17 @@ pub const DataServer = struct {
         const generation = self.ha_public_gate_state.currentGeneration();
         try self.ha_public_gate_state.checkWrite(generation);
         const mirror = self.haPrimaryMirror() orelse return error.HACatalogReplicationUnavailable;
-        if (mirror.primary.identity.table_id != 0 or mirror.primary.identity.shard_id != 0)
+        if (mirror.publisher.identity().table_id != 0 or mirror.publisher.identity().shard_id != 0)
             return error.HACatalogRequiresWholeInstance;
         errdefer self.ha_public_gate_state.publishPrimaryFence(true);
-        const lsn = try mirror.primary.append(.{
+        const lsn = try (try ha_publisher_adapter.runtimePrimary(mirror)).append(.{
             .kind = .metadata_mutation,
             .payload_codec = .json,
             .table_id = 0,
             .shard_id = 0,
             .payload = payload,
         });
-        try mirror.primary.log.wal.sync(true);
+        try (try ha_publisher_adapter.runtimePrimary(mirror)).log.wal.sync(true);
         self.ha_primary_mirror_last_lsn.store(lsn, .release);
         return .{ .mirror = mirror, .generation = generation, .lsn = lsn };
     }
@@ -7165,9 +7166,9 @@ pub const DataServer = struct {
             const generation = self.ha_public_gate_state.currentGeneration();
             try self.ha_public_gate_state.checkWrite(generation);
             const mirror = self.haPrimaryMirror() orelse return error.HACatalogReplicationUnavailable;
-            if (mirror.primary.identity.table_id != 0 or mirror.primary.identity.shard_id != 0)
+            if (mirror.publisher.identity().table_id != 0 or mirror.publisher.identity().shard_id != 0)
                 return error.HACatalogRequiresWholeInstance;
-            break :blk .{ .mirror = mirror, .generation = generation, .lsn = mirror.primary.lastLsn() };
+            break :blk .{ .mirror = mirror, .generation = generation, .lsn = (try ha_publisher_adapter.runtimePrimary(mirror)).lastLsn() };
         };
         try self.acknowledgeHACatalogCreate(commit);
     }
@@ -7179,12 +7180,12 @@ pub const DataServer = struct {
         const mirror = commit.mirror;
         // Do not hold the transition mutex while waiting for receiver acks.
         if (mirror.sync_wait_fn) |wait| {
-            try wait(mirror.sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.primary, commit.lsn, mirror.sync_policy);
+            try wait(mirror.sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.publisher.ptr, commit.lsn, mirror.sync_policy);
         }
         platform_sync.lockYielding(&self.ha_state_mutex);
         defer self.ha_state_mutex.unlock();
         try self.ha_public_gate_state.checkWrite(commit.generation);
-        const gate = try antfly.hot_standby.commit_gate.evaluate(mirror.primary, commit.lsn, mirror.sync_policy);
+        const gate = try antfly.hot_standby.commit_gate.evaluate(try ha_publisher_adapter.runtimePrimary(mirror), commit.lsn, mirror.sync_policy);
         if (!gate.shouldAcknowledge()) return error.SyncPolicyUnsatisfied;
     }
 
@@ -7868,7 +7869,7 @@ pub const DataServer = struct {
     fn haWriteGate(self: *DataServer) ?antfly.db.HAWriteGate {
         const ctx = self.ha_cfg.admin_context orelse return null;
         if (ctx.standby != null or ctx.primary != null) return .{ .shared = .{
-            .state = &self.ha_public_gate_state,
+            .state = self.ha_public_gate_state.storageWriteState(),
         } };
         return null;
     }
@@ -7884,7 +7885,7 @@ pub const DataServer = struct {
 
     fn haPrimaryMirrorFor(self: *DataServer, primary: *antfly.hot_standby.primary.Primary) antfly.db.HAAsyncEffectMirror {
         var mirror = antfly.db.HAAsyncEffectMirror{
-            .primary = primary,
+            .publisher = ha_publisher_adapter.bind(primary),
             .mutation_barrier = &self.ha_mutation_barrier,
             .transition_mutex = &self.ha_state_mutex,
             .last_lsn = &self.ha_primary_mirror_last_lsn,
@@ -7898,7 +7899,7 @@ pub const DataServer = struct {
         };
         if (mirror.sync_policy.mode != .async and mirror.sync_policy.failure_policy == .block) {
             mirror.sync_wait_ctx = &self.ha_primary_sync_wait;
-            mirror.sync_wait_fn = antfly.db.HAPrimaryProgressSyncWait.wait;
+            mirror.sync_wait_fn = antfly.hot_standby.sync_wait.HAPrimaryProgressSyncWait.wait;
         }
         return mirror;
     }
@@ -11416,7 +11417,7 @@ pub const DataServer = struct {
             if (self.ha_cfg.internal_primary) |primary| {
                 const admin = self.ha_cfg.admin_context orelse return error.RowPolicyUnsupported;
                 const mirror = self.write_source.ha_async_mirror orelse return error.RowPolicyUnsupported;
-                if (admin.standby != null or admin.primary != primary or mirror.primary != primary or
+                if (admin.standby != null or admin.primary != primary or mirror.publisher.ptr != @as(*anyopaque, @ptrCast(primary)) or
                     primary.identity.table_id != 0 or primary.identity.shard_id != 0)
                     return error.RowPolicyUnsupported;
                 try self.ha_public_gate_state.checkWrite(self.ha_public_gate_state.currentGeneration());
@@ -27415,7 +27416,7 @@ const RemoteMetadataSource = struct {
         }
         var bounded = request;
         bounded.deadline_ns = started +| remaining;
-        bounded.deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&self.io);
+        bounded.deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&self.io);
         const slot = &self.validation_slots[std.hash.Wyhash.hash(0, name) % self.validation_slots.len];
         while (!slot.mutex.tryLock()) {
             try bounded.ensureActive();
@@ -34156,7 +34157,7 @@ fn consumerTests() type {
                 defer source.deinit();
                 const context: antfly.public_api.operation.RequestContext = .{
                     .deadline_ns = source.awakeNs() + (if (mode == .short_deadline) @as(u64, 3 * std.time.ns_per_s) else remote_metadata_snapshot_timeout_ns),
-                    .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&io),
+                    .deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io),
                     .cancellation = cancellation.token(),
                 };
                 const result = source.readSystemCatalog(alloc, context, .{ .write_validation = "docs" });
@@ -34424,7 +34425,7 @@ fn consumerTests() type {
                     event.waitUncancelable(io);
                 }
             };
-            var tasks: [@import("../common/threaded_io_limits.zig").backend_runtime_control]std.Io.Future(void) = undefined;
+            var tasks: [@import("antfly_runtime_fs").threaded_io_limits.backend_runtime_control]std.Io.Future(void) = undefined;
             var started: usize = 0;
             defer {
                 release.set(control_io);
@@ -34438,7 +34439,7 @@ fn consumerTests() type {
 
             const raft_io = backend_runtime.ptr().raftOutboundIo().?;
             var raft_release: std.Io.Event = .unset;
-            var raft_tasks: [@import("../common/threaded_io_limits.zig").backend_runtime_raft_outbound]std.Io.Future(void) = undefined;
+            var raft_tasks: [@import("antfly_runtime_fs").threaded_io_limits.backend_runtime_raft_outbound]std.Io.Future(void) = undefined;
             var raft_started: usize = 0;
             defer {
                 raft_release.set(raft_io);
@@ -34483,7 +34484,7 @@ fn consumerTests() type {
             // task graph uses the separately admitted forwarding lane.
             const api_io = backend_runtime.ptr().apiIo().?;
             var api_release: std.Io.Event = .unset;
-            var api_tasks: [@import("../common/threaded_io_limits.zig").backend_runtime_api]std.Io.Future(void) = undefined;
+            var api_tasks: [@import("antfly_runtime_fs").threaded_io_limits.backend_runtime_api]std.Io.Future(void) = undefined;
             var api_started: usize = 0;
             defer {
                 api_release.set(api_io);
@@ -34531,7 +34532,7 @@ fn consumerTests() type {
             // cannot consume the capacity needed to replicate and confirm their work.
             const forward_io = forward_lane.io();
             var forward_release: std.Io.Event = .unset;
-            var forward_tasks: [@import("../common/threaded_io_limits.zig").backend_runtime_request_forward]std.Io.Future(void) = undefined;
+            var forward_tasks: [@import("antfly_runtime_fs").threaded_io_limits.backend_runtime_request_forward]std.Io.Future(void) = undefined;
             var forward_started: usize = 0;
             defer {
                 forward_release.set(forward_io);
@@ -41720,7 +41721,7 @@ fn consumerTests() type {
             const source_gate = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;
             switch (source_gate) {
                 .shared => |gate| {
-                    try std.testing.expect(gate.state == &server.ha_public_gate_state);
+                    try std.testing.expect(gate.state.ptr == @as(*const anyopaque, @ptrCast(&server.ha_public_gate_state)));
                     try std.testing.expect(gate.generation == null);
                 },
                 .primary, .fenced_primary, .standby => return error.TestExpectedEqual,
@@ -43834,7 +43835,7 @@ fn consumerTests() type {
             defer source.deinit();
             try std.testing.expectError(error.Cancelled, source.statusSource().acquireJoinPlanning(.{
                 .clock = .{ .deadline_ns = platform_time.monotonicNs() + 250 * std.time.ns_per_ms },
-                .cancellation = @import("../common/cancellation.zig").CancellationToken.fromAtomic(&fake.canceled),
+                .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&fake.canceled),
             }));
             try std.testing.expectEqual(@as(usize, 1), fake.calls);
             try std.testing.expect(source.control_read_generation == null);
@@ -43865,7 +43866,7 @@ fn consumerTests() type {
             defer observed.release();
             try std.testing.expectError(error.Timeout, source.refreshControlReadGenerationAfterMiss(observed, .{ .clock = .{ .deadline_ns = 0 } }));
             var canceled: std.atomic.Value(bool) = .init(true);
-            try std.testing.expectError(error.Cancelled, source.refreshControlReadGenerationAfterMiss(observed, .{ .cancellation = @import("../common/cancellation.zig").CancellationToken.fromAtomic(&canceled) }));
+            try std.testing.expectError(error.Cancelled, source.refreshControlReadGenerationAfterMiss(observed, .{ .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&canceled) }));
             try std.testing.expect(source.control_read_generation == observed);
             source.test_faults.fetch_head_error = error.ConnectionRefused;
             // A missing route forces a fresh head even inside the cache TTL.
@@ -45347,7 +45348,7 @@ fn consumerTests() type {
             defer clock.deinit();
             const context: antfly.public_api.distributed_txn.PreDecisionContext = .{
                 .deadline_ns = 2 * std.time.ns_per_s,
-                .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&clock.io()),
+                .deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&clock.io()),
             };
             try std.testing.expectEqual(@as(?u64, 2 * std.time.ns_per_s - response_reserve_ns), DataServer.preDecisionLeaderWaitNs(context));
             clock.monotonic_ns = 1_200 * std.time.ns_per_ms;
@@ -47181,7 +47182,7 @@ fn implementationTests() type {
             defer server.ha_state_mutex.unlock();
             try server.rewireHAPromotionMirrors();
             try std.testing.expectEqual(@as(usize, 1), probe.bound);
-            try std.testing.expect(server.write_source.ha_async_mirror.?.primary == &primary);
+            try std.testing.expect(server.write_source.ha_async_mirror.?.publisher.ptr == @as(*anyopaque, @ptrCast(&primary)));
         }
 
         test "data runtime private cancel proof recovers a restarted native terminal owner" {
@@ -54238,7 +54239,7 @@ fn implementationTests() type {
                 const io = virtual_io.io();
                 var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
                     .backend = .manual,
-                    .lane_limits = .{ .request_forward = @import("../common/threaded_io_limits.zig").request_forward_workers_per_request },
+                    .lane_limits = .{ .request_forward = @import("antfly_runtime_fs").threaded_io_limits.request_forward_workers_per_request },
                     .borrowed_io = .{ .general = io, .control = io, .request_forward = io },
                 });
                 defer runtime.deinit();
@@ -55088,12 +55089,12 @@ fn implementationTests() type {
             try server.initApiServer();
 
             const source_mirror = server.write_source.ha_async_mirror orelse return error.TestExpectedEqual;
-            try std.testing.expect(source_mirror.primary == &primary);
+            try std.testing.expect(source_mirror.publisher.ptr == @as(*anyopaque, @ptrCast(&primary)));
             const owner_mirror = if (comptime linked_storage)
                 server.kernel_owner_source.?.ha_async_mirror orelse return error.TestExpectedEqual
             else
                 server.provisioned_storage.write_cache.ha_async_mirror orelse return error.TestExpectedEqual;
-            try std.testing.expect(owner_mirror.primary == &primary);
+            try std.testing.expect(owner_mirror.publisher.ptr == @as(*anyopaque, @ptrCast(&primary)));
 
             _ = try server.write_source.source().batch(alloc, "docs", .{
                 .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
@@ -55215,7 +55216,7 @@ fn implementationTests() type {
             const source_gate = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;
             switch (source_gate) {
                 .shared => |gate| {
-                    try std.testing.expect(gate.state == &server.ha_public_gate_state);
+                    try std.testing.expect(gate.state.ptr == @as(*const anyopaque, @ptrCast(&server.ha_public_gate_state)));
                     try std.testing.expect(gate.generation == null);
                 },
                 .standby, .fenced_primary, .primary => return error.TestExpectedEqual,
@@ -55224,7 +55225,7 @@ fn implementationTests() type {
             const cache_gate = server.provisioned_storage.write_cache.ha_write_gate orelse return error.TestExpectedEqual;
             switch (cache_gate) {
                 .shared => |gate| {
-                    try std.testing.expect(gate.state == &server.ha_public_gate_state);
+                    try std.testing.expect(gate.state.ptr == @as(*const anyopaque, @ptrCast(&server.ha_public_gate_state)));
                     try std.testing.expect(gate.generation == null);
                 },
                 .standby, .fenced_primary, .primary => return error.TestExpectedEqual,

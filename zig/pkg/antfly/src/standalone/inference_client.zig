@@ -18,13 +18,13 @@
 
 const std = @import("std");
 const managed_embedder = @import("../inference/managed_embedder.zig");
-const inference_types = @import("../inference/types.zig");
+const inference_types = @import("antfly_inference_types");
 const template = @import("../template.zig");
 const readers = @import("antfly_readers");
 const transcribing = @import("antfly_transcribing");
 const extracting = @import("antfly_extracting");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
-const bridge = @import("inference_bridge.zig");
+const bridge = @import("antfly_inference_bridge");
 const failure_identity = @import("runtime_failure_identity");
 
 const DenseApi = struct {

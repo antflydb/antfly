@@ -218,7 +218,7 @@ const RecoveryLog = struct {
         errdefer allocator.free(path);
         var file = try dir.createFile(io, path, .{ .exclusive = true, .permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode")) .fromMode(0o600) else .default_file });
         errdefer file.close(io);
-        try @import("../../common/fs_paths.zig").syncDirectoryHandlePortable(io, dir);
+        try @import("antfly_runtime_fs").fs_paths.syncDirectoryHandlePortable(io, dir);
         return .{ .file = file, .path = path, .alloc = allocator };
     }
 

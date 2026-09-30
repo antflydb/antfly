@@ -16,8 +16,8 @@
 //! Both the focused kernel root and broad benchmark root share this surface.
 
 pub const relational_expression_errors = @import("schema/relational_expression_errors.zig");
-pub const runtime_native_abi = @import("runtime_native_abi.zig");
-pub const runtime_error_abi = @import("runtime_error_abi.zig");
+pub const runtime_native_abi = @import("antfly_runtime_abi").native_abi;
+pub const runtime_error_abi = @import("antfly_runtime_abi").error_abi;
 pub const relational_read_provider = @import("storage/relational_read_provider.zig");
 pub const statement_read_fence = @import("storage/statement_read_fence.zig");
 pub const sql_catalog = @import("sql/catalog.zig");

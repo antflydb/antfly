@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Elastic-2.0
 
 //! This adapter always executes in the archive that owns the HA Primary.
+const ha_publisher_adapter = @import("hot_standby/db_commit.zig");
 const std = @import("std");
 const policy = @import("db/ha_contract.zig");
 const port = @import("metadata_ha_port.zig");
@@ -33,7 +34,7 @@ pub const Adapter = struct {
     }
     fn identity(ptr: *anyopaque) !port.Identity {
         const mirror = cast(ptr).mirror orelse return error.MetadataHAOutboxPending;
-        return .{ .next_lsn = mirror.primary.nextLsn(), .timeline_id = mirror.primary.identity.timeline_id, .epoch = mirror.primary.identity.epoch };
+        return .{ .next_lsn = mirror.publisher.nextLsn(), .timeline_id = mirror.publisher.identity().timeline_id, .epoch = mirror.publisher.identity().epoch };
     }
     fn publishAndLock(ptr: *anyopaque, raw: []const u8) !void {
         const self = cast(ptr);
@@ -45,7 +46,7 @@ pub const Adapter = struct {
         errdefer if (locked) unlock(ptr);
         const gate = if (self.gate) |value| value.pinned() else null;
         if (gate) |value| try value.check();
-        const same_timeline = std.mem.readInt(u64, raw[8..16], .little) == mirror.primary.identity.timeline_id and std.mem.readInt(u64, raw[16..24], .little) == mirror.primary.identity.epoch;
+        const same_timeline = std.mem.readInt(u64, raw[8..16], .little) == mirror.publisher.identity().timeline_id and std.mem.readInt(u64, raw[16..24], .little) == mirror.publisher.identity().epoch;
         var search_from = std.mem.readInt(u64, raw[0..8], .little);
         var lsn: u64 = 0;
         var index: u32 = 0;
@@ -59,16 +60,16 @@ pub const Adapter = struct {
             try lock(ptr);
             locked = true;
             if (gate) |value| try value.check();
-            const prior = if (same_timeline) try mirror.primary.findMatchingRecordFrom(search_from, .metadata_mutation, frame, 0, 0) else null;
-            lsn = prior orelse try mirror.primary.append(.{ .kind = .metadata_mutation, .payload_codec = .binary, .shard_id = 0, .table_id = 0, .payload = frame });
+            const prior = if (same_timeline) try (try ha_publisher_adapter.runtimePrimary(mirror)).findMatchingRecordFrom(search_from, .metadata_mutation, frame, 0, 0) else null;
+            lsn = prior orelse try (try ha_publisher_adapter.runtimePrimary(mirror)).append(.{ .kind = .metadata_mutation, .payload_codec = .binary, .shard_id = 0, .table_id = 0, .payload = frame });
             search_from = lsn +| 1;
         }
         if (mirror.last_lsn) |last| last.store(lsn, .release);
         unlock(ptr);
         locked = false;
         if (mirror.sync_policy.mode != .async) {
-            if (mirror.sync_wait_fn) |wait| try wait(mirror.sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.primary, lsn, mirror.sync_policy);
-            const decision = try @import("hot_standby/commit_gate.zig").evaluate(mirror.primary, lsn, mirror.sync_policy);
+            if (mirror.sync_wait_fn) |wait| try wait(mirror.sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.publisher.ptr, lsn, mirror.sync_policy);
+            const decision = try @import("hot_standby/commit_gate.zig").evaluate(try ha_publisher_adapter.runtimePrimary(mirror), lsn, mirror.sync_policy);
             if (!decision.shouldAcknowledge()) return error.HASyncCommitWouldBlock;
         }
         try lock(ptr);

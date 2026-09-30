@@ -1867,6 +1867,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "prepared writer open evicts an inactive sibling group before retrying descriptor pressure",
             "prepared writer open reclaims descriptor capacity from startup cache",
             "forwarded write sources use the local writer owner dirty lifecycle",
+            "writer cache distinguishes borrowed publisher callbacks and synchronization",
             "HA ownership transition invalidates cached visibility and dirty identities",
             "HA ownership transition serializes with active writer cache mutation",
             "HA seed request admission drains accepted writes and closes the preflight race",

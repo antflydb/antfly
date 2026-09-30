@@ -9,12 +9,12 @@ const builtin = @import("builtin");
 const platform = @import("antfly_platform");
 const platform_time = platform.time;
 const process_memory_budget = @import("../common/process_memory_budget.zig");
-pub const inference_bridge = @import("inference_bridge.zig");
+pub const inference_bridge = @import("antfly_inference_bridge");
 const inference_connection_abi = @import("../inference_connection_abi.zig");
-pub const runtime_http_abi = @import("../runtime_http_abi.zig");
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+pub const runtime_http_abi = @import("antfly_runtime_abi").http_abi;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const inline_inference_codegen = builtin.is_test and !@import("standalone_runtime_options").linked_inference;
-const inference_host = if (inline_inference_codegen) @import("inference_host.zig") else struct {};
+const inference_host = if (inline_inference_codegen) @import("antfly_inference_host") else struct {};
 const inference_chunker = @import("inference_chunker");
 const chunking_types = @import("../chunking/types.zig");
 const inference = @import("../inference/mod.zig");
@@ -482,7 +482,7 @@ fn observeLiteInferenceTokenizerCache(context: *anyopaque, observer_id: usize, p
 fn configureLiteInferenceResourceBudget(handle: *anyopaque) !*LiteInferenceResourceOwner {
     const owner = try std.heap.c_allocator.create(LiteInferenceResourceOwner);
     owner.* = .{};
-    // `Client.configure` (standalone/inference_worker.zig) calls
+    // `Client.configure` (pkg/inference/src/host/worker.zig) calls
     // `retain_context` -- and sets its own `self.budget` field to point at
     // `owner` -- *before* it can fail (for example the `ensureWorker`
     // failure this catches at the call site below): a failure after that
@@ -1032,7 +1032,7 @@ pub fn inferenceProviderEmbedDensePartsBorrowed(
     deadline_ns: ?u64,
     cancellation: CancellationToken,
 ) ![][]f32 {
-    const embedding_wire = @import("../inference/embedding_wire.zig");
+    const embedding_wire = @import("antfly_inference_embedding_wire");
     const wire_parts = try alloc.alloc(template.ContentPart, parts.len);
     defer alloc.free(wire_parts);
     const payload_storage = try alloc.alloc(inference_bridge.ProviderBinaryPayload, parts.len);
@@ -1103,7 +1103,7 @@ pub fn inferenceProviderRerankDocumentsWithContext(
     context: inference.RequestContext,
 ) anyerror![]f32 {
     try context.check();
-    const embedding_wire = @import("../inference/embedding_wire.zig");
+    const embedding_wire = @import("antfly_inference_embedding_wire");
     var part_count: usize = 0;
     for (documents) |document| part_count += document.len;
     const wire_documents = try alloc.alloc([]template.ContentPart, documents.len);

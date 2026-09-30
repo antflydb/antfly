@@ -1342,7 +1342,7 @@ test "distributed txn partial witness scan translates distinct clock epochs with
     var vtable = std.testing.io.vtable.*;
     vtable.now = FakeClock.now;
     const io: std.Io = .{ .userdata = &now, .vtable = &vtable };
-    const control: RequestContext = .{ .deadline_ns = now + std.time.ns_per_s, .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&io) };
+    const control: RequestContext = .{ .deadline_ns = now + std.time.ns_per_s, .deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io) };
     const before = @import("antfly_platform").time.monotonicNs();
     const options = try partialWitnessScanOptions(control, "query");
     const after = @import("antfly_platform").time.monotonicNs();
@@ -1735,8 +1735,8 @@ test "distributed txn primary prefetch retries transient owner reads once after 
             .metadata = &.{},
             .source = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = undefined, .query = undefined } },
             .control = .{
-                .fanout_io = @import("../runtime_io_abi.zig").Borrow.init(&io),
-                .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&clock),
+                .fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io),
+                .deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&clock),
                 .deadline_ns = 50,
                 .cancellation = types.CancellationToken.fromAtomic(&fixture.canceled),
             },
@@ -1795,7 +1795,7 @@ test "distributed txn primary prefetch owns observations and drains failed batch
         var fixture: Fixture = .{ .fail = fail };
         var table: Loaded = undefined;
         table.name = "rows";
-        var builder: Builder = .{ .alloc = arena.allocator(), .metadata = &.{}, .source = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = undefined, .query = undefined } }, .control = .{ .fanout_io = @import("../runtime_io_abi.zig").Borrow.init(&io) } };
+        var builder: Builder = .{ .alloc = arena.allocator(), .metadata = &.{}, .source = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = undefined, .query = undefined } }, .control = .{ .fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io) } };
         defer builder.deinit();
         const keys = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i" };
         if (fail) {

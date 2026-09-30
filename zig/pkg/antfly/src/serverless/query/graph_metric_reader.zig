@@ -2910,7 +2910,7 @@ test "serverless graph metric point reads authenticate before fetching ranges" {
         fn stat(_: *anyopaque, _: Allocator, _: []const u8) !artifacts_mod.ArtifactMetadata {
             return error.UnexpectedStat;
         }
-        fn verifyContent(ptr: *anyopaque, _: Allocator, _: []const u8, _: u64, _: []const u8, _: @import("../../common/cancellation.zig").CancellationToken) !void {
+        fn verifyContent(ptr: *anyopaque, _: Allocator, _: []const u8, _: u64, _: []const u8, _: @import("antfly_cancellation").CancellationToken) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.verify_calls += 1;
             return error.ArtifactIntegrityMismatch;
@@ -3074,7 +3074,7 @@ fn testAuthenticatedMetricReadsWithPrefix(score_count: usize, prefix: []const u8
         fn stat(_: *anyopaque, _: Allocator, _: []const u8) !artifacts_mod.ArtifactMetadata {
             return error.UnexpectedStat;
         }
-        fn verifyContent(ptr: *anyopaque, _: Allocator, _: []const u8, _: u64, _: []const u8, _: @import("../../common/cancellation.zig").CancellationToken) !void {
+        fn verifyContent(ptr: *anyopaque, _: Allocator, _: []const u8, _: u64, _: []const u8, _: @import("antfly_cancellation").CancellationToken) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             _ = self.verify_calls.fetchAdd(1, .monotonic);
             return error.UnexpectedFullVerification;

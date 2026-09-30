@@ -93,7 +93,7 @@ test "artifact publication upload control is private, bounded, and single purpos
 const db_mod = @import("../storage/db/selected_root.zig").db;
 const ant_json = @import("antfly-json");
 const document_mapper = @import("../storage/db/document_mapper.zig");
-const public_limits = @import("public_limits.zig");
+const public_limits = @import("antfly_public_limits");
 const merge_pages = @import("../storage/db/merge_page_contract.zig");
 const MergePageEffects = struct { writes: []db_mod.types.BatchWrite, deletes: [][]const u8 };
 

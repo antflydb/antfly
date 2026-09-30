@@ -261,7 +261,7 @@ fn consumerTests() type {
             };
             var fixture: Fixture = .{};
             const alloc = std.testing.allocator;
-            const client = try Client.create(alloc, .{ .ptr = &fixture, .clock_io = @import("../runtime_io_abi.zig").Borrow.init(&std.testing.io), .vtable = &.{ .execute = Fixture.execute } }, "http://peer", "a/b", .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 2, .topology_epoch = 4, .route = .{ .group_id = 3, .range_id = 3, .identity_namespace = .{ .table_id = 2, .shard_id = 3, .range_id = 3 } } }, 5, null);
+            const client = try Client.create(alloc, .{ .ptr = &fixture, .clock_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io), .vtable = &.{ .execute = Fixture.execute } }, "http://peer", "a/b", .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 2, .topology_epoch = 4, .route = .{ .group_id = 3, .range_id = 3, .identity_namespace = .{ .table_id = 2, .shard_id = 3, .range_id = 3 } } }, 5, null);
             defer client.destroy();
             client.token = .{ .incarnation = 1, .sequence = 1, .slot = 0 };
             try std.testing.expect(std.mem.endsWith(u8, client.uri, "/tables/a%2Fb/retained-read"));
@@ -336,7 +336,7 @@ fn consumerTests() type {
             var lifetime = try registry.Registry.init(alloc, std.testing.io, 1, 8, 8, 30 * std.time.ns_per_s);
             defer lifetime.deinit();
             var fixture: Fixture = .{ .registry_owner = &lifetime };
-            const executor = http.RequestExecutor{ .ptr = &fixture, .clock_io = @import("../runtime_io_abi.zig").Borrow.init(&std.testing.io), .vtable = &.{ .execute = Fixture.execute } };
+            const executor = http.RequestExecutor{ .ptr = &fixture, .clock_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io), .vtable = &.{ .execute = Fixture.execute } };
             const fence = (try Client.capture(alloc, executor, "http://peer", "rows", Fixture.route, 5, null)).?;
             const view = try fence.open(alloc, "", "", .{ .relational_query = .{ .fields = &.{ "n", "j" } }, .sql_document_preimage = true, .include_content_hashes = true, .include_range_proofs = true });
             try fence.validate();

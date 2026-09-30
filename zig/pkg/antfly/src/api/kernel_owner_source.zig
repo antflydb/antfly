@@ -31,8 +31,7 @@ const runtime_callbacks = @import("../storage/db/runtime_callbacks.zig");
 const ha_contract = @import("../storage/db/ha_contract.zig");
 const document_artifact_child_range = @import("../storage/db/document_artifact_child_range.zig");
 const text_memory = @import("../storage/db/text_memory_stats.zig");
-const ha_commit_gate = @import("../storage/hot_standby/commit_gate.zig");
-const ha_effects = @import("../storage/hot_standby/effects.zig");
+const ha_effects = @import("../storage/db/replication_effects.zig");
 const ha_replication_record = @import("../storage/hot_standby/replication_record.zig");
 const runtime_preflight = @import("../storage/db/runtime_preflight.zig");
 const metadata_api = @import("../metadata/api.zig");
@@ -114,7 +113,7 @@ test "source owner deadlines normalize executor clock epochs without extending b
     var vtable = std.testing.io.vtable.*;
     vtable.now = FakeClock.now;
     const io: std.Io = .{ .userdata = &clock_now, .vtable = &vtable };
-    const context: request_operation.RequestContext = .{ .deadline_ns = 10 + std.time.ns_per_s, .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&io) };
+    const context: request_operation.RequestContext = .{ .deadline_ns = 10 + std.time.ns_per_s, .deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io) };
     const before = platform_time.monotonicNs();
     const normalized = try platformDeadlineContext(context);
     const after = platform_time.monotonicNs();
@@ -157,7 +156,7 @@ test "source owner routed admission preserves the fence clock" {
     var catalog: Fixture = .{ .now = 1000 * std.time.ns_per_s };
     catalog.io = .{ .userdata = &catalog, .vtable = &vtable };
     var source: ProvisionedKernelOwnerSource = undefined;
-    source.catalog = .{ .ptr = &catalog, .io = @import("../runtime_io_abi.zig").Borrow.init(&catalog.io), .vtable = &.{ .admin_snapshot = Fixture.admin, .free_admin_snapshot = Fixture.free, .validate_route = Fixture.resolve } };
+    source.catalog = .{ .ptr = &catalog, .io = @import("antfly_runtime_abi").io_abi.Borrow.init(&catalog.io), .vtable = &.{ .admin_snapshot = Fixture.admin, .free_admin_snapshot = Fixture.free, .validate_route = Fixture.resolve } };
     const fence: metadata_api.CatalogRouteFence = .{
         .metadata_group_id = 1,
         .catalog_revision = 1,
@@ -165,7 +164,7 @@ test "source owner routed admission preserves the fence clock" {
         .topology_epoch = 1,
         .route = .{ .group_id = 2, .range_id = 2, .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 } },
         .admission_deadline_ns = request.now + std.time.ns_per_s,
-        .admission_deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&request.io),
+        .admission_deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&request.io),
     };
     try std.testing.expectError(error.TopologyChanged, source.validateRoutedRead(std.testing.allocator, fence, 2, "rows"));
     try std.testing.expectEqual(@as(usize, 1), catalog.calls);
@@ -2891,7 +2890,7 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     const ReadControls = struct {
         execution_deadline_ns: ?u64 = null,
-        execution_io: ?@import("../runtime_io_abi.zig").Borrow = null,
+        execution_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
         cancellation: ?db_types.CancellationToken = null,
         historical_raft_apply: bool = false,
         allow_deferred_catalog: bool = false,
@@ -4331,7 +4330,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         route: metadata_api.CatalogRouteFence,
         group: u64,
         table: []u8,
-        cancellation: ?@import("../common/cancellation.zig").CancellationToken,
+        cancellation: ?@import("antfly_cancellation").CancellationToken,
         deadline_ns: ?u64,
         frozen_proof: read_gate.ReadSafetyBarrier.FrozenProof,
 
@@ -4383,7 +4382,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         }
     };
 
-    fn openStatementSnapshotRouted(ptr: *anyopaque, alloc: std.mem.Allocator, route: metadata_api.CatalogRouteFence, group: u64, table: []const u8, consistency: read_gate.ReadConsistency, cancellation: ?@import("../common/cancellation.zig").CancellationToken, deadline_ns: ?u64) !table_read_source.RelationalStatementSnapshot {
+    fn openStatementSnapshotRouted(ptr: *anyopaque, alloc: std.mem.Allocator, route: metadata_api.CatalogRouteFence, group: u64, table: []const u8, consistency: read_gate.ReadConsistency, cancellation: ?@import("antfly_cancellation").CancellationToken, deadline_ns: ?u64) !table_read_source.RelationalStatementSnapshot {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         var scoped = route;
         if (cancellation) |token| scoped.admission_cancellation = token;
@@ -4976,21 +4975,7 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     fn preflightHAMirrorSyncCommit(self: *ProvisionedKernelOwnerSource) !void {
         const mirror = self.ha_async_mirror orelse return;
-        if (mirror.sync_policy.mode == .async or mirror.sync_policy.failure_policy != .fail_closed) return;
-        const target_lsn = mirror.primary.nextLsn();
-        const decision = try mirror.primary.evaluateAppendDurability(target_lsn, mirror.sync_policy);
-        const gate = ha_commit_gate.GateResult{
-            .target_lsn = target_lsn,
-            .action = switch (decision.status) {
-                .satisfied => .acknowledge,
-                .would_block => .wait_for_standby,
-                .fail_closed => .reject,
-                .degraded_to_async => .acknowledge_degraded,
-            },
-            .decision = decision,
-        };
-        recordHAMirrorGate(mirror, gate);
-        if (gate.action == .reject) return error.SyncPolicyUnsatisfied;
+        try mirror.publisher.preflightRecordingDecision(mirror);
     }
 
     const CommittedBatchEffectsContext = struct {
@@ -5026,7 +5011,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         var transition_locked = transition_mutex != null;
         defer if (transition_locked) transition_mutex.?.unlock();
 
-        const lsn = ha_effects.appendBatchMutationRequest(self.alloc, mirror.primary, req, .{
+        const payload = ha_effects.encodeBatchMutationRequestAlloc(self.alloc, req) catch |err| {
+            noteHAMirrorFailure(mirror, err);
+            if (mirror.sync_policy.mode != .async) return err;
+            return;
+        };
+        defer self.alloc.free(payload);
+        const lsn = mirror.publisher.publish(mirror, .batch, payload, .{
             .shard_id = identity.shard_id,
             .table_id = identity.table_id,
         }) catch |err| {
@@ -5059,7 +5050,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         var transition_locked = transition_mutex != null;
         defer if (transition_locked) transition_mutex.?.unlock();
 
-        const lsn = ha_effects.appendEncodedDerivedChangeRecord(mirror.primary, replay_payload, .{
+        const lsn = mirror.publisher.publish(mirror, .replay, replay_payload, .{
             .shard_id = identity.shard_id,
             .table_id = identity.table_id,
         }) catch |err| {
@@ -5082,42 +5073,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     fn evaluateHAMirrorCommitGate(mirror: ha_contract.AsyncEffectMirror, lsn: u64) !void {
-        if (mirror.sync_policy.mode == .async) return;
-        var gate = try ha_commit_gate.evaluate(mirror.primary, lsn, mirror.sync_policy);
-        recordHAMirrorGate(mirror, gate);
-        switch (gate.action) {
-            .acknowledge, .acknowledge_degraded => return,
-            .reject => return error.SyncPolicyUnsatisfied,
-            .wait_for_standby => {
-                const wait_fn = mirror.sync_wait_fn orelse return error.HASyncCommitWouldBlock;
-                const wait_ctx = mirror.sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext;
-                try wait_fn(wait_ctx, mirror.primary, lsn, mirror.sync_policy);
-                gate = try ha_commit_gate.evaluate(mirror.primary, lsn, mirror.sync_policy);
-                recordHAMirrorGate(mirror, gate);
-                switch (gate.action) {
-                    .acknowledge, .acknowledge_degraded => return,
-                    .reject => return error.SyncPolicyUnsatisfied,
-                    .wait_for_standby => return error.HASyncCommitWouldBlock,
-                }
-            },
-        }
-    }
-
-    fn recordHAMirrorGate(mirror: ha_contract.AsyncEffectMirror, gate: ha_commit_gate.GateResult) void {
-        if (mirror.last_gate_lsn) |last_lsn| last_lsn.store(gate.target_lsn, .release);
-        if (mirror.last_gate_action) |last_action| last_action.store(@intFromEnum(gate.action), .release);
-        switch (gate.action) {
-            .acknowledge => {},
-            .acknowledge_degraded => {
-                if (mirror.sync_degraded_count) |counter| _ = counter.fetchAdd(1, .monotonic);
-            },
-            .reject => {
-                if (mirror.sync_reject_count) |counter| _ = counter.fetchAdd(1, .monotonic);
-            },
-            .wait_for_standby => {
-                if (mirror.sync_wait_count) |counter| _ = counter.fetchAdd(1, .monotonic);
-            },
-        }
+        try mirror.publisher.complete(mirror, lsn);
     }
 
     fn noteHAMirrorFailure(mirror: ha_contract.AsyncEffectMirror, err: anyerror) void {

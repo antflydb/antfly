@@ -13,13 +13,13 @@
 // limitations.
 
 const std = @import("std");
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
-const query_embedding_cache = @import("../inference/query_embedding_cache.zig");
-const cache_budget = @import("../common/cache_budget.zig");
+const query_embedding_cache = @import("antfly_inference_query_embedding_cache");
+const cache_budget = @import("antfly_cache_budget");
 const common_secrets = @import("../common/secrets.zig");
 const platform_time = @import("antfly_platform").time;
 const scraping = @import("antfly_scraping");
