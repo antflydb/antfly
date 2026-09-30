@@ -26,6 +26,7 @@ fn main() {
     // Progenitor doesn't support multiple media types per operation or
     // heterogeneous response schemas. Adapt the generator input below.
     strip_non_json_media_types(&mut spec);
+    expand_sql_default_error_responses(&mut spec);
     unify_error_response_schemas(&mut spec);
     normalize_mutation_success_transport(&mut spec);
     unify_success_response_schemas(&mut spec);
@@ -48,6 +49,48 @@ fn main() {
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let out_path = Path::new(&out_dir).join("client.rs");
     fs::write(&out_path, code).expect("failed to write generated client");
+}
+
+// Progenitor includes `default` in its success response set, so a typed 200
+// response plus a distinct default error body makes client generation panic.
+// Keep the public OpenAPI contract intact and use error ranges only in the
+// Rust generator input.
+fn expand_sql_default_error_responses(spec: &mut serde_yaml::Value) {
+    use serde_yaml::Value;
+
+    for methods in spec["paths"].as_mapping_mut().expect("paths").values_mut() {
+        let Some(methods) = methods.as_mapping_mut() else {
+            continue;
+        };
+        for operation in methods.values_mut() {
+            let Some(id) = operation.get("operationId").and_then(Value::as_str) else {
+                continue;
+            };
+            if ![
+                "openSQLConnection",
+                "closeSQLConnection",
+                "prepareSQL",
+                "executePreparedSQL",
+                "closePreparedSQL",
+            ]
+            .contains(&id)
+            {
+                continue;
+            }
+            let responses = operation["responses"].as_mapping_mut().expect("responses");
+            let default = responses
+                .remove(Value::String("default".into()))
+                .expect("SQL operation has a default error response");
+            for range in ["4XX", "5XX"] {
+                assert!(
+                    responses
+                        .insert(Value::String(range.into()), default.clone())
+                        .is_none(),
+                    "SQL error range already exists"
+                );
+            }
+        }
+    }
 }
 
 // Keep the public wire contract intact. Progenitor requires homogeneous success

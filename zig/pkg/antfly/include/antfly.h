@@ -449,6 +449,10 @@ antfly_error_code antfly_db_scan_hashes(
 );
 antfly_error_code antfly_db_stats_json(antfly_db *db, antfly_buffer *out);
 antfly_error_code antfly_db_search_json(antfly_db *db, antfly_slice request_json, antfly_buffer *out);
+/* Single embedded table SQL; uses SQLRequest statement/parameters/limit.
+ * Sessions, DDL, qualified catalog names and managed owners are unsupported.
+ * Always free a nonempty out buffer, including SQL diagnostics on error. */
+antfly_error_code antfly_db_sql_json(antfly_db *db, antfly_slice table_name, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_db_search_dense(
     antfly_db *db,
     antfly_slice index_name,

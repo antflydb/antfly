@@ -69,13 +69,18 @@ pub const TableWorkflow = struct {
     ) !control_loop.ReconcileSummary {
         const request: api_operation.RequestContext = .{};
         try self.ensureCatalogMutationReadyWithContext(service, request);
-        const catalog_locked = lockCatalogMutation(service);
+        try preflightProjectedPlacementWithContext(service, request);
+        try preflightTableRecordWithContext(service, request, table);
+        for (initial_ranges) |initial_range|
+            try preflightInitialPlacementForGroupWithContext(service, request, initial_range.group_id);
+        var catalog_locked = lockCatalogMutation(service);
         defer unlockCatalogMutation(service, catalog_locked);
         return try self.createTableWithRangesCatalogLockedWithContext(
             service,
             request,
             table,
             initial_ranges,
+            &catalog_locked,
         );
     }
 
@@ -88,13 +93,14 @@ pub const TableWorkflow = struct {
         request: api_operation.RequestContext,
         table: table_manager.TableRecord,
         initial_ranges: []const table_manager.RangeRecord,
+        held_catalog_gate: *bool,
     ) !control_loop.ReconcileSummary {
         try self.bootstrapDesiredFromCommitted(service);
         try self.loop.stateRef().tableManager().upsertTable(table);
         for (initial_ranges) |initial_range| {
             try self.loop.stateRef().tableManager().upsertRange(initial_range);
         }
-        return try self.loop.reconcilePreparedCatalogLockedWithContext(service, request);
+        return try self.loop.reconcilePreparedCatalogLockedWithContextAndGate(service, request, held_catalog_gate);
     }
 
     pub fn ensureCatalogMutationReadyWithContext(
@@ -104,6 +110,7 @@ pub const TableWorkflow = struct {
     ) !void {
         _ = self;
         try ensureCatalogWorkflowLeaseWithContext(service, request);
+        try ensureReconciliationPlacementReadCutWithContext(service, request);
     }
 
     pub fn requestSplit(
@@ -112,6 +119,7 @@ pub const TableWorkflow = struct {
         intent: table_manager.SplitIntent,
     ) !control_loop.ReconcileSummary {
         try ensureCatalogWorkflowLease(service);
+        try ensureReconciliationPlacementReadCut(service);
         const catalog_locked = lockCatalogMutation(service);
         defer unlockCatalogMutation(service, catalog_locked);
         try self.bootstrapDesiredFromCommitted(service);
@@ -128,6 +136,7 @@ pub const TableWorkflow = struct {
         intent: table_manager.MergeIntent,
     ) !control_loop.ReconcileSummary {
         try ensureCatalogWorkflowLease(service);
+        try ensureReconciliationPlacementReadCut(service);
         const catalog_locked = lockCatalogMutation(service);
         defer unlockCatalogMutation(service, catalog_locked);
         try self.bootstrapDesiredFromCommitted(service);
@@ -152,6 +161,7 @@ pub const TableWorkflow = struct {
         record: table_manager.RangeRecord,
     ) !control_loop.ReconcileSummary {
         try ensureCatalogWorkflowLease(service);
+        try ensureReconciliationPlacementReadCut(service);
         const catalog_locked = lockCatalogMutation(service);
         defer unlockCatalogMutation(service, catalog_locked);
         try self.bootstrapDesiredFromCommitted(service);
@@ -166,9 +176,10 @@ pub const TableWorkflow = struct {
     ) !control_loop.ReconcileSummary {
         const request: api_operation.RequestContext = .{};
         try self.ensureCatalogMutationReadyWithContext(service, request);
-        const catalog_locked = lockCatalogMutation(service);
+        try preflightProjectedPlacementWithContext(service, request);
+        var catalog_locked = lockCatalogMutation(service);
         defer unlockCatalogMutation(service, catalog_locked);
-        return try self.dropTableCatalogLockedWithContext(service, request, table_id);
+        return try self.dropTableCatalogLockedWithContext(service, request, table_id, &catalog_locked);
     }
 
     pub fn dropTableCatalogLockedWithContext(
@@ -176,10 +187,11 @@ pub const TableWorkflow = struct {
         service: anytype,
         request: api_operation.RequestContext,
         table_id: u64,
+        held_catalog_gate: *bool,
     ) !control_loop.ReconcileSummary {
         try self.bootstrapDesiredFromCommitted(service);
         _ = self.loop.stateRef().tableManager().removeTableTopology(table_id);
-        return try self.loop.reconcilePreparedCatalogLockedWithContext(service, request);
+        return try self.loop.reconcilePreparedCatalogLockedWithContextAndGate(service, request, held_catalog_gate);
     }
 
     pub fn planLocalPlacementIntents(
@@ -273,6 +285,56 @@ fn ensureCatalogWorkflowLease(service: anytype) !void {
     };
     if (@hasDecl(ServiceDeclType, "ensureCatalogWorkflowLease"))
         try service.ensureCatalogWorkflowLease();
+}
+
+fn ensureReconciliationPlacementReadCut(service: anytype) !void {
+    const ServiceType = @TypeOf(service);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (@hasDecl(ServiceDeclType, "ensureReconciliationPlacementReadCut"))
+        try service.ensureReconciliationPlacementReadCut();
+}
+
+fn ensureReconciliationPlacementReadCutWithContext(service: anytype, request: api_operation.RequestContext) !void {
+    const ServiceType = @TypeOf(service);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (@hasDecl(ServiceDeclType, "ensureReconciliationPlacementReadCutWithContext"))
+        try service.ensureReconciliationPlacementReadCutWithContext(request);
+}
+
+fn preflightInitialPlacementForGroupWithContext(service: anytype, request: api_operation.RequestContext, group_id: u64) !void {
+    const ServiceType = @TypeOf(service);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (@hasDecl(ServiceDeclType, "preflightInitialPlacementForGroupWithContext"))
+        try service.preflightInitialPlacementForGroupWithContext(request, group_id);
+}
+
+fn preflightProjectedPlacementWithContext(service: anytype, request: api_operation.RequestContext) !void {
+    const ServiceType = @TypeOf(service);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (@hasDecl(ServiceDeclType, "preflightProjectedPlacementWithContext"))
+        try service.preflightProjectedPlacementWithContext(request);
+}
+
+fn preflightTableRecordWithContext(service: anytype, request: api_operation.RequestContext, table: table_manager.TableRecord) !void {
+    const ServiceType = @TypeOf(service);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (@hasDecl(ServiceDeclType, "preflightTableRecordWithContext"))
+        try service.preflightTableRecordWithContext(request, table);
 }
 
 fn ensureCatalogWorkflowLeaseWithContext(
@@ -646,11 +708,19 @@ test "table workflow can build desired topology through the control loop seam" {
         range_upserts: usize = 0,
         batch_applies: usize = 0,
         lease_checks: usize = 0,
+        read_cuts: usize = 0,
+        read_cut_error: ?anyerror = null,
         catalog_locked: bool = false,
 
         pub fn ensureCatalogWorkflowLease(self: *@This()) !void {
             std.debug.assert(!self.catalog_locked);
             self.lease_checks += 1;
+        }
+
+        pub fn ensureReconciliationPlacementReadCut(self: *@This()) !void {
+            if (self.catalog_locked) return error.ReadCutUnderCatalogLock;
+            self.read_cuts += 1;
+            if (self.read_cut_error) |err| return err;
         }
 
         pub fn lockCatalogMutation(self: *@This()) void {
@@ -755,6 +825,29 @@ test "table workflow can build desired topology through the control loop seam" {
     try std.testing.expectEqual(@as(usize, 1), fake.range_upserts);
     try std.testing.expectEqual(@as(usize, 1), fake.batch_applies);
     try std.testing.expectEqual(@as(usize, 1), fake.lease_checks);
+    try std.testing.expectEqual(@as(usize, 0), fake.read_cuts);
+    try std.testing.expect(!fake.catalog_locked);
+
+    fake.read_cut_error = error.InjectedReadCutTimeout;
+    try std.testing.expectError(error.InjectedReadCutTimeout, workflow.addRange(&fake, .{
+        .group_id = 5502,
+        .table_id = 55,
+        .start_key = "doc:z",
+    }));
+    try std.testing.expectError(error.InjectedReadCutTimeout, workflow.requestSplit(&fake, .{
+        .transition_id = 1,
+        .table_id = 55,
+        .source_group_id = 5501,
+        .destination_group_id = 5502,
+        .split_key = "doc:m",
+    }));
+    try std.testing.expectError(error.InjectedReadCutTimeout, workflow.requestMerge(&fake, .{
+        .transition_id = 2,
+        .table_id = 55,
+        .donor_group_id = 5501,
+        .receiver_group_id = 5502,
+    }));
+    try std.testing.expectEqual(@as(usize, 3), fake.read_cuts);
     try std.testing.expect(!fake.catalog_locked);
 }
 

@@ -646,6 +646,197 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/sql/connections": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Open a durable idle HTTP SQL connection
+         * @description Creates a principal- and API-node-owned connection with a one-hour idle-use deadline. Active or uncertain transactions retain their exact connection binding until completion or reconciliation; expiry is not an abort decision. Send connection_id with later SQL and prepared requests. This ID is not a transaction session_id. DISCARD ALL resets only this connection's setting overlay and prepared resources, and refuses active or uncertain transactions. Do not automatically replay ambiguous create responses.
+         */
+        post: operations["openSQLConnection"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/sql/connections/{connection_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                connection_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Close an idle SQL connection and its prepared resources
+         * @description Refuses an active, beginning or uncertain transaction; route to owner_node_id.
+         */
+        delete: operations["closeSQLConnection"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/sql/prepared": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create a durable prepared SQL resource
+         * @description Binds SELECT, INSERT, UPDATE or DELETE without executing it. The immutable resource belongs to the authenticated principal and API node, expires after one hour, and survives transaction COMMIT and owner restart with the same durable store and node identity. A session-bound resource is executable only while its attached session remains active. Owner failover is not automatic; execute and close must reach owner_node_id. Each durable store admits at most 128 resources and 4 MiB of serialized prepared state. Expired resources are reclaimed atomically during subsequent creation or close. Execution authenticates and authorizes again and rejects changed catalog identities or schemas. When session_id is supplied, preparation uses the attached session's authenticated database, namespace and setting overlay under its execution lease. The resource is bound to that session; execution re-reads current values but rejects a changed setting catalog. A native durable session store is required.
+         */
+        post: operations["prepareSQL"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/sql/prepared/{prepared_id}/execute": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                prepared_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Execute a durable prepared SQL resource
+         * @description Uses the stored statement, namespace and immutable binding identities. Resource admission linearizes when its durable record is loaded; a later close or expiry does not cancel that already admitted execution. Mutation outcomes must be reconciled rather than replayed after ambiguous errors.
+         */
+        post: operations["executePreparedSQL"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/sql/prepared/{prepared_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                prepared_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Release a durable prepared SQL resource */
+        delete: operations["closePreparedSQL"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Publish or remove a durable SQL setting
+         * @description Cluster-administrator-only, revision-fenced publication of typed setting definitions and global, database, and credential-role defaults. SQL SET cannot change policy-sensitive settings. Observe an ambiguous mutation before retrying.
+         */
+        post: operations["administerSqlSettings"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/store-roots/enroll": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Approve a physical store-root signing identity
+         * @description Cluster-administrator-only approval of a locally signed proof bound to the metadata cluster, node, store and physical root. Ordinary node registration does not grant retirement authority. The request is not automatically retried; observe the enrollment after an ambiguous 503.
+         */
+        post: operations["enrollStoreRoot"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/store-roots/enrollment-status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Check one exact physical store-root enrollment
+         * @description Read-only, linearizable cluster-administrator check for the exact identity in a signed proof. Use after an ambiguous enroll response; this operation never submits another enrollment mutation.
+         */
+        post: operations["getStoreRootEnrollmentStatus"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/sql": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Execute a SQL statement
+         * @description Executes the bounded relational SELECT, INSERT, UPDATE, and DELETE
+         *     subset through the current catalog and native row execution contracts.
+         *     Parameters are bound separately from statement text. Document, graph,
+         *     and lake SQL sources, DDL, and SQL sessions are not yet supported.
+         *     Reads inherit native owner-local consistency, not a global SQL
+         *     transaction snapshot. Statements requiring a retained multi-page
+         *     statement snapshot fail when that capability is unavailable.
+         *     Unsupported statement shapes fail explicitly; the server never
+         *     silently substitutes a different query or truncates the result.
+         */
+        post: operations["executeSQL"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/query": {
         parameters: {
             query?: never;
@@ -4182,6 +4373,221 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * @description Logical SQL result type. Integer values are decimal strings to preserve exact precision in every client.
+         * @enum {string}
+         */
+        SQLColumnType: "string" | "uuid" | "integer" | "number" | "boolean" | "datetime" | "json" | "unknown";
+        SQLColumn: {
+            /** @description Display label. Labels need not be unique; rows use matching ordinal positions. */
+            name: string;
+            type: components["schemas"]["SQLColumnType"];
+        };
+        SQLPrepareRequest: {
+            statement: string;
+            database?: string;
+            namespace?: string;
+            /** @description Optional durable SQL session. Preparation binds its authenticated scope and current setting catalog under the session lease; execution must supply the same session. */
+            session_id?: string;
+            /** @description Optional idle HTTP SQL connection. Preparation binds to its current DISCARD generation; a transaction-bound preparation remains bound to session_id instead. */
+            connection_id?: string;
+        };
+        SQLPreparedExecutionRequest: {
+            parameters?: unknown[];
+            /** @default 128 */
+            limit?: number;
+            /** @description Optional durable transaction session. Required when the resource was prepared against a session; otherwise independent of the prepared resource lifetime. */
+            session_id?: string;
+            /** @description Required for a connection-bound resource; DISCARD ALL closes it without affecting other clients' resources. */
+            connection_id?: string;
+        };
+        SQLConnectionOpenRequest: {
+            /** @default default */
+            database?: string;
+            /** @default public */
+            namespace?: string;
+        };
+        SQLConnectionResponse: {
+            connection_id: string;
+            /** @description The owning API node. Zero denotes a standalone-local endpoint; send subsequent connection requests to that same endpoint. Otherwise route requests to the returned owning node. */
+            owner_node_id: string;
+            /**
+             * Format: int64
+             * @description Idle-use deadline in Unix milliseconds. An attached active or uncertain transaction remains accessible for completion and reconciliation after this deadline; expiry never implies abort.
+             */
+            expires_at_ms: number;
+            database: string;
+            namespace: string;
+        };
+        SQLPreparedResponse: {
+            prepared_id: string;
+            /** Format: int64 */
+            expires_at_ms: number;
+            /** @description Exact decimal API owner identifier, preserved by JavaScript clients. */
+            owner_node_id: string;
+            parameter_types: components["schemas"]["SQLColumnType"][];
+            columns: components["schemas"]["SQLColumn"][];
+        };
+        /** @description One typed setting value, matching the declared kind. */
+        SqlSettingValue: {
+            boolean: boolean;
+        } | {
+            /** Format: int64 */
+            integer: number;
+        } | {
+            string: string;
+        };
+        SqlSettingDatabaseDefault: {
+            database: string;
+            value: components["schemas"]["SqlSettingValue"];
+        };
+        SqlSettingRoleDefault: {
+            principal: string;
+            database: string;
+            value: components["schemas"]["SqlSettingValue"];
+        };
+        SqlSettingPut: {
+            name: string;
+            /** @enum {string} */
+            kind: "boolean" | "integer" | "string";
+            policy_sensitive?: boolean;
+            session_writable?: boolean;
+            default: components["schemas"]["SqlSettingValue"];
+            database_defaults?: components["schemas"]["SqlSettingDatabaseDefault"][];
+            role_defaults?: components["schemas"]["SqlSettingRoleDefault"][];
+        };
+        SqlSettingMutationPut: {
+            put: components["schemas"]["SqlSettingPut"];
+        };
+        SqlSettingMutationDrop: {
+            drop: string;
+        };
+        /** @description Put a complete definition/default set or drop one by name. */
+        SqlSettingMutationRequest: components["schemas"]["SqlSettingMutationPut"] | components["schemas"]["SqlSettingMutationDrop"];
+        StoreRootEnrollmentIdentity: {
+            metadata_incarnation: string;
+            /** Format: int64 */
+            node_id: number;
+            /** Format: int64 */
+            store_id: number;
+            /** @description Decimal u128 string; never pass through a floating-point JSON number. */
+            root_incarnation: string;
+            /** @description Ed25519 public key in lowercase hex. */
+            public_key: string;
+        };
+        StoreRootEnrollmentRequest: {
+            identity: components["schemas"]["StoreRootEnrollmentIdentity"];
+            /** @description Ed25519 proof-of-possession signature in lowercase hex. */
+            signature: string;
+        };
+        /**
+         * @description Execute one SQL statement. Parameters are positional (`$1`, `$2`, ...),
+         *     never interpolated into SQL text. To preserve integer precision in
+         *     JavaScript clients, supply integers outside the exact JSON number range
+         *     as decimal strings; binding coerces parameters to the expected type.
+         *     The result limit is an admission bound, not an implicit SQL LIMIT:
+         *     statements whose results exceed it fail instead of silently truncating.
+         *     Request bodies are limited to 4 MiB, preparation to 8 MiB of allocated
+         *     memory, and encoded results to a 16 MiB allocation budget.
+         */
+        SQLRequest: {
+            /** @description A single SQL statement. */
+            statement: string;
+            /** @description Positional JSON parameter values, including null. */
+            parameters?: unknown[];
+            /** @description Database used to resolve unqualified catalog names. */
+            database?: string;
+            /** @description Namespace used to resolve unqualified table names. */
+            namespace?: string;
+            /**
+             * @description Maximum admitted result rows; does not change statement semantics.
+             * @default 128
+             */
+            limit?: number;
+            /** @description Opaque SQL session identifier returned by a previous response. */
+            session_id?: string;
+            /** @description Durable idle HTTP connection. Its scope and settings are inherited; active transaction IDs cannot be bypassed by omitting session_id. DISCARD ALL requires this identity and is rejected while a transaction is active or uncertain. */
+            connection_id?: string;
+        };
+        /**
+         * @description Authoritative native SQL session state after the statement. Failed sessions require ROLLBACK or ROLLBACK TO SAVEPOINT; uncertain commit outcomes must be reconciled by transaction_id, never replayed.
+         * @enum {string}
+         */
+        SQLTransactionStatus: "idle" | "in_transaction" | "failed";
+        /**
+         * @description Durable mutation outcome. Every value confirms a commit and must not
+         *     cause the statement to be replayed. Pending or repair outcomes require
+         *     visibility convergence or operator action rather than another write.
+         * @enum {string}
+         */
+        SQLMutationOutcome: "committed" | "committed_pending" | "committed_repair_required" | "committed_graph_metric_materialization_rejected";
+        /**
+         * @description Ordinal result rows with corresponding logical column metadata. SQL NULL
+         *     is JSON null; sql_nulls distinguishes it from a JSON column containing
+         *     the JSON literal null. Integer-typed values are exact decimal strings; datetime
+         *     values are strings. Objects and arrays in JSON columns remain JSON.
+         */
+        SQLResponse: {
+            columns: components["schemas"]["SQLColumn"][];
+            rows: unknown[][];
+            /**
+             * Format: int64
+             * @description Number of rows affected by a mutation, or zero for a read-only statement.
+             */
+            rows_affected: number;
+            /**
+             * @description Null flags aligned exactly with rows and their columns. True denotes
+             *     SQL NULL; false denotes a value, including the JSON literal null.
+             *     When omitted, null cells have the legacy SQL NULL interpretation.
+             */
+            sql_nulls?: boolean[][];
+            /** @description SQL command completion tag. */
+            command_tag: string;
+            mutation_outcome?: components["schemas"]["SQLMutationOutcome"];
+            ddl_receipt?: components["schemas"]["SQLDDLReceipt"];
+            /** @description Native transaction receipt for visibility or repair reconciliation; never replay a committed statement. */
+            transaction_id?: string;
+            /** @description Opaque SQL session identifier for subsequent requests. */
+            session_id?: string;
+            transaction_status?: components["schemas"]["SQLTransactionStatus"];
+        };
+        /** @enum {string} */
+        SQLDDLReceiptState: "ready" | "pending" | "invalid" | "admission_unknown";
+        /**
+         * @description Durable DDL declaration receipt. admission_unknown means admission has
+         *     not been confirmed; reconcile restore_job_id and idempotency_key without replaying DDL.
+         *     Pending or invalid means the declaration
+         *     committed but validation has not established an active constraint. Do not
+         *     replay it. Inspect table constraint status using this immutable table
+         *     identity and schema generation; a later generation supersedes this receipt.
+         */
+        SQLDDLReceipt: {
+            database: string;
+            namespace: string;
+            table: string;
+            table_id: string;
+            /** Format: int64 */
+            schema_version: number;
+            state: components["schemas"]["SQLDDLReceiptState"];
+            diagnostic?: string;
+            /** @description Native staging job for an atomic schema rewrite or TRUNCATE generation barrier. table_id identifies the source generation. Poll the job; pending or admission_unknown is not completed DDL and must not be replayed. */
+            restore_job_id?: string;
+            /** @description Durable retry identity for an admitted or uncertain schema rewrite. Retain it with restore_job_id when reconciling admission; do not replay the DDL. */
+            idempotency_key?: string;
+        };
+        SQLDiagnostic: {
+            /** @description Five-character SQLSTATE error code. */
+            code: string;
+            /** @description Human-readable diagnostic with no sensitive parameter values. */
+            message: string;
+            /** @description Optional one-based character position in the submitted SQL statement. */
+            position?: number;
+            /** @description Native transaction receipt for reconciliation when a mutation outcome is unknown. */
+            transaction_id?: string;
+            /** @description False for SQLSTATE 40003; never replay a mutation whose outcome is unknown. */
+            retryable?: boolean;
+            transaction_status?: components["schemas"]["SQLTransactionStatus"];
+        };
         /** @description Database catalog object. Tables and namespaces resolve under a database before authorization and routing. */
         DatabaseCatalogRecord: {
             /**
@@ -7357,6 +7763,8 @@ export interface components {
             row: {
                 [key: string]: unknown;
             };
+            /** @description Projected JSON columns containing the JSON literal null rather than SQL NULL. Other null-valued fields are SQL NULL. */
+            json_null_fields?: string[];
             /** @description Exact row version for mutation preconditions, encoded as decimal text. */
             version: string;
             /**
@@ -7373,6 +7781,8 @@ export interface components {
             row?: {
                 [key: string]: unknown;
             };
+            /** @description Names of JSON-typed columns whose row value is the JSON literal null rather than SQL NULL. Each name must identify a present null-valued JSON column; duplicates, unknown names, non-null values, and use with deletion are rejected. */
+            json_null_fields?: string[];
         };
         /** @description Atomic version-conditional typed-row replacements and deletions using the durable distributed transaction coordinator. */
         RelationalRowMutationRequest: {
@@ -7864,6 +8274,11 @@ export interface components {
             lease_expires_at: number;
             lease_state: string;
             sync_level: string;
+            /**
+             * @description Durable read-only transaction outcome. outcome_unknown is not permission to replay a mutation with another ID.
+             * @enum {string}
+             */
+            disposition: "active" | "outcome_unknown" | "committed" | "committed_pending" | "committed_repair_required" | "aborted";
             staged_table_count: number;
             staged_read_count: number;
             staged_write_count: number;
@@ -8104,6 +8519,8 @@ export interface components {
         RestoreJob: {
             /** @description Opaque durable restore-job identifier. Clients must not parse it as a number. */
             job_id: string;
+            /** @description Durable admission identity. Retain it with job_id when reconciling an uncertain schema rewrite; do not replay the DDL. */
+            idempotency_key?: string;
             /** Format: int64 */
             attempt_id: number;
             /** @enum {string} */
@@ -13239,22 +13656,6 @@ export interface components {
             expression?: components["schemas"]["RelationalScalarExpression"];
         };
         /**
-         * @description A named, ordered composite unique key. Validation status is maintained
-         *     by the server. TTL expiry uses the distributed integrity coordinator.
-         *     Referenced unique keys are nondeferrable.
-         */
-        RelationalUniqueConstraint: {
-            name: string;
-            columns: string[];
-            /** @description When true, NULL components compare equal for uniqueness. */
-            nulls_not_distinct?: boolean;
-        };
-        /**
-         * @description Action on referencing rows when a referenced row is changed or removed.
-         * @enum {string}
-         */
-        ForeignKeyAction: "restrict" | "set_null" | "cascade" | "no_action";
-        /**
          * @description Enforcement timing for atomic mutations and transaction sessions. Deferred
          *     requires deferrable=true and validates the final transaction state.
          *     NO ACTION permits a valid final-state parent replacement; RESTRICT
@@ -13264,6 +13665,31 @@ export interface components {
          * @enum {string}
          */
         ForeignKeyTiming: "immediate" | "deferred";
+        /**
+         * @description A named, ordered composite unique key. Validation status is maintained
+         *     by the server. TTL expiry uses the distributed integrity coordinator.
+         *     Referenced unique keys are nondeferrable.
+         */
+        RelationalUniqueConstraint: {
+            name: string;
+            /** @description SQL primary-key identity. At most one per relational table; all key columns must be required and nonnullable. */
+            primary?: boolean;
+            columns?: string[];
+            /** @description Typed native unique keys. Specify either columns or keys. */
+            keys?: components["schemas"]["RelationalIndexKey"][];
+            /** @description Conjunction restricting uniqueness to matching rows. */
+            where?: components["schemas"]["RelationalIndexPredicate"][];
+            /** @description When true, NULL components compare equal for uniqueness. */
+            nulls_not_distinct?: boolean;
+            /** @description Permit uniqueness checks at transaction commit. Never eligible as an ON CONFLICT arbiter or a referenced foreign key target. */
+            deferrable?: boolean;
+            timing?: components["schemas"]["ForeignKeyTiming"];
+        };
+        /**
+         * @description Action on referencing rows when a referenced row is changed or removed.
+         * @enum {string}
+         */
+        ForeignKeyAction: "restrict" | "set_null" | "cascade" | "no_action";
         /**
          * @description Null matching semantics of a composite foreign key. Partial requires
          *     at least one parent matching every non-null child component; all-null
@@ -21285,6 +21711,465 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             500: components["responses"]["InternalServerError"];
+        };
+    };
+    openSQLConnection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["SQLConnectionOpenRequest"];
+            };
+        };
+        responses: {
+            /** @description Opened connection and routing owner */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLConnectionResponse"];
+                };
+            };
+            /** @description Connection admission failed */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+        };
+    };
+    closeSQLConnection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                connection_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Closed connection */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description Connection close rejected */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+        };
+    };
+    prepareSQL: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SQLPrepareRequest"];
+            };
+        };
+        responses: {
+            /** @description Durable prepared resource */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLPreparedResponse"];
+                };
+            };
+            /** @description Preparation rejected */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+        };
+    };
+    executePreparedSQL: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                prepared_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SQLPreparedExecutionRequest"];
+            };
+        };
+        responses: {
+            /** @description SQL result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLResponse"];
+                };
+            };
+            /** @description Execution rejected or durable mutation outcome */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+        };
+    };
+    closePreparedSQL: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Required to close a connection-bound prepared resource. */
+                "X-Antfly-SQL-Connection-Id"?: string;
+            };
+            path: {
+                prepared_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Resource released; already admitted executions may finish */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description Close rejected */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+        };
+    };
+    administerSqlSettings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SqlSettingMutationRequest"];
+            };
+        };
+        responses: {
+            /** @description Setting catalog mutation committed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Invalid setting definition or default */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Cluster administrator permission required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Catalog revision or setting generation changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Metadata peer upgrade required */
+            426: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Mutation outcome unknown or metadata unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    enrollStoreRoot: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StoreRootEnrollmentRequest"];
+            };
+        };
+        responses: {
+            /** @description Enrollment committed and observed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StoreRootEnrollmentIdentity"];
+                };
+            };
+            /** @description Invalid identity or proof of possession */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Cluster administrator permission required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Root registration or enrollment changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Metadata peer upgrade required */
+            426: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Outcome unknown or metadata unavailable; observe before retrying */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getStoreRootEnrollmentStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StoreRootEnrollmentIdentity"];
+            };
+        };
+        responses: {
+            /** @description Exact enrollment observed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StoreRootEnrollmentIdentity"];
+                };
+            };
+            /** @description Invalid identity */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Cluster administrator permission required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Exact identity is not enrolled, or store-root registration changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Metadata unavailable; retry the read later */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    executeSQL: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SQLRequest"];
+            };
+        };
+        responses: {
+            /** @description SQL statement result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLResponse"];
+                };
+            };
+            /** @description DDL declaration durably admitted; constraint validation or native staging is pending. Do not replay. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLResponse"];
+                };
+            };
+            /** @description Invalid statement, parameter, or result admission limit */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+            /** @description Authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Insufficient permission for the statement's catalog resources */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Transaction or catalog conflict, committed DDL whose validation failed, or uncertain DDL admission with a recovery receipt. Do not replay uncertain DDL. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"] | components["schemas"]["SQLResponse"];
+                };
+            };
+            /** @description Foreground query, write, or request-body admission is exhausted */
+            429: {
+                headers: {
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Internal SQL execution failure */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+            /** @description SQL statement shape is not supported */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+            /** @description SQL backend execution capacity is unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
         };
     };
     globalQuery: {

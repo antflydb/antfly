@@ -18,7 +18,7 @@ pub const artifact_sources_protocol_version: u16 = 1;
 /// The store understands native HBC authority markers, WAL recovery, and the
 /// fail-closed placement contract used during rolling upgrades.
 pub const dense_native_storage_protocol_version: u16 = 1;
-pub const relational_topology_protocol_version: u16 = 1;
+pub const relational_topology_protocol_version: u16 = 2;
 pub const embedding_activity_protocol_version: u16 = 2;
 const group_ids = @import("../common/group_ids.zig");
 const topology_records = @import("../common/topology_records.zig");
@@ -457,6 +457,13 @@ pub const StoreRecord = struct {
     /// Random non-zero process incarnation established by store registration.
     /// Status generations are comparable only within this incarnation.
     reporter_incarnation: u64 = 0,
+    /// Durable physical identity of the store's replica-root directory.
+    /// Unlike reporter_incarnation this survives same-disk process restart;
+    /// replacing that root must create a different value before registration.
+    replica_root_incarnation: u128 = 0,
+    /// Ed25519 verifier for retirement receipts from this exact physical root.
+    /// Once registered, the same root must never silently replace this key.
+    replica_root_public_key: [32]u8 = @splat(0),
     /// Highest status snapshot generation accepted for `reporter_incarnation`.
     status_generation: u64 = 0,
     /// Non-zero only after this store can parse, materialize, and report the
@@ -1031,6 +1038,10 @@ pub const RuntimeGroupStatusReport = struct {
     /// accepted replay target for the group. Heartbeat/activity freshness is
     /// intentionally independent from this convergence proof.
     target_observation_complete: bool = true,
+    /// Applied immutable relational schema version sampled from the same
+    /// storage-owner observation as index and identity facts. Zero is unknown
+    /// for older runtime-status wire profiles, not proof of an empty schema.
+    schema_epoch: u32 = 0,
     doc_count: u64 = 0,
     disk_bytes: u64 = 0,
     disk_bytes_known: bool = false,
@@ -2566,6 +2577,8 @@ pub fn cloneStore(alloc: std.mem.Allocator, record: StoreRecord) !StoreRecord {
         .store_id = record.store_id,
         .node_id = record.node_id,
         .reporter_incarnation = record.reporter_incarnation,
+        .replica_root_incarnation = record.replica_root_incarnation,
+        .replica_root_public_key = record.replica_root_public_key,
         .status_generation = record.status_generation,
         .artifact_sources_protocol_version = record.artifact_sources_protocol_version,
         .native_generation_restore_version = record.native_generation_restore_version,
@@ -2713,6 +2726,7 @@ pub fn cloneRuntimeGroupStatusReport(alloc: std.mem.Allocator, record: RuntimeGr
         .status_generation = record.status_generation,
         .target_observation_revision = record.target_observation_revision,
         .target_observation_complete = record.target_observation_complete,
+        .schema_epoch = record.schema_epoch,
         .doc_count = record.doc_count,
         .disk_bytes = record.disk_bytes,
         .disk_bytes_known = record.disk_bytes_known,

@@ -3959,6 +3959,40 @@ test "filesystem backup location returns the canonical authorized identity" {
     opened.close(io);
 }
 
+fn cloneAcceptedGenerationSummary(alloc: std.mem.Allocator, entries: []const TableBackupManifest.AcceptedGeneration) ![]const TableBackupManifest.AcceptedGeneration {
+    if (entries.len == 0) return &.{};
+    const owned = try alloc.alloc(TableBackupManifest.AcceptedGeneration, entries.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (owned[0..initialized]) |entry| {
+            alloc.free(entry.child_table_name);
+            alloc.free(entry.constraint_name);
+        }
+        alloc.free(owned);
+    }
+    for (entries, owned) |entry, *target| {
+        const child_name = try alloc.dupe(u8, entry.child_table_name);
+        errdefer alloc.free(child_name);
+        target.* = .{
+            .child_table_id = entry.child_table_id,
+            .child_table_name = child_name,
+            .constraint_name = try alloc.dupe(u8, entry.constraint_name),
+            .active_generation = entry.active_generation,
+            .source_scope_digest = entry.source_scope_digest,
+        };
+        initialized += 1;
+    }
+    return owned;
+}
+
+fn shardAdmissionNamespace(table_id: u64, shard: ShardSnapshot) @import("../storage/db/doc_identity_namespace.zig").Namespace {
+    return .{
+        .table_id = table_id,
+        .shard_id = if (shard.doc_identity_shard_id != 0) shard.doc_identity_shard_id else shard.group_id,
+        .range_id = if (shard.doc_identity_range_id != 0) shard.doc_identity_range_id else if (shard.range_id != 0) shard.range_id else shard.group_id,
+    };
+}
+
 pub fn createManifest(
     alloc: std.mem.Allocator,
     backup_id: []const u8,
@@ -3966,6 +4000,16 @@ pub fn createManifest(
     table: *const metadata_table_manager.TableRecord,
     shards: []const ShardSnapshot,
 ) !TableBackupManifest {
+    var proof_count: usize = 0;
+    for (shards) |shard| {
+        if (shard.accepted_generation_summary_digest) |digest| {
+            if (format != .portable or
+                !std.mem.eql(u8, &digest, &try @import("../storage/portable_backup.zig").sourceGenerationAdmissionSummaryDigest(shardAdmissionNamespace(table.table_id, shard), shard.accepted_generation_summary)))
+                return error.BackupIntegrityFailure;
+            proof_count += 1;
+        } else if (shard.accepted_generation_summary.len != 0) return error.BackupIntegrityFailure;
+    }
+    if (proof_count != 0 and proof_count != shards.len) return error.BackupIntegrityFailure;
     const owned_shards = try alloc.alloc(ShardSnapshot, shards.len);
     var initialized: usize = 0;
     errdefer {
@@ -3993,6 +4037,8 @@ pub fn createManifest(
                 try alloc.dupe(u8, shard.native_manifest_sha256)
             else
                 "",
+            .accepted_generation_summary_digest = shard.accepted_generation_summary_digest,
+            .accepted_generation_summary = try cloneAcceptedGenerationSummary(alloc, shard.accepted_generation_summary),
         };
         initialized += 1;
     }
@@ -4030,6 +4076,19 @@ pub fn createManifest(
     // keyspace and every artifact has a declared identity.
     try validatePublishedTableManifest(alloc, &manifest, backup_id);
     return manifest;
+}
+
+test "portable backup manifest rejects partial per-shard accepted generation proof" {
+    const alloc = std.testing.allocator;
+    const table: metadata_table_manager.TableRecord = .{ .table_id = 11, .name = "parents", .schema_json = "{}" };
+    const empty_digest = try @import("../storage/portable_backup.zig").sourceGenerationAdmissionSummaryDigest(.{ .table_id = 11, .shard_id = 101, .range_id = 101 }, &.{});
+    const shards = [_]ShardSnapshot{
+        .{ .group_id = 101, .range_id = 101, .doc_identity_shard_id = 101, .doc_identity_range_id = 101, .start_key = "", .end_key = "m", .snapshot_path = "first.afb", .accepted_generation_summary_digest = empty_digest },
+        .{ .group_id = 102, .range_id = 102, .doc_identity_shard_id = 102, .doc_identity_range_id = 102, .start_key = "m", .snapshot_path = "second.afb" },
+    };
+    try std.testing.expectError(error.BackupIntegrityFailure, createManifest(alloc, "daily", .portable, &table, &shards));
+    const manifest: TableBackupManifest = .{ .format = .portable, .backup_id = "daily", .table_name = "parents", .table_id = 11, .description = "", .schema_json = "{}", .read_schema_json = "", .indexes_json = "{}", .replication_sources_json = "[]", .shards = &shards };
+    try std.testing.expectError(error.BackupIntegrityFailure, validateTableManifest(alloc, &manifest, "daily"));
 }
 
 pub fn writeManifest(
@@ -4261,6 +4320,16 @@ pub fn validateTableManifest(
 ) !void {
     if (manifest.format_version != format_version) return error.UnsupportedBackupFormat;
     if (!std.mem.eql(u8, manifest.backup_id, requested_backup_id)) return error.InvalidBackupRequest;
+    var proof_count: usize = 0;
+    for (manifest.shards) |shard| {
+        if (shard.accepted_generation_summary_digest) |digest| {
+            if (manifest.format != .portable or manifest.table_id == 0 or
+                !std.mem.eql(u8, &digest, &try @import("../storage/portable_backup.zig").sourceGenerationAdmissionSummaryDigest(shardAdmissionNamespace(manifest.table_id, shard), shard.accepted_generation_summary)))
+                return error.BackupIntegrityFailure;
+            proof_count += 1;
+        } else if (shard.accepted_generation_summary.len != 0) return error.BackupIntegrityFailure;
+    }
+    if (proof_count != 0 and proof_count != manifest.shards.len) return error.BackupIntegrityFailure;
     try validateManifestShards(alloc, manifest);
 }
 
@@ -14841,6 +14910,8 @@ fn cloneTableBackupManifest(alloc: std.mem.Allocator, manifest: TableBackupManif
                 try alloc.dupe(u8, shard.native_manifest_sha256)
             else
                 "",
+            .accepted_generation_summary_digest = shard.accepted_generation_summary_digest,
+            .accepted_generation_summary = try cloneAcceptedGenerationSummary(alloc, shard.accepted_generation_summary),
         };
         initialized_shards += 1;
     }

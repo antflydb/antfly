@@ -38,6 +38,7 @@ pub const NativeSecretStoreConfig = types.NativeSecretStoreConfig;
 pub const ObjectStorageConfig = types.ObjectStorageConfig;
 pub const ObjectStorageLanes = types.ObjectStorageLanes;
 pub const ObjectStorageLocation = types.ObjectStorageLocation;
+pub const PgwireConfig = types.PgwireConfig;
 pub const QueryAdmissionConfig = types.QueryAdmissionConfig;
 pub const S3ExternalIoConfig = types.S3ExternalIoConfig;
 pub const SecretSourceConfig = types.SecretSourceConfig;

@@ -1,5 +1,6 @@
 """Contains all the data models used in inputs/outputs"""
 
+from .administer_sql_settings_response_200 import AdministerSqlSettingsResponse200
 from .advance_table_storage_migration_body import AdvanceTableStorageMigrationBody
 from .advance_table_storage_migration_body_action import AdvanceTableStorageMigrationBodyAction
 from .advance_table_storage_migration_response_200 import AdvanceTableStorageMigrationResponse200
@@ -99,6 +100,8 @@ from .chunker_config_full_text_index import ChunkerConfigFullTextIndex
 from .chunker_provider import ChunkerProvider
 from .classification_step_config import ClassificationStepConfig
 from .classification_transformation_result import ClassificationTransformationResult
+from .close_prepared_sql_response_200 import ClosePreparedSQLResponse200
+from .close_sql_connection_response_200 import CloseSQLConnectionResponse200
 from .cluster_backup_request import ClusterBackupRequest
 from .cluster_backup_request_format import ClusterBackupRequestFormat
 from .cluster_backup_response import ClusterBackupResponse
@@ -1189,6 +1192,29 @@ from .sort_field import SortField
 from .sort_profile import SortProfile
 from .sort_profile_candidate_source import SortProfileCandidateSource
 from .sort_profile_sort_lifecycle_state import SortProfileSortLifecycleState
+from .sql_column import SQLColumn
+from .sql_column_type import SQLColumnType
+from .sql_connection_open_request import SQLConnectionOpenRequest
+from .sql_connection_response import SQLConnectionResponse
+from .sql_diagnostic import SQLDiagnostic
+from .sql_mutation_outcome import SQLMutationOutcome
+from .sql_prepare_request import SQLPrepareRequest
+from .sql_prepared_execution_request import SQLPreparedExecutionRequest
+from .sql_prepared_response import SQLPreparedResponse
+from .sql_request import SQLRequest
+from .sql_response import SQLResponse
+from .sql_setting_database_default import SqlSettingDatabaseDefault
+from .sql_setting_mutation_drop import SqlSettingMutationDrop
+from .sql_setting_mutation_put import SqlSettingMutationPut
+from .sql_setting_put import SqlSettingPut
+from .sql_setting_put_kind import SqlSettingPutKind
+from .sql_setting_role_default import SqlSettingRoleDefault
+from .sql_setting_value_type_0 import SqlSettingValueType0
+from .sql_setting_value_type_1 import SqlSettingValueType1
+from .sql_setting_value_type_2 import SqlSettingValueType2
+from .sql_transaction_status import SQLTransactionStatus
+from .sqlddl_receipt import SQLDDLReceipt
+from .sqlddl_receipt_state import SQLDDLReceiptState
 from .sse_error import SSEError
 from .sse_error_reason import SSEErrorReason
 from .sse_event import SSEEvent
@@ -1211,6 +1237,8 @@ from .storage_resource_exhausted_error_error import StorageResourceExhaustedErro
 from .storage_runtime_status import StorageRuntimeStatus
 from .storage_runtime_status_engine import StorageRuntimeStatusEngine
 from .storage_status import StorageStatus
+from .store_root_enrollment_identity import StoreRootEnrollmentIdentity
+from .store_root_enrollment_request import StoreRootEnrollmentRequest
 from .stream_transcription_audio_format import StreamTranscriptionAudioFormat
 from .stt_provider import STTProvider
 from .success_message import SuccessMessage
@@ -1298,6 +1326,7 @@ from .transaction_session_details_response import TransactionSessionDetailsRespo
 from .transaction_session_list_response import TransactionSessionListResponse
 from .transaction_session_read_snapshot import TransactionSessionReadSnapshot
 from .transaction_session_status import TransactionSessionStatus
+from .transaction_session_status_disposition import TransactionSessionStatusDisposition
 from .transaction_session_table_detail import TransactionSessionTableDetail
 from .transaction_stage_delete_request import TransactionStageDeleteRequest
 from .transaction_stage_read_request import TransactionStageReadRequest
@@ -1351,6 +1380,7 @@ from .you_search_config import YouSearchConfig
 from .you_search_config_provider import YouSearchConfigProvider
 
 __all__ = (
+    "AdministerSqlSettingsResponse200",
     "AdvanceTableStorageMigrationBody",
     "AdvanceTableStorageMigrationBodyAction",
     "AdvanceTableStorageMigrationResponse200",
@@ -1450,6 +1480,8 @@ __all__ = (
     "ChunkOptions",
     "ClassificationStepConfig",
     "ClassificationTransformationResult",
+    "ClosePreparedSQLResponse200",
+    "CloseSQLConnectionResponse200",
     "ClusterBackupRequest",
     "ClusterBackupRequestFormat",
     "ClusterBackupResponse",
@@ -2528,6 +2560,29 @@ __all__ = (
     "SortProfile",
     "SortProfileCandidateSource",
     "SortProfileSortLifecycleState",
+    "SQLColumn",
+    "SQLColumnType",
+    "SQLConnectionOpenRequest",
+    "SQLConnectionResponse",
+    "SQLDDLReceipt",
+    "SQLDDLReceiptState",
+    "SQLDiagnostic",
+    "SQLMutationOutcome",
+    "SQLPreparedExecutionRequest",
+    "SQLPreparedResponse",
+    "SQLPrepareRequest",
+    "SQLRequest",
+    "SQLResponse",
+    "SqlSettingDatabaseDefault",
+    "SqlSettingMutationDrop",
+    "SqlSettingMutationPut",
+    "SqlSettingPut",
+    "SqlSettingPutKind",
+    "SqlSettingRoleDefault",
+    "SqlSettingValueType0",
+    "SqlSettingValueType1",
+    "SqlSettingValueType2",
+    "SQLTransactionStatus",
     "SSEError",
     "SSEErrorReason",
     "SSEEvent",
@@ -2550,6 +2605,8 @@ __all__ = (
     "StorageRuntimeStatus",
     "StorageRuntimeStatusEngine",
     "StorageStatus",
+    "StoreRootEnrollmentIdentity",
+    "StoreRootEnrollmentRequest",
     "StreamTranscriptionAudioFormat",
     "STTProvider",
     "SuccessMessage",
@@ -2637,6 +2694,7 @@ __all__ = (
     "TransactionSessionListResponse",
     "TransactionSessionReadSnapshot",
     "TransactionSessionStatus",
+    "TransactionSessionStatusDisposition",
     "TransactionSessionTableDetail",
     "TransactionStageDeleteRequest",
     "TransactionStageReadRequest",

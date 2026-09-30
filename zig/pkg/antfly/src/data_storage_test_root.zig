@@ -28,6 +28,8 @@ const wal_replica_state = @import("raft/storage/wal_replica_state.zig");
 
 test {
     _ = @import("data/storage/merge_page_projection_test.zig");
+    _ = @import("data/merge_membership_admission.zig");
+    _ = @import("data/fk_retirement_worker.zig");
 }
 
 test "data storage module tests are reachable" {

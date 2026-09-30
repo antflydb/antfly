@@ -1787,6 +1787,7 @@ pub const Reconciler = struct {
                 if (!permit.allows(intent)) return .waiting_for_policy;
             }
             self.host.proposeConfChangeV2(intent.record.group_id, .{}) catch |err| return switch (err) {
+                error.MembershipChangeFenced => .waiting_for_policy,
                 error.PendingConfChange,
                 error.NotInJointState,
                 error.ProposalDropped,
@@ -1823,6 +1824,7 @@ pub const Reconciler = struct {
         }
 
         self.host.proposeConfChangeV2(intent.record.group_id, .{ .changes = changes }) catch |err| return switch (err) {
+            error.MembershipChangeFenced => .waiting_for_policy,
             error.PendingConfChange,
             error.MustLeaveJointFirst,
             error.ProposalDropped,
