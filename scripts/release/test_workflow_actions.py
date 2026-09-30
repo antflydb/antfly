@@ -148,7 +148,9 @@ class WorkflowActionPolicyTests(unittest.TestCase):
                     # Each ARC job starts in a fresh container; a setup in its
                     # predecessor cannot provide the CLI for this invocation.
                     setup = block.find("uses: ./.github/actions/setup-github-cli")
-                    check = block.index("python scripts/release/github_environment.py check")
+                    check = block.index(
+                        "python scripts/release/github_environment.py check"
+                    )
                     self.assertGreaterEqual(setup, 0)
                     self.assertLess(setup, check)
 

@@ -2252,9 +2252,7 @@ def _exercise_online_document_merge(
     # diagnostic snapshots are best effort and can be absent during recovery.
     table_id = cluster.table_ids[table_name]
     catalog_table = next(
-        value
-        for value in snapshot["tables"]
-        if int(value["table_id"]) == table_id
+        value for value in snapshot["tables"] if int(value["table_id"]) == table_id
     )
     physical_name = quote(catalog_table["name"], safe="")
     ranges = sorted(
