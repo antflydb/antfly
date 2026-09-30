@@ -1197,7 +1197,7 @@ test "capi lite AddIndexJSON restores the enrichment catalog when admission reje
     }
 }
 
-test "capi lite AddIndexJSON registers a graph config's nested resolvers" {
+test "capi lite AddIndexJSON registers a graph config nested resolvers" {
     // The server registers entity resolvers from the whole table's indexes
     // JSON (metadata_table_provisioner.ensureResolvers); a native Lite
     // handle admits one index at a time, so registerLiteIndexResolvers
