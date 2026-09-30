@@ -6496,9 +6496,9 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 			if action.SeedArtifactReceipt == nil {
 				continue
 			}
-            // Checkpoint recovered evidence before dependencies execute or TTL
-            // cleanup can remove its only durable source.
-            return errHAPlanNeedsPersistence
+			// Checkpoint recovered evidence before dependencies execute or TTL
+			// cleanup can remove its only durable source.
+			return errHAPlanNeedsPersistence
 		}
 		if haActionKind(action.Kind) == haActionActivateSeedArtifact && action.AdminJobPhase == haAdminJobPhaseSucceeded {
 			current, err := r.haActivationReceiptMatchesCurrentTarget(ctx, cluster, *action)

@@ -5,8 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
 	"io"
+	"net/http"
+	"strings"
+	"testing"
+
+	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -14,10 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	"net/http"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"strings"
-	"testing"
 )
 
 func activationLogFixture(t *testing.T) (antflyv1.HAPlannedActionStatus, string) {
