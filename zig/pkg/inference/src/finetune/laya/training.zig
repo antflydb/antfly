@@ -78,8 +78,12 @@ pub fn floatValues(a: std.mem.Allocator, tensor: Tensor) ![]f32 {
 /// A `.lora_A`/`.lora_B` adapter has no source value to freeze to, so
 /// `freeze_layers` never covers it: it stays trainable even under a frozen
 /// layer, which is an ordinary LoRA-on-a-frozen-base configuration.
+/// `whole_encoder` freezes every `encoder.*` tensor, the final norm included,
+/// so the encoder's output is exactly the source's (a head trained on a
+/// shared trunk); a job asks for it with `freeze_layers = num_hidden_layers + 1`.
 pub fn frozen(name: []const u8, layers: u32, lora: ?architecture.Lora) bool {
     const adapter = std.mem.endsWith(u8, name, ".lora_A") or std.mem.endsWith(u8, name, ".lora_B");
+    if (layers == whole_encoder and !adapter and std.mem.startsWith(u8, name, "encoder.")) return true;
     if (layers > 0 and !adapter) {
         if (std.mem.startsWith(u8, name, "encoder.embeddings.")) return true;
         const prefix = "encoder.layers.";
@@ -93,6 +97,8 @@ pub fn frozen(name: []const u8, layers: u32, lora: ?architecture.Lora) bool {
     if (lora) |cfg| if (architecture.isLoraFrozen(name, cfg.targets)) return true;
     return false;
 }
+
+pub const whole_encoder = std.math.maxInt(u32);
 
 /// A frozen parameter's value, owned by the caller for the whole run and
 /// bound by name into every program. It is never updated or freed by a step.
