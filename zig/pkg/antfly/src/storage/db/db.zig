@@ -47129,6 +47129,214 @@ pub const DB = struct {
         });
     }
 
+    /// Owned filter_query_json/exclusion_query_json produced by lifting
+    /// query.bool.filter/must_not (filter_text/exclusion_text) clauses out of
+    /// the native per-arm query for chunk-backed member/chunk-mode search.
+    /// Empty when there was nothing to lift.
+    const ChunkBoolFilterLowering = struct {
+        filter_query_json: ?[]u8 = null,
+        exclusion_query_json: ?[]u8 = null,
+
+        fn deinit(self: *ChunkBoolFilterLowering, alloc: Allocator) void {
+            if (self.filter_query_json) |owned| alloc.free(owned);
+            if (self.exclusion_query_json) |owned| alloc.free(owned);
+        }
+    };
+
+    const ChunkBoolFilterLoweringBudget = struct {
+        remaining_nodes: usize = 256,
+    };
+
+    const StoredPatternCombinator = enum { conjuncts, disjuncts };
+
+    /// Member/chunk-mode chunk hits are a separate full-text/vector document
+    /// from their parent row, so resolving `filter_text`/`exclusion_text`
+    /// (query.bool.filter/must_not) against the chunk-backed index's own
+    /// doc-number/ordinal space can never see a parent-only field (issue
+    /// #931). Convert the clauses that `applyStoredSearchPatternFilters`'
+    /// stored-pattern matcher (graph_exec.compilePatternFilter) can also
+    /// express, and fold them into filter_query_json/exclusion_query_json so
+    /// they reach that parent-aware matcher instead. Returns
+    /// error.UnsupportedQueryRequest for a clause the stored-pattern matcher
+    /// cannot represent (e.g. an analyzed `match`/`phrase`), rather than
+    /// silently dropping or misapplying it.
+    fn liftChunkBoolFilterClausesAlloc(
+        alloc: Allocator,
+        filter_text: ?types.TextQuery,
+        exclusion_text: ?types.TextQuery,
+        existing_filter_query_json: []const u8,
+        existing_exclusion_query_json: []const u8,
+    ) !ChunkBoolFilterLowering {
+        var out = ChunkBoolFilterLowering{};
+        errdefer out.deinit(alloc);
+        if (filter_text == null and exclusion_text == null) return out;
+
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+
+        if (filter_text) |text_query| {
+            var budget = ChunkBoolFilterLoweringBudget{};
+            const lowered = try lowerTextQueryToStoredPatternValueAlloc(arena_alloc, text_query, 0, &budget);
+            out.filter_query_json = try combineStoredPatternJsonAlloc(alloc, arena_alloc, existing_filter_query_json, lowered, .conjuncts);
+        }
+        if (exclusion_text) |text_query| {
+            var budget = ChunkBoolFilterLoweringBudget{};
+            const lowered = try lowerTextQueryToStoredPatternValueAlloc(arena_alloc, text_query, 0, &budget);
+            out.exclusion_query_json = try combineStoredPatternJsonAlloc(alloc, arena_alloc, existing_exclusion_query_json, lowered, .disjuncts);
+        }
+        return out;
+    }
+
+    /// Combines an (optionally empty) existing stored-pattern-filter JSON
+    /// string with a newly lowered node into one filter, returning an owned
+    /// string allocated with `alloc`. `existing_json` is parsed with the
+    /// caller's transient `arena_alloc`; only the final serialized string is
+    /// durably allocated.
+    fn combineStoredPatternJsonAlloc(
+        alloc: Allocator,
+        arena_alloc: Allocator,
+        existing_json: []const u8,
+        addition: std.json.Value,
+        combinator: StoredPatternCombinator,
+    ) ![]u8 {
+        if (existing_json.len == 0) {
+            return try std.json.Stringify.valueAlloc(alloc, addition, .{});
+        }
+        const existing = try std.json.parseFromSliceLeaky(std.json.Value, arena_alloc, existing_json, .{});
+        var items = std.json.Array.init(arena_alloc);
+        try items.ensureTotalCapacity(2);
+        items.appendAssumeCapacity(existing);
+        items.appendAssumeCapacity(addition);
+        var body = std.json.ObjectMap.empty;
+        try body.put(arena_alloc, switch (combinator) {
+            .conjuncts => "conjuncts",
+            .disjuncts => "disjuncts",
+        }, .{ .array = items });
+        return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = body }, .{});
+    }
+
+    fn storedPatternWrappedPredicate(alloc: Allocator, name: []const u8, body: std.json.Value) !std.json.Value {
+        var root = std.json.ObjectMap.empty;
+        try root.put(alloc, name, body);
+        return .{ .object = root };
+    }
+
+    fn storedPatternEmptyPredicate(alloc: Allocator, name: []const u8) !std.json.Value {
+        return storedPatternWrappedPredicate(alloc, name, .{ .object = std.json.ObjectMap.empty });
+    }
+
+    fn storedPatternJsonU64(value: u64) std.json.Value {
+        if (value <= std.math.maxInt(i64)) return .{ .integer = @intCast(value) };
+        // Stored-pattern date_range compares numerically; values this large
+        // fall outside any representable nanosecond timestamp we accept
+        // elsewhere, so this branch is unreachable in practice but kept for
+        // exhaustiveness rather than risking silent truncation.
+        return .{ .float = @floatFromInt(value) };
+    }
+
+    /// Lowers the subset of `TextQuery` that `graph_exec.compilePatternFilter`
+    /// can also express (match_all/match_none/term/bool_field/numeric_range/
+    /// date_range/doc_id, and bool_query composed of those) into the
+    /// equivalent stored-pattern-filter JSON value. Analyzed/tokenized shapes
+    /// (match, phrase, multi_phrase, match_phrase, multi_match_bool_prefix)
+    /// and shapes the stored-pattern matcher does not yet lower this way
+    /// (fuzzy, prefix, wildcard, regexp, term_range, ip_range, geo_*) return
+    /// error.UnsupportedQueryRequest rather than a wrong or partial result.
+    fn lowerTextQueryToStoredPatternValueAlloc(
+        alloc: Allocator,
+        query: types.TextQuery,
+        depth: u8,
+        budget: *ChunkBoolFilterLoweringBudget,
+    ) anyerror!std.json.Value {
+        if (depth > 16 or budget.remaining_nodes == 0) return error.UnsupportedQueryRequest;
+        budget.remaining_nodes -= 1;
+        return switch (query) {
+            .match_all => try storedPatternEmptyPredicate(alloc, "match_all"),
+            .match_none => try storedPatternEmptyPredicate(alloc, "match_none"),
+            .term => |term| blk: {
+                var body = std.json.ObjectMap.empty;
+                try body.put(alloc, term.field, .{ .string = term.term });
+                break :blk try storedPatternWrappedPredicate(alloc, "term", .{ .object = body });
+            },
+            .bool_field => |bool_field| blk: {
+                var body = std.json.ObjectMap.empty;
+                try body.put(alloc, "field", .{ .string = bool_field.field });
+                try body.put(alloc, "value", .{ .bool = bool_field.value });
+                break :blk try storedPatternWrappedPredicate(alloc, "bool_field", .{ .object = body });
+            },
+            .numeric_range => |range| blk: {
+                if (range.min == null and range.max == null) return error.UnsupportedQueryRequest;
+                var body = std.json.ObjectMap.empty;
+                try body.put(alloc, "field", .{ .string = range.field });
+                if (range.min) |bound| try body.put(alloc, "min", .{ .float = bound });
+                if (range.max) |bound| try body.put(alloc, "max", .{ .float = bound });
+                try body.put(alloc, "inclusive_min", .{ .bool = range.inclusive_min });
+                try body.put(alloc, "inclusive_max", .{ .bool = range.inclusive_max });
+                break :blk try storedPatternWrappedPredicate(alloc, "numeric_range", .{ .object = body });
+            },
+            .date_range => |range| blk: {
+                if (range.start_ns == null and range.end_ns == null) return error.UnsupportedQueryRequest;
+                var body = std.json.ObjectMap.empty;
+                try body.put(alloc, "field", .{ .string = range.field });
+                if (range.start_ns) |ns| try body.put(alloc, "start_ns", storedPatternJsonU64(ns));
+                if (range.end_ns) |ns| try body.put(alloc, "end_ns", storedPatternJsonU64(ns));
+                try body.put(alloc, "inclusive_start", .{ .bool = range.inclusive_start });
+                try body.put(alloc, "inclusive_end", .{ .bool = range.inclusive_end });
+                break :blk try storedPatternWrappedPredicate(alloc, "date_range", .{ .object = body });
+            },
+            .doc_id => |doc_id| blk: {
+                if (doc_id.ids.len == 0) return error.UnsupportedQueryRequest;
+                var ids = std.json.Array.init(alloc);
+                try ids.ensureTotalCapacity(doc_id.ids.len);
+                for (doc_id.ids) |id| ids.appendAssumeCapacity(.{ .string = id });
+                break :blk try storedPatternWrappedPredicate(alloc, "doc_id", .{ .array = ids });
+            },
+            .bool_query => |bool_query| blk: {
+                if (bool_query.must.len == 0 and bool_query.should.len == 0 and bool_query.must_not.len == 0) {
+                    return error.UnsupportedQueryRequest;
+                }
+                var body = std.json.ObjectMap.empty;
+                // A pure, explicitly-optional should-disjunction has no
+                // must/filter clause to anchor it; the stored-pattern bool
+                // contract always floors a pure should to a minimum of one
+                // match, so make the match-all requirement explicit instead
+                // of weakening that shared invariant.
+                const needs_optional_anchor = bool_query.pure_should_optional and bool_query.must.len == 0;
+                if (bool_query.must.len > 0 or needs_optional_anchor) {
+                    var must = std.json.Array.init(alloc);
+                    try must.ensureTotalCapacity(bool_query.must.len + @as(usize, if (needs_optional_anchor) 1 else 0));
+                    if (needs_optional_anchor) must.appendAssumeCapacity(try storedPatternEmptyPredicate(alloc, "match_all"));
+                    for (bool_query.must) |child| {
+                        must.appendAssumeCapacity(try lowerTextQueryToStoredPatternValueAlloc(alloc, child, depth + 1, budget));
+                    }
+                    try body.put(alloc, "must", .{ .array = must });
+                }
+                if (bool_query.should.len > 0) {
+                    var should = std.json.Array.init(alloc);
+                    try should.ensureTotalCapacity(bool_query.should.len);
+                    for (bool_query.should) |child| {
+                        should.appendAssumeCapacity(try lowerTextQueryToStoredPatternValueAlloc(alloc, child, depth + 1, budget));
+                    }
+                    try body.put(alloc, "should", .{ .array = should });
+                    if (bool_query.min_should > 0) {
+                        try body.put(alloc, "minimum_should_match", .{ .integer = bool_query.min_should });
+                    }
+                }
+                if (bool_query.must_not.len > 0) {
+                    var must_not = std.json.Array.init(alloc);
+                    try must_not.ensureTotalCapacity(bool_query.must_not.len);
+                    for (bool_query.must_not) |child| {
+                        must_not.appendAssumeCapacity(try lowerTextQueryToStoredPatternValueAlloc(alloc, child, depth + 1, budget));
+                    }
+                    try body.put(alloc, "must_not", .{ .array = must_not });
+                }
+                break :blk try storedPatternWrappedPredicate(alloc, "bool", .{ .object = body });
+            },
+            else => error.UnsupportedQueryRequest,
+        };
+    }
+
     fn searchTextQuery(self: *DB, alloc: Allocator, req: types.SearchRequest, text_query: types.TextQuery) !types.SearchResult {
         const needs_algebraic_doc_filter = req.doc_filter_bindings.len > 0 or req.require_algebraic_filter_resolution;
         var algebraic_filter = if (needs_algebraic_doc_filter)
@@ -47148,12 +47356,35 @@ pub const DB = struct {
         const chunk_backed_for_filter = try self.core.textIndexIsChunkBacked(alloc, execution_req.index_name);
         const member_mode_for_filter = execution_req.return_mode == .member or execution_req.return_mode == .chunk;
         const suppress_text_doc_num_filter = chunk_backed_for_filter and member_mode_for_filter;
+        var lifted_bool_filter = ChunkBoolFilterLowering{};
+        defer lifted_bool_filter.deinit(alloc);
         if (suppress_text_doc_num_filter) {
-            // Discard any doc-number resolution a composed search's shared
-            // filter step may already have attached upstream (searchComposed
-            // resolves this unconditionally before dispatching to per-arm
-            // searches); it would be just as wrong here.
+            // Discard any doc-number/ordinal resolution a composed search's
+            // shared filter step may already have attached upstream
+            // (searchComposed resolves these unconditionally before
+            // dispatching to per-arm searches); they would be just as wrong
+            // here.
             execution_req.resolved_text_doc_filter = null;
+            execution_req.resolved_doc_filter = null;
+            // query.bool.filter/must_not (native TextQuery filter_text/
+            // exclusion_text) are resolved the same wrong way: against the
+            // chunk-backed index's own doc-number/ordinal space, which never
+            // covers a parent-only field. Lift representable clauses into
+            // filter_query_json/exclusion_query_json instead, so they reach
+            // applyStoredSearchPatternFilters' parent-aware matcher (issue
+            // #931). Unrepresentable shapes fail closed with a clear error
+            // rather than silently matching nothing or everything.
+            lifted_bool_filter = try liftChunkBoolFilterClausesAlloc(
+                alloc,
+                execution_req.filter_text,
+                execution_req.exclusion_text,
+                execution_req.filter_query_json,
+                execution_req.exclusion_query_json,
+            );
+            if (lifted_bool_filter.filter_query_json) |json| execution_req.filter_query_json = json;
+            if (lifted_bool_filter.exclusion_query_json) |json| execution_req.exclusion_query_json = json;
+            if (execution_req.filter_text != null) execution_req.filter_text = null;
+            if (execution_req.exclusion_text != null) execution_req.exclusion_text = null;
         }
         const maybe_resolved_text_filter = if (suppress_text_doc_num_filter)
             null
@@ -47939,6 +48170,37 @@ pub const DB = struct {
         var algebraic_filter = try self.searchRequestWithAlgebraicDocFilterAlloc(req);
         defer algebraic_filter.deinit();
         if (bench_profile) algebraic_ns = platform_time.monotonicNs() - algebraic_start_ns;
+        // Chunk members are a separate vector member from their parent row
+        // and share only its ordinal, not its own fields. query.bool.filter/
+        // must_not (filter_text/exclusion_text) resolve against the
+        // chunk-backed index's own doc set the same way filter_query/
+        // exclusion_query would without the parent-aware path built for the
+        // text arm: lift the representable clauses into filter_query_json/
+        // exclusion_query_json so the same parent-aware matcher covers this
+        // arm too (issue #931).
+        var lifted_dense_bool_filter = ChunkBoolFilterLowering{};
+        defer lifted_dense_bool_filter.deinit(alloc);
+        {
+            const chunk_backed_for_filter = if (self.core.denseIndex(algebraic_filter.req.index_name)) |entry|
+                entry.chunk_name != null
+            else
+                false;
+            const member_mode_for_filter = algebraic_filter.req.return_mode == .member or algebraic_filter.req.return_mode == .chunk;
+            if (chunk_backed_for_filter and member_mode_for_filter) {
+                algebraic_filter.req.resolved_doc_filter = null;
+                lifted_dense_bool_filter = try liftChunkBoolFilterClausesAlloc(
+                    alloc,
+                    algebraic_filter.req.filter_text,
+                    algebraic_filter.req.exclusion_text,
+                    algebraic_filter.req.filter_query_json,
+                    algebraic_filter.req.exclusion_query_json,
+                );
+                if (lifted_dense_bool_filter.filter_query_json) |json| algebraic_filter.req.filter_query_json = json;
+                if (lifted_dense_bool_filter.exclusion_query_json) |json| algebraic_filter.req.exclusion_query_json = json;
+                algebraic_filter.req.filter_text = null;
+                algebraic_filter.req.exclusion_text = null;
+            }
+        }
         const prove_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         try self.proveVectorSearchAccessPath(algebraic_filter.req.index_name, .dense_vector, hasNativeDocIdConstraints(algebraic_filter.req));
         if (bench_profile) prove_ns = platform_time.monotonicNs() - prove_start_ns;
@@ -95760,6 +96022,150 @@ test "db member-mode chunk hits filter through the parent row on the full-text a
     try std.testing.expectEqual(@as(usize, 1), excluded.hits.len);
 }
 
+test "db member-mode chunk hits apply query.bool.filter/must_not against the parent row" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .enable_without_producers = true,
+        },
+    });
+    defer db.close();
+
+    const ephemeral_chunker =
+        "{\"provider\":\"antfly\",\"store_chunks\":false,\"text\":{\"target_tokens\":32,\"overlap_tokens\":0}}";
+    try db.addEnrichment(.{
+        .name = "body_chunks_v1",
+        .kind = .chunk,
+        .field = "body",
+        .chunker_json = ephemeral_chunker,
+    });
+    try db.addIndex(.{
+        .name = "selected_text",
+        .kind = .full_text,
+        .config_json = "{\"sources\":[{\"artifact\":\"body_chunks_v1\"}]}",
+    });
+
+    // `filter_text`/`exclusion_text` are the native TextQuery form
+    // query.bool.filter/must_not lowers to at the API layer. `category`
+    // only exists on the parent row, never on a chunk's own stored payload.
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:keep", .value = "{\"body\":\"alpha searchable text\",\"category\":\"keep\"}" },
+            .{ .key = "doc:drop", .value = "{\"body\":\"alpha also appears here\",\"category\":\"drop\"}" },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    var included = try db.search(alloc, .{
+        .index_name = "selected_text",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .return_mode = .member,
+        .filter_text = .{ .term = .{ .field = "category", .term = "keep" } },
+    });
+    defer included.deinit();
+    try std.testing.expectEqual(@as(u32, 1), included.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), included.hits.len);
+    try std.testing.expectEqualStrings("doc:keep", included.hits[0].artifact_ref.?.document_id);
+
+    var excluded = try db.search(alloc, .{
+        .index_name = "selected_text",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .return_mode = .member,
+        .exclusion_text = .{ .term = .{ .field = "category", .term = "keep" } },
+    });
+    defer excluded.deinit();
+    try std.testing.expectEqual(@as(u32, 1), excluded.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), excluded.hits.len);
+    try std.testing.expectEqualStrings("doc:drop", excluded.hits[0].artifact_ref.?.document_id);
+
+    // An analyzed/tokenized clause (`match`) has no stored-pattern
+    // equivalent; chunk-backed member mode must reject it rather than
+    // silently resolve it against the chunk's own (wrong) doc-number space.
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.search(alloc, .{
+        .index_name = "selected_text",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .return_mode = .member,
+        .filter_text = .{ .match = .{ .field = "category", .text = "keep" } },
+    }));
+}
+
+test "db member-mode chunk hits apply query.bool.filter/must_not against the parent row on the dense arm" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var embedder = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = embedder.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
+    });
+
+    // Each 15-char body yields exactly 3 chunks at chunk_size 8 / overlap 2
+    // (see the sibling "db chunked dense enrichment..." tests above).
+    // `category` only exists on the parent row, never on a chunk's own
+    // stored payload.
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:keep", .value = "{\"body\":\"abcdefghijklmno\",\"category\":\"keep\"}" },
+            .{ .key = "doc:drop", .value = "{\"body\":\"pqrstuvwxyzabcd\",\"category\":\"drop\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(u64, 6), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+
+    const query_vec = try embedder.interface().embedDense(alloc, "chunk_dense_v1", "abcdefgh", 3);
+    defer alloc.free(query_vec);
+
+    var unfiltered = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 10 },
+        .return_mode = .member,
+    });
+    defer unfiltered.deinit();
+    try std.testing.expectEqual(@as(u32, 6), unfiltered.total_hits);
+
+    var included = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 10 },
+        .return_mode = .member,
+        .filter_text = .{ .term = .{ .field = "category", .term = "keep" } },
+    });
+    defer included.deinit();
+    try std.testing.expectEqual(@as(u32, 3), included.total_hits);
+    for (included.hits) |hit| try std.testing.expectEqualStrings("doc:keep", hit.artifact_ref.?.document_id);
+
+    var excluded = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 10 },
+        .return_mode = .member,
+        .exclusion_text = .{ .term = .{ .field = "category", .term = "keep" } },
+    });
+    defer excluded.deinit();
+    try std.testing.expectEqual(@as(u32, 3), excluded.total_hits);
+    for (excluded.hits) |hit| try std.testing.expectEqualStrings("doc:drop", hit.artifact_ref.?.document_id);
+}
+
 test "db asset consumes another asset artifact and re-derives on upstream change" {
     const alloc = std.testing.allocator;
 
@@ -121084,6 +121490,65 @@ test "db full text match_all applies stored filters" {
     try std.testing.expectEqual(@as(usize, 2), result.hits.len);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
     try std.testing.expectEqualStrings("doc:c", result.hits[1].id);
+}
+
+test "db full text match_all applies exclusion_query" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"status\":\"active\",\"body\":\"alpha\"}" },
+            .{ .key = "doc:b", .value = "{\"status\":\"draft\",\"body\":\"beta\"}" },
+            .{ .key = "doc:c", .value = "{\"status\":\"active\",\"body\":\"gamma\"}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    // Issue #931 "related observation": exclusion_query (and, separately,
+    // bool.must_not) is silently ignored when the scoring query is
+    // match_all, even though the identical exclusion correctly drops
+    // matches for a non-match_all query (see the filter_query sibling test
+    // above, and the non-match_all case below).
+    var result = try waitForSearchResult(alloc, &db, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match_all = {} },
+        .exclusion_query_json = "{\"term\":{\"status\":\"draft\"}}",
+        .limit = 10,
+    }, 2);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:c", result.hits[1].id);
+
+    // The equivalent native bool_query{must:[match_all], must_not:[term]}
+    // shape that query.bool.must_not lowers to for full-text requests.
+    var bool_result = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .bool_query = .{
+            .must = &.{.{ .match_all = {} }},
+            .must_not = &.{.{ .term = .{ .field = "status", .term = "draft" } }},
+        } },
+        .limit = 10,
+    });
+    defer bool_result.deinit();
+    try std.testing.expectEqual(@as(u32, 2), bool_result.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), bool_result.hits.len);
 }
 
 test "db full_index delete waits for full text visibility" {
