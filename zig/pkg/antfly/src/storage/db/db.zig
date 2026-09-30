@@ -96337,6 +96337,203 @@ test "db member-mode chunk hits apply query.bool.filter/must_not against the par
     for (excluded.hits) |hit| try std.testing.expectEqualStrings("doc:drop", hit.artifact_ref.?.document_id);
 }
 
+test "db member-mode chunk hits apply filter_query/exclusion_query against the parent row on the dense arm (issue #931)" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var embedder = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = embedder.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
+    });
+    // An algebraic index over `category` gives filter_query_json/
+    // exclusion_query_json a real doc-number-set resolution path to
+    // wrongly resolve against (the parent row's own doc space) - without
+    // one, searchRequestWithAlgebraicDocFilterAlloc simply has nothing to
+    // resolve and the bug this test targets can't reproduce.
+    try db.addIndex(.{
+        .name = "alg",
+        .kind = .algebraic,
+        .config_json =
+        \\{
+        \\  "version": 1,
+        \\  "table": "docs",
+        \\  "group_fields": [{"name":"category","path":"category","type":"string"}],
+        \\  "measure_fields": [],
+        \\  "materializations": []
+        \\}
+        ,
+    });
+
+    // filter_query/exclusion_query (unlike query.bool.filter/must_not) used
+    // to reach searchDense's algebraic doc-filter resolver *before* the
+    // chunk-backed member-mode gate ran, resolving-and-clearing them against
+    // the parent doc-number space instead of leaving them for the
+    // parent-aware applyStoredSearchPatternFilters matcher - silently
+    // dropping the filter and returning every chunk regardless.
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:keep", .value = "{\"body\":\"abcdefghijklmno\",\"category\":\"keep\"}" },
+            .{ .key = "doc:drop", .value = "{\"body\":\"pqrstuvwxyzabcd\",\"category\":\"drop\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(u64, 6), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+
+    const keep_doc_ids = (try db.core.index_manager.algebraicIndex("alg").?.index.docIdsForFilterJsonAlloc(db.core.store, "{\"term\":{\"category\":\"keep\"}}")) orelse return error.TestUnexpectedResult;
+    defer db.core.index_manager.algebraicIndex("alg").?.index.freeDocIds(keep_doc_ids);
+    try std.testing.expectEqual(@as(usize, 1), keep_doc_ids.len);
+    try std.testing.expectEqualStrings("doc:keep", keep_doc_ids[0]);
+
+    const query_vec = try embedder.interface().embedDense(alloc, "chunk_dense_v1", "abcdefgh", 3);
+    defer alloc.free(query_vec);
+
+    var included = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 10 },
+        .return_mode = .member,
+        .filter_query_json = "{\"term\":{\"category\":\"keep\"}}",
+        .require_algebraic_filter_resolution = true,
+    });
+    defer included.deinit();
+    try std.testing.expectEqual(@as(u32, 3), included.total_hits);
+    for (included.hits) |hit| try std.testing.expectEqualStrings("doc:keep", hit.artifact_ref.?.document_id);
+
+    var excluded = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 10 },
+        .return_mode = .member,
+        .exclusion_query_json = "{\"term\":{\"category\":\"keep\"}}",
+        .require_algebraic_filter_resolution = true,
+    });
+    defer excluded.deinit();
+    try std.testing.expectEqual(@as(u32, 3), excluded.total_hits);
+    for (excluded.hits) |hit| try std.testing.expectEqualStrings("doc:drop", hit.artifact_ref.?.document_id);
+}
+
+test "db composed full_text+dense (rrf) member-mode fusion scopes filter_query/exclusion_query to the parent row without collapsing distinct chunks (issue #931)" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var embedder = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = embedder.interface(),
+        },
+    });
+    defer db.close();
+
+    // The dense index's inline generator registers the "body_chunks_v1"
+    // chunk enrichment as a side effect; the full-text index then sources
+    // from that same chunk artifact so both arms search the identical
+    // chunk-backed member set (issue #931's fused/hybrid scope).
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
+    });
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{\"sources\":[{\"artifact\":\"body_chunks_v1\"}]}",
+    });
+
+    // Each 15-char body yields exactly 3 chunks at chunk_size 8 / overlap 2
+    // (see the sibling dense-arm tests above). `category` only exists on
+    // the parent row, never on a chunk's own stored payload.
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:keep", .value = "{\"body\":\"abcdefghijklmno\",\"category\":\"keep\"}" },
+            .{ .key = "doc:drop", .value = "{\"body\":\"pqrstuvwxyzabcd\",\"category\":\"drop\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(u64, 6), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+
+    const query_vec = try embedder.interface().embedDense(alloc, "chunk_dense_v1", "abcdefgh", 3);
+    defer alloc.free(query_vec);
+
+    const merge_config = types.MergeConfig{ .strategy = .rrf };
+
+    // Unfiltered: the dense arm alone already covers every chunk (k=10 over
+    // 6 live chunks); the text arm's single exact-term hit is a subset of
+    // it. Fusion must keep all 6 distinct chunks rather than collapsing the
+    // 3 chunks sharing each parent ordinal into one hit per document.
+    var unfiltered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .term = .{ .field = "body", .term = "abcdefgh" } },
+        .dense_queries = &.{
+            .{ .name = "dv_v1", .index_name = "dv_v1", .query = .{ .vector = query_vec, .k = 10 } },
+        },
+        .merge_config = merge_config,
+        .return_mode = .member,
+    });
+    defer unfiltered.deinit();
+    try std.testing.expectEqual(@as(u32, 6), unfiltered.total_hits);
+    try std.testing.expectEqual(@as(usize, 6), unfiltered.hits.len);
+
+    const included_req: types.SearchRequest = .{
+        .index_name = "ft_v1",
+        .full_text = .{ .term = .{ .field = "body", .term = "abcdefgh" } },
+        .dense_queries = &.{
+            .{ .name = "dv_v1", .index_name = "dv_v1", .query = .{ .vector = query_vec, .k = 10 } },
+        },
+        .merge_config = merge_config,
+        .return_mode = .member,
+        .filter_query_json = "{\"term\":{\"category\":\"keep\"}}",
+    };
+    // Directly guard the composed-level gate itself: searchComposed's shared
+    // filter step (resolveStructuredDocFilterForComposedCallback) resolves
+    // filter_query_json/exclusion_query_json exactly once for every arm
+    // before fanning out, with no awareness that the dense arm here is
+    // chunk-backed and returns member-mode hits. Without this gate tripping,
+    // that shared resolution runs unconditionally and can silently drop the
+    // filter for the whole fused query (issue #931), independent of whether
+    // the text arm's own doc space happens to resolve `category` at all.
+    try std.testing.expect(try db.composedRequestTouchesChunkBackedMemberModeArm(alloc, included_req));
+
+    var included = try db.search(alloc, included_req);
+    defer included.deinit();
+    try std.testing.expectEqual(@as(u32, 3), included.total_hits);
+    try std.testing.expectEqual(@as(usize, 3), included.hits.len);
+    for (included.hits) |hit| try std.testing.expectEqualStrings("doc:keep", hit.artifact_ref.?.document_id);
+
+    var excluded = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .term = .{ .field = "body", .term = "abcdefgh" } },
+        .dense_queries = &.{
+            .{ .name = "dv_v1", .index_name = "dv_v1", .query = .{ .vector = query_vec, .k = 10 } },
+        },
+        .merge_config = merge_config,
+        .return_mode = .member,
+        .exclusion_query_json = "{\"term\":{\"category\":\"keep\"}}",
+    });
+    defer excluded.deinit();
+    try std.testing.expectEqual(@as(u32, 3), excluded.total_hits);
+    try std.testing.expectEqual(@as(usize, 3), excluded.hits.len);
+    for (excluded.hits) |hit| try std.testing.expectEqualStrings("doc:drop", hit.artifact_ref.?.document_id);
+}
+
 test "db asset consumes another asset artifact and re-derives on upstream change" {
     const alloc = std.testing.allocator;
 

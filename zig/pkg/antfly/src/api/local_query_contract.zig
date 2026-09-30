@@ -6428,3 +6428,47 @@ pub fn replaceOwnedCapabilityState(alloc: std.mem.Allocator, state: *[]const u8,
     alloc.free(state.*);
     state.* = owned;
 }
+
+test "ancestors-only hierarchy survives the internal wire re-encode without a stray group_by (issue #930)" {
+    const alloc = std.testing.allocator;
+    // Every public query - even one served entirely by a single local
+    // shard - is parsed once from the caller's JSON and then re-encoded via
+    // encodeQueryRequestWithGraphWireMode into an internal wire request that
+    // gets parsed a second time for execution. A request that only uses
+    // hierarchy.ancestors (no group_by/children) must survive that hop.
+    const body =
+        \\{
+        \\  "full_text_search": {"match": "needle", "field": "content"},
+        \\  "hierarchy": {"ancestors": {"source": {"fields": ["title", "url"]}}}
+        \\}
+    ;
+    var first = try query_contract.parseQueryRequest(alloc, null, "docs", body);
+    defer first.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.ReturnMode.member, first.req.return_mode);
+    try std.testing.expect(first.req.hierarchy_include_source);
+    try std.testing.expect(!first.req.hierarchy_include_unit);
+    try std.testing.expect(!first.req.hierarchy_source_include_all_fields);
+    try std.testing.expectEqual(@as(usize, 2), first.req.hierarchy_source_fields.len);
+    try std.testing.expectEqualStrings("title", first.req.hierarchy_source_fields[0]);
+    try std.testing.expectEqualStrings("url", first.req.hierarchy_source_fields[1]);
+
+    const encoded = try encodeQueryRequest(alloc, first.req);
+    defer alloc.free(encoded);
+    // Two distinct mistakes both corrupt this hop: omitting "hierarchy"
+    // entirely (drops hierarchy_include_source, so ancestors.source never
+    // hydrates) and unconditionally writing "group_by" once this control is
+    // forwarded at all (flips the reparsed request's return_mode from member
+    // to parent).
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"ancestors\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"group_by\"") == null);
+
+    var second = try query_contract.parseQueryRequest(alloc, null, "docs", encoded);
+    defer second.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.ReturnMode.member, second.req.return_mode);
+    try std.testing.expect(second.req.hierarchy_include_source);
+    try std.testing.expect(!second.req.hierarchy_include_unit);
+    try std.testing.expect(!second.req.hierarchy_source_include_all_fields);
+    try std.testing.expectEqual(@as(usize, 2), second.req.hierarchy_source_fields.len);
+    try std.testing.expectEqualStrings("title", second.req.hierarchy_source_fields[0]);
+    try std.testing.expectEqualStrings("url", second.req.hierarchy_source_fields[1]);
+}
