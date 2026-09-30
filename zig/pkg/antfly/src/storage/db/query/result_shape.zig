@@ -125,6 +125,21 @@ pub const StoredPatternFilterExecutor = struct {
         doc_ids: []const []const u8,
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet = null,
+    // Member/chunk-mode hits are separate full-text/vector documents from
+    // their parent row and never carry the parent's own fields in their own
+    // stored payload. When set, `filter_query`/`exclusion_query` match member
+    // hits against the resolved parent row instead (issue #931).
+    resolve_parent_id: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        hit: types.SearchHit,
+    ) anyerror![]u8 = null,
+    load_parent_stored: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        parent_id: []const u8,
+    ) anyerror!?[]u8 = null,
 };
 
 pub const SearchResultPostprocessor = struct {
@@ -1513,22 +1528,41 @@ pub fn applyStoredSearchPatternFilters(
     const exclusion_needs_stored = if (compiled_exclusion) |compiled| compiled.needsStoredDoc() else false;
     const needs_stored = filter_needs_stored or exclusion_needs_stored;
 
+    // Member/chunk-mode hits are a separate full-text/vector document from
+    // their parent row: their own stored payload never carries the parent's
+    // fields. When the caller wired parent resolution, match against the
+    // resolved parent row instead of the hit's own stored data (issue #931).
+    const member_mode = req.return_mode == .member or req.return_mode == .chunk;
+    const parent_aware = member_mode and executor.resolve_parent_id != null and executor.load_parent_stored != null;
+
     const source = result;
     const original_hits_len = result.hits.len;
 
     var missing_indices = std.ArrayListUnmanaged(usize).empty;
     defer missing_indices.deinit(alloc);
     for (result.hits, 0..) |hit, i| {
-        if (needs_stored and hit.stored_data == null) try missing_indices.append(alloc, i);
+        if (needs_stored and !parent_aware and hit.stored_data == null) try missing_indices.append(alloc, i);
     }
 
-    const loaded_many = if (needs_stored and executor.load_many_stored != null and missing_indices.items.len > 0) blk: {
+    const loaded_many = if (needs_stored and !parent_aware and executor.load_many_stored != null and missing_indices.items.len > 0) blk: {
         const keys = try alloc.alloc([]const u8, missing_indices.items.len);
         defer alloc.free(keys);
         for (missing_indices.items, 0..) |hit_index, i| keys[i] = result.hits[hit_index].id;
         break :blk try executor.load_many_stored.?(executor.ctx, alloc, keys);
     } else null;
     defer if (loaded_many) |values| freeOptionalOwnedBytes(alloc, values);
+
+    // Parent rows are deduped and cached by resolved parent id so several
+    // chunks of the same parent only load and parse that row once.
+    var parent_stored_cache = std.StringHashMapUnmanaged(?[]u8).empty;
+    defer {
+        var it = parent_stored_cache.iterator();
+        while (it.next()) |entry| {
+            alloc.free(entry.key_ptr.*);
+            if (entry.value_ptr.*) |bytes| alloc.free(bytes);
+        }
+        parent_stored_cache.deinit(alloc);
+    }
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -1548,7 +1582,18 @@ pub fn applyStoredSearchPatternFilters(
             break :blk loaded_many.?[loaded_missing_index];
         } else null;
         const parsed_stored = if (needs_stored) blk: {
-            const maybe_stored = if (hit.stored_data) |stored|
+            const maybe_stored: ?[]u8 = if (parent_aware) pblk: {
+                const parent_id = executor.resolve_parent_id.?(executor.ctx, alloc, hit) catch |err| switch (err) {
+                    error.InvalidChunkArtifact, error.StoredDocMissing => break :pblk null,
+                    else => return err,
+                };
+                defer alloc.free(parent_id);
+                if (parent_stored_cache.get(parent_id)) |cached| break :pblk cached;
+                const loaded = try executor.load_parent_stored.?(executor.ctx, alloc, req, parent_id);
+                const owned_key = try alloc.dupe(u8, parent_id);
+                try parent_stored_cache.put(alloc, owned_key, loaded);
+                break :pblk loaded;
+            } else if (hit.stored_data) |stored|
                 stored
             else if (loaded_many != null)
                 batch_loaded_stored
@@ -1558,7 +1603,7 @@ pub fn applyStoredSearchPatternFilters(
                 keep_hits[i] = false;
                 continue;
             };
-            defer if (hit.stored_data == null and loaded_many == null) alloc.free(stored);
+            defer if (!parent_aware and hit.stored_data == null and loaded_many == null) alloc.free(stored);
             break :blk try std.json.parseFromSlice(std.json.Value, hit_alloc, stored, .{});
         } else null;
 
@@ -1657,6 +1702,8 @@ pub fn postprocessTextSearchResult(
         .load_many_stored = processor.load_many_stored,
         .resolve_doc_set_doc_ids = processor.resolve_doc_set_doc_ids,
         .resolve_doc_ids_to_doc_set = processor.resolve_doc_ids_to_doc_set,
+        .resolve_parent_id = if (chunk_backed) processor.resolve_parent_id else null,
+        .load_parent_stored = if (chunk_backed) processor.load_parent_stored else null,
     });
     if (chunk_backed) {
         // Chunk members intentionally share their parent document ordinal.
@@ -1733,6 +1780,8 @@ pub fn postprocessVectorSearchResult(
         .load_many_stored = processor.load_many_stored,
         .resolve_doc_set_doc_ids = processor.resolve_doc_set_doc_ids,
         .resolve_doc_ids_to_doc_set = processor.resolve_doc_ids_to_doc_set,
+        .resolve_parent_id = if (chunk_backed) processor.resolve_parent_id else null,
+        .load_parent_stored = if (chunk_backed) processor.load_parent_stored else null,
     });
 }
 
@@ -2372,6 +2421,138 @@ test "applyStoredSearchPatternFilters reports lower-bound total for filtered pag
         try std.testing.expectEqual(types.TotalHitsRelation.gte, result.total_hits_relation);
         try std.testing.expectEqualStrings("doc:b", result.hits[kept - 1].id);
     }
+}
+
+const TestParentFieldFilterLoader = struct {
+    load_stored_calls: usize = 0,
+    load_parent_calls: usize = 0,
+
+    fn resolveParentId(_: ?*anyopaque, alloc: Allocator, hit: types.SearchHit) ![]u8 {
+        const sep = std.mem.indexOfScalar(u8, hit.id, '#') orelse return error.InvalidChunkArtifact;
+        return try alloc.dupe(u8, hit.id[0..sep]);
+    }
+
+    fn loadParentStored(ctx: ?*anyopaque, alloc: Allocator, _: types.SearchRequest, parent_id: []const u8) !?[]u8 {
+        const self: *TestParentFieldFilterLoader = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        self.load_parent_calls += 1;
+        if (std.mem.eql(u8, parent_id, "doc:a")) return try alloc.dupe(u8, "{\"category\":\"garden\"}");
+        if (std.mem.eql(u8, parent_id, "doc:b")) return try alloc.dupe(u8, "{\"category\":\"finance\"}");
+        return null;
+    }
+
+    fn loadStored(ctx: ?*anyopaque, _: Allocator, _: []const u8) !?[]u8 {
+        // A member-mode chunk hit's own payload never carries a parent field
+        // like `category`; parent-aware filtering must never consult it.
+        const self: *TestParentFieldFilterLoader = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        self.load_stored_calls += 1;
+        return error.TestUnexpectedResult;
+    }
+};
+
+test "applyStoredSearchPatternFilters matches member-mode chunk hits against the parent row (#931)" {
+    const alloc = std.testing.allocator;
+    var hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a#0") };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b#0") };
+
+    var loader = TestParentFieldFilterLoader{};
+    var result = try applyStoredSearchPatternFilters(alloc, .{
+        .return_mode = .member,
+        .filter_query_json = "{\"term\":{\"category\":\"garden\"}}",
+    }, .{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+    }, .{
+        .ctx = &loader,
+        .load_stored = TestParentFieldFilterLoader.loadStored,
+        .resolve_parent_id = TestParentFieldFilterLoader.resolveParentId,
+        .load_parent_stored = TestParentFieldFilterLoader.loadParentStored,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:a#0", result.hits[0].id);
+    try std.testing.expectEqual(@as(usize, 0), loader.load_stored_calls);
+}
+
+test "applyStoredSearchPatternFilters drops member-mode chunk hits via parent-row exclusion_query (#931)" {
+    const alloc = std.testing.allocator;
+    var hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a#0") };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b#0") };
+
+    var loader = TestParentFieldFilterLoader{};
+    var result = try applyStoredSearchPatternFilters(alloc, .{
+        .return_mode = .member,
+        .exclusion_query_json = "{\"term\":{\"category\":\"garden\"}}",
+    }, .{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+    }, .{
+        .ctx = &loader,
+        .load_stored = TestParentFieldFilterLoader.loadStored,
+        .resolve_parent_id = TestParentFieldFilterLoader.resolveParentId,
+        .load_parent_stored = TestParentFieldFilterLoader.loadParentStored,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b#0", result.hits[0].id);
+    try std.testing.expectEqual(@as(usize, 0), loader.load_stored_calls);
+}
+
+test "applyStoredSearchPatternFilters caches parent row loads across chunks of the same parent (#931)" {
+    const alloc = std.testing.allocator;
+    var hits = try alloc.alloc(types.SearchHit, 3);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a#0") };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:a#1") };
+    hits[2] = .{ .id = try alloc.dupe(u8, "doc:b#0") };
+
+    var loader = TestParentFieldFilterLoader{};
+    var result = try applyStoredSearchPatternFilters(alloc, .{
+        .return_mode = .member,
+        .filter_query_json = "{\"term\":{\"category\":\"garden\"}}",
+    }, .{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 3,
+    }, .{
+        .ctx = &loader,
+        .load_stored = TestParentFieldFilterLoader.loadStored,
+        .resolve_parent_id = TestParentFieldFilterLoader.resolveParentId,
+        .load_parent_stored = TestParentFieldFilterLoader.loadParentStored,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    // doc:a is the parent of two hits but must only be loaded once.
+    try std.testing.expectEqual(@as(usize, 2), loader.load_parent_calls);
+}
+
+test "applyStoredSearchPatternFilters evaluates filters against the hit's own payload without parent callbacks" {
+    const alloc = std.testing.allocator;
+    var hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .stored_data = try alloc.dupe(u8, "{\"title\":\"alpha\"}") };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .stored_data = try alloc.dupe(u8, "{\"title\":\"beta\"}") };
+
+    var loader = TestStoredLoader{};
+    var result = try applyStoredSearchPatternFilters(alloc, .{
+        .filter_query_json = "{\"term\":{\"title\":\"beta\"}}",
+    }, .{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+    }, .{
+        .ctx = &loader,
+        .load_stored = TestStoredLoader.loadStored,
+        .load_many_stored = TestStoredLoader.loadManyStored,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
 }
 
 const TestPostprocessor = struct {

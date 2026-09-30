@@ -46962,16 +46962,37 @@ pub const DB = struct {
             AlgebraicDocFilterRequest{ .req = req };
         defer algebraic_filter.deinit();
         var execution_req = algebraic_filter.req;
-        const maybe_resolved_text_filter = try db_query_search.resolveStructuredTextDocNumFilterForComposedAlloc(alloc, execution_req, .{
-            .ctx = self,
-            .text_index_entry = textIndexEntryCallback,
-            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
-            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
-            .live_filter_doc_set = liveFilterDocSetCallback,
-            .all_docs_visible = allDocsVisibleCallback,
-            .project_ordinals_to_doc_ids = false,
-            .identity_read_generation = execution_req.identity_read_generation,
-        });
+        // Chunk members are separate full-text documents from their parent
+        // row and have their own doc numbers, so resolving filter_query/
+        // exclusion_query into parent-row doc-number sets here can never
+        // match a chunk (positive clause: 0 hits) or exclude one (negative
+        // clause: no effect). Leave the JSON filters unresolved for
+        // chunk-backed member/chunk-mode text queries so they survive into
+        // applyStoredSearchPatternFilters, which matches them against the
+        // resolved parent row instead (issue #931).
+        const chunk_backed_for_filter = try self.core.textIndexIsChunkBacked(alloc, execution_req.index_name);
+        const member_mode_for_filter = execution_req.return_mode == .member or execution_req.return_mode == .chunk;
+        const suppress_text_doc_num_filter = chunk_backed_for_filter and member_mode_for_filter;
+        if (suppress_text_doc_num_filter) {
+            // Discard any doc-number resolution a composed search's shared
+            // filter step may already have attached upstream (searchComposed
+            // resolves this unconditionally before dispatching to per-arm
+            // searches); it would be just as wrong here.
+            execution_req.resolved_text_doc_filter = null;
+        }
+        const maybe_resolved_text_filter = if (suppress_text_doc_num_filter)
+            null
+        else
+            try db_query_search.resolveStructuredTextDocNumFilterForComposedAlloc(alloc, execution_req, .{
+                .ctx = self,
+                .text_index_entry = textIndexEntryCallback,
+                .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+                .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+                .live_filter_doc_set = liveFilterDocSetCallback,
+                .all_docs_visible = allDocsVisibleCallback,
+                .project_ordinals_to_doc_ids = false,
+                .identity_read_generation = execution_req.identity_read_generation,
+            });
         var resolved_text_filter_storage: db_query_search.ResolvedTextDocNumFilter = undefined;
         var has_resolved_text_filter = false;
         defer {
@@ -95315,6 +95336,78 @@ test "db direct generated chunks feed multi-source text and graph indexes" {
     const after_delete = try db.getEdges(alloc, "selected_graph", "doc:a", "mentions", .out);
     defer graph_mod.GraphIndex.freeEdges(alloc, after_delete);
     try std.testing.expectEqual(@as(usize, 0), after_delete.len);
+}
+
+test "db member-mode chunk hits filter through the parent row on the full-text arm" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .enable_without_producers = true,
+        },
+    });
+    defer db.close();
+
+    const ephemeral_chunker =
+        "{\"provider\":\"antfly\",\"store_chunks\":false,\"text\":{\"target_tokens\":32,\"overlap_tokens\":0}}";
+    try db.addEnrichment(.{
+        .name = "body_chunks_v1",
+        .kind = .chunk,
+        .field = "body",
+        .chunker_json = ephemeral_chunker,
+    });
+    try db.addIndex(.{
+        .name = "selected_text",
+        .kind = .full_text,
+        .config_json = "{\"sources\":[{\"artifact\":\"body_chunks_v1\"}]}",
+    });
+
+    // Chunk members are a separate full-text document from their parent row
+    // and never carry the parent's own fields (issue #931). `category` only
+    // exists on the parent row, never on a chunk's own stored payload.
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:keep", .value = "{\"body\":\"alpha searchable text\",\"category\":\"keep\"}" },
+            .{ .key = "doc:drop", .value = "{\"body\":\"alpha also appears here\",\"category\":\"drop\"}" },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    var unfiltered = try db.search(alloc, .{
+        .index_name = "selected_text",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .return_mode = .member,
+    });
+    defer unfiltered.deinit();
+    try std.testing.expectEqual(@as(u32, 2), unfiltered.total_hits);
+
+    var included = try db.search(alloc, .{
+        .index_name = "selected_text",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .return_mode = .member,
+        .filter_query_json = "{\"term\":{\"category\":\"keep\"}}",
+    });
+    defer included.deinit();
+    try std.testing.expectEqual(@as(u32, 1), included.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), included.hits.len);
+    try std.testing.expectEqualStrings("doc:keep", included.hits[0].artifact_ref.?.document_id);
+
+    var excluded = try db.search(alloc, .{
+        .index_name = "selected_text",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .return_mode = .member,
+        .exclusion_query_json = "{\"term\":{\"category\":\"keep\"}}",
+    });
+    defer excluded.deinit();
+    try std.testing.expectEqual(@as(u32, 1), excluded.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), excluded.hits.len);
 }
 
 test "db asset consumes another asset artifact and re-derives on upstream change" {
