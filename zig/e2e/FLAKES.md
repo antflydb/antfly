@@ -49,6 +49,33 @@ merge after restart, and 9.1–13.7 seconds independently probing all 47 UNIQUE
 claims with three workers. These identify phases to investigate, not the exact
 server-side cause of the delay or unloaded latency.
 
+## 2026-09-27: PR #885 recovery-2 write and restore stalls
+
+[PR #885 run 36345949010](https://github.com/antflydb/antfly/actions/runs/36345949010)
+tested head `50dd1f7d1` against base `1fc8a3161`. Its
+[recovery-2 job](https://github.com/antflydb/antfly/actions/runs/36345949010/job/108702992295)
+finished with six passed and two failed cases. In
+`test_online_fk_merge_preserves_shadow_claims_and_retained_references[release-reply_loss]`,
+the child table did not become writable; the last write returned 503
+`write unavailable`. In
+`test_schema_rewrite_recovers_dependency_cohort[publication-coordinator]`,
+the restore did not reach success: one metadata endpoint still reported
+`running` with `OnlineSourcePinMissing`, while two returned
+`metadata leader unavailable`. The supplied log summary also reports metadata
+leadership and Raft persistence delays. It does not establish which condition
+blocked progress or whether both assertions share a cause.
+
+The [previous approved PR #885 run](https://github.com/antflydb/antfly/actions/runs/36298230764)
+passed this same recovery-2 shard at head `6965bc5b4`. Between that head and
+`50dd1f7d1`, the only change was to the nested pytest probe in
+`test_standalone_harness.py`; neither recovery test nor production Antfly
+runtime code changed. Earlier recovery history below also records
+`publication-coordinator` stalls and owner-link/leader availability problems.
+This is evidence against a direct GLiNER2.5-Decide regression, but one passing
+and one failing CI run do not establish a harmless test flake. A matched
+head/base reproduction with retained data-group and metadata Raft diagnostics
+is still needed before changing recovery behavior or deadlines.
+
 ## 2026-09-25: progressive activation observations during admission maintenance
 
 [Main job 108330133910](https://github.com/antflydb/antfly/actions/runs/36213445604/job/108330133910)

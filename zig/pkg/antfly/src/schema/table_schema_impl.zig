@@ -2248,7 +2248,7 @@ fn validateNonNegativeInteger(value: std.json.Value) !void {
     _ = exactU64JsonNumber(value) orelse return error.InvalidSchemaUpdateRequest;
 }
 
-fn parseTtlDurationNs(raw: []const u8) !u64 {
+pub fn parseTtlDurationNs(raw: []const u8) !u64 {
     const text = std.mem.trim(u8, raw, " \t\r\n");
     if (text.len == 0) return error.InvalidSchemaUpdateRequest;
     var total: u64 = 0;

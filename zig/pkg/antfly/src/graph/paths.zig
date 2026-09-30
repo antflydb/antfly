@@ -40,13 +40,14 @@ const edge_stream = @import("edge_stream.zig");
 
 const GraphIndexEdgeReader = struct {
     graph_index: *GraphIndex,
+    now_ns: u64,
 
     pub fn openEdgeStream(self: @This(), a: Allocator, key: []const u8, kinds: []const []const u8, direction: EdgeDirection) !edge_stream.Stream {
-        return edge_stream.openGraph(a, self.graph_index, key, kinds, direction);
+        return edge_stream.openGraphAt(a, self.graph_index, key, kinds, direction, self.now_ns);
     }
 
     pub fn getEdges(self: @This(), alloc: Allocator, key: []const u8, direction: EdgeDirection) ![]Edge {
-        return try self.graph_index.getEdges(alloc, key, "", direction);
+        return try self.graph_index.getEdgesAt(alloc, key, "", direction, self.now_ns);
     }
 
     pub fn getEdgesBoundedForPath(
@@ -58,13 +59,14 @@ const GraphIndexEdgeReader = struct {
         max_edges: usize,
         max_bytes: usize,
     ) ![]Edge {
-        return try self.graph_index.getEdgesByTypesBounded(
+        return try self.graph_index.getEdgesByTypesBoundedAt(
             alloc,
             key,
             edge_types,
             direction,
             max_edges,
             max_bytes,
+            self.now_ns,
         );
     }
 
@@ -90,6 +92,7 @@ pub const PathFindOptions = struct {
     /// Shared by every path operation in the enclosing request. Yen spur
     /// searches deliberately reuse this pointer rather than resetting limits.
     work_budget: ?*work_budget_mod.WorkBudget = null,
+    ttl_now_ns: ?u64 = null,
     /// Maximum number of live frontier/candidate states.
     max_intermediate_states: usize = work_budget_mod.default_max_intermediate_states,
     /// See TraversalRules.owning_table: a `target_table` edge tag naming the
@@ -387,7 +390,7 @@ pub fn findShortestPath(
 ) !?Path {
     return findShortestPathWithEdgeReader(
         alloc,
-        GraphIndexEdgeReader{ .graph_index = graph_index },
+        GraphIndexEdgeReader{ .graph_index = graph_index, .now_ns = opts.ttl_now_ns orelse graph_index.clock.nowRealtimeNs() },
         source,
         target,
         opts,
@@ -419,7 +422,7 @@ pub fn findShortestPathWithExclusions(
 ) !?Path {
     return findShortestPathWithExclusionsAndEdgeReader(
         alloc,
-        GraphIndexEdgeReader{ .graph_index = graph_index },
+        GraphIndexEdgeReader{ .graph_index = graph_index, .now_ns = opts.ttl_now_ns orelse graph_index.clock.nowRealtimeNs() },
         source,
         target,
         opts,
@@ -799,7 +802,7 @@ pub fn findKShortestPaths(
 ) ![]Path {
     return try findKShortestPathsWithEdgeReader(
         alloc,
-        GraphIndexEdgeReader{ .graph_index = graph_index },
+        GraphIndexEdgeReader{ .graph_index = graph_index, .now_ns = opts.ttl_now_ns orelse graph_index.clock.nowRealtimeNs() },
         source,
         target,
         k,
