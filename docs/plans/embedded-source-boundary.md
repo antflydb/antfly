@@ -106,7 +106,7 @@ consumers can.
 The borrowed replication interfaces, replay ingress, local snapshot hooks, and
 server runtime test fixtures are separated in #940. Runtime adapters use
 `hot_standby_*` names; local engine contracts use generic replication names.
-Existing durable keys, wire formats, error identities, and C ABI symbols remain
+Existing durable keys, wire formats, error identities, and public C ABI symbols remain
 compatible. The authored production source audit follows 590 local sources
 without entering server coordination. The complete physical source move and
 private C API server-owner separation remain in progress.
