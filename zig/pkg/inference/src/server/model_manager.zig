@@ -4549,6 +4549,28 @@ pub const ModelManager = struct {
         return self.acquireRequestsWithEviction(requests);
     }
 
+    /// Borrow reserved generation workspace before charging the remaining
+    /// request bytes. Every failure unwinds the sub-ledgers, including a failed
+    /// draft admission, process cap, live-memory check, or cancellation later.
+    pub fn acquireGenerationResources(
+        self: *ModelManager,
+        requests: []const GenerationAdmissionRequest,
+    ) !GenerationAdmissionLease {
+        if (requests.len == 0 or requests.len > 2) return error.ResourceLimitExceeded;
+        var result = GenerationAdmissionLease{};
+        errdefer result.release();
+        var remaining: [2]runtime.tier.memory.AdmissionRequest = undefined;
+        for (requests, 0..) |request, i| {
+            remaining[i] = request.resources;
+            if (request.session.generation_workspace) |workspace| {
+                result.workspace[i] = try workspace.acquire(&remaining[i].amounts);
+            }
+        }
+        // This call also checks hard caps when all KV/scratch is prepaid.
+        result.resources = try self.acquireRunResourceEstimates(remaining[0..requests.len]);
+        return result;
+    }
+
     pub fn configureAdmissionLimits(
         self: *ModelManager,
         overrides: runtime.tier.memory.Limits,
@@ -8479,6 +8501,21 @@ pub const ManagedHfTokenizer = struct {
 
 const LoadedSessionPlan = ManagedSession;
 
+pub const GenerationAdmissionRequest = struct {
+    session: backends.Session,
+    resources: runtime.tier.memory.AdmissionRequest,
+};
+
+pub const GenerationAdmissionLease = struct {
+    resources: ?runtime.tier.memory.AdmissionLease = null,
+    workspace: [2]?runtime.tier.memory.AdmissionLease = .{ null, null },
+
+    pub fn release(self: *@This()) void {
+        if (self.resources) |*lease| lease.release();
+        for (&self.workspace) |*slot| if (slot.*) |*lease| lease.release();
+    }
+};
+
 const ModelLoadAdmissionPlan = struct {
     /// Maximum simultaneous bytes while parsing/importing/repacking.
     peak: runtime.tier.memory.AdmissionAmounts,
@@ -8487,6 +8524,9 @@ const ModelLoadAdmissionPlan = struct {
     /// Minimum serving envelope justified by the same resolved load plan.
     /// Operator overrides are applied after this floor.
     limit_floor: runtime.tier.memory.Limits = .{},
+    /// CUDA A4B serving excludes temporary GGUF staging and reuses the
+    /// resident KV/scratch reservation through a bounded session sub-ledger.
+    serving_floor: ?runtime.tier.memory.Limits = null,
 };
 
 fn modelRunWorkspaceAllowance(weight_bytes: usize) usize {
@@ -8871,6 +8911,12 @@ fn a4bGpuModelLoadAdmission(
             .kv_limit_bytes = kv,
             .scratch_limit_bytes = scratch,
         },
+        .serving_floor = if (backend == .cuda) .{
+            .backend_limit_bytes = budget,
+            .combined_limit_bytes = budget,
+            .kv_limit_bytes = kv,
+            .scratch_limit_bytes = scratch,
+        } else null,
     };
 }
 
@@ -8890,6 +8936,78 @@ test "A4B GPU admission lease equals the configured memory envelope" {
     try std.testing.expectEqual(cuda_plan.resident.backendTotalBytes(), cuda_plan.peak.backendTotalBytes());
     try std.testing.expectEqual(@as(usize, 1234), cuda_plan.peak.host_weight_bytes);
     try std.testing.expectEqual(@as(usize, 0), cuda_plan.resident.host_weight_bytes);
+}
+
+test "CUDA A4B serving reuses retained workspace and unwinds failed requests" {
+    const memory = runtime.tier.memory;
+    for ([_]?backend_contracts.A4bInferenceRequest{ null, .{ .residency_mode = .resident, .memory_budget_mb = 24 * 1024 } }) |request| {
+        const config = try backend_contracts.buildCudaA4bInferenceConfig(request, backend_contracts.qualified_a4b_geometries[0]);
+        const plan = a4bGpuModelLoadAdmission(config, 4 * 1024 * 1024 * 1024, .cuda);
+        var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+        defer manager.deinit();
+        try manager.ensureResourceOwnerReady();
+        const controller = manager.admissionController();
+        // No physical GPU allocation or host-capacity dependency in this test.
+        controller.configureSharedLimits(.{});
+        var model_lease = try controller.tryAcquire(.gpu, plan.limit_floor, plan.peak, false);
+        defer model_lease.release();
+        try model_lease.retain(plan.resident);
+        var workspace = memory.ReservedGenerationWorkspace{
+            .floor = plan.serving_floor.?,
+            .capacity = .{ .backend_kv_bytes = plan.resident.backend_kv_bytes, .backend_scratch_bytes = plan.resident.backend_scratch_bytes },
+        };
+        defer workspace.borrowed.deinit();
+        const session = backends.Session{ .ptr = &workspace, .vtable = undefined, .generation_workspace = &workspace };
+        const limits = session_factory.widenBudgetLimitsForSession(session, .{ .host_limit_bytes = 1024, .backend_limit_bytes = 9 * 1024 * 1024 * 1024 });
+        try std.testing.expectEqual(@as(usize, 1024), limits.host_limit_bytes);
+        try std.testing.expectEqual(@as(usize, @intCast(config.memory_budget_bytes)), limits.backend_limit_bytes);
+        try std.testing.expectEqual(limits.host_limit_bytes + limits.backend_limit_bytes, limits.combined_limit_bytes);
+        const one_byte = memory.AdmissionAmounts{ .backend_scratch_bytes = 1 };
+        // AJ's reproduction: preserving the floor alone still double-charges.
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryAcquire(.gpu, limits, one_byte, false));
+        var requests = [_]GenerationAdmissionRequest{.{ .session = session, .resources = .{ .backend_class = .gpu, .limits = limits, .amounts = one_byte } }};
+        var ordinary = try manager.acquireGenerationResources(&requests);
+        try std.testing.expectEqualDeep(plan.resident, controller.snapshot());
+        ordinary.release();
+        // A streaming lifetime can hold the complete KV/scratch allowance;
+        // another borrower cannot spend the same bytes until it releases.
+        requests[0].resources.amounts = workspace.capacity;
+        var streaming = try manager.acquireGenerationResources(&requests);
+        try std.testing.expectEqualDeep(plan.resident, controller.snapshot());
+        requests[0].resources.amounts = one_byte;
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.acquireGenerationResources(&requests));
+        streaming.release();
+        var retry = try manager.acquireGenerationResources(&requests);
+        retry.release();
+        // Operator caps still apply even when the global request increment is zero.
+        inline for (.{ memory.Limits{ .backend_limit_bytes = limits.backend_limit_bytes - 1 }, memory.Limits{ .combined_limit_bytes = limits.backend_limit_bytes - 1 }, memory.Limits{ .kv_limit_bytes = plan.resident.backend_kv_bytes - 1 }, memory.Limits{ .scratch_limit_bytes = plan.resident.backend_scratch_bytes - 1 } }) |cap| {
+            requests[0].resources.limits = memory.applyLimitOverrides(limits, cap);
+            try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.acquireGenerationResources(&requests));
+            try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, workspace.borrowed.snapshot());
+        }
+        requests[0].resources.limits = limits;
+        requests[0].resources.amounts = .{ .backend_kv_bytes = workspace.capacity.backend_kv_bytes + 1 };
+        try std.testing.expectError(error.ResourceLimitExceeded, manager.acquireGenerationResources(&requests));
+        requests[0].resources.amounts = .{ .backend_scratch_bytes = workspace.capacity.backend_scratch_bytes + 1 };
+        try std.testing.expectError(error.ResourceLimitExceeded, manager.acquireGenerationResources(&requests));
+        // Host work remains charged; a rejected host request restores credits.
+        requests[0].resources.amounts = .{ .backend_scratch_bytes = 1, .host_weight_bytes = 1025 };
+        try std.testing.expectError(error.ResourceLimitExceeded, manager.acquireGenerationResources(&requests));
+        try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, workspace.borrowed.snapshot());
+        requests[0].resources.amounts = .{ .backend_scratch_bytes = 1, .host_weight_bytes = 8 };
+        var host = try manager.acquireGenerationResources(&requests);
+        try std.testing.expectEqual(@as(usize, 8), controller.snapshot().host_weight_bytes);
+        host.release();
+        // Target borrowing must unwind if admission of a second session fails.
+        requests[0].resources.amounts = one_byte;
+        const pair = [_]GenerationAdmissionRequest{ requests[0], .{
+            .session = .{ .ptr = &workspace, .vtable = undefined },
+            .resources = .{ .backend_class = .gpu, .limits = limits, .amounts = .{ .backend_weight_bytes = 1 } },
+        } };
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.acquireGenerationResources(&pair));
+        try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, workspace.borrowed.snapshot());
+        try std.testing.expectEqualDeep(plan.resident, controller.snapshot());
+    }
 }
 
 test "CUDA A4B load plan widens explicit budget above default" {
@@ -9121,6 +9239,7 @@ fn loadSessionForPreferredBackends(
         defer if (resource_lease) |*lease| lease.release();
         var resident_amounts = runtime.tier.memory.AdmissionAmounts{};
         var admission_limits = runtime.tier.memory.Limits{};
+        var serving_floor: ?runtime.tier.memory.Limits = null;
         if (manager.admission_enabled) {
             const admission_plan = estimateModelLoadAdmission(
                 model_dir,
@@ -9132,6 +9251,7 @@ fn loadSessionForPreferredBackends(
                 continue;
             };
             resident_amounts = admission_plan.resident;
+            serving_floor = admission_plan.serving_floor;
             admission_limits = manager.admissionLimitsForModelPath(
                 model_dir,
                 backend_runtime,
@@ -9200,6 +9320,11 @@ fn loadSessionForPreferredBackends(
             try session_factory.prepareLayaResident(loaded.session, control);
             if (loaded.resource_lease) |*lease| try lease.retain(resident_amounts);
             if (manager.admission_enabled) {
+                if (serving_floor) |floor| session_factory.configureReservedGenerationWorkspace(
+                    &loaded.session,
+                    floor,
+                    resident_amounts,
+                );
                 const session_admission_limits = manager.admissionLimitsForSession(
                     backend_runtime,
                     loaded.session,

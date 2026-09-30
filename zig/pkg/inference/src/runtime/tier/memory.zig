@@ -698,6 +698,41 @@ pub const AdmissionRequest = struct {
     amounts: AdmissionAmounts,
 };
 
+/// A bounded sub-ledger for KV/scratch already charged by a model's resident
+/// lease. Borrowers still acquire the process-wide lease for unreserved bytes
+/// and to enforce the effective operator caps against total residency.
+pub const ReservedGenerationWorkspace = struct {
+    floor: Limits,
+    capacity: AdmissionAmounts,
+    borrowed: AdmissionController = .{},
+
+    pub fn widenLimits(self: *const @This(), defaults: Limits) Limits {
+        var limits = maxCompositeLimits(defaults, self.floor);
+        // Host request work remains separately charged. Construction staging
+        // is absent from this floor; allow the serving host and device domains.
+        limits.combined_limit_bytes = @max(limits.combined_limit_bytes, limits.host_limit_bytes +| limits.backend_limit_bytes);
+        return limits;
+    }
+
+    pub fn acquire(self: *@This(), amounts: *AdmissionAmounts) !AdmissionLease {
+        const covered = AdmissionAmounts{
+            .backend_kv_bytes = amounts.backend_kv_bytes,
+            .backend_scratch_bytes = amounts.backend_scratch_bytes,
+        };
+        // Zero capacity means no credit, not an unlimited sub-ledger.
+        if (covered.backend_kv_bytes > self.capacity.backend_kv_bytes or
+            covered.backend_scratch_bytes > self.capacity.backend_scratch_bytes)
+            return error.ResourceLimitExceeded;
+        const lease = try self.borrowed.tryAcquire(.gpu, .{
+            .kv_limit_bytes = self.capacity.backend_kv_bytes,
+            .scratch_limit_bytes = self.capacity.backend_scratch_bytes,
+        }, covered, false);
+        amounts.backend_kv_bytes = 0;
+        amounts.backend_scratch_bytes = 0;
+        return lease;
+    }
+};
+
 /// The exact transient constraint that rejected an admission. Callers that can
 /// reclaim resident resources use this to choose a victim that can actually
 /// relieve the failed budget instead of evicting by coarse byte-category
