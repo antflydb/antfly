@@ -232,6 +232,24 @@ unbounded retention.
 
 ### Portable seed artifacts
 
+Portable seed Job logs may contain complete leading `warning: ` diagnostic
+lines before their machine-readable receipt (including with runtime v0.2.3).
+The operator strips only those leading lines and decodes the entire remaining
+body as one receipt. Unknown activation fields, extra JSON documents, trailing
+diagnostics, and mismatched identity/digest evidence remain rejected.
+
+For a succeeded Job whose receipt was not collected, reconciliation re-reads
+its original succeeded pod logs before validating the activation target. It
+keeps the completed attempt and defers TTL cleanup until receipt evidence is
+valid; it does not rerun activation merely because the receipt is missing.
+An operator-only upgrade can recover such an attempt if the Job and its
+succeeded pod logs remain available and the topology, generation, target PVC
+incarnation, and digest bindings still match. Normal dependency and target
+cleanup reconciliation must finish before startup is authorized. If those
+logs have already been removed, this recovery path has no evidence to collect;
+do not fabricate a receipt or bypass the startup gate.
+
+
 Configure `standbys[*].seedArtifact` when the source backup and the standby do
 not share a filesystem. The same path is used for initial bootstrap and reseed:
 
