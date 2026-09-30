@@ -1430,7 +1430,7 @@ func optionalGraphIdentity(value string) *string {
 
 func validateGraphRelationshipIdentity(id, owner *string) error {
 	for _, value := range []*string{id, owner} {
-		if value != nil && (*value == "" || len(*value) > maxGraphEdgeTypeBytes || !utf8.ValidString(*value)) {
+		if value != nil && (*value == "" || !utf8.ValidString(*value)) {
 			return fmt.Errorf("graph relationship identity must be a nonempty UTF-8 string")
 		}
 	}

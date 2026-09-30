@@ -398,6 +398,8 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi lite exposes hosted and status-only profiles",
         "capi lite open options validate and configure ttl cleanup",
         "capi execute graph queries honors identity read generation",
+        "capi fact relationships preserve identities and filter before ranking",
+        "capi fact path serialization and parsing release partial allocations",
         "capi search rejects stale identity generation before readable lease hook",
         "capi search json returns stamped identity generation",
         "packed dense response exposes public ids not doc ordinals",

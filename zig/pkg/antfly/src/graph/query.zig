@@ -21,7 +21,7 @@
 //!   - k_shortest_paths: via paths.findKShortestPaths()
 
 const std = @import("std");
-const relationship_filter = @import("relationship_filter.zig");
+pub const relationship_filter = @import("relationship_filter.zig");
 const Allocator = std.mem.Allocator;
 const platform_time = @import("antfly_platform").time;
 const graph_mod = @import("graph.zig");

@@ -6793,6 +6793,32 @@ pub const GraphIndex = struct {
     fn applyMutationPage(self: *GraphIndex, writes: []const BatchWrite, deletes: []const BatchDelete, comptime coalesced: bool, completed_intent: ?[]const u8) !void {
         if (writes.len == 0 and deletes.len == 0) return;
 
+        // The source document is the implicit owner. Canonicalize redundant
+        // explicit owners before constructing either direction's private key,
+        // so live writes and primary-artifact reconstruction have one identity.
+        var redundant_owner = false;
+        for (writes) |write| {
+            if (write.owner_document.len > 0 and write.edge_id.len == 0) return error.InvalidGraphEdges;
+            redundant_owner = redundant_owner or (write.owner_document.len > 0 and std.mem.eql(u8, write.owner_document, write.source));
+        }
+        for (deletes) |delete| {
+            if (delete.owner_document.len > 0 and delete.edge_id.len == 0) return error.InvalidGraphEdges;
+            redundant_owner = redundant_owner or (delete.owner_document.len > 0 and std.mem.eql(u8, delete.owner_document, delete.source));
+        }
+        if (redundant_owner) {
+            const canonical_writes = try self.alloc.dupe(BatchWrite, writes);
+            defer self.alloc.free(canonical_writes);
+            const canonical_deletes = try self.alloc.dupe(BatchDelete, deletes);
+            defer self.alloc.free(canonical_deletes);
+            for (canonical_writes) |*write| if (std.mem.eql(u8, write.owner_document, write.source)) {
+                write.owner_document = "";
+            };
+            for (canonical_deletes) |*delete| if (std.mem.eql(u8, delete.owner_document, delete.source)) {
+                delete.owner_document = "";
+            };
+            return self.applyMutationPage(canonical_writes, canonical_deletes, coalesced, completed_intent);
+        }
+
         // Validate the complete batch before opening either physical write
         // batch, so invalid durable fields cannot partially mutate one
         // direction or create records that the public graph wire contract
@@ -7620,7 +7646,7 @@ pub const GraphIndex = struct {
         }
         for (probes, 0..) |probe, i| {
             keys[i] = .{
-                .encoded = try relationshipKeyAlloc(alloc, probe.source, self.index_name, probe.edge_type, probe.target, probe.edge_id, probe.owner_document),
+                .encoded = try relationshipKeyAlloc(alloc, probe.source, self.index_name, probe.edge_type, probe.target, probe.edge_id, if (std.mem.eql(u8, probe.source, probe.owner_document)) "" else probe.owner_document),
                 .result_index = i,
             };
             initialized_keys += 1;
@@ -7667,7 +7693,7 @@ pub const GraphIndex = struct {
             errdefer alloc.free(edge_type);
             const edge_id = try alloc.dupe(u8, probe.edge_id);
             errdefer alloc.free(edge_id);
-            const owner_document = try alloc.dupe(u8, probe.owner_document);
+            const owner_document = try alloc.dupe(u8, if (std.mem.eql(u8, probe.source, probe.owner_document)) "" else probe.owner_document);
             errdefer alloc.free(owner_document);
             const metadata = if (decoded.metadata.len > 0)
                 try alloc.dupe(u8, decoded.metadata)
@@ -36150,4 +36176,26 @@ test "graph owned build helpers remain leak-free across allocation failures" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "graph redundant source ownership is canonical across writes probes and deletes" {
+    const alloc = std.testing.allocator;
+    var graph = try GraphIndex.openWithPrivateStores(alloc, "unused-out", "unused-in", "facts", .{ .reverse_backend = .mem });
+    defer graph.close();
+    try graph.batchApply(&.{.{ .source = "a", .target = "b", .edge_type = "R", .edge_id = "one", .owner_document = "a" }}, &.{});
+    try graph.batchApply(&.{.{ .source = "a", .target = "b", .edge_type = "R", .edge_id = "one", .weight = 2 }}, &.{});
+    const edges = try graph.getEdges(alloc, "a", "R", .out);
+    defer GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("", edges[0].owner_document);
+    try std.testing.expectEqual(@as(f64, 2), edges[0].weight);
+    const probes = try graph.probeEdgesAllocBounded(alloc, &.{.{ .source = "a", .target = "b", .edge_type = "R", .edge_id = "one", .owner_document = "a" }}, 4096);
+    defer GraphIndex.freeProbedEdges(alloc, probes);
+    try std.testing.expect(probes[0] != null);
+    try std.testing.expectEqualStrings("", probes[0].?.owner_document);
+    try std.testing.expectEqual(@as(f64, 2), probes[0].?.weight);
+    try graph.batchApply(&.{}, &.{.{ .source = "a", .target = "b", .edge_type = "R", .edge_id = "one", .owner_document = "a" }});
+    const remaining = try graph.getEdges(alloc, "b", "R", .in);
+    defer GraphIndex.freeEdges(alloc, remaining);
+    try std.testing.expectEqual(@as(usize, 0), remaining.len);
 }

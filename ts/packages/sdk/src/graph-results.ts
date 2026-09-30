@@ -215,9 +215,9 @@ function pathEdge(
     invalid(`${path}.direction`, "must be out or in");
   }
   nonemptyString(edge.type, `${path}.type`, MAX_EDGE_TYPE_BYTES);
-  if (edge.edge_id !== undefined) nonemptyString(edge.edge_id, `${path}.edge_id`, MAX_EDGE_TYPE_BYTES);
+  if (edge.edge_id !== undefined) nonemptyString(edge.edge_id, `${path}.edge_id`);
   if (edge.owner_document !== undefined) {
-    nonemptyString(edge.owner_document, `${path}.owner_document`, MAX_EDGE_TYPE_BYTES);
+    nonemptyString(edge.owner_document, `${path}.owner_document`);
     if (edge.edge_id === undefined) invalid(path, "owner_document requires edge_id");
   }
   if (edge.metadata !== undefined) object(edge.metadata, `${path}.metadata`);

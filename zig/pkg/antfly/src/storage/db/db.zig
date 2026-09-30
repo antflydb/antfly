@@ -24869,26 +24869,31 @@ pub const DB = struct {
         min_weight: ?f64,
         max_weight: ?f64,
     ) !?paths_mod.Path {
+        return self.findShortestPathWithOptions(alloc, index_name, source, target, .{
+            .edge_types = edge_types,
+            .direction = direction,
+            .weight_mode = weight_mode,
+            .max_depth = max_depth,
+            .min_weight = min_weight,
+            .max_weight = max_weight,
+        });
+    }
+
+    /// Options are borrowed for this synchronous call. Predicates and admission
+    /// are evaluated before ranking; callers may share one work budget.
+    pub fn findShortestPathWithOptions(self: *DB, alloc: Allocator, index_name: []const u8, source: []const u8, target: []const u8, options: paths_mod.PathFindOptions) !?paths_mod.Path {
+        try options.edge_filter.validate(alloc);
         if (source.len == 0 or target.len == 0) return null;
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
-        if (try self.findAlgebraicShortestPath(alloc, index_name, source, target, edge_types, direction, weight_mode, max_depth, min_weight, max_weight)) |path| {
-            return path;
+        if (!options.edge_filter.active() and options.node_admission == null and options.work_budget == null) {
+            if (try self.findAlgebraicShortestPath(alloc, index_name, source, target, options.edge_types, options.direction, options.weight_mode, options.max_depth, options.min_weight, options.max_weight)) |path| return path;
         }
-        return try self.core.graphFindShortestPath(
-            alloc,
-            index_name,
-            source,
-            target,
-            edge_types,
-            direction,
-            weight_mode,
-            max_depth,
-            min_weight,
-            max_weight,
-            null,
-            null,
-        );
+        const entry = self.core.index_manager.graphIndex(index_name) orelse {
+            try self.failIfIndexQuarantined(index_name);
+            return error.IndexNotFound;
+        };
+        return paths_mod.findShortestPath(alloc, &entry.index, source, target, options);
     }
 
     pub fn findKShortestPaths(
@@ -24905,32 +24910,35 @@ pub const DB = struct {
         min_weight: ?f64,
         max_weight: ?f64,
     ) ![]paths_mod.Path {
-        if (source.len == 0 or target.len == 0 or k == 0) return try alloc.alloc(paths_mod.Path, 0);
+        return self.findKShortestPathsWithOptions(alloc, index_name, source, target, k, .{
+            .edge_types = edge_types,
+            .direction = direction,
+            .weight_mode = weight_mode,
+            .max_depth = max_depth,
+            .min_weight = min_weight,
+            .max_weight = max_weight,
+        });
+    }
+
+    pub fn findKShortestPathsWithOptions(self: *DB, alloc: Allocator, index_name: []const u8, source: []const u8, target: []const u8, k: u32, options: paths_mod.PathFindOptions) ![]paths_mod.Path {
+        try options.edge_filter.validate(alloc);
+        if (source.len == 0 or target.len == 0 or k == 0) return alloc.alloc(paths_mod.Path, 0);
         if (k == 1) {
-            if (try self.findShortestPath(alloc, index_name, source, target, edge_types, direction, weight_mode, max_depth, min_weight, max_weight)) |path| {
+            if (try self.findShortestPathWithOptions(alloc, index_name, source, target, options)) |path| {
+                errdefer paths_mod.freePath(alloc, path);
                 const paths = try alloc.alloc(paths_mod.Path, 1);
                 paths[0] = path;
                 return paths;
             }
-            return try alloc.alloc(paths_mod.Path, 0);
+            return alloc.alloc(paths_mod.Path, 0);
         }
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
-        return try self.core.graphFindKShortestPaths(
-            alloc,
-            index_name,
-            source,
-            target,
-            k,
-            edge_types,
-            direction,
-            weight_mode,
-            max_depth,
-            min_weight,
-            max_weight,
-            null,
-            null,
-        );
+        const entry = self.core.index_manager.graphIndex(index_name) orelse {
+            try self.failIfIndexQuarantined(index_name);
+            return error.IndexNotFound;
+        };
+        return paths_mod.findKShortestPaths(alloc, &entry.index, source, target, k, options);
     }
 
     fn findAlgebraicShortestPath(
@@ -59187,7 +59195,9 @@ fn collectGraphMutationsForArtifacts(
                 decoded.deinit(alloc);
                 try deletes.append(alloc, .{
                     .index_name = try alloc.dupe(u8, parsed.index_name),
-                    .source = try alloc.dupe(u8, parsed.doc_key),
+                    .source = try alloc.dupe(u8, if (parsed.logical_source.len > 0) parsed.logical_source else parsed.doc_key),
+                    .edge_id = try alloc.dupe(u8, parsed.edge_id),
+                    .owner_document = if (parsed.logical_source.len > 0) try alloc.dupe(u8, parsed.doc_key) else "",
                     .target = try alloc.dupe(u8, parsed.target_doc_key),
                     .edge_type = try alloc.dupe(u8, parsed.edge_type),
                 });
@@ -128492,6 +128502,7 @@ test "db graph fact projections survive logical snapshot restore and reopen" {
             .graph_writes = &.{
                 .{ .index_name = "facts", .source = "alice", .target = "acme", .edge_type = "RELATES_TO", .edge_id = "fact:1", .owner_document = "fact:1" },
                 .{ .index_name = "facts", .source = "alice", .target = "acme", .edge_type = "RELATES_TO", .edge_id = "fact:2", .owner_document = "fact:2" },
+                .{ .index_name = "facts", .source = "fact:2", .target = "acme", .edge_type = "RELATES_TO", .edge_id = "source-owned", .owner_document = "fact:2" },
             },
             .sync_level = .enrichments,
         });
@@ -128505,9 +128516,48 @@ test "db graph fact projections survive logical snapshot restore and reopen" {
         defer graph_mod.GraphIndex.freeEdges(alloc, edges);
         try std.testing.expectEqual(@as(usize, if (iteration == 0) 2 else 1), edges.len);
         for (edges) |edge| try std.testing.expectEqualStrings(edge.edge_id, edge.owner_document);
+        const source_owned = try db.getEdges(alloc, "facts", "fact:2", "RELATES_TO", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, source_owned);
+        try std.testing.expectEqual(@as(usize, if (iteration == 0) 1 else 0), source_owned.len);
         if (iteration == 0) {
-            try db.batch(.{ .deletes = &.{"fact:1"}, .sync_level = .enrichments });
+            try std.testing.expectEqualStrings("", source_owned[0].owner_document);
+            try db.batch(.{
+                .graph_deletes = &.{.{ .index_name = "facts", .source = "fact:2", .target = "acme", .edge_type = "RELATES_TO", .edge_id = "source-owned", .owner_document = "fact:2" }},
+                .deletes = &.{"fact:1"},
+                .sync_level = .full_index,
+            });
             try db.runUntilIdle();
         } else try std.testing.expectEqualStrings("fact:2", edges[0].edge_id);
     }
+}
+
+test "db graph stale generation cleanup retires the exact fact identity" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("fact-generation");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, std.mem.span(directory.path().ptr), .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "facts", .kind = .graph, .config_json = "{}" });
+    try db.batch(.{
+        .writes = &.{ .{ .key = "a", .value = "{}" }, .{ .key = "fact:one", .value = "{}" } },
+        .graph_writes = &.{
+            .{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R" },
+            .{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R", .edge_id = "one", .owner_document = "fact:one" },
+        },
+        .sync_level = .full_index,
+    });
+    const key = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, "fact:one", "facts", "R", "b", "a", "one");
+    defer alloc.free(key);
+    const generation = db.core.index_manager.graphIndex("facts").?.config.coverage_generation;
+    var stale = try collectGraphMutationsForArtifacts(alloc, db.core.store, &.{key}, "facts", .{ .expected_generation = generation + 1 });
+    defer stale.deinit();
+    try std.testing.expectEqual(@as(usize, 1), stale.deletes.len);
+    try std.testing.expectEqualStrings("a", stale.deletes[0].source);
+    try std.testing.expectEqualStrings("one", stale.deletes[0].edge_id);
+    try std.testing.expectEqualStrings("fact:one", stale.deletes[0].owner_document);
+    try db.core.index_manager.applyGraphMutationsByName("facts", stale.writes, stale.deletes);
+    const remaining = try db.getEdges(alloc, "facts", "a", "R", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, remaining);
+    try std.testing.expectEqual(@as(usize, 1), remaining.len);
+    try std.testing.expectEqualStrings("", remaining[0].edge_id);
 }

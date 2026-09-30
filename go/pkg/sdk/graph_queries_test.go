@@ -1547,3 +1547,24 @@ func TestGraphRelationshipFilterRequestPreservesFactPredicates(t *testing.T) {
 		t.Fatalf("lost relationship predicates: %s", encoded)
 	}
 }
+
+func TestGraphResultPreservesLargeRelationshipIdentities(t *testing.T) {
+	id := strings.Repeat("f", 65537)
+	owner := strings.Repeat("o", 65537)
+	body := fmt.Sprintf(`{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"},{"key":"b"}],"edges":[{"from":{"key":"a"},"to":{"key":"b"},"direction":"out","type":"R","weight":1,"edge_id":%q,"owner_document":%q}],"length":1,"objective":"min_hops","weight_sum":1,"objective_value":1}}],"stats":{"returned_items":1}}`, id, owner)
+	var result GraphResult
+	if err := json.Unmarshal([]byte(body), &result); err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeCanonicalGraphResult(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), id) || !strings.Contains(string(encoded), owner) {
+		t.Fatal("relationship identities were truncated")
+	}
+}

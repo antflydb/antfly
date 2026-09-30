@@ -9112,9 +9112,9 @@ fn parseGraphTraverseQuery(alloc: std.mem.Allocator, value: indexes_openapi.Grap
     const requested_edge_types = traversal.edge_types orelse &.{};
     graph_query_mod.validateEdgeTypes(requested_edge_types) catch return error.InvalidQueryRequest;
     const edge_types = try cloneFields(alloc, requested_edge_types);
+    errdefer freeOwnedStringSlice(alloc, edge_types);
     const edge_filter = if (traversal.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) err else error.InvalidQueryRequest else relationship_filter.Filter{};
     errdefer edge_filter.deinit(alloc);
-    errdefer freeOwnedStringSlice(alloc, edge_types);
     const filter = try parseGraphFilterValue(alloc, traversal.filter);
     errdefer freePatternNodeFilter(alloc, filter);
     const fields = if (traversal.fields) |items| try cloneFields(alloc, items) else &.{};
@@ -9187,9 +9187,9 @@ fn parseGraphPathQuery(
     const requested_edge_types = path.edge_types orelse &.{};
     graph_query_mod.validateEdgeTypes(requested_edge_types) catch return error.InvalidQueryRequest;
     const edge_types = try cloneFields(alloc, requested_edge_types);
+    errdefer freeOwnedStringSlice(alloc, edge_types);
     const edge_filter = if (path.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) err else error.InvalidQueryRequest else relationship_filter.Filter{};
     errdefer edge_filter.deinit(alloc);
-    errdefer freeOwnedStringSlice(alloc, edge_types);
     const filter = try parseGraphFilterValue(alloc, path.filter);
     errdefer freePatternNodeFilter(alloc, filter);
     const fields = if (path.fields) |items| try cloneFields(alloc, items) else &.{};
@@ -16416,7 +16416,10 @@ fn consumerTests() type {
                 \\{"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["Alice"]},"edge_filter":{"properties":[{"field":"/metadata/x","op":"eq","value":null}]}}}}}
             ));
             try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(alloc, null, "docs",
-                \\{"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["Alice"]},"edge_filter":{"valid_at":"yesterday"}}}}}
+                \\{"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["Alice"]},"edge_types":["R"],"edge_filter":{"valid_at":"yesterday"}}}}}
+            ));
+            try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(alloc, null, "docs",
+                \\{"graph_queries":{"path":{"index":"g","shortest_path":{"from":{"key":"Alice"},"to":{"key":"Acme"},"edge_types":["R"],"edge_filter":{"valid_at":"yesterday"}}}}}
             ));
         }
 

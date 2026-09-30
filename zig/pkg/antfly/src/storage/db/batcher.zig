@@ -754,12 +754,14 @@ const GraphReplayAccumulator = struct {
     }
 
     fn recordGraphDelete(self: *GraphReplayAccumulator, delete: types.GraphEdgeDelete) !void {
-        if (self.deleted_keys.contains(delete.source) or self.deleted_keys.contains(delete.target) or
-            self.doc_clears.contains(delete.source) or self.doc_clears.contains(delete.target) or
-            self.deleted_keys.contains(delete.owner_document) or self.doc_clears.contains(delete.owner_document))
-        {
-            return;
-        }
+        // A node clear retires incident source-owned edges, but leaves facts
+        // owned by other documents intact. It cannot subsume their deletions.
+        const separately_owned = delete.owner_document.len > 0 and !std.mem.eql(u8, delete.owner_document, delete.source);
+        if (if (separately_owned)
+            self.deleted_keys.contains(delete.owner_document) or self.doc_clears.contains(delete.owner_document)
+        else
+            self.deleted_keys.contains(delete.source) or self.deleted_keys.contains(delete.target) or
+                self.doc_clears.contains(delete.source) or self.doc_clears.contains(delete.target)) return;
 
         const owned_key = try internal_keys.graphRelationshipArtifactKeyAlloc(self.alloc, if (delete.owner_document.len > 0) delete.owner_document else delete.source, delete.index_name, delete.edge_type, delete.target, delete.source, delete.edge_id);
         errdefer self.alloc.free(owned_key);
@@ -795,7 +797,7 @@ const GraphReplayAccumulator = struct {
         var writes_it = self.graph_writes.iterator();
         while (writes_it.next()) |entry| {
             const write = entry.value_ptr.*;
-            if (if (write.owner_document.len > 0) std.mem.eql(u8, write.owner_document, key) else (std.mem.eql(u8, write.source, key) or std.mem.eql(u8, write.target, key))) {
+            if (if (write.owner_document.len > 0 and !std.mem.eql(u8, write.owner_document, write.source)) std.mem.eql(u8, write.owner_document, key) else (std.mem.eql(u8, write.source, key) or std.mem.eql(u8, write.target, key))) {
                 try remove_keys.append(self.alloc, try self.alloc.dupe(u8, entry.key_ptr.*));
             }
         }
@@ -813,7 +815,7 @@ const GraphReplayAccumulator = struct {
         var deletes_it = self.graph_deletes.iterator();
         while (deletes_it.next()) |entry| {
             const delete = entry.value_ptr.*;
-            if (if (delete.owner_document.len > 0) std.mem.eql(u8, delete.owner_document, key) else (std.mem.eql(u8, delete.source, key) or std.mem.eql(u8, delete.target, key))) {
+            if (if (delete.owner_document.len > 0 and !std.mem.eql(u8, delete.owner_document, delete.source)) std.mem.eql(u8, delete.owner_document, key) else (std.mem.eql(u8, delete.source, key) or std.mem.eql(u8, delete.target, key))) {
                 try remove_keys.append(self.alloc, try self.alloc.dupe(u8, entry.key_ptr.*));
             }
         }
@@ -1198,4 +1200,19 @@ fn deinitGraphDelete(alloc: Allocator, delete: *types.GraphEdgeDelete) void {
     if (delete.edge_id.len > 0) alloc.free(@constCast(delete.edge_id));
     if (delete.owner_document.len > 0) alloc.free(@constCast(delete.owner_document));
     delete.* = undefined;
+}
+
+test "graph replay node clears do not subsume independently owned fact deletions" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |clear_first| {
+        var accumulator = GraphReplayAccumulator{ .alloc = alloc, .index_name = "facts" };
+        defer accumulator.deinit();
+        const deletion = types.GraphEdgeDelete{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R", .edge_id = "one", .owner_document = "fact:one" };
+        if (clear_first) try accumulator.recordDocClear("a");
+        try accumulator.recordGraphDelete(deletion);
+        if (!clear_first) try accumulator.recordDocDelete("b");
+        try std.testing.expectEqual(@as(usize, 1), accumulator.graph_deletes.count());
+        try accumulator.recordDocDelete("fact:one");
+        try std.testing.expectEqual(@as(usize, 0), accumulator.graph_deletes.count());
+    }
 }

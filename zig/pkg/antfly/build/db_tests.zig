@@ -29,6 +29,20 @@ pub const AddTestsResult = struct {
 
 pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
+    const relationship_identity_filters = [_][]const u8{
+        "db graph stale generation cleanup retires the exact fact identity",
+        "db graph fact documents project arbitrary endpoints and retain parallel facts",
+        "db graph fact projections survive logical snapshot restore and reopen",
+        "graph replay node clears do not subsume independently owned fact deletions",
+        "graph redundant source ownership is canonical across writes probes and deletes",
+    };
+    const relationship_identity_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &relationship_identity_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_relationship_identity_tests = addCuratedTestRunArtifact(b, relationship_identity_tests, &relationship_identity_filters);
+    b.step("antfly-storage-graph-identity-test", "Run relationship ownership, lifecycle, snapshot and replay regressions").dependOn(&run_relationship_identity_tests.step);
     const db_enrichment_filters: []const []const u8 = &.{
         "db resolver worker resumes durable backfill after deferred activation and reopen",
         "db managed resolver changes fence in-flight replay and reset durable cursors",
@@ -355,6 +369,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.db.test.db graph ",
         "derived log record binary round trips",
         "derived log relationship identities select v6 and survive cloning",
+        "graph replay node clears do not subsume independently owned fact deletions",
         "graph relationship artifact identity is versioned and owner scoped",
         "storage.db.db.test.db search ",
         "storage.db.db.test.db default dynamic schema vector term filters project through doc identity ordinals",
