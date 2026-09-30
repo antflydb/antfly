@@ -381,25 +381,16 @@ pub const CatalogRouteQuery = struct {
 };
 
 pub const CatalogIdentityNamespace = @import("catalog_route_contract.zig").CatalogIdentityNamespace;
-
 pub const CatalogGroupRoute = @import("catalog_route_contract.zig").CatalogGroupRoute;
-
 pub const catalog_route_fence_protocol_current = @import("catalog_route_contract.zig").catalog_route_fence_protocol_current;
-pub const catalog_route_fence_header = "X-Antfly-Catalog-Route-Fence";
-pub const catalog_route_fence_ack_header = "X-Antfly-Catalog-Route-Fence-Ack";
-pub const catalog_route_fence_ack_value = "1";
-/// Separate from routing acknowledgement: emitted only after a successful
-/// fenced read-index lookup proves the logical key absent.
-pub const read_index_absence_header = "X-Antfly-Read-Index-Absence";
-pub const read_index_absence_value = "1";
-pub const catalog_route_deadline_ms_header = "X-Antfly-Catalog-Route-Deadline-Ms";
-pub const catalog_route_default_deadline_ms: u32 = 5_000;
-pub const catalog_route_max_deadline_ms: u32 = 30_000;
-
-/// Immutable authority and identity carried with every first-party
-/// group-local read. The receiver validates this against its compact routing
-/// projection before opening storage, so an independently cached admin
-/// snapshot can never select a different table generation.
+pub const catalog_route_fence_header = @import("catalog_route_contract.zig").catalog_route_fence_header;
+pub const catalog_route_fence_ack_header = @import("catalog_route_contract.zig").catalog_route_fence_ack_header;
+pub const catalog_route_fence_ack_value = @import("catalog_route_contract.zig").catalog_route_fence_ack_value;
+pub const read_index_absence_header = @import("catalog_route_contract.zig").read_index_absence_header;
+pub const read_index_absence_value = @import("catalog_route_contract.zig").read_index_absence_value;
+pub const catalog_route_deadline_ms_header = @import("catalog_route_contract.zig").catalog_route_deadline_ms_header;
+pub const catalog_route_default_deadline_ms = @import("catalog_route_contract.zig").catalog_route_default_deadline_ms;
+pub const catalog_route_max_deadline_ms = @import("catalog_route_contract.zig").catalog_route_max_deadline_ms;
 pub const CatalogRouteFence = @import("catalog_route_contract.zig").CatalogRouteFence;
 
 pub const CatalogRoutePlan = struct {

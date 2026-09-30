@@ -14,14 +14,14 @@
 // limitations under the License.
 
 //! Borrowed replication integration contracts shared by local storage and
-//! distributed control. Implementations belong to the HA runtime; this owner
+//! distributed control. Implementations belong to the hot standby runtime; this owner
 //! must never import a primary, standby, transport, or failover implementation.
 
 const std = @import("std");
 const outbox = @import("durable_outbox.zig");
 const Namespace = @import("doc_identity_namespace.zig").Namespace;
 pub const policy = @import("replication_policy.zig");
-const mutation_barrier_mod = @import("../hot_standby/mutation_barrier.zig");
+const mutation_barrier_mod = @import("antfly_runtime_abi").mutation_barrier;
 
 pub const SyncWaitFn = *const fn (
     ctx: *anyopaque,
@@ -32,7 +32,7 @@ pub const SyncWaitFn = *const fn (
 
 pub const AsyncEffectMirror = struct {
     publisher: Publisher,
-    /// Shared across every writer owned by one HA runtime. Mutations hold a
+    /// Shared across every writer owned by one hot standby runtime. Mutations hold a
     /// shared lease through WAL publication and the sync durability decision;
     /// seed capture takes the exclusive lease before choosing its checkpoint.
     mutation_barrier: ?*mutation_barrier_mod.MutationBarrier = null,
@@ -66,7 +66,7 @@ pub const Publisher = struct {
         next_lsn: *const fn (*anyopaque) u64,
         identity: *const fn (*anyopaque) Identity,
         publish: *const fn (AsyncEffectMirror, outbox.Kind, []const u8, Namespace) anyerror!u64,
-        recover: *const fn (AsyncEffectMirror, outbox.Kind, outbox.DurableHAOutbox, Namespace) anyerror!u64,
+        recover: *const fn (AsyncEffectMirror, outbox.Kind, outbox.DurableReplicationOutbox, Namespace) anyerror!u64,
         preflight: *const fn (AsyncEffectMirror, bool) anyerror!void,
         complete: *const fn (AsyncEffectMirror, u64) anyerror!void,
     };
@@ -81,7 +81,7 @@ pub const Publisher = struct {
         std.debug.assert(self.ptr == mirror.publisher.ptr and self.vtable == mirror.publisher.vtable);
         return self.vtable.publish(mirror, kind, payload, namespace);
     }
-    pub fn recover(self: Publisher, mirror: AsyncEffectMirror, kind: outbox.Kind, pending: outbox.DurableHAOutbox, namespace: Namespace) !u64 {
+    pub fn recover(self: Publisher, mirror: AsyncEffectMirror, kind: outbox.Kind, pending: outbox.DurableReplicationOutbox, namespace: Namespace) !u64 {
         std.debug.assert(self.ptr == mirror.publisher.ptr and self.vtable == mirror.publisher.vtable);
         return self.vtable.recover(mirror, kind, pending, namespace);
     }

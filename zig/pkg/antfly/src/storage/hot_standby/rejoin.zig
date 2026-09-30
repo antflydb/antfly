@@ -24,7 +24,7 @@
 const std = @import("std");
 const fencing = @import("fencing.zig");
 const replication_log = @import("replication_log.zig");
-const replication_record = @import("replication_record.zig");
+const replication_record = @import("../db/replication_record.zig");
 const standby_mod = @import("standby.zig");
 
 var test_path_counter: u64 = 0;

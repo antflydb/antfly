@@ -13,6 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const replication_ingress = @import("replication_ingress.zig");
 const std = @import("std");
 const db_mod = @import("mod.zig");
 const pages = @import("merge_page_contract.zig");
@@ -116,9 +117,9 @@ fn readCopyReceipt(db: *db_mod.DB) !std.json.Parsed(@import("merge_contract.zig"
 
 fn applyChunk(db: *db_mod.DB, index: *u64, lsn: *u64, standby: bool, request: types.BatchRequest) !void {
     if (!standby) return apply(db, index, request);
-    const encoded = try @import("../hot_standby/effects.zig").encodeBatchMutationRequestAlloc(alloc, request);
+    const encoded = try @import("replication_effects.zig").encodeBatchMutationRequestAlloc(alloc, request);
     defer alloc.free(encoded);
-    try db.applyHAReplicationRecord(.{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = lsn.* + 1, .previous_lsn = lsn.*, .payload = encoded });
+    try replication_ingress.applyRecord(db, .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = lsn.* + 1, .previous_lsn = lsn.*, .payload = encoded });
     lsn.* += 1;
 }
 
@@ -422,11 +423,11 @@ test "relational index system retained merge tail fragments preserve deletes tim
         }
         // The native standby envelope is independently fail-closed and must
         // preserve the same tail fragment and its original row timestamp.
-        const standby_payload = try @import("../hot_standby/effects.zig").encodeBatchMutationRequestAlloc(alloc, second);
+        const standby_payload = try @import("replication_effects.zig").encodeBatchMutationRequestAlloc(alloc, second);
         defer alloc.free(standby_payload);
-        const standby_record: @import("../hot_standby/replication_record.zig").RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = standby_payload };
-        try db.applyHAReplicationRecord(standby_record);
-        try db.applyHAReplicationRecord(standby_record);
+        const standby_record: @import("replication_record.zig").RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = standby_payload };
+        try replication_ingress.applyRecord(&db, standby_record);
+        try replication_ingress.applyRecord(&db, standby_record);
         try std.testing.expectEqual(@as(u64, 555), try db.getTimestamp(alloc, "c"));
         var progress = (try db.mergeCopyPageStatus(alloc)).?;
         defer progress.deinit();
@@ -715,13 +716,13 @@ test "relational index system merge pages commit effects and cursors with reopen
         try std.testing.expectError(error.MergePageSequenceGap, db.batch(skipped));
         command = .{ .source = source, .sequence = 3, .phase = .rows, .after = "b", .next = "c", .exhausted = true, .digest = @splat(0), .timestamps = &.{456} };
         const standby_request = seal(.{ .merge_replication = context, .merge_page = command, .writes = &.{.{ .key = "c", .value = "{\"id\":8,\"doubled\":16}" }} });
-        const standby_payload = try @import("../hot_standby/effects.zig").encodeBatchMutationRequestAlloc(alloc, standby_request);
+        const standby_payload = try @import("replication_effects.zig").encodeBatchMutationRequestAlloc(alloc, standby_request);
         defer alloc.free(standby_payload);
-        const standby_record: @import("../hot_standby/replication_record.zig").RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = standby_payload };
-        try db.applyHAReplicationRecord(standby_record);
+        const standby_record: @import("replication_record.zig").RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = standby_payload };
+        try replication_ingress.applyRecord(&db, standby_record);
         db.close();
         db = try db_mod.DB.open(alloc, directory.path(), options);
-        try db.applyHAReplicationRecord(standby_record);
+        try replication_ingress.applyRecord(&db, standby_record);
         if (relational) {
             const key = try @import("../internal_keys.zig").relationalRowKeyAlloc(alloc, "c");
             defer alloc.free(key);

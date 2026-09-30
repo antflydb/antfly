@@ -17,7 +17,7 @@
 //! Keep this read lease until DB.open has acquired its own generation lease.
 const std = @import("std");
 const lifecycle = @import("db/generation_lifecycle.zig");
-const backup_restore = @import("../raft/storage/backup_restore.zig");
+const backup_restore = @import("backup_restore.zig");
 const Identity = @import("restore_identity.zig").Identity;
 
 pub fn acquire(

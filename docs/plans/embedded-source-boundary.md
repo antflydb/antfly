@@ -103,17 +103,18 @@ consumers can.
 
 ## DB and hot-standby separation
 
-The first extraction is implemented on this branch; the complete dependency
-boundary remains in progress. Moving `db.zig` as a whole would still move both
-the engine and its replication integrations. Its `ha_contract.zig` still
-imports concrete `Primary` and `Standby` types, and DB still owns recovery
-scheduling, replication-record dispatch, and HA seed entry points. These must
-be separated alongside Raft.
+The borrowed replication interfaces, replay ingress, local snapshot hooks, and
+server runtime test fixtures are separated in #940. Runtime adapters use
+`hot_standby_*` names; local engine contracts use generic replication names.
+Existing durable keys, wire formats, error identities, and C ABI symbols remain
+compatible. The authored production source audit follows 590 local sources
+without entering server coordination. The complete physical source move and
+private C API server-owner separation remain in progress.
 
 Current implementation owners (still under `pkg/antfly` until their storage
 dependency layers move):
 
-- `storage/db/apply_receipts.zig` owns Raft and HA receipt persistence helpers
+- `storage/db/apply_receipts.zig` owns Raft and replication receipt persistence helpers
   and replay disposition. Mutations still commit their receipt writes under
   their existing apply fence.
 - `storage/db/durable_outbox.zig` owns persisted keys, explicit kind tags,
@@ -122,12 +123,12 @@ dependency layers move):
 - `storage/db/durable_outbox_store.zig` owns bounded pending-page reads,
   rolling-upgrade singleton reads, and exact-key clearing. Publication cannot
   reach arbitrary internal KV keys through this interface.
-- `storage/db/ha_contract.zig` owns borrowed publisher and write-admission
+- `storage/db/replication_contract.zig` owns borrowed publisher and write-admission
   interfaces. DB options hold no concrete primary, standby, or fence-store
   handles. Publishers report live identity rather than copying epoch state.
-- `storage/db/replication_policy.zig` owns policy data and enums; the HA primary
+- `storage/db/replication_policy.zig` owns policy data and enums; the hot standby primary
   reexports the same declarations so callbacks retain one type identity.
-- `storage/db/replication_effects.zig` owns portable mutation codecs. The HA
+- `storage/db/replication_effects.zig` owns portable mutation codecs. The hot standby
   effects adapter reexports those declarations and owns runtime log appends.
 - `storage/db/commit_integration.zig` owns local publication lock ordering,
   pending-record recovery sequencing, and final authority rechecks. Durability

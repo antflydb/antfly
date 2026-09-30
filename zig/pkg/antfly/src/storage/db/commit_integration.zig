@@ -18,24 +18,24 @@
 //! and uses this owner to recheck authority before acknowledging the client.
 const std = @import("std");
 const builtin = @import("builtin");
-const ha_contract = @import("ha_contract.zig");
-const HAAsyncEffectMirror = ha_contract.AsyncEffectMirror;
-const HAWriteGate = ha_contract.WriteGate;
-const ha_effects_mod = @import("replication_effects.zig");
+const replication_contract = @import("replication_contract.zig");
+const ReplicationAsyncEffectMirror = replication_contract.AsyncEffectMirror;
+const ReplicationWriteGate = replication_contract.WriteGate;
+const replication_effects_mod = @import("replication_effects.zig");
 const durable_outbox = @import("durable_outbox.zig");
 const Namespace = @import("doc_identity_namespace.zig").Namespace;
 const types = @import("types.zig");
 const schema_mod = @import("../schema.zig");
 
-pub const HADeferredCommitGate = struct {
-    mirror: HAAsyncEffectMirror,
+pub const ReplicationDeferredCommitGate = struct {
+    mirror: ReplicationAsyncEffectMirror,
     lsn: u64,
 };
 
-pub const HADeferredCommitGates = struct {
+pub const ReplicationDeferredCommitGates = struct {
     transition_mutex: ?*std.atomic.Mutex = null,
     transition_locked: bool = false,
-    gates: [2]HADeferredCommitGate = undefined,
+    gates: [2]ReplicationDeferredCommitGate = undefined,
     gate_count: usize = 0,
 
     pub fn begin(transition_mutex: ?*std.atomic.Mutex) @This() {
@@ -46,7 +46,7 @@ pub const HADeferredCommitGates = struct {
         };
     }
 
-    pub fn append(self: *@This(), gate: ?HADeferredCommitGate) void {
+    pub fn append(self: *@This(), gate: ?ReplicationDeferredCommitGate) void {
         const item = gate orelse return;
         std.debug.assert(self.gate_count < self.gates.len);
         self.gates[self.gate_count] = item;
@@ -59,14 +59,14 @@ pub const HADeferredCommitGates = struct {
         self.transition_locked = false;
     }
 
-    pub fn waitForDurabilityAndAuthority(self: *@This(), write_gate: ?HAWriteGate) !void {
+    pub fn waitForDurabilityAndAuthority(self: *@This(), write_gate: ?ReplicationWriteGate) !void {
         // The HA records are already durable and ordered with the local commit.
         // Remote acknowledgement must not retain the DB apply lock or the
         // transition mutex: status updates and safe reads need both paths to
         // remain live while a synchronous policy is pending.
         self.releaseTransition();
         for (self.gates[0..self.gate_count]) |gate| {
-            try evaluateHAMirrorCommitGate(gate.mirror, gate.lsn);
+            try evaluateReplicationMirrorCommitGate(gate.mirror, gate.lsn);
         }
 
         // Serialize the final success decision with fencing after every remote
@@ -77,35 +77,35 @@ pub const HADeferredCommitGates = struct {
             self.transition_locked = true;
         }
         defer self.releaseTransition();
-        try enforceHAWriteGateOptional(write_gate);
+        try enforceReplicationWriteGateOptional(write_gate);
     }
 };
 
-pub fn evaluateHAMirrorCommitGate(mirror: HAAsyncEffectMirror, lsn: u64) !void {
+pub fn evaluateReplicationMirrorCommitGate(mirror: ReplicationAsyncEffectMirror, lsn: u64) !void {
     try mirror.publisher.complete(mirror, lsn);
 }
 
-pub fn haMirrorSyncEnabled(mirror: HAAsyncEffectMirror) bool {
+pub fn replicationMirrorSyncEnabled(mirror: ReplicationAsyncEffectMirror) bool {
     return mirror.sync_policy.mode != .async;
 }
 
-pub fn haMirrorRequiresDurableOutbox(mirror: HAAsyncEffectMirror) bool {
-    return haMirrorSyncEnabled(mirror) and mirror.sync_policy.failure_policy != .degrade_to_async;
+pub fn replicationMirrorRequiresDurableOutbox(mirror: ReplicationAsyncEffectMirror) bool {
+    return replicationMirrorSyncEnabled(mirror) and mirror.sync_policy.failure_policy != .degrade_to_async;
 }
 
-pub fn noteHAMirrorFailure(mirror: HAAsyncEffectMirror, comptime label: []const u8, err: anyerror) void {
+pub fn noteReplicationMirrorFailure(mirror: ReplicationAsyncEffectMirror, comptime label: []const u8, err: anyerror) void {
     if (mirror.failure_count) |counter| _ = counter.fetchAdd(1, .monotonic);
     std.log.warn("failed to mirror DB " ++ label ++ " into HA stream: {s}", .{@errorName(err)});
 }
 
-pub fn enforceHAWriteGateOptional(gate: ?HAWriteGate) !void {
+pub fn enforceReplicationWriteGateOptional(gate: ?ReplicationWriteGate) !void {
     const configured = gate orelse return;
     try configured.check();
 }
 
 /// Check fail-closed availability before committing locally. The borrowed log
 /// lock serializes this decision with append and the next-LSN observation.
-pub fn preflight(mirror: ?HAAsyncEffectMirror, log_mutex: *std.atomic.Mutex) !void {
+pub fn preflight(mirror: ?ReplicationAsyncEffectMirror, log_mutex: *std.atomic.Mutex) !void {
     const configured = mirror orelse return;
     if (configured.sync_policy.mode == .async or configured.sync_policy.failure_policy != .fail_closed) return;
     lockAtomic(log_mutex);
@@ -129,18 +129,18 @@ pub const RecoveryContext = struct {
     transition_mutex: ?*std.atomic.Mutex,
     log_mutex: *std.atomic.Mutex,
     namespace: Namespace,
-    write_gate: ?HAWriteGate,
+    write_gate: ?ReplicationWriteGate,
 };
 
 /// Match an already published record before appending, fail closed when its
 /// retention fence is gone, and complete acknowledgement without a DB lock.
 pub fn recoverDurableOutbox(
     context: RecoveryContext,
-    mirror: HAAsyncEffectMirror,
-    outbox: durable_outbox.DurableHAOutbox,
+    mirror: ReplicationAsyncEffectMirror,
+    outbox: durable_outbox.DurableReplicationOutbox,
     kind: durable_outbox.Kind,
 ) !void {
-    var deferred = HADeferredCommitGates.begin(context.transition_mutex);
+    var deferred = ReplicationDeferredCommitGates.begin(context.transition_mutex);
     defer deferred.releaseTransition();
 
     const lsn = blk: {
@@ -149,9 +149,9 @@ pub fn recoverDurableOutbox(
 
         break :blk mirror.publisher.recover(mirror, kind, outbox, context.namespace) catch |err| {
             switch (kind) {
-                .batch, .restore_batch => noteHAMirrorFailure(mirror, "batch mutation recovery", err),
-                .replay, .primary_effect => noteHAMirrorFailure(mirror, "derived effect recovery", err),
-                .schema, .row_policy => noteHAMirrorFailure(mirror, "metadata mutation recovery", err),
+                .batch, .restore_batch => noteReplicationMirrorFailure(mirror, "batch mutation recovery", err),
+                .replay, .primary_effect => noteReplicationMirrorFailure(mirror, "derived effect recovery", err),
+                .schema, .row_policy => noteReplicationMirrorFailure(mirror, "metadata mutation recovery", err),
             }
             return err;
         };
@@ -168,20 +168,20 @@ pub const CommitContext = struct {
     identity_namespace: Namespace,
     transition_mutex: ?*std.atomic.Mutex,
     log_mutex: *std.atomic.Mutex,
-    ha_write_gate: ?HAWriteGate,
-    ha_async_effect_mirror: ?HAAsyncEffectMirror,
-    ha_async_batch_mirror: ?HAAsyncEffectMirror,
-    ha_async_metadata_mirror: ?HAAsyncEffectMirror,
+    replication_write_gate: ?ReplicationWriteGate,
+    replication_async_effect_mirror: ?ReplicationAsyncEffectMirror,
+    replication_async_batch_mirror: ?ReplicationAsyncEffectMirror,
+    replication_async_metadata_mirror: ?ReplicationAsyncEffectMirror,
     append_pending: ?*const std.atomic.Value(bool),
 };
 
 fn checkWrite(ctx: *const CommitContext) !void {
-    try enforceHAWriteGateOptional(ctx.ha_write_gate);
+    try enforceReplicationWriteGateOptional(ctx.replication_write_gate);
     if (ctx.append_pending) |pending| if (pending.load(.acquire)) return error.HAMirrorUnavailable;
 }
 
-pub fn mirrorHAReplayPayloadBestEffortContext(ctx: *const CommitContext, payload: []const u8) void {
-    const mirror = ctx.ha_async_effect_mirror orelse return;
+pub fn mirrorReplicationReplayPayloadBestEffortContext(ctx: *const CommitContext, payload: []const u8) void {
+    const mirror = ctx.replication_async_effect_mirror orelse return;
     const transition_mutex = mirror.transition_mutex;
     if (transition_mutex) |mutex| lockAtomic(mutex);
     defer if (transition_mutex) |mutex| mutex.unlock();
@@ -196,15 +196,15 @@ pub fn mirrorHAReplayPayloadBestEffortContext(ctx: *const CommitContext, payload
     if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
 }
 
-pub fn mirrorHAReplayPayloadCommitContext(ctx: *const CommitContext, payload: []const u8) !void {
-    var deferred = HADeferredCommitGates.begin(ctx.transition_mutex);
+pub fn mirrorReplicationReplayPayloadCommitContext(ctx: *const CommitContext, payload: []const u8) !void {
+    var deferred = ReplicationDeferredCommitGates.begin(ctx.transition_mutex);
     defer deferred.releaseTransition();
-    deferred.append(try appendHAReplayPayloadCommitLockedContext(ctx, payload));
-    try deferred.waitForDurabilityAndAuthority(ctx.ha_write_gate);
+    deferred.append(try appendReplicationReplayPayloadCommitLockedContext(ctx, payload));
+    try deferred.waitForDurabilityAndAuthority(ctx.replication_write_gate);
 }
 
-pub fn appendHAReplayPayloadCommitLockedContext(ctx: *const CommitContext, payload: []const u8) !?HADeferredCommitGate {
-    const mirror = ctx.ha_async_effect_mirror orelse return null;
+pub fn appendReplicationReplayPayloadCommitLockedContext(ctx: *const CommitContext, payload: []const u8) !?ReplicationDeferredCommitGate {
+    const mirror = ctx.replication_async_effect_mirror orelse return null;
     // The local store has already committed. Always represent that mutation in
     // the HA tail; a fence that arrived after the preflight gate may reject the
     // client acknowledgement below, but must not create an unlogged local fork.
@@ -212,8 +212,8 @@ pub fn appendHAReplayPayloadCommitLockedContext(ctx: *const CommitContext, paylo
         lockAtomic(ctx.log_mutex);
         defer ctx.log_mutex.*.unlock();
         const lsn = mirror.publisher.publish(mirror, .replay, payload, ctx.identity_namespace) catch |err| {
-            noteHAMirrorFailure(mirror, "derived effect", err);
-            if (haMirrorSyncEnabled(mirror)) return err;
+            noteReplicationMirrorFailure(mirror, "derived effect", err);
+            if (replicationMirrorSyncEnabled(mirror)) return err;
             return null;
         };
         if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
@@ -222,8 +222,8 @@ pub fn appendHAReplayPayloadCommitLockedContext(ctx: *const CommitContext, paylo
     return .{ .mirror = mirror, .lsn = lsn };
 }
 
-pub fn mirrorHABatchMutationBestEffortContext(ctx: *const CommitContext, request: types.BatchRequest) void {
-    const mirror = ctx.ha_async_batch_mirror orelse return;
+pub fn mirrorReplicationBatchMutationBestEffortContext(ctx: *const CommitContext, request: types.BatchRequest) void {
+    const mirror = ctx.replication_async_batch_mirror orelse return;
     const transition_mutex = mirror.transition_mutex;
     if (transition_mutex) |mutex| lockAtomic(mutex);
     defer if (transition_mutex) |mutex| mutex.unlock();
@@ -238,15 +238,15 @@ pub fn mirrorHABatchMutationBestEffortContext(ctx: *const CommitContext, request
     if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
 }
 
-pub fn mirrorHABatchMutationCommitContext(ctx: *const CommitContext, request: types.BatchRequest) !void {
-    var deferred = HADeferredCommitGates.begin(ctx.transition_mutex);
+pub fn mirrorReplicationBatchMutationCommitContext(ctx: *const CommitContext, request: types.BatchRequest) !void {
+    var deferred = ReplicationDeferredCommitGates.begin(ctx.transition_mutex);
     defer deferred.releaseTransition();
-    deferred.append(try appendHABatchMutationCommitLockedContext(ctx, request));
-    try deferred.waitForDurabilityAndAuthority(ctx.ha_write_gate);
+    deferred.append(try appendReplicationBatchMutationCommitLockedContext(ctx, request));
+    try deferred.waitForDurabilityAndAuthority(ctx.replication_write_gate);
 }
 
-pub fn appendHABatchMutationCommitLockedContext(ctx: *const CommitContext, request: types.BatchRequest) !?HADeferredCommitGate {
-    const mirror = ctx.ha_async_batch_mirror orelse return null;
+pub fn appendReplicationBatchMutationCommitLockedContext(ctx: *const CommitContext, request: types.BatchRequest) !?ReplicationDeferredCommitGate {
+    const mirror = ctx.replication_async_batch_mirror orelse return null;
     // The local store has already committed. Always append before applying the
     // final authority check so rejoin cannot mistake local divergence for an
     // exact fork boundary.
@@ -254,8 +254,8 @@ pub fn appendHABatchMutationCommitLockedContext(ctx: *const CommitContext, reque
         lockAtomic(ctx.log_mutex);
         defer ctx.log_mutex.*.unlock();
         const lsn = publishBatch(ctx, mirror, request) catch |err| {
-            noteHAMirrorFailure(mirror, "batch mutation", err);
-            if (haMirrorSyncEnabled(mirror)) return err;
+            noteReplicationMirrorFailure(mirror, "batch mutation", err);
+            if (replicationMirrorSyncEnabled(mirror)) return err;
             return null;
         };
         if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
@@ -264,25 +264,25 @@ pub fn appendHABatchMutationCommitLockedContext(ctx: *const CommitContext, reque
     return .{ .mirror = mirror, .lsn = lsn };
 }
 
-pub fn mirrorHAEncodedBatchMutationCommitContext(ctx: *const CommitContext, payload: []const u8) !void {
-    var deferred = HADeferredCommitGates.begin(ctx.transition_mutex);
+pub fn mirrorReplicationEncodedBatchMutationCommitContext(ctx: *const CommitContext, payload: []const u8) !void {
+    var deferred = ReplicationDeferredCommitGates.begin(ctx.transition_mutex);
     defer deferred.releaseTransition();
-    deferred.append(try appendHAEncodedBatchMutationCommitLockedContext(ctx, payload));
-    try deferred.waitForDurabilityAndAuthority(ctx.ha_write_gate);
+    deferred.append(try appendReplicationEncodedBatchMutationCommitLockedContext(ctx, payload));
+    try deferred.waitForDurabilityAndAuthority(ctx.replication_write_gate);
 }
 
-pub fn appendHAEncodedBatchMutationCommitLockedContext(ctx: *const CommitContext, payload: []const u8) !?HADeferredCommitGate {
-    return appendHAEncodedBatchMutationCommitLockedContextStrict(ctx, payload, false);
+pub fn appendReplicationEncodedBatchMutationCommitLockedContext(ctx: *const CommitContext, payload: []const u8) !?ReplicationDeferredCommitGate {
+    return appendReplicationEncodedBatchMutationCommitLockedContextStrict(ctx, payload, false);
 }
 
-pub fn appendHAEncodedBatchMutationCommitLockedContextStrict(ctx: *const CommitContext, payload: []const u8, strict_append: bool) !?HADeferredCommitGate {
-    const mirror = ctx.ha_async_batch_mirror orelse return null;
+pub fn appendReplicationEncodedBatchMutationCommitLockedContextStrict(ctx: *const CommitContext, payload: []const u8, strict_append: bool) !?ReplicationDeferredCommitGate {
+    const mirror = ctx.replication_async_batch_mirror orelse return null;
     const lsn = blk: {
         lockAtomic(ctx.log_mutex);
         defer ctx.log_mutex.*.unlock();
         const lsn = mirror.publisher.publish(mirror, .batch, payload, ctx.identity_namespace) catch |err| {
-            noteHAMirrorFailure(mirror, "batch mutation", err);
-            if (strict_append or haMirrorSyncEnabled(mirror)) return err;
+            noteReplicationMirrorFailure(mirror, "batch mutation", err);
+            if (strict_append or replicationMirrorSyncEnabled(mirror)) return err;
             return null;
         };
         if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
@@ -291,12 +291,12 @@ pub fn appendHAEncodedBatchMutationCommitLockedContextStrict(ctx: *const CommitC
     return .{ .mirror = mirror, .lsn = lsn };
 }
 
-pub fn mirrorHASchemaMetadataBestEffortContext(
+pub fn mirrorReplicationSchemaMetadataBestEffortContext(
     ctx: *const CommitContext,
     table_schema: schema_mod.TableSchema,
     public_schema_json: ?[]const u8,
 ) void {
-    const mirror = ctx.ha_async_metadata_mirror orelse return;
+    const mirror = ctx.replication_async_metadata_mirror orelse return;
     const transition_mutex = mirror.transition_mutex;
     if (transition_mutex) |mutex| lockAtomic(mutex);
     defer if (transition_mutex) |mutex| mutex.unlock();
@@ -311,20 +311,20 @@ pub fn mirrorHASchemaMetadataBestEffortContext(
     if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
 }
 
-pub fn appendHASchemaMetadataCommitLockedContext(
+pub fn appendReplicationSchemaMetadataCommitLockedContext(
     ctx: *const CommitContext,
     table_schema: schema_mod.TableSchema,
     public_schema_json: ?[]const u8,
-) !?HADeferredCommitGate {
-    const mirror = ctx.ha_async_metadata_mirror orelse return null;
+) !?ReplicationDeferredCommitGate {
+    const mirror = ctx.replication_async_metadata_mirror orelse return null;
     // As with document batches, committed metadata must remain represented in
     // the HA tail even when authority expires before acknowledgement.
     const lsn = blk: {
         lockAtomic(ctx.log_mutex);
         defer ctx.log_mutex.*.unlock();
         const lsn = publishSchema(ctx, mirror, table_schema, public_schema_json) catch |err| {
-            noteHAMirrorFailure(mirror, "metadata mutation", err);
-            if (haMirrorSyncEnabled(mirror)) return err;
+            noteReplicationMirrorFailure(mirror, "metadata mutation", err);
+            if (replicationMirrorSyncEnabled(mirror)) return err;
             return null;
         };
         if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
@@ -333,17 +333,17 @@ pub fn appendHASchemaMetadataCommitLockedContext(
     return .{ .mirror = mirror, .lsn = lsn };
 }
 
-pub fn appendHAEncodedSchemaMetadataCommitLockedContext(
+pub fn appendReplicationEncodedSchemaMetadataCommitLockedContext(
     ctx: *const CommitContext,
     payload: []const u8,
-) !?HADeferredCommitGate {
-    const mirror = ctx.ha_async_metadata_mirror orelse return null;
+) !?ReplicationDeferredCommitGate {
+    const mirror = ctx.replication_async_metadata_mirror orelse return null;
     const lsn = blk: {
         lockAtomic(ctx.log_mutex);
         defer ctx.log_mutex.*.unlock();
         const lsn = mirror.publisher.publish(mirror, .schema, payload, ctx.identity_namespace) catch |err| {
-            noteHAMirrorFailure(mirror, "metadata mutation", err);
-            if (haMirrorSyncEnabled(mirror)) return err;
+            noteReplicationMirrorFailure(mirror, "metadata mutation", err);
+            if (replicationMirrorSyncEnabled(mirror)) return err;
             return null;
         };
         if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
@@ -352,14 +352,14 @@ pub fn appendHAEncodedSchemaMetadataCommitLockedContext(
     return .{ .mirror = mirror, .lsn = lsn };
 }
 
-fn publishBatch(ctx: *const CommitContext, mirror: HAAsyncEffectMirror, request: types.BatchRequest) !u64 {
-    const payload = try ha_effects_mod.encodeBatchMutationRequestAlloc(ctx.alloc, request);
+fn publishBatch(ctx: *const CommitContext, mirror: ReplicationAsyncEffectMirror, request: types.BatchRequest) !u64 {
+    const payload = try replication_effects_mod.encodeBatchMutationRequestAlloc(ctx.alloc, request);
     defer ctx.alloc.free(payload);
     return try mirror.publisher.publish(mirror, .batch, payload, ctx.identity_namespace);
 }
 
-fn publishSchema(ctx: *const CommitContext, mirror: HAAsyncEffectMirror, schema: schema_mod.TableSchema, public_schema_json: ?[]const u8) !u64 {
-    const payload = try ha_effects_mod.encodeSchemaMetadataMutationAlloc(ctx.alloc, schema, public_schema_json);
+fn publishSchema(ctx: *const CommitContext, mirror: ReplicationAsyncEffectMirror, schema: schema_mod.TableSchema, public_schema_json: ?[]const u8) !u64 {
+    const payload = try replication_effects_mod.encodeSchemaMetadataMutationAlloc(ctx.alloc, schema, public_schema_json);
     defer ctx.alloc.free(payload);
     return try mirror.publisher.publish(mirror, .schema, payload, ctx.identity_namespace);
 }
@@ -378,19 +378,19 @@ const TestPublisher = struct {
     fn cast(ptr: *anyopaque) *@This() {
         return @ptrCast(@alignCast(ptr));
     }
-    fn mirror(self: *@This()) HAAsyncEffectMirror {
+    fn mirror(self: *@This()) ReplicationAsyncEffectMirror {
         return .{ .publisher = .{ .ptr = self, .vtable = &vtable }, .transition_mutex = &self.transition, .sync_policy = .{ .mode = .remote_apply, .failure_policy = .fail_closed } };
     }
     fn next(_: *anyopaque) u64 {
         return 7;
     }
-    fn identity(_: *anyopaque) ha_contract.Publisher.Identity {
+    fn identity(_: *anyopaque) replication_contract.Publisher.Identity {
         return .{ .table_id = 1, .shard_id = 2, .timeline_id = 3, .epoch = 4 };
     }
-    fn publish(_: HAAsyncEffectMirror, _: durable_outbox.Kind, _: []const u8, _: Namespace) !u64 {
+    fn publish(_: ReplicationAsyncEffectMirror, _: durable_outbox.Kind, _: []const u8, _: Namespace) !u64 {
         return 7;
     }
-    fn recover(m: HAAsyncEffectMirror, kind: durable_outbox.Kind, pending: durable_outbox.DurableHAOutbox, ns: Namespace) !u64 {
+    fn recover(m: ReplicationAsyncEffectMirror, kind: durable_outbox.Kind, pending: durable_outbox.DurableReplicationOutbox, ns: Namespace) !u64 {
         const self = cast(m.publisher.ptr);
         try std.testing.expect(!self.log.tryLock());
         try std.testing.expect(!self.transition.tryLock());
@@ -401,13 +401,13 @@ const TestPublisher = struct {
         self.recovered = true;
         return 7;
     }
-    fn preflight(m: HAAsyncEffectMirror, _: bool) !void {
+    fn preflight(m: ReplicationAsyncEffectMirror, _: bool) !void {
         const self = cast(m.publisher.ptr);
         self.preflight_locked = !self.log.tryLock();
         if (!self.preflight_locked) self.log.unlock();
         return error.SyncPolicyUnsatisfied;
     }
-    fn complete(m: HAAsyncEffectMirror, lsn: u64) !void {
+    fn complete(m: ReplicationAsyncEffectMirror, lsn: u64) !void {
         const self = cast(m.publisher.ptr);
         try std.testing.expectEqual(@as(u64, 7), lsn);
         try std.testing.expect(self.transition.tryLock());
@@ -423,10 +423,10 @@ const TestPublisher = struct {
         try std.testing.expect(!@constCast(&self.transition).tryLock());
         if (self.fenced) return error.PrimaryFenced;
     }
-    fn gate(self: *@This()) HAWriteGate {
+    fn gate(self: *@This()) ReplicationWriteGate {
         return .{ .primary = .{ .ptr = self, .check_fn = check } };
     }
-    const vtable: ha_contract.Publisher.VTable = .{ .next_lsn = next, .identity = identity, .publish = publish, .recover = recover, .preflight = @This().preflight, .complete = complete };
+    const vtable: replication_contract.Publisher.VTable = .{ .next_lsn = next, .identity = identity, .publish = publish, .recover = recover, .preflight = @This().preflight, .complete = complete };
 };
 
 test "storage.hot_standby engine preflight holds the local log fence and propagates rejection" {
@@ -448,7 +448,7 @@ test "storage.hot_standby engine recovery releases locks for durability and rech
 
 test "storage.hot_standby engine pending durability releases the transition fence without acknowledging" {
     var publisher: TestPublisher = .{ .fail_completion = true };
-    var gates = HADeferredCommitGates.begin(&publisher.transition);
+    var gates = ReplicationDeferredCommitGates.begin(&publisher.transition);
     defer gates.releaseTransition();
     gates.append(.{ .mirror = publisher.mirror(), .lsn = 7 });
     try std.testing.expectError(error.HASyncCommitWouldBlock, gates.waitForDurabilityAndAuthority(publisher.gate()));

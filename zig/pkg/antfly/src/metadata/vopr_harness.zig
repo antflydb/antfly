@@ -6894,7 +6894,7 @@ pub const MetadataAdminVoprSource = struct {
         };
     }
 
-    fn systemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/domain.zig").Call) ![]u8 {
+    fn systemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
         try context.ensureActive();
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (input == .mutate) return error.UnsupportedOperation;

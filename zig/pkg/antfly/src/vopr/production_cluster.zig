@@ -5990,7 +5990,7 @@ pub const Fixture = struct {
         self.beginStandbyScalingOperation("catch up fenced standby boundary");
         try owners.catchUp(self.executor.executor(), owners.primary_uri.?);
         if (owners.observed_progress.applied_lsn <= previous_applied) return error.ProductionStandbyStreamingProgressMissing;
-        try std.testing.expectError(error.HAFencedPrimary, owners.primary_server.?.write_source.ha_write_gate.?.check());
+        try std.testing.expectError(error.HAFencedPrimary, owners.primary_server.?.write_source.replication_write_gate.?.check());
         const old_metadata_leader = self.metadata.?.cluster.currentMetadataLeaderIndex() orelse return error.MetadataLeaderUnavailable;
         // Retire the old process's callback admission before reconstruction;
         // the new metadata owner must reinstall its production shard RPCs.

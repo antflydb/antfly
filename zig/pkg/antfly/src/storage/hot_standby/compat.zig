@@ -22,7 +22,7 @@
 
 const std = @import("std");
 const backup_manifest = @import("backup_manifest.zig");
-const replication_record = @import("replication_record.zig");
+const replication_record = @import("../db/replication_record.zig");
 
 const v1_payload = "v1-fixture";
 

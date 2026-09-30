@@ -13,8 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const ha_publisher_adapter = @import("../storage/hot_standby/db_commit.zig");
-const ha_write_gate_adapter = @import("../storage/hot_standby/write_gate.zig");
+const hot_standby_publisher_adapter = @import("../storage/hot_standby/db_commit.zig");
+const hot_standby_write_gate_adapter = @import("../storage/hot_standby/write_gate.zig");
+const replication_ingress = @import("../storage/db/replication_ingress.zig");
 const std = @import("std");
 const system_catalog = @import("../system_catalog/domain.zig");
 const ha_wal = @import("../storage/wal_runtime.zig");
@@ -761,8 +762,8 @@ const LocalStandaloneMetadata = struct {
     metadata_incarnation: ?@import("../metadata/incarnation.zig").MetadataClusterIncarnation = null,
     native_owner_binding: ?@import("../metadata/standalone_native_owner.zig").Binding = null,
     coordinated_lifecycle_allowed: bool = true,
-    ha_gate: ?antfly.db.HAWriteGate = null,
-    ha_mirror: ?antfly.db.HAAsyncEffectMirror = null,
+    ha_gate: ?antfly.db.ReplicationWriteGate = null,
+    ha_mirror: ?antfly.db.ReplicationAsyncEffectMirror = null,
     ha_binding_generation: u64 = 0,
     prepared_restore_term: u64 = 0,
     owned_catalog_backend: ?antfly.lsm_backend.BackendHandle = null,
@@ -1114,7 +1115,7 @@ const LocalStandaloneMetadata = struct {
 
     const LifecycleRequest = antfly.public_api.operation.RequestContext;
     const Staging = @import("../metadata/restore_staging.zig");
-    fn bindHAMetadata(ptr: *anyopaque, gate: ?antfly.db.HAWriteGate, mirror: ?antfly.db.HAAsyncEffectMirror) !void {
+    fn bindHAMetadata(ptr: *anyopaque, gate: ?antfly.db.ReplicationWriteGate, mirror: ?antfly.db.ReplicationAsyncEffectMirror) !void {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         // Promotion owns the HA transition mutex. Never wait for a catalog
         // writer that may itself be waiting for that transition boundary.
@@ -1198,7 +1199,7 @@ const LocalStandaloneMetadata = struct {
     }
     const MutationLock = struct {
         owner: *LocalStandaloneMetadata,
-        lease: ?antfly.db.HAMutationBarrier.SharedLease,
+        lease: ?antfly.db.MutationBarrier.SharedLease,
         fn deinit(self: *@This()) void {
             self.owner.mutex.unlock();
             if (self.lease) |*lease| lease.release();
@@ -1218,7 +1219,7 @@ const LocalStandaloneMetadata = struct {
         const barrier = if (self.ha_mirror) |mirror| mirror.mutation_barrier else null;
         const binding_generation = self.ha_binding_generation;
         self.mutex.unlock();
-        var lease: ?antfly.db.HAMutationBarrier.SharedLease = if (barrier) |value| value.acquireShared() else null;
+        var lease: ?antfly.db.MutationBarrier.SharedLease = if (barrier) |value| value.acquireShared() else null;
         errdefer if (lease) |*value| value.release();
         if (gate) |value| try value.check();
         lockAtomic(&self.mutex);
@@ -1576,7 +1577,7 @@ const LocalStandaloneMetadata = struct {
                 var arena = std.heap.ArenaAllocator.init(self.alloc);
                 defer arena.deinit();
                 const scope = try Staging.ownerScope(arena.allocator(), job.value.plan, job.value.plan_digest, target, range);
-                if (try server.write_source.readHAHiddenOwnerBootstrap(self.alloc, owner_group_id, target.table.table_id)) |raw| {
+                if (try server.write_source.readHotStandbyHiddenOwnerBootstrap(self.alloc, owner_group_id, target.table.table_id)) |raw| {
                     var descriptor = raw;
                     defer descriptor.deinit();
                     if (!std.mem.eql(u8, &scope.digest(), &descriptor.value.scope.digest())) return error.RestoreStagingScopeChanged;
@@ -2328,7 +2329,7 @@ const LocalStandaloneMetadata = struct {
         return .{ .arena = arena, .value = .{ .revision = self.systemCatalogState().revision, .entries = page.entries, .legacy_membership = membership, .next_after = page.next, .next_table_id = if (page.next != null) page.entries[page.entries.len - 1].table.table_id else null, .ranges = ranges.items, .stores = stores, .placement_intents = intents.items } };
     }
 
-    fn systemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, call: system_catalog.Call) ![]u8 {
+    fn systemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
         // Cancellation callbacks may consult this same catalog (restore checks
         // its leadership term). Invoke them only outside the metadata mutex.
         // Keep deadline checks inside the bounded atomic capture/commit; once a
@@ -2400,7 +2401,7 @@ const LocalStandaloneMetadata = struct {
         return try server.write_source.prepareReplicaRetirements(alloc, targets);
     }
 
-    fn systemCatalogAdmitted(ptr: *anyopaque, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, call: system_catalog.Call) ![]u8 {
+    fn systemCatalogAdmitted(ptr: *anyopaque, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
         if (call == .mutate or call == .setting_mutate or call == .policy_definition_mutate or
@@ -5004,7 +5005,7 @@ pub fn runFromIterator(
         if (comptime control_only_storage_sources) {
             const request_json = try std.json.Stringify.valueAlloc(alloc, expectation, .{});
             defer alloc.free(request_json);
-            break :blk kernel_owner_client.haSeedValidateActivatedGeneration(request_json) catch |err| {
+            break :blk kernel_owner_client.hotStandbySeedValidateActivatedGeneration(request_json) catch |err| {
                 std.log.err("standalone startup failed step=validate_ha_active_generation err={}", .{err});
                 return err;
             };
@@ -12485,7 +12486,7 @@ test "standalone catalog remote apply outage preserves committed creation and re
         }
     };
     var failure_context: u8 = 0;
-    const mirror: antfly.db.HAAsyncEffectMirror = .{ .publisher = ha_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &failure_context, .sync_wait_fn = Failure.wait };
+    const mirror: antfly.db.ReplicationAsyncEffectMirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &failure_context, .sync_wait_fn = Failure.wait };
     var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, runtime.ptr(), null, .local);
     var metadata_open = true;
     defer if (metadata_open) metadata.deinit();
@@ -12687,13 +12688,13 @@ test "standalone shared restore HA policy mirrors mixed publication and durable 
     var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, runtime.ptr(), null, .local);
     defer metadata.deinit();
     const baseline = try metadata.lifecycle_store.?.exportHACheckpoint(std.testing.io, checkpoint);
-    var barrier: antfly.db.HAMutationBarrier = .{};
-    const mirror: antfly.db.HAAsyncEffectMirror = .{ .publisher = ha_publisher_adapter.bind(&primary), .mutation_barrier = &barrier };
+    var barrier: antfly.db.MutationBarrier = .{};
+    const mirror: antfly.db.ReplicationAsyncEffectMirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .mutation_barrier = &barrier };
     try LocalStandaloneMetadata.bindHAMetadata(&metadata, .{ .primary = &primary }, mirror);
     try @import("../api/restore_worker_fixture.zig").runWithPolicy(antfly.public_api.http_server.RestoreWorkerTestDriver, false, metadata.statusSource(), metadata.restorePersistence(), .{
         .failover_safe = true,
         .guard = .{ .ptr = &metadata, .is_current = LocalStandaloneMetadata.restoreTermCurrent },
-        .gate = .{ .primary = ha_write_gate_adapter.bindPrimary(&primary) },
+        .gate = .{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) },
         .mirror = mirror,
     });
     const standby_root = try std.fmt.allocPrint(alloc, "{s}/standby-metadata", .{root});
@@ -13650,7 +13651,7 @@ test "system catalog cancellation callbacks run outside the authority mutex" {
     };
     var probe: Probe = .{ .metadata = &metadata };
     const context: antfly.public_api.operation.RequestContext = .{ .cancellation = .{ .ptr = &probe, .is_cancelled_fn = Probe.canceled } };
-    for ([_]system_catalog.Call{
+    for ([_]@import("../system_catalog/server_call.zig").Call{
         .snapshot,
         .{ .list_tables = .{} },
         .{ .resolve_many = .{} },
@@ -13903,7 +13904,7 @@ fn exerciseStandalonePolicyPublication(use_ha: bool) !void {
                 defer effect.deinit();
                 try std.testing.expectEqual(antfly.hot_standby.effects.MetadataMutationKind.row_policy, effect.value.kind);
                 try std.testing.expectEqual(if (owner_effects == 0) policies.Publication.Phase.pending_install else policies.Publication.Phase.serving_install, effect.value.row_policy_request.?.expected_phase);
-                try standby_owner.applyHAReplicationRecord(entry.record);
+                try replication_ingress.applyRecord(&standby_owner, entry.record);
                 owner_effects += 1;
                 if (owner_effects == 1)
                     try std.testing.expectError(error.RowPolicyAuthenticationRequired, standby_owner.get(alloc, "absent"));
@@ -14039,7 +14040,7 @@ test "system catalog standalone setting publication survives native restart and 
     defer alloc.free(path);
     var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer backend.deinit();
-    const request: system_catalog.Call = .{ .setting_mutate = .{ .put = .{
+    const request: @import("../system_catalog/server_call.zig").Call = .{ .setting_mutate = .{ .put = .{
         .name = "app.tenant",
         .kind = .string,
         .policy_sensitive = true,

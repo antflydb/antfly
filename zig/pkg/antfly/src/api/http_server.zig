@@ -1425,7 +1425,7 @@ fn restoreWorkerAuthorityMatches(
 /// public application operations below.
 pub const RequestAdmission = @import("../common/request_admission.zig").RequestAdmission;
 
-pub const HAMutationPolicySnapshot = struct {
+pub const HotStandbyMutationPolicySnapshot = struct {
     failover_safe_mutations_only: bool = false,
     remote_apply_mutations_enabled: bool = false,
     catalog_create_enabled: bool = false,
@@ -1434,11 +1434,11 @@ pub const HAMutationPolicySnapshot = struct {
 /// Live HA ingress policy owned by the process runtime. Promotion changes the
 /// authority role without rebuilding the HTTP router, so policy cannot be a
 /// startup-only boolean.
-pub const HAMutationPolicySource = struct {
+pub const HotStandbyMutationPolicySource = struct {
     ptr: *const anyopaque,
-    snapshot_fn: *const fn (ptr: *const anyopaque) HAMutationPolicySnapshot,
+    snapshot_fn: *const fn (ptr: *const anyopaque) HotStandbyMutationPolicySnapshot,
 
-    pub fn snapshot(self: HAMutationPolicySource) HAMutationPolicySnapshot {
+    pub fn snapshot(self: HotStandbyMutationPolicySource) HotStandbyMutationPolicySnapshot {
         return self.snapshot_fn(self.ptr);
     }
 };
@@ -1738,7 +1738,7 @@ pub const ApiHttpServerConfig = struct {
     ha_catalog_create_enabled: bool = false,
     /// Optional live source supplied by HA-aware runtimes. Static fields above
     /// remain the policy for kernels and tests without a mutable role.
-    ha_mutation_policy_source: ?HAMutationPolicySource = null,
+    hot_standby_mutation_policy_source: ?HotStandbyMutationPolicySource = null,
     /// Optional production-neutral durable-join microstep observer. The hook
     /// can coordinate process lifecycle or deterministic faults, but does not
     /// replace the planner, worker protocol, or persistence implementation.
@@ -1988,7 +1988,7 @@ pub const StatusSource = struct {
     pub const VTable = struct {
         supports_query_definitions: bool = false,
         acquire_join_planning: ?*const fn (*anyopaque, table_router.RouteBudget) anyerror!?*join_planning.Generation = null,
-        system_catalog: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: system_catalog.Call) anyerror![]u8 = null,
+        system_catalog: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) anyerror![]u8 = null,
 
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
         admin_snapshot: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot = null,
@@ -2054,7 +2054,7 @@ pub const StatusSource = struct {
         return try BoundaryAbi.call("acquire_join_planning", self.boundary_dispatch, capture, .{ self.ptr, budget });
     }
 
-    pub fn systemCatalog(self: StatusSource, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: system_catalog.Call) ![]u8 {
+    pub fn systemCatalog(self: StatusSource, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
         const callback = self.vtable.system_catalog orelse return error.UnsupportedOperation;
         return BoundaryAbi.call("system_catalog", self.boundary_dispatch, callback, .{ self.ptr, alloc, context, input }) catch |err| switch (err) {
             error.MetadataIncarnationUnavailable, error.InvalidMetadataIncarnation, error.MetadataIncarnationMismatch => error.CatalogRoutingUnavailable,
@@ -2395,7 +2395,7 @@ pub const StatusSource = struct {
                 return @ptrCast(@alignCast(ptr));
             }
 
-            fn systemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: system_catalog.Call) anyerror![]u8 {
+            fn systemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) anyerror![]u8 {
                 return system_catalog_operations.call(cast(ptr), alloc, context, input);
             }
 
@@ -2734,7 +2734,7 @@ pub const StatusSource = struct {
     }
 
     const HttpRoutedCatalog = struct {
-        fn call(ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: system_catalog.Call) anyerror![]u8 {
+        fn call(ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) anyerror![]u8 {
             const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
             var result: ?[]u8 = null;
             errdefer if (result) |bytes| alloc.free(bytes);
@@ -2746,7 +2746,7 @@ pub const StatusSource = struct {
             svc: *metadata_service.MetadataHttpService,
             alloc: std.mem.Allocator,
             request: api_operation.RequestContext,
-            input: system_catalog.Call,
+            input: @import("../system_catalog/server_call.zig").Call,
             result: *?[]u8,
             pub fn local(self: @This()) anyerror!void {
                 self.result.* = try system_catalog_operations.call(self.svc, self.alloc, self.request, self.input);
@@ -3957,7 +3957,7 @@ pub const ApiHttpServer = struct {
         return ApiHttpServer.initWithRequestAllocator(alloc, request_alloc, cfg, source, table_read_source, table_write_source);
     }
 
-    pub fn haMutationPolicy(self: *const ApiHttpServer) HAMutationPolicySnapshot {
+    pub fn hotStandbyMutationPolicy(self: *const ApiHttpServer) HotStandbyMutationPolicySnapshot {
         return .{
             .failover_safe_mutations_only = self.cfg.ha_failover_safe_mutations_only,
             .remote_apply_mutations_enabled = self.cfg.ha_remote_apply_mutations_enabled,
@@ -5462,7 +5462,7 @@ pub const ApiHttpServer = struct {
     /// the builder; metadata rechecks the entire cut at Raft apply.
     pub fn beginFkGenerationPublication(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, identity: ?AuthenticatedIdentity, before: metadata_table_manager.TableRecord, proposed_schema_json: []const u8) !FkGenerationBegin {
         if (self.cfg.deployment_mode == .standalone and
-            (self.haMutationPolicy().failover_safe_mutations_only or self.cfg.fk_generation_source == null or self.cfg.fk_generation_parent == null))
+            (self.hotStandbyMutationPolicy().failover_safe_mutations_only or self.cfg.fk_generation_source == null or self.cfg.fk_generation_parent == null))
             return error.UnsupportedOperation;
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
@@ -5627,7 +5627,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn mutationBackgroundExecutionPermitted(self: *const ApiHttpServer) bool {
-        return !self.haMutationPolicy().failover_safe_mutations_only;
+        return !self.hotStandbyMutationPolicy().failover_safe_mutations_only;
     }
 
     fn retryPendingTransactionRecovery(self: *ApiHttpServer, limit: usize) !void {
@@ -11516,7 +11516,7 @@ pub const ApiHttpServer = struct {
         fn canceled(ptr: *const anyopaque) bool {
             const self: *const @This() = @ptrCast(@alignCast(ptr));
             if (self.upstream) |token| if (token.isCancelled()) return true;
-            if (!self.server.haMutationPolicy().failover_safe_mutations_only) return false;
+            if (!self.server.hotStandbyMutationPolicy().failover_safe_mutations_only) return false;
             const guard = self.server.cfg.restore_execution_guard orelse return true;
             return !self.server.restoreExecutionPermitted() or !guard.is_current(guard.ptr, self.term);
         }
@@ -11534,7 +11534,7 @@ pub const ApiHttpServer = struct {
     /// Reuses session maintenance, so restart discovery does not depend on
     /// process-local repository registrations or create another job queue.
     fn recoverBackupCohortSlice(self: *ApiHttpServer) !void {
-        if (self.haMutationPolicy().failover_safe_mutations_only and !self.restoreExecutionPermitted()) return;
+        if (self.hotStandbyMutationPolicy().failover_safe_mutations_only and !self.restoreExecutionPermitted()) return;
         if (self.source.vtable.list_backup_cohorts == null) return;
         const records = try self.source.listBackupCohorts(self.alloc, if (self.backup_cohort_recovery_cursor_len == 0) null else self.backup_cohort_recovery_cursor[0..self.backup_cohort_recovery_cursor_len], 1, self.backupCohortContext());
         defer {
@@ -15096,7 +15096,7 @@ pub const ApiHttpServer = struct {
             if (!std.mem.eql(u8, status.value.status, "completed")) return error.BackupOutcomeAmbiguous;
             return;
         }
-        if (self.haMutationPolicy().failover_safe_mutations_only and expected_fence == null) return error.MethodNotAllowed;
+        if (self.hotStandbyMutationPolicy().failover_safe_mutations_only and expected_fence == null) return error.MethodNotAllowed;
         var admitted_fence: backups_api.TableBackupFence = undefined;
         var table = table: {
             var authoritative_snapshot = (self.source.linearizableSnapshot(operation_request) catch |err| {
@@ -16873,7 +16873,7 @@ pub const ApiHttpServer = struct {
         request: api_operation.RequestContext,
     ) cluster_api_http.ClusterApi.ExecuteBackupError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        if (self.haMutationPolicy().failover_safe_mutations_only and !self.restoreExecutionPermitted()) return error.NotLeader;
+        if (self.hotStandbyMutationPolicy().failover_safe_mutations_only and !self.restoreExecutionPermitted()) return error.NotLeader;
         var authority: BackupAuthorityControl = .{ .server = self, .upstream = request.cancellation, .term = self.restore_leadership_term.load(.acquire) };
         const operation_request = authority.bind(self.boundedBackupRequest(request));
         operation_request.ensureActive() catch |err| switch (err) {
@@ -18637,7 +18637,7 @@ pub const ApiHttpServer = struct {
         }
         // Migrated legacy jobs must not fall through to in-place/predrop
         // activation after HA promotion. Only scoped native staging is mirrored.
-        if (self.haMutationPolicy().failover_safe_mutations_only) return error.MethodNotAllowed;
+        if (self.hotStandbyMutationPolicy().failover_safe_mutations_only) return error.MethodNotAllowed;
         var catalog_arena = std.heap.ArenaAllocator.init(op_alloc);
         defer catalog_arena.deinit();
         const ca = catalog_arena.allocator();
@@ -19107,7 +19107,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn restoreExecutionPermitted(self: *ApiHttpServer) bool {
-        if (self.haMutationPolicy().failover_safe_mutations_only and !self.haCoordinatedRestoreAvailable()) return false;
+        if (self.hotStandbyMutationPolicy().failover_safe_mutations_only and !self.haCoordinatedRestoreAvailable()) return false;
         if (self.restore_dispatch_paused.load(.acquire)) return false;
         const guard = self.cfg.restore_execution_guard orelse return true;
         const term = self.restore_leadership_term.load(.acquire);
@@ -21232,7 +21232,7 @@ pub const ApiHttpServer = struct {
         idempotency_key: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !contextual_operations.OwnedResponse {
-        if (self.haMutationPolicy().failover_safe_mutations_only and !self.restoreExecutionPermitted())
+        if (self.hotStandbyMutationPolicy().failover_safe_mutations_only and !self.restoreExecutionPermitted())
             return try contextualJsonErrorResponse(self.alloc, 503, "hot-standby restore authority is not ready");
         const parsed = backups_api.parseRestoreRequest(self.alloc, body) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid restore request");
         defer parsed.deinit();
@@ -21283,7 +21283,7 @@ pub const ApiHttpServer = struct {
             break :manifest selected_manifest;
         };
         defer manifest.deinit(self.alloc);
-        if (self.haMutationPolicy().failover_safe_mutations_only and source_kind != .cluster_cohort)
+        if (self.hotStandbyMutationPolicy().failover_safe_mutations_only and source_kind != .cluster_cohort)
             return try contextualJsonErrorResponse(self.alloc, 409, "historical independent snapshots are not certified for hot-standby restore; select a dependency-complete cohort");
         if (source_kind == .cluster_cohort) {
             @import("restore_staging_driver.zig").validateSelection(self.alloc, &.{.{ .source_table_id = manifest.table_id, .manifest = &manifest }}) catch |err| return try contextualJsonErrorResponse(self.alloc, 409, if (err == error.RestoreDependencyMissing)
@@ -21380,7 +21380,7 @@ pub const ApiHttpServer = struct {
         idempotency_key: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !contextual_operations.OwnedResponse {
-        if (self.haMutationPolicy().failover_safe_mutations_only and !self.restoreExecutionPermitted())
+        if (self.hotStandbyMutationPolicy().failover_safe_mutations_only and !self.restoreExecutionPermitted())
             return try contextualJsonErrorResponse(self.alloc, 503, "hot-standby restore metadata authority is not ready");
         var req = backups_api.parseClusterRestoreRequest(self.alloc, body) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid restore request");
         defer backups_api.freeClusterRestoreRequest(self.alloc, &req);
@@ -21396,7 +21396,7 @@ pub const ApiHttpServer = struct {
         }) catch |err| return try contextualJsonErrorResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
         defer location.deinit(self.alloc);
 
-        if (self.haMutationPolicy().failover_safe_mutations_only) {
+        if (self.hotStandbyMutationPolicy().failover_safe_mutations_only) {
             const restore_io = self.backupLocationIo(&location) orelse
                 return try contextualJsonErrorResponse(self.alloc, 503, "restore service unavailable");
             var verification_cache: backups_api.ArtifactVerificationCache = .{};
@@ -21517,7 +21517,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn resumeRestoreJobsOnce(self: *ApiHttpServer) !void {
-        if (self.haMutationPolicy().failover_safe_mutations_only and !self.haCoordinatedRestoreAvailable()) return;
+        if (self.hotStandbyMutationPolicy().failover_safe_mutations_only and !self.haCoordinatedRestoreAvailable()) return;
         if (self.restore_jobs_resumed.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
         self.schedulePendingRestoreJobs() catch |err| {
             self.restore_jobs_resumed.store(false, .release);
@@ -21782,7 +21782,7 @@ pub const ApiHttpServer = struct {
         const state = parsed.value;
         if (state.phase != .running or state.attempt_id != begin.attempt_id)
             return error.CorruptRestoreJobStore;
-        if (self.haMutationPolicy().failover_safe_mutations_only and state.scope != .cluster and state.source_kind != .cluster_cohort) {
+        if (self.hotStandbyMutationPolicy().failover_safe_mutations_only and state.scope != .cluster and state.source_kind != .cluster_cohort) {
             const failed = try self.restore_job_store.fail(self.alloc, state, "hot-standby restore requires a dependency-complete native cluster cohort");
             self.alloc.free(failed);
             return;
@@ -31011,7 +31011,7 @@ test "system catalog validates writes against table-specific extension data shap
             };
         }
 
-        fn catalog(_: *anyopaque, a: std.mem.Allocator, request: api_operation.RequestContext, input: system_catalog.Call) ![]u8 {
+        fn catalog(_: *anyopaque, a: std.mem.Allocator, request: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             try request.ensureActive();
             if (input == .resolve) {
                 try std.testing.expectEqualStrings("memories", input.resolve.table);
@@ -33392,7 +33392,7 @@ test "ordinary read needs no principal without policy but active policy fails cl
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 77, .metrics = .{} };
         }
-        fn catalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, call: system_catalog.Call) ![]u8 {
+        fn catalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expect(call == .policy_publication_status);
             try std.testing.expectEqual(@as(u64, 7), call.policy_publication_status);
@@ -54746,7 +54746,7 @@ test "system catalog binds foreign keys once and authorizes cascades by current 
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
-        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: api_operation.RequestContext, input: system_catalog.Call) ![]u8 {
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expect(input == .resolve_many);
             const request = input.resolve_many;
@@ -54806,7 +54806,7 @@ test "system catalog authorizes qualified resources before lookup and rename adm
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
         }
-        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, context: api_operation.RequestContext, input: system_catalog.Call) ![]u8 {
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try context.ensureActive();
             self.calls += 1;
@@ -54916,7 +54916,7 @@ test "system catalog restore listing shares one projection and honors legacy ren
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
         }
-        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: api_operation.RequestContext, input: system_catalog.Call) ![]u8 {
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expect(input == .snapshot);
             self.snapshots += 1;
@@ -54980,7 +54980,7 @@ test "system catalog binds primary and nested joins once without conflating lite
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
         }
-        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: api_operation.RequestContext, input: system_catalog.Call) ![]u8 {
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
             try std.testing.expect(input == .resolve_many);
@@ -55052,7 +55052,7 @@ test "system catalog plain retries and joined graph reads reuse request identity
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
-        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: api_operation.RequestContext, input: system_catalog.Call) ![]u8 {
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expect(input == .resolve_many);
             self.bindings += 1;
@@ -55119,7 +55119,7 @@ test "system catalog NDJSON reuses one query definition without administrative s
         fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
             return error.UnexpectedAdministrativeSnapshot;
         }
-        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: api_operation.RequestContext, input: system_catalog.Call) ![]u8 {
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.bindings += 1;
             try std.testing.expect(input == .resolve_many);
@@ -55162,7 +55162,7 @@ test "system catalog table listing never joins stale topology with current bindi
         fn admin(_: *anyopaque) !metadata_api.AdminSnapshot {
             return error.StaleTopologyMustNotBeRead;
         }
-        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: api_operation.RequestContext, input: system_catalog.Call) ![]u8 {
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expect(input == .list_tables);
             self.calls += 1;
@@ -55188,7 +55188,7 @@ test "system catalog HTTP and MCP detail resolve and project in one observation"
         fn admin(_: *anyopaque) !metadata_api.AdminSnapshot {
             return error.FullCatalogMustNotBeRead;
         }
-        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: api_operation.RequestContext, input: system_catalog.Call) ![]u8 {
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expect(input == .table_status);
             if (input.table_status == .logical) {
@@ -55440,7 +55440,7 @@ test "system catalog identity failures remain unavailable across status adapters
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
-        fn call(ptr: *anyopaque, _: std.mem.Allocator, _: api_operation.RequestContext, _: system_catalog.Call) ![]u8 {
+        fn call(ptr: *anyopaque, _: std.mem.Allocator, _: api_operation.RequestContext, _: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.err;
         }
@@ -55472,7 +55472,7 @@ test "system catalog public mutation retains admission proof across the HTTP ada
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
-        fn call(ptr: *anyopaque, _: std.mem.Allocator, _: api_operation.RequestContext, _: system_catalog.Call) ![]u8 {
+        fn call(ptr: *anyopaque, _: std.mem.Allocator, _: api_operation.RequestContext, _: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.err;
         }

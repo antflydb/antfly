@@ -515,7 +515,7 @@ test "SQL catalog ALTER submits native schema CAS without client generations" {
         fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
-        fn run(_: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: domain.Call) ![]u8 {
+        fn run(_: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             try std.testing.expect(call == .resolve_many);
             return std.json.Stringify.valueAlloc(alloc, .{ .revision = 9, .tables = .{.{ .table_id = 17, .name = "table:immutable-17", .query_definition = .{ .schema_json = "{\"version\":7,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}", .read_schema_json = "", .indexes_json = "{}" } }} }, .{});
         }
@@ -567,7 +567,7 @@ test "SQL catalog DDL authorizes before lookup and handles atomic conditional ou
         fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
-        fn run(raw: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: domain.Call) ![]u8 {
+        fn run(raw: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
             try std.testing.expect(call == .mutate);
@@ -640,7 +640,7 @@ test "SQL UUID prepared CREATE TABLE commits and replays catalog topology only o
         pub fn verifyTableCreateProjection(self: *@This(), alloc: std.mem.Allocator, table: table_manager.TableRecord, ranges: []const table_manager.RangeRecord) !void {
             try self.store.verifyTableCreateProjectionExact(alloc, self.metadata_group_id, table, ranges);
         }
-        fn run(raw: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, call: domain.Call) ![]u8 {
+        fn run(raw: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (call != .mutate) return error.UnexpectedCall;
             try std.testing.expect(std.mem.indexOf(u8, self.output.?.written(), "PREPARE\x00") != null);

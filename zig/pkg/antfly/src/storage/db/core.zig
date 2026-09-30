@@ -63,7 +63,7 @@ const store_snapshot_file_name = "store.bin";
 const store_snapshot_v2_magic = "AFSTKV02";
 const logical_store_artifact_format = "antfly-kv-stream";
 const logical_store_artifact_version: u32 = 2;
-pub const logical_snapshot_manifest_file_name = "SNAPSHOT.json";
+pub const logical_snapshot_manifest_file_name = @import("../backup_codec.zig").logical_snapshot_manifest_file_name;
 const logical_snapshot_manifest_format_version: u32 = 1;
 const store_snapshot_batch_entries: usize = 8192;
 const store_snapshot_batch_bytes: usize = 8 * 1024 * 1024;
@@ -2339,30 +2339,30 @@ pub const DBCore = struct {
         return try manager.validateIntentSnapshot(txn_id, expected_revision);
     }
 
-    pub fn loadTransactionHAOutbox(
+    pub fn loadTransactionReplicationOutbox(
         self: *DBCore,
         alloc: Allocator,
         txn_id: transactions_mod.TxnId,
-    ) !transactions_mod.HAOutbox {
+    ) !transactions_mod.ReplicationOutbox {
         var manager = try self.initTxnManager();
         defer manager.deinit();
-        return try manager.loadHAOutbox(alloc, txn_id);
+        return try manager.loadReplicationOutbox(alloc, txn_id);
     }
 
-    pub fn transactionHasHAOutbox(self: *DBCore, txn_id: transactions_mod.TxnId) !bool {
+    pub fn transactionHasReplicationOutbox(self: *DBCore, txn_id: transactions_mod.TxnId) !bool {
         var manager = try self.initTxnManager();
         defer manager.deinit();
-        return try manager.hasHAOutbox(txn_id);
+        return try manager.hasReplicationOutbox(txn_id);
     }
 
-    pub fn clearTransactionHAOutbox(
+    pub fn clearTransactionReplicationOutbox(
         self: *DBCore,
         txn_id: transactions_mod.TxnId,
-        kind: transactions_mod.HAOutboxKind,
+        kind: transactions_mod.ReplicationOutboxKind,
     ) !void {
         var manager = try self.initTxnManager();
         defer manager.deinit();
-        try manager.clearHAOutbox(txn_id, kind);
+        try manager.clearReplicationOutbox(txn_id, kind);
     }
 
     pub fn collectTransactionIntentDocumentKeys(

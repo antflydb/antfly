@@ -221,6 +221,7 @@ pub const index_manager_vopr = @import("storage/index_manager_vopr.zig");
 pub const db_split_vopr = @import("storage/db_split_vopr.zig");
 
 test {
+    _ = @import("system_catalog/server_call.zig");
     _ = @import("vopr/index_maintenance.zig");
     _ = @import("cmd/serverless.zig");
     // Storage shard builds compile this authoritative discovery root and then

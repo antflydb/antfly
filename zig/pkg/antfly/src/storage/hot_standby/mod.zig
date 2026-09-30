@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-pub const replication_record = @import("replication_record.zig");
+pub const replication_record = @import("../db/replication_record.zig");
 pub const metadata_effects = @import("metadata_effects.zig");
 pub const metadata_effect_chunks = @import("metadata_effect_chunks.zig");
 pub const replay_floor = @import("replay_floor.zig");
@@ -37,7 +37,7 @@ pub const seed_materialization = @import("seed_materialization.zig");
 pub const seed_capture = @import("seed_capture.zig");
 pub const lifecycle_receipt_ledger = @import("lifecycle_receipt_ledger.zig");
 pub const local_generation_gc = @import("local_generation_gc.zig");
-pub const mutation_barrier = @import("mutation_barrier.zig");
+pub const mutation_barrier = @import("antfly_runtime_abi").mutation_barrier;
 pub const mutation_inventory = @import("mutation_inventory.zig");
 pub const bootstrap = @import("bootstrap.zig");
 pub const status = @import("status.zig");

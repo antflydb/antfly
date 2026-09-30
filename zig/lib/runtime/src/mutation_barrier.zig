@@ -19,12 +19,12 @@ const builtin = @import("builtin");
 threadlocal var shared_barrier: ?*MutationBarrier = null;
 threadlocal var shared_depth: usize = 0;
 
-/// Process-wide HA capture barrier.
+/// Process-wide mutation/capture barrier.
 ///
 /// Every primary-side persistent mutation holds a shared lease from before its
-/// first durable side effect until its matching HA WAL record is complete. The
+/// first durable side effect until its matching replication record is complete. The
 /// mutation lease is released before waiting for remote durability: the local
-/// commit and HA tail are already atomically ordered at that point, and holding
+/// commit and replication tail are already atomically ordered at that point, and holding
 /// it would deadlock the seed capture needed to restore that durability. Seed
 /// capture holds the exclusive lease while it selects the exact checkpoint and
 /// snapshots every catalog/data store. The reader gate is held by a queued

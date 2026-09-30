@@ -191,7 +191,7 @@ pub fn decode(bytes: []const u8) !RecordView {
     };
 }
 
-test "ha replication record round trips all envelope fields" {
+test "replication record round trips all envelope fields" {
     const payload = "doc:alpha={\"ok\":true}";
     const encoded = try encodeAlloc(std.testing.allocator, .{
         .kind = .batch_mutation,
@@ -224,7 +224,7 @@ test "ha replication record round trips all envelope fields" {
     try std.testing.expectEqualStrings(payload, decoded.payload);
 }
 
-test "ha replication record rejects payload corruption" {
+test "replication record rejects payload corruption" {
     var encoded = try encodeAlloc(std.testing.allocator, .{
         .kind = .derived_effect,
         .cluster_id = 1,
@@ -240,7 +240,7 @@ test "ha replication record rejects payload corruption" {
     try std.testing.expectError(error.PayloadCrcMismatch, decode(encoded));
 }
 
-test "ha replication record rejects header corruption" {
+test "replication record rejects header corruption" {
     var encoded = try encodeAlloc(std.testing.allocator, .{
         .kind = .metadata_mutation,
         .cluster_id = 1,
@@ -256,7 +256,7 @@ test "ha replication record rejects header corruption" {
     try std.testing.expectError(error.HeaderCrcMismatch, decode(encoded));
 }
 
-test "ha replication record validates framing before returning a view" {
+test "replication record validates framing before returning a view" {
     const encoded = try encodeAlloc(std.testing.allocator, .{
         .kind = .backup_start,
         .cluster_id = 1,
@@ -277,7 +277,7 @@ test "ha replication record validates framing before returning a view" {
     try std.testing.expectError(error.TrailingBytes, decode(with_trailing));
 }
 
-test "ha replication record rejects unsupported versions and bad magic" {
+test "replication record rejects unsupported versions and bad magic" {
     var encoded = try encodeAlloc(std.testing.allocator, .{
         .kind = .timeline_switch,
         .cluster_id = 1,
@@ -297,7 +297,7 @@ test "ha replication record rejects unsupported versions and bad magic" {
     try std.testing.expectError(error.UnsupportedVersion, decode(encoded));
 }
 
-test "ha replication record rejects unknown current-version kind and codec" {
+test "replication record rejects unknown current-version kind and codec" {
     var encoded = try encodeAlloc(std.testing.allocator, .{
         .kind = .batch_mutation,
         .payload_codec = .raw,
@@ -320,7 +320,7 @@ test "ha replication record rejects unknown current-version kind and codec" {
     try std.testing.expectError(error.UnsupportedPayloadCodec, decode(encoded));
 }
 
-test "ha replication record refuses to encode unknown current-version kind and codec" {
+test "replication record refuses to encode unknown current-version kind and codec" {
     try std.testing.expectError(error.UnsupportedRecordKind, encodeAlloc(std.testing.allocator, .{
         .kind = @enumFromInt(0xffff),
         .payload_codec = .raw,

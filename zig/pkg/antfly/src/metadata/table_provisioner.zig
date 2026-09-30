@@ -240,7 +240,17 @@ pub fn reconcileReplicaRootWithOptions(
             .source_table = table.name,
             .destination_authorizer = options.destination_authorizer,
         });
-        summary.merge(index_summary);
+        summary.merge(.{
+            .indexes_added = index_summary.indexes_added,
+            .indexes_removed = index_summary.indexes_removed,
+            .indexes_pending = index_summary.indexes_pending,
+            .enrichments_added = index_summary.enrichments_added,
+            .enrichments_updated = index_summary.enrichments_updated,
+            .enrichments_removed = index_summary.enrichments_removed,
+            .resolvers_added = index_summary.resolvers_added,
+            .resolvers_updated = index_summary.resolvers_updated,
+            .resolvers_removed = index_summary.resolvers_removed,
+        });
     }
     return summary;
 }
@@ -255,9 +265,11 @@ pub fn reconcileDbIndexes(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
     indexes_json: []const u8,
-) !ProvisionSummary {
+) !IndexReconcileSummary {
     return try reconcileDbIndexesWithOptions(alloc, db, indexes_json, .{});
 }
+
+pub const IndexReconcileSummary = @import("local_index_reconcile.zig").IndexReconcileSummary;
 
 pub const ReconcileDbIndexOptions = @import("local_index_reconcile.zig").ReconcileDbIndexOptions;
 
@@ -270,7 +282,7 @@ pub fn reconcileDbIndexTarget(
     db: *db_mod.DB,
     indexes_json: []const u8,
     index_name: []const u8,
-) !ProvisionSummary {
+) !IndexReconcileSummary {
     return try reconcileDbIndexTargetWithOptions(alloc, db, indexes_json, index_name, .{});
 }
 

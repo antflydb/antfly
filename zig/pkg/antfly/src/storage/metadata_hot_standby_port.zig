@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Creator-owned HA publication for the compiled metadata store. No Primary,
+//! Creator-owned hot standby publication for the compiled metadata store. No Primary,
 //! allocator, file, or Io implementation is dereferenced across this boundary.
 const callback = @import("../runtime_callback_abi.zig");
 
@@ -38,7 +38,7 @@ pub const Port = struct {
         try Boundary.call("lock", self.dispatch, self.vtable.lock, .{self.ptr});
     }
     pub fn unlock(self: Port) void {
-        Boundary.call("unlock", self.dispatch, self.vtable.unlock, .{self.ptr}) catch @panic("metadata HA callback ABI mismatch");
+        Boundary.call("unlock", self.dispatch, self.vtable.unlock, .{self.ptr}) catch @panic("metadata hot standby callback ABI mismatch");
     }
     pub fn check(self: Port) !void {
         try Boundary.call("check", self.dispatch, self.vtable.check, .{self.ptr});

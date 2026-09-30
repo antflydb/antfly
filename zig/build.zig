@@ -807,6 +807,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = optimize,
     });
     runtime_abi_mod.addImport("httpx", httpx_mod);
+    runtime_abi_mod.addImport("antfly_platform", platform_mod);
     const runtime_fs_mod = b.createModule(.{
         .root_source_file = b.path("lib/runtime/src/fs.zig"),
         .target = target,

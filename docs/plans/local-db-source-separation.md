@@ -22,22 +22,52 @@ behavior changes belong to #893.
   Server replica catalogs, provisioning summaries, and coordination remain
   with the server.
 
-## Database and HA contracts
+## Database and hot standby contracts
 
 `storage/db` owns apply receipts, durable outbox storage, replication policy
 values, effect codecs, and publication sequencing. Borrowed publisher and
-write-gate interfaces keep concrete HA runtimes outside DB production code.
+write-gate interfaces keep concrete hot standby runtimes outside DB production code.
 `storage/hot_standby` supplies the primary, standby, fencing, policy/metrics,
 and synchronous wait adapters. These interfaces preserve durable frame formats
 and acknowledge writes only after publication/wait and authority revalidation.
 Writer-cache identity includes adapter identity and borrowed lock identity.
 
+## Engine boundary
+
+DB executes typed replicated mutations; `storage/db/replication_ingress.zig`
+owns envelope decoding and temporary payload allocation. Apply receipts remain
+atomic with primary mutations and derived effects. The engine also owns record
+and effect formats, durable outbox recovery, and local snapshot maintenance.
+The runtime library owns the shared/exclusive mutation barrier. Hot standby
+adapters own seed capture, authenticated replica restore coordination, and
+remote acknowledgement waits.
+
+Runtime names use `hot_standby_*` or `HotStandby*`; engine contracts use generic
+replication names. Existing persisted key bytes, record encodings, error names,
+and C ABI symbols/tags remain compatible. Server runtime integration tests
+live under `storage/hot_standby`, with test-only hooks for white-box engine
+assertions. Production DB sources do not import those fixtures or runtimes.
+
+`zig build embedded-source-boundary-check` follows authored production imports
+from the embedded source root and physical DB, excluding test bodies. It rejects
+server coordination, missing sources, and imports outside the source owner, and
+runs with the existing storage test ownership audit. Native and WASM builds
+validate named module dependencies separately.
+
+Local index reconciliation has its own result summary; server provisioning
+keeps group/root counts separately. Local range observation limits and catalog
+route identity are portable contracts. Server catalog command envelopes stay
+with server coordination. Backup materialization stays with local storage;
+replica-catalog restore admission stays under server Raft storage.
+
 ## Remaining separation
 
-The DB is not yet independently housed in embedded. Replay/seed adapters and
-runtime-dependent test fixtures still need extraction before moving its owner.
-The source layout here is a prerequisite for that work, not completion of the
-full embedded package separation.
+The physical DB and its complete local source closure must still move into
+`antfly-embedded`. The local source owner now uses shared APIs directly rather
+than server facades. The native C API's private server owner operations also
+need separate ownership, while its public local DB/inference surface and WASM
+build must remain independently buildable. Source-boundary checks and staged
+build verification will enforce that separation.
 
 ## Review and merge order
 

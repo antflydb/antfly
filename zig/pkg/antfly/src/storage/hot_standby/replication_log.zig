@@ -22,7 +22,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const replication_record = @import("replication_record.zig");
+const replication_record = @import("../db/replication_record.zig");
 const wal_mod = @import("../wal_runtime.zig");
 
 var test_path_counter: u64 = 0;

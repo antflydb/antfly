@@ -182,7 +182,7 @@ fn tablespaceValue(alloc: std.mem.Allocator, resource: domain.Resource) !Tablesp
 test "system catalog committed mutations retain success when projection fails" {
     const Source = struct {
         snapshot: ?[]const u8,
-        fn systemCatalog(self: @This(), alloc: std.mem.Allocator, _: operation.RequestContext, call: domain.Call) ![]const u8 {
+        fn systemCatalog(self: @This(), alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]const u8 {
             return switch (call) {
                 .mutate => try alloc.dupe(u8, "{}"),
                 .read => try alloc.dupe(u8, self.snapshot orelse return error.Timeout),
@@ -213,7 +213,7 @@ test "system catalog failures use the shared public error envelope" {
 
 test "system catalog mutation response uses admitted identity without a name readback" {
     const Source = struct {
-        fn systemCatalog(_: @This(), alloc: std.mem.Allocator, _: operation.RequestContext, call: domain.Call) ![]const u8 {
+        fn systemCatalog(_: @This(), alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]const u8 {
             if (call != .mutate) return error.UnexpectedReadback;
             return std.json.Stringify.valueAlloc(alloc, domain.MutationResult{ .revision = 9, .resource = .{ .kind = .database, .id = 7, .name = "created" } }, .{});
         }
@@ -229,7 +229,7 @@ test "system catalog mutation response uses admitted identity without a name rea
 test "system catalog mutation preserves non-admission proof without marking reads or unknown outcomes" {
     const Source = struct {
         err: anyerror,
-        fn systemCatalog(self: @This(), _: std.mem.Allocator, _: operation.RequestContext, _: domain.Call) ![]const u8 {
+        fn systemCatalog(self: @This(), _: std.mem.Allocator, _: operation.RequestContext, _: @import("../system_catalog/server_call.zig").Call) ![]const u8 {
             return self.err;
         }
     };

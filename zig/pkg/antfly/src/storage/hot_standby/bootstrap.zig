@@ -25,7 +25,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const backup_manifest = @import("backup_manifest.zig");
 const primary_mod = @import("primary.zig");
-const replication_record = @import("replication_record.zig");
+const replication_record = @import("../db/replication_record.zig");
 const session = @import("session.zig");
 const standby_mod = @import("standby.zig");
 

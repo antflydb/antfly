@@ -68,31 +68,31 @@ pub fn raftAppliedEntryDisposition(
     return .already_applied;
 }
 
-pub const ha_applied_lsn_value_len: usize = @sizeOf(u64);
+pub const replication_applied_lsn_value_len: usize = @sizeOf(u64);
 
-pub fn haAppliedReplicationLsnWrite(lsn: u64, value_buf: *[ha_applied_lsn_value_len]u8) docstore_mod.KVPair {
+pub fn replicationAppliedSequenceWrite(lsn: u64, value_buf: *[replication_applied_lsn_value_len]u8) docstore_mod.KVPair {
     std.mem.writeInt(u64, value_buf, lsn, .little);
     return .{
-        .key = internal_keys.ha_applied_lsn_key[0..],
+        .key = internal_keys.replication_applied_lsn_key[0..],
         .value = value_buf[0..],
     };
 }
 
-pub fn readHAAppliedReplicationLsn(alloc: Allocator, store: *docstore_mod.DocStore) !u64 {
-    const raw = store.get(alloc, internal_keys.ha_applied_lsn_key[0..]) catch |err| switch (err) {
+pub fn readReplicationAppliedSequence(alloc: Allocator, store: *docstore_mod.DocStore) !u64 {
+    const raw = store.get(alloc, internal_keys.replication_applied_lsn_key[0..]) catch |err| switch (err) {
         error.NotFound => return 0,
         else => return err,
     };
     defer alloc.free(raw);
-    if (raw.len != ha_applied_lsn_value_len) return error.CorruptHAAppliedReplicationLsn;
-    return std.mem.readInt(u64, raw[0..ha_applied_lsn_value_len], .little);
+    if (raw.len != replication_applied_lsn_value_len) return error.CorruptHAAppliedReplicationLsn;
+    return std.mem.readInt(u64, raw[0..replication_applied_lsn_value_len], .little);
 }
 
 test "storage.hot_standby apply receipts preserve independent Raft and HA encodings" {
     var raft_buf: [raft_applied_entry_value_len]u8 = undefined;
-    var ha_buf: [ha_applied_lsn_value_len]u8 = undefined;
+    var replication_buf: [replication_applied_lsn_value_len]u8 = undefined;
     const raft = raftAppliedEntryWrite(.{ .term = 0x0102030405060708, .index = 9 }, &raft_buf);
-    const ha = haAppliedReplicationLsnWrite(11, &ha_buf);
+    const ha = replicationAppliedSequenceWrite(11, &replication_buf);
     try std.testing.expectEqualSlices(u8, &.{ 8, 7, 6, 5, 4, 3, 2, 1, 9, 0, 0, 0, 0, 0, 0, 0 }, raft.value);
     try std.testing.expectEqualSlices(u8, &.{ 11, 0, 0, 0, 0, 0, 0, 0 }, ha.value);
     try std.testing.expect(!std.mem.eql(u8, raft.key, ha.key));

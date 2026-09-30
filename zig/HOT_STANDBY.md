@@ -1248,7 +1248,7 @@ old phase ordering where one component depends on another.
 
 ### Local Replication Format
 
-`zig/pkg/antfly/src/storage/hot_standby/replication_record.zig` defines the
+`zig/pkg/antfly/src/storage/db/replication_record.zig` defines the
 `ReplicationRecord` envelope and binary codec described in
 [WAL Stream Shape](#wal-stream-shape). `compat.zig` hard-codes golden v1
 byte fixtures so header, endian, enum, CRC, or payload layout drift is caught

@@ -156,7 +156,7 @@ test "SQL policy DDL writes a durable draft only and never publishes it" {
         fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
-        fn systemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, call: domain.Call) ![]u8 {
+        fn systemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return switch (call) {
                 .snapshot => alloc.dupe(u8, "{\"revision\":7,\"next_id\":42}"),

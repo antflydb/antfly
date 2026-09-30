@@ -32,7 +32,21 @@ pub const CatalogGroupRoute = struct {
 };
 
 pub const catalog_route_fence_protocol_current: u16 = 1;
+pub const catalog_route_fence_header = "X-Antfly-Catalog-Route-Fence";
+pub const catalog_route_fence_ack_header = "X-Antfly-Catalog-Route-Fence-Ack";
+pub const catalog_route_fence_ack_value = "1";
+/// Separate from routing acknowledgement: emitted only after a successful
+/// fenced read-index lookup proves the logical key absent.
+pub const read_index_absence_header = "X-Antfly-Read-Index-Absence";
+pub const read_index_absence_value = "1";
+pub const catalog_route_deadline_ms_header = "X-Antfly-Catalog-Route-Deadline-Ms";
+pub const catalog_route_default_deadline_ms: u32 = 5_000;
+pub const catalog_route_max_deadline_ms: u32 = 30_000;
 
+/// Immutable authority and identity carried with every first-party
+/// group-local read. The receiver validates this against its compact routing
+/// projection before opening storage, so an independently cached admin
+/// snapshot can never select a different table generation.
 pub const CatalogRouteFence = struct {
     protocol: u16 = catalog_route_fence_protocol_current,
     metadata_group_id: u64,

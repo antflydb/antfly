@@ -17,19 +17,29 @@
 //! Older derived-effect readers reject the distinct magic rather than silently
 //! dropping primary state. Payload bytes are borrowed; only slice tables allocate.
 const std = @import("std");
-const journal = @import("../db/derived/change_journal.zig");
+const journal = @import("derived/change_journal.zig");
 const magic = "HPE1";
 const retirement_magic = "HPE2";
-const expiration = @import("../db/graph_edge_ttl_expiration.zig");
+const expiration = @import("graph_edge_ttl_expiration.zig");
 pub const GraphRetirement = struct { candidate: expiration.Candidate, source_digest: [32]u8 };
 const header_len = 16;
 pub const Write = struct { key: []const u8, value: []const u8 };
+/// Borrowed authoritative writes and replay, independent of decoder ownership.
+pub const View = struct {
+    writes: []const Write,
+    deletes: []const []const u8,
+    replay: []const u8,
+    graph_retirement: ?GraphRetirement = null,
+};
 pub const Decoded = struct {
     alloc: std.mem.Allocator,
     writes: []Write,
     deletes: [][]const u8,
     replay: []const u8,
     graph_retirement: ?GraphRetirement = null,
+    pub fn view(self: *const @This()) View {
+        return .{ .writes = self.writes, .deletes = self.deletes, .replay = self.replay, .graph_retirement = self.graph_retirement };
+    }
     pub fn deinit(self: *@This()) void {
         self.alloc.free(self.writes);
         self.alloc.free(self.deletes);
@@ -124,7 +134,7 @@ pub fn decode(alloc: std.mem.Allocator, raw: []const u8) !Decoded {
     return .{ .alloc = alloc, .writes = writes, .deletes = deletes, .replay = raw[offset..] };
 }
 
-test "HA primary effect preserves binary writes and rejects truncated effects" {
+test "primary effect preserves binary writes and rejects truncated effects" {
     const alloc = std.testing.allocator;
     const replay = try journal.encodeRecord(alloc, .{ .sequence = 7, .changed_artifact_keys = &.{"edge"} });
     defer alloc.free(replay);
@@ -143,7 +153,7 @@ test "HA primary effect preserves binary writes and rejects truncated effects" {
     try std.testing.expectError(error.InvalidPrimaryEffect, decode(alloc, "HPE2"));
 }
 
-test "HA primary effect graph retirement round trips without copying derived state" {
+test "primary effect graph retirement round trips without copying derived state" {
     const alloc = std.testing.allocator;
     const keys = @import("../internal_keys.zig");
     const edge = try keys.graphEdgeArtifactKeyAlloc(alloc, "owner\x00binary", "g", "links", "doc:b");

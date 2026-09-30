@@ -94,9 +94,9 @@ pub const ReplaceTableDefinitionRequest = struct {
 
 pub const ReseedExactCutoverResult = table_operations.ReseedExactCutoverResult;
 
-fn systemCatalogServiceCall(comptime Service: type) *const fn (*anyopaque, std.mem.Allocator, operation.RequestContext, system_catalog.Call) anyerror![]u8 {
+fn systemCatalogServiceCall(comptime Service: type) *const fn (*anyopaque, std.mem.Allocator, operation.RequestContext, @import("../system_catalog/server_call.zig").Call) anyerror![]u8 {
     return struct {
-        fn call(ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, input: system_catalog.Call) ![]u8 {
+        fn call(ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const svc: *Service = @ptrCast(@alignCast(ptr));
             // Metadata service internals use native CPU deadlines. Keep the
             // borrowed ingress clock until this concrete service boundary.
@@ -208,7 +208,7 @@ pub const AdminSource = struct {
 
     pub const VTable = struct {
         catalog_identity: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.CatalogIdentity = null,
-        system_catalog: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, input: system_catalog.Call) anyerror![]u8 = null,
+        system_catalog: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) anyerror![]u8 = null,
 
         head: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataHead = null,
         linearizable_head: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.MetadataHead = null,
@@ -2075,7 +2075,7 @@ pub const MetadataHttpServer = struct {
         try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_not_proposed);
         const body = (try ctx.body()) orelse return ctx.status(400).text("missing body");
         if (body.len > system_catalog.max_command_bytes) return ctx.status(413).text("catalog request too large");
-        var parsed = std.json.parseFromSlice(system_catalog.Call, ctx.allocator, body, .{}) catch return ctx.status(400).text("invalid catalog request");
+        var parsed = std.json.parseFromSlice(@import("../system_catalog/server_call.zig").Call, ctx.allocator, body, .{}) catch return ctx.status(400).text("invalid catalog request");
         defer parsed.deinit();
         // Ticket pages name a physical store. The shared service/read grant
         // authenticates a node, not that store, so admitting this call would
@@ -5405,7 +5405,7 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
                     "11111111111111111111111111111111".*,
             };
         }
-        fn catalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, call: system_catalog.Call) ![]u8 {
+        fn catalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             try context.ensureActive();
             if (call == .policy_publication_status) {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -5426,7 +5426,7 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
         .catalog_identity = Fixture.identity,
     };
     var server = MetadataHttpServer.init(alloc, .{ .setting_authority_secret = "separate-setting-authority-secret", .setting_authority_issuer = "cluster-a" }, .{ .ptr = &fixture, .vtable = &vtable });
-    const body = try std.json.Stringify.valueAlloc(alloc, @as(system_catalog.Call, .snapshot), .{});
+    const body = try std.json.Stringify.valueAlloc(alloc, @as(@import("../system_catalog/server_call.zig").Call, .snapshot), .{});
     defer alloc.free(body);
     for ([_]u16{ 200, 503, 426 }) |expected| {
         fixture.reads = 0;
@@ -5452,7 +5452,7 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
     // The principal-independent publication stamp needs a service token, but
     // no body-bound setting grant. A tokenless legacy-migration request cannot
     // acquire even this narrow read authority.
-    const status_body = try std.json.Stringify.valueAlloc(alloc, system_catalog.Call{ .policy_publication_status = 7 }, .{});
+    const status_body = try std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/server_call.zig").Call{ .policy_publication_status = 7 }, .{});
     defer alloc.free(status_body);
     var status_request = try httpx.Request.init(alloc, .POST, "/internal/v1/system-catalog");
     defer status_request.deinit();
@@ -5476,7 +5476,7 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
     try std.testing.expectEqual(@as(usize, 1), fixture.status_reads);
     // A caller cannot smuggle the native setting-admin capability through
     // the service-authenticated catalog JSON route.
-    const admin_body = try std.json.Stringify.valueAlloc(alloc, system_catalog.Call{ .setting_mutate = .{ .drop = "app.tenant" } }, .{});
+    const admin_body = try std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/server_call.zig").Call{ .setting_mutate = .{ .drop = "app.tenant" } }, .{});
     defer alloc.free(admin_body);
     var admin_request = try httpx.Request.init(alloc, .POST, "/internal/v1/system-catalog");
     defer admin_request.deinit();
@@ -5498,7 +5498,7 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
     var spoofed = try server.metadataSystemCatalog(&spoofed_ctx);
     defer spoofed.deinit();
     try std.testing.expectEqual(@as(u16, 403), spoofed.status.code);
-    const scope_body = try std.json.Stringify.valueAlloc(alloc, system_catalog.Call{ .setting_snapshot = .{ .principal = "alice", .database = "main" } }, .{});
+    const scope_body = try std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/server_call.zig").Call{ .setting_snapshot = .{ .principal = "alice", .database = "main" } }, .{});
     defer alloc.free(scope_body);
     const authority = @import("../system_catalog/setting_authority.zig");
     const read_grant = try authority.sign(alloc, "separate-setting-authority-secret", "cluster-a", .read, scope_body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));

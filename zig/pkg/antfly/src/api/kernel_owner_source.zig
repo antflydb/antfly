@@ -29,11 +29,11 @@ const descriptor_contract = @import("../storage/kernel_owner_descriptor.zig");
 const backend_types = @import("../storage/backend_types.zig");
 const db_types = @import("../storage/db/types.zig");
 const runtime_callbacks = @import("../storage/db/runtime_callbacks.zig");
-const ha_contract = @import("../storage/db/ha_contract.zig");
+const replication_contract = @import("../storage/db/replication_contract.zig");
 const document_artifact_child_range = @import("../storage/db/document_artifact_child_range.zig");
 const text_memory = @import("../storage/db/text_memory_stats.zig");
-const ha_effects = @import("../storage/db/replication_effects.zig");
-const ha_replication_record = @import("../storage/hot_standby/replication_record.zig");
+const replication_effects = @import("../storage/db/replication_effects.zig");
+const ha_replication_record = @import("../storage/db/replication_record.zig");
 const runtime_preflight = @import("../storage/db/runtime_preflight.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_domain = @import("../metadata/domain.zig");
@@ -196,8 +196,8 @@ pub const ProvisionedKernelOwnerSource = struct {
     runtime_status_cache: ?*runtime_status.TableRuntimeSnapshotCache = null,
     native_migration_policy: ?runtime_callbacks.DenseNativeMigrationPolicySource = null,
     promotion_leadership_source: ?table_writes.PromotionLeadershipSource = null,
-    ha_write_gate: ?ha_contract.WriteGate = null,
-    ha_async_mirror: ?ha_contract.AsyncEffectMirror = null,
+    replication_write_gate: ?replication_contract.WriteGate = null,
+    ha_async_mirror: ?replication_contract.AsyncEffectMirror = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     remote_content_configured: bool = false,
     secret_store: ?*anyopaque = null,
@@ -646,12 +646,12 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// physical commit; this adapter fences before it and appends the exact
     /// coarse batch plus its provider-produced derived effect only after that
     /// commit succeeds.
-    pub fn withHAControls(
+    pub fn withHotStandbyControls(
         self: *ProvisionedKernelOwnerSource,
-        gate: ?ha_contract.WriteGate,
-        mirror: ?ha_contract.AsyncEffectMirror,
+        gate: ?replication_contract.WriteGate,
+        mirror: ?replication_contract.AsyncEffectMirror,
     ) *ProvisionedKernelOwnerSource {
-        self.ha_write_gate = gate;
+        self.replication_write_gate = gate;
         self.ha_async_mirror = mirror;
         return self;
     }
@@ -820,8 +820,8 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .local_runtime_statuses = localRuntimeStatuses,
                 .text_memory_attribution_stats_best_effort = textMemoryAttributionStatsBestEffort,
                 .preflight_write_admission_group_local = preflightWriteAdmissionGroupLocal,
-                .prepare_ha_seed_snapshot_group_local = prepareHASeedSnapshotGroupLocal,
-                .capture_ha_seed_snapshot_group_local = captureHASeedSnapshotGroupLocal,
+                .prepare_hot_standby_seed_snapshot_group_local = prepareHotStandbySeedSnapshotGroupLocal,
+                .capture_hot_standby_seed_snapshot_group_local = captureHotStandbySeedSnapshotGroupLocal,
                 .find_median_key_group_local = findMedianKeyGroupLocal,
                 .reconcile_table_group_local = reconcileTableGroupLocal,
                 .reconcile_table_group_local_transient = reconcileTableGroupLocalTransient,
@@ -1309,17 +1309,17 @@ pub const ProvisionedKernelOwnerSource = struct {
         return {};
     }
 
-    fn captureHASeedSnapshotGroupLocal(ptr: *anyopaque, group_id: u64, table_name: []const u8, token: []const u8, destination: []const u8) !?void {
+    fn captureHotStandbySeedSnapshotGroupLocal(ptr: *anyopaque, group_id: u64, table_name: []const u8, token: []const u8, destination: []const u8) !?void {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         // Preparation opened the owner before the exclusive HA freeze. Never
         // resolve catalog metadata or open a competing owner inside that freeze.
         var lease = (try self.acquireIfPresent(group_id, table_name)) orelse return error.StorageKernelOwnerUnavailable;
         defer lease.deinit();
-        try lease.owner().captureHASeedSnapshot(table_name, token, destination);
+        try lease.owner().captureHotStandbySeedSnapshot(table_name, token, destination);
         return {};
     }
 
-    fn prepareHASeedSnapshotGroupLocal(
+    fn prepareHotStandbySeedSnapshotGroupLocal(
         ptr: *anyopaque,
         group_id: u64,
         table_name: []const u8,
@@ -1331,7 +1331,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             return err;
         };
         defer lease.deinit();
-        try lease.owner().prepareHASeedSnapshot(table_name, deadline_ns);
+        try lease.owner().prepareHotStandbySeedSnapshot(table_name, deadline_ns);
         return {};
     }
 
@@ -1622,7 +1622,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         try lease.owner().waitForSyncWithCancellation(table_name, owner_sync_level, cancellation);
     }
 
-    pub fn applyHAReplicationRecordGroupLocal(
+    pub fn applyHotStandbyReplicationRecordGroupLocal(
         self: *ProvisionedKernelOwnerSource,
         group_id: u64,
         table_name: []const u8,
@@ -1630,7 +1630,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     ) !void {
         var lease = try self.acquire(group_id, table_name);
         defer lease.deinit();
-        try lease.owner().applyHAReplicationRecord(table_name, .{
+        try lease.owner().applyHotStandbyReplicationRecord(table_name, .{
             .record_kind = @intFromEnum(record.kind),
             .payload_codec = @intFromEnum(record.payload_codec),
             .flags = record.flags,
@@ -1649,7 +1649,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// Read the persisted private bootstrap without asking the public catalog
     /// to invent a route for an unpublished owner. Warm reads pin the exact
     /// current generation; cold reads stay inside the compiled storage owner.
-    pub fn readHAHiddenOwnerBootstrap(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_id: u64) !?std.json.Parsed(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap) {
+    pub fn readHotStandbyHiddenOwnerBootstrap(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_id: u64) !?std.json.Parsed(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap) {
         try self.ensureContextConfigured();
         const generation = self.visibleRootGeneration(group_id);
         var resident: ?Lease = blk: {
@@ -1753,7 +1753,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         return parsed.value;
     }
 
-    pub fn captureHASeedHiddenReplicaSnapshot(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, scope: [32]u8, snapshot_token: []const u8, destination_root: []const u8) !void {
+    pub fn captureHotStandbySeedHiddenReplicaSnapshot(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, scope: [32]u8, snapshot_token: []const u8, destination_root: []const u8) !void {
         var descriptor = (try self.cachedRestoreDescriptor(alloc, group_id, table_name, scope)) orelse return error.RestoreStagingScopeChanged;
         defer descriptor.deinit(alloc);
         const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
@@ -1765,7 +1765,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer abi.antfly_storage_owner_buffer_destroy(&output);
     }
 
-    pub fn captureHASeedReplicaSnapshot(self: *ProvisionedKernelOwnerSource, table_name: []const u8, group_id: u64, snapshot_token: []const u8, destination_root: []const u8) !void {
+    pub fn captureHotStandbySeedReplicaSnapshot(self: *ProvisionedKernelOwnerSource, table_name: []const u8, group_id: u64, snapshot_token: []const u8, destination_root: []const u8) !void {
         var lease = try self.acquire(group_id, table_name);
         defer lease.deinit();
         var output: abi.OwnedBytes = .{};
@@ -1776,7 +1776,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// Hidden initial FK owners are already resident from the authenticated
     /// private placement projection. Public catalog lookup must not be used
     /// before the final metadata publication CAS.
-    pub fn captureHASeedInitialChildReplicaSnapshot(self: *ProvisionedKernelOwnerSource, table_name: []const u8, group_id: u64, snapshot_token: []const u8, destination_root: []const u8) !void {
+    pub fn captureHotStandbySeedInitialChildReplicaSnapshot(self: *ProvisionedKernelOwnerSource, table_name: []const u8, group_id: u64, snapshot_token: []const u8, destination_root: []const u8) !void {
         var lease = try self.acquirePreparedOwner(group_id, table_name);
         defer lease.deinit();
         if (lease.entry.initial_child_bootstrap_json.len == 0) return error.InvalidInitialChildPublication;
@@ -1785,14 +1785,14 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer abi.antfly_storage_owner_buffer_destroy(&output);
     }
 
-    pub fn applyHAHiddenOwnerRecord(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: [32]u8, record: ha_replication_record.RecordView) !void {
+    pub fn applyHotStandbyHiddenOwnerRecord(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: [32]u8, record: ha_replication_record.RecordView) !void {
         var descriptor = (try self.cachedRestoreDescriptor(alloc, group_id, table_name, scope)) orelse return error.RestoreStagingScopeChanged;
         defer descriptor.deinit(alloc);
         const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
         defer alloc.free(path);
         var lease = try self.acquireDescriptor(group_id, table_name, path, descriptor.view());
         defer lease.deinit();
-        try lease.owner().applyHAReplicationRecord(table_name, .{
+        try lease.owner().applyHotStandbyReplicationRecord(table_name, .{
             .record_kind = @intFromEnum(record.kind),
             .payload_codec = @intFromEnum(record.payload_codec),
             .flags = record.flags,
@@ -1808,12 +1808,12 @@ pub const ProvisionedKernelOwnerSource = struct {
         });
     }
 
-    pub fn applyHAInitialChildOwnerRecord(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, record: ha_replication_record.RecordView) !void {
+    pub fn applyHotStandbyInitialChildOwnerRecord(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, record: ha_replication_record.RecordView) !void {
         var lease = try self.acquirePreparedOwner(group_id, table_name);
         defer lease.deinit();
         if (lease.entry.initial_child_bootstrap_json.len == 0 or lease.entry.identity.table_id != record.table_id or
             lease.entry.identity.shard_id != record.shard_id) return error.InitialChildPublicationChanged;
-        try lease.owner().applyHAReplicationRecord(table_name, .{
+        try lease.owner().applyHotStandbyReplicationRecord(table_name, .{
             .record_kind = @intFromEnum(record.kind),
             .payload_codec = @intFromEnum(record.payload_codec),
             .flags = record.flags,
@@ -4919,13 +4919,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         req: db_types.BatchRequest,
         descriptor: ?descriptor_contract.Descriptor,
     ) !?void {
-        if (self.ha_write_gate) |gate| try gate.check();
-        var ha_mutation = if (self.ha_async_mirror) |mirror|
+        if (self.replication_write_gate) |gate| try gate.check();
+        var replication_mutation = if (self.ha_async_mirror) |mirror|
             if (mirror.mutation_barrier) |barrier| barrier.acquireShared() else null
         else
             null;
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.preflightHAMirrorSyncCommit();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.preflightHotStandbyMirrorSyncCommit();
         const request_json = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
         defer alloc.free(request_json);
         const private_path = if (descriptor != null) try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id }) else null;
@@ -4974,7 +4974,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         return {};
     }
 
-    fn preflightHAMirrorSyncCommit(self: *ProvisionedKernelOwnerSource) !void {
+    fn preflightHotStandbyMirrorSyncCommit(self: *ProvisionedKernelOwnerSource) !void {
         const mirror = self.ha_async_mirror orelse return;
         try mirror.publisher.preflightRecordingDecision(mirror);
     }
@@ -4992,16 +4992,16 @@ pub const ProvisionedKernelOwnerSource = struct {
     ) callconv(.c) abi.Status {
         const context: *CommittedBatchEffectsContext = @ptrCast(@alignCast(ptr orelse
             return .invalid_argument));
-        context.source.mirrorHABatchMutationCommit(context.request, context.identity) catch |err|
+        context.source.mirrorReplicationBatchMutationCommit(context.request, context.identity) catch |err|
             return context.error_relay.capture(err);
         if (replay_payload.len != 0) {
-            context.source.mirrorHAReplayPayloadCommit(replay_payload.slice(), context.identity) catch |err|
+            context.source.mirrorReplicationReplayPayloadCommit(replay_payload.slice(), context.identity) catch |err|
                 return context.error_relay.capture(err);
         }
         return .ok;
     }
 
-    fn mirrorHABatchMutationCommit(
+    fn mirrorReplicationBatchMutationCommit(
         self: *ProvisionedKernelOwnerSource,
         req: db_types.BatchRequest,
         identity: Identity,
@@ -5012,8 +5012,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         var transition_locked = transition_mutex != null;
         defer if (transition_locked) transition_mutex.?.unlock();
 
-        const payload = ha_effects.encodeBatchMutationRequestAlloc(self.alloc, req) catch |err| {
-            noteHAMirrorFailure(mirror, err);
+        const payload = replication_effects.encodeBatchMutationRequestAlloc(self.alloc, req) catch |err| {
+            noteReplicationMirrorFailure(mirror, err);
             if (mirror.sync_policy.mode != .async) return err;
             return;
         };
@@ -5022,7 +5022,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .shard_id = identity.shard_id,
             .table_id = identity.table_id,
         }) catch |err| {
-            noteHAMirrorFailure(mirror, err);
+            noteReplicationMirrorFailure(mirror, err);
             if (mirror.sync_policy.mode != .async) return err;
             return;
         };
@@ -5032,15 +5032,15 @@ pub const ProvisionedKernelOwnerSource = struct {
             mutex.unlock();
             transition_locked = false;
         }
-        try evaluateHAMirrorCommitGate(mirror, lsn);
+        try evaluateReplicationMirrorCommitGate(mirror, lsn);
         if (transition_mutex) |mutex| {
             lock(mutex);
             transition_locked = true;
         }
-        if (self.ha_write_gate) |gate| try gate.check();
+        if (self.replication_write_gate) |gate| try gate.check();
     }
 
-    fn mirrorHAReplayPayloadCommit(
+    fn mirrorReplicationReplayPayloadCommit(
         self: *ProvisionedKernelOwnerSource,
         replay_payload: []const u8,
         identity: Identity,
@@ -5055,7 +5055,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .shard_id = identity.shard_id,
             .table_id = identity.table_id,
         }) catch |err| {
-            noteHAMirrorFailure(mirror, err);
+            noteReplicationMirrorFailure(mirror, err);
             if (mirror.sync_policy.mode != .async) return err;
             return;
         };
@@ -5065,19 +5065,19 @@ pub const ProvisionedKernelOwnerSource = struct {
             mutex.unlock();
             transition_locked = false;
         }
-        try evaluateHAMirrorCommitGate(mirror, lsn);
+        try evaluateReplicationMirrorCommitGate(mirror, lsn);
         if (transition_mutex) |mutex| {
             lock(mutex);
             transition_locked = true;
         }
-        if (self.ha_write_gate) |gate| try gate.check();
+        if (self.replication_write_gate) |gate| try gate.check();
     }
 
-    fn evaluateHAMirrorCommitGate(mirror: ha_contract.AsyncEffectMirror, lsn: u64) !void {
+    fn evaluateReplicationMirrorCommitGate(mirror: replication_contract.AsyncEffectMirror, lsn: u64) !void {
         try mirror.publisher.complete(mirror, lsn);
     }
 
-    fn noteHAMirrorFailure(mirror: ha_contract.AsyncEffectMirror, err: anyerror) void {
+    fn noteReplicationMirrorFailure(mirror: replication_contract.AsyncEffectMirror, err: anyerror) void {
         if (mirror.failure_count) |counter| _ = counter.fetchAdd(1, .monotonic);
         std.log.warn("failed to mirror compiled-owner commit into HA stream: {s}", .{@errorName(err)});
     }

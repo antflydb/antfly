@@ -26,7 +26,7 @@ const bootstrap = @import("bootstrap.zig");
 const fencing = @import("fencing.zig");
 const primary_mod = @import("primary.zig");
 const rejoin = @import("rejoin.zig");
-const replication_record = @import("replication_record.zig");
+const replication_record = @import("../db/replication_record.zig");
 const session = @import("session.zig");
 const standby_mod = @import("standby.zig");
 

@@ -127,7 +127,7 @@ pub const replay_key_len: usize = 1 + 1 + @sizeOf(u64);
 pub const replay_meta_init_key = [_]u8{ replay_namespace, 0xff, 0x01 };
 pub const replay_meta_next_sequence_key = [_]u8{ replay_namespace, 0xff, 0x02 };
 pub const replay_meta_latest_sequence_kind: u8 = 0x03;
-pub const ha_applied_lsn_key = [_]u8{ replay_namespace, 0xff, 0x04 };
+pub const replication_applied_lsn_key = [_]u8{ replay_namespace, 0xff, 0x04 };
 /// Latest document-store mutation applied from the local data Raft log. The
 /// value stores term/index and is committed in the same primary batch as the
 /// document effects so restart replay cannot repeat non-idempotent transforms.

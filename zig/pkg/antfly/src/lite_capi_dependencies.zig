@@ -18,8 +18,8 @@
 
 pub const relational_expression_errors = @import("schema/relational_expression_errors.zig");
 pub const storage_coordinated_ttl = @import("storage/coordinated_ttl.zig");
-pub const storage_metadata_ha_port = @import("storage/metadata_ha_port.zig");
-pub const storage_hot_standby_replication_record = @import("storage/hot_standby/replication_record.zig");
+pub const storage_metadata_hot_standby_port = @import("storage/metadata_hot_standby_port.zig");
+pub const storage_hot_standby_replication_record = @import("storage/db/replication_record.zig");
 pub const storage_docstore = @import("storage/docstore.zig");
 pub const metadata_restore_staging = struct {};
 pub const metadata_storage_raft_apply_store = struct {};
@@ -87,3 +87,5 @@ pub const statement_read_fence = @import("storage/statement_read_fence.zig");
 pub const storage_range_protection = @import("storage/range_protection.zig");
 
 pub const storage_row_identity = @import("storage/row_identity.zig");
+
+pub const storage_db_replication_ingress = @import("storage/db/replication_ingress.zig");

@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const replication_ingress = antfly.capi_dependencies.storage_db_replication_ingress;
 const std = @import("std");
 const builtin = @import("builtin");
 const local_write = antfly.local_write;
@@ -52,7 +53,7 @@ const traversal_mod = antfly.traversal;
 const paths_mod = antfly.paths;
 const graph_query_mod = antfly.graph_query;
 const graph_pattern_mod = antfly.graph_pattern;
-const ha_seed_activation = antfly.ha_seed_activation;
+const hot_standby_seed_activation = antfly.hot_standby_seed_activation;
 const transactions_mod = antfly.transactions;
 const aggregations_mod = db_mod.aggregations;
 const aggregations_contract = aggregations_mod.contract;
@@ -4468,7 +4469,7 @@ pub fn metadataApplyStoreBindHA(
 ) callconv(.c) kernel_owner_abi.Status {
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
     const handle = asMetadataApplyStore(store_ptr) orelse return .invalid_argument;
-    const port: ?antfly.capi_dependencies.storage_metadata_ha_port.Port = if (request.port) |ptr| @as(*const antfly.capi_dependencies.storage_metadata_ha_port.Port, @ptrCast(@alignCast(ptr))).* else null;
+    const port: ?antfly.capi_dependencies.storage_metadata_hot_standby_port.Port = if (request.port) |ptr| @as(*const antfly.capi_dependencies.storage_metadata_hot_standby_port.Port, @ptrCast(@alignCast(ptr))).* else null;
     handle.store.bindHAPort(port) catch |err| return storageOwnerStatusFromError(err);
     return .ok;
 }
@@ -6564,12 +6565,12 @@ pub fn storageHASeedActivateJson(
     const request_json = validateHASeedRequest(request, operation) catch |err|
         return storageHASeedFailure(err, operation, out_failure);
     const alloc = std.heap.c_allocator;
-    var parsed = std.json.parseFromSlice(ha_seed_activation.ActivateRequest, alloc, request_json, .{
+    var parsed = std.json.parseFromSlice(hot_standby_seed_activation.ActivateRequest, alloc, request_json, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = false,
     }) catch return storageHASeedFailure(error.InvalidArgument, operation, out_failure);
     defer parsed.deinit();
-    var result = ha_seed_activation.activate(alloc, parsed.value) catch |err|
+    var result = hot_standby_seed_activation.activate(alloc, parsed.value) catch |err|
         return storageHASeedFailure(err, operation, out_failure);
     alloc.free(result.generation_path);
     const response = result.active_receipt_json;
@@ -6592,12 +6593,12 @@ pub fn storageHASeedValidateJson(
     const request_json = validateHASeedRequest(request, operation) catch |err|
         return storageHASeedFailure(err, operation, out_failure);
     const alloc = std.heap.c_allocator;
-    var parsed = std.json.parseFromSlice(ha_seed_activation.StartupExpectation, alloc, request_json, .{
+    var parsed = std.json.parseFromSlice(hot_standby_seed_activation.StartupExpectation, alloc, request_json, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = false,
     }) catch return storageHASeedFailure(error.InvalidArgument, operation, out_failure);
     defer parsed.deinit();
-    out_result.checkpoint_lsn = ha_seed_activation.validateActivatedGeneration(alloc, parsed.value) catch |err|
+    out_result.checkpoint_lsn = hot_standby_seed_activation.validateActivatedGeneration(alloc, parsed.value) catch |err|
         return storageHASeedFailure(err, operation, out_failure);
     return .ok;
 }
@@ -6613,12 +6614,12 @@ pub fn storageHASeedPruneJson(
     const request_json = validateHASeedRequest(request, operation) catch |err|
         return storageHASeedFailure(err, operation, out_failure);
     const alloc = std.heap.c_allocator;
-    var parsed = std.json.parseFromSlice(ha_seed_activation.ActivatedGenerationGCRequest, alloc, request_json, .{
+    var parsed = std.json.parseFromSlice(hot_standby_seed_activation.ActivatedGenerationGCRequest, alloc, request_json, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = false,
     }) catch return storageHASeedFailure(error.InvalidArgument, operation, out_failure);
     defer parsed.deinit();
-    var result = ha_seed_activation.pruneActivatedGenerations(alloc, parsed.value) catch |err|
+    var result = hot_standby_seed_activation.pruneActivatedGenerations(alloc, parsed.value) catch |err|
         return storageHASeedFailure(err, operation, out_failure);
     const response = result.result_json;
     result = undefined;
@@ -6889,7 +6890,7 @@ pub fn storageOwnerApplyHAReplicationRecord(
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
     const handle = asHandle(owner) orelse return .invalid_argument;
     _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
-    handle.db.applyHAReplicationRecord(.{
+    replication_ingress.applyRecord(&handle.db, .{
         .kind = @enumFromInt(request.record_kind),
         .payload_codec = @enumFromInt(request.payload_codec),
         .flags = request.flags,
@@ -8913,15 +8914,15 @@ pub fn storageOwnerMaintenance(
         .capture_ha_seed_snapshot => {
             const token = request.snapshot_token.slice();
             const destination = request.destination_root.slice();
-            if (!antfly.ha_validation.isIdentifier(token) or !std.fs.path.isAbsolute(destination)) return .invalid_argument;
-            antfly.ha_seed_snapshot.capture(handle.alloc, &handle.db, handle.db.core.path, token, destination) catch |err| {
+            if (!antfly.hot_standby_validation.isIdentifier(token) or !std.fs.path.isAbsolute(destination)) return .invalid_argument;
+            antfly.hot_standby_seed_snapshot.capture(handle.alloc, &handle.db, handle.db.core.path, token, destination) catch |err| {
                 std.log.warn("storage owner HA seed capture failed err={s}", .{@errorName(err)});
                 return storageOwnerStatusFromError(err);
             };
         },
         .prepare_ha_seed_snapshot => {
             if (request.deadline_ns == 0) return .invalid_argument;
-            handle.db.prepareHASeedSnapshot(request.deadline_ns) catch |err| {
+            handle.db.drainSnapshotMaintenance(request.deadline_ns) catch |err| {
                 std.log.warn("storage owner HA seed preparation failed err={s}", .{@errorName(err)});
                 return storageOwnerStatusFromError(err);
             };
@@ -17856,7 +17857,7 @@ fn captureOwnerSeedSnapshot(alloc: std.mem.Allocator, db: *db_mod.DB, request: *
     std.Io.Dir.cwd().deleteTree(io, path) catch {};
     defer std.Io.Dir.cwd().deleteTree(io, path) catch {};
     const clock = db.backend_runtime.monotonicClock();
-    _ = try db.snapshotHASeed(token, clock.nowRealtimeNs() +| std.time.ns_per_s);
+    _ = try db.snapshotWithMaintenanceDeadline(token, clock.nowRealtimeNs() +| std.time.ns_per_s);
     try backups_api.copyDirectoryRecursive(alloc, path, request.destination_root.slice());
 }
 

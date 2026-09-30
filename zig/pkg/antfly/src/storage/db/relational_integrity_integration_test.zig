@@ -13,8 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const ha_publisher_adapter = @import("../hot_standby/db_commit.zig");
-const ha_write_gate_adapter = @import("../hot_standby/write_gate.zig");
+const hot_standby_publisher_adapter = @import("../hot_standby/db_commit.zig");
+const hot_standby_write_gate_adapter = @import("../hot_standby/write_gate.zig");
+const replication_ingress = @import("replication_ingress.zig");
 const std = @import("std");
 const db_mod = @import("db.zig");
 const integrity = @import("relational_integrity.zig");
@@ -380,8 +381,8 @@ test "self-FK owner retains one fence through parent ACK and atomic child instal
         // the HA schema-cut record consumes it atomically with fence release.
         const standby_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/self-fk-dual-standby", .{tmp.sub_path});
         defer alloc.free(standby_path);
-        const effects = @import("../hot_standby/effects.zig");
-        const ha_payload = try effects.encodePublishedChildSchemaMetadataMutationAlloc(alloc, runtime_schema, next_json, .{
+        const effects = @import("replication_effects.zig");
+        const replication_payload = try effects.encodePublishedChildSchemaMetadataMutationAlloc(alloc, runtime_schema, next_json, .{
             .fence = fence,
             .before_schema_json_digest = old_json_digest,
             .schema_json_digest = next_json_digest,
@@ -390,8 +391,8 @@ test "self-FK owner retains one fence through parent ACK and atomic child instal
             .applied_term = 1,
             .applied_index = 5,
         });
-        defer alloc.free(ha_payload);
-        const ha_record: @import("../hot_standby/replication_record.zig").Record = .{
+        defer alloc.free(replication_payload);
+        const replication_record: @import("replication_record.zig").Record = .{
             .kind = .metadata_mutation,
             .payload_codec = .json,
             .cluster_id = 1,
@@ -399,7 +400,7 @@ test "self-FK owner retains one fence through parent ACK and atomic child instal
             .epoch = 1,
             .lsn = 1,
             .previous_lsn = 0,
-            .payload = ha_payload,
+            .payload = replication_payload,
         };
         {
             var standby = try db_mod.DB.open(alloc, standby_path, options);
@@ -408,7 +409,7 @@ test "self-FK owner retains one fence through parent ACK and atomic child instal
             try standby.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .begin, .fence = fence } }, .{ .term = 2, .index = 1 });
             try standby.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .stage_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 2, .index = 2 });
             try standby.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .activate_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 2, .index = 3 });
-            try std.testing.expectError(error.GenerationAdmissionAcknowledgementPending, standby.applyHAReplicationRecord(ha_record));
+            try std.testing.expectError(error.GenerationAdmissionAcknowledgementPending, replication_ingress.applyRecord(&standby, replication_record));
             try std.testing.expect((try standby.relationalTopologyStatus()).fence.?.eql(fence));
             const old = (try standby.getSchemaJson(alloc)).?;
             defer alloc.free(old);
@@ -419,8 +420,8 @@ test "self-FK owner retains one fence through parent ACK and atomic child instal
             defer standby.close();
             try std.testing.expect((try standby.relationalTopologyStatus()).fence.?.eql(fence));
             try standby.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .acknowledge_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 2, .index = 4 });
-            try standby.applyHAReplicationRecord(ha_record);
-            try standby.applyHAReplicationRecord(ha_record);
+            try replication_ingress.applyRecord(&standby, replication_record);
+            try replication_ingress.applyRecord(&standby, replication_record);
             try std.testing.expect((try standby.relationalTopologyStatus()).fence == null);
             const after = (try standby.getSchemaJson(alloc)).?;
             defer alloc.free(after);
@@ -626,7 +627,7 @@ test "child FK generation schema install commits catalog and source release with
     defer if (standby_open) standby.close();
     try standby.setSchemaJson(alloc, before_json);
     try standby.applyRelationalTopologyControl(.{ .action = .begin, .fence = fence }, null);
-    const effects = @import("../hot_standby/effects.zig");
+    const effects = @import("replication_effects.zig");
     const bad_payload = try effects.encodePublishedChildSchemaMetadataMutationAlloc(alloc, runtime_schema, after_json, .{
         .fence = fence,
         .before_schema_json_digest = before_schema_json_digest,
@@ -637,7 +638,7 @@ test "child FK generation schema install commits catalog and source release with
         .applied_index = publication.raft_entry.index,
     });
     defer alloc.free(bad_payload);
-    const bad_record: @import("../hot_standby/replication_record.zig").Record = .{
+    const bad_record: @import("replication_record.zig").Record = .{
         .kind = .metadata_mutation,
         .payload_codec = .json,
         .cluster_id = 1,
@@ -647,7 +648,7 @@ test "child FK generation schema install commits catalog and source release with
         .previous_lsn = 0,
         .payload = bad_payload,
     };
-    try std.testing.expectError(error.IntegrityCatalogChanged, standby.applyHAReplicationRecord(bad_record));
+    try std.testing.expectError(error.IntegrityCatalogChanged, replication_ingress.applyRecord(&standby, bad_record));
     const payload = try effects.encodePublishedChildSchemaMetadataMutationAlloc(alloc, runtime_schema, after_json, .{
         .fence = fence,
         .before_schema_json_digest = before_schema_json_digest,
@@ -658,7 +659,7 @@ test "child FK generation schema install commits catalog and source release with
         .applied_index = publication.raft_entry.index,
     });
     defer alloc.free(payload);
-    const record: @import("../hot_standby/replication_record.zig").Record = .{
+    const record: @import("replication_record.zig").Record = .{
         .kind = .metadata_mutation,
         .payload_codec = .json,
         .cluster_id = 1,
@@ -668,8 +669,8 @@ test "child FK generation schema install commits catalog and source release with
         .previous_lsn = 0,
         .payload = payload,
     };
-    try standby.applyHAReplicationRecord(record);
-    try standby.applyHAReplicationRecord(record);
+    try replication_ingress.applyRecord(&standby, record);
+    try replication_ingress.applyRecord(&standby, record);
     const standby_schema = (try standby.getSchemaJson(alloc)).?;
     defer alloc.free(standby_schema);
     try std.testing.expectEqualStrings(after_json, standby_schema);
@@ -782,9 +783,9 @@ test "initial FK child owner stays hidden across restart until replicated releas
         standby_options.initial_child_bootstrap = bootstrap;
         var standby = try db_mod.DB.open(alloc, standby_path, standby_options);
         defer standby.close();
-        const payload = try @import("../hot_standby/effects.zig").encodeInitialChildMutationRequestAlloc(alloc, .{ .relational_topology = provision }, .{ .term = 2, .index = 1 });
+        const payload = try @import("replication_effects.zig").encodeInitialChildMutationRequestAlloc(alloc, .{ .relational_topology = provision }, .{ .term = 2, .index = 1 });
         defer alloc.free(payload);
-        const ha_record: @import("../hot_standby/replication_record.zig").RecordView = .{
+        const replication_record: @import("replication_record.zig").RecordView = .{
             .kind = .batch_mutation,
             .payload_codec = .json,
             .cluster_id = 1,
@@ -794,8 +795,8 @@ test "initial FK child owner stays hidden across restart until replicated releas
             .previous_lsn = 0,
             .payload = payload,
         };
-        try standby.applyHAReplicationRecord(ha_record);
-        try standby.applyHAReplicationRecord(ha_record);
+        try replication_ingress.applyRecord(&standby, replication_record);
+        try replication_ingress.applyRecord(&standby, replication_record);
         try std.testing.expectError(error.InitialChildNotPublished, standby.lookup(alloc, "leak", .{}));
         const replayed = try standby.core.store.get(alloc, hidden.key);
         defer alloc.free(replayed);
@@ -866,9 +867,9 @@ test "initial FK child owner stays hidden across restart until replicated releas
         var standby = try db_mod.DB.open(alloc, standby_path, standby_options);
         var standby_open = true;
         defer if (standby_open) standby.close();
-        const payload = try @import("../hot_standby/effects.zig").encodeInitialChildMutationRequestAlloc(alloc, .{ .relational_topology = release }, .{ .term = 2, .index = 2 });
+        const payload = try @import("replication_effects.zig").encodeInitialChildMutationRequestAlloc(alloc, .{ .relational_topology = release }, .{ .term = 2, .index = 2 });
         defer alloc.free(payload);
-        const record: @import("../hot_standby/replication_record.zig").RecordView = .{
+        const record: @import("replication_record.zig").RecordView = .{
             .kind = .batch_mutation,
             .payload_codec = .json,
             .cluster_id = 1,
@@ -878,8 +879,8 @@ test "initial FK child owner stays hidden across restart until replicated releas
             .previous_lsn = 1,
             .payload = payload,
         };
-        try standby.applyHAReplicationRecord(record);
-        try standby.applyHAReplicationRecord(record);
+        try replication_ingress.applyRecord(&standby, record);
+        try replication_ingress.applyRecord(&standby, record);
         const replayed = try standby.core.store.get(alloc, hidden.key);
         defer alloc.free(replayed);
         try std.testing.expectEqualSlices(u8, stored, replayed);
@@ -1286,7 +1287,7 @@ test "relational integrity accepted generation survives restart and bounded two-
         var staged = try transition.beginStaging();
         defer staged.deinit();
         try std.testing.expectError(error.CoordinatedConstraintRestoreRequired, db_mod.DB.restoreSnapshotToStagedGeneration(&staged, alloc, snapshot_path, staged.path(), options));
-        try db_mod.DB.restoreCoherentHASeedReplicaToStagedGeneration(&staged, alloc, snapshot_path, staged.path(), options, namespace);
+        try db_mod.DB.restoreAuthenticatedReplicaToStagedGeneration(&staged, alloc, snapshot_path, staged.path(), options, namespace);
         var staged_options = options;
         staged_options.staged_generation = &staged;
         var seeded = try db_mod.DB.open(alloc, staged.path(), staged_options);
@@ -1304,9 +1305,9 @@ test "relational integrity accepted generation survives restart and bounded two-
 fn applyRestoreReplica(db: *db_mod.DB, request: @import("types.zig").BatchRequest, index: u64, ha: bool) !void {
     if (!ha) return db.batchRaftReplicatedApply(request, .{ .term = 1, .index = index });
     const alloc = std.testing.allocator;
-    const payload = try @import("../hot_standby/effects.zig").encodeBatchMutationRequestAlloc(alloc, request);
+    const payload = try @import("replication_effects.zig").encodeBatchMutationRequestAlloc(alloc, request);
     defer alloc.free(payload);
-    try db.applyHAReplicationRecord(.{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = index, .previous_lsn = index - 1, .payload = payload });
+    try replication_ingress.applyRecord(db, .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = index, .previous_lsn = index - 1, .payload = payload });
 }
 
 test "relational integrity restore follower repairs projection and CHECK debt before validated receipt" {
@@ -1347,7 +1348,7 @@ test "relational integrity restore follower repairs projection and CHECK debt be
         const encoded = try @import("../schema.zig").serializeSchema(owned, target.core.schema.?);
         const scope: restore.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = source_options.identity_namespace.?, .target_namespace = options.identity_namespace.?, .target_schema_digest = restore.digest(encoded) };
         try target.reserveRestoreStagingScoped(alloc, scope);
-        if (ha) target.ha_write_gate = .{ .shared = .{ .state = gate.storageWriteState() } };
+        if (ha) target.replication_write_gate = .{ .shared = .{ .state = gate.storageWriteState() } };
         try applyRestoreReplica(&target, .{ .restore_staging = .{ .begin = scope } }, 1, ha);
         var index: u64 = 2;
         var crashed = false;
@@ -1362,7 +1363,7 @@ test "relational integrity restore follower repairs projection and CHECK debt be
                     open = false;
                     target = try db_mod.DB.open(alloc, path, options);
                     open = true;
-                    if (ha) target.ha_write_gate = .{ .shared = .{ .state = gate.storageWriteState() } };
+                    if (ha) target.replication_write_gate = .{ .shared = .{ .state = gate.storageWriteState() } };
                     try applyRestoreReplica(&target, batch, index, ha);
                     // Model the last physical projection watermark being
                     // lost at the crash cut while the primary Raft/HA receipt
@@ -1409,7 +1410,7 @@ test "relational integrity restore follower repairs projection and CHECK debt be
         const validate_index = index + 1;
         const validate: @import("types.zig").BatchRequest = .{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .validated } } };
         try std.testing.expectError(error.RestoreProjectionCatchUpPending, applyRestoreReplica(&target, validate, validate_index, ha));
-        if (ha) try std.testing.expectEqual(index, try target.haAppliedReplicationLsn()) else try std.testing.expectEqual(index, (try target.raftAppliedEntry()).?.index);
+        if (ha) try std.testing.expectEqual(index, try target.replicationAppliedSequence()) else try std.testing.expectEqual(index, (try target.raftAppliedEntry()).?.index);
         try std.testing.expectError(error.RestoreStagingInProgress, target.lookup(alloc, "row-0000", .{}));
         var validated = false;
         // CHECK repair is time-sliced: a loaded runner can process only one
@@ -1707,7 +1708,7 @@ test "relational integrity scoped two phase resolution mirrors binary claims thr
     const alloc = std.testing.allocator;
     const restore = @import("restore_staging.zig");
     const primary_mod = @import("../hot_standby/primary.zig");
-    const effects = @import("../hot_standby/effects.zig");
+    const effects = @import("replication_effects.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -1752,8 +1753,8 @@ test "relational integrity scoped two phase resolution mirrors binary claims thr
     const slots_path = try std.fmt.allocPrintSentinel(owned, ".zig-cache/tmp/{s}/ha-2pc-slots", .{tmp.sub_path}, 0);
     var primary = try primary_mod.Primary.open(alloc, log_path, slots_path, .{ .cluster_id = 1, .timeline_id = 1, .epoch = 1, .table_id = 10, .shard_id = 11 }, .{});
     defer primary.close();
-    target.ha_async_batch_mirror = .{ .publisher = ha_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .async } };
-    defer target.ha_async_batch_mirror = null;
+    target.replication_async_batch_mirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .async } };
+    defer target.replication_async_batch_mirror = null;
     var view = target.core.acquireSchemaView().?;
     defer view.release();
     var tuple_plan = try tuples.TuplePlan.init(alloc, view.tableSchema().*, view.physicalLayout(), &.{.{ .column = "id" }});
@@ -1773,7 +1774,7 @@ test "relational integrity scoped two phase resolution mirrors binary claims thr
     defer decoded.deinit();
     try std.testing.expectEqualSlices(u8, &scope.digest(), &decoded.value.request.restore_staging_scope.?);
     try std.testing.expect(decoded.value.request.restore_staging == null);
-    try replica.applyHAReplicationRecord(entry.record);
+    try replication_ingress.applyRecord(&replica, entry.record);
     const claim_key = address.claimKey();
     const expected = (try target.core.getStoreValue(alloc, &claim_key)).?;
     defer alloc.free(expected);
@@ -1785,7 +1786,7 @@ test "relational integrity scoped two phase resolution mirrors binary claims thr
 test "relational integrity live two phase HA replay preserves rows and binary claim reference effects" {
     const alloc = std.testing.allocator;
     const primary_mod = @import("../hot_standby/primary.zig");
-    const effects = @import("../hot_standby/effects.zig");
+    const effects = @import("replication_effects.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -1807,8 +1808,8 @@ test "relational integrity live two phase HA replay preserves rows and binary cl
     const slots_path = try std.fmt.allocPrintSentinel(owned, ".zig-cache/tmp/{s}/live-slots", .{tmp.sub_path}, 0);
     var primary = try primary_mod.Primary.open(alloc, log_path, slots_path, .{ .cluster_id = 1, .timeline_id = 1, .epoch = 1, .table_id = 10, .shard_id = 11 }, .{});
     defer primary.close();
-    db.ha_async_batch_mirror = .{ .publisher = ha_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .async } };
-    defer db.ha_async_batch_mirror = null;
+    db.replication_async_batch_mirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .async } };
+    defer db.replication_async_batch_mirror = null;
     var view = db.core.acquireSchemaView().?;
     defer view.release();
     var plan = try tuples.TuplePlan.init(alloc, view.tableSchema().*, view.physicalLayout(), &.{.{ .column = "id" }});
@@ -1845,8 +1846,8 @@ test "relational integrity live two phase HA replay preserves rows and binary cl
         try std.testing.expect(decoded.value.request.restore_staging_scope == null);
         // The same bytes remain forbidden to the unauthenticated raw batch API.
         try std.testing.expectError(error.InvalidIntegrityOperation, replica.batch(decoded.value.request));
-        try replica.applyHAReplicationRecord(entry.record);
-        try replica.applyHAReplicationRecord(entry.record);
+        try replication_ingress.applyRecord(&replica, entry.record);
+        try replication_ingress.applyRecord(&replica, entry.record);
     }
     try replica.applyRelationalTopologyControl(.{ .fence = fence, .action = .release }, null);
     var row = (try replica.lookup(alloc, "p", .{})).?;
@@ -1866,11 +1867,11 @@ test "relational integrity live two phase HA replay preserves rows and binary cl
     while (lsn <= primary.lastLsn()) : (lsn += 1) {
         var entry = (try primary.log.entryAt(alloc, lsn)).?;
         defer entry.deinit(alloc);
-        try replica.applyHAReplicationRecord(entry.record);
+        try replication_ingress.applyRecord(&replica, entry.record);
     }
     try std.testing.expect((try replica.lookup(alloc, "p", .{})) == null);
     for ([_][]const u8{ &claim_key, &reference_key }) |key| try std.testing.expect((try replica.core.getStoreValue(alloc, key)) == null);
-    const before_invalid = try replica.haAppliedReplicationLsn();
+    const before_invalid = try replica.replicationAppliedSequence();
     const invalid_address = try integrity.Address.init(@splat(199), tuple.items);
     const invalid_key = invalid_address.claimKey();
     const invalid_value = try claim.encode(alloc, invalid_address);
@@ -1880,8 +1881,8 @@ test "relational integrity live two phase HA replay preserves rows and binary cl
     }, .{});
     var invalid_entry = (try primary.log.entryAt(alloc, invalid_lsn)).?;
     defer invalid_entry.deinit(alloc);
-    try std.testing.expectError(error.IntegrityCatalogChanged, replica.applyHAReplicationRecord(invalid_entry.record));
-    try std.testing.expectEqual(before_invalid, try replica.haAppliedReplicationLsn());
+    try std.testing.expectError(error.IntegrityCatalogChanged, replication_ingress.applyRecord(&replica, invalid_entry.record));
+    try std.testing.expectEqual(before_invalid, try replica.replicationAppliedSequence());
 }
 
 test "relational integrity DB transactions atomically preserve cross-table parent dependencies" {
@@ -2270,7 +2271,7 @@ fn testMergeIntegrityHandoff(comptime rollback: bool, comptime empty: bool, comp
     var primary: @import("../hot_standby/primary.zig").Primary = if (ha) try @import("../hot_standby/primary.zig").Primary.open(alloc, try std.fmt.allocPrintSentinel(owned, ".zig-cache/tmp/{s}/ha-log", .{tmp.sub_path}, 0), try std.fmt.allocPrintSentinel(owned, ".zig-cache/tmp/{s}/ha-slots", .{tmp.sub_path}, 0), .{ .cluster_id = 901, .timeline_id = 1, .epoch = 1 }, .{}) else undefined;
     defer if (ha) primary.close();
     const source_options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 900, .shard_id = 901 }, .primary_backend = .{ .lsm = .{} } };
-    const destination_options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 900, .shard_id = 902 }, .primary_backend = .{ .lsm = .{} }, .ha_async_batch_mirror = if (ha) .{ .publisher = ha_publisher_adapter.bind(&primary) } else null, .ha_write_gate = if (ha) .{ .primary = ha_write_gate_adapter.bindPrimary(&primary) } else null };
+    const destination_options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 900, .shard_id = 902 }, .primary_backend = .{ .lsm = .{} }, .replication_async_batch_mirror = if (ha) .{ .publisher = hot_standby_publisher_adapter.bind(&primary) } else null, .replication_write_gate = if (ha) .{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) } else null };
     var source = try db_mod.DB.open(alloc, source_path, source_options);
     defer source.close();
     var destination = try db_mod.DB.open(alloc, destination_path, destination_options);
@@ -2283,8 +2284,8 @@ fn testMergeIntegrityHandoff(comptime rollback: bool, comptime empty: bool, comp
     try source.setSchemaJson(alloc, schema);
     try destination.setSchemaJson(alloc, schema);
     var standby_options = destination_options;
-    standby_options.ha_async_batch_mirror = null;
-    standby_options.ha_write_gate = null;
+    standby_options.replication_async_batch_mirror = null;
+    standby_options.replication_write_gate = null;
     var standby: db_mod.DB = if (ha) try db_mod.DB.open(alloc, try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/standby", .{tmp.sub_path}), standby_options) else undefined;
     defer if (ha) standby.close();
     if (ha) {
@@ -2369,7 +2370,7 @@ fn testMergeIntegrityHandoff(comptime rollback: bool, comptime empty: bool, comp
         _ = try read.get(&imported.?.claimKey());
         _ = try read.get(&retained.?.claimKey());
         try std.testing.expectError(error.NotFound, read.get(handoff.manifest_key));
-        if (ha) try verifyMergeHAReplay(&primary, replay_start, &standby, imported.?, retained.?, false);
+        if (ha) try verifyMergeReplicationReplay(&primary, replay_start, &standby, imported.?, retained.?, false);
         return;
     }
     checkpoint.kind = .rollback;
@@ -2396,16 +2397,16 @@ fn testMergeIntegrityHandoff(comptime rollback: bool, comptime empty: bool, comp
     try std.testing.expectError(error.NotFound, read.get(&imported.?.claimKey()));
     _ = try read.get(&retained.?.claimKey());
     try std.testing.expectError(error.NotFound, read.get(handoff.manifest_key));
-    if (ha) try verifyMergeHAReplay(&primary, replay_start, &standby, imported.?, retained.?, true);
+    if (ha) try verifyMergeReplicationReplay(&primary, replay_start, &standby, imported.?, retained.?, true);
 }
 
-fn verifyMergeHAReplay(primary: *@import("../hot_standby/primary.zig").Primary, start_lsn: u64, standby: *db_mod.DB, imported: integrity.Address, retained: integrity.Address, rollback: bool) !void {
+fn verifyMergeReplicationReplay(primary: *@import("../hot_standby/primary.zig").Primary, start_lsn: u64, standby: *db_mod.DB, imported: integrity.Address, retained: integrity.Address, rollback: bool) !void {
     var lsn = start_lsn;
     while (lsn <= primary.lastLsn()) : (lsn += 1) {
         var entry = (try primary.log.entryAt(std.testing.allocator, lsn)) orelse return error.TestUnexpectedResult;
         defer entry.deinit(std.testing.allocator);
-        try standby.applyHAReplicationRecord(entry.record);
-        try standby.applyHAReplicationRecord(entry.record);
+        try replication_ingress.applyRecord(&standby, entry.record);
+        try replication_ingress.applyRecord(&standby, entry.record);
     }
     try std.testing.expect((try standby.relationalTopologyStatus()).fence == null);
     try std.testing.expectEqualStrings(if (rollback) "m" else "", standby.getRange().end);
@@ -2446,8 +2447,8 @@ test "relational integrity historical restore stays fenced while coherent HA see
     try std.testing.expectError(error.CoordinatedConstraintRestoreRequired, db_mod.DB.restoreSnapshotToStagedGeneration(&staged, alloc, snapshot_path, staged.path(), options));
     var wrong = namespace;
     wrong.table_id += 1;
-    try std.testing.expectError(error.IdentityNamespaceMismatch, db_mod.DB.restoreCoherentHASeedReplicaToStagedGeneration(&staged, alloc, snapshot_path, staged.path(), options, wrong));
-    try db_mod.DB.restoreCoherentHASeedReplicaToStagedGeneration(&staged, alloc, snapshot_path, staged.path(), options, namespace);
+    try std.testing.expectError(error.IdentityNamespaceMismatch, db_mod.DB.restoreAuthenticatedReplicaToStagedGeneration(&staged, alloc, snapshot_path, staged.path(), options, wrong));
+    try db_mod.DB.restoreAuthenticatedReplicaToStagedGeneration(&staged, alloc, snapshot_path, staged.path(), options, namespace);
     var staged_options = options;
     staged_options.staged_generation = &staged;
     var restored = try db_mod.DB.open(alloc, staged.path(), staged_options);

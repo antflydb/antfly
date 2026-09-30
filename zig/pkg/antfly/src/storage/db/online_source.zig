@@ -16,7 +16,8 @@
 //! Transactional source retention lifecycle. Exactly sixteen reusable catalog
 //! slots bound metadata growth; the retained journal's epoch high-watermark
 //! prevents old admissions from resurrecting after a terminal slot is reused.
-const ha_publisher_adapter = @import("../hot_standby/db_commit.zig");
+
+const replication_ingress = @import("replication_ingress.zig");
 const std = @import("std");
 const retained = @import("../retained_effects.zig");
 const topology = @import("relational_integrity_topology.zig");
@@ -526,7 +527,7 @@ test "relational index system online source controls survive LSM reopen with ato
 
 test "relational index system online source standby replay preserves admission certificate and final cut clocks" {
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-    const effects = @import("../hot_standby/effects.zig");
+    const effects = @import("replication_effects.zig");
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -571,9 +572,9 @@ test "relational index system online source standby replay preserves admission c
         else
             try effects.encodeBatchMutationRequestAlloc(alloc, request);
         defer alloc.free(payload);
-        const record: @import("../hot_standby/replication_record.zig").RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = lsn, .previous_lsn = lsn - 1, .payload = payload };
-        try standby.applyHAReplicationRecord(record);
-        try standby.applyHAReplicationRecord(record);
+        const record: @import("replication_record.zig").RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = lsn, .previous_lsn = lsn - 1, .payload = payload };
+        try replication_ingress.applyRecord(&standby, record);
+        try replication_ingress.applyRecord(&standby, record);
         if (i == 0) {
             certificate = try source.prepareOnlineSourcePublication(scope, .none);
             const replica_certificate = try standby.prepareOnlineSourcePublication(scope, .none);
@@ -589,7 +590,7 @@ test "relational index system online source standby replay preserves admission c
         const primary_progress = encode(primary_value);
         const standby_progress = encode(standby_value);
         try std.testing.expectEqualSlices(u8, &primary_progress, &standby_progress);
-        try std.testing.expectEqual(lsn, try standby.haAppliedReplicationLsn());
+        try std.testing.expectEqual(lsn, try standby.replicationAppliedSequence());
     }
     try std.testing.expectEqual(@as(u64, 11), (try standby.onlineSourceStatus(scope)).admitted_applied_index);
     try std.testing.expectEqual(@as(u64, 14), (try standby.onlineSourceStatus(scope)).applied_index);
@@ -601,94 +602,10 @@ test "relational index system online source standby replay preserves admission c
     try std.testing.expectEqualSlices(u8, &expected_certificate, &(try source.onlineSourceStatus(scope)).snapshot_certificate);
 }
 
-test "relational index system online source durable standby outbox resumes before already applied Raft receipt" {
-    try sourceOutboxRecovery(false);
-}
-
-test "relational index system native rewrite source clock is forwarded by durable outbox across lost acknowledgement" {
-    try sourceOutboxRecovery(true);
-}
-
-fn sourceOutboxRecovery(native_authority: bool) !void {
-    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-    const primary_mod = @import("../hot_standby/primary.zig");
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const owned = arena.allocator();
-    const path = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/source-outbox", .{tmp.sub_path});
-    const log_path = try std.fmt.allocPrintSentinel(owned, ".zig-cache/tmp/{s}/log", .{tmp.sub_path}, 0);
-    const slots_path = try std.fmt.allocPrintSentinel(owned, ".zig-cache/tmp/{s}/slots", .{tmp.sub_path}, 0);
-    var primary = try primary_mod.Primary.open(alloc, log_path, slots_path, .{ .cluster_id = 1, .timeline_id = 1, .epoch = 1, .table_id = 1, .shard_id = 2 }, .{});
-    defer primary.close();
-    try primary.createSlot("standby", 0);
-    const Ack = struct {
-        calls: usize = 0,
-        fn wait(ptr: *anyopaque, stream_ctx: *anyopaque, lsn: u64, _: primary_mod.SyncPolicy) !void {
-            const stream: *primary_mod.Primary = @ptrCast(@alignCast(stream_ctx));
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.calls += 1;
-            if (self.calls == 1) return error.InjectedSourceMirrorWaitFailure;
-            try stream.standbyStatusUpdate("standby", 1, lsn, lsn);
-        }
-    };
-    var ack: Ack = .{};
-    const options: db_mod.OpenOptions = .{ .online_source_authority = if (native_authority) .native else null, .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
-    var scope: Scope = undefined;
-    {
-        var db = try db_mod.DB.open(alloc, path, options);
-        defer db.close();
-        try db.setSchemaJson(alloc, "{}");
-        const owner = try db.relationalTopologyIdentity();
-        scope = .{
-            .authority = if (native_authority) .native else .raft,
-            .fence = .{ .admission_epoch = owner.next_epoch, .transition_id = 44, .attempt = 1, .peer_group_id = 3, .owner_group_id = 2, .role = if (native_authority) .rewrite_source else .merge_source, .namespace = owner.namespace, .catalog_digest = owner.catalog_digest },
-            .receiver_namespace = .{ .table_id = if (native_authority) 4 else 1, .shard_id = 3, .range_id = 3 },
-            .consumer_epoch = 1,
-            .copy_attempt = .{ .donor_term = if (native_authority) 0 else 1, .sequence = 1 },
-        };
-        db.ha_async_batch_mirror = .{ .publisher = ha_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .remote_write, .standby_names = &.{"standby"}, .failure_policy = .block }, .sync_wait_ctx = &ack, .sync_wait_fn = Ack.wait };
-        const request: @import("types.zig").BatchRequest = .{ .online_source = .{ .admit = .{ .scope = scope } } };
-        try std.testing.expectError(error.InjectedSourceMirrorWaitFailure, if (native_authority) db.batch(request) else db.batchRaftReplicatedApply(request, .{ .term = 1, .index = 11 }));
-        try std.testing.expectEqual(@as(u64, if (native_authority) 1 else 11), (try db.onlineSourceStatus(scope)).admitted_applied_index);
-        try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
-        // Simulate loss of process-local mirror state before its outstanding
-        // acknowledgement can complete. The owner/outbox remain durable.
-        db.ha_async_batch_mirror = null;
-    }
-    {
-        var db = try db_mod.DB.open(alloc, path, options);
-        defer db.close();
-        db.ha_async_batch_mirror = .{ .publisher = ha_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .remote_write, .standby_names = &.{"standby"}, .failure_policy = .block }, .sync_wait_ctx = &ack, .sync_wait_fn = Ack.wait };
-        const request: @import("types.zig").BatchRequest = .{ .online_source = .{ .admit = .{ .scope = scope } } };
-        if (native_authority) try db.batch(request) else try db.batchRaftReplicatedApply(request, .{ .term = 1, .index = 11 });
-        try std.testing.expect(ack.calls >= 2);
-        try std.testing.expectEqual(@as(u64, if (native_authority) 2 else 1), primary.lastLsn());
-        var entry = (try primary.log.entryAt(alloc, 1)) orelse return error.TestUnexpectedResult;
-        defer entry.deinit(alloc);
-        var decoded = try @import("../hot_standby/effects.zig").decodeBatchMutationRequest(alloc, entry.record);
-        defer decoded.deinit();
-        try std.testing.expectEqual(@as(?u64, if (native_authority) 1 else 11), decoded.value.online_source_applied_index);
-        try std.testing.expectEqualSlices(u8, &scope.pin(), &decoded.value.request.online_source.?.scope().pin());
-        if (native_authority) {
-            var retry = (try primary.log.entryAt(alloc, 2)).?;
-            defer retry.deinit(alloc);
-            var retry_decoded = try @import("../hot_standby/effects.zig").decodeBatchMutationRequest(alloc, retry.record);
-            defer retry_decoded.deinit();
-            try std.testing.expectEqual(@as(?u64, 2), retry_decoded.value.online_source_applied_index);
-            try std.testing.expectEqual(.native, retry_decoded.value.request.online_source.?.scope().authority);
-            try std.testing.expectEqual(@as(u64, 1), (try db.onlineSourceStatus(scope)).admitted_applied_index);
-            try std.testing.expect((try db.raftAppliedEntry()) == null);
-        }
-    }
-}
-
 test "relational index system native rewrite authority clocks survive pin crash ordinary writes and exact standby replay" {
     const DB = @import("antfly_source_root").antfly_sources.physical_db;
     const clock = @import("../source_authority.zig");
-    const effects = @import("../hot_standby/effects.zig");
+    const effects = @import("replication_effects.zig");
     const pin = @import("source_pin.zig");
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -716,9 +633,9 @@ test "relational index system native rewrite authority clocks survive pin crash 
         fn replay(db: *DB.DB, request: @import("types.zig").BatchRequest, sequence_value: u64, lsn: u64) !void {
             const payload = if (request.online_source != null) try effects.encodeOnlineSourceMutationRequestAlloc(alloc, request, sequence_value) else try effects.encodeBatchMutationRequestAlloc(alloc, request);
             defer alloc.free(payload);
-            const record: @import("../hot_standby/replication_record.zig").RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = lsn, .previous_lsn = lsn - 1, .payload = payload };
-            try db.applyHAReplicationRecord(record);
-            try db.applyHAReplicationRecord(record);
+            const record: @import("replication_record.zig").RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = lsn, .previous_lsn = lsn - 1, .payload = payload };
+            try replication_ingress.applyRecord(&db, record);
+            try replication_ingress.applyRecord(&db, record);
         }
     };
     const admit: @import("types.zig").BatchRequest = .{ .online_source = .{ .admit = .{ .scope = scope } } };
@@ -752,7 +669,7 @@ test "relational index system native rewrite authority clocks survive pin crash 
     try Helper.replay(&replica, begin, 0, 4);
     const finish: @import("types.zig").BatchRequest = .{ .online_source = .{ .final_fence = .{ .scope = scope, .expected_sequence = 1 } } };
     try std.testing.expectError(error.OnlineSourceScopeChanged, Helper.replay(&replica, finish, 9, 5));
-    try std.testing.expectEqual(@as(u64, 4), try replica.haAppliedReplicationLsn());
+    try std.testing.expectEqual(@as(u64, 4), try replica.replicationAppliedSequence());
     try primary.batch(finish);
     try Helper.replay(&replica, finish, 4, 5);
     const final = try primary.onlineSourceStatus(scope);

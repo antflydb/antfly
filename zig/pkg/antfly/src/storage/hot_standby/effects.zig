@@ -26,7 +26,7 @@ const change_journal = @import("../db/derived/change_journal.zig");
 pub const primary_effect = codecs.primary_effect;
 const db_types = @import("../db/types.zig");
 const primary_mod = @import("primary.zig");
-const replication_record = @import("replication_record.zig");
+const replication_record = @import("../db/replication_record.zig");
 const schema_mod = @import("../schema.zig");
 
 var test_path_counter: u64 = 0;

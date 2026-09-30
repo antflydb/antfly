@@ -4,6 +4,7 @@ zig/examples/antfly_lite_cli_smoke.zig
 zig/examples/antfly_wasm.zig
 zig/lib/httpx/src/tls/check_client_compat.sh
 zig/lib/pdf/integration_fixture.zig
+zig/lib/runtime/src/mutation_barrier.zig
 zig/lib/sql/grammar/antfly_sql.y
 zig/pdf_standard_fonts.zig
 zig/pkg/antfly-embedded/shaders/attention.wgsl
@@ -222,7 +223,6 @@ zig/pkg/antfly/src/metadata/store_root_enrollment.zig
 zig/pkg/antfly/src/metadata/topology_protocol.zig
 zig/pkg/antfly/src/raft/feature_reads.zig
 zig/pkg/antfly/src/raft/read_gate.zig
-zig/pkg/antfly/src/raft/storage/backup_restore.zig
 zig/pkg/antfly/src/raft/storage/catalog.zig
 zig/pkg/antfly/src/runtime_bridge.zig
 zig/pkg/antfly/src/runtime_callback_abi.zig
@@ -320,6 +320,7 @@ zig/pkg/antfly/src/storage/background_runtime.zig
 zig/pkg/antfly/src/storage/backup_bundle.zig
 zig/pkg/antfly/src/storage/backup_bundle_io.zig
 zig/pkg/antfly/src/storage/backup_codec.zig
+zig/pkg/antfly/src/storage/backup_restore.zig
 zig/pkg/antfly/src/storage/byte_range.zig
 zig/pkg/antfly/src/storage/commit_participant.zig
 zig/pkg/antfly/src/storage/coordinated_ttl.zig
@@ -483,7 +484,6 @@ zig/pkg/antfly/src/storage/db/graph_mutation_scopes.zig
 zig/pkg/antfly/src/storage/db/graph_retirement_config.zig
 zig/pkg/antfly/src/storage/db/graph_retirement_seal.zig
 zig/pkg/antfly/src/storage/db/graph_state_name.zig
-zig/pkg/antfly/src/storage/db/ha_contract.zig
 zig/pkg/antfly/src/storage/db/lease.zig
 zig/pkg/antfly/src/storage/db/maintenance/graph_metric_runtime.zig
 zig/pkg/antfly/src/storage/db/maintenance/sparse_compaction_runtime.zig
@@ -520,6 +520,7 @@ zig/pkg/antfly/src/storage/db/planning_adapter.zig
 zig/pkg/antfly/src/storage/db/planning_bindings.zig
 zig/pkg/antfly/src/storage/db/planning_collectors.zig
 zig/pkg/antfly/src/storage/db/planning_stats.zig
+zig/pkg/antfly/src/storage/db/primary_effect.zig
 zig/pkg/antfly/src/storage/db/promotion_runtime.zig
 zig/pkg/antfly/src/storage/db/publication.zig
 zig/pkg/antfly/src/storage/db/query/control_contract.zig
@@ -576,8 +577,11 @@ zig/pkg/antfly/src/storage/db/relational_row_transform.zig
 zig/pkg/antfly/src/storage/db/relational_rows.zig
 zig/pkg/antfly/src/storage/db/relational_store.zig
 zig/pkg/antfly/src/storage/db/relational_transition_contract.zig
+zig/pkg/antfly/src/storage/db/replication_contract.zig
 zig/pkg/antfly/src/storage/db/replication_effects.zig
+zig/pkg/antfly/src/storage/db/replication_ingress.zig
 zig/pkg/antfly/src/storage/db/replication_policy.zig
+zig/pkg/antfly/src/storage/db/replication_record.zig
 zig/pkg/antfly/src/storage/db/resolution_handoff.zig
 zig/pkg/antfly/src/storage/db/resolution_runtime.zig
 zig/pkg/antfly/src/storage/db/restore_generation_admissions.zig
@@ -629,13 +633,10 @@ zig/pkg/antfly/src/storage/hot_standby/commit_gate.zig
 zig/pkg/antfly/src/storage/hot_standby/db_commit.zig
 zig/pkg/antfly/src/storage/hot_standby/effects.zig
 zig/pkg/antfly/src/storage/hot_standby/fencing.zig
-zig/pkg/antfly/src/storage/hot_standby/mutation_barrier.zig
 zig/pkg/antfly/src/storage/hot_standby/primary.zig
-zig/pkg/antfly/src/storage/hot_standby/primary_effect.zig
 zig/pkg/antfly/src/storage/hot_standby/public_gate_state.zig
 zig/pkg/antfly/src/storage/hot_standby/read_gate.zig
 zig/pkg/antfly/src/storage/hot_standby/replication_log.zig
-zig/pkg/antfly/src/storage/hot_standby/replication_record.zig
 zig/pkg/antfly/src/storage/hot_standby/restore_owner_contract.zig
 zig/pkg/antfly/src/storage/hot_standby/seed_topology.zig
 zig/pkg/antfly/src/storage/hot_standby/session.zig
@@ -706,7 +707,7 @@ zig/pkg/antfly/src/storage/maintenance_signal.zig
 zig/pkg/antfly/src/storage/mem_backend.zig
 zig/pkg/antfly/src/storage/mem_ordered.zig
 zig/pkg/antfly/src/storage/memory_budget.zig
-zig/pkg/antfly/src/storage/metadata_ha_port.zig
+zig/pkg/antfly/src/storage/metadata_hot_standby_port.zig
 zig/pkg/antfly/src/storage/native_artifact_sink.zig
 zig/pkg/antfly/src/storage/native_read_scratch_pool.zig
 zig/pkg/antfly/src/storage/object_storage.zig
@@ -783,3 +784,5 @@ zig/pkg/antfly/src/usermgr/row_policy_authority.zig
 zig/pkg/antfly/src/usermgr/storage_adapter.zig
 zig/pkg/antfly/src/usermgr/storage_imports.zig
 zig/pkg/antfly/src/usermgr/user_manager.zig
+zig/tools/audit_embedded_source_boundary.py
+zig/tools/test_audit_embedded_source_boundary.py

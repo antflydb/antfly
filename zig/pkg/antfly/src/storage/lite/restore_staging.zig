@@ -30,7 +30,7 @@ const internal_keys = @import("../internal_keys.zig");
 const portable_backup = @import("../portable_backup.zig");
 const query_api = @import("../../api/query.zig");
 const tables_api = @import("../../api/local_tables.zig");
-const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
+const table_writes = @import("../../api/local_table_writes.zig");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const full_text_index_defaults = @import("../../common/full_text_index_defaults.zig");
 

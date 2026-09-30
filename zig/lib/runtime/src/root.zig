@@ -18,3 +18,5 @@ pub const http_abi = @import("runtime_http_abi.zig");
 pub const native_abi = @import("runtime_native_abi.zig");
 pub const io_abi = @import("runtime_io_abi.zig");
 pub const http_bridge = @import("runtime_http_bridge.zig");
+
+pub const mutation_barrier = @import("mutation_barrier.zig");

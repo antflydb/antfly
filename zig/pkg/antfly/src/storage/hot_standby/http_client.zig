@@ -25,7 +25,7 @@ const fencing = @import("fencing.zig");
 const http_admin = @import("http_admin.zig");
 const primary_mod = @import("primary.zig");
 const replication_log = @import("replication_log.zig");
-const replication_record = @import("replication_record.zig");
+const replication_record = @import("../db/replication_record.zig");
 const standby_mod = @import("standby.zig");
 const validation = @import("validation.zig");
 

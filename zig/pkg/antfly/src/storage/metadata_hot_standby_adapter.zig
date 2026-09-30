@@ -14,10 +14,10 @@
 // limitations.
 
 //! This adapter always executes in the archive that owns the HA Primary.
-const ha_publisher_adapter = @import("hot_standby/db_commit.zig");
+const hot_standby_publisher_adapter = @import("hot_standby/db_commit.zig");
 const std = @import("std");
-const policy = @import("db/ha_contract.zig");
-const port = @import("metadata_ha_port.zig");
+const policy = @import("db/replication_contract.zig");
+const port = @import("metadata_hot_standby_port.zig");
 const chunks = @import("hot_standby/metadata_effect_chunks.zig");
 
 pub const Adapter = struct {
@@ -72,8 +72,8 @@ pub const Adapter = struct {
             try lock(ptr);
             locked = true;
             if (gate) |value| try value.check();
-            const prior = if (same_timeline) try (try ha_publisher_adapter.runtimePrimary(mirror)).findMatchingRecordFrom(search_from, .metadata_mutation, frame, 0, 0) else null;
-            lsn = prior orelse try (try ha_publisher_adapter.runtimePrimary(mirror)).append(.{ .kind = .metadata_mutation, .payload_codec = .binary, .shard_id = 0, .table_id = 0, .payload = frame });
+            const prior = if (same_timeline) try (try hot_standby_publisher_adapter.runtimePrimary(mirror)).findMatchingRecordFrom(search_from, .metadata_mutation, frame, 0, 0) else null;
+            lsn = prior orelse try (try hot_standby_publisher_adapter.runtimePrimary(mirror)).append(.{ .kind = .metadata_mutation, .payload_codec = .binary, .shard_id = 0, .table_id = 0, .payload = frame });
             search_from = lsn +| 1;
         }
         if (mirror.last_lsn) |last| last.store(lsn, .release);
@@ -81,7 +81,7 @@ pub const Adapter = struct {
         locked = false;
         if (mirror.sync_policy.mode != .async) {
             if (mirror.sync_wait_fn) |wait| try wait(mirror.sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.publisher.ptr, lsn, mirror.sync_policy);
-            const decision = try @import("hot_standby/commit_gate.zig").evaluate(try ha_publisher_adapter.runtimePrimary(mirror), lsn, mirror.sync_policy);
+            const decision = try @import("hot_standby/commit_gate.zig").evaluate(try hot_standby_publisher_adapter.runtimePrimary(mirror), lsn, mirror.sync_policy);
             if (!decision.shouldAcknowledge()) return error.HASyncCommitWouldBlock;
         }
         try lock(ptr);

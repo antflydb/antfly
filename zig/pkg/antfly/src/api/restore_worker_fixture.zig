@@ -774,7 +774,7 @@ pub fn runWithPersistence(comptime Driver: type, invalid_child: bool, override: 
     return runWithPolicy(Driver, invalid_child, override, persistence, .{});
 }
 
-pub const Policy = struct { failover_safe: bool = false, guard: ?http.RestoreExecutionGuard = null, gate: ?db.HAWriteGate = null, mirror: ?db.HAAsyncEffectMirror = null, term: u64 = 1, portable: bool = false, restart_after_commit: bool = false, table_restore: bool = false, migration: bool = false, generated: bool = false, remote_owner: bool = false, benchmark_rows: usize = 1, benchmark_deadline_ms: u32 = 30_000, validation_route_gaps: usize = 0 };
+pub const Policy = struct { failover_safe: bool = false, guard: ?http.RestoreExecutionGuard = null, gate: ?db.ReplicationWriteGate = null, mirror: ?db.ReplicationAsyncEffectMirror = null, term: u64 = 1, portable: bool = false, restart_after_commit: bool = false, table_restore: bool = false, migration: bool = false, generated: bool = false, remote_owner: bool = false, benchmark_rows: usize = 1, benchmark_deadline_ms: u32 = 30_000, validation_route_gaps: usize = 0 };
 
 fn generatedSchema(alloc: std.mem.Allocator, input: []const u8, default_base: []const u8) ![]const u8 {
     var schema = try std.json.parseFromSlice(std.json.Value, alloc, input, .{});
@@ -1064,7 +1064,7 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
         fixture.cache_paths[i] = try std.fmt.allocPrint(a, "{s}/decoder-{d}", .{ root, i });
         const database = try alloc.create(db.DB);
         fixture.target_paths[i] = try std.fmt.allocPrint(a, "{s}/target-{d}", .{ root, i });
-        database.* = try db.DB.open(alloc, fixture.target_paths[i], .{ .backend_runtime = &runtime, .identity_namespace = scope.target_namespace, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false, .ha_write_gate = policy.gate });
+        database.* = try db.DB.open(alloc, fixture.target_paths[i], .{ .backend_runtime = &runtime, .identity_namespace = scope.target_namespace, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false, .replication_write_gate = policy.gate });
         fixture.dbs[i] = database;
         fixture.target_open[i] = true;
         opened += 1;
@@ -1075,7 +1075,7 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
         _ = try @import("../metadata/table_provisioner.zig").reconcileDbIndexesWithOptions(alloc, database, target.table.indexes_json, .{ .restore_build_only = true });
         // Match production provisioning: initialization is local and hidden;
         // only the authorized owner generation may start emitting HA effects.
-        try database.attachRestoreStagingHAMirror(policy.mirror);
+        try database.attachRestoreStagingReplicationMirror(policy.mirror);
     }
     var hidden = (try source.adminSnapshot()).?;
     try std.testing.expectEqual(@as(usize, 0), hidden.tables.len);

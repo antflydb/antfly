@@ -22,7 +22,7 @@ const common_secrets = @import("../common/secrets.zig");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const backups_api = @import("../api/local_backups.zig");
 const metadata_table_provisioner = @import("../metadata/local_index_reconcile.zig");
-const backup_restore = @import("../raft/storage/backup_restore.zig");
+const backup_restore = @import("backup_restore.zig");
 const transactions_mod = @import("transactions.zig");
 const doc_identity = @import("db/doc_identity.zig");
 const hbc_mod = @import("hbc_adapter.zig");
@@ -38,7 +38,7 @@ const db_embedder = @import("db/enrichment/embedder.zig");
 const asset_producer_runtime = @import("../asset_producer_runtime.zig");
 const asset_producer_mod = @import("db/enrichment/asset_producer.zig");
 const document_extraction_mod = @import("db/enrichment/document_extraction.zig");
-const distributed_txn = @import("../api/local_transaction_contract.zig");
+const local_transaction_contract = @import("../api/local_transaction_contract.zig");
 const platform_time = @import("antfly_platform").time;
 const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
 const control_only_storage_sources = false;
@@ -379,14 +379,14 @@ pub fn applyReplicatedTransactionMutationInternal(
     if (req.relational_index_maintenance) |command| if (command.owner_group_id != group_id) return error.PreparedGenerationChanged;
     switch (mutation) {
         .begin => |begin| {
-            const local_participant = try distributed_txn.participantIdForGroupScoped(alloc, table_name, group_id, req.restore_staging_scope, req.restore_staging_plan_id);
+            const local_participant = try local_transaction_contract.participantIdForGroupScoped(alloc, table_name, group_id, req.restore_staging_scope, req.restore_staging_plan_id);
             defer alloc.free(local_participant);
             if (begin.participants.len == 0) return error.InvalidBatchRequest;
             var seen = std.StringHashMapUnmanaged(void).empty;
             defer seen.deinit(alloc);
             var local_present = false;
             for (begin.participants) |participant| {
-                if (distributed_txn.parseParticipantRef(participant) == null) return error.InvalidBatchRequest;
+                if (local_transaction_contract.parseParticipantRef(participant) == null) return error.InvalidBatchRequest;
                 const entry = try seen.getOrPut(alloc, participant);
                 if (entry.found_existing) return error.InvalidBatchRequest;
                 if (std.mem.eql(u8, participant, local_participant)) local_present = true;
@@ -445,7 +445,7 @@ pub fn applyReplicatedTransactionMutationInternal(
                 try db.writeTransaction(prepare.txn_id, intents);
         },
         .resolve => |resolve| {
-            const local_participant = try distributed_txn.participantIdForGroupScoped(alloc, table_name, group_id, req.restore_staging_scope, req.restore_staging_plan_id);
+            const local_participant = try local_transaction_contract.participantIdForGroupScoped(alloc, table_name, group_id, req.restore_staging_scope, req.restore_staging_plan_id);
             defer alloc.free(local_participant);
             if (raft_entry) |entry| {
                 // Retained coordinators keep their own acknowledgement pending
@@ -602,10 +602,10 @@ pub const ManagedDbOpenOptions = struct {
     reconcile_for_replicated_apply: bool = false,
     inference_api_url: ?[]const u8 = null,
     remote_capability_cache: ?*remote_capabilities.Cache = null,
-    ha_write_gate: ?db_mod.HAWriteGate = null,
-    ha_async_effect_mirror: ?db_mod.HAAsyncEffectMirror = null,
-    ha_async_batch_mirror: ?db_mod.HAAsyncBatchMirror = null,
-    ha_async_metadata_mirror: ?db_mod.HAAsyncMetadataMirror = null,
+    replication_write_gate: ?db_mod.ReplicationWriteGate = null,
+    replication_async_effect_mirror: ?db_mod.ReplicationAsyncEffectMirror = null,
+    replication_async_batch_mirror: ?db_mod.ReplicationAsyncBatchMirror = null,
+    replication_async_metadata_mirror: ?db_mod.ReplicationAsyncMetadataMirror = null,
     staged_generation: ?*const (if (control_only_storage_sources) anyopaque else db_mod.generation_lifecycle.StagedGeneration) = null,
     /// Immutable native backend decision retained by PreparedRestore. Only
     /// repair execution policy and owned enrichment providers may be layered
@@ -654,7 +654,7 @@ pub fn configureRestoreOwnerDb(alloc: std.mem.Allocator, db: *db_mod.DB, bootstr
         if (bootstrap.schema_json.len != 0) try db.setSchemaJson(alloc, bootstrap.schema_json);
     }
     try db.installRestoreStagingReadSchema(alloc, bootstrap.scope, bootstrap.read_schema_json);
-    _ = try @import("../metadata/local_index_reconcile.zig").reconcileDbIndexesWithOptions(alloc, db, bootstrap.indexes_json, .{ .restore_build_only = true });
+    _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, db, bootstrap.indexes_json, .{ .restore_build_only = true });
     try db.updateRange(bootstrap.byte_range);
     try db.reserveRestoreStagingScoped(alloc, bootstrap.scope);
     try db.installRestoreStagingBootstrap(alloc, bootstrap);
@@ -874,10 +874,10 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
     const reconcile_mode: ManagedDbOpenMode = if (options.reconcile_for_replicated_apply) .restore_repair else mode;
     var reconcile_options = options;
     if (options.reconcile_for_replicated_apply) {
-        reconcile_options.ha_write_gate = null;
-        reconcile_options.ha_async_effect_mirror = null;
-        reconcile_options.ha_async_batch_mirror = null;
-        reconcile_options.ha_async_metadata_mirror = null;
+        reconcile_options.replication_write_gate = null;
+        reconcile_options.replication_async_effect_mirror = null;
+        reconcile_options.replication_async_batch_mirror = null;
+        reconcile_options.replication_async_metadata_mirror = null;
     }
     var enrichments = try createManagedDbEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, options.remote_capability_cache, options.inference_api_url, options.source_table, secret_store, remote_content);
     // takeConfig() clears every transferred owner. An unconditional defer is
@@ -917,10 +917,10 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                 resolved.identity_namespace = namespace;
                 resolved.prefer_existing_identity_namespace = namespace != null;
                 resolved.enrichment = enrichment_cfg;
-                resolved.ha_write_gate = open_options.ha_write_gate;
-                resolved.ha_async_effect_mirror = null;
-                resolved.ha_async_batch_mirror = null;
-                resolved.ha_async_metadata_mirror = null;
+                resolved.replication_write_gate = open_options.replication_write_gate;
+                resolved.replication_async_effect_mirror = null;
+                resolved.replication_async_batch_mirror = null;
+                resolved.replication_async_metadata_mirror = null;
                 resolved.schema_before_index_load = schema_before_index_load;
                 resolved.open_mode = .writer_no_replay;
                 resolved.start_index_workers = false;
@@ -945,10 +945,10 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                 .identity_namespace = namespace,
                 .prefer_existing_identity_namespace = namespace != null,
                 .enrichment = enrichment_cfg,
-                .ha_write_gate = open_options.ha_write_gate,
-                .ha_async_effect_mirror = open_options.ha_async_effect_mirror,
-                .ha_async_batch_mirror = open_options.ha_async_batch_mirror,
-                .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
+                .replication_write_gate = open_options.replication_write_gate,
+                .replication_async_effect_mirror = open_options.replication_async_effect_mirror,
+                .replication_async_batch_mirror = open_options.replication_async_batch_mirror,
+                .replication_async_metadata_mirror = open_options.replication_async_metadata_mirror,
                 .transaction_recovery = open_options.transaction_recovery,
                 .schema_before_index_load = schema_before_index_load,
                 .start_resolver_workers = !open_options.defer_resolver_workers,
@@ -968,10 +968,10 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .remote_content = remote,
                         .identity_namespace = namespace,
                         .prefer_existing_identity_namespace = namespace != null,
-                        .ha_write_gate = open_options.ha_write_gate,
-                        .ha_async_effect_mirror = open_options.ha_async_effect_mirror,
-                        .ha_async_batch_mirror = open_options.ha_async_batch_mirror,
-                        .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
+                        .replication_write_gate = open_options.replication_write_gate,
+                        .replication_async_effect_mirror = open_options.replication_async_effect_mirror,
+                        .replication_async_batch_mirror = open_options.replication_async_batch_mirror,
+                        .replication_async_metadata_mirror = open_options.replication_async_metadata_mirror,
                         .transaction_recovery = open_options.transaction_recovery,
                         .schema_before_index_load = schema_before_index_load,
                         .start_resolver_workers = !open_options.defer_resolver_workers,
@@ -989,10 +989,10 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .identity_namespace = namespace,
                         .prefer_existing_identity_namespace = namespace != null,
                         .enrichment = enrichment_cfg,
-                        .ha_write_gate = open_options.ha_write_gate,
-                        .ha_async_effect_mirror = open_options.ha_async_effect_mirror,
-                        .ha_async_batch_mirror = open_options.ha_async_batch_mirror,
-                        .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
+                        .replication_write_gate = open_options.replication_write_gate,
+                        .replication_async_effect_mirror = open_options.replication_async_effect_mirror,
+                        .replication_async_batch_mirror = open_options.replication_async_batch_mirror,
+                        .replication_async_metadata_mirror = open_options.replication_async_metadata_mirror,
                         .transaction_recovery = open_options.transaction_recovery,
                         .schema_before_index_load = schema_before_index_load,
                         .start_resolver_workers = !open_options.defer_resolver_workers,
@@ -1015,10 +1015,10 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .remote_content = remote,
                         .identity_namespace = namespace,
                         .prefer_existing_identity_namespace = namespace != null,
-                        .ha_write_gate = open_options.ha_write_gate,
-                        .ha_async_effect_mirror = open_options.ha_async_effect_mirror,
-                        .ha_async_batch_mirror = open_options.ha_async_batch_mirror,
-                        .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
+                        .replication_write_gate = open_options.replication_write_gate,
+                        .replication_async_effect_mirror = open_options.replication_async_effect_mirror,
+                        .replication_async_batch_mirror = open_options.replication_async_batch_mirror,
+                        .replication_async_metadata_mirror = open_options.replication_async_metadata_mirror,
                         .transaction_recovery = open_options.transaction_recovery,
                         .schema_before_index_load = schema_before_index_load,
                         .start_resolver_workers = !open_options.defer_resolver_workers,
@@ -1036,7 +1036,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                     .remote_content = remote,
                     .identity_namespace = namespace,
                     .prefer_existing_identity_namespace = namespace != null,
-                    .ha_write_gate = open_options.ha_write_gate,
+                    .replication_write_gate = open_options.replication_write_gate,
                     .schema_before_index_load = schema_before_index_load,
                     .start_resolver_workers = !open_options.defer_resolver_workers,
                     .open_mode = .writer_no_replay,
@@ -1080,7 +1080,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .identity_namespace = namespace,
                         .prefer_existing_identity_namespace = namespace != null,
                         .enrichment = enrichment_cfg,
-                        .ha_write_gate = open_options.ha_write_gate,
+                        .replication_write_gate = open_options.replication_write_gate,
                         .schema_before_index_load = schema_before_index_load,
                         .start_resolver_workers = !open_options.defer_resolver_workers,
                         .open_mode = .writer_no_replay,
@@ -1103,7 +1103,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .remote_content = remote,
                         .identity_namespace = namespace,
                         .prefer_existing_identity_namespace = namespace != null,
-                        .ha_write_gate = open_options.ha_write_gate,
+                        .replication_write_gate = open_options.replication_write_gate,
                         .schema_before_index_load = schema_before_index_load,
                         .start_resolver_workers = !open_options.defer_resolver_workers,
                         .open_mode = .writer_no_replay,
@@ -1127,7 +1127,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .identity_namespace = namespace,
                         .prefer_existing_identity_namespace = namespace != null,
                         .enrichment = enrichment_cfg,
-                        .ha_write_gate = open_options.ha_write_gate,
+                        .replication_write_gate = open_options.replication_write_gate,
                         .open_mode = .query_readonly,
                         .start_index_workers = false,
                         .ttl_cleanup = .{ .enabled = false },
@@ -1146,7 +1146,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .remote_content = remote,
                         .identity_namespace = namespace,
                         .prefer_existing_identity_namespace = namespace != null,
-                        .ha_write_gate = open_options.ha_write_gate,
+                        .replication_write_gate = open_options.replication_write_gate,
                         .open_mode = .query_readonly,
                         .start_index_workers = false,
                         .ttl_cleanup = .{ .enabled = false },
@@ -1166,7 +1166,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .identity_namespace = namespace,
                         .prefer_existing_identity_namespace = namespace != null,
                         .enrichment = enrichment_cfg,
-                        .ha_write_gate = open_options.ha_write_gate,
+                        .replication_write_gate = open_options.replication_write_gate,
                         .open_mode = .status_only,
                         .start_index_workers = false,
                         .ttl_cleanup = .{ .enabled = false },
@@ -1185,7 +1185,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .remote_content = remote,
                         .identity_namespace = namespace,
                         .prefer_existing_identity_namespace = namespace != null,
-                        .ha_write_gate = open_options.ha_write_gate,
+                        .replication_write_gate = open_options.replication_write_gate,
                         .open_mode = .status_only,
                         .start_index_workers = false,
                         .ttl_cleanup = .{ .enabled = false },
@@ -2058,7 +2058,7 @@ pub fn reconcileStorageKernelOwnerDb(
             try metadata_table_provisioner.reconcileDbIndexTargetWithOptions(alloc, db, indexes_json, target, options)
         else
             try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, db, indexes_json, options);
-    } else metadata_table_provisioner.ProvisionSummary{};
+    } else metadata_table_provisioner.IndexReconcileSummary{};
     if (replace) try db.resumeEnrichmentRuntimeAfterReconfigure("owner reconciliation", target_index_name orelse "*");
     if (indexes_json.len > 0 and !installed_matches) try persistOwnerCatalogContract(alloc, db, indexes_json);
     if (indexes_json.len > 0) if (installed) |state| state.publish(indexes_json);
