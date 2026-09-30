@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from ..models.graph_key_node_selector import GraphKeyNodeSelector
     from ..models.graph_metric_filter import GraphMetricFilter
     from ..models.graph_metric_order import GraphMetricOrder
+    from ..models.graph_relationship_filter import GraphRelationshipFilter
     from ..models.graph_result_ref_node_selector import GraphResultRefNodeSelector
 
 
@@ -44,6 +45,11 @@ class GraphTraversal:
         Attributes:
             start (GraphIdentityNodeSelector | GraphKeyNodeSelector | GraphResultRefNodeSelector): Select graph nodes using
                 exactly one explicit, exact selector form.
+            edge_filter (GraphRelationshipFilter | Unset): AND predicates applied to every relationship before neighbor
+                admission, path ranking, and match counting. Missing or null properties fail comparisons, including ne; use
+                explicit null operators. Maximum 64 predicates and 64 KiB of predicate fields and values. Time intervals have
+                inclusive lower and exclusive upper bounds. Missing/null valid-time bounds are open; known_at requires a
+                created_at value. Invalid timestamp properties never match.
             direction (EdgeDirection | Unset): Direction of edges to query:
                 - out: Outgoing edges from the node
                 - in: Incoming edges to the node
@@ -80,6 +86,7 @@ class GraphTraversal:
     """
 
     start: GraphIdentityNodeSelector | GraphKeyNodeSelector | GraphResultRefNodeSelector
+    edge_filter: GraphRelationshipFilter | Unset = UNSET
     direction: EdgeDirection | Unset = UNSET
     edge_types: list[str] | Unset = UNSET
     max_depth: int | Unset = 1
@@ -137,6 +144,10 @@ class GraphTraversal:
             start = self.start.to_dict()
         else:
             start = self.start.to_dict()
+
+        edge_filter: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.edge_filter, Unset):
+            edge_filter = self.edge_filter.to_dict()
 
         direction: str | Unset = UNSET
         if not isinstance(self.direction, Unset):
@@ -227,6 +238,8 @@ class GraphTraversal:
                 "start": start,
             }
         )
+        if edge_filter is not UNSET:
+            field_dict["edge_filter"] = edge_filter
         if direction is not UNSET:
             field_dict["direction"] = direction
         if edge_types is not UNSET:
@@ -280,6 +293,7 @@ class GraphTraversal:
         from ..models.graph_key_node_selector import GraphKeyNodeSelector
         from ..models.graph_metric_filter import GraphMetricFilter
         from ..models.graph_metric_order import GraphMetricOrder
+        from ..models.graph_relationship_filter import GraphRelationshipFilter
         from ..models.graph_result_ref_node_selector import GraphResultRefNodeSelector
 
         d = dict(src_dict)
@@ -308,6 +322,13 @@ class GraphTraversal:
             return componentsschemas_graph_node_selector_type_2
 
         start = _parse_start(d.pop("start"))
+
+        _edge_filter = d.pop("edge_filter", UNSET)
+        edge_filter: GraphRelationshipFilter | Unset
+        if isinstance(_edge_filter, Unset):
+            edge_filter = UNSET
+        else:
+            edge_filter = GraphRelationshipFilter.from_dict(_edge_filter)
 
         _direction = d.pop("direction", UNSET)
         direction: EdgeDirection | Unset
@@ -508,6 +529,7 @@ class GraphTraversal:
 
         graph_traversal = cls(
             start=start,
+            edge_filter=edge_filter,
             direction=direction,
             edge_types=edge_types,
             max_depth=max_depth,

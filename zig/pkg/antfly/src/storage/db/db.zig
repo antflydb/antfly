@@ -8411,6 +8411,7 @@ pub const DB = struct {
             payload_bytes +|= @intCast(write.source.len);
             payload_bytes +|= @intCast(write.target.len);
             payload_bytes +|= @intCast(write.edge_type.len);
+            payload_bytes +|= @intCast(write.edge_id.len +| write.owner_document.len);
             payload_bytes +|= @intCast(write.metadata_json.len);
             operations +|= 1;
         }
@@ -8419,6 +8420,7 @@ pub const DB = struct {
             payload_bytes +|= @intCast(delete.source.len);
             payload_bytes +|= @intCast(delete.target.len);
             payload_bytes +|= @intCast(delete.edge_type.len);
+            payload_bytes +|= @intCast(delete.edge_id.len +| delete.owner_document.len);
             operations +|= 1;
         }
         for (req.predicates) |predicate| payload_bytes +|= @intCast(predicate.key.len);
@@ -9968,7 +9970,7 @@ pub const DB = struct {
             try appendUniqueOwnedKeyIndexed(self.alloc, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, write.key);
         }
         for (effective_req.graph_deletes) |delete| {
-            const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(self.alloc, delete.source, delete.index_name, delete.edge_type, delete.target);
+            const artifact_key = try internal_keys.graphRelationshipArtifactKeyAlloc(self.alloc, if (delete.owner_document.len > 0) delete.owner_document else delete.source, delete.index_name, delete.edge_type, delete.target, delete.source, delete.edge_id);
             defer self.alloc.free(artifact_key);
             if (explicit_graph_write_key_set.contains(artifact_key)) continue;
             if (graph_delete_key_set.contains(artifact_key)) continue;
@@ -12092,6 +12094,8 @@ pub const DB = struct {
         alloc.free(@constCast(write.source));
         alloc.free(@constCast(write.target));
         alloc.free(@constCast(write.edge_type));
+        if (write.edge_id.len > 0) alloc.free(@constCast(write.edge_id));
+        if (write.owner_document.len > 0) alloc.free(@constCast(write.owner_document));
         if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
         write.* = undefined;
     }
@@ -12101,6 +12105,8 @@ pub const DB = struct {
         alloc.free(@constCast(delete.source));
         alloc.free(@constCast(delete.target));
         alloc.free(@constCast(delete.edge_type));
+        if (delete.edge_id.len > 0) alloc.free(@constCast(delete.edge_id));
+        if (delete.owner_document.len > 0) alloc.free(@constCast(delete.owner_document));
         delete.* = undefined;
     }
 
@@ -12108,7 +12114,9 @@ pub const DB = struct {
         return std.mem.eql(u8, left.index_name, right.index_name) and
             std.mem.eql(u8, left.source, right.source) and
             std.mem.eql(u8, left.target, right.target) and
-            std.mem.eql(u8, left.edge_type, right.edge_type);
+            std.mem.eql(u8, left.edge_type, right.edge_type) and
+            std.mem.eql(u8, left.edge_id, if (@hasField(@TypeOf(right), "edge_id")) right.edge_id else "") and
+            std.mem.eql(u8, left.owner_document, if (@hasField(@TypeOf(right), "owner_document")) right.owner_document else "");
     }
 
     fn appendGraphTransformWrite(
@@ -12152,6 +12160,11 @@ pub const DB = struct {
         errdefer alloc.free(target);
         const edge_type = try alloc.dupe(u8, path.edge_type);
         errdefer alloc.free(edge_type);
+        const edge_id = if (parsed.value.object.get("edge_id")) |value| blk: {
+            if (value != .string or value.string.len == 0) return error.InvalidGraphEdges;
+            break :blk try alloc.dupe(u8, value.string);
+        } else "";
+        errdefer if (edge_id.len > 0) alloc.free(edge_id);
 
         // Transform operations are ordered. Since the storage batch carries
         // graph writes and deletes in separate slices (deletes execute first),
@@ -12166,6 +12179,7 @@ pub const DB = struct {
                 .source = owned_source,
                 .target = target,
                 .edge_type = edge_type,
+                .edge_id = edge_id,
             })) continue;
             var removed = deletes.orderedRemove(delete_index);
             deinitOwnedGraphEdgeDelete(alloc, &removed);
@@ -12176,6 +12190,7 @@ pub const DB = struct {
             .source = owned_source,
             .target = target,
             .edge_type = edge_type,
+            .edge_id = edge_id,
             .weight = weight,
             .metadata_json = metadata_json,
         });
@@ -12203,6 +12218,11 @@ pub const DB = struct {
         errdefer alloc.free(target);
         const edge_type = try alloc.dupe(u8, path.edge_type);
         errdefer alloc.free(edge_type);
+        const edge_id = if (parsed.value.object.get("edge_id")) |value| blk: {
+            if (value != .string or value.string.len == 0) return error.InvalidGraphEdges;
+            break :blk try alloc.dupe(u8, value.string);
+        } else "";
+        errdefer if (edge_id.len > 0) alloc.free(edge_id);
 
         // A later pull overrides every earlier projected write for the same
         // physical relationship before the split graph mutation batch is built.
@@ -12215,6 +12235,7 @@ pub const DB = struct {
                 .source = owned_source,
                 .target = target,
                 .edge_type = edge_type,
+                .edge_id = edge_id,
             })) continue;
             var removed = writes.orderedRemove(write_index);
             deinitOwnedGraphEdgeWrite(alloc, &removed);
@@ -12224,6 +12245,7 @@ pub const DB = struct {
             .source = owned_source,
             .target = target,
             .edge_type = edge_type,
+            .edge_id = edge_id,
         });
     }
 
@@ -22157,6 +22179,8 @@ pub const DB = struct {
                     alloc.free(edge.index_name);
                     alloc.free(edge.edge_type);
                     alloc.free(edge.target_doc_key);
+                    alloc.free(edge.edge_id);
+                    alloc.free(edge.logical_source);
                 }
                 const index = self.core.index_manager.graphIndex(edge.index_name) orelse continue;
                 var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, row.value);
@@ -24974,6 +24998,8 @@ pub const DB = struct {
                 alloc.free(edge.source);
                 alloc.free(edge.target);
                 alloc.free(edge.edge_type);
+                if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+                if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
                 if (edge.metadata.len > 0) alloc.free(edge.metadata);
             }
             alloc.free(edges);
@@ -24984,6 +25010,8 @@ pub const DB = struct {
                 .source = try alloc.dupe(u8, item.source),
                 .target = try alloc.dupe(u8, item.target),
                 .edge_type = try alloc.dupe(u8, item.edge_type),
+                .edge_id = if (item.edge_id.len > 0) try alloc.dupe(u8, item.edge_id) else "",
+                .owner_document = if (item.owner_document.len > 0) try alloc.dupe(u8, item.owner_document) else "",
                 .weight = item.weight,
                 .metadata = if (item.metadata.len > 0) try alloc.dupe(u8, item.metadata) else "",
             };
@@ -26211,12 +26239,14 @@ pub const DB = struct {
         var deletes = try alloc.alloc(types.GraphEdgeDelete, inbound.len);
         defer alloc.free(deletes);
         for (inbound, 0..) |edge, i| {
-            deletes[i] = .{ .index_name = index_name, .source = edge.source, .target = old_key, .edge_type = edge.edge_type };
+            deletes[i] = .{ .index_name = index_name, .source = edge.source, .target = old_key, .edge_type = edge.edge_type, .edge_id = edge.edge_id, .owner_document = edge.owner_document };
             writes[i] = .{
                 .index_name = index_name,
                 .source = edge.source,
                 .target = new_key,
                 .edge_type = edge.edge_type,
+                .edge_id = edge.edge_id,
+                .owner_document = edge.owner_document,
                 .weight = edge.weight,
                 .created_at = edge.created_at,
                 .updated_at = edge.updated_at,
@@ -26870,6 +26900,8 @@ pub const DB = struct {
                 alloc.free(@constCast(write.source));
                 alloc.free(@constCast(write.target));
                 alloc.free(@constCast(write.edge_type));
+                if (write.edge_id.len > 0) alloc.free(@constCast(write.edge_id));
+                if (write.owner_document.len > 0) alloc.free(@constCast(write.owner_document));
                 if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
             }
             graph_writes.deinit(alloc);
@@ -26918,6 +26950,8 @@ pub const DB = struct {
                     .source = try alloc.dupe(u8, graph_write.source),
                     .target = try alloc.dupe(u8, graph_write.target),
                     .edge_type = try alloc.dupe(u8, graph_write.edge_type),
+                    .edge_id = if (graph_write.edge_id.len > 0) try alloc.dupe(u8, graph_write.edge_id) else "",
+                    .owner_document = if (graph_write.owner_document.len > 0) try alloc.dupe(u8, graph_write.owner_document) else "",
                     .weight = graph_write.weight,
                     .created_at = graph_write.created_at,
                     .updated_at = graph_write.updated_at,
@@ -40160,8 +40194,8 @@ fn encodeThinReplayRecordPayload(
     }
 
     for (req.graph_writes) |write| {
-        try appendUniqueReplayRecordKeyWithSet(alloc, &changed_doc_keys, &changed_doc_key_set, write.source);
-        const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);
+        try appendUniqueReplayRecordKeyWithSet(alloc, &changed_doc_keys, &changed_doc_key_set, if (write.owner_document.len > 0) write.owner_document else write.source);
+        const artifact_key = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, if (write.owner_document.len > 0) write.owner_document else write.source, write.index_name, write.edge_type, write.target, write.source, write.edge_id);
         defer alloc.free(artifact_key);
         try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, artifact_key);
         try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
@@ -40171,8 +40205,8 @@ fn encodeThinReplayRecordPayload(
         // does not delete the source document. Classifying it as a document
         // deletion makes graph replay clear every source edge before applying
         // the targeted artifact delta.
-        try appendUniqueReplayRecordKeyWithSet(alloc, &changed_doc_keys, &changed_doc_key_set, delete.source);
-        const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, delete.source, delete.index_name, delete.edge_type, delete.target);
+        try appendUniqueReplayRecordKeyWithSet(alloc, &changed_doc_keys, &changed_doc_key_set, if (delete.owner_document.len > 0) delete.owner_document else delete.source);
+        const artifact_key = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, if (delete.owner_document.len > 0) delete.owner_document else delete.source, delete.index_name, delete.edge_type, delete.target, delete.source, delete.edge_id);
         defer alloc.free(artifact_key);
         try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, artifact_key);
         try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
@@ -40416,6 +40450,8 @@ fn augmentExtractedWriteWithGraphFieldEdgesParsed(
             alloc.free(@constCast(write.source));
             alloc.free(@constCast(write.target));
             alloc.free(@constCast(write.edge_type));
+            if (write.edge_id.len > 0) alloc.free(@constCast(write.edge_id));
+            if (write.owner_document.len > 0) alloc.free(@constCast(write.owner_document));
             if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
         }
         extra_writes.deinit(alloc);
@@ -40495,6 +40531,8 @@ fn augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed(
             alloc.free(@constCast(write.source));
             alloc.free(@constCast(write.target));
             alloc.free(@constCast(write.edge_type));
+            if (write.edge_id.len > 0) alloc.free(@constCast(write.edge_id));
+            if (write.owner_document.len > 0) alloc.free(@constCast(write.owner_document));
             if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
         }
         extra_writes.deinit(alloc);
@@ -44996,7 +45034,7 @@ fn appendPreparedGraphEdgeArtifactWrite(
     write: types.GraphEdgeWrite,
     generation: u64,
 ) !void {
-    const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);
+    const key = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, if (write.owner_document.len > 0) write.owner_document else write.source, write.index_name, write.edge_type, write.target, write.source, write.edge_id);
     defer alloc.free(key);
     const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, generation, write.weight, write.created_at, write.updated_at, write.metadata_json);
     var payload_owned = true;
@@ -47517,7 +47555,7 @@ fn appendPrecomputedGraphSourceArtifactKey(
             );
             defer freeGraphWrites(self.alloc, graph_writes);
             for (graph_writes) |write| {
-                const key = try internal_keys.graphEdgeArtifactKeyAlloc(self.alloc, write.source, write.index_name, write.edge_type, write.target);
+                const key = try internal_keys.graphRelationshipArtifactKeyAlloc(self.alloc, if (write.owner_document.len > 0) write.owner_document else write.source, write.index_name, write.edge_type, write.target, write.source, write.edge_id);
                 var key_owned = true;
                 errdefer if (key_owned) self.alloc.free(key);
                 const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(
@@ -48689,7 +48727,7 @@ fn buildDerivedBatch(
             try appendDerivedTargetRefAlloc(alloc, &targets, .graph, index_name);
         }
         for (req.graph_writes) |graph_write| {
-            if (std.mem.eql(u8, graph_write.source, write.key)) {
+            if (std.mem.eql(u8, if (graph_write.owner_document.len > 0) graph_write.owner_document else graph_write.source, write.key)) {
                 try appendDerivedTargetRefAlloc(alloc, &targets, .graph, graph_write.index_name);
             }
         }
@@ -55423,6 +55461,8 @@ fn managedIndexDeleteKeyAffectsProjection(
                     index_manager.alloc.free(parsed.index_name);
                     index_manager.alloc.free(parsed.edge_type);
                     index_manager.alloc.free(parsed.target_doc_key);
+                    index_manager.alloc.free(parsed.edge_id);
+                    index_manager.alloc.free(parsed.logical_source);
                 }
                 if (std.mem.eql(u8, parsed.index_name, index_ref.name)) break :blk true;
             }
@@ -55554,6 +55594,8 @@ fn managedIndexBatchApplicabilityWithEmbeddingNames(
                         index_manager.alloc.free(parsed.index_name);
                         index_manager.alloc.free(parsed.edge_type);
                         index_manager.alloc.free(parsed.target_doc_key);
+                        index_manager.alloc.free(parsed.edge_id);
+                        index_manager.alloc.free(parsed.logical_source);
                     }
                     if (std.mem.eql(u8, parsed.index_name, index_ref.name)) return .relevant;
                 }
@@ -55690,6 +55732,8 @@ fn managedIndexRecordApplicability(
                         index_manager.alloc.free(parsed.index_name);
                         index_manager.alloc.free(parsed.edge_type);
                         index_manager.alloc.free(parsed.target_doc_key);
+                        index_manager.alloc.free(parsed.edge_id);
+                        index_manager.alloc.free(parsed.logical_source);
                     }
                     if (std.mem.eql(u8, parsed.index_name, index_ref.name)) return .relevant;
                 }
@@ -57250,7 +57294,7 @@ fn materializeGraphArtifactValuePaged(
         var graph_write_positions = StoreWritePositions.empty;
         defer graph_write_positions.deinit(alloc);
         for (page.writes) |write| {
-            const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);
+            const key = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, if (write.owner_document.len > 0) write.owner_document else write.source, write.index_name, write.edge_type, write.target, write.source, write.edge_id);
             var key_owned = true;
             errdefer if (key_owned) alloc.free(key);
             const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, generation, write.weight, write.created_at, write.updated_at, write.metadata_json);
@@ -57406,7 +57450,7 @@ fn materializeGraphSourceArtifactsForIndex(
             };
             defer freeGraphWrites(alloc, graph_writes);
             for (graph_writes) |write| {
-                const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);
+                const key = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, if (write.owner_document.len > 0) write.owner_document else write.source, write.index_name, write.edge_type, write.target, write.source, write.edge_id);
                 var key_owned = true;
                 errdefer if (key_owned) alloc.free(key);
                 const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(
@@ -57750,7 +57794,7 @@ fn materializeGraphSourceArtifactRestorePage(
     var write_positions = StoreWritePositions.empty;
     defer write_positions.deinit(alloc);
     for (page.writes) |write| {
-        const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);
+        const key = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, if (write.owner_document.len > 0) write.owner_document else write.source, write.index_name, write.edge_type, write.target, write.source, write.edge_id);
         var key_owned = true;
         errdefer if (key_owned) alloc.free(key);
         const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, generation, write.weight, write.created_at, write.updated_at, write.metadata_json);
@@ -57945,7 +57989,7 @@ fn materializeMentionEdgesForResolutionKey(
         );
         defer freeGraphWrites(alloc, mention_edge_writes);
         for (mention_edge_writes) |write| {
-            const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);
+            const key = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, if (write.owner_document.len > 0) write.owner_document else write.source, write.index_name, write.edge_type, write.target, write.source, write.edge_id);
             var key_owned = true;
             errdefer if (key_owned) alloc.free(key);
             const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, generation, write.weight, write.created_at, write.updated_at, write.metadata_json);
@@ -58066,6 +58110,8 @@ fn freeGraphWriteFields(alloc: Allocator, write: types.GraphEdgeWrite) void {
     alloc.free(@constCast(write.source));
     alloc.free(@constCast(write.target));
     alloc.free(@constCast(write.edge_type));
+    if (write.edge_id.len > 0) alloc.free(@constCast(write.edge_id));
+    if (write.owner_document.len > 0) alloc.free(@constCast(write.owner_document));
     if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
 }
 
@@ -58662,10 +58708,20 @@ fn appendRelationItem(
         jsonStringField(item, "type") orelse jsonStringField(item, "edge_type") orelse jsonStringField(item, "relation") orelse return;
     if (edge_type.len == 0) return;
 
-    // Materialized edges are routed and retired with their source document.
-    // Artifact payloads may describe a source endpoint, but allowing it to
-    // replace the owner would make writes and split ownership disagree.
-    const source_doc = doc_key;
+    const mapped_source = if (mapping.source_template.len > 0)
+        try renderGraphArtifactTemplateAlloc(alloc, mapping.source_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
+    else
+        null;
+    defer if (mapped_source) |value| alloc.free(value);
+    const source_doc = if (mapped_source) |value| value else doc_key;
+    if (source_doc.len == 0) return error.InvalidGraphEdges;
+    const mapped_id = if (mapping.edge_id_template.len > 0)
+        try renderGraphArtifactTemplateAlloc(alloc, mapping.edge_id_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
+    else
+        null;
+    defer if (mapped_id) |value| alloc.free(value);
+    const edge_id = mapped_id orelse "";
+    if (mapped_id != null and edge_id.len == 0) return error.InvalidGraphEdges;
 
     const mapped_target = if (mapping.target_template.len > 0)
         try renderGraphArtifactTemplateAlloc(alloc, mapping.target_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
@@ -58703,7 +58759,13 @@ fn appendRelationItem(
     errdefer alloc.free(owned_target);
     const owned_edge_type = try alloc.dupe(u8, edge_type);
     errdefer alloc.free(owned_edge_type);
+    const owned_id = try alloc.dupe(u8, edge_id);
+    errdefer alloc.free(owned_id);
+    const owner_document = if (!std.mem.eql(u8, source_doc, doc_key)) try alloc.dupe(u8, doc_key) else "";
+    errdefer if (owner_document.len > 0) alloc.free(owner_document);
     try writes.append(alloc, .{
+        .edge_id = owned_id,
+        .owner_document = owner_document,
         .index_name = owned_index_name,
         .source = owned_source,
         .target = owned_target,
@@ -58995,6 +59057,8 @@ const OwnedGraphMutations = struct {
             self.alloc.free(@constCast(write.source));
             self.alloc.free(@constCast(write.target));
             self.alloc.free(@constCast(write.edge_type));
+            if (write.edge_id.len > 0) self.alloc.free(@constCast(write.edge_id));
+            if (write.owner_document.len > 0) self.alloc.free(@constCast(write.owner_document));
             if (write.metadata_json.len > 0) self.alloc.free(@constCast(write.metadata_json));
         }
         if (self.writes.len > 0) self.alloc.free(self.writes);
@@ -59004,6 +59068,8 @@ const OwnedGraphMutations = struct {
             self.alloc.free(@constCast(delete.source));
             self.alloc.free(@constCast(delete.target));
             self.alloc.free(@constCast(delete.edge_type));
+            if (delete.edge_id.len > 0) self.alloc.free(@constCast(delete.edge_id));
+            if (delete.owner_document.len > 0) self.alloc.free(@constCast(delete.owner_document));
         }
         if (self.deletes.len > 0) self.alloc.free(self.deletes);
 
@@ -59036,6 +59102,8 @@ fn collectGraphMutationsForArtifacts(
             alloc.free(@constCast(write.source));
             alloc.free(@constCast(write.target));
             alloc.free(@constCast(write.edge_type));
+            if (write.edge_id.len > 0) alloc.free(@constCast(write.edge_id));
+            if (write.owner_document.len > 0) alloc.free(@constCast(write.owner_document));
             if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
         }
         writes.deinit(alloc);
@@ -59047,6 +59115,8 @@ fn collectGraphMutationsForArtifacts(
             alloc.free(@constCast(delete.source));
             alloc.free(@constCast(delete.target));
             alloc.free(@constCast(delete.edge_type));
+            if (delete.edge_id.len > 0) alloc.free(@constCast(delete.edge_id));
+            if (delete.owner_document.len > 0) alloc.free(@constCast(delete.owner_document));
         }
         deletes.deinit(alloc);
     }
@@ -59069,6 +59139,8 @@ fn collectGraphMutationsForArtifacts(
             alloc.free(parsed.index_name);
             alloc.free(parsed.edge_type);
             alloc.free(parsed.target_doc_key);
+            alloc.free(parsed.edge_id);
+            alloc.free(parsed.logical_source);
         }
         if (!std.mem.eql(u8, parsed.index_name, index_name)) continue;
 
@@ -59135,7 +59207,9 @@ fn collectGraphMutationsForArtifacts(
             errdefer decoded.deinit(alloc);
             try writes.append(alloc, .{
                 .index_name = try alloc.dupe(u8, parsed.index_name),
-                .source = try alloc.dupe(u8, parsed.doc_key),
+                .source = try alloc.dupe(u8, if (parsed.logical_source.len > 0) parsed.logical_source else parsed.doc_key),
+                .edge_id = try alloc.dupe(u8, parsed.edge_id),
+                .owner_document = if (parsed.logical_source.len > 0) try alloc.dupe(u8, parsed.doc_key) else "",
                 .target = try alloc.dupe(u8, parsed.target_doc_key),
                 .edge_type = try alloc.dupe(u8, parsed.edge_type),
                 .weight = decoded.weight,
@@ -59148,7 +59222,9 @@ fn collectGraphMutationsForArtifacts(
         } else {
             try deletes.append(alloc, .{
                 .index_name = try alloc.dupe(u8, parsed.index_name),
-                .source = try alloc.dupe(u8, parsed.doc_key),
+                .source = try alloc.dupe(u8, if (parsed.logical_source.len > 0) parsed.logical_source else parsed.doc_key),
+                .edge_id = try alloc.dupe(u8, parsed.edge_id),
+                .owner_document = if (parsed.logical_source.len > 0) try alloc.dupe(u8, parsed.doc_key) else "",
                 .target = try alloc.dupe(u8, parsed.target_doc_key),
                 .edge_type = try alloc.dupe(u8, parsed.edge_type),
             });
@@ -60864,6 +60940,8 @@ fn applySplitGraphArtifactsStreaming(
                 buffer_alloc.free(@constCast(write.source));
                 buffer_alloc.free(@constCast(write.target));
                 buffer_alloc.free(@constCast(write.edge_type));
+                if (write.edge_id.len > 0) buffer_alloc.free(@constCast(write.edge_id));
+                if (write.owner_document.len > 0) buffer_alloc.free(@constCast(write.owner_document));
                 if (write.metadata_json.len > 0) buffer_alloc.free(@constCast(write.metadata_json));
             }
             buffer.writes.clearRetainingCapacity();
@@ -60926,17 +61004,23 @@ fn applySplitGraphArtifactsStreaming(
             try buffer.writes.ensureUnusedCapacity(state.alloc, 1);
             const index_name = try state.alloc.dupe(u8, parsed.index_name);
             errdefer state.alloc.free(index_name);
-            const source = try state.alloc.dupe(u8, parsed.doc_key);
+            const source = try state.alloc.dupe(u8, if (parsed.logical_source.len > 0) parsed.logical_source else parsed.doc_key);
             errdefer state.alloc.free(source);
             const target = try state.alloc.dupe(u8, parsed.target_doc_key);
             errdefer state.alloc.free(target);
             const edge_type = try state.alloc.dupe(u8, parsed.edge_type);
             errdefer state.alloc.free(edge_type);
+            const edge_id = try state.alloc.dupe(u8, parsed.edge_id);
+            errdefer state.alloc.free(edge_id);
+            const owner_document = if (parsed.logical_source.len > 0) try state.alloc.dupe(u8, parsed.doc_key) else "";
+            errdefer if (owner_document.len > 0) state.alloc.free(owner_document);
             buffer.writes.appendAssumeCapacity(.{
                 .index_name = index_name,
                 .source = source,
                 .target = target,
                 .edge_type = edge_type,
+                .edge_id = edge_id,
+                .owner_document = owner_document,
                 .weight = decoded.weight,
                 .created_at = decoded.created_at,
                 .updated_at = decoded.updated_at,
@@ -60955,6 +61039,8 @@ fn applySplitGraphArtifactsStreaming(
                 state.alloc.free(parsed.index_name);
                 state.alloc.free(parsed.edge_type);
                 state.alloc.free(parsed.target_doc_key);
+                state.alloc.free(parsed.edge_id);
+                state.alloc.free(parsed.logical_source);
             }
             const buffer_index = state.indexes_by_name.get(parsed.index_name) orelse return .@"continue";
             var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(state.alloc, value);
@@ -61012,6 +61098,8 @@ fn applySplitGraphArtifactsForIndexStreamingContext(
                 state.ctx.alloc.free(@constCast(write.source));
                 state.ctx.alloc.free(@constCast(write.target));
                 state.ctx.alloc.free(@constCast(write.edge_type));
+                if (write.edge_id.len > 0) state.ctx.alloc.free(@constCast(write.edge_id));
+                if (write.owner_document.len > 0) state.ctx.alloc.free(@constCast(write.owner_document));
                 if (write.metadata_json.len > 0) state.ctx.alloc.free(@constCast(write.metadata_json));
             }
             state.writes.clearRetainingCapacity();
@@ -61058,6 +61146,8 @@ fn applySplitGraphArtifactsForIndexStreamingContext(
                 state.ctx.alloc.free(parsed.index_name);
                 state.ctx.alloc.free(parsed.edge_type);
                 state.ctx.alloc.free(parsed.target_doc_key);
+                state.ctx.alloc.free(parsed.edge_id);
+                state.ctx.alloc.free(parsed.logical_source);
             }
             if (!std.mem.eql(u8, parsed.index_name, state.index_name)) return .@"continue";
 
@@ -61107,9 +61197,11 @@ fn applySplitGraphArtifactsForIndexStreamingContext(
             errdefer decoded.deinit(state.ctx.alloc);
             try state.writes.append(state.ctx.alloc, .{
                 .index_name = try state.ctx.alloc.dupe(u8, parsed.index_name),
-                .source = try state.ctx.alloc.dupe(u8, parsed.doc_key),
+                .source = try state.ctx.alloc.dupe(u8, if (parsed.logical_source.len > 0) parsed.logical_source else parsed.doc_key),
                 .target = try state.ctx.alloc.dupe(u8, parsed.target_doc_key),
                 .edge_type = try state.ctx.alloc.dupe(u8, parsed.edge_type),
+                .edge_id = try state.ctx.alloc.dupe(u8, parsed.edge_id),
+                .owner_document = if (parsed.logical_source.len > 0) try state.ctx.alloc.dupe(u8, parsed.doc_key) else "",
                 .weight = decoded.weight,
                 .created_at = decoded.created_at,
                 .updated_at = decoded.updated_at,
@@ -77558,6 +77650,64 @@ test "db drains pending resolver backfill when retrying a no-op upsertResolver" 
     }
 }
 
+test "db graph fact documents project arbitrary endpoints and retain parallel facts" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("fact-projection");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, std.mem.span(directory.path().ptr), .{});
+    defer db.close();
+    try db.addIndex(.{
+        .name = "facts",
+        .kind = .graph,
+        .config_json =
+        \\{"source":{"artifact":"relations_v1","path":"$","nodes":{"source":"{{ _item.source }}","target":"{{ _item.target }}"},"edge":{"edge_id":"{{ _doc.key }}","type":"RELATES_TO"}},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}}
+        ,
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "fact:works", .value = "{\"relations\":[{\"source\":\"alice\",\"target\":\"acme\",\"weight\":0.5}]}" },
+            .{ .key = "fact:founded", .value = "{\"relations\":[{\"source\":\"alice\",\"target\":\"acme\",\"weight\":0.9}]}" },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+    const graph_entry = db.core.index_manager.graphIndex("facts") orelse return error.IndexNotFound;
+    const graph = &graph_entry.index;
+    {
+        const edges = try graph.getEdges(alloc, "alice", "RELATES_TO", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 2), edges.len);
+        for (edges) |edge| {
+            try std.testing.expectEqualStrings("acme", edge.target);
+            try std.testing.expectEqualStrings(edge.edge_id, edge.owner_document);
+        }
+    }
+    try db.batch(.{ .deletes = &.{"fact:works"}, .sync_level = .enrichments });
+    try db.runUntilIdle();
+    const remaining = try graph.getEdges(alloc, "acme", "RELATES_TO", .in);
+    defer graph_mod.GraphIndex.freeEdges(alloc, remaining);
+    try std.testing.expectEqual(@as(usize, 1), remaining.len);
+    try std.testing.expectEqualStrings("fact:founded", remaining[0].edge_id);
+    try db.batch(.{ .writes = &.{.{ .key = "alice", .value = "{\"name\":\"Alice\"}" }}, .sync_level = .enrichments });
+    try db.runUntilIdle();
+    {
+        const after_entity_update = try graph.getEdges(alloc, "alice", "RELATES_TO", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, after_entity_update);
+        try std.testing.expectEqual(@as(usize, 1), after_entity_update.len);
+    }
+    try db.batch(.{ .writes = &.{.{ .key = "fact:founded", .value = "{\"relations\":[{\"source\":\"bob\",\"target\":\"acme\",\"weight\":0.9}]}" }}, .sync_level = .enrichments });
+    try db.runUntilIdle();
+    {
+        const old_source = try graph.getEdges(alloc, "alice", "RELATES_TO", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, old_source);
+        try std.testing.expectEqual(@as(usize, 0), old_source.len);
+        const new_source = try graph.getEdges(alloc, "bob", "RELATES_TO", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, new_source);
+        try std.testing.expectEqual(@as(usize, 1), new_source.len);
+        try std.testing.expectEqualStrings("fact:founded", new_source[0].edge_id);
+    }
+}
+
 test "db refuses resolver removal while resolution or promotion replay is pending" {
     const alloc = std.testing.allocator;
 
@@ -79332,7 +79482,7 @@ test "db portable restore rebuilds multi-source graph contender provenance" {
     try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"winner\":\"fallback\"") != null);
 }
 
-test "db graph config rejects cross-document materialized source ownership" {
+test "db graph config requires stable ids for arbitrary source endpoints" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -128317,4 +128467,47 @@ test "db dense artifact rebuild chunks retain nonzero posting capture coverage" 
     try std.testing.expectEqual(@as(?u64, covered), dense.index.experimentalPostingDurableAppliedSequence());
     try std.testing.expectEqual(covered, try db.core.loadAppliedSequence(alloc, name));
     try std.testing.expectEqual(@as(u64, 1), dense.index.stats().active_count);
+}
+
+test "db graph fact projections survive logical snapshot restore and reopen" {
+    const alloc = std.testing.allocator;
+    var source_dir = try TestDirectory.init("fact-snapshot-source");
+    defer source_dir.cleanup();
+    var dest_dir = try TestDirectory.init("fact-snapshot-dest");
+    defer dest_dir.cleanup();
+    const primary: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/facts", .{source_dir.path()});
+    defer alloc.free(snapshot_root);
+    defer {
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), snapshot_root) catch {};
+    }
+    {
+        var db = try DB.open(alloc, std.mem.span(source_dir.path().ptr), .{ .primary_backend = primary });
+        defer db.close();
+        try db.addIndex(.{ .name = "facts", .kind = .graph, .config_json = "{}" });
+        try db.batch(.{
+            .writes = &.{ .{ .key = "fact:1", .value = "{\"fact\":\"Alice works at Acme\"}" }, .{ .key = "fact:2", .value = "{\"fact\":\"Alice founded Acme\"}" } },
+            .graph_writes = &.{
+                .{ .index_name = "facts", .source = "alice", .target = "acme", .edge_type = "RELATES_TO", .edge_id = "fact:1", .owner_document = "fact:1" },
+                .{ .index_name = "facts", .source = "alice", .target = "acme", .edge_type = "RELATES_TO", .edge_id = "fact:2", .owner_document = "fact:2" },
+            },
+            .sync_level = .enrichments,
+        });
+        _ = try db.snapshot("facts");
+    }
+    try DB.restoreSnapshotTo(alloc, snapshot_root, std.mem.span(dest_dir.path().ptr), .{ .primary_backend = primary });
+    for (0..2) |iteration| {
+        var db = try DB.open(alloc, std.mem.span(dest_dir.path().ptr), .{ .primary_backend = primary });
+        defer db.close();
+        const edges = try db.getEdges(alloc, "facts", "alice", "RELATES_TO", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, if (iteration == 0) 2 else 1), edges.len);
+        for (edges) |edge| try std.testing.expectEqualStrings(edge.edge_id, edge.owner_document);
+        if (iteration == 0) {
+            try db.batch(.{ .deletes = &.{"fact:1"}, .sync_level = .enrichments });
+            try db.runUntilIdle();
+        } else try std.testing.expectEqualStrings("fact:2", edges[0].edge_id);
+    }
 }

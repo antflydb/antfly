@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.edge_direction import EdgeDirection
 from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.graph_relationship_filter import GraphRelationshipFilter
+
 
 T = TypeVar("T", bound="PatternEdgeStep")
 
@@ -17,6 +21,11 @@ class PatternEdgeStep:
     """Deprecated linear graph_searches pattern edge.
 
     Attributes:
+        edge_filter (GraphRelationshipFilter | Unset): AND predicates applied to every relationship before neighbor
+            admission, path ranking, and match counting. Missing or null properties fail comparisons, including ne; use
+            explicit null operators. Maximum 64 predicates and 64 KiB of predicate fields and values. Time intervals have
+            inclusive lower and exclusive upper bounds. Missing/null valid-time bounds are open; known_at requires a
+            created_at value. Invalid timestamp properties never match.
         types (list[str] | Unset): Empty or omitted matches every edge type; otherwise at most 64 unique types totaling
             at most 64 KiB.
         direction (EdgeDirection | Unset): Direction of edges to query:
@@ -29,6 +38,7 @@ class PatternEdgeStep:
         max_weight (float | Unset):
     """
 
+    edge_filter: GraphRelationshipFilter | Unset = UNSET
     types: list[str] | Unset = UNSET
     direction: EdgeDirection | Unset = UNSET
     min_hops: int | Unset = 1
@@ -38,6 +48,10 @@ class PatternEdgeStep:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        edge_filter: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.edge_filter, Unset):
+            edge_filter = self.edge_filter.to_dict()
+
         types: list[str] | Unset = UNSET
         if not isinstance(self.types, Unset):
             types = self.types
@@ -57,6 +71,8 @@ class PatternEdgeStep:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if edge_filter is not UNSET:
+            field_dict["edge_filter"] = edge_filter
         if types is not UNSET:
             field_dict["types"] = types
         if direction is not UNSET:
@@ -74,7 +90,16 @@ class PatternEdgeStep:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.graph_relationship_filter import GraphRelationshipFilter
+
         d = dict(src_dict)
+        _edge_filter = d.pop("edge_filter", UNSET)
+        edge_filter: GraphRelationshipFilter | Unset
+        if isinstance(_edge_filter, Unset):
+            edge_filter = UNSET
+        else:
+            edge_filter = GraphRelationshipFilter.from_dict(_edge_filter)
+
         types = cast(list[str], d.pop("types", UNSET))
 
         _direction = d.pop("direction", UNSET)
@@ -93,6 +118,7 @@ class PatternEdgeStep:
         max_weight = d.pop("max_weight", UNSET)
 
         pattern_edge_step = cls(
+            edge_filter=edge_filter,
             types=types,
             direction=direction,
             min_hops=min_hops,

@@ -140,6 +140,8 @@ pub fn deinitDerivedGraphWrite(alloc: Allocator, write: graph_edge_types.GraphEd
     alloc.free(@constCast(write.source));
     alloc.free(@constCast(write.target));
     alloc.free(@constCast(write.edge_type));
+    if (write.edge_id.len > 0) alloc.free(@constCast(write.edge_id));
+    if (write.owner_document.len > 0) alloc.free(@constCast(write.owner_document));
     if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
 }
 
@@ -148,6 +150,8 @@ pub fn deinitDerivedGraphDelete(alloc: Allocator, delete: graph_edge_types.Graph
     alloc.free(@constCast(delete.source));
     alloc.free(@constCast(delete.target));
     alloc.free(@constCast(delete.edge_type));
+    if (delete.edge_id.len > 0) alloc.free(@constCast(delete.edge_id));
+    if (delete.owner_document.len > 0) alloc.free(@constCast(delete.owner_document));
 }
 
 fn cloneDerivedTargetRefs(alloc: Allocator, targets: []const DerivedTargetRef) ![]DerivedTargetRef {
@@ -250,6 +254,10 @@ pub fn cloneDerivedGraphWrite(alloc: Allocator, write: graph_edge_types.GraphEdg
     errdefer alloc.free(target);
     const edge_type = try alloc.dupe(u8, write.edge_type);
     errdefer alloc.free(edge_type);
+    const edge_id = try alloc.dupe(u8, write.edge_id);
+    errdefer alloc.free(edge_id);
+    const owner_document = try alloc.dupe(u8, write.owner_document);
+    errdefer alloc.free(owner_document);
     const metadata_json = if (write.metadata_json.len > 0)
         try alloc.dupe(u8, write.metadata_json)
     else
@@ -259,6 +267,8 @@ pub fn cloneDerivedGraphWrite(alloc: Allocator, write: graph_edge_types.GraphEdg
         .source = source,
         .target = target,
         .edge_type = edge_type,
+        .edge_id = edge_id,
+        .owner_document = owner_document,
         .weight = write.weight,
         .created_at = write.created_at,
         .updated_at = write.updated_at,
@@ -274,11 +284,17 @@ pub fn cloneDerivedGraphDelete(alloc: Allocator, delete: graph_edge_types.GraphE
     const target = try alloc.dupe(u8, delete.target);
     errdefer alloc.free(target);
     const edge_type = try alloc.dupe(u8, delete.edge_type);
+    errdefer alloc.free(edge_type);
+    const edge_id = try alloc.dupe(u8, delete.edge_id);
+    errdefer alloc.free(edge_id);
+    const owner_document = try alloc.dupe(u8, delete.owner_document);
     return .{
         .index_name = index_name,
         .source = source,
         .target = target,
         .edge_type = edge_type,
+        .edge_id = edge_id,
+        .owner_document = owner_document,
     };
 }
 
@@ -440,7 +456,7 @@ pub fn cloneBatch(alloc: Allocator, batch: DerivedBatch) !DerivedBatch {
 }
 
 const binary_magic = "ADLG";
-const binary_version: u16 = 5;
+const binary_version: u16 = 6;
 const min_supported_binary_version: u16 = 2;
 
 pub fn encodeLogRecord(alloc: Allocator, batch: DerivedBatch) ![]u8 {
@@ -454,7 +470,17 @@ pub fn encodeLogRecordInto(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), b
     out.clearRetainingCapacity();
 
     try out.appendSlice(alloc, binary_magic);
-    try appendInt(out, alloc, u16, binary_version);
+    // Preserve v5 replay compatibility until a batch actually uses explicit identities.
+    var version: u16 = 5;
+    for (batch.graph_writes) |write| if (write.edge_id.len > 0 or write.owner_document.len > 0) {
+        version = binary_version;
+        break;
+    };
+    for (batch.graph_deletes) |delete| if (delete.edge_id.len > 0 or delete.owner_document.len > 0) {
+        version = binary_version;
+        break;
+    };
+    try appendInt(out, alloc, u16, version);
     try appendInt(out, alloc, u64, batch.sequence);
 
     try appendInt(out, alloc, u32, @intCast(batch.documents.len));
@@ -514,6 +540,10 @@ pub fn encodeLogRecordInto(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), b
         try writeBytes(out, alloc, write.source);
         try writeBytes(out, alloc, write.target);
         try writeBytes(out, alloc, write.edge_type);
+        if (version >= 6) {
+            try writeBytes(out, alloc, write.edge_id);
+            try writeBytes(out, alloc, write.owner_document);
+        }
         try appendInt(out, alloc, u64, @bitCast(write.weight));
         try appendInt(out, alloc, u64, write.created_at);
         try appendInt(out, alloc, u64, write.updated_at);
@@ -526,6 +556,10 @@ pub fn encodeLogRecordInto(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), b
         try writeBytes(out, alloc, delete.source);
         try writeBytes(out, alloc, delete.target);
         try writeBytes(out, alloc, delete.edge_type);
+        if (version >= 6) {
+            try writeBytes(out, alloc, delete.edge_id);
+            try writeBytes(out, alloc, delete.owner_document);
+        }
     }
 
     return out.items;
@@ -822,6 +856,8 @@ fn decodeBinaryLogRecord(alloc: Allocator, payload: []const u8) !DecodedLogRecor
             alloc.free(write.source);
             alloc.free(write.target);
             alloc.free(write.edge_type);
+            if (write.edge_id.len > 0) alloc.free(write.edge_id);
+            if (write.owner_document.len > 0) alloc.free(write.owner_document);
             if (write.metadata_json.len > 0) alloc.free(write.metadata_json);
         }
     }
@@ -831,6 +867,8 @@ fn decodeBinaryLogRecord(alloc: Allocator, payload: []const u8) !DecodedLogRecor
             .source = try reader.readBytesAlloc(alloc),
             .target = try reader.readBytesAlloc(alloc),
             .edge_type = try reader.readBytesAlloc(alloc),
+            .edge_id = if (version >= 6) try reader.readBytesOrEmpty(alloc) else "",
+            .owner_document = if (version >= 6) try reader.readBytesOrEmpty(alloc) else "",
             .weight = @bitCast(try reader.readInt(u64)),
             .created_at = try reader.readInt(u64),
             .updated_at = try reader.readInt(u64),
@@ -850,6 +888,8 @@ fn decodeBinaryLogRecord(alloc: Allocator, payload: []const u8) !DecodedLogRecor
             alloc.free(delete.source);
             alloc.free(delete.target);
             alloc.free(delete.edge_type);
+            if (delete.edge_id.len > 0) alloc.free(delete.edge_id);
+            if (delete.owner_document.len > 0) alloc.free(delete.owner_document);
         }
     }
     for (graph_deletes) |*delete| {
@@ -858,6 +898,8 @@ fn decodeBinaryLogRecord(alloc: Allocator, payload: []const u8) !DecodedLogRecor
             .source = try reader.readBytesAlloc(alloc),
             .target = try reader.readBytesAlloc(alloc),
             .edge_type = try reader.readBytesAlloc(alloc),
+            .edge_id = if (version >= 6) try reader.readBytesOrEmpty(alloc) else "",
+            .owner_document = if (version >= 6) try reader.readBytesOrEmpty(alloc) else "",
         };
         initialized_graph_deletes += 1;
     }
@@ -921,7 +963,7 @@ test "derived log record binary round trips" {
     var decoded = try decodeLogRecord(alloc, payload);
     defer decoded.deinit();
 
-    try std.testing.expectEqual(@as(u16, binary_version), decoded.version);
+    try std.testing.expectEqual(@as(u16, 5), decoded.version);
     try std.testing.expectEqual(@as(u64, 42), decoded.batch.sequence);
     try std.testing.expectEqualStrings("doc:a", decoded.batch.documents[0].key);
     try std.testing.expectEqualStrings("dv_v1", decoded.batch.documents[0].targets[0].index_name);
@@ -1073,4 +1115,20 @@ test "derived batch clone releases every partial allocation" {
         }.run,
         .{source},
     );
+}
+
+test "derived log relationship identities select v6 and survive cloning" {
+    const alloc = std.testing.allocator;
+    const write = graph_edge_types.GraphEdgeWrite{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "RELATES_TO", .edge_id = "fact:1", .owner_document = "fact:1" };
+    const delete = graph_edge_types.GraphEdgeDelete{ .index_name = write.index_name, .source = write.source, .target = write.target, .edge_type = write.edge_type, .edge_id = write.edge_id, .owner_document = write.owner_document };
+    const payload = try encodeLogRecord(alloc, .{ .sequence = 1, .graph_writes = &.{write}, .graph_deletes = &.{delete} });
+    defer alloc.free(payload);
+    var decoded = try decodeLogRecord(alloc, payload);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u16, 6), decoded.version);
+    try std.testing.expectEqualStrings("fact:1", decoded.batch.graph_writes[0].edge_id);
+    try std.testing.expectEqualStrings("fact:1", decoded.batch.graph_deletes[0].owner_document);
+    var cloned = try cloneBatch(alloc, decoded.batch);
+    defer deinitDerivedBatch(alloc, &cloned);
+    try std.testing.expectEqualStrings("fact:1", cloned.graph_deletes[0].edge_id);
 }

@@ -1078,12 +1078,18 @@ fn cloneGraphPathEdgeInfo(
     errdefer alloc.free(target);
     const edge_type = try alloc.dupe(u8, edge.edge_type);
     errdefer alloc.free(edge_type);
+    const edge_id = try alloc.dupe(u8, edge.edge_id);
+    errdefer alloc.free(edge_id);
+    const owner_document = try alloc.dupe(u8, edge.owner_document);
+    errdefer alloc.free(owner_document);
     const metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "";
     errdefer if (metadata.len > 0) alloc.free(metadata);
     return .{
         .source = source,
         .target = target,
         .edge_type = edge_type,
+        .edge_id = edge_id,
+        .owner_document = owner_document,
         .weight = edge.weight,
         .metadata = metadata,
         .traversal_direction = if (@hasField(@TypeOf(edge), "traversal_direction"))
@@ -1123,6 +1129,8 @@ pub fn convertPatternMatchesToGraphMatches(
                 alloc.free(edge.source);
                 alloc.free(edge.target);
                 alloc.free(edge.edge_type);
+                if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+                if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
                 if (edge.metadata.len > 0) alloc.free(edge.metadata);
             }
             if (path.len > 0) alloc.free(path);
@@ -2188,6 +2196,8 @@ fn discardGraphResultPaths(
                 alloc.free(edge.source);
                 alloc.free(edge.target);
                 alloc.free(edge.edge_type);
+                if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+                if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
                 if (edge.metadata.len > 0) alloc.free(edge.metadata);
             }
             alloc.free(edges);

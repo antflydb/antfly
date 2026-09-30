@@ -729,7 +729,7 @@ const GraphReplayAccumulator = struct {
     }
 
     fn recordGraphWrite(self: *GraphReplayAccumulator, write: types.GraphEdgeWrite) !void {
-        const owned_key = try edgeKeyAlloc(self.alloc, write.source, write.target, write.edge_type);
+        const owned_key = try internal_keys.graphRelationshipArtifactKeyAlloc(self.alloc, if (write.owner_document.len > 0) write.owner_document else write.source, write.index_name, write.edge_type, write.target, write.source, write.edge_id);
         errdefer self.alloc.free(owned_key);
 
         if (self.graph_deletes.fetchRemove(owned_key)) |removed| {
@@ -755,12 +755,13 @@ const GraphReplayAccumulator = struct {
 
     fn recordGraphDelete(self: *GraphReplayAccumulator, delete: types.GraphEdgeDelete) !void {
         if (self.deleted_keys.contains(delete.source) or self.deleted_keys.contains(delete.target) or
-            self.doc_clears.contains(delete.source) or self.doc_clears.contains(delete.target))
+            self.doc_clears.contains(delete.source) or self.doc_clears.contains(delete.target) or
+            self.deleted_keys.contains(delete.owner_document) or self.doc_clears.contains(delete.owner_document))
         {
             return;
         }
 
-        const owned_key = try edgeKeyAlloc(self.alloc, delete.source, delete.target, delete.edge_type);
+        const owned_key = try internal_keys.graphRelationshipArtifactKeyAlloc(self.alloc, if (delete.owner_document.len > 0) delete.owner_document else delete.source, delete.index_name, delete.edge_type, delete.target, delete.source, delete.edge_id);
         errdefer self.alloc.free(owned_key);
 
         if (self.graph_writes.fetchRemove(owned_key)) |removed| {
@@ -794,7 +795,7 @@ const GraphReplayAccumulator = struct {
         var writes_it = self.graph_writes.iterator();
         while (writes_it.next()) |entry| {
             const write = entry.value_ptr.*;
-            if (std.mem.eql(u8, write.source, key) or std.mem.eql(u8, write.target, key)) {
+            if (if (write.owner_document.len > 0) std.mem.eql(u8, write.owner_document, key) else (std.mem.eql(u8, write.source, key) or std.mem.eql(u8, write.target, key))) {
                 try remove_keys.append(self.alloc, try self.alloc.dupe(u8, entry.key_ptr.*));
             }
         }
@@ -812,7 +813,7 @@ const GraphReplayAccumulator = struct {
         var deletes_it = self.graph_deletes.iterator();
         while (deletes_it.next()) |entry| {
             const delete = entry.value_ptr.*;
-            if (std.mem.eql(u8, delete.source, key) or std.mem.eql(u8, delete.target, key)) {
+            if (if (delete.owner_document.len > 0) std.mem.eql(u8, delete.owner_document, key) else (std.mem.eql(u8, delete.source, key) or std.mem.eql(u8, delete.target, key))) {
                 try remove_keys.append(self.alloc, try self.alloc.dupe(u8, entry.key_ptr.*));
             }
         }
@@ -956,7 +957,11 @@ fn lessThanGraphWrite(_: void, lhs: types.GraphEdgeWrite, rhs: types.GraphEdgeWr
     if (source_cmp != .eq) return source_cmp == .lt;
     const target_cmp = std.mem.order(u8, lhs.target, rhs.target);
     if (target_cmp != .eq) return target_cmp == .lt;
-    return std.mem.order(u8, lhs.edge_type, rhs.edge_type) == .lt;
+    const type_cmp = std.mem.order(u8, lhs.edge_type, rhs.edge_type);
+    if (type_cmp != .eq) return type_cmp == .lt;
+    const id_cmp = std.mem.order(u8, lhs.edge_id, rhs.edge_id);
+    if (id_cmp != .eq) return id_cmp == .lt;
+    return std.mem.order(u8, lhs.owner_document, rhs.owner_document) == .lt;
 }
 
 fn lessThanGraphDelete(_: void, lhs: types.GraphEdgeDelete, rhs: types.GraphEdgeDelete) bool {
@@ -964,7 +969,11 @@ fn lessThanGraphDelete(_: void, lhs: types.GraphEdgeDelete, rhs: types.GraphEdge
     if (source_cmp != .eq) return source_cmp == .lt;
     const target_cmp = std.mem.order(u8, lhs.target, rhs.target);
     if (target_cmp != .eq) return target_cmp == .lt;
-    return std.mem.order(u8, lhs.edge_type, rhs.edge_type) == .lt;
+    const type_cmp = std.mem.order(u8, lhs.edge_type, rhs.edge_type);
+    if (type_cmp != .eq) return type_cmp == .lt;
+    const id_cmp = std.mem.order(u8, lhs.edge_id, rhs.edge_id);
+    if (id_cmp != .eq) return id_cmp == .lt;
+    return std.mem.order(u8, lhs.owner_document, rhs.owner_document) == .lt;
 }
 
 fn cloneDerivedDocument(alloc: Allocator, doc: derived_types.DerivedDocument) !derived_types.DerivedDocument {
@@ -1150,6 +1159,8 @@ fn cloneGraphWrite(alloc: Allocator, write: types.GraphEdgeWrite) !types.GraphEd
         .source = try alloc.dupe(u8, write.source),
         .target = try alloc.dupe(u8, write.target),
         .edge_type = try alloc.dupe(u8, write.edge_type),
+        .edge_id = try alloc.dupe(u8, write.edge_id),
+        .owner_document = try alloc.dupe(u8, write.owner_document),
         .weight = write.weight,
         .created_at = write.created_at,
         .updated_at = write.updated_at,
@@ -1162,6 +1173,8 @@ fn deinitGraphWrite(alloc: Allocator, write: *types.GraphEdgeWrite) void {
     alloc.free(@constCast(write.source));
     alloc.free(@constCast(write.target));
     alloc.free(@constCast(write.edge_type));
+    if (write.edge_id.len > 0) alloc.free(@constCast(write.edge_id));
+    if (write.owner_document.len > 0) alloc.free(@constCast(write.owner_document));
     if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
     write.* = undefined;
 }
@@ -1172,6 +1185,8 @@ fn cloneGraphDelete(alloc: Allocator, delete: types.GraphEdgeDelete) !types.Grap
         .source = try alloc.dupe(u8, delete.source),
         .target = try alloc.dupe(u8, delete.target),
         .edge_type = try alloc.dupe(u8, delete.edge_type),
+        .edge_id = try alloc.dupe(u8, delete.edge_id),
+        .owner_document = try alloc.dupe(u8, delete.owner_document),
     };
 }
 
@@ -1180,5 +1195,7 @@ fn deinitGraphDelete(alloc: Allocator, delete: *types.GraphEdgeDelete) void {
     alloc.free(@constCast(delete.source));
     alloc.free(@constCast(delete.target));
     alloc.free(@constCast(delete.edge_type));
+    if (delete.edge_id.len > 0) alloc.free(@constCast(delete.edge_id));
+    if (delete.owner_document.len > 0) alloc.free(@constCast(delete.owner_document));
     delete.* = undefined;
 }

@@ -38,6 +38,8 @@ describe("graph result admission", () => {
                     from: { key: "a" },
                     to: { key: "b" },
                     direction: "in",
+                    edge_id: "fact:works",
+                    owner_document: "fact:works",
                     type: "related",
                     weight: 1,
                   },

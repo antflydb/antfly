@@ -1261,6 +1261,8 @@ fn collectGraphEdgeArtifact(
         alloc.free(parsed.index_name);
         alloc.free(parsed.edge_type);
         alloc.free(parsed.target_doc_key);
+        alloc.free(parsed.edge_id);
+        alloc.free(parsed.logical_source);
     }
 
     try appendEdgeBatchEntry(alloc, batches, parsed.index_name, parsed.doc_key, parsed.target_doc_key, parsed.edge_type, value);

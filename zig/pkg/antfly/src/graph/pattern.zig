@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const relationship_filter = @import("relationship_filter.zig");
 const Allocator = std.mem.Allocator;
 const graph_mod = @import("graph.zig");
 const identifier_policy = @import("identifier_policy_generated.zig");
@@ -60,6 +61,7 @@ pub const FilterEvaluator = struct {
 };
 
 pub const PatternEdgeStep = struct {
+    edge_filter: relationship_filter.Filter = .{},
     direction: graph_mod.EdgeDirection = .out,
     min_hops: u32 = 1,
     max_hops: u32 = 1,
@@ -262,6 +264,7 @@ fn edgeOwnedBytes(edges: []const graph_mod.Edge) !usize {
             return error.QueryCandidateBudgetExceeded;
         total = std.math.add(usize, total, edge.target.len) catch
             return error.QueryCandidateBudgetExceeded;
+        total = std.math.add(usize, total, edge.edge_id.len +| edge.owner_document.len) catch return error.GraphExploredEdgeBytesBudgetExceeded;
         total = std.math.add(usize, total, edge.edge_type.len) catch
             return error.QueryCandidateBudgetExceeded;
         total = std.math.add(usize, total, edge.metadata.len) catch
@@ -280,6 +283,7 @@ fn probedEdgeOwnedBytes(edges: []const ?graph_mod.Edge) !usize {
             return error.QueryCandidateBudgetExceeded;
         total = std.math.add(usize, total, edge.target.len) catch
             return error.QueryCandidateBudgetExceeded;
+        total = std.math.add(usize, total, edge.edge_id.len +| edge.owner_document.len) catch return error.GraphExploredEdgeBytesBudgetExceeded;
         total = std.math.add(usize, total, edge.edge_type.len) catch
             return error.QueryCandidateBudgetExceeded;
         total = std.math.add(usize, total, edge.metadata.len) catch
@@ -682,6 +686,10 @@ pub fn matchPattern(
             graph_mod.GraphIndex.freeEdges(a, edges);
         }
 
+        pub fn supportsTupleProbes(self: @This()) bool {
+            return !self.graph_index.has_relationship_ids;
+        }
+
         pub fn probeEdgesBounded(
             self: @This(),
             a: Allocator,
@@ -994,6 +1002,9 @@ fn matchExactTwoEdgePattern(
     {
         return null;
     }
+    if (comptime @hasDecl(@TypeOf(edge_reader), "supportsTupleProbes")) {
+        if (!edge_reader.supportsTupleProbes()) return null;
+    }
     if (pattern.len != 3 or start_nodes.len != 1 or !opts.target_required or opts.target_nodes.len != 1 or
         start_nodes[0].table != null or opts.target_nodes[0].table != null or
         opts.node_admission != null)
@@ -1051,7 +1062,7 @@ fn matchExactTwoEdgePattern(
     var candidates = std.ArrayListUnmanaged(Candidate).empty;
     defer candidates.deinit(alloc);
     for (forward_edges, 0..) |graph_edge, edge_index| {
-        if (!edgeMatches(graph_edge, pattern[1].edge)) continue;
+        if (!try edgeMatches(alloc, graph_edge, pattern[1].edge)) continue;
         if (traversal_mod.metadataTargetTable(graph_edge.metadata) != null) return null;
         const middle_key = edgeTarget(graph_edge, start_key, pattern[1].edge.direction) orelse continue;
         if (edgeTargetTable(null, graph_edge, middle_key) != null) return null;
@@ -1131,7 +1142,7 @@ fn matchExactTwoEdgePattern(
                 matches = .empty;
                 return null;
             }
-            if (!edgeMatches(backward_edge, pattern[2].edge)) continue;
+            if (!try edgeMatches(alloc, backward_edge, pattern[2].edge)) continue;
             exact_edge_matches += 1;
             if (matches.items.len >= result_limit) continue;
             const forward_edge = forward_edges[candidate.forward_edge_index];
@@ -1337,7 +1348,7 @@ fn streamReachableNodes(
                     try candidate_indexes.ensureTotalCapacity(alloc, edges.len);
                     try candidate_nodes.ensureTotalCapacity(alloc, edges.len);
                     for (edges, 0..) |graph_edge, edge_index| {
-                        if (!edgeMatches(graph_edge, edge)) continue;
+                        if (!try edgeMatches(alloc, graph_edge, edge)) continue;
                         const target_key = edgeTarget(graph_edge, frontier.key, edge.direction) orelse continue;
                         const target_table = resolvedEdgeTargetTable(
                             edge_reader,
@@ -1382,7 +1393,7 @@ fn streamReachableNodes(
                     for (edges, 0..) |graph_edge, edge_index| {
                         if (admitted_edges) |mask| {
                             if (!mask[edge_index]) continue;
-                        } else if (!edgeMatches(graph_edge, edge)) continue;
+                        } else if (!try edgeMatches(alloc, graph_edge, edge)) continue;
                         const target_key = edgeTarget(graph_edge, frontier.key, edge.direction) orelse continue;
                         const target_table = resolvedEdgeTargetTable(
                             edge_reader,
@@ -1427,7 +1438,7 @@ fn streamReachableNodes(
                     if (admitted_edges) |mask| {
                         if (!mask[edge_index]) continue;
                     } else {
-                        if (!edgeMatches(graph_edge, edge)) continue;
+                        if (!try edgeMatches(alloc, graph_edge, edge)) continue;
                         if (shouldRejectPathRevisit(
                             revisits_path,
                             .{ .table = target_table, .key = target_key },
@@ -1527,7 +1538,7 @@ fn targetNodeMatches(node: node_identity.Ref, targets: []const node_identity.Ref
     return false;
 }
 
-fn edgeMatches(edge: graph_mod.Edge, step: PatternEdgeStep) bool {
+fn edgeMatches(alloc: Allocator, edge: graph_mod.Edge, step: PatternEdgeStep) !bool {
     if (step.types.len > 0) {
         var matched = false;
         for (step.types) |edge_type| {
@@ -1540,17 +1551,17 @@ fn edgeMatches(edge: graph_mod.Edge, step: PatternEdgeStep) bool {
     }
     if (step.min_weight) |min_weight| if (edge.weight < min_weight) return false;
     if (step.max_weight) |max_weight| if (edge.weight > max_weight) return false;
-    return true;
+    return step.edge_filter.matches(alloc, edge);
 }
 
 test "pattern edge filters preserve explicit zero bounds" {
     const zero = graph_mod.Edge{ .source = "a", .target = "b", .edge_type = "e", .weight = 0, .created_at = 0, .updated_at = 0, .metadata = "" };
     const positive = graph_mod.Edge{ .source = "a", .target = "b", .edge_type = "e", .weight = 0.1, .created_at = 0, .updated_at = 0, .metadata = "" };
     const negative = graph_mod.Edge{ .source = "a", .target = "b", .edge_type = "e", .weight = -0.1, .created_at = 0, .updated_at = 0, .metadata = "" };
-    try std.testing.expect(edgeMatches(zero, .{ .max_weight = 0 }));
-    try std.testing.expect(!edgeMatches(positive, .{ .max_weight = 0 }));
-    try std.testing.expect(edgeMatches(negative, .{ .max_weight = 0 }));
-    try std.testing.expect(!edgeMatches(negative, .{ .min_weight = 0 }));
+    try std.testing.expect(try edgeMatches(std.testing.allocator, zero, .{ .max_weight = 0 }));
+    try std.testing.expect(!try edgeMatches(std.testing.allocator, positive, .{ .max_weight = 0 }));
+    try std.testing.expect(try edgeMatches(std.testing.allocator, negative, .{ .max_weight = 0 }));
+    try std.testing.expect(!try edgeMatches(std.testing.allocator, negative, .{ .min_weight = 0 }));
 }
 
 fn edgeTarget(edge: graph_mod.Edge, current_key: []const u8, direction: graph_mod.EdgeDirection) ?[]const u8 {
@@ -3419,7 +3430,7 @@ fn clonePathEdges(alloc: Allocator, edges: []const paths_mod.PathEdge) ![]paths_
         if (out.len > 0) alloc.free(out);
     }
     for (edges, 0..) |edge, i| {
-        out[i] = try dupePathEdge(alloc, edge.source, edge.target, edge.edge_type, edge.weight, edge.metadata, edge.traversal_direction);
+        out[i] = try dupePathEdge(alloc, edge.source, edge.target, edge.edge_type, edge.weight, edge.metadata, edge.traversal_direction, edge.edge_id, edge.owner_document);
         initialized += 1;
     }
     return out;
@@ -3433,11 +3444,11 @@ fn concatPathEdges(alloc: Allocator, left: []const paths_mod.PathEdge, right: []
         if (out.len > 0) alloc.free(out);
     }
     for (left, 0..) |edge, i| {
-        out[i] = try dupePathEdge(alloc, edge.source, edge.target, edge.edge_type, edge.weight, edge.metadata, edge.traversal_direction);
+        out[i] = try dupePathEdge(alloc, edge.source, edge.target, edge.edge_type, edge.weight, edge.metadata, edge.traversal_direction, edge.edge_id, edge.owner_document);
         initialized += 1;
     }
     for (right, 0..) |edge, i| {
-        out[left.len + i] = try dupePathEdge(alloc, edge.source, edge.target, edge.edge_type, edge.weight, edge.metadata, edge.traversal_direction);
+        out[left.len + i] = try dupePathEdge(alloc, edge.source, edge.target, edge.edge_type, edge.weight, edge.metadata, edge.traversal_direction, edge.edge_id, edge.owner_document);
         initialized += 1;
     }
     return out;
@@ -3458,7 +3469,7 @@ fn appendPathEdge(
         if (out.len > 0) alloc.free(out);
     }
     for (existing, 0..) |item, i| {
-        out[i] = try dupePathEdge(alloc, item.source, item.target, item.edge_type, item.weight, item.metadata, item.traversal_direction);
+        out[i] = try dupePathEdge(alloc, item.source, item.target, item.edge_type, item.weight, item.metadata, item.traversal_direction, item.edge_id, item.owner_document);
         initialized += 1;
     }
     out[out.len - 1] = try dupePathEdge(
@@ -3469,6 +3480,8 @@ fn appendPathEdge(
         edge.weight,
         edge.metadata,
         try traversedEdgeDirection(edge, source, target, requested_direction),
+        edge.edge_id,
+        edge.owner_document,
     );
     initialized += 1;
     return out;
@@ -3507,6 +3520,8 @@ fn dupePathEdge(
     weight: f64,
     metadata: []const u8,
     traversal_direction: ?graph_mod.EdgeDirection,
+    edge_id: []const u8,
+    owner_document: []const u8,
 ) !paths_mod.PathEdge {
     const owned_source = try alloc.dupe(u8, source);
     errdefer alloc.free(owned_source);
@@ -3514,12 +3529,18 @@ fn dupePathEdge(
     errdefer alloc.free(owned_target);
     const owned_edge_type = try alloc.dupe(u8, edge_type);
     errdefer alloc.free(owned_edge_type);
+    const owned_id = if (edge_id.len > 0) try alloc.dupe(u8, edge_id) else "";
+    errdefer if (owned_id.len > 0) alloc.free(owned_id);
+    const owned_owner = if (owner_document.len > 0) try alloc.dupe(u8, owner_document) else "";
+    errdefer if (owned_owner.len > 0) alloc.free(owned_owner);
     const owned_metadata = if (metadata.len > 0) try alloc.dupe(u8, metadata) else "";
     errdefer if (owned_metadata.len > 0) alloc.free(owned_metadata);
     return .{
         .source = owned_source,
         .target = owned_target,
         .edge_type = owned_edge_type,
+        .edge_id = owned_id,
+        .owner_document = owned_owner,
         .weight = weight,
         .metadata = owned_metadata,
         .traversal_direction = traversal_direction,
@@ -3536,6 +3557,8 @@ fn freePathEdgeItems(alloc: Allocator, edges: []const paths_mod.PathEdge) void {
         alloc.free(edge.source);
         alloc.free(edge.target);
         alloc.free(edge.edge_type);
+        if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+        if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
         if (edge.metadata.len > 0) alloc.free(edge.metadata);
     }
 }
@@ -5446,4 +5469,28 @@ test "pattern match supports linear alias bindings and cycles" {
     try std.testing.expectEqualStrings("b", matches[0].bindings[1].key);
     try std.testing.expectEqual(@as(u32, 1), matches[0].bindings[1].depth);
     try std.testing.expectEqual(@as(usize, 3), matches[0].path.len);
+}
+
+test "exact two-edge pattern preserves same type parallel relationship matches" {
+    const alloc = std.testing.allocator;
+    var graph = try graph_mod.GraphIndex.openWithPrivateStores(alloc, "unused-out", "unused-in", "facts", .{ .reverse_backend = .mem });
+    defer graph.close();
+    try graph.batchApply(&.{
+        .{ .source = "forum", .target = "post", .edge_type = "CONTAINER_OF" },
+        .{ .source = "post", .target = "tag", .edge_type = "HAS_TAG", .edge_id = "fact:1", .owner_document = "fact:1" },
+        .{ .source = "post", .target = "tag", .edge_type = "HAS_TAG", .edge_id = "fact:2", .owner_document = "fact:2" },
+    }, &.{});
+    for ([_]bool{ false, true }) |include_paths| {
+        const matches = try matchPattern(alloc, &graph, &.{"forum"}, &.{
+            .{ .alias = "forum" },
+            .{ .alias = "post", .edge = .{ .types = &.{"CONTAINER_OF"} } },
+            .{ .alias = "tag", .edge = .{ .types = &.{"HAS_TAG"} } },
+        }, .{ .target_nodes = &.{.{ .table = null, .key = "tag" }}, .target_required = true, .include_paths = include_paths });
+        defer freeMatches(alloc, matches);
+        try std.testing.expectEqual(@as(usize, 2), matches.len);
+        if (include_paths) {
+            try std.testing.expect(!std.mem.eql(u8, matches[0].path[1].edge_id, matches[1].path[1].edge_id));
+            try std.testing.expectEqualStrings(matches[0].path[1].edge_id, matches[0].path[1].owner_document);
+        }
+    }
 }

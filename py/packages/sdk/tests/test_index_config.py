@@ -132,8 +132,8 @@ def test_graph_sources_reject_duplicates_and_invalid_values() -> None:
         graph_index_sources(GraphArtifactSource("relations", edge=GraphEdgeMapping(weight=float("nan"))))
     with pytest.raises(ValueError, match="path"):
         graph_index_sources(GraphArtifactSource("relations", path="$.relations[0]"))
-    with pytest.raises(TypeError, match="source"):
-        GraphNodeMapping(source="{{ _doc.key }}")  # type: ignore[call-arg]
+    with pytest.raises(ValueError, match="requires edge.edge_id"):
+        graph_index_sources(GraphArtifactSource("relations", nodes=GraphNodeMapping(source="{{ _doc.key }}")))
     with pytest.raises(ValueError, match="nodes.target"):
         graph_index_sources(GraphArtifactSource("relations", nodes=GraphNodeMapping(target=float("inf"))))
 
@@ -179,3 +179,16 @@ def test_validates_openapi_index_request_relationships() -> None:
             "sources": [{"artifact": "dense_v1"}],
         }
     )
+
+
+def test_graph_fact_projection_preserves_arbitrary_source_and_edge_id() -> None:
+    source = graph_index_sources(
+        GraphArtifactSource(
+            "relations",
+            path="$",
+            nodes=GraphNodeMapping(source="{{ _item.source }}", target="{{ _item.target }}"),
+            edge=GraphEdgeMapping(edge_id="{{ _doc.key }}", type="RELATES_TO"),
+        )
+    )[0]
+    assert source["nodes"]["source"] == "{{ _item.source }}"
+    assert source["edge"]["edge_id"] == "{{ _doc.key }}"

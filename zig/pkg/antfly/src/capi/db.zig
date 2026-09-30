@@ -1770,6 +1770,8 @@ const JsonSparseEnrichmentWrite = struct {
 };
 
 const JsonGraphWrite = struct {
+    edge_id: []const u8,
+    owner_document: []const u8,
     index_name: []const u8,
     source_b64: []u8,
     target_b64: []u8,
@@ -1781,6 +1783,8 @@ const JsonGraphWrite = struct {
 
     fn init(alloc: Allocator, write: db_mod.types.GraphEdgeWrite) !JsonGraphWrite {
         return .{
+            .edge_id = write.edge_id,
+            .owner_document = write.owner_document,
             .index_name = write.index_name,
             .source_b64 = try dupBase64(alloc, write.source),
             .target_b64 = try dupBase64(alloc, write.target),

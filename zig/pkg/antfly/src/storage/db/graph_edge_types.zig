@@ -13,6 +13,8 @@
 // limitations.
 
 pub const GraphEdgeWrite = struct {
+    edge_id: []const u8 = "",
+    owner_document: []const u8 = "",
     index_name: []const u8,
     source: []const u8,
     target: []const u8,
@@ -24,6 +26,8 @@ pub const GraphEdgeWrite = struct {
 };
 
 pub const GraphEdgeDelete = struct {
+    edge_id: []const u8 = "",
+    owner_document: []const u8 = "",
     index_name: []const u8,
     source: []const u8,
     target: []const u8,

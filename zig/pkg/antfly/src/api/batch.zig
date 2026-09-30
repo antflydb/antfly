@@ -760,7 +760,7 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
         try writer.writeAll(",\"_graph_writes\":[");
         for (req.graph_writes, 0..) |write, i| {
             if (i != 0) try writer.writeByte(',');
-            try writer.print("{{\"index_name\":{f},\"source\":{f},\"target\":{f},\"edge_type\":{f},\"weight\":{d},\"created_at\":\"{d}\",\"updated_at\":\"{d}\",\"metadata_json\":{f}}}", .{
+            try writer.print("{{\"index_name\":{f},\"source\":{f},\"target\":{f},\"edge_type\":{f},\"weight\":{d},\"created_at\":\"{d}\",\"updated_at\":\"{d}\",\"metadata_json\":{f}", .{
                 std.json.fmt(write.index_name, .{}),
                 std.json.fmt(write.source, .{}),
                 std.json.fmt(write.target, .{}),
@@ -770,6 +770,9 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
                 write.updated_at,
                 std.json.fmt(write.metadata_json, .{}),
             });
+            if (write.edge_id.len > 0) try writer.print(",\"edge_id\":{f}", .{std.json.fmt(write.edge_id, .{})});
+            if (write.owner_document.len > 0) try writer.print(",\"owner_document\":{f}", .{std.json.fmt(write.owner_document, .{})});
+            try writer.writeByte('}');
         }
         try writer.writeByte(']');
     }
@@ -777,12 +780,15 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
         try writer.writeAll(",\"_graph_deletes\":[");
         for (req.graph_deletes, 0..) |delete, i| {
             if (i != 0) try writer.writeByte(',');
-            try writer.print("{{\"index_name\":{f},\"source\":{f},\"target\":{f},\"edge_type\":{f}}}", .{
+            try writer.print("{{\"index_name\":{f},\"source\":{f},\"target\":{f},\"edge_type\":{f}", .{
                 std.json.fmt(delete.index_name, .{}),
                 std.json.fmt(delete.source, .{}),
                 std.json.fmt(delete.target, .{}),
                 std.json.fmt(delete.edge_type, .{}),
             });
+            if (delete.edge_id.len > 0) try writer.print(",\"edge_id\":{f}", .{std.json.fmt(delete.edge_id, .{})});
+            if (delete.owner_document.len > 0) try writer.print(",\"owner_document\":{f}", .{std.json.fmt(delete.owner_document, .{})});
+            try writer.writeByte('}');
         }
         try writer.writeByte(']');
     }
@@ -1023,6 +1029,12 @@ fn optionalObjectF64(object: std.json.ObjectMap, name: []const u8, default: f64)
     };
 }
 
+fn optionalGraphIdentityString(alloc: std.mem.Allocator, object: std.json.ObjectMap, name: []const u8) ![]const u8 {
+    const value = object.get(name) orelse return "";
+    if (value != .string or value.string.len == 0) return error.InvalidBatchRequest;
+    return alloc.dupe(u8, value.string);
+}
+
 fn parseGraphWrites(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.types.GraphEdgeWrite {
     if (value != .array) return error.InvalidBatchRequest;
     const writes = try alloc.alloc(db_mod.types.GraphEdgeWrite, value.array.items.len);
@@ -1047,7 +1059,14 @@ fn parseGraphWrites(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.t
         errdefer alloc.free(edge_type);
         const owned_metadata_json = try alloc.dupe(u8, metadata_json);
         errdefer alloc.free(owned_metadata_json);
+        const edge_id = try optionalGraphIdentityString(alloc, item.object, "edge_id");
+        errdefer if (edge_id.len > 0) alloc.free(edge_id);
+        const owner_document = try optionalGraphIdentityString(alloc, item.object, "owner_document");
+        errdefer if (owner_document.len > 0) alloc.free(owner_document);
+        if (owner_document.len > 0 and edge_id.len == 0) return error.InvalidBatchRequest;
         writes[i] = .{
+            .edge_id = edge_id,
+            .owner_document = owner_document,
             .index_name = index_name,
             .source = source,
             .target = target,
@@ -1080,7 +1099,14 @@ fn parseGraphDeletes(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.
         errdefer alloc.free(target);
         const edge_type = try alloc.dupe(u8, try requiredObjectString(item.object, "edge_type"));
         errdefer alloc.free(edge_type);
+        const edge_id = try optionalGraphIdentityString(alloc, item.object, "edge_id");
+        errdefer if (edge_id.len > 0) alloc.free(edge_id);
+        const owner_document = try optionalGraphIdentityString(alloc, item.object, "owner_document");
+        errdefer if (owner_document.len > 0) alloc.free(owner_document);
+        if (owner_document.len > 0 and edge_id.len == 0) return error.InvalidBatchRequest;
         deletes[i] = .{
+            .edge_id = edge_id,
+            .owner_document = owner_document,
             .index_name = index_name,
             .source = source,
             .target = target,
@@ -1222,6 +1248,8 @@ fn freeGraphWriteElements(alloc: std.mem.Allocator, writes: []db_mod.types.Graph
         alloc.free(@constCast(write.source));
         alloc.free(@constCast(write.target));
         alloc.free(@constCast(write.edge_type));
+        if (write.edge_id.len > 0) alloc.free(@constCast(write.edge_id));
+        if (write.owner_document.len > 0) alloc.free(@constCast(write.owner_document));
         alloc.free(@constCast(write.metadata_json));
     }
 }
@@ -1237,6 +1265,8 @@ fn freeGraphDeleteElements(alloc: std.mem.Allocator, deletes: []db_mod.types.Gra
         alloc.free(@constCast(delete.source));
         alloc.free(@constCast(delete.target));
         alloc.free(@constCast(delete.edge_type));
+        if (delete.edge_id.len > 0) alloc.free(@constCast(delete.edge_id));
+        if (delete.owner_document.len > 0) alloc.free(@constCast(delete.owner_document));
     }
 }
 
@@ -1329,6 +1359,8 @@ fn consumerTests() type {
                     .source = "doc:a",
                     .target = "doc:b",
                     .edge_type = "mentions",
+                    .edge_id = "fact:1",
+                    .owner_document = "fact:1",
                     .weight = 0.75,
                     .created_at = 11,
                     .updated_at = 12,
@@ -1339,6 +1371,8 @@ fn consumerTests() type {
                     .source = "doc:c",
                     .target = "doc:d",
                     .edge_type = "mentions",
+                    .edge_id = "fact:1",
+                    .owner_document = "fact:1",
                 }},
             };
             const encoded = try encodeBatchRequest(alloc, request);
@@ -1355,6 +1389,8 @@ fn consumerTests() type {
             try std.testing.expectEqualStrings("{\"target_table\":\"entities\"}", parsed.req.graph_writes[0].metadata_json);
             try std.testing.expectEqual(@as(usize, 1), parsed.req.graph_deletes.len);
             try std.testing.expectEqualStrings("doc:d", parsed.req.graph_deletes[0].target);
+            try std.testing.expectEqualStrings("fact:1", parsed.req.graph_writes[0].edge_id);
+            try std.testing.expectEqualStrings("fact:1", parsed.req.graph_deletes[0].owner_document);
         }
 
         test "internal batch parser requires source acknowledgements to be metadata-only" {

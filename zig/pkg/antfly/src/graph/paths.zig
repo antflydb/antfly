@@ -25,6 +25,7 @@
 //!   max_weight: Dijkstra log — maximize product of edge weights in [0, 1]
 
 const std = @import("std");
+const relationship_filter = @import("relationship_filter.zig");
 const Allocator = std.mem.Allocator;
 const platform_time = @import("antfly_platform").time;
 const graph_mod = @import("graph.zig");
@@ -79,6 +80,7 @@ const GraphIndexEdgeReader = struct {
 pub const PathWeightMode = enum { min_hops, min_weight, max_weight };
 
 pub const PathFindOptions = struct {
+    edge_filter: relationship_filter.Filter = .{},
     weight_mode: PathWeightMode = .min_hops,
     edge_types: []const []const u8 = &.{},
     direction: EdgeDirection = .out,
@@ -94,6 +96,8 @@ pub const PathFindOptions = struct {
 };
 
 pub const PathEdge = struct {
+    edge_id: []const u8 = "",
+    owner_document: []const u8 = "",
     source: []const u8,
     target: []const u8,
     edge_type: []const u8,
@@ -134,6 +138,8 @@ pub fn freePath(alloc: Allocator, path: Path) void {
         alloc.free(e.source);
         alloc.free(e.target);
         alloc.free(e.edge_type);
+        if (e.edge_id.len > 0) alloc.free(e.edge_id);
+        if (e.owner_document.len > 0) alloc.free(e.owner_document);
         if (e.metadata.len > 0) alloc.free(e.metadata);
     }
     alloc.free(path.edges);
@@ -158,6 +164,8 @@ const PathNode = struct {
 };
 
 const OwnedEdgeInfo = struct {
+    edge_id: []const u8 = "",
+    owner_document: []const u8 = "",
     source: []const u8,
     target: []const u8,
     edge_type: []const u8,
@@ -171,6 +179,8 @@ fn destroyPathNode(alloc: Allocator, node: *PathNode) void {
         alloc.free(edge.source);
         alloc.free(edge.target);
         alloc.free(edge.edge_type);
+        if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+        if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
         if (edge.metadata.len > 0) alloc.free(edge.metadata);
     }
     alloc.destroy(node);
@@ -195,12 +205,18 @@ fn createPathNode(
         errdefer alloc.free(target);
         const edge_type = try alloc.dupe(u8, value.edge_type);
         errdefer alloc.free(edge_type);
+        const edge_id = try alloc.dupe(u8, value.edge_id);
+        errdefer alloc.free(edge_id);
+        const owner_document = try alloc.dupe(u8, value.owner_document);
+        errdefer alloc.free(owner_document);
         const metadata = if (value.metadata.len > 0) try alloc.dupe(u8, value.metadata) else "";
         errdefer if (metadata.len > 0) alloc.free(metadata);
         break :blk .{
             .source = source,
             .target = target,
             .edge_type = edge_type,
+            .edge_id = edge_id,
+            .owner_document = owner_document,
             .weight = value.weight,
             .metadata = metadata,
         };
@@ -227,7 +243,7 @@ fn retainPathNodeState(
     var added = std.math.add(usize, @sizeOf(PathNode) + 3 * @sizeOf(*PathNode), duplicated_key_bytes) catch
         return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
     if (edge) |value| {
-        for ([_][]const u8{ value.source, value.target, value.edge_type, value.metadata }) |part| {
+        for ([_][]const u8{ value.source, value.target, value.edge_type, value.edge_id, value.owner_document, value.metadata }) |part| {
             added = std.math.add(usize, added, part.len) catch
                 return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
         }
@@ -237,6 +253,8 @@ fn retainPathNodeState(
 }
 
 const EdgeIdentity = struct {
+    edge_id: []const u8 = "",
+    owner_document: []const u8 = "",
     source: []const u8,
     target: []const u8,
     edge_type: []const u8,
@@ -248,13 +266,15 @@ const EdgeIdentityContext = struct {
         hashIdentityPart(&hasher, key.source);
         hashIdentityPart(&hasher, key.target);
         hashIdentityPart(&hasher, key.edge_type);
+        hashIdentityPart(&hasher, key.edge_id);
+        hashIdentityPart(&hasher, key.owner_document);
         return hasher.final();
     }
 
     pub fn eql(_: @This(), a: EdgeIdentity, b: EdgeIdentity) bool {
         return std.mem.eql(u8, a.source, b.source) and
             std.mem.eql(u8, a.target, b.target) and
-            std.mem.eql(u8, a.edge_type, b.edge_type);
+            std.mem.eql(u8, a.edge_id, b.edge_id) and std.mem.eql(u8, a.owner_document, b.owner_document) and std.mem.eql(u8, a.edge_type, b.edge_type);
     }
 
     fn hashIdentityPart(hasher: *std.hash.Wyhash, value: []const u8) void {
@@ -292,11 +312,15 @@ fn putExcludedEdge(
     source: []const u8,
     target: []const u8,
     edge_type: []const u8,
+    edge_id: []const u8,
+    owner_document: []const u8,
 ) !void {
     const borrowed: EdgeIdentity = .{
         .source = source,
         .target = target,
         .edge_type = edge_type,
+        .edge_id = edge_id,
+        .owner_document = owner_document,
     };
     if (set.contains(borrowed)) return;
 
@@ -306,7 +330,13 @@ fn putExcludedEdge(
     errdefer alloc.free(owned_target);
     const owned_edge_type = try alloc.dupe(u8, edge_type);
     errdefer alloc.free(owned_edge_type);
+    const owned_id = try alloc.dupe(u8, edge_id);
+    errdefer alloc.free(owned_id);
+    const owned_owner = try alloc.dupe(u8, owner_document);
+    errdefer alloc.free(owned_owner);
     try set.putNoClobber(alloc, .{
+        .edge_id = owned_id,
+        .owner_document = owned_owner,
         .source = owned_source,
         .target = owned_target,
         .edge_type = owned_edge_type,
@@ -319,6 +349,8 @@ fn deinitExcludedEdges(set: *ExcludedEdgeSet, alloc: Allocator) void {
         alloc.free(key.source);
         alloc.free(key.target);
         alloc.free(key.edge_type);
+        if (key.edge_id.len > 0) alloc.free(key.edge_id);
+        if (key.owner_document.len > 0) alloc.free(key.owner_document);
     }
     set.deinit(alloc);
 }
@@ -512,7 +544,7 @@ fn bfsShortestPath(
                 try candidate_indexes.ensureTotalCapacity(alloc, edges.len);
                 try candidate_nodes.ensureTotalCapacity(alloc, edges.len);
                 for (edges, 0..) |edge, edge_index| {
-                    if (!shouldTraverseEdge(opts, &edge)) continue;
+                    if (!try shouldTraverseEdge(alloc, opts, &edge)) continue;
                     const next_key = if (std.mem.eql(u8, current.key, edge.source)) edge.target else edge.source;
                     if (excluded_nodes) |en| if (en.contains(next_key)) continue;
                     if (excluded_edges) |ee| {
@@ -520,6 +552,8 @@ fn bfsShortestPath(
                             .source = edge.source,
                             .target = edge.target,
                             .edge_type = edge.edge_type,
+                            .edge_id = edge.edge_id,
+                            .owner_document = edge.owner_document,
                         })) continue;
                     }
                     if (visited.contains(next_key)) continue;
@@ -550,13 +584,15 @@ fn bfsShortestPath(
                 if (admitted_edges) |mask| {
                     if (!mask[edge_index]) continue;
                 } else {
-                    if (!shouldTraverseEdge(opts, &edge)) continue;
+                    if (!try shouldTraverseEdge(alloc, opts, &edge)) continue;
                     if (excluded_nodes) |en| if (en.contains(next_key)) continue;
                     if (excluded_edges) |ee| {
                         if (ee.contains(.{
                             .source = edge.source,
                             .target = edge.target,
                             .edge_type = edge.edge_type,
+                            .edge_id = edge.edge_id,
+                            .owner_document = edge.owner_document,
                         })) continue;
                     }
                 }
@@ -667,7 +703,7 @@ fn dijkstraPath(
                 try candidate_indexes.ensureTotalCapacity(alloc, edges.len);
                 try candidate_nodes.ensureTotalCapacity(alloc, edges.len);
                 for (edges, 0..) |edge, edge_index| {
-                    if (!shouldTraverseEdge(opts, &edge)) continue;
+                    if (!try shouldTraverseEdge(alloc, opts, &edge)) continue;
                     const next_key = if (std.mem.eql(u8, current.key, edge.source)) edge.target else edge.source;
                     if (excluded_nodes) |en| if (en.contains(next_key)) continue;
                     if (excluded_edges) |ee| {
@@ -675,6 +711,8 @@ fn dijkstraPath(
                             .source = edge.source,
                             .target = edge.target,
                             .edge_type = edge.edge_type,
+                            .edge_id = edge.edge_id,
+                            .owner_document = edge.owner_document,
                         })) continue;
                     }
                     const target_table = if (std.mem.eql(u8, next_key, edge.target))
@@ -704,13 +742,15 @@ fn dijkstraPath(
                 if (admitted_edges) |mask| {
                     if (!mask[edge_index]) continue;
                 } else {
-                    if (!shouldTraverseEdge(opts, &edge)) continue;
+                    if (!try shouldTraverseEdge(alloc, opts, &edge)) continue;
                     if (excluded_nodes) |en| if (en.contains(next_key)) continue;
                     if (excluded_edges) |ee| {
                         if (ee.contains(.{
                             .source = edge.source,
                             .target = edge.target,
                             .edge_type = edge.edge_type,
+                            .edge_id = edge.edge_id,
+                            .owner_document = edge.owner_document,
                         })) continue;
                     }
                 }
@@ -869,6 +909,8 @@ pub fn findKShortestPathsWithEdgeReader(
                     edge.source,
                     edge.target,
                     edge.edge_type,
+                    edge.edge_id,
+                    edge.owner_document,
                 );
             }
 
@@ -1002,16 +1044,20 @@ fn getEdgesForPathBudget(
 // Helpers
 // ============================================================================
 
-fn shouldTraverseEdge(opts: PathFindOptions, edge: *const Edge) bool {
-    if (opts.min_weight) |min_weight| if (edge.weight < min_weight) return false;
-    if (opts.max_weight) |max_weight| if (edge.weight > max_weight) return false;
+fn shouldTraverseEdge(alloc: Allocator, opts: PathFindOptions, edge: *const Edge) !bool {
+    if (opts.min_weight) |bound| if (edge.weight < bound) return false;
+    if (opts.max_weight) |bound| if (edge.weight > bound) return false;
     if (opts.edge_types.len > 0) {
+        var matched = false;
         for (opts.edge_types) |et| {
-            if (std.mem.eql(u8, edge.edge_type, et)) return true;
+            if (std.mem.eql(u8, edge.edge_type, et)) {
+                matched = true;
+                break;
+            }
         }
-        return false;
+        if (!matched) return false;
     }
-    return true;
+    return opts.edge_filter.matches(alloc, edge.*);
 }
 
 pub fn pathEdgeCost(mode: PathWeightMode, weight: f64) !f64 {
@@ -1045,19 +1091,25 @@ pub fn sumPathEdgeWeights(edges: anytype) !f64 {
     return total;
 }
 
-fn clonePathEdge(alloc: Allocator, edge: anytype) !PathEdge {
+pub fn clonePathEdge(alloc: Allocator, edge: anytype) !PathEdge {
     const source = try alloc.dupe(u8, edge.source);
     errdefer alloc.free(source);
     const target = try alloc.dupe(u8, edge.target);
     errdefer alloc.free(target);
     const edge_type = try alloc.dupe(u8, edge.edge_type);
     errdefer alloc.free(edge_type);
+    const edge_id = try alloc.dupe(u8, edge.edge_id);
+    errdefer alloc.free(edge_id);
+    const owner_document = try alloc.dupe(u8, edge.owner_document);
+    errdefer alloc.free(owner_document);
     const metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "";
     errdefer if (metadata.len > 0) alloc.free(metadata);
     return .{
         .source = source,
         .target = target,
         .edge_type = edge_type,
+        .edge_id = edge_id,
+        .owner_document = owner_document,
         .weight = edge.weight,
         .metadata = metadata,
         .traversal_direction = if (@hasField(@TypeOf(edge), "traversal_direction"))
@@ -1157,10 +1209,10 @@ test "path weight filters preserve explicit zero bounds" {
     const zero = Edge{ .source = "a", .target = "b", .edge_type = "e", .weight = 0, .created_at = 0, .updated_at = 0, .metadata = "" };
     const positive = Edge{ .source = "a", .target = "b", .edge_type = "e", .weight = 0.1, .created_at = 0, .updated_at = 0, .metadata = "" };
     const negative = Edge{ .source = "a", .target = "b", .edge_type = "e", .weight = -0.1, .created_at = 0, .updated_at = 0, .metadata = "" };
-    try std.testing.expect(shouldTraverseEdge(.{ .max_weight = 0 }, &zero));
-    try std.testing.expect(!shouldTraverseEdge(.{ .max_weight = 0 }, &positive));
-    try std.testing.expect(shouldTraverseEdge(.{ .max_weight = 0 }, &negative));
-    try std.testing.expect(!shouldTraverseEdge(.{ .min_weight = 0 }, &negative));
+    try std.testing.expect(try shouldTraverseEdge(std.testing.allocator, .{ .max_weight = 0 }, &zero));
+    try std.testing.expect(!try shouldTraverseEdge(std.testing.allocator, .{ .max_weight = 0 }, &positive));
+    try std.testing.expect(try shouldTraverseEdge(std.testing.allocator, .{ .max_weight = 0 }, &negative));
+    try std.testing.expect(!try shouldTraverseEdge(std.testing.allocator, .{ .min_weight = 0 }, &negative));
 }
 
 test "path scoring follows the selected objective" {
@@ -1217,6 +1269,8 @@ fn reconstructPath(
             alloc.free(edge.source);
             alloc.free(edge.target);
             alloc.free(edge.edge_type);
+            if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+            if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
             if (edge.metadata.len > 0) alloc.free(edge.metadata);
         }
         alloc.free(path_edges);
@@ -1256,7 +1310,7 @@ fn reconstructedPathOwnedBytes(end_node: *const PathNode) !usize {
         total = try std.math.add(usize, total, node.key.len);
         if (node.parent_edge) |edge| {
             total = try std.math.add(usize, total, @sizeOf(PathEdge));
-            for ([_][]const u8{ edge.source, edge.target, edge.edge_type, edge.metadata }) |part| {
+            for ([_][]const u8{ edge.source, edge.target, edge.edge_type, edge.edge_id, edge.owner_document, edge.metadata }) |part| {
                 total = try std.math.add(usize, total, part.len);
             }
         }
@@ -1280,7 +1334,7 @@ fn pathToKey(alloc: Allocator, path: *const Path) ![]u8 {
     for (path.edges) |edge| {
         total_len = std.math.add(usize, total_len, 1) catch
             return error.PathIdentityTooLarge;
-        for ([_][]const u8{ edge.source, edge.target, edge.edge_type }) |part| {
+        for ([_][]const u8{ edge.source, edge.target, edge.edge_type, edge.edge_id, edge.owner_document }) |part| {
             total_len = std.math.add(usize, total_len, @sizeOf(u64)) catch
                 return error.PathIdentityTooLarge;
             total_len = std.math.add(usize, total_len, part.len) catch
@@ -1313,7 +1367,7 @@ fn pathToKey(alloc: Allocator, path: *const Path) ![]u8 {
             .both => 3,
         } else 0;
         pos += 1;
-        for ([_][]const u8{ edge.source, edge.target, edge.edge_type }) |part| {
+        for ([_][]const u8{ edge.source, edge.target, edge.edge_type, edge.edge_id, edge.owner_document }) |part| {
             std.mem.writeInt(u64, buf[pos..][0..8], @intCast(part.len), .little);
             pos += 8;
             @memcpy(buf[pos..][0..part.len], part);
@@ -1355,7 +1409,7 @@ fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
 fn pathEdgeIdentityEql(a: PathEdge, b: PathEdge) bool {
     return std.mem.eql(u8, a.source, b.source) and
         std.mem.eql(u8, a.target, b.target) and
-        std.mem.eql(u8, a.edge_type, b.edge_type) and
+        std.mem.eql(u8, a.edge_id, b.edge_id) and std.mem.eql(u8, a.owner_document, b.owner_document) and std.mem.eql(u8, a.edge_type, b.edge_type) and
         a.traversal_direction == b.traversal_direction;
 }
 
@@ -1386,11 +1440,11 @@ fn joinedPathOwnedBytes(root: *const Path, spur_idx: usize, spur: *const Path) !
     for (root.nodes[0..spur_idx]) |node| total = try std.math.add(usize, total, node.len);
     for (spur.nodes) |node| total = try std.math.add(usize, total, node.len);
     for (root.edges[0..spur_idx]) |edge| {
-        for ([_][]const u8{ edge.source, edge.target, edge.edge_type, edge.metadata }) |part|
+        for ([_][]const u8{ edge.source, edge.target, edge.edge_type, edge.edge_id, edge.owner_document, edge.metadata }) |part|
             total = try std.math.add(usize, total, part.len);
     }
     for (spur.edges) |edge| {
-        for ([_][]const u8{ edge.source, edge.target, edge.edge_type, edge.metadata }) |part|
+        for ([_][]const u8{ edge.source, edge.target, edge.edge_type, edge.edge_id, edge.owner_document, edge.metadata }) |part|
             total = try std.math.add(usize, total, part.len);
     }
     return total;
@@ -1415,6 +1469,8 @@ fn joinPaths(alloc: Allocator, root: *const Path, spur_idx: usize, spur: *const 
             alloc.free(edge.source);
             alloc.free(edge.target);
             alloc.free(edge.edge_type);
+            if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+            if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
             if (edge.metadata.len > 0) alloc.free(edge.metadata);
         }
         alloc.free(edges);
@@ -1718,6 +1774,33 @@ test "k shortest paths" {
     try std.testing.expect(found_paths[1].total_weight <= found_paths[2].total_weight);
 }
 
+test "k shortest paths preserve same type fact relationship ids" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    const store_path = tmpPath(&sb, "k-fact-id-s");
+    defer cleanupTmp(store_path);
+    var rb: [256]u8 = undefined;
+    const reverse_path = tmpPath(&rb, "k-fact-id-r");
+    defer cleanupTmp(reverse_path);
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    var graph = try GraphIndex.open(alloc, &store, reverse_path, "facts", .{});
+    defer graph.close();
+    try graph.batchApply(&.{
+        .{ .source = "A", .target = "B", .edge_type = "RELATES_TO", .edge_id = "works", .owner_document = "fact:works", .weight = 1 },
+        .{ .source = "A", .target = "B", .edge_type = "RELATES_TO", .edge_id = "founded", .owner_document = "fact:founded", .weight = 2 },
+        .{ .source = "B", .target = "C", .edge_type = "RELATES_TO" },
+    }, &.{});
+    const found = try findKShortestPaths(alloc, &graph, "A", "C", 2, .{ .weight_mode = .min_weight });
+    defer freePaths(alloc, found);
+    try std.testing.expectEqual(@as(usize, 2), found.len);
+    try std.testing.expectEqualStrings("works", found[0].edges[0].edge_id);
+    try std.testing.expectEqualStrings("founded", found[1].edges[0].edge_id);
+    try std.testing.expectEqualStrings("fact:works", found[0].edges[0].owner_document);
+    try std.testing.expectEqual(@as(f64, 2), found[0].total_weight);
+    try std.testing.expectEqual(@as(f64, 3), found[1].total_weight);
+}
+
 test "k shortest paths preserve parallel typed edge identities" {
     const alloc = std.testing.allocator;
     var sb: [256]u8 = undefined;
@@ -1992,4 +2075,131 @@ test "consumed path state detaches its request-scoped release hook" {
     try std.testing.expectEqual(@as(usize, 0), path.retained_state_bytes);
     freePath(alloc, path);
     try std.testing.expectEqual(@as(usize, retained_bytes), budget.retained_state_bytes);
+}
+
+test "fact temporal predicates affect traversal weighted ranking and relationship counts" {
+    const alloc = std.testing.allocator;
+    var graph = try GraphIndex.openWithPrivateStores(alloc, "unused-out", "unused-in", "facts", .{ .reverse_backend = .mem });
+    defer graph.close();
+    const expired = "{\"group_id\":\"g\",\"valid_at\":\"2020-01-01T00:00:00Z\",\"invalid_at\":\"2021-01-01T00:00:00Z\",\"created_at\":\"2020-01-01T00:00:00Z\"}";
+    const valid = "{\"group_id\":\"g\",\"valid_at\":\"2020-01-01T00:00:00Z\",\"invalid_at\":null,\"created_at\":\"2020-01-01T00:00:00Z\",\"expired_at\":null}";
+    const future_knowledge = "{\"group_id\":\"g\",\"valid_at\":\"2020-01-01T00:00:00Z\",\"created_at\":\"2024-01-01T00:00:00Z\"}";
+    try graph.batchApply(&.{
+        .{ .source = "Alice", .target = "Acme", .edge_type = "RELATES_TO", .edge_id = "a-expired", .owner_document = "fact:expired", .weight = 0.1, .metadata_json = expired },
+        .{ .source = "Alice", .target = "Acme", .edge_type = "RELATES_TO", .edge_id = "b-works", .owner_document = "fact:works", .weight = 0.5, .metadata_json = valid },
+        .{ .source = "Alice", .target = "Acme", .edge_type = "RELATES_TO", .edge_id = "c-founded", .owner_document = "fact:founded", .weight = 0.8, .metadata_json = valid },
+        .{ .source = "Alice", .target = "C", .edge_type = "RELATES_TO", .edge_id = "expired-shortcut", .owner_document = "fact:shortcut", .weight = 0.01, .metadata_json = expired },
+        .{ .source = "Alice", .target = "C", .edge_type = "RELATES_TO", .edge_id = "not-yet-known", .owner_document = "fact:future", .weight = 0.02, .metadata_json = future_knowledge },
+        .{ .source = "Acme", .target = "C", .edge_type = "RELATES_TO", .metadata_json = valid },
+    }, &.{});
+    var filter = try relationship_filter.parsePublicAlloc(alloc, .{
+        .valid_at = "2022-01-01T00:00:00Z",
+        .known_at = "2023-01-01T00:00:00Z",
+        .properties = .{.{ .field = "/metadata/group_id", .op = "eq", .value = "g" }},
+    });
+    defer filter.deinit(alloc);
+    const sums = try findKShortestPaths(alloc, &graph, "Alice", "C", 3, .{ .weight_mode = .min_weight, .edge_filter = filter });
+    defer freePaths(alloc, sums);
+    try std.testing.expectEqual(@as(usize, 2), sums.len);
+    try std.testing.expectEqualStrings("b-works", sums[0].edges[0].edge_id);
+    try std.testing.expectEqualStrings("c-founded", sums[1].edges[0].edge_id);
+    try std.testing.expectEqual(@as(f64, 1.5), sums[0].total_weight);
+    try std.testing.expectEqual(@as(f64, 1.8), sums[1].total_weight);
+    const products = try findKShortestPaths(alloc, &graph, "Alice", "C", 2, .{ .weight_mode = .max_weight, .edge_filter = filter });
+    defer freePaths(alloc, products);
+    try std.testing.expectEqualStrings("c-founded", products[0].edges[0].edge_id);
+    const shortest = (try findShortestPath(alloc, &graph, "Alice", "C", .{ .edge_filter = filter })) orelse return error.TestExpectedPath;
+    defer freePath(alloc, shortest);
+    try std.testing.expectEqual(@as(u32, 2), shortest.length);
+    const traversal = @import("traversal.zig");
+    for ([_]EdgeDirection{ .out, .both }) |direction| {
+        const reached = try traversal.traverse(alloc, &graph, "Alice", .{ .max_depth = 1, .direction = direction, .edge_filter = filter });
+        defer traversal.freeOwnedResults(alloc, reached);
+        try std.testing.expectEqual(@as(usize, 1), reached.len);
+        try std.testing.expectEqualStrings("Acme", reached[0].key);
+    }
+    const incoming = try traversal.traverse(alloc, &graph, "C", .{ .max_depth = 1, .direction = .in, .edge_filter = filter });
+    defer traversal.freeOwnedResults(alloc, incoming);
+    try std.testing.expectEqual(@as(usize, 1), incoming.len);
+    try std.testing.expectEqualStrings("Acme", incoming[0].key);
+    const pattern = @import("pattern.zig");
+    const nodes = [_]pattern.MatchNode{ .{ .alias = "a" }, .{ .alias = "b" } };
+    const specs = [_]pattern.CountAggregateSpec{ .{}, .{ .alias = "b", .distinct = true } };
+    for ([_]bool{ false, true }) |filtered| {
+        const edges = [_]pattern.MatchEdge{.{ .from = "a", .to = "b", .step = .{ .types = &.{"RELATES_TO"}, .edge_filter = if (filtered) filter else .{} } }};
+        const counts = try pattern.aggregateConjunctivePattern(alloc, &graph, &.{"Alice"}, .{ .anchor_alias = "a", .nodes = &nodes, .edges = &edges }, &specs, .{});
+        defer {
+            for (counts) |*count| count.deinit(alloc);
+            alloc.free(counts);
+        }
+        try std.testing.expectEqual(@as(u128, if (filtered) 2 else 5), counts[0].value);
+        try std.testing.expectEqual(@as(u128, if (filtered) 1 else 2), counts[1].value);
+    }
+}
+
+test "fact temporal predicates apply to variable MATCH optional and not exists" {
+    const alloc = std.testing.allocator;
+    const pattern = @import("pattern.zig");
+    var graph = try GraphIndex.openWithPrivateStores(alloc, "unused-out", "unused-in", "facts", .{ .reverse_backend = .mem });
+    defer graph.close();
+    const valid = "{\"valid_at\":\"2020-01-01T00:00:00Z\"}";
+    const expired = "{\"invalid_at\":\"2021-01-01T00:00:00Z\"}";
+    try graph.batchApply(&.{
+        .{ .source = "A", .target = "B", .edge_type = "R", .edge_id = "one", .metadata_json = valid },
+        .{ .source = "A", .target = "B", .edge_type = "R", .edge_id = "two", .metadata_json = valid },
+        .{ .source = "B", .target = "C", .edge_type = "R", .metadata_json = valid },
+        .{ .source = "A", .target = "C", .edge_type = "R", .metadata_json = expired },
+    }, &.{});
+    const filter = relationship_filter.Filter{ .valid_at_ns = @import("../storage/schema.zig").parseRfc3339ToSignedNs("2022-01-01T00:00:00Z") };
+    const variable_nodes = [_]pattern.MatchNode{ .{ .alias = "a" }, .{ .alias = "c" } };
+    const variable_edges = [_]pattern.MatchEdge{.{ .from = "a", .to = "c", .step = .{ .min_hops = 2, .max_hops = 2, .edge_filter = filter } }};
+    const variable = try pattern.aggregateConjunctivePattern(alloc, &graph, &.{"A"}, .{ .anchor_alias = "a", .nodes = &variable_nodes, .edges = &variable_edges }, &.{.{}}, .{});
+    defer {
+        for (variable) |*count| count.deinit(alloc);
+        alloc.free(variable);
+    }
+    try std.testing.expectEqual(@as(u128, 2), variable[0].value);
+    const nodes = [_]pattern.MatchNode{ .{ .alias = "a" }, .{ .alias = "b" }, .{ .alias = "c" } };
+    const required = [_]pattern.MatchEdge{
+        .{ .from = "a", .to = "b", .step = .{ .edge_filter = filter } },
+        .{ .from = "b", .to = "c", .step = .{ .edge_filter = filter } },
+    };
+    for ([_]bool{ false, true }) |filtered| {
+        const absent = [_]pattern.MatchEdge{.{ .from = "a", .to = "c", .step = .{ .edge_filter = if (filtered) filter else .{} } }};
+        const predicates = [_]pattern.MatchPredicate{.{ .not_exists = &absent }};
+        const counts = try pattern.aggregateConjunctivePattern(alloc, &graph, &.{"A"}, .{ .anchor_alias = "a", .nodes = &nodes, .edges = &required, .predicates = &predicates }, &.{.{}}, .{});
+        defer {
+            for (counts) |*count| count.deinit(alloc);
+            alloc.free(counts);
+        }
+        try std.testing.expectEqual(@as(u128, if (filtered) 2 else 0), counts[0].value);
+    }
+    const optional_nodes = [_]pattern.MatchNode{.{ .alias = "maybe" }};
+    const optional_edges = [_]pattern.MatchEdge{.{ .from = "a", .to = "maybe", .step = .{ .edge_filter = .{ .properties = &.{.{ .field = "/metadata/missing", .op = .is_not_null }} } } }};
+    const optional = [_]pattern.OptionalPattern{.{ .nodes = &optional_nodes, .edges = &optional_edges }};
+    const optional_counts = try pattern.aggregateConjunctivePattern(alloc, &graph, &.{"A"}, .{ .anchor_alias = "a", .nodes = &variable_nodes, .edges = &variable_edges, .optional = &optional }, &.{ .{}, .{ .alias = "maybe" } }, .{});
+    defer {
+        for (optional_counts) |*count| count.deinit(alloc);
+        alloc.free(optional_counts);
+    }
+    try std.testing.expectEqual(@as(u128, 2), optional_counts[0].value);
+    try std.testing.expectEqual(@as(u128, 0), optional_counts[1].value);
+}
+
+pub fn freePathEdgeAlloc(alloc: Allocator, edge: PathEdge) void {
+    alloc.free(edge.source);
+    alloc.free(edge.target);
+    alloc.free(edge.edge_type);
+    if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+    if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
+    if (edge.metadata.len > 0) alloc.free(edge.metadata);
+}
+
+pub fn freePathEdgesAlloc(alloc: Allocator, edges: []const PathEdge) void {
+    for (edges) |edge| freePathEdgeAlloc(alloc, edge);
+    alloc.free(edges);
+}
+
+pub fn pathEdgeOwnedBytes(edge: PathEdge) usize {
+    return @sizeOf(PathEdge) +| edge.source.len +| edge.target.len +| edge.edge_type.len +| edge.edge_id.len +| edge.owner_document.len +| edge.metadata.len;
 }

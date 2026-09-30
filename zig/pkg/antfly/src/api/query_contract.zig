@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const relationship_filter = @import("../graph/relationship_filter.zig");
 const builtin = @import("builtin");
 const ant_json = @import("antfly-json");
 const db_mod = @import("../storage/db/selected_root.zig").db;
@@ -5476,6 +5477,8 @@ fn toOpenApiPathEdges(
             .source = edge.source,
             .target = edge.target,
             .type = edge.edge_type,
+            .edge_id = if (edge.edge_id.len > 0) edge.edge_id else null,
+            .owner_document = if (edge.owner_document.len > 0) edge.owner_document else null,
             .weight = edge.weight,
             .metadata = try pathEdgeMetadataObjectMap(alloc, edge.metadata),
         };
@@ -5529,6 +5532,8 @@ fn toOpenApiGraphPathEdges(
             },
             .direction = direction,
             .type = edge.edge_type,
+            .edge_id = if (edge.edge_id.len > 0) edge.edge_id else null,
+            .owner_document = if (edge.owner_document.len > 0) edge.owner_document else null,
             .weight = edge.weight,
             .metadata = try pathEdgeMetadataObjectMap(alloc, edge.metadata),
         };
@@ -8995,6 +9000,7 @@ fn parseLegacyPatternSteps(
             alloc.free(step.alias);
             freePatternNodeFilter(alloc, step.node_filter);
             freeOwnedStringSlice(alloc, step.edge.types);
+            step.edge.edge_filter.deinit(alloc);
         }
         alloc.free(steps);
     }
@@ -9007,6 +9013,8 @@ fn parseLegacyPatternSteps(
         graph_query_mod.validateEdgeTypes(requested_edge_types) catch return error.InvalidQueryRequest;
         const edge_types = try cloneFields(alloc, requested_edge_types);
         errdefer freeOwnedStringSlice(alloc, edge_types);
+        const edge_filter = if (step.edge) |edge| if (edge.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) err else error.InvalidQueryRequest else relationship_filter.Filter{} else relationship_filter.Filter{};
+        errdefer edge_filter.deinit(alloc);
         steps[i] = .{
             .alias = try alloc.dupe(u8, step.alias orelse ""),
             .node_filter = try parseLegacyPatternNodeFilter(alloc, step.node_filter),
@@ -9021,6 +9029,7 @@ fn parseLegacyPatternSteps(
                 .min_weight = legacyWeightBound(edge.min_weight),
                 .max_weight = legacyWeightBound(edge.max_weight),
                 .types = edge_types,
+                .edge_filter = edge_filter,
             } else .{ .types = edge_types },
         };
         if (step.edge != null and (steps[i].edge.min_hops == 0 or
@@ -9064,8 +9073,12 @@ fn parseLegacyGraphQueryParams(
     const requested_edge_types = value.edge_types orelse &.{};
     graph_query_mod.validateEdgeTypes(requested_edge_types) catch return error.InvalidQueryRequest;
     const edge_types = try cloneFields(alloc, requested_edge_types);
+    errdefer freeOwnedStringSlice(alloc, edge_types);
+    const edge_filter = if (value.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) err else error.InvalidQueryRequest else relationship_filter.Filter{};
+    errdefer edge_filter.deinit(alloc);
     return .{
         .edge_types = edge_types,
+        .edge_filter = edge_filter,
         .direction = if (value.direction) |direction| switch (direction) {
             .out => .out,
             .in => .in,
@@ -9099,6 +9112,8 @@ fn parseGraphTraverseQuery(alloc: std.mem.Allocator, value: indexes_openapi.Grap
     const requested_edge_types = traversal.edge_types orelse &.{};
     graph_query_mod.validateEdgeTypes(requested_edge_types) catch return error.InvalidQueryRequest;
     const edge_types = try cloneFields(alloc, requested_edge_types);
+    const edge_filter = if (traversal.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) err else error.InvalidQueryRequest else relationship_filter.Filter{};
+    errdefer edge_filter.deinit(alloc);
     errdefer freeOwnedStringSlice(alloc, edge_types);
     const filter = try parseGraphFilterValue(alloc, traversal.filter);
     errdefer freePatternNodeFilter(alloc, filter);
@@ -9129,6 +9144,7 @@ fn parseGraphTraverseQuery(alloc: std.mem.Allocator, value: indexes_openapi.Grap
         .start_nodes = start,
         .params = .{
             .edge_types = edge_types,
+            .edge_filter = edge_filter,
             .direction = parseGraphDirection(traversal.direction),
             .max_depth = try parseGraphBoundedU32(traversal.max_depth, 1, 1, 64),
             .max_results = try parseGraphBoundedU32(traversal.limit, 100, 1, 10_000),
@@ -9171,6 +9187,8 @@ fn parseGraphPathQuery(
     const requested_edge_types = path.edge_types orelse &.{};
     graph_query_mod.validateEdgeTypes(requested_edge_types) catch return error.InvalidQueryRequest;
     const edge_types = try cloneFields(alloc, requested_edge_types);
+    const edge_filter = if (path.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) err else error.InvalidQueryRequest else relationship_filter.Filter{};
+    errdefer edge_filter.deinit(alloc);
     errdefer freeOwnedStringSlice(alloc, edge_types);
     const filter = try parseGraphFilterValue(alloc, path.filter);
     errdefer freePatternNodeFilter(alloc, filter);
@@ -9184,6 +9202,7 @@ fn parseGraphPathQuery(
         .k = k,
         .params = .{
             .edge_types = edge_types,
+            .edge_filter = edge_filter,
             .direction = parseGraphDirection(path.direction),
             .max_depth = try parseGraphBoundedU32(path.max_depth, 10, 1, 64),
             .min_weight = weight_bounds.min,
@@ -9372,6 +9391,7 @@ fn parseGraphMatchEdges(alloc: std.mem.Allocator, value: []const indexes_openapi
             alloc.free(edge.from);
             alloc.free(edge.to);
             freeOwnedStringSlice(alloc, edge.step.types);
+            edge.step.edge_filter.deinit(alloc);
         }
         alloc.free(edges);
     }
@@ -9388,11 +9408,14 @@ fn parseGraphMatchEdges(alloc: std.mem.Allocator, value: []const indexes_openapi
         graph_query_mod.validateEdgeTypes(requested_types) catch return error.InvalidQueryRequest;
         const types = try cloneFields(alloc, requested_types);
         errdefer freeOwnedStringSlice(alloc, types);
+        const edge_filter = if (edge.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) err else error.InvalidQueryRequest else relationship_filter.Filter{};
+        errdefer edge_filter.deinit(alloc);
         edges[i] = .{
             .from = from,
             .to = to,
             .step = .{
                 .types = types,
+                .edge_filter = edge_filter,
                 .direction = parseGraphDirection(edge.direction),
                 .min_hops = try parseGraphBoundedU32(edge.min_hops, 1, 1, graph_pattern_mod.max_pattern_hops),
                 .max_hops = try parseGraphBoundedU32(edge.max_hops, 1, 1, graph_pattern_mod.max_pattern_hops),
@@ -9864,6 +9887,7 @@ fn freePatternSteps(alloc: std.mem.Allocator, steps: []const graph_pattern_mod.P
         freePatternNodeFilter(alloc, step.node_filter);
         for (step.edge.types) |edge_type| alloc.free(edge_type);
         if (step.edge.types.len > 0) alloc.free(step.edge.types);
+        step.edge.edge_filter.deinit(alloc);
     }
     if (steps.len > 0) alloc.free(steps);
 }
@@ -12059,6 +12083,7 @@ fn freeGraphMatchEdges(alloc: std.mem.Allocator, edges: []const graph_pattern_mo
         alloc.free(edge.from);
         alloc.free(edge.to);
         freeOwnedStringSlice(alloc, edge.step.types);
+        edge.step.edge_filter.deinit(alloc);
     }
     if (edges.len > 0) alloc.free(edges);
 }
@@ -12115,6 +12140,7 @@ fn freeGraphQueryParams(alloc: std.mem.Allocator, params: graph_query_mod.QueryP
     for (params.edge_types) |edge_type| alloc.free(edge_type);
     if (params.edge_types.len > 0) alloc.free(params.edge_types);
     freePatternNodeFilter(alloc, params.node_filter);
+    params.edge_filter.deinit(alloc);
 }
 
 fn freeTextQueryList(alloc: std.mem.Allocator, items: []const db_mod.types.TextQuery) void {
@@ -16364,6 +16390,34 @@ fn consumerTests() type {
                     parsePublicQueryRequest(std.testing.allocator, null, "docs", body),
                 );
             }
+        }
+
+        test "canonical relationship predicates parse for every graph operation and fail closed" {
+            const alloc = std.testing.allocator;
+            const bodies = [_][]const u8{
+                \\{"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["Alice"]},"edge_filter":{"valid_at":"2022-01-01T00:00:00Z","known_at":"2023-01-01T00:00:00Z","properties":[{"field":"/metadata/group_id","op":"eq","value":"g"}]}}}}}
+                ,
+                \\{"graph_queries":{"path":{"index":"g","shortest_path":{"from":{"key":"Alice"},"to":{"key":"Acme"},"edge_filter":{"valid_at":"2022-01-01T00:00:00Z"}}}}}
+                ,
+                \\{"graph_queries":{"paths":{"index":"g","k_shortest_paths":{"from":{"key":"Alice"},"to":{"key":"Acme"},"k":2,"edge_filter":{"valid_at":"2022-01-01T00:00:00Z"}}}}}
+                ,
+            };
+            for (bodies) |body| {
+                var owned = try parsePublicQueryRequest(alloc, null, "docs", body);
+                defer owned.deinit(alloc);
+                try std.testing.expect(owned.req.graph_queries[0].query.params.edge_filter.active());
+            }
+            var matched = try parsePublicQueryRequest(alloc, null, "docs",
+                \\{"graph_queries":{"facts":{"index":"g","match":{"anchor":"a","nodes":{"a":{},"b":{}},"edges":[{"from":"a","to":"b","edge_filter":{"valid_at":"2022-01-01T00:00:00Z"}}]},"return":{"aggregates":{"facts":{"count":"*"}}}}}}
+            );
+            defer matched.deinit(alloc);
+            try std.testing.expect(matched.req.graph_queries[0].query.match_pattern.?.edges[0].step.edge_filter.active());
+            try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(alloc, null, "docs",
+                \\{"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["Alice"]},"edge_filter":{"properties":[{"field":"/metadata/x","op":"eq","value":null}]}}}}}
+            ));
+            try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(alloc, null, "docs",
+                \\{"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["Alice"]},"edge_filter":{"valid_at":"yesterday"}}}}}
+            ));
         }
 
         test "canonical graph traversal and paths preserve requested direction" {

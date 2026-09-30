@@ -1049,7 +1049,7 @@ func TestDecodeGraphResultForQueryEnforcesObservableQuerySemantics(t *testing.T)
 		)
 	}
 	const abNodes = `[{"key":"a"},{"key":"b"}]`
-	const abEdge = `[{"from":{"key":"a"},"to":{"key":"b"},"direction":"out","type":"links","weight":1}]`
+	const abEdge = `[{"from":{"key":"a"},"to":{"key":"b"},"direction":"out","edge_id":"fact:works","owner_document":"fact:works","type":"links","weight":1}]`
 	tests := []struct {
 		name     string
 		query    string
@@ -1528,4 +1528,22 @@ func mustMarshalGraphAggregates(t *testing.T, count int) string {
 		t.Fatal(err)
 	}
 	return string(encoded)
+}
+
+func TestGraphRelationshipFilterRequestPreservesFactPredicates(t *testing.T) {
+	var query GraphQuery
+	body := []byte(`{"index":"facts","k_shortest_paths":{"from":{"key":"alice"},"to":{"key":"acme"},"k":2,"objective":"max_weight_product","edge_filter":{"valid_at":"1969-12-31T23:59:59Z","known_at":"2023-01-01T00:00:00Z","properties":[{"field":"/metadata/group_id","op":"eq","value":"team-a"},{"field":"/metadata/score","op":"gte","value":0}]}}}`)
+	if err := json.Unmarshal(body, &query); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateGraphQuery(query); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(encoded, []byte(`"edge_filter"`)) || !bytes.Contains(encoded, []byte(`"value":0`)) || !bytes.Contains(encoded, []byte(`1969-12-31T23:59:59Z`)) {
+		t.Fatalf("lost relationship predicates: %s", encoded)
+	}
 }

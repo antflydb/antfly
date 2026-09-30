@@ -21,6 +21,7 @@
 //!   - k_shortest_paths: via paths.findKShortestPaths()
 
 const std = @import("std");
+const relationship_filter = @import("relationship_filter.zig");
 const Allocator = std.mem.Allocator;
 const platform_time = @import("antfly_platform").time;
 const graph_mod = @import("graph.zig");
@@ -337,6 +338,7 @@ pub const ResultRef = struct {
 };
 
 pub const QueryParams = struct {
+    edge_filter: relationship_filter.Filter = .{},
     edge_types: []const []const u8 = &.{},
     direction: graph_mod.EdgeDirection = .out,
     max_depth: u32 = 1,
@@ -541,6 +543,8 @@ fn appendGraphMetricDependencyName(
 // ============================================================================
 
 pub const PathEdgeInfo = struct {
+    edge_id: []const u8 = "",
+    owner_document: []const u8 = "",
     source: []const u8,
     target: []const u8,
     edge_type: []const u8,
@@ -588,6 +592,8 @@ pub const GraphResultNode = struct {
                 alloc.free(e.source);
                 alloc.free(e.target);
                 alloc.free(e.edge_type);
+                if (e.edge_id.len > 0) alloc.free(e.edge_id);
+                if (e.owner_document.len > 0) alloc.free(e.owner_document);
                 if (e.metadata.len > 0) alloc.free(e.metadata);
             }
             alloc.free(pe);
@@ -1440,6 +1446,7 @@ pub const GraphQueryEngine = struct {
         };
         var rules = traversal_mod.TraversalRules{
             .edge_types = params.edge_types,
+            .edge_filter = params.edge_filter,
             .direction = params.direction,
             .max_depth = params.max_depth,
             .min_weight = params.min_weight,
@@ -1495,6 +1502,7 @@ pub const GraphQueryEngine = struct {
         start_keys: []const []const u8,
         target_keys: []const []const u8,
     ) !?GraphQueryResult {
+        if (params.edge_filter.active()) return null;
         if (!algebraicTraversalProof(graph_index, params).safe()) return null;
         if (!try algebraicTraversalTensorProgramAccepted(self.alloc, graph_index, params, target_keys)) return null;
 
@@ -1583,6 +1591,7 @@ pub const GraphQueryEngine = struct {
         const opts = paths_mod.PathFindOptions{
             .weight_mode = gq.params.weight_mode,
             .edge_types = gq.params.edge_types,
+            .edge_filter = gq.params.edge_filter,
             .direction = gq.params.direction,
             .max_depth = gq.params.max_depth,
             .min_weight = gq.params.min_weight,
@@ -1627,6 +1636,7 @@ pub const GraphQueryEngine = struct {
         start_keys: []const []const u8,
         target_keys: []const []const u8,
     ) !?GraphQueryResult {
+        if (params.edge_filter.active()) return null;
         if (!(params.algebraic_semiring or graph_index.supportsAlgebraicSemiringTraversal())) return null;
         if (params.weight_mode != .min_hops) return null;
         if (params.max_depth == 0) return null;
@@ -1706,6 +1716,7 @@ pub const GraphQueryEngine = struct {
         const opts = paths_mod.PathFindOptions{
             .weight_mode = gq.params.weight_mode,
             .edge_types = gq.params.edge_types,
+            .edge_filter = gq.params.edge_filter,
             .direction = gq.params.direction,
             .max_depth = gq.params.max_depth,
             .min_weight = gq.params.min_weight,
@@ -1930,6 +1941,17 @@ fn traversalResultNodeAlloc(
         null;
     errdefer if (path_tables) |tables| freePathTables(alloc, tables);
 
+    const path_edges = if (result.path_edges) |edges| blk: {
+        const owned = try alloc.alloc(PathEdgeInfo, edges.len);
+        var count: usize = 0;
+        errdefer freePathEdgeItems(alloc, owned, count);
+        for (edges, 0..) |edge, i| {
+            owned[i] = try pathEdgeInfoFromPathEdge(alloc, edge);
+            count += 1;
+        }
+        break :blk owned;
+    } else null;
+    errdefer if (path_edges) |edges| freePathEdgeItems(alloc, edges, edges.len);
     return .{
         .key = key,
         .table = table,
@@ -1937,7 +1959,7 @@ fn traversalResultNodeAlloc(
         .distance = result.distance,
         .path = path,
         .path_tables = path_tables,
-        .path_edges = null,
+        .path_edges = path_edges,
     };
 }
 
@@ -1950,6 +1972,9 @@ fn traversalGraphResultNodeOwnedBytes(result: traversal_mod.TraversalResult) !us
         total = try std.math.add(usize, total, try std.math.mul(usize, items.len, @sizeOf(?[]const u8)));
         if (result.target_table) |table| total = try std.math.add(usize, total, table.len);
     }
+    if (result.path_edges) |edges| for (edges) |edge| {
+        total = try std.math.add(usize, total, paths_mod.pathEdgeOwnedBytes(edge));
+    };
     return total;
 }
 
@@ -1978,11 +2003,12 @@ fn algebraicPatternPlan(gq: GraphQuery) ?AlgebraicPatternPlan {
     if (!algebraicPatternAliasesUnique(gq.pattern)) return null;
 
     const first_edge = gq.pattern[1].edge;
-    if (!algebraicPatternStepIsOneHop(first_edge)) return null;
+    if (!algebraicPatternStepIsOneHop(first_edge) or first_edge.edge_filter.active()) return null;
     if (gq.pattern[1].node_filter.filter_query_json != null) return null;
     for (gq.pattern[2..]) |step| {
         if (step.node_filter.filter_query_json != null) return null;
         if (!algebraicPatternStepIsOneHop(step.edge)) return null;
+        if (step.edge.edge_filter.active()) return null;
         if (step.edge.direction != first_edge.direction) return null;
         if (step.edge.min_weight != first_edge.min_weight or step.edge.max_weight != first_edge.max_weight) return null;
         if (!stringSlicesEqual(step.edge.types, first_edge.types)) return null;
@@ -2159,6 +2185,8 @@ fn clonePatternPathEdgesFromInfoAlloc(alloc: Allocator, edges: []const PathEdgeI
             .source = try alloc.dupe(u8, edge.source),
             .target = try alloc.dupe(u8, edge.target),
             .edge_type = try alloc.dupe(u8, edge.edge_type),
+            .edge_id = try alloc.dupe(u8, edge.edge_id),
+            .owner_document = try alloc.dupe(u8, edge.owner_document),
             .weight = edge.weight,
             .metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "",
             .traversal_direction = edge.traversal_direction,
@@ -2173,6 +2201,8 @@ fn freeGraphPatternPathEdgeItems(alloc: Allocator, edges: []const paths_mod.Path
         alloc.free(edge.source);
         alloc.free(edge.target);
         alloc.free(edge.edge_type);
+        if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+        if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
         if (edge.metadata.len > 0) alloc.free(edge.metadata);
     }
 }
@@ -2230,6 +2260,8 @@ fn pathToResultNodeRetained(
             alloc.free(edge.source);
             alloc.free(edge.target);
             alloc.free(edge.edge_type);
+            if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+            if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
             if (edge.metadata.len > 0) alloc.free(edge.metadata);
         }
         if (path_edges.len > 0) alloc.free(path_edges);
@@ -2270,7 +2302,7 @@ fn pathGraphResultNodeOwnedBytes(path: *const paths_mod.Path) !usize {
     }
     total = try std.math.add(usize, total, try std.math.mul(usize, path.edges.len, @sizeOf(PathEdgeInfo)));
     for (path.edges) |edge| {
-        for ([_][]const u8{ edge.source, edge.target, edge.edge_type, edge.metadata }) |part|
+        for ([_][]const u8{ edge.source, edge.target, edge.edge_type, edge.edge_id, edge.owner_document, edge.metadata }) |part|
             total = try std.math.add(usize, total, part.len);
     }
     return total;
@@ -2316,11 +2348,17 @@ fn pathEdgeInfoFromPathEdge(alloc: Allocator, edge: paths_mod.PathEdge) !PathEdg
     errdefer alloc.free(target);
     const edge_type = try alloc.dupe(u8, edge.edge_type);
     errdefer alloc.free(edge_type);
+    const edge_id = try alloc.dupe(u8, edge.edge_id);
+    errdefer alloc.free(edge_id);
+    const owner_document = try alloc.dupe(u8, edge.owner_document);
+    errdefer alloc.free(owner_document);
     const metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "";
     return .{
         .source = source,
         .target = target,
         .edge_type = edge_type,
+        .edge_id = edge_id,
+        .owner_document = owner_document,
         .weight = edge.weight,
         .metadata = metadata,
         .traversal_direction = edge.traversal_direction,
@@ -2361,6 +2399,8 @@ fn algebraicTraversalResultNodeAlloc(
 }
 
 const ParsedProvenanceEdge = struct {
+    edge_id: []const u8 = "",
+    owner_document: []const u8 = "",
     source: []const u8,
     edge_type: []const u8,
     target: []const u8,
@@ -2415,6 +2455,8 @@ fn algebraicShortestPathResultNodeAlloc(
             .source = try alloc.dupe(u8, match_edge.source),
             .target = try alloc.dupe(u8, match_edge.target),
             .edge_type = try alloc.dupe(u8, match_edge.edge_type),
+            .edge_id = try alloc.dupe(u8, match_edge.edge_id),
+            .owner_document = try alloc.dupe(u8, match_edge.owner_document),
             .weight = weight,
         };
         path_edge_count += 1;
@@ -2448,7 +2490,36 @@ fn algebraicShortestPathResultNodeAlloc(
     };
 }
 
+fn graphEdgeProvenanceLabelAlloc(alloc: Allocator, edge: graph_mod.Edge) ![]u8 {
+    if (edge.edge_id.len == 0) return std.fmt.allocPrint(alloc, "{s}\x1f{s}\x1f{s}", .{ edge.source, edge.edge_type, edge.target });
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.append(alloc, 2);
+    for ([_][]const u8{ edge.source, edge.edge_type, edge.target, edge.edge_id, edge.owner_document }) |part| {
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, @intCast(part.len), .little);
+        try out.appendSlice(alloc, &length);
+        try out.appendSlice(alloc, part);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
 fn parseProvenanceEdge(label: []const u8) ?ParsedProvenanceEdge {
+    if (label.len > 0 and label[0] == 2) {
+        var pos: usize = 1;
+        var parts: [5][]const u8 = undefined;
+        for (&parts) |*part| {
+            if (label.len - pos < 8) return null;
+            const len = std.math.cast(usize, std.mem.readInt(u64, label[pos..][0..8], .little)) orelse return null;
+            pos += 8;
+            if (len > label.len - pos) return null;
+            part.* = label[pos..][0..len];
+            pos += len;
+        }
+        if (pos != label.len or parts[3].len == 0) return null;
+        return .{ .source = parts[0], .edge_type = parts[1], .target = parts[2], .edge_id = parts[3], .owner_document = parts[4] };
+    }
+
     var it = std.mem.splitScalar(u8, label, 0x1f);
     const source = it.next() orelse return null;
     const edge_type = it.next() orelse return null;
@@ -2484,6 +2555,7 @@ fn resolveUniqueGraphEdgeWeight(
         if (!std.mem.eql(u8, edge.source, provenance_edge.source)) continue;
         if (!std.mem.eql(u8, edge.target, provenance_edge.target)) continue;
         if (!std.mem.eql(u8, edge.edge_type, provenance_edge.edge_type)) continue;
+        if (!std.mem.eql(u8, edge.edge_id, provenance_edge.edge_id) or !std.mem.eql(u8, edge.owner_document, provenance_edge.owner_document)) continue;
         if (found != null) return null;
         found = edge.weight;
     }
@@ -2514,6 +2586,8 @@ fn freePathEdgeItems(alloc: Allocator, edges: []const PathEdgeInfo, initialized:
         alloc.free(edge.source);
         alloc.free(edge.target);
         alloc.free(edge.edge_type);
+        if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+        if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
         if (edge.metadata.len > 0) alloc.free(edge.metadata);
     }
     alloc.free(edges);
@@ -2636,7 +2710,7 @@ fn collectAlgebraicReachabilityEdges(
                 if (work_budget) |budget| try budget.consumeNode();
             }
 
-            const provenance_label = try std.fmt.allocPrint(alloc, "{s}\x1f{s}\x1f{s}", .{ edge.source, edge.edge_type, edge.target });
+            const provenance_label = try graphEdgeProvenanceLabelAlloc(alloc, edge);
             defer alloc.free(provenance_label);
             const provenance = try algebraic_path_mod.provenanceTokenAlloc(alloc, &.{provenance_label});
             var provenance_owned = true;
@@ -4565,4 +4639,14 @@ test "pattern algebraic provenance falls back for ambiguous linear chain" {
     defer fallback_result.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 2), fallback_result.matches.len);
+}
+
+test "graph algebraic provenance preserves binary relationship identity" {
+    const alloc = std.testing.allocator;
+    const label = try graphEdgeProvenanceLabelAlloc(alloc, .{ .source = "a\x1f", .target = "b", .edge_type = "RELATES_TO", .edge_id = "fact\x00:1", .owner_document = "fact:1", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" });
+    defer alloc.free(label);
+    const parsed = parseProvenanceEdge(label) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("fact\x00:1", parsed.edge_id);
+    try std.testing.expectEqualStrings("a\x1f", parsed.source);
+    try std.testing.expectEqualStrings("fact:1", parsed.owner_document);
 }

@@ -554,3 +554,6 @@ export interface QueryOptions {
   orderBy?: Record<string, boolean>;
   aggregations?: Record<string, AggregationRequest>;
 }
+
+export type GraphRelationshipFilter = components["schemas"]["GraphRelationshipFilter"];
+export type GraphRelationshipPropertyPredicate = components["schemas"]["GraphRelationshipPropertyPredicate"];

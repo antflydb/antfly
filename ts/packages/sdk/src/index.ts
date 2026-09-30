@@ -264,6 +264,8 @@ export type {
   GraphCountAggregate,
   GraphDocumentFilter,
   GraphEdgeWeightRange,
+  GraphRelationshipFilter,
+  GraphRelationshipPropertyPredicate,
   GraphExactResultStats,
   GraphIdentityNodeSelector,
   GraphIndexConfig,

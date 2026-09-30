@@ -190,12 +190,21 @@ pub const ExtractedWrite = struct {
                 errdefer alloc.free(target);
                 const edge_type = try alloc.dupe(u8, write.edge_type);
                 errdefer alloc.free(edge_type);
+                const edge_id = try alloc.dupe(u8, write.edge_id);
+                errdefer alloc.free(edge_id);
+                const owner_document = try alloc.dupe(u8, write.owner_document);
+                errdefer alloc.free(owner_document);
                 const metadata_json = if (write.metadata_json.len > 0) try alloc.dupe(u8, write.metadata_json) else "";
                 break :blk .{
                     .index_name = index_name,
                     .source = source,
                     .target = target,
                     .edge_type = edge_type,
+                    .edge_id = edge_id,
+                    .owner_document = owner_document,
+                    .weight = write.weight,
+                    .created_at = write.created_at,
+                    .updated_at = write.updated_at,
                     .metadata_json = metadata_json,
                 };
             };
@@ -285,6 +294,8 @@ pub const ExtractedWrite = struct {
             alloc.free(@constCast(graph_write.source));
             alloc.free(@constCast(graph_write.target));
             alloc.free(@constCast(graph_write.edge_type));
+            if (graph_write.edge_id.len > 0) alloc.free(@constCast(graph_write.edge_id));
+            if (graph_write.owner_document.len > 0) alloc.free(@constCast(graph_write.owner_document));
             if (graph_write.metadata_json.len > 0) alloc.free(@constCast(graph_write.metadata_json));
         }
         if (self.graph_writes.len > 0) alloc.free(self.graph_writes);
@@ -2071,6 +2082,8 @@ fn extractWriteFromParsedPrepared(
             alloc.free(@constCast(graph_write.source));
             alloc.free(@constCast(graph_write.target));
             alloc.free(@constCast(graph_write.edge_type));
+            if (graph_write.edge_id.len > 0) alloc.free(@constCast(graph_write.edge_id));
+            if (graph_write.owner_document.len > 0) alloc.free(@constCast(graph_write.owner_document));
             if (graph_write.metadata_json.len > 0) alloc.free(@constCast(graph_write.metadata_json));
         }
         graph_writes.deinit(alloc);
@@ -2123,6 +2136,10 @@ fn extractWriteFromParsedPrepared(
                     const target_value = edge_item.object.get("target") orelse return error.InvalidGraphEdges;
                     if (target_value != .string) return error.InvalidGraphEdges;
 
+                    const edge_id: []const u8 = if (edge_item.object.get("edge_id")) |value| blk: {
+                        if (value != .string or value.string.len == 0) return error.InvalidGraphEdges;
+                        break :blk value.string;
+                    } else "";
                     var metadata_json: []const u8 = "";
                     if (edge_item.object.get("metadata")) |metadata_value| {
                         metadata_json = try std.json.Stringify.valueAlloc(alloc, metadata_value, .{});
@@ -2134,6 +2151,7 @@ fn extractWriteFromParsedPrepared(
                         .source = try alloc.dupe(u8, key),
                         .target = try alloc.dupe(u8, target_value.string),
                         .edge_type = try alloc.dupe(u8, edge_type),
+                        .edge_id = if (edge_id.len > 0) try alloc.dupe(u8, edge_id) else "",
                         .weight = if (edge_item.object.get("weight")) |weight_value|
                             try jsonNumberToF64(weight_value)
                         else

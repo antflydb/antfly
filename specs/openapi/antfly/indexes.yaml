@@ -204,12 +204,18 @@ components:
           type: string
           enum: [document, external]
           default: document
+        source:
+          $ref: "#/components/schemas/GraphTemplateValue"
+          description: Logical source endpoint. When set, edge.edge_id is required; the artifact document remains the durable owner.
         target: { $ref: "#/components/schemas/GraphTemplateValue" }
     GraphArtifactEdgeMappingConfig:
       type: object
       additionalProperties: false
-      description: "Maps each artifact item to an edge type, weight, and public metadata."
+      description: "Maps each artifact item to a relationship identity, type, weight, and public metadata."
       properties:
+        edge_id:
+          $ref: "#/components/schemas/GraphTemplateValue"
+          description: Stable application relationship ID. Required with nodes.source. Replays update the same identity; distinct IDs preserve parallel relationships.
         type: { $ref: "#/components/schemas/GraphTemplateValue" }
         weight: { $ref: "#/components/schemas/GraphTemplateValue" }
         metadata:
@@ -2890,6 +2896,14 @@ components:
         - type
         - weight
       properties:
+        edge_id:
+          type: string
+          minLength: 1
+          description: Application relationship ID. Absent on legacy tuple relationships. IDs are scoped to this graph index, owning document, and endpoint/type tuple.
+        owner_document:
+          type: string
+          minLength: 1
+          description: Owning fact document key in the graph index table when it differs from the logical source. The document is the authority for replay and deletion.
         source:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -3152,6 +3166,14 @@ components:
       x-go-type-skip-optional-pointer: true
       type: object
       properties:
+        edge_id:
+          type: string
+          minLength: 1
+          description: Application relationship ID. Absent on legacy tuple relationships. IDs are scoped to this graph index, owning document, and endpoint/type tuple.
+        owner_document:
+          type: string
+          minLength: 1
+          description: Owning fact document key in the graph index table when it differs from the logical source. The document is the authority for replay and deletion.
         source:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -3179,6 +3201,14 @@ components:
         remains unambiguous across tables and for equal keys in different
         tables.
       properties:
+        edge_id:
+          type: string
+          minLength: 1
+          description: Application relationship ID. Absent on legacy tuple relationships. IDs are scoped to this graph index, owning document, and endpoint/type tuple.
+        owner_document:
+          type: string
+          minLength: 1
+          description: Owning fact document key in the graph index table when it differs from the logical source. The document is the authority for replay and deletion.
         from: { $ref: '#/components/schemas/GraphPathEndpoint' }
         to: { $ref: '#/components/schemas/GraphPathEndpoint' }
         direction: { $ref: '#/components/schemas/GraphPathEdgeDirection' }
@@ -3308,6 +3338,8 @@ components:
       deprecated: true
       description: Deprecated graph_searches traversal and path parameters.
       properties:
+        edge_filter:
+          $ref: '#/components/schemas/GraphRelationshipFilter'
         edge_types:
           x-go-type-skip-optional-pointer: true
           type: array
@@ -3360,6 +3392,8 @@ components:
       deprecated: true
       description: Deprecated linear graph_searches pattern edge.
       properties:
+        edge_filter:
+          $ref: '#/components/schemas/GraphRelationshipFilter'
         types:
           x-go-type-skip-optional-pointer: true
           type: array
@@ -3785,6 +3819,47 @@ components:
       properties:
         min: { type: number, format: double, minimum: 0, x-go-type-skip-optional-pointer: false }
         max: { type: number, format: double, minimum: 0, x-go-type-skip-optional-pointer: false }
+    GraphRelationshipPropertyPredicate:
+      type: object
+      additionalProperties: false
+      required: [field, op]
+      properties:
+        field:
+          type: string
+          description: JSON pointer to /metadata/... or /edge_id, /owner_document, /source, /target, /type, /weight, /created_at, /updated_at.
+        op:
+          type: string
+          enum: [eq, ne, lt, lte, gt, gte, is_null, is_not_null]
+        value:
+          description: Non-null scalar comparison value. Omit for is_null and is_not_null.
+        value_type:
+          type: string
+          enum: [scalar, datetime]
+          default: scalar
+          description: Datetime compares RFC3339 instants rather than string ordering.
+    GraphRelationshipFilter:
+      type: object
+      additionalProperties: false
+      description: >-
+        AND predicates applied to every relationship before neighbor admission,
+        path ranking, and match counting. Missing or null properties fail comparisons,
+        including ne; use explicit null operators. Maximum 64 predicates and 64 KiB
+        of predicate fields and values. Time intervals have inclusive lower and
+        exclusive upper bounds. Missing/null valid-time bounds are open; known_at
+        requires a created_at value. Invalid timestamp properties never match.
+      properties:
+        properties:
+          type: array
+          maxItems: 64
+          items: { $ref: '#/components/schemas/GraphRelationshipPropertyPredicate' }
+        valid_at:
+          type: string
+          format: date-time
+          description: Require metadata.valid_at <= instant < metadata.invalid_at.
+        known_at:
+          type: string
+          format: date-time
+          description: Require metadata.created_at <= instant < metadata.expired_at.
     GraphTraversal:
       type: object
       additionalProperties: false
@@ -3795,6 +3870,8 @@ components:
         to traverse a relationship as undirected without storing a reciprocal
         edge.
       properties:
+        edge_filter:
+          $ref: '#/components/schemas/GraphRelationshipFilter'
         start:
           $ref: '#/components/schemas/GraphNodeSelector'
         direction:
@@ -3912,6 +3989,8 @@ components:
       required: [from, to]
       description: Find the best path from `from` to `to` in the requested stored-edge direction.
       properties:
+        edge_filter:
+          $ref: '#/components/schemas/GraphRelationshipFilter'
         from: { $ref: '#/components/schemas/GraphPathEndpoint' }
         to: { $ref: '#/components/schemas/GraphPathEndpoint' }
         direction:
@@ -3955,9 +4034,11 @@ components:
       description: >-
         Find up to `k` loopless paths from `from` to `to` in the requested
         stored-edge direction. Results are unique by ordered table-qualified
-        node identities plus stored-edge direction and type, and are ordered
+        node identities plus stored-edge direction, type, edge ID and fact owner, and are ordered
         best-first by the selected objective.
       properties:
+        edge_filter:
+          $ref: '#/components/schemas/GraphRelationshipFilter'
         from: { $ref: '#/components/schemas/GraphPathEndpoint' }
         to: { $ref: '#/components/schemas/GraphPathEndpoint' }
         direction:
@@ -4039,6 +4120,8 @@ components:
         cross-table multi-hop patterns as explicit single-hop edges with a
         table-qualified alias at each table boundary.
       properties:
+        edge_filter:
+          $ref: '#/components/schemas/GraphRelationshipFilter'
         from: { $ref: 'generated/graph_identifier.yaml#/components/schemas/GraphIdentifier' }
         to: { $ref: 'generated/graph_identifier.yaml#/components/schemas/GraphIdentifier' }
         direction:

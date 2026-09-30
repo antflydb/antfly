@@ -101,6 +101,8 @@ def test_canonical_path_does_not_compute_unused_overflowing_product() -> None:
                                     "from": {"key": "a"},
                                     "to": {"key": "b"},
                                     "direction": "out",
+                                    "edge_id": "fact:works",
+                                    "owner_document": "fact:works",
                                     "type": "related",
                                     "weight": 1e200,
                                 },

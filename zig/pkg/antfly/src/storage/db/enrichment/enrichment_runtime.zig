@@ -19121,7 +19121,7 @@ fn materializeGraphAssetForRuntime(
         var write_positions = RuntimeWritePositions.empty;
         defer write_positions.deinit(runtime.alloc);
         for (graph_writes) |write| {
-            const key = try internal_keys.graphEdgeArtifactKeyAlloc(runtime.alloc, write.source, write.index_name, write.edge_type, write.target);
+            const key = try internal_keys.graphRelationshipArtifactKeyAlloc(runtime.alloc, if (write.owner_document.len > 0) write.owner_document else write.source, write.index_name, write.edge_type, write.target, write.source, write.edge_id);
             var key_owned = true;
             errdefer if (key_owned) runtime.alloc.free(key);
             const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(runtime.alloc, null, graph_entry.config.coverage_generation, write.weight, write.created_at, write.updated_at, write.metadata_json);
@@ -19734,6 +19734,8 @@ fn runtimeFreeGraphWriteFields(alloc: Allocator, write: types.GraphEdgeWrite) vo
     alloc.free(@constCast(write.source));
     alloc.free(@constCast(write.target));
     alloc.free(@constCast(write.edge_type));
+    if (write.edge_id.len > 0) alloc.free(@constCast(write.edge_id));
+    if (write.owner_document.len > 0) alloc.free(@constCast(write.owner_document));
     if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
 }
 
@@ -19844,7 +19846,20 @@ fn runtimeAppendRelationItem(
         runtimeJsonStringField(item, "type") orelse runtimeJsonStringField(item, "edge_type") orelse runtimeJsonStringField(item, "relation") orelse return;
     if (edge_type.len == 0) return;
 
-    const source_doc = doc_key;
+    const mapped_source = if (mapping.source_template.len > 0)
+        try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.source_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
+    else
+        null;
+    defer if (mapped_source) |value| alloc.free(value);
+    const source_doc = if (mapped_source) |value| value else doc_key;
+    if (source_doc.len == 0) return error.InvalidGraphEdges;
+    const mapped_id = if (mapping.edge_id_template.len > 0)
+        try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.edge_id_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
+    else
+        null;
+    defer if (mapped_id) |value| alloc.free(value);
+    const edge_id = mapped_id orelse "";
+    if (mapped_id != null and edge_id.len == 0) return error.InvalidGraphEdges;
 
     const mapped_target = if (mapping.target_template.len > 0)
         try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.target_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
@@ -19882,7 +19897,13 @@ fn runtimeAppendRelationItem(
     errdefer alloc.free(owned_target);
     const owned_edge_type = try alloc.dupe(u8, edge_type);
     errdefer alloc.free(owned_edge_type);
+    const owned_id = try alloc.dupe(u8, edge_id);
+    errdefer alloc.free(owned_id);
+    const owner_document = if (!std.mem.eql(u8, source_doc, doc_key)) try alloc.dupe(u8, doc_key) else "";
+    errdefer if (owner_document.len > 0) alloc.free(owner_document);
     try writes.append(alloc, .{
+        .edge_id = owned_id,
+        .owner_document = owner_document,
         .index_name = owned_index_name,
         .source = owned_source,
         .target = owned_target,

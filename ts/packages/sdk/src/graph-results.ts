@@ -205,7 +205,7 @@ function pathEdge(
   maxWeightProduct: boolean
 ): number {
   const edge = object(value, path);
-  exactKeys(edge, path, ["from", "to", "direction", "type", "weight"], ["metadata"]);
+  exactKeys(edge, path, ["from", "to", "direction", "type", "weight"], ["metadata", "edge_id", "owner_document"]);
   const from = endpoint(edge.from, `${path}.from`);
   const to = endpoint(edge.to, `${path}.to`);
   if (!sameEndpoint(from, expectedFrom) || !sameEndpoint(to, expectedTo)) {
@@ -215,6 +215,11 @@ function pathEdge(
     invalid(`${path}.direction`, "must be out or in");
   }
   nonemptyString(edge.type, `${path}.type`, MAX_EDGE_TYPE_BYTES);
+  if (edge.edge_id !== undefined) nonemptyString(edge.edge_id, `${path}.edge_id`, MAX_EDGE_TYPE_BYTES);
+  if (edge.owner_document !== undefined) {
+    nonemptyString(edge.owner_document, `${path}.owner_document`, MAX_EDGE_TYPE_BYTES);
+    if (edge.edge_id === undefined) invalid(path, "owner_document requires edge_id");
+  }
   if (edge.metadata !== undefined) object(edge.metadata, `${path}.metadata`);
   return finiteNonnegative(edge.weight, `${path}.weight`, maxWeightProduct);
 }

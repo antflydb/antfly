@@ -23941,6 +23941,8 @@ pub const IndexManager = struct {
                 self.alloc.free(@constCast(delete.source));
                 self.alloc.free(@constCast(delete.target));
                 self.alloc.free(@constCast(delete.edge_type));
+                if (delete.edge_id.len > 0) self.alloc.free(@constCast(delete.edge_id));
+                if (delete.owner_document.len > 0) self.alloc.free(@constCast(delete.owner_document));
             }
             deletes.deinit(self.alloc);
         }
@@ -23981,12 +23983,14 @@ pub const IndexManager = struct {
         defer batch_deletes.deinit(self.alloc);
 
         for (writes) |write| {
-            if (!self.keyInRange(write.source)) continue;
+            if (!self.keyInRange(if (write.owner_document.len > 0) write.owner_document else write.source)) continue;
             if (!std.mem.eql(u8, write.index_name, entry.config.name)) continue;
             try batch_writes.append(self.alloc, .{
                 .source = write.source,
                 .target = write.target,
                 .edge_type = write.edge_type,
+                .edge_id = write.edge_id,
+                .owner_document = write.owner_document,
                 .weight = write.weight,
                 .created_at = write.created_at,
                 .updated_at = write.updated_at,
@@ -23995,12 +23999,14 @@ pub const IndexManager = struct {
         }
 
         for (deletes) |delete| {
-            if (!self.keyInRange(delete.source)) continue;
+            if (!self.keyInRange(if (delete.owner_document.len > 0) delete.owner_document else delete.source)) continue;
             if (!std.mem.eql(u8, delete.index_name, entry.config.name)) continue;
             try batch_deletes.append(self.alloc, .{
                 .source = delete.source,
                 .target = delete.target,
                 .edge_type = delete.edge_type,
+                .edge_id = delete.edge_id,
+                .owner_document = delete.owner_document,
             });
         }
 
@@ -28791,6 +28797,8 @@ pub const GraphNodeModel = enum {
 
 pub const GraphArtifactMapping = struct {
     node_model: GraphNodeModel = .document,
+    source_template: []u8 = "",
+    edge_id_template: []u8 = "",
     target_template: []u8 = "",
     edge_type_template: []u8 = "",
     weight_template: []u8 = "",
@@ -28813,6 +28821,8 @@ pub const GraphArtifactMapping = struct {
         }
         return .{
             .node_model = mapping.node_model,
+            .source_template = if (mapping.source_template.len > 0) try alloc.dupe(u8, mapping.source_template) else "",
+            .edge_id_template = if (mapping.edge_id_template.len > 0) try alloc.dupe(u8, mapping.edge_id_template) else "",
             .target_template = if (mapping.target_template.len > 0) try alloc.dupe(u8, mapping.target_template) else "",
             .edge_type_template = if (mapping.edge_type_template.len > 0) try alloc.dupe(u8, mapping.edge_type_template) else "",
             .weight_template = if (mapping.weight_template.len > 0) try alloc.dupe(u8, mapping.weight_template) else "",
@@ -28822,6 +28832,8 @@ pub const GraphArtifactMapping = struct {
     }
 
     pub fn deinit(self: *GraphArtifactMapping, alloc: Allocator) void {
+        if (self.source_template.len > 0) alloc.free(self.source_template);
+        if (self.edge_id_template.len > 0) alloc.free(self.edge_id_template);
         if (self.target_template.len > 0) alloc.free(self.target_template);
         if (self.edge_type_template.len > 0) alloc.free(self.edge_type_template);
         if (self.weight_template.len > 0) alloc.free(self.weight_template);
@@ -30391,7 +30403,7 @@ fn parseGraphArtifactMapping(alloc: Allocator, root: std.json.Value) !GraphArtif
 
     if (root.object.get("nodes")) |nodes| {
         if (nodes != .object) return error.InvalidIndexConfig;
-        if (nodes.object.get("source") != null) return error.InvalidIndexConfig;
+        mapping.source_template = try parseOptionalGraphTemplate(alloc, nodes, "source");
         if (nodes.object.get("model")) |model| {
             if (model != .string) return error.InvalidIndexConfig;
             if (std.mem.eql(u8, model.string, "document")) {
@@ -30408,6 +30420,7 @@ fn parseGraphArtifactMapping(alloc: Allocator, root: std.json.Value) !GraphArtif
     if (root.object.get("edge")) |edge| {
         if (edge != .object) return error.InvalidIndexConfig;
         mapping.edge_type_template = try parseOptionalGraphTemplate(alloc, edge, "type");
+        mapping.edge_id_template = try parseOptionalGraphTemplate(alloc, edge, "edge_id");
         mapping.weight_template = try parseOptionalGraphTemplate(alloc, edge, "weight");
         if (edge.object.get("metadata")) |metadata| {
             mapping.metadata_template_json = try std.json.Stringify.valueAlloc(alloc, metadata, .{});
@@ -30419,6 +30432,7 @@ fn parseGraphArtifactMapping(alloc: Allocator, root: std.json.Value) !GraphArtif
         mapping.context_doc_fields = try parseGraphContextDocFields(alloc, context);
     }
 
+    if (mapping.source_template.len > 0 and mapping.edge_id_template.len == 0) return error.InvalidIndexConfig;
     try validateGraphMappingTemplates(mapping);
     return mapping;
 }
@@ -30450,6 +30464,8 @@ fn parseGraphContextDocFields(alloc: Allocator, context: std.json.Value) ![]cons
 }
 
 fn validateGraphMappingTemplates(mapping: GraphArtifactMapping) !void {
+    try validateGraphTemplateDocFields(mapping.source_template, mapping.context_doc_fields);
+    try validateGraphTemplateDocFields(mapping.edge_id_template, mapping.context_doc_fields);
     try validateGraphTemplateDocFields(mapping.target_template, mapping.context_doc_fields);
     try validateGraphTemplateDocFields(mapping.edge_type_template, mapping.context_doc_fields);
     try validateGraphTemplateDocFields(mapping.weight_template, mapping.context_doc_fields);
@@ -30736,7 +30752,7 @@ test "graph config parses artifact mapping templates and context fields" {
     try std.testing.expect(std.mem.indexOf(u8, mapping.metadata_template_json, "_item.evidence") != null);
 }
 
-test "graph config rejects source owner overrides undeclared doc fields and unsupported paths" {
+test "graph config rejects source mappings without ids undeclared doc fields and unsupported paths" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
         \\{"source":{"artifact":"relations_v1"},"edge":{"type":"{{ _doc.value.tenant_id }}"}}

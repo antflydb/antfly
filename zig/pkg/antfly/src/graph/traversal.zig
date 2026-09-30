@@ -20,7 +20,9 @@
 //!   - Optional path tracking
 
 const std = @import("std");
+const relationship_filter = @import("relationship_filter.zig");
 const Allocator = std.mem.Allocator;
+const paths_mod = @import("paths.zig");
 const platform_time = @import("antfly_platform").time;
 const graph_mod = @import("graph.zig");
 const Edge = graph_mod.Edge;
@@ -37,6 +39,7 @@ const edge_stream = @import("edge_stream.zig");
 // ============================================================================
 
 pub const TraversalRules = struct {
+    edge_filter: relationship_filter.Filter = .{},
     edge_types: []const []const u8 = &.{}, // empty = all types
     direction: EdgeDirection = .out,
     max_depth: u32 = 3,
@@ -76,6 +79,7 @@ pub const TraversalResult = struct {
     /// from distance for the legacy direct traversal response.
     total_weight: f64,
     path: ?[]const []const u8, // if include_paths
+    path_edges: ?[]const paths_mod.PathEdge = null,
     /// Table of the reached node, when the edge that reached it declared a
     /// cross-table endpoint (`target_table` in its metadata). Owned.
     target_table: ?[]const u8 = null,
@@ -100,6 +104,7 @@ pub fn metadataTargetTable(metadata: []const u8) ?[]const u8 {
 // ============================================================================
 
 const TraversalAncestryNode = struct {
+    incoming_edge: ?paths_mod.PathEdge = null,
     key: []const u8,
     target_table: ?[]const u8,
     parent: ?*const TraversalAncestryNode,
@@ -128,11 +133,13 @@ const TraversalAncestry = struct {
         key: []const u8,
         target_table: ?[]const u8,
         parent: ?*const TraversalAncestryNode,
+        incoming_edge: ?paths_mod.PathEdge,
     ) !*const TraversalAncestryNode {
         var added = std.math.add(usize, @sizeOf(TraversalAncestryNode) + @sizeOf(QueueEntry), key.len) catch
             return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
         if (target_table) |table| added = std.math.add(usize, added, table.len) catch
             return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        if (incoming_edge) |edge| added = std.math.add(usize, added, paths_mod.pathEdgeOwnedBytes(edge)) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
         try self.work_budget.retainStateBytes(added);
         errdefer self.work_budget.releaseStateBytes(added);
 
@@ -140,7 +147,7 @@ const TraversalAncestry = struct {
         const owned_key = try arena_alloc.dupe(u8, key);
         const owned_table = if (target_table) |table| try arena_alloc.dupe(u8, table) else null;
         const node = try arena_alloc.create(TraversalAncestryNode);
-        node.* = .{ .key = owned_key, .target_table = owned_table, .parent = parent };
+        node.* = .{ .key = owned_key, .target_table = owned_table, .parent = parent, .incoming_edge = if (incoming_edge) |edge| try paths_mod.clonePathEdge(arena_alloc, edge) else null };
         self.retained_bytes += added;
         return node;
     }
@@ -231,7 +238,7 @@ pub fn traverseWithEdgeReader(
     // Seed with start node
     try work_budget.checkIntermediateStates(1, effective_rules.max_intermediate_states);
     try work_budget.consumeNode();
-    const start_ancestry = try ancestry.append(start_key, null, null);
+    const start_ancestry = try ancestry.append(start_key, null, null, null);
     try queue.append(alloc, .{
         .ancestry = start_ancestry,
         .depth = 0,
@@ -301,7 +308,7 @@ pub fn traverseWithEdgeReader(
                 try candidate_indexes.ensureTotalCapacity(alloc, edges.len);
                 try candidate_nodes.ensureTotalCapacity(alloc, edges.len);
                 for (edges, 0..) |edge, edge_index| {
-                    if (!shouldTraverseEdge(&effective_rules, &edge)) continue;
+                    if (!try shouldTraverseEdge(alloc, &effective_rules, &edge)) continue;
                     const next_key = if (std.mem.eql(u8, current.ancestry.key, edge.source)) edge.target else edge.source;
                     const target_table = if (std.mem.eql(u8, next_key, edge.target))
                         metadataTargetTable(edge.metadata)
@@ -335,7 +342,7 @@ pub fn traverseWithEdgeReader(
                 if (admitted_edges) |mask| {
                     if (!mask[edge_index]) continue;
                 } else {
-                    if (!shouldTraverseEdge(&effective_rules, &edge)) continue;
+                    if (!try shouldTraverseEdge(alloc, &effective_rules, &edge)) continue;
                 }
                 const target_table = if (std.mem.eql(u8, next_key, edge.target))
                     metadataTargetTable(edge.metadata)
@@ -352,7 +359,21 @@ pub fn traverseWithEdgeReader(
                 const pending_states = queue.items.len - queue_head;
                 try work_budget.checkIntermediateStates(pending_states + 1, effective_rules.max_intermediate_states);
                 try work_budget.consumeNode();
-                const next_ancestry = try ancestry.append(next_key, target_table, current.ancestry);
+                const selected_edge: ?paths_mod.PathEdge = if (effective_rules.include_paths) .{
+                    .source = edge.source,
+                    .target = edge.target,
+                    .edge_type = edge.edge_type,
+                    .edge_id = edge.edge_id,
+                    .owner_document = edge.owner_document,
+                    .weight = edge.weight,
+                    .metadata = edge.metadata,
+                    .traversal_direction = switch (effective_rules.direction) {
+                        .out => .out,
+                        .in => .in,
+                        .both => if (std.mem.eql(u8, edge.source, edge.target)) null else if (std.mem.eql(u8, edge.source, current.ancestry.key)) .out else .in,
+                    },
+                } else null;
+                const next_ancestry = try ancestry.append(next_key, target_table, current.ancestry, selected_edge);
                 const total_weight = current.total_weight + edge.weight;
                 if (!std.math.isFinite(total_weight)) return error.GraphPathWeightOverflow;
                 try queue.append(alloc, .{
@@ -404,6 +425,24 @@ fn traversalResultFromQueueEntry(
         for (items) |item| alloc.free(item);
         alloc.free(items);
     };
+    const path_edges = if (include_path) blk: {
+        const owned = try alloc.alloc(paths_mod.PathEdge, entry.depth);
+        var count: usize = 0;
+        errdefer {
+            for (owned[owned.len - count ..]) |edge| paths_mod.freePathEdgeAlloc(alloc, edge);
+            alloc.free(owned);
+        }
+        var cursor: ?*const TraversalAncestryNode = entry.ancestry;
+        while (cursor) |node| : (cursor = node.parent) {
+            if (node.incoming_edge) |edge| {
+                owned[owned.len - count - 1] = try paths_mod.clonePathEdge(alloc, edge);
+                count += 1;
+            }
+        }
+        std.debug.assert(count == owned.len);
+        break :blk owned;
+    } else null;
+    errdefer if (path_edges) |edges| paths_mod.freePathEdgesAlloc(alloc, edges);
     const target_table = if (entry.ancestry.target_table) |table|
         try alloc.dupe(u8, table)
     else
@@ -415,6 +454,7 @@ fn traversalResultFromQueueEntry(
         .distance = @floatFromInt(entry.depth),
         .total_weight = entry.total_weight,
         .path = path,
+        .path_edges = path_edges,
         .target_table = target_table,
         .retained_budget = returned_state_budget,
         .retained_state_bytes = retained_bytes,
@@ -430,6 +470,7 @@ fn traversalResultRetainedBytes(entry: QueueEntry, include_path: bool) !usize {
         var cursor: ?*const TraversalAncestryNode = entry.ancestry;
         while (cursor) |node| : (cursor = node.parent) {
             total = try std.math.add(usize, total, node.key.len);
+            if (node.incoming_edge) |edge| total = try std.math.add(usize, total, paths_mod.pathEdgeOwnedBytes(edge));
         }
     }
     return total;
@@ -550,19 +591,20 @@ fn getEdgesForTraversalBudget(
     return try edge_reader.getEdges(alloc, key, rules.direction);
 }
 
-fn shouldTraverseEdge(rules: *const TraversalRules, edge: *const Edge) bool {
-    // Weight filter
-    if (rules.min_weight) |min_weight| if (edge.weight < min_weight) return false;
-    if (rules.max_weight) |max_weight| if (edge.weight > max_weight) return false;
-
-    // Edge type filter
+fn shouldTraverseEdge(alloc: Allocator, rules: *const TraversalRules, edge: *const Edge) !bool {
+    if (rules.min_weight) |bound| if (edge.weight < bound) return false;
+    if (rules.max_weight) |bound| if (edge.weight > bound) return false;
     if (rules.edge_types.len > 0) {
+        var matched = false;
         for (rules.edge_types) |et| {
-            if (std.mem.eql(u8, edge.edge_type, et)) return true;
+            if (std.mem.eql(u8, edge.edge_type, et)) {
+                matched = true;
+                break;
+            }
         }
-        return false;
+        if (!matched) return false;
     }
-    return true;
+    return rules.edge_filter.matches(alloc, edge.*);
 }
 
 test "traversal weight filters preserve explicit zero bounds" {
@@ -571,10 +613,10 @@ test "traversal weight filters preserve explicit zero bounds" {
     const negative = Edge{ .source = "a", .target = "b", .edge_type = "e", .weight = -0.1, .created_at = 0, .updated_at = 0, .metadata = "" };
     const max_zero = TraversalRules{ .max_weight = 0 };
     const min_zero = TraversalRules{ .min_weight = 0 };
-    try std.testing.expect(shouldTraverseEdge(&max_zero, &zero));
-    try std.testing.expect(!shouldTraverseEdge(&max_zero, &positive));
-    try std.testing.expect(shouldTraverseEdge(&max_zero, &negative));
-    try std.testing.expect(!shouldTraverseEdge(&min_zero, &negative));
+    try std.testing.expect(try shouldTraverseEdge(std.testing.allocator, &max_zero, &zero));
+    try std.testing.expect(!try shouldTraverseEdge(std.testing.allocator, &max_zero, &positive));
+    try std.testing.expect(try shouldTraverseEdge(std.testing.allocator, &max_zero, &negative));
+    try std.testing.expect(!try shouldTraverseEdge(std.testing.allocator, &min_zero, &negative));
 }
 
 /// Free traversal results.
@@ -584,6 +626,7 @@ fn freeResult(alloc: Allocator, result: TraversalResult) void {
         for (path) |key| alloc.free(key);
         alloc.free(path);
     }
+    if (result.path_edges) |edges| paths_mod.freePathEdgesAlloc(alloc, edges);
     if (result.target_table) |table| alloc.free(table);
     if (result.retained_budget) |budget| budget.releaseStateBytes(result.retained_state_bytes);
 }
@@ -903,4 +946,26 @@ test "traversal ancestry and returned paths share retained state budget" {
     }));
     try std.testing.expectEqual(work_budget_mod.Dimension.retained_state_bytes, budget.exhaustion().?.dimension);
     try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+}
+
+test "traversal selected fact relationships are allocation failure safe" {
+    const alloc = std.testing.allocator;
+    var graph = try GraphIndex.openWithPrivateStores(alloc, "unused-out", "unused-in", "facts", .{ .reverse_backend = .mem });
+    defer graph.close();
+    try graph.batchApply(&.{
+        .{ .source = "a", .target = "b", .edge_type = "R", .edge_id = "one", .owner_document = "fact:one", .weight = 0.2, .metadata_json = "{\"fact\":1}" },
+        .{ .source = "a", .target = "b", .edge_type = "R", .edge_id = "two", .owner_document = "fact:two", .weight = 0.9, .metadata_json = "{\"fact\":2}" },
+    }, &.{});
+    const Case = struct {
+        fn run(a: Allocator, index: *GraphIndex) !void {
+            const results = try traverse(a, index, "a", .{ .max_depth = 1, .include_paths = true, .deduplicate = false });
+            defer freeOwnedResults(a, results);
+            try std.testing.expectEqual(@as(usize, 2), results.len);
+            try std.testing.expectEqualStrings("one", results[0].path_edges.?[0].edge_id);
+            try std.testing.expectEqualStrings("two", results[1].path_edges.?[0].edge_id);
+            try std.testing.expectEqual(@as(f64, 0.2), results[0].path_edges.?[0].weight);
+            try std.testing.expectEqualStrings("fact:two", results[1].path_edges.?[0].owner_document);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Case.run, .{&graph});
 }

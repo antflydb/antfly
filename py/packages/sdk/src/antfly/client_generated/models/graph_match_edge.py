@@ -10,6 +10,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.graph_edge_weight_range import GraphEdgeWeightRange
+    from ..models.graph_relationship_filter import GraphRelationshipFilter
 
 
 T = TypeVar("T", bound="GraphMatchEdge")
@@ -35,6 +36,11 @@ class GraphMatchEdge:
                 Identifiers are exact UTF-8 strings and are not normalized. Ordinary internal ASCII spaces are allowed. The
                 value must not equal `*`, begin with `$`, have leading or trailing spaces, contain non-ASCII Unicode
                 White_Space, or contain Unicode Cc control or Cf format code points. UTF-8 encoding is limited to 512 bytes.
+            edge_filter (GraphRelationshipFilter | Unset): AND predicates applied to every relationship before neighbor
+                admission, path ranking, and match counting. Missing or null properties fail comparisons, including ne; use
+                explicit null operators. Maximum 64 predicates and 64 KiB of predicate fields and values. Time intervals have
+                inclusive lower and exclusive upper bounds. Missing/null valid-time bounds are open; known_at requires a
+                created_at value. Invalid timestamp properties never match.
             direction (EdgeDirection | Unset): Direction of edges to query:
                 - out: Outgoing edges from the node
                 - in: Incoming edges to the node
@@ -50,6 +56,7 @@ class GraphMatchEdge:
 
     from_: str
     to: str
+    edge_filter: GraphRelationshipFilter | Unset = UNSET
     direction: EdgeDirection | Unset = UNSET
     types: list[str] | Unset = UNSET
     min_hops: int | Unset = 1
@@ -60,6 +67,10 @@ class GraphMatchEdge:
         from_ = self.from_
 
         to = self.to
+
+        edge_filter: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.edge_filter, Unset):
+            edge_filter = self.edge_filter.to_dict()
 
         direction: str | Unset = UNSET
         if not isinstance(self.direction, Unset):
@@ -85,6 +96,8 @@ class GraphMatchEdge:
                 "to": to,
             }
         )
+        if edge_filter is not UNSET:
+            field_dict["edge_filter"] = edge_filter
         if direction is not UNSET:
             field_dict["direction"] = direction
         if types is not UNSET:
@@ -101,11 +114,19 @@ class GraphMatchEdge:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.graph_edge_weight_range import GraphEdgeWeightRange
+        from ..models.graph_relationship_filter import GraphRelationshipFilter
 
         d = dict(src_dict)
         from_ = d.pop("from")
 
         to = d.pop("to")
+
+        _edge_filter = d.pop("edge_filter", UNSET)
+        edge_filter: GraphRelationshipFilter | Unset
+        if isinstance(_edge_filter, Unset):
+            edge_filter = UNSET
+        else:
+            edge_filter = GraphRelationshipFilter.from_dict(_edge_filter)
 
         _direction = d.pop("direction", UNSET)
         direction: EdgeDirection | Unset
@@ -130,6 +151,7 @@ class GraphMatchEdge:
         graph_match_edge = cls(
             from_=from_,
             to=to,
+            edge_filter=edge_filter,
             direction=direction,
             types=types,
             min_hops=min_hops,

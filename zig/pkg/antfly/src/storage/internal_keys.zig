@@ -1438,6 +1438,51 @@ pub fn graphEdgeArtifactKeyAlloc(
     return out;
 }
 
+/// Versioned relationship identity extension. Empty IDs retain the original
+/// tuple key. Ownership and logical endpoints are independent for fact edges.
+pub const GraphRelationshipSuffix = struct {
+    edge_id: []const u8 = "",
+    owner_document: []const u8 = "",
+    logical_source: []const u8 = "",
+};
+
+pub fn appendGraphRelationshipSuffix(list: *std.ArrayListUnmanaged(u8), alloc: Allocator, identity: GraphRelationshipSuffix) !void {
+    if (identity.edge_id.len == 0 and identity.owner_document.len == 0 and identity.logical_source.len == 0) return;
+    if (identity.edge_id.len == 0) return error.InvalidGraphEdges;
+    try list.append(alloc, 1); // relationship key extension version
+    try appendEncodedComponent(list, alloc, identity.edge_id);
+    try appendEncodedComponent(list, alloc, identity.owner_document);
+    try appendEncodedComponent(list, alloc, identity.logical_source);
+}
+
+/// Components are encoded, borrowed slices; callers decode only after budget
+/// admission. Reject unknown versions and trailing bytes instead of truncating.
+pub fn parseGraphRelationshipSuffix(key: []const u8, start: usize) ?GraphRelationshipSuffix {
+    if (start == key.len) return .{};
+    if (start > key.len or key[start] != 1) return null;
+    var pos = start + 1;
+    const id_end = findComponentTerminator(key, pos) orelse return null;
+    if (id_end == pos) return null;
+    const id = key[pos..id_end];
+    pos = id_end + 2;
+    const owner_end = findComponentTerminator(key, pos) orelse return null;
+    const owner = key[pos..owner_end];
+    pos = owner_end + 2;
+    const source_end = findComponentTerminator(key, pos) orelse return null;
+    if (source_end + 2 != key.len) return null;
+    return .{ .edge_id = id, .owner_document = owner, .logical_source = key[pos..source_end] };
+}
+
+pub fn graphRelationshipArtifactKeyAlloc(alloc: Allocator, owner: []const u8, index_name: []const u8, edge_type: []const u8, target: []const u8, source: []const u8, edge_id: []const u8) ![]u8 {
+    const base = try graphEdgeArtifactKeyAlloc(alloc, owner, index_name, edge_type, target);
+    defer alloc.free(base);
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, base);
+    try appendGraphRelationshipSuffix(&list, alloc, .{ .edge_id = edge_id, .logical_source = if (std.mem.eql(u8, owner, source)) "" else source });
+    return list.toOwnedSlice(alloc);
+}
+
 pub fn derivedEmbeddingBaseKeyAlloc(alloc: Allocator, key: []const u8) !?[]u8 {
     if (!isDerivedEmbeddingArtifactKey(key)) return null;
 
@@ -1721,7 +1766,7 @@ pub fn isGraphEdgeArtifactKey(key: []const u8) bool {
     pos = edge_type_term + 2;
 
     const target_term = findComponentTerminator(key, pos) orelse return false;
-    return target_term + 2 == key.len;
+    return parseGraphRelationshipSuffix(key, target_term + 2) != null;
 }
 
 pub fn matchesGraphEdgeIndexName(key: []const u8, index_name: []const u8) bool {
@@ -2069,7 +2114,7 @@ pub fn artifactNameView(key: []const u8) !?[]const u8 {
 pub fn parseGraphEdgeArtifactKeyAlloc(
     alloc: Allocator,
     key: []const u8,
-) !?struct { doc_key: []u8, index_name: []u8, edge_type: []u8, target_doc_key: []u8 } {
+) !?struct { doc_key: []u8, index_name: []u8, edge_type: []u8, target_doc_key: []u8, edge_id: []u8, logical_source: []u8 } {
     if (!isGraphEdgeArtifactKey(key)) return null;
 
     const doc_term = findComponentTerminator(key, 1).?;
@@ -2095,12 +2140,20 @@ pub fn parseGraphEdgeArtifactKeyAlloc(
 
     const target_term = findComponentTerminator(key, pos).?;
     const target_doc_key = try decodeBodyAlloc(alloc, key[pos..target_term]);
+    errdefer alloc.free(target_doc_key);
+    const suffix = parseGraphRelationshipSuffix(key, target_term + 2).?;
+    const edge_id = try decodeBodyAlloc(alloc, suffix.edge_id);
+    errdefer alloc.free(edge_id);
+    const logical_source = try decodeBodyAlloc(alloc, suffix.logical_source);
+    errdefer alloc.free(logical_source);
 
     return .{
         .doc_key = doc_key,
         .index_name = index_name,
         .edge_type = edge_type,
         .target_doc_key = target_doc_key,
+        .edge_id = edge_id,
+        .logical_source = logical_source,
     };
 }
 
@@ -2917,4 +2970,32 @@ test "document extraction spool keys isolate attempts and preserve unit order" {
     try std.testing.expect(std.mem.startsWith(u8, second_root, artifact_root));
     try std.testing.expect(!std.mem.startsWith(u8, first, second_root));
     try std.testing.expect(std.mem.order(u8, first, second) == .lt);
+}
+
+test "graph relationship artifact identity is versioned and owner scoped" {
+    const alloc = std.testing.allocator;
+    const legacy = try graphRelationshipArtifactKeyAlloc(alloc, "a", "facts", "RELATES_TO", "b", "a", "");
+    defer alloc.free(legacy);
+    const old = try graphEdgeArtifactKeyAlloc(alloc, "a", "facts", "RELATES_TO", "b");
+    defer alloc.free(old);
+    try std.testing.expectEqualSlices(u8, old, legacy);
+    const explicit = try graphRelationshipArtifactKeyAlloc(alloc, "fact\x00:1", "facts", "RELATES_TO", "b\x00", "a\x1f", "uuid\x00:1");
+    defer alloc.free(explicit);
+    try std.testing.expect(isGraphEdgeArtifactKey(explicit));
+    const parsed = (try parseGraphEdgeArtifactKeyAlloc(alloc, explicit)).?;
+    defer {
+        alloc.free(parsed.doc_key);
+        alloc.free(parsed.index_name);
+        alloc.free(parsed.edge_type);
+        alloc.free(parsed.target_doc_key);
+        alloc.free(parsed.edge_id);
+        alloc.free(parsed.logical_source);
+    }
+    try std.testing.expectEqualStrings("fact\x00:1", parsed.doc_key);
+    try std.testing.expectEqualStrings("a\x1f", parsed.logical_source);
+    try std.testing.expectEqualStrings("uuid\x00:1", parsed.edge_id);
+    const corrupt = try std.mem.concat(alloc, u8, &.{ explicit, "x" });
+    defer alloc.free(corrupt);
+    try std.testing.expect(!isGraphEdgeArtifactKey(corrupt));
+    try std.testing.expectError(error.InvalidGraphEdges, graphRelationshipArtifactKeyAlloc(alloc, "fact", "facts", "RELATES_TO", "b", "a", ""));
 }
