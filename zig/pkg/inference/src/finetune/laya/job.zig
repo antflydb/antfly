@@ -36,6 +36,9 @@ pub const Config = struct {
     gradient_accumulation: u32 = 1,
     encoder_lr: f32 = 2.5e-5,
     head_lr: f32 = 1e-4,
+    /// Learning rate of a pointer head (`decision_head: .pointer`), which
+    /// starts from scratch rather than from the released scorer.
+    pointer_lr: f32 = 1e-3,
     weight_decay: f32 = 0.01,
     max_grad_norm: f32 = 1,
     head_dropout: f32 = 0.1,
@@ -74,6 +77,10 @@ pub const Config = struct {
     /// Question-first positions (`packing.question_first`). Requires
     /// `packing`.
     question_first: bool = false,
+    /// Train (and export) this option scorer (`laya.decision_head`). Null
+    /// keeps the source checkpoint's; `.pointer` on a scorer checkpoint
+    /// starts a new, seeded pointer head.
+    decision_head: ?model.DecisionHead = null,
     /// Two-stage choice (roadmap 2b): only valid with `packing: .candidate`.
     /// Set to also train, alongside the ordinary candidate rows, one joint
     /// (question-style) row per eligible `choice` record over a sampled
@@ -135,7 +142,7 @@ pub fn validate(c: Config) !void {
         c.checkpoint_every_steps == 0 or c.max_host_bytes < 64 * 1024 * 1024 or c.max_host_bytes > 128 * 1024 * 1024 * 1024 or
         c.max_backend_bytes < 256 * 1024 * 1024 or c.max_backend_bytes > 64 * 1024 * 1024 * 1024)
         return error.InvalidLayaJob;
-    for ([_]f32{ c.encoder_lr, c.head_lr, c.sigma_start, c.sigma_end, c.max_grad_norm }) |v| if (!std.math.isFinite(v) or v <= 0) return error.InvalidLayaJob;
+    for ([_]f32{ c.encoder_lr, c.head_lr, c.pointer_lr, c.sigma_start, c.sigma_end, c.max_grad_norm }) |v| if (!std.math.isFinite(v) or v <= 0) return error.InvalidLayaJob;
     if (!std.math.isFinite(c.weight_decay) or c.weight_decay < 0 or !std.math.isFinite(c.head_dropout) or c.head_dropout < 0 or c.head_dropout >= 1) return error.InvalidLayaJob;
     for ([_][]const u8{ c.model_dir, c.train_file, c.eval_file, c.output_dir }) |value| if (!std.fs.path.isAbsolute(value)) return error.LayaJobRequiresAbsolutePaths;
     if (c.resume_from) |value| if (!std.fs.path.isAbsolute(value)) return error.LayaJobRequiresAbsolutePaths;
@@ -378,6 +385,12 @@ fn exportModel(a: std.mem.Allocator, io: std.Io, c: Config, config_json: std.jso
     if (c.packing != null) {
         _ = decision.object.swapRemove("packing");
         if (layout.enabled()) try decision.object.put(a, "packing", try packingConfigJson(a, layout));
+        if (c.decision_head) |head| {
+            try decision.object.put(a, "decision_head", .{ .string = @tagName(head) });
+            if (head == .pointer) {
+                try decision.object.put(a, "pointer_dim", .{ .integer = @intCast((model.Config{}).pointer_dim) });
+            } else _ = decision.object.orderedRemove("pointer_dim");
+        }
     }
     // The old option buckets override per-type temperatures in inference.
     // They must never survive a change to the trained weights.
@@ -558,6 +571,12 @@ fn validateEncoderMetadata(value: std.json.Value) !void {
 /// Trainable values already have an owned copy and are filled at publication.
 fn exportInputs(a: std.mem.Allocator, reader: *const safetensors.MMapReader, selected: []const training.controller.Parameter) ![]checkpoint.NamedTensor {
     var result: std.ArrayListUnmanaged(checkpoint.NamedTensor) = .empty;
+    // Trained tensors the source lacks (a new pointer head) are exported too.
+    for (selected) |p| if (std.mem.startsWith(u8, p.name, "pointer.") and reader.header.tensors.get(p.name) == null) {
+        const shape = try a.alloc(usize, p.dimensions.len);
+        for (shape, p.dimensions) |*dst, dim| dst.* = @intCast(dim);
+        try result.append(a, .{ .name = try a.dupe(u8, p.name), .shape = shape, .data = &.{} });
+    };
     var tensors = reader.header.tensors.iterator();
     while (tensors.next()) |entry| {
         const shape = try a.alloc(usize, entry.value_ptr.shape.len);
@@ -593,6 +612,7 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory
     var encoder = try modern.parseConfig(a, config_bytes);
     const source_laya = encoder.laya orelse return error.InvalidLayaConfig;
     encoder.laya.?.packing = try packing(c, source_laya);
+    if (c.decision_head) |head| encoder.laya.?.decision_head = head;
     const laya = encoder.laya.?;
     if (c.freeze_layers > encoder.num_hidden_layers + 1) return error.InvalidLayaJob;
     const freeze = if (c.freeze_layers > encoder.num_hidden_layers) training.whole_encoder else c.freeze_layers;
@@ -646,7 +666,11 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory
         defer a.free(source_bytes);
         var source = try safetensors.MMapReader.fromBorrowedBytesLimited(a, source_bytes, 16 * 1024 * 1024);
         defer source.deinit();
-        try @import("../../models/laya.zig").validateReader(&source, laya, encoder);
+        // The source is checked against its own head; a pointer head it
+        // lacks is initialized by `training.parameters`.
+        var source_check = laya;
+        source_check.decision_head = source_laya.decision_head;
+        try @import("../../models/laya.zig").validateReader(&source, source_check, encoder);
         if (source.header.tensors.get("temperature")) |meta| if (!std.mem.eql(i64, meta.shape, &.{3})) return error.InvalidLayaWeights;
         const initial = try cache.get(train.examples[0..@min(train.examples.len, c.batch_size)]);
         const selected = try training.parameters(permanent, &initial.graph, &source, freeze, lora, c.seed);
@@ -749,6 +773,7 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory
         .groups = &.{
             .{ .optimizer = .{ .weight_decay = c.weight_decay }, .schedule = .{ .cosine = .{ .initial_lr = c.encoder_lr, .min_lr = @min(c.encoder_lr, 1e-6), .total_steps = steps } } },
             .{ .optimizer = .{ .weight_decay = c.weight_decay }, .schedule = .{ .cosine = .{ .initial_lr = c.head_lr, .min_lr = @min(c.head_lr, 1e-6), .total_steps = steps } } },
+            .{ .optimizer = .{ .weight_decay = c.weight_decay }, .schedule = .{ .cosine = .{ .initial_lr = c.pointer_lr, .min_lr = @min(c.pointer_lr, 1e-6), .total_steps = steps } } },
         },
         .grad_accum_steps = c.gradient_accumulation,
         .max_grad_norm = c.max_grad_norm,
