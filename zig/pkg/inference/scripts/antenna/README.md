@@ -157,6 +157,15 @@ ANTFLY_ANTENNA_DATA=<cache> python distill_pool.py --upstream <GLiNER2> --output
   --source go_emotions=50000 --source squad=40000 --source dbpedia=25000
 ```
 
+`gap_probe.py` measures where a distilled student departs from its teacher:
+the distillation loss's z-space error per evaluation dataset (own and
+pool-style schemas) and pool, word rows and marker rows apart:
+
+```sh
+ANTFLY_ANTENNA_DATA=<cache> python gap_probe.py --upstream <GLiNER2> --student <student> \
+  --teacher <gliner2.5-base dir> --pool <pool>/validation.jsonl --output <report.json>
+```
+
 A ModernBERT-base job on resident Metal needs larger budgets than the job
 defaults, which are sized for the small DeBERTa checkpoint: for example
 `"memory": {"host_bytes": 6 GiB, "backend_bytes": 14 GiB, "combined_bytes":
