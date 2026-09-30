@@ -3328,6 +3328,7 @@ pub const TextMergeStats = struct {
     last_merge_error: RuntimeErrorName = .{},
     retry_after_ns: u64 = 0,
     deferred_for_pressure: u64 = 0,
+    forced_drains: u64 = 0,
     backpressure_events: u64 = 0,
     backpressure_ns: u64 = 0,
     backpressure_timeouts: u64 = 0,
@@ -3479,6 +3480,7 @@ pub fn accumulateTextMergeStats(dst: *TextMergeStats, src: TextMergeStats) void 
     if (src.last_merge_error.len != 0) dst.last_merge_error = src.last_merge_error;
     dst.retry_after_ns = @max(dst.retry_after_ns, src.retry_after_ns);
     dst.deferred_for_pressure +|= src.deferred_for_pressure;
+    dst.forced_drains +|= src.forced_drains;
     dst.backpressure_events +|= src.backpressure_events;
     dst.backpressure_ns +|= src.backpressure_ns;
     dst.backpressure_timeouts +|= src.backpressure_timeouts;

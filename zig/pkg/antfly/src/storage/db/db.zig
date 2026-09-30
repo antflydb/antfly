@@ -9314,13 +9314,17 @@ pub const DB = struct {
     pub fn snapshotTextMergeStats(self: *DB) types.TextMergeStats {
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
-        return self.core.index_manager.textMergeStatsSnapshot();
+        var merge_stats = self.core.index_manager.textMergeStatsSnapshot();
+        if (self.text_merge_runtime) |runtime| runtime.overlayRuntimeStats(&merge_stats);
+        return merge_stats;
     }
 
     pub fn trySnapshotTextMergeStats(self: *DB) ?types.TextMergeStats {
         if (!self.core.tryLockApplyShared()) return null;
         defer self.core.unlockApplyShared();
-        return self.core.index_manager.textMergeStatsSnapshot();
+        var merge_stats = self.core.index_manager.textMergeStatsSnapshot();
+        if (self.text_merge_runtime) |runtime| runtime.overlayRuntimeStats(&merge_stats);
+        return merge_stats;
     }
 
     pub fn snapshotPrimaryLsmWriteStatsForTest(self: *DB) ?lsm_backend_mod.Backend.WriteStats {
@@ -35101,12 +35105,14 @@ pub const DB = struct {
                 .file_backed = segment.data.isFileBacked(),
             };
         }
+        var merge_stats = self.core.index_manager.textMergeStatsSnapshotForIndex(index_name);
+        if (self.text_merge_runtime) |runtime| runtime.overlayRuntimeStats(&merge_stats);
         return .{
             .global_doc_count = text_snapshot.liveDocCount(),
             .total_bytes = total_bytes,
             .segments = segments,
             .merge_policy = index_manager_mod.defaultTextMergePolicyStats(),
-            .merge_stats = self.core.index_manager.textMergeStatsSnapshotForIndex(index_name),
+            .merge_stats = merge_stats,
         };
     }
 
@@ -41976,6 +41982,7 @@ pub const DB = struct {
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                     }
                     item.text_merge = self.core.index_manager.textMergeStatsSnapshotForIndex(item.name);
+                    if (self.text_merge_runtime) |runtime| runtime.overlayRuntimeStats(&item.text_merge);
                     if (self.derivedCoverageAppliesToIndex(.full_text, item.name))
                         try self.populateConfiguredDerivedCoverageCounts(item.name, item);
                 },
@@ -44035,6 +44042,7 @@ pub const DB = struct {
                         term_doc_freq_cache_misses += text_snapshot.term_doc_freq_cache_misses;
                     }
                     item.text_merge = self.core.index_manager.textMergeStatsSnapshotForIndex(cfg.name);
+                    if (self.text_merge_runtime) |runtime| runtime.overlayRuntimeStats(&item.text_merge);
                     // Artifact-fed full-text projections carry the same
                     // durable per-document generation outcomes as embeddings
                     // indexes; surface them so terminal failures are settled
@@ -44296,6 +44304,7 @@ pub const DB = struct {
                         indexed_doc_count = @max(indexed_doc_count orelse 0, item.doc_count);
                     }
                     item.text_merge = self.core.index_manager.textMergeStatsForIndex(cfg.name);
+                    if (self.text_merge_runtime) |runtime| runtime.overlayRuntimeStats(&item.text_merge);
                     if (self.core.textIndexEntry(cfg.name)) |entry| {
                         const rebuild_state = self.core.index_manager.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
                         if (try rebuild_state.estimateProgress(byte_range.start, byte_range.end, alloc)) |progress| {
@@ -44569,6 +44578,7 @@ pub const DB = struct {
             item.repair_degraded = item.repair_degraded or !index_repair_summary.ready or item.repair_issue_count != 0;
             if (cfg.kind == .full_text) {
                 item.text_merge = self.core.index_manager.textMergeStatsSnapshotForIndex(cfg.name);
+                if (self.text_merge_runtime) |runtime| runtime.overlayRuntimeStats(&item.text_merge);
             }
             if (item.load_error != null) applyTerminalLoadFailureStatus(&item);
             any_index_repair_degraded = any_index_repair_degraded or item.repair_degraded;

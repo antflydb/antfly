@@ -3217,6 +3217,7 @@ fn writeTextMergeMetrics(writer: *std.Io.Writer, stats: antfly.db.types.TextMerg
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_quarantined_segments", "gauge", "Cached write full-text source segments currently quarantined after failure", stats.quarantined_segments);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_retry_after_ns", "gauge", "Latest monotonic retry-after timestamp for cached write full-text merge work", stats.retry_after_ns);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_deferred_for_pressure_total", "counter", "Cached write full-text merge attempts deferred for resource pressure", stats.deferred_for_pressure);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_forced_drains_total", "counter", "Cached write full-text merges force-drained after the tiered policy found nothing to merge", stats.forced_drains);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_backpressure_events_total", "counter", "Cached write full-text merge backpressure events", stats.backpressure_events);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_backpressure_ns_total", "counter", "Nanoseconds spent under full-text merge backpressure", stats.backpressure_ns);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_backpressure_timeouts_total", "counter", "Full-text merge backpressure deadlines reached", stats.backpressure_timeouts);
