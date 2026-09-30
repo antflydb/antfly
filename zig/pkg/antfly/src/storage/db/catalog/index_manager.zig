@@ -15592,7 +15592,7 @@ pub const IndexManager = struct {
         // Use the publication predicate, including implicit full-text chunk
         // routing. A failed dependency inspection must conservatively schedule
         // replay, which will surface the error, never silently skip a delete.
-        return textIndexShouldConsumeDoc(self, entry, key) catch true;
+        return textIndexShouldRetireDeletedDoc(self, entry, key) catch true;
     }
 
     pub fn textIndexIsChunkBacked(self: *const IndexManager, alloc: Allocator, name: ?[]const u8) !bool {
@@ -17639,6 +17639,23 @@ pub const IndexManager = struct {
         defer entry.unlockAnalysisShared();
         if (entry.projection_revision != context.projection_revision) return error.IndexNotFound;
         return try textIndexShouldConsumeDoc(self, entry, key);
+    }
+
+    /// Like textPublicationContextConsumesKeyAssumeCatalogLocked, for a key
+    /// being deleted: also retires members of chunk artifacts that no longer
+    /// route into the index.
+    pub fn textPublicationContextRetiresDeletedKeyAssumeCatalogLocked(
+        self: *IndexManager,
+        index_name: []const u8,
+        context: TextPublicationContext,
+        key: []const u8,
+    ) !bool {
+        const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
+        if (entry.instance_id != context.instance_id) return error.IndexNotFound;
+        entry.lockAnalysisShared();
+        defer entry.unlockAnalysisShared();
+        if (entry.projection_revision != context.projection_revision) return error.IndexNotFound;
+        return try textIndexShouldRetireDeletedDoc(self, entry, key);
     }
 
     /// Plan the natural segment fan-out before producer admission. Projection
@@ -30027,6 +30044,18 @@ fn textIndexShouldConsumeDoc(self: *const IndexManager, entry: *const IndexManag
     if (!internal_keys.isInternalUserKey(key) and docstore_mod.KeyEncoder.parseEdgeKey(key) == null) return true;
     if (!internal_keys.isChunkArtifactRecordKey(key)) return false;
     return try self.textIndexIsChunkBacked(self.alloc, entry.config.name);
+}
+
+fn textIndexShouldRetireDeletedDoc(self: *const IndexManager, entry: *const IndexManager.TextIndex, key: []const u8) !bool {
+    if (try textIndexShouldConsumeDoc(self, entry, key)) return true;
+    // A chunk artifact whose enrichment was deleted no longer routes into the
+    // default index, but members it published earlier may still be posted
+    // there. Deleting its rows must also retire those postings; retiring an
+    // absent member is a no-op.
+    if (entry.chunk_name != null or entry.source_artifact_names.len > 0) return false;
+    if (!internal_keys.isChunkArtifactRecordKey(key)) return false;
+    const chunk_name = (try internal_keys.artifactNameView(key)) orelse return true;
+    return self.getEnrichment(.chunk, chunk_name) == null;
 }
 
 fn visibleBaseDocumentRowKey(self: *const IndexManager, key: []const u8) bool {

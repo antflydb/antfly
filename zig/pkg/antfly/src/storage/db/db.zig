@@ -53363,7 +53363,7 @@ fn computeDocumentExtractionAssetRequestDerived(
         const unit_unchanged = std.mem.eql(u8, unit_descriptor.key, unit_key) and
             unitDescriptorFingerprintMatches(previous_state.unit_descriptors, unit_key, unit_descriptor.fingerprint);
         if (unit_unchanged and
-            try documentUnitCanSkipLocalWrites(alloc, db, request.doc_key, artifact_name, unit_key, unit, text_indexes))
+            try documentUnitCanSkipLocalWrites(alloc, db, request.doc_key, artifact_name, unit_key, unit_descriptor.fingerprint, unit, desired_chunk_keys.items, chunk_range_base_index, previous_child_ranges))
         {
             if (force_reprocess) {
                 const payload = try documentUnitPayloadAlloc(alloc, request.doc_key, artifact_name, unit, unit_descriptor.fingerprint, source_url, extraction.content_type, unit_route);
@@ -54323,20 +54323,27 @@ fn storeKeyExists(alloc: Allocator, db: *DB, key: []const u8) !bool {
         error.NotFound => return false,
         else => return err,
     };
-    if (value) |owned| alloc.free(owned);
+    const owned = value orelse return false;
+    alloc.free(owned);
     return true;
 }
 
+/// A unit may skip its local writes only when every chunk the current chunk
+/// enrichments would produce is already stored byte-for-byte. Key existence
+/// alone is not enough: after a chunker config change the old chunk ids can
+/// still exist while holding the previous configuration's text.
 fn documentUnitCanSkipLocalWrites(
     alloc: Allocator,
     db: *DB,
     doc_key: []const u8,
     source_artifact_name: []const u8,
     unit_key: []const u8,
+    unit_fingerprint: []const u8,
     unit: document_extraction_mod.Unit,
-    unit_text_indexes: []const []const u8,
+    desired_chunk_keys: []const []const u8,
+    chunk_range_base_index: usize,
+    previous_child_ranges: []const types.DocumentArtifactChildRange,
 ) !bool {
-    _ = unit_text_indexes;
     if (!(try storeKeyExists(alloc, db, unit_key))) return false;
 
     for (db.core.index_manager.enrichments.items) |entry| {
@@ -54350,11 +54357,23 @@ fn documentUnitCanSkipLocalWrites(
         defer chunker_mod.freeChunks(alloc, chunks);
         document_extraction_mod.applyTranscriptTiming(unit, chunks);
 
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const scratch = arena_state.allocator();
+
         for (chunks) |chunk| {
             if (!chunk.isText()) continue;
-            const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id));
-            defer alloc.free(chunk_key);
-            if (!(try storeKeyExists(alloc, db, chunk_key))) return false;
+            defer _ = arena_state.reset(.retain_capacity);
+            const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(scratch, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id));
+            const chunk_key_index = documentExtractionKeyIndex(desired_chunk_keys, chunk_key) orelse return false;
+            const stored = (db.core.getStoreValue(scratch, chunk_key) catch |err| switch (err) {
+                error.NotFound => return false,
+                else => return err,
+            }) orelse return false;
+            const chunk_range_id = try documentExtractionRangeIdAlloc(scratch, chunk_range_base_index + (chunk_key_index / document_extraction_range_target_children));
+            const chunk_route = documentExtractionRangeRoute(previous_child_ranges, chunk_range_id, "chunk", "derived_chunks");
+            const expected = try buildDocumentUnitChunkPayloadAlloc(scratch, doc_key, unit_key, unit_fingerprint, entry.name, source_artifact_name, entry.source_field, unit, chunk, true, chunk_route);
+            if (!std.mem.eql(u8, stored, expected)) return false;
             if (!(try documentUnitChunkEmbeddingArtifactsPresent(alloc, db, chunk_key, entry.name))) return false;
         }
     }
@@ -70758,7 +70777,7 @@ fn collectTextReplayDeleteKeys(
     defer seen.deinit(alloc);
 
     for (batch.deleted_keys) |key| {
-        if (!try index_manager.textPublicationContextConsumesKeyAssumeCatalogLocked(index_name, publication_context, key)) continue;
+        if (!try index_manager.textPublicationContextRetiresDeletedKeyAssumeCatalogLocked(index_name, publication_context, key)) continue;
         try appendUniqueBorrowedKeyWithSet(alloc, &keys, &seen, key);
     }
     for (batch.overwritten_doc_keys) |key| {
@@ -105276,6 +105295,118 @@ test "db document extraction changed version updates large chunked source docume
     });
     defer first_result.deinit();
     try std.testing.expectEqual(@as(u32, 0), first_result.total_hits);
+}
+
+fn testChunkArtifactCount(alloc: Allocator, db: *DB, doc_key: []const u8, chunk_name: []const u8) !usize {
+    const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "chunk", chunk_name);
+    defer alloc.free(chunk_prefix);
+    const artifacts = try db.core.store.scanPrefix(alloc, chunk_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, artifacts);
+    var count: usize = 0;
+    for (artifacts) |artifact| {
+        if (internal_keys.isChunkArtifactRecordKey(artifact.key)) count += 1;
+    }
+    return count;
+}
+
+fn testDefaultTextHitCount(alloc: Allocator, db: *DB, term: []const u8) !u32 {
+    var result = try db.search(alloc, .{
+        .index_name = "ft_default",
+        .full_text = .{ .match = .{ .field = "text", .text = term } },
+        .return_mode = .chunk,
+    });
+    defer result.deinit();
+    return result.total_hits;
+}
+
+// Chunk artifacts routed into the default full-text index must follow their
+// enrichment's lifecycle: a chunker config change rechunks on reprocess
+// (issue 927), a newly registered chunk artifact materializes without wedging
+// full-text replay (issue 928), and a deleted one has its members retired
+// from the index when reprocess purges its rows (issue 929).
+test "db document extraction chunk enrichment lifecycle rechunks adds and retires chunk artifacts" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 64,
+        .chunk_overlap = 0,
+        .full_text_index = true,
+    });
+    try db.addIndex(.{ .name = "ft_default", .kind = .full_text, .config_json = "{}" });
+
+    var url = std.ArrayListUnmanaged(u8).empty;
+    defer url.deinit(alloc);
+    try url.appendSlice(alloc, "data:text/plain,");
+    for (0..40) |i| {
+        const word = try std.fmt.allocPrint(alloc, "harbor{d}%20ledger%20window%20", .{i});
+        defer alloc.free(word);
+        try url.appendSlice(alloc, word);
+    }
+    try url.appendSlice(alloc, "zygomorphic");
+    const doc_value = try std.fmt.allocPrint(alloc, "{{\"url\":\"{s}\"}}", .{url.items});
+    defer alloc.free(doc_value);
+
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = doc_value }}, .sync_level = .full_index });
+    try db.runUntilIdle();
+    const small_chunks = try testChunkArtifactCount(alloc, &db, "doc:a", "document_chunks_v1");
+    try std.testing.expect(small_chunks > 4);
+    try std.testing.expectEqual(@as(u32, 1), try testDefaultTextHitCount(alloc, &db, "zygomorphic"));
+
+    // Growing the chunk size keeps the old chunk ids 0..n but must replace
+    // their text, so the tail term moves into the new last chunk.
+    _ = try db.upsertEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 4096,
+        .chunk_overlap = 0,
+        .full_text_index = true,
+    });
+    try std.testing.expect(try db.reprocessDocumentArtifact(alloc, "doc:a", "document_units_v1"));
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 1), try testChunkArtifactCount(alloc, &db, "doc:a", "document_chunks_v1"));
+    try std.testing.expectEqual(@as(u32, 1), try testDefaultTextHitCount(alloc, &db, "zygomorphic"));
+    try std.testing.expectEqual(@as(u32, 1), try testDefaultTextHitCount(alloc, &db, "harbor0"));
+
+    try db.addEnrichment(.{
+        .name = "document_chunks_v2",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 4096,
+        .chunk_overlap = 0,
+        .full_text_index = true,
+    });
+    try std.testing.expect(try db.reprocessDocumentArtifact(alloc, "doc:a", "document_units_v1"));
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 1), try testChunkArtifactCount(alloc, &db, "doc:a", "document_chunks_v2"));
+    try std.testing.expectEqual(@as(u32, 2), try testDefaultTextHitCount(alloc, &db, "zygomorphic"));
+
+    try std.testing.expect(try db.deleteEnrichment(.chunk, "document_chunks_v2"));
+    try std.testing.expect(try db.reprocessDocumentArtifact(alloc, "doc:a", "document_units_v1"));
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 0), try testChunkArtifactCount(alloc, &db, "doc:a", "document_chunks_v2"));
+    try std.testing.expectEqual(@as(u32, 1), try testDefaultTextHitCount(alloc, &db, "zygomorphic"));
 }
 
 test "db document extraction update recovers corrupt previous extraction state" {
