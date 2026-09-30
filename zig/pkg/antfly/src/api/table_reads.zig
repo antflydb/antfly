@@ -3103,30 +3103,42 @@ pub const BoundTableReadSource = struct {
             for (expansions[0..initialized]) |*expansion| expansion.deinit(alloc);
             alloc.free(expansions);
         }
+        var remaining_scans: usize = req.max_scanned_rows;
         for (req.frontier, 0..) |item, i| {
-            const search_req = try distributed_graph.frontierItemToSearchRequest(alloc, req, item);
+            if (remaining_scans == 0) return error.GraphExploredEdgesBudgetExceeded;
+            var item_scanned: usize = 0;
+            var scoped = req;
+            scoped.max_scanned_rows = @intCast(remaining_scans);
+            scoped.physical_scan_observation = &item_scanned;
+            const search_req = try distributed_graph.frontierItemToSearchRequest(alloc, scoped, item);
             defer distributed_graph.freeExpandSearchRequest(alloc, search_req);
 
+            const frontier_key = try alloc.dupe(u8, item.key);
+            errdefer alloc.free(frontier_key);
+            var graph_result = graph_result_blk: {
+                var result = try self.reads.searchWithConsistency(alloc, self.db, search_req, consistency);
+                defer result.deinit();
+                var graph_result = if (result.graph_results.len > 0)
+                    try distributed_graph.filterGraphSearchResult(alloc, table_name, result.graph_results[0], req.exclude_nodes, req.exclude_edges)
+                else
+                    try distributed_graph.emptyGraphSearchResult(alloc, req.name);
+                for (graph_result.hits) |*hit| hit.deinit(alloc);
+                if (graph_result.hits.len > 0) alloc.free(graph_result.hits);
+                graph_result.hits = @constCast((&[_]db_mod.types.SearchHit{})[0..]);
+                break :graph_result_blk graph_result;
+            };
+            errdefer graph_result.deinit(alloc);
+            if (item_scanned > remaining_scans) return error.InvalidGraphExpandResponse;
             expansions[i] = .{
                 .frontier_id = item.id,
-                .frontier_key = try alloc.dupe(u8, item.key),
-                .graph_result = graph_result_blk: {
-                    var result = try self.reads.searchWithConsistency(alloc, self.db, search_req, consistency);
-                    defer result.deinit();
-                    var graph_result = if (result.graph_results.len > 0)
-                        try distributed_graph.filterGraphSearchResult(alloc, table_name, result.graph_results[0], req.exclude_nodes, req.exclude_edges)
-                    else
-                        try distributed_graph.emptyGraphSearchResult(alloc, req.name);
-                    for (graph_result.hits) |*hit| hit.deinit(alloc);
-                    if (graph_result.hits.len > 0) alloc.free(graph_result.hits);
-                    graph_result.hits = @constCast((&[_]db_mod.types.SearchHit{})[0..]);
-                    break :graph_result_blk graph_result;
-                },
+                .frontier_key = frontier_key,
+                .graph_result = graph_result,
             };
             initialized += 1;
+            remaining_scans -= item_scanned;
         }
 
-        return .{ .expansions = expansions };
+        return .{ .expansions = expansions, .scanned_rows = @intCast(req.max_scanned_rows - remaining_scans) };
     }
 
     fn graphHydrateGroupLocal(
@@ -3164,15 +3176,17 @@ pub const BoundTableReadSource = struct {
         if (req.topology_epoch != 0) return error.TopologyChanged;
         try distributed_graph.validateGraphEdgesTensorAccessPath(alloc, req);
         const graph_entry = self.db.core.graphIndex(req.index_name) orelse return error.IndexNotFound;
-        const edges = try graph_entry.index.getEdgesByTypesBounded(
+        const result = try graph_entry.index.getEdgesByTypesBoundedWithStatsAt(
             alloc,
             req.key,
             req.edge_types,
             req.direction,
             req.max_edges,
             req.max_owned_bytes,
+            req.max_scanned_rows,
+            if (req.ttl_now_ns != 0) req.ttl_now_ns else platform_time.realtimeNs(),
         );
-        return .{ .edges = edges };
+        return .{ .edges = result.edges, .scanned_rows = @intCast(result.scanned_rows) };
     }
 };
 
@@ -4798,6 +4812,7 @@ pub const ProvisionedTableReadSource = struct {
             var hosted = self.routedHostedSource();
             return HostedProvisionedTableReadSource.query(&hosted, alloc, table_name, req, consistency);
         }
+        const timed_req = graphTimedSearchRequest(req);
         // Graph retries re-run the base scan and every shard fanout. Keep one
         // fresh topology retry, matching the hosted path, instead of applying
         // the generic point-read retry multiplier to expensive graph work.
@@ -4805,7 +4820,7 @@ pub const ProvisionedTableReadSource = struct {
         var attempt: usize = 0;
         while (attempt < attempt_limit) : (attempt += 1) {
             checkQueryDeadline(req) catch |err| return err;
-            return self.queryAttempt(alloc, table_name, req, consistency) catch |err| switch (err) {
+            return self.queryAttempt(alloc, table_name, timed_req, consistency) catch |err| switch (err) {
                 error.TopologyChanged => if (attempt + 1 < attempt_limit) continue else return err,
                 error.ResidentDbRetryRequired => if (attempt + 1 < attempt_limit) continue else return error.StorageReadTemporarilyUnavailable,
                 else => return err,
@@ -7273,6 +7288,7 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         const hosted: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const timed_req = graphTimedSearchRequest(req);
         // A graph retry re-runs its base scan and every shard fanout. Keep the
         // public retry budget to one fresh topology snapshot so churn cannot
         // amplify an expensive query up to the generic point-read limit.
@@ -7280,7 +7296,7 @@ pub const HostedProvisionedTableReadSource = struct {
         var attempt: usize = 0;
         while (attempt < attempt_limit) : (attempt += 1) {
             checkQueryDeadline(req) catch |err| return err;
-            return hosted.queryAttempt(alloc, table_name, req, consistency) catch |err| switch (err) {
+            return hosted.queryAttempt(alloc, table_name, timed_req, consistency) catch |err| switch (err) {
                 error.TopologyChanged => if (attempt + 1 < attempt_limit) continue else return err,
                 else => return err,
             };
@@ -7972,29 +7988,41 @@ pub const HostedProvisionedTableReadSource = struct {
             for (expansions[0..initialized]) |*expansion| expansion.deinit(alloc);
             alloc.free(expansions);
         }
+        var remaining_scans: usize = req.max_scanned_rows;
         for (req.frontier, 0..) |item, i| {
-            const search_req = try distributed_graph.frontierItemToSearchRequest(alloc, req, item);
+            if (remaining_scans == 0) return error.GraphExploredEdgesBudgetExceeded;
+            var item_scanned: usize = 0;
+            var scoped = req;
+            scoped.max_scanned_rows = @intCast(remaining_scans);
+            scoped.physical_scan_observation = &item_scanned;
+            const search_req = try distributed_graph.frontierItemToSearchRequest(alloc, scoped, item);
             defer distributed_graph.freeExpandSearchRequest(alloc, search_req);
 
+            const frontier_key = try alloc.dupe(u8, item.key);
+            errdefer alloc.free(frontier_key);
+            var graph_result = graph_blk: {
+                var result = try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.read_safety_barrier, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, search_req, consistency, false);
+                defer result.deinit();
+                var graph_result = if (result.graph_results.len > 0)
+                    try distributed_graph.filterGraphSearchResult(alloc, table_name, result.graph_results[0], req.exclude_nodes, req.exclude_edges)
+                else
+                    try distributed_graph.emptyGraphSearchResult(alloc, req.name);
+                for (graph_result.hits) |*hit| hit.deinit(alloc);
+                if (graph_result.hits.len > 0) alloc.free(graph_result.hits);
+                graph_result.hits = @constCast((&[_]db_mod.types.SearchHit{})[0..]);
+                break :graph_blk graph_result;
+            };
+            errdefer graph_result.deinit(alloc);
+            if (item_scanned > remaining_scans) return error.InvalidGraphExpandResponse;
             expansions[i] = .{
                 .frontier_id = item.id,
-                .frontier_key = try alloc.dupe(u8, item.key),
-                .graph_result = graph_blk: {
-                    var result = try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.read_safety_barrier, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, search_req, consistency, false);
-                    defer result.deinit();
-                    var graph_result = if (result.graph_results.len > 0)
-                        try distributed_graph.filterGraphSearchResult(alloc, table_name, result.graph_results[0], req.exclude_nodes, req.exclude_edges)
-                    else
-                        try distributed_graph.emptyGraphSearchResult(alloc, req.name);
-                    for (graph_result.hits) |*hit| hit.deinit(alloc);
-                    if (graph_result.hits.len > 0) alloc.free(graph_result.hits);
-                    graph_result.hits = @constCast((&[_]db_mod.types.SearchHit{})[0..]);
-                    break :graph_blk graph_result;
-                },
+                .frontier_key = frontier_key,
+                .graph_result = graph_result,
             };
             initialized += 1;
+            remaining_scans -= item_scanned;
         }
-        return .{ .expansions = expansions };
+        return .{ .expansions = expansions, .scanned_rows = @intCast(req.max_scanned_rows - remaining_scans) };
     }
 
     fn graphHydrateGroupLocal(
@@ -9173,6 +9201,13 @@ const graphHydrateRequestHasResolvedDocFilter = local_query_contract.graphHydrat
 /// edges are document-owned rows in the same index) and canonicalize
 /// self-table target tags. Multi-group and non-graph requests pass through
 /// untouched; coordinator-routed requests never reach this helper.
+fn graphTimedSearchRequest(req: db_mod.types.SearchRequest) db_mod.types.SearchRequest {
+    if (req.graph_queries.len == 0 or req.graph_ttl_now_ns != 0) return req;
+    var timed = req;
+    timed.graph_ttl_now_ns = platform_time.realtimeNs();
+    return timed;
+}
+
 fn graphScopedSearchRequest(
     req: db_mod.types.SearchRequest,
     group_count: usize,
@@ -9182,6 +9217,7 @@ fn graphScopedSearchRequest(
     var scoped = req;
     scoped.graph_owning_table = table_name;
     scoped.graph_index_complete_snapshot = true;
+    if (scoped.graph_ttl_now_ns == 0) scoped.graph_ttl_now_ns = platform_time.realtimeNs();
     return scoped;
 }
 
@@ -9344,18 +9380,24 @@ fn graphHydrateOnPreparedDb(
         for (hits) |*hit| hit.deinit(alloc);
         if (hits.len > 0) alloc.free(hits);
     }
+    const incoming = if (req.incoming_index_name.len > 0)
+        try db.graphHasIncomingEdgesForInternalReadBoundedAt(
+            alloc,
+            req.incoming_index_name,
+            req.keys,
+            .{ .generation = req.incoming_index_identity.incarnation, .config_fingerprint = req.incoming_index_identity.config_hash },
+            req.identity_read_generation,
+            req.incoming_ttl_now_ns,
+            @min(req.incoming_max_scanned_rows, graph_pattern_mod.default_max_explored_edges),
+        )
+    else
+        null;
     return .{
         .hits = hits,
-        .has_incoming = if (req.incoming_index_name.len > 0)
-            try db.graphHasIncomingEdgesForInternalRead(
-                alloc,
-                req.incoming_index_name,
-                req.keys,
-                .{ .generation = req.incoming_index_identity.incarnation, .config_fingerprint = req.incoming_index_identity.config_hash },
-                req.identity_read_generation,
-            )
-        else
-            @constCast((&[_]bool{})[0..]),
+        .has_incoming = if (incoming) |probe| probe.has_incoming else @constCast((&[_]bool{})[0..]),
+        .has_physical_incoming = if (incoming) |probe| probe.has_physical_incoming else @constCast((&[_]bool{})[0..]),
+        .incoming_ttl_now_ns = if (incoming != null) req.incoming_ttl_now_ns else null,
+        .incoming_scanned_rows = if (incoming) |probe| @intCast(probe.scanned_rows) else null,
         .incoming_index_identity = req.incoming_index_identity,
     };
 }
@@ -10884,8 +10926,14 @@ fn executeProvisionedGraphExpandAttempt(
         alloc.free(expansions);
     }
 
+    var remaining_scans: usize = req.max_scanned_rows;
     for (req.frontier, 0..) |item, i| {
-        const search_req = try distributed_graph.frontierItemToSearchRequest(alloc, req, item);
+        if (remaining_scans == 0) return error.GraphExploredEdgesBudgetExceeded;
+        var item_scanned: usize = 0;
+        var scoped = req;
+        scoped.max_scanned_rows = @intCast(remaining_scans);
+        scoped.physical_scan_observation = &item_scanned;
+        const search_req = try distributed_graph.frontierItemToSearchRequest(alloc, scoped, item);
         defer distributed_graph.freeExpandSearchRequest(alloc, search_req);
         const frontier_key = try alloc.dupe(u8, item.key);
         errdefer alloc.free(frontier_key);
@@ -10902,14 +10950,16 @@ fn executeProvisionedGraphExpandAttempt(
             break :graph_result_blk filtered;
         };
         errdefer graph_result.deinit(alloc);
+        if (item_scanned > remaining_scans) return error.InvalidGraphExpandResponse;
         expansions[i] = .{
             .frontier_id = item.id,
             .frontier_key = frontier_key,
             .graph_result = graph_result,
         };
+        remaining_scans -= item_scanned;
         initialized += 1;
     }
-    return .{ .expansions = expansions };
+    return .{ .expansions = expansions, .scanned_rows = @intCast(req.max_scanned_rows - remaining_scans) };
 }
 
 fn executeProvisionedGraphHydrate(
@@ -11137,14 +11187,18 @@ fn executeProvisionedGraphGetEdgesAttempt(
     defer db_owner.deinit();
     _ = try currentIdentityReadGenerationForDb(req.identity_read_generation, db_owner.db());
     const graph_entry = db_owner.db().core.graphIndex(req.index_name) orelse return error.IndexNotFound;
-    return .{ .edges = try graph_entry.index.getEdgesByTypesBounded(
+    const ttl_now_ns = if (req.ttl_now_ns != 0) req.ttl_now_ns else platform_time.realtimeNs();
+    const result = try graph_entry.index.getEdgesByTypesBoundedWithStatsAt(
         alloc,
         req.key,
         req.edge_types,
         req.direction,
         req.max_edges,
         req.max_owned_bytes,
-    ) };
+        req.max_scanned_rows,
+        ttl_now_ns,
+    );
+    return .{ .edges = result.edges, .scanned_rows = @intCast(result.scanned_rows) };
 }
 
 fn executeHostedGraphGetEdges(
@@ -11190,15 +11244,17 @@ fn graphGetEdgesLocal(
     try reads.reads.prepareLookupWithConsistency(group_id, req.key, .{}, consistency);
 
     const graph_entry = db.core.graphIndex(req.index_name) orelse return error.IndexNotFound;
-    const edges = try graph_entry.index.getEdgesByTypesBounded(
+    const result = try graph_entry.index.getEdgesByTypesBoundedWithStatsAt(
         alloc,
         req.key,
         req.edge_types,
         req.direction,
         req.max_edges,
         req.max_owned_bytes,
+        req.max_scanned_rows,
+        if (req.ttl_now_ns != 0) req.ttl_now_ns else platform_time.realtimeNs(),
     );
-    return .{ .edges = edges };
+    return .{ .edges = result.edges, .scanned_rows = @intCast(result.scanned_rows) };
 }
 
 fn lookupLocal(
@@ -15893,16 +15949,70 @@ fn graphExpandRemote(
         http_common.RequestCancellation.fromToken(token)
     else
         null;
-    var result = try client.fetchGroupGraphExpandWithControl(
+    var result = client.fetchGroupGraphExpandWithControl(
         base_uri,
         group_id,
         table_name,
         body,
         req.timeout_ms,
         if (cancellation != null) &cancellation.? else null,
-    );
+    ) catch |err| blk: {
+        if (err != error.InvalidGraphExpandWireRequest or !req.allow_legacy_wire_fallback) return err;
+        // The older endpoint cannot enforce a smaller per-shard scan limit.
+        // Only retry when the whole default ceiling fits the remaining budget.
+        const legacy_body = try distributed_graph.encodeLegacyGraphExpandRequest(alloc, req);
+        defer alloc.free(legacy_body);
+        break :blk try client.fetchGroupGraphExpandWithControl(
+            base_uri,
+            group_id,
+            table_name,
+            legacy_body,
+            req.timeout_ms,
+            if (cancellation != null) &cancellation.? else null,
+        );
+    };
     defer result.deinit(alloc);
     return try distributed_graph.parseGraphExpandResponse(alloc, result.body);
+}
+
+test "graph expand remote retries legacy wire only with a full scan ceiling" {
+    const alloc = std.testing.allocator;
+    const LegacyWorker = struct {
+        calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const modern = std.mem.indexOf(u8, request.body, "\"max_scanned_rows\"") != null;
+            return .{
+                .status = if (modern) 400 else 200,
+                .body = try a.dupe(u8, if (modern) "invalid graph expand request" else "{\"expansions\":[]}"),
+            };
+        }
+    };
+    var worker = LegacyWorker{};
+    var req = distributed_graph.GraphExpandRequest{
+        .name = try alloc.dupe(u8, "walk"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .frontier = @constCast((&[_]distributed_graph.GraphFrontierItem{})[0..]),
+        .exclude_nodes = @constCast((&[_]distributed_graph.GraphNodeIdentity{})[0..]),
+        .exclude_edges = @constCast((&[_][]u8{})[0..]),
+        .params = .{},
+        .allow_legacy_wire_fallback = true,
+    };
+    defer req.deinit(alloc);
+    var response = try graphExpandRemote(worker.executor(), alloc, "http://example.test", 7, "docs", req);
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), worker.calls);
+    try std.testing.expectEqual(@as(u32, @intCast(graph_pattern_mod.default_max_explored_edges)), response.scanned_rows);
+
+    req.max_scanned_rows -= 1;
+    try std.testing.expectError(error.GraphExploredEdgesBudgetExceeded, graphExpandRemote(worker.executor(), alloc, "http://example.test", 7, "docs", req));
+    try std.testing.expectEqual(@as(usize, 3), worker.calls);
 }
 
 fn graphHydrateRemote(
@@ -15920,14 +16030,26 @@ fn graphHydrateRemote(
         http_common.RequestCancellation.fromToken(token)
     else
         null;
-    var result = try client.fetchGroupGraphHydrateWithControl(
+    var result = client.fetchGroupGraphHydrateWithControl(
         base_uri,
         group_id,
         table_name,
         body,
         req.timeout_ms,
         if (cancellation != null) &cancellation.? else null,
-    );
+    ) catch |err| blk: {
+        if (err != error.InvalidGraphHydrateWireRequest or req.metric_reads.len != 0 or req.metric_index_name.len != 0) return err;
+        const legacy_body = try distributed_graph.encodeLegacyGraphHydrateRequest(alloc, req);
+        defer alloc.free(legacy_body);
+        break :blk try client.fetchGroupGraphHydrateWithControl(
+            base_uri,
+            group_id,
+            table_name,
+            legacy_body,
+            req.timeout_ms,
+            if (cancellation != null) &cancellation.? else null,
+        );
+    };
     defer result.deinit(alloc);
     return try distributed_graph.parseGraphHydrateResponse(alloc, result.body);
 }
@@ -15947,16 +16069,83 @@ fn graphEdgesRemote(
         http_common.RequestCancellation.fromToken(token)
     else
         null;
-    var result = try client.fetchGroupGraphEdgesWithControl(
+    var result = client.fetchGroupGraphEdgesWithControl(
         base_uri,
         group_id,
         table_name,
         body,
         req.timeout_ms,
         if (cancellation != null) &cancellation.? else null,
-    );
+    ) catch |err| blk: {
+        if (err != error.InvalidGraphEdgesWireRequest or !req.allow_legacy_wire_fallback) return err;
+        const legacy_body = try distributed_graph.encodeLegacyGraphEdgesRequest(alloc, req);
+        defer alloc.free(legacy_body);
+        break :blk try client.fetchGroupGraphEdgesWithControl(
+            base_uri,
+            group_id,
+            table_name,
+            legacy_body,
+            req.timeout_ms,
+            if (cancellation != null) &cancellation.? else null,
+        );
+    };
     defer result.deinit(alloc);
     return try distributed_graph.parseGraphEdgesResponse(alloc, result.body);
+}
+
+test "graph hydrate and edges remote retry legacy wire safely" {
+    const alloc = std.testing.allocator;
+    const LegacyWorker = struct {
+        calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const edges = std.mem.endsWith(u8, request.uri, "/graph-edges");
+            const modern = if (edges)
+                std.mem.indexOf(u8, request.body, "\"max_scanned_rows\"") != null
+            else
+                std.mem.indexOf(u8, request.body, "\"metric_reads\"") != null;
+            return .{
+                .status = if (modern) 400 else 200,
+                .body = try a.dupe(u8, if (modern) "invalid request" else if (edges) "{\"edges\":[]}" else "{\"hits\":[]}"),
+            };
+        }
+    };
+    var worker = LegacyWorker{};
+    var hydrate = distributed_graph.GraphHydrateRequest{ .keys = try alloc.alloc([]u8, 0) };
+    defer hydrate.deinit(alloc);
+    var hydrated = try graphHydrateRemote(worker.executor(), alloc, "http://example.test", 7, "docs", hydrate);
+    defer hydrated.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), worker.calls);
+
+    const path = algebraic_ir.graphEdgeAccessPath("graph_v1");
+    var edges_req = distributed_graph.GraphEdgesRequest{
+        .index_name = try alloc.dupe(u8, "graph_v1"),
+        .key = try alloc.dupe(u8, "doc:a"),
+        .direction = .out,
+        .tensor_access_path = .{
+            .owner = try alloc.dupe(u8, path.owner),
+            .layout = path.layout,
+            .fragments = try alloc.dupe(algebraic_ir.TensorFragment, path.fragments),
+            .output_dims = try alloc.dupe(algebraic_ir.Dimension, path.output_dims),
+            .law_ids = try alloc.dupe(algebraic_law.Id, path.law_ids),
+        },
+        .tensor_program = try distributed_graph.graphEdgesTensorProgramEnvelopeAlloc(alloc, "graph_v1"),
+        .allow_legacy_wire_fallback = true,
+    };
+    defer edges_req.deinit(alloc);
+    var edges = try graphEdgesRemote(worker.executor(), alloc, "http://example.test", 7, "docs", edges_req);
+    defer edges.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 4), worker.calls);
+    try std.testing.expectEqual(@as(u32, graph_pattern_mod.default_max_explored_edges), edges.scanned_rows);
+    edges_req.max_scanned_rows -= 1;
+    try std.testing.expectError(error.GraphExploredEdgesBudgetExceeded, graphEdgesRemote(worker.executor(), alloc, "http://example.test", 7, "docs", edges_req));
+    try std.testing.expectEqual(@as(usize, 5), worker.calls);
 }
 
 fn encodeLookupFields(alloc: std.mem.Allocator, opts: db_mod.types.LookupOptions) !?[]u8 {
@@ -26133,6 +26322,9 @@ fn consumerTests() type {
             const scoped = graphScopedSearchRequest(req, 1, "docs");
             try std.testing.expect(scoped.graph_index_complete_snapshot);
             try std.testing.expectEqualStrings("docs", scoped.graph_owning_table);
+            try std.testing.expect(scoped.graph_ttl_now_ns != 0);
+            const pinned = graphTimedSearchRequest(req);
+            try std.testing.expectEqual(pinned.graph_ttl_now_ns, graphTimedSearchRequest(pinned).graph_ttl_now_ns);
 
             // A multi-group table cannot claim snapshot completeness, and a
             // request without graph queries has no scope to carry.

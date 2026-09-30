@@ -4967,11 +4967,12 @@ fn graphArtifactValueFromPortableEdgeValueAlloc(alloc: Allocator, value: []const
         if (header.kind == .graph_edge) {
             var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, value);
             defer decoded.deinit(alloc);
-            return try enrichment_artifact_codec.encodePortableUnboundGraphEdgeAlloc(
+            return try enrichment_artifact_codec.encodePortableUnboundGraphEdgeWithTtlAlloc(
                 alloc,
                 decoded.weight,
                 decoded.created_at,
                 decoded.updated_at,
+                decoded.ttl_created_ns,
                 decoded.metadata_json,
             );
         }

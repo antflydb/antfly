@@ -2258,6 +2258,11 @@ pub extern fn antfly_storage_owner_merge_artifacts_page(
     request: *const MergeArtifactsPageRequest,
     out_result: *OwnedBytes,
 ) callconv(.c) Status;
+pub extern fn antfly_storage_owner_merge_cleanup_keys_page(
+    owner: ?*anyopaque,
+    request: *const MergeArtifactsPageRequest,
+    out_result: *OwnedBytes,
+) callconv(.c) Status;
 
 /// Process-wide interactive admission state, owned by physical storage.
 /// kind: 0 = embedding, 1 = generation; delta: +1 begin, -1 end, 0 observe.

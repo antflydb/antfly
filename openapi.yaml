@@ -1734,10 +1734,17 @@ tags:
       ## Graph Indexes and Edge TTL
 
 
-      Graph indexes (`graph`) enable relationship modeling and traversal queries. Like documents, graph
-      edges
+      Graph indexes (`graph`) enable relationship modeling and traversal queries.
 
-      support automatic expiration through per-index TTL configuration.
+      Edge TTL is under development. The stateful runtime currently stamps edge
+
+      artifacts and selects live projected contributors for adjacency reads, but
+
+      authoritative cleanup, metric invalidation, and
+
+      serverless visibility are not complete. Do not rely on graph TTL in
+
+      production until those pieces are implemented.
 
 
       ### Graph Index Overview
@@ -1767,7 +1774,9 @@ tags:
       ### Edge TTL Configuration
 
 
-      Configure automatic edge expiration per graph index using `ttl_duration`:
+      Graph indexes accept an index-level `ttl.duration` policy. The legacy
+
+      `ttl_duration` field is an alias; do not specify both.
 
 
       ```json
@@ -1775,270 +1784,28 @@ tags:
       {
         "type": "graph",
         "name": "recent_interactions",
-        "ttl_duration": "7d"
+        "ttl": {"duration": "7d"}
       }
 
       ```
 
 
-      **How it works:**
+      The duration uses the same format as document TTL, such as `30s`, `5m`,
 
-      - Edges expire after the specified duration from their creation timestamp
+      `24h`, or `7d`. Each source contribution receives a server-assigned
 
-      - Background cleanup runs every 30 seconds on the Raft leader
+      creation timestamp. Stateful graph reads filter expired contributions
 
-      - Each edge has a timestamp key (`:t` suffix) tracking when it was created
+      and select the highest-priority live source when sources overlap.
 
-      - Expired edges are filtered from traversal queries immediately
 
-      - Deletions are batched (1000 edges at a time) and go through Raft consensus
+      Graph TTL is currently incomplete. There is no authoritative edge
 
+      cleanup worker, published graph metric invalidation at a deadline, or
 
-      ### Edge TTL vs Document TTL
+      serverless segment expiration filter. See `zig/GRAPH.md` for the design
 
-
-      **Document TTL** (table-level):
-
-      - Configured via the `ttl` policy in the table schema
-
-      - Applies to all documents in the table
-
-      - Uses `_timestamp` or a custom `ttl.field`
-
-
-      **Edge TTL** (index-level):
-
-      - Configured via `ttl_duration` in graph index config
-
-      - Applies only to edges in that specific graph index
-
-      - Uses edge creation timestamp (stored in `:t` key)
-
-      - Different graph indexes can have different TTL durations
-
-
-      ### Duration Format
-
-
-      Edge TTL uses the same Antfly integer-component duration format as document TTL:
-
-      - `30s` - 30 seconds
-
-      - `5m` - 5 minutes
-
-      - `24h` - 24 hours
-
-      - `7d` - 7 days (treated as 168h)
-
-
-      ### Use Cases
-
-
-      **Session Graphs:**
-
-      ```json
-
-      {
-        "type": "graph",
-        "name": "active_sessions",
-        "ttl_duration": "1h"
-      }
-
-      ```
-
-      Track active user sessions; edges expire after 1 hour of inactivity.
-
-
-      **Recent Activity Feed:**
-
-      ```json
-
-      {
-        "type": "graph",
-        "name": "recent_interactions",
-        "ttl_duration": "7d"
-      }
-
-      ```
-
-      Keep only the last week of user interactions; older edges automatically deleted.
-
-
-      **Temporary Recommendations:**
-
-      ```json
-
-      {
-        "type": "graph",
-        "name": "trending_connections",
-        "ttl_duration": "24h"
-      }
-
-      ```
-
-      Track trending content connections; refresh daily by letting old edges expire.
-
-
-      **Rate Limiting:**
-
-      ```json
-
-      {
-        "type": "graph",
-        "name": "api_calls",
-        "ttl_duration": "1h"
-      }
-
-      ```
-
-      Track API calls per user; edges expire after 1 hour for sliding window rate limiting.
-
-
-      ### Performance Characteristics
-
-
-      Edge TTL cleanup uses the same optimized approach as document TTL:
-
-
-      **Optimized Scanning:**
-
-      - Only scans edge timestamp keys (`:t` suffix)
-
-      - No document deserialization required
-
-      - O(1) per edge - just reads a timestamp
-
-      - ~100-1000x faster than scanning full edge data
-
-
-      **Query Filtering:**
-
-      - Single key lookup to check edge expiration
-
-      - Minimal latency impact on traversal queries
-
-      - Scales to millions of edges
-
-
-      **Cleanup Behavior:**
-
-      - Runs every 30 seconds (same interval as document TTL)
-
-      - Leader-only operation
-
-      - 5-second grace period for replication
-
-      - Batched deletions (1000 edges per batch)
-
-
-      ### Monitoring
-
-
-      Edge TTL operations are logged separately from document TTL:
-
-      ```
-
-      INFO  Starting edge TTL cleanup job indexes_with_ttl=3 cleanup_interval=30s
-
-      INFO  Cleaned up expired edges count=127 duration=89ms total_expired=5432
-
-      ```
-
-
-      Metrics tracked per graph index:
-
-      - Total edges expired since leader became active
-
-      - Last cleanup duration
-
-      - Scanned vs expired edge counts
-
-
-      ### Modifying Edge TTL
-
-
-      **Adding TTL to existing graph index:**
-
-      - Currently requires dropping and recreating the index
-
-      - Edges are not preserved when index is dropped
-
-      - Plan accordingly for production deployments
-
-
-      **Removing TTL:**
-
-      - Drop and recreate index without `ttl_duration`
-
-      - All edges become permanent
-
-
-      **Changing duration:**
-
-      - Drop and recreate index with new `ttl_duration`
-
-      - Existing edges are not preserved
-
-
-      ### Limitations
-
-
-      - **Per-index configuration**: Each graph index has its own TTL setting
-
-      - **Edge-level timestamps**: Uses edge creation time (not document timestamps)
-
-      - **No per-edge TTL**: All edges in a graph index share the same TTL duration
-
-      - **Index recreation required**: Cannot modify TTL on existing graph index
-
-      - **Clock synchronization**: Requires NTP for accurate expiration across cluster nodes
-
-
-      ### Best Practices
-
-
-      **Separate indexes for different TTLs:**
-
-      ```json
-
-      {
-        "indexes": {
-          "permanent_relationships": {
-            "type": "graph"
-          },
-          "recent_activity": {
-            "type": "graph",
-            "ttl_duration": "7d"
-          },
-          "realtime_events": {
-            "type": "graph",
-            "ttl_duration": "1h"
-          }
-        }
-      }
-
-      ```
-
-
-      Use multiple graph indexes when you need different expiration policies for different types of relationships.
-
-
-      **Monitor cleanup logs:**
-
-      - Watch for high edge counts requiring cleanup
-
-      - Adjust TTL duration if cleanup becomes a bottleneck
-
-      - Consider shorter cleanup intervals for time-sensitive use cases
-
-
-      **Test before production:**
-
-      - Verify edge expiration behavior matches expectations
-
-      - Test cleanup performance with representative edge counts
-
-      - Ensure traversal queries filter expired edges correctly
+      and current implementation status.
   - name: User
     x-displayName: User
     description: Operations related to users
@@ -26021,6 +25788,16 @@ components:
         execution:
           $ref: '#/components/schemas/IndexExecutionConfig'
           description: Non-semantic execution policy for shorthand-created chunking or embedding producers.
+    GraphTtlConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - duration
+      properties:
+        duration:
+          type: string
+          description: Expiration duration using Antfly's integer-component duration format (ns, us, ms,
+            s, m, h, d).
     GraphEdgeType:
       type: string
       minLength: 1
@@ -26772,7 +26549,16 @@ components:
       x-antfly-mutually-exclusive:
         - - sources
           - source
+        - - ttl
+          - ttl_duration
       properties:
+        ttl:
+          $ref: '#/components/schemas/GraphTtlConfig'
+          description: Creation-based edge expiration for this graph index. The duration is immutable
+            within an index incarnation.
+        ttl_duration:
+          type: string
+          description: Compatibility alias for ttl.duration. Do not specify together with ttl.
         metrics:
           type: object
           description: Named published graph metrics. Serverless supports background refresh only and

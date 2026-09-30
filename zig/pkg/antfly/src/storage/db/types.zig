@@ -472,7 +472,10 @@ pub fn validateMergeArtifacts(req: BatchRequest) !void {
     const keys = @import("../internal_keys.zig");
     for (req.merge_artifacts) |row| {
         if (!keys.isGraphEdgeArtifactKey(row.key) and !keys.isEmbeddingArtifactKey(row.key) and
-            !keys.isDerivedEmbeddingArtifactKey(row.key)) return error.InvalidBatchRequest;
+            !keys.isDerivedEmbeddingArtifactKey(row.key) and !keys.isAssetArtifactKey(row.key) and
+            !keys.isGraphGlobalEdgeContenderKey(row.key) and
+            !keys.isGraphEdgeTtlLifetimeKey(row.key) and !keys.isGraphEdgeTtlTombstoneKey(row.key))
+            return error.InvalidBatchRequest;
     }
 }
 
@@ -1815,6 +1818,9 @@ pub const SearchRequest = struct {
     /// same-snapshot single-index read (the embedded DBCore entry points'
     /// justification). Never populated by public JSON.
     graph_index_complete_snapshot: bool = false,
+    /// Trusted coordinator-selected wall time for graph contribution TTL.
+    /// Zero asks a standalone local executor to capture the time itself.
+    graph_ttl_now_ns: u64 = 0,
     query: Query = .{ .match_all = {} },
     index_name: ?[]const u8 = null,
     primary_text_index_name: ?[]const u8 = null,
@@ -1850,6 +1856,10 @@ pub const SearchRequest = struct {
     /// Trusted operator-owned graph admission ceilings. Public request parsing
     /// never reads these from JSON, and shard transport must not serialize them.
     graph_execution_limits: @import("../../graph/work_budget.zig").Limits = .{},
+    /// Internal synchronous observer for physical adjacency work. A shard
+    /// expansion RPC uses it to report rows hidden by graph TTL to its
+    /// coordinator. It is never serialized or retained beyond search().
+    graph_physical_scan_observation: ?*usize = null,
     /// Owned, validated API wire sidecar. Execution never inspects it; it is
     /// retained only for allocation-light owner proxying and response shaping.
     graph_query_transport: ?GraphQueryTransport = null,
@@ -1965,8 +1975,10 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
     "execution_deadline_ns",
     "cancellation",
     "graph_execution_limits",
+    "graph_physical_scan_observation",
     "graph_owning_table",
     "graph_index_complete_snapshot",
+    "graph_ttl_now_ns",
 };
 
 const hierarchy_children_rejected_fields = [_][]const u8{
@@ -3072,6 +3084,9 @@ pub const TTLCleanupStats = struct {
     runs: u64 = 0,
     scanned_timestamps: u64 = 0,
     deleted_docs: u64 = 0,
+    scanned_graph_candidates: u64 = 0,
+    expired_graph_sources: u64 = 0,
+    expired_graph_artifacts: u64 = 0,
     last_run_ns: u64 = 0,
     error_count: u64 = 0,
     lease_acquire_failures: u64 = 0,

@@ -5227,6 +5227,11 @@ const ReplicatedTransitionLease = struct {
         return try self.owner.db.mergeArtifactsPage(alloc, range, after_key);
     }
 
+    fn mergeCleanupKeysPage(self: *ReplicatedTransitionLease, alloc: std.mem.Allocator, range: antfly.db.types.ByteRange, after_key: ?[]const u8) ![]antfly.db.types.BatchWrite {
+        if (comptime linked_storage) return try self.owner.mergeCleanupKeysPage(alloc, range, after_key);
+        return try self.owner.db.mergeCleanupKeysPage(alloc, range, after_key);
+    }
+
     fn relationalTopologyStatus(self: *ReplicatedTransitionLease) !struct { fence: ?DataServer.IntegrityTopology.Fence, drained: bool } {
         const status = if (comptime linked_storage) try self.owner.relationalTopologyStatus() else try self.owner.db.relationalTopologyStatus();
         return .{ .fence = status.fence, .drained = status.drained };
@@ -17056,6 +17061,53 @@ pub const DataServer = struct {
             if (after_key) |key| self.alloc.free(key);
             after_key = next_after;
             if (page.exhausted) break;
+        }
+
+        // The Raft projection contains primary rows only. A previous copy can
+        // leave graph or other document-owned artifacts whose owner has no
+        // primary row, so page the receiver's physical keys after primary
+        // deletion and retire each remaining owner through replicated batches.
+        var after_physical: ?[]u8 = null;
+        defer if (after_physical) |key| self.alloc.free(key);
+        while (true) {
+            // The proposal must acquire the receiver's apply writer. Release
+            // the read lease before submitting it, then reacquire for the
+            // next bounded physical page.
+            const rows = blk: {
+                var receiver_lease = try self.leaseReplicatedTransitionOwner(
+                    receiver_group_id,
+                    table_contract,
+                    .target,
+                    .exact,
+                );
+                defer receiver_lease.release();
+                break :blk try receiver_lease.mergeCleanupKeysPage(self.alloc, donor_range, after_physical);
+            };
+            defer {
+                for (rows) |row| {
+                    self.alloc.free(row.key);
+                    self.alloc.free(row.value);
+                }
+                self.alloc.free(rows);
+            }
+            if (rows.len == 0) break;
+            var owners = std.ArrayListUnmanaged([]const u8).empty;
+            defer owners.deinit(self.alloc);
+            var seen = std.StringHashMapUnmanaged(void).empty;
+            defer seen.deinit(self.alloc);
+            for (rows) |row| {
+                if (row.value.len == 0 or row.value[0] == 0) continue;
+                const gop = try seen.getOrPut(self.alloc, row.value);
+                if (!gop.found_existing) try owners.append(self.alloc, row.value);
+            }
+            const next_after = try self.alloc.dupe(u8, rows[rows.len - 1].key);
+            if (owners.items.len != 0) try self.proposeRaftBatchGroup(self.alloc, receiver_group_id, table_contract.table_name, .{
+                .deletes = owners.items,
+                .sync_level = .write,
+                .merge_replication = replication,
+            }, .{ .discovery = .cached });
+            if (after_physical) |key| self.alloc.free(key);
+            after_physical = next_after;
         }
     }
 
@@ -54443,10 +54495,11 @@ fn implementationTests() type {
 
             const incarnation: antfly.metadata_api.MetadataClusterIncarnation =
                 "11111111111111111111111111111111".*;
+            const ttl_fixture_now = platform_clock.Clock.real().nowRealtimeNs();
             const contract: antfly.metadata.TransitionTableContract = .{
                 .table_id = 7,
                 .table_name = "docs",
-                .indexes_json = "{\"gr_v1\":{\"type\":\"graph\"}}",
+                .indexes_json = "{\"gr_v1\":{\"type\":\"graph\",\"ttl\":{\"duration\":\"1h\"}}}",
                 .source_identity = .{ .shard_id = 71, .range_id = 711 },
                 .target_identity = .{ .shard_id = 72, .range_id = 721 },
             };
@@ -54547,12 +54600,13 @@ fn implementationTests() type {
                 });
                 defer donor.close();
                 try antfly.public_api.table_writes.applyLocalTableSchemaJson(alloc, &donor, contract.schema_json);
-                try donor.addIndex(.{ .name = "gr_v1", .kind = .graph, .config_json = "{}" });
+                try donor.addIndex(.{ .name = "gr_v1", .kind = .graph, .config_json = "{\"ttl\":{\"duration\":\"1h\"}}" });
                 try donor.updateRange(.{ .start = "doc:a", .end = "doc:m" });
                 try donor.batch(.{ .writes = &.{.{
                     .key = "doc:b",
                     .value = "{\"side\":\"donor\",\"_edges\":{\"gr_v1\":{\"links\":[{\"target\":\"doc:z\"}]}}}",
-                }} });
+                }}, .timestamp_ns = ttl_fixture_now });
+                try donor.runUntilIdle();
             }
             const receiver_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, replica_root, 72);
             defer alloc.free(receiver_path);
@@ -54570,12 +54624,20 @@ fn implementationTests() type {
                 });
                 defer receiver.close();
                 try antfly.public_api.table_writes.applyLocalTableSchemaJson(alloc, &receiver, contract.schema_json);
-                try receiver.addIndex(.{ .name = "gr_v1", .kind = .graph, .config_json = "{}" });
+                try receiver.addIndex(.{ .name = "gr_v1", .kind = .graph, .config_json = "{\"ttl\":{\"duration\":\"1h\"}}" });
+                // Simulate an earlier copy that left a donor-range direct edge
+                // without a primary row. The Raft row projection cannot name it.
+                try receiver.batch(.{ .graph_writes = &.{.{ .index_name = "gr_v1", .source = "doc:c", .target = "doc:q", .edge_type = "links" }}, .timestamp_ns = ttl_fixture_now });
                 try receiver.updateRange(.{ .start = "doc:m", .end = "" });
                 try receiver.batch(.{ .writes = &.{.{
                     .key = "doc:z",
                     .value = "{\"side\":\"receiver\"}",
                 }} });
+                try receiver.runUntilIdle();
+                const stale_key = try antfly.db.internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:c", "gr_v1", "links", "doc:q");
+                defer alloc.free(stale_key);
+                const stale_value = try receiver.core.store.get(alloc, stale_key);
+                alloc.free(stale_value);
             }
 
             try server.syncDataRaftFromSnapshot(&snapshot, .linearizable);
@@ -54892,6 +54954,18 @@ fn implementationTests() type {
             defer @import("../graph/graph.zig").GraphIndex.freeEdges(alloc, edges);
             try std.testing.expectEqual(@as(usize, 1), edges.len);
             try std.testing.expectEqualStrings("doc:z", edges[0].target);
+            const stale = try receiver.getEdges(alloc, "gr_v1", "doc:c", "links", .out);
+            defer @import("../graph/graph.zig").GraphIndex.freeEdges(alloc, stale);
+            try std.testing.expectEqual(@as(usize, 0), stale.len);
+            const stale_artifact = try antfly.db.internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:c", "gr_v1", "links", "doc:q");
+            defer alloc.free(stale_artifact);
+            try std.testing.expectError(error.NotFound, receiver.core.store.get(alloc, stale_artifact));
+            const due_rows = try receiver.core.store.scanPrefix(alloc, &antfly.db.internal_keys.graph_edge_expiration_index_prefix);
+            defer antfly.db.docstore.DocStore.freeResults(alloc, due_rows);
+            for (due_rows) |row| switch (try @import("../storage/db/graph_edge_ttl_expiration.zig").decodeDue(row.value)) {
+                .direct => |candidate| try std.testing.expect(!std.mem.eql(u8, candidate.artifact_key, stale_artifact)),
+                .source => {},
+            };
             try vopr_io.ensureNoCapabilityViolation();
         }
 

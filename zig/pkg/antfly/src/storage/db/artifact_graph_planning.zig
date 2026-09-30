@@ -16,7 +16,7 @@ const types = @import("types.zig");
 pub const Catalog = struct {
     entries: []Entry,
     resolvers: struct { items: []resolvers.ResolverConfig },
-    pub const Entry = struct { config: types.IndexConfig, artifact_sources: []manager.GraphArtifactSource, max_edges_per_document: u32 };
+    pub const Entry = struct { config: types.IndexConfig, artifact_sources: []manager.GraphArtifactSource, max_edges_per_document: u32, ttl_duration_ns: u64 };
 
     pub fn graphIndexes(self: *const Catalog) []const Entry {
         return self.entries;
@@ -51,6 +51,7 @@ pub const Context = struct {
     source_index: u32,
     commands: std.ArrayList(publication.Command) = .empty,
     proof: provenance.Owned,
+    ttl_now_ns: u64 = 0,
 
     /// expected_asset is the exact stored artifact read in this snapshot.
     /// Its accepted proof must still have current original inputs: a receipt
@@ -88,7 +89,7 @@ pub const Context = struct {
             const consumes = for (parsed.artifact_sources) |source| {
                 if (std.mem.eql(u8, source.artifact_name, artifact_name)) break true;
             } else false;
-            if (consumes) try entries.append(self.owned, .{ .config = config, .artifact_sources = parsed.artifact_sources, .max_edges_per_document = parsed.max_edges_per_document });
+            if (consumes) try entries.append(self.owned, .{ .config = config, .artifact_sources = parsed.artifact_sources, .max_edges_per_document = parsed.max_edges_per_document, .ttl_duration_ns = parsed.ttl_duration_ns });
         }
         self.catalog = .{ .entries = entries.items, .resolvers = .{ .items = if (catalogs.resolvers.len == 0) &.{} else try resolvers.deserializeCatalog(self.owned, catalogs.resolvers) } };
         self.index_manager = &self.catalog;

@@ -142,6 +142,26 @@ pub fn isEmptyForGeneration(raw: []const u8, generation: u64) bool {
     return false;
 }
 
+/// A merge copies source manifests rather than regenerating their outputs.
+/// Validate the complete record before binding its identity to the receiver.
+pub fn rebindGenerationAlloc(alloc: Allocator, raw: []const u8, expected: u64, replacement: u64, segment: bool) ![]u8 {
+    if (try recordGeneration(alloc, raw, segment) != expected) return error.InvalidGraphAssetState;
+    const out = try alloc.dupe(u8, raw);
+    std.mem.writeInt(u64, out[version_4_magic.len..header_len], replacement, .big);
+    return out;
+}
+
+pub fn recordGeneration(alloc: Allocator, raw: []const u8, segment: bool) !u64 {
+    if (segment) {
+        if (raw.len < header_len) return error.InvalidGraphAssetState;
+        const generation = std.mem.readInt(u64, raw[segment_magic.len..header_len], .big);
+        const keys = try decodeSegmentKeysAlloc(alloc, raw, generation);
+        defer freeKeys(alloc, keys);
+        return generation;
+    }
+    return coverageGeneration(raw);
+}
+
 /// A v5 root is intentionally small and is published only after every
 /// deterministic segment is durable. The root therefore acts as the commit
 /// record for a resumable restore while ordinary readers can load segments in

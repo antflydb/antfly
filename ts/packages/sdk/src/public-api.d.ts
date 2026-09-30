@@ -12939,6 +12939,10 @@ export interface components {
             /** @description Non-semantic execution policy for shorthand-created chunking or embedding producers. */
             execution?: components["schemas"]["IndexExecutionConfig"];
         };
+        GraphTtlConfig: {
+            /** @description Expiration duration using Antfly's integer-component duration format (ns, us, ms, s, m, h, d). */
+            duration: string;
+        };
         /** @description Durable graph edge type. Values must be valid UTF-8 and encode to at most 64 KiB; `maxLength` is the standard-schema code-point ceiling and `x-antfly-max-utf8-bytes` carries the exact wire-byte limit. */
         GraphEdgeType: string;
         /** @description Omitting this object selects all edge types. A types list selects only those types; mode and types cannot both be supplied. */
@@ -13383,6 +13387,10 @@ export interface components {
         };
         /** @description Configuration for graph index type */
         GraphIndexConfig: {
+            /** @description Creation-based edge expiration for this graph index. The duration is immutable within an index incarnation. */
+            ttl?: components["schemas"]["GraphTtlConfig"];
+            /** @description Compatibility alias for ttl.duration. Do not specify together with ttl. */
+            ttl_duration?: string;
             /** @description Named published graph metrics. Serverless supports background refresh only and limits configurations to 16 metrics per graph, 64 total per publication, 64 types per filter, and 128 UTF-8 bytes per metric name. */
             metrics?: {
                 [key: string]: components["schemas"]["GraphMetricConfig"];

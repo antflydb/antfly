@@ -21,6 +21,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const change_journal = @import("../db/derived/change_journal.zig");
+pub const primary_effect = @import("primary_effect.zig");
 const db_types = @import("../db/types.zig");
 const primary_mod = @import("primary.zig");
 const replication_record = @import("replication_record.zig");
@@ -1100,7 +1101,7 @@ pub fn appendEncodedDerivedChangeRecord(
     encoded_change_record: []const u8,
     options: AppendDerivedEffectOptions,
 ) !u64 {
-    if (!change_journal.looksLikeBinaryRecord(encoded_change_record)) {
+    if (!change_journal.looksLikeBinaryRecord(encoded_change_record) and !primary_effect.isPrimaryEffect(encoded_change_record)) {
         return error.UnsupportedDerivedEffectPayload;
     }
 
@@ -1120,6 +1121,11 @@ pub fn decodeDerivedChangeRecord(
 ) !change_journal.DecodedRecord {
     if (record.kind != .derived_effect) return error.NotDerivedEffectRecord;
     if (record.payload_codec != .binary) return error.UnsupportedDerivedEffectCodec;
+    if (primary_effect.isPrimaryEffect(record.payload)) {
+        var decoded = try primary_effect.decode(alloc, record.payload);
+        defer decoded.deinit();
+        return try change_journal.decodeRecord(alloc, decoded.replay);
+    }
     return try change_journal.decodeRecord(alloc, record.payload);
 }
 

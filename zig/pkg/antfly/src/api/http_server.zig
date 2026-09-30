@@ -7447,7 +7447,7 @@ pub const ApiHttpServer = struct {
         return storage_status_buf[0..];
     }
 
-    fn catalogSource(self: *ApiHttpServer) table_catalog.CatalogSource {
+    pub fn catalogSource(self: *ApiHttpServer) table_catalog.CatalogSource {
         if (self.source.routingSource() == null) {
             return .{
                 .ptr = self,
@@ -13659,6 +13659,7 @@ pub const ApiHttpServer = struct {
             error.ModelNotFound => return error.ModelNotFound,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.GraphMetricGlobalMaterializationRequired => return error.GraphMetricGlobalMaterializationRequired,
+            error.GraphMetricPersonalizationUnsupported => return error.GraphMetricPersonalizationUnsupported,
             error.GraphMetricMaterializationRejected => return error.GraphMetricMaterializationRejected,
             error.GraphMetricQueryBudgetExceeded => return error.GraphMetricQueryBudgetExceeded,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
@@ -13964,6 +13965,7 @@ pub const ApiHttpServer = struct {
                 error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
                 error.UnsupportedExactSort => return error.UnsupportedExactSort,
                 error.GraphMetricGlobalMaterializationRequired => return error.GraphMetricGlobalMaterializationRequired,
+                error.GraphMetricPersonalizationUnsupported => return error.GraphMetricPersonalizationUnsupported,
                 error.GraphMetricMaterializationRejected => return error.GraphMetricMaterializationRejected,
                 error.GraphMetricQueryBudgetExceeded => return error.GraphMetricQueryBudgetExceeded,
                 error.TableNotFound, error.NotFound => return error.NotFound,
@@ -14041,6 +14043,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.GraphMetricGlobalMaterializationRequired => return error.GraphMetricGlobalMaterializationRequired,
+            error.GraphMetricPersonalizationUnsupported => return error.GraphMetricPersonalizationUnsupported,
             error.GraphMetricMaterializationRejected => return error.GraphMetricMaterializationRejected,
             error.GraphMetricQueryBudgetExceeded => return error.GraphMetricQueryBudgetExceeded,
             error.ModelNotFound => return error.ModelNotFound,
@@ -14150,6 +14153,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.GraphMetricGlobalMaterializationRequired => return error.GraphMetricGlobalMaterializationRequired,
+            error.GraphMetricPersonalizationUnsupported => return error.GraphMetricPersonalizationUnsupported,
             error.GraphMetricMaterializationRejected => return error.GraphMetricMaterializationRejected,
             error.GraphMetricQueryBudgetExceeded => return error.GraphMetricQueryBudgetExceeded,
             error.TableNotFound => return error.NotFound,
@@ -20068,6 +20072,11 @@ pub const ApiHttpServer = struct {
             error.GraphMetricGlobalMaterializationRequired => contextual_operations.jsonWithStatus(
                 422,
                 try public_table_http.graphMetricGlobalMaterializationRequiredBody(self.alloc),
+                false,
+            ),
+            error.GraphMetricPersonalizationUnsupported => contextual_operations.jsonWithStatus(
+                422,
+                try public_table_http.graphMetricPersonalizationUnsupportedBody(self.alloc),
                 false,
             ),
             error.GraphMetricMaterializationRejected => contextual_operations.jsonWithStatus(

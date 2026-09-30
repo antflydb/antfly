@@ -2322,6 +2322,7 @@ pub const AntflyApiHandler = struct {
             error.Canceled => textResponse(ctx, 408, "request canceled"),
             error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
             error.QueryCandidateBudgetExceeded => textResponse(ctx, 422, "query candidate budget exceeded"),
+            error.GraphMetricPersonalizationUnsupported => textResponse(ctx, 422, "distributed graph metric personalization unsupported"),
             error.GraphExploredEdgesBudgetExceeded => textResponse(ctx, 422, "graph explored edges budget exceeded"),
             error.GraphExploredEdgeBytesBudgetExceeded => textResponse(ctx, 422, "graph explored edge bytes budget exceeded"),
             else => textResponse(ctx, 500, "internal server error"),
@@ -3468,10 +3469,11 @@ pub const AntflyApiHandler = struct {
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid graph expand request");
         var input = distributed_graph.parseGraphExpandRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid graph expand request");
         defer input.deinit(ctx.allocator);
+        if (try self.rejectUnsafeLegacyGraphWire(ctx, params.table_name, input.index_name, input.legacy_wire_request)) |response| return response;
         var result = self.internalGroupOperations().graphExpand(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
             return if (err == error.InvalidArgument) textResponse(ctx, 400, @errorName(err)) else internalGroupErrorResponse(ctx, err);
         defer result.deinit(ctx.allocator);
-        const encoded = try distributed_graph.encodeGraphExpandResponse(ctx.allocator, result);
+        const encoded = try distributed_graph.encodeGraphExpandResponseForWire(ctx.allocator, result, input.legacy_wire_request);
         defer ctx.allocator.free(encoded);
         return jsonResponse(ctx, 200, encoded);
     }
@@ -3482,10 +3484,13 @@ pub const AntflyApiHandler = struct {
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid graph hydrate request");
         var input = distributed_graph.parseGraphHydrateRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid graph hydrate request");
         defer input.deinit(ctx.allocator);
+        if (input.incoming_index_name.len > 0) {
+            if (try self.rejectUnsafeLegacyGraphWire(ctx, params.table_name, input.incoming_index_name, input.legacy_wire_request)) |response| return response;
+        }
         var result = self.internalGroupOperations().graphHydrate(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
             return internalGroupErrorResponse(ctx, err);
         defer result.deinit(ctx.allocator);
-        const encoded = try distributed_graph.encodeGraphHydrateResponse(ctx.allocator, result);
+        const encoded = try distributed_graph.encodeGraphHydrateResponseForWire(ctx.allocator, result, input.legacy_wire_request);
         defer ctx.allocator.free(encoded);
         return jsonResponse(ctx, 200, encoded);
     }
@@ -3496,12 +3501,25 @@ pub const AntflyApiHandler = struct {
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid graph edges request");
         var input = distributed_graph.parseGraphEdgesRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid graph edges request");
         defer input.deinit(ctx.allocator);
+        if (try self.rejectUnsafeLegacyGraphWire(ctx, params.table_name, input.index_name, input.legacy_wire_request)) |response| return response;
         var result = self.internalGroupOperations().graphEdges(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
             return if (err == error.InvalidArgument) textResponse(ctx, 400, "invalid graph edges request") else internalGroupErrorResponse(ctx, err);
         defer result.deinit(ctx.allocator);
-        const encoded = try distributed_graph.encodeGraphEdgesResponse(ctx.allocator, result);
+        const encoded = try distributed_graph.encodeGraphEdgesResponseForWire(ctx.allocator, result, input.legacy_wire_request);
         defer ctx.allocator.free(encoded);
         return jsonResponse(ctx, 200, encoded);
+    }
+
+    fn rejectUnsafeLegacyGraphWire(
+        self: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        table_name: []const u8,
+        index_name: []const u8,
+        legacy: bool,
+    ) !?httpx.Response {
+        if (!legacy) return null;
+        if (try distributed_graph.catalogGraphIndexAllowsLegacyWire(ctx.allocator, self.api_server.catalogSource(), table_name, index_name)) return null;
+        return try textResponse(ctx, 409, "GraphWireUpgradeRequired");
     }
 
     fn internalGraphMetricMaintenance(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {

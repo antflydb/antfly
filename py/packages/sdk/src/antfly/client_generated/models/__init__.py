@@ -638,6 +638,7 @@ from .graph_shortest_path_query import GraphShortestPathQuery
 from .graph_traversal import GraphTraversal
 from .graph_traversal_metric_freshness import GraphTraversalMetricFreshness
 from .graph_traverse_query import GraphTraverseQuery
+from .graph_ttl_config import GraphTtlConfig
 from .graph_where_and import GraphWhereAnd
 from .graph_where_not_equal import GraphWhereNotEqual
 from .graph_where_not_exists import GraphWhereNotExists
@@ -2009,6 +2010,7 @@ __all__ = (
     "GraphTraversal",
     "GraphTraversalMetricFreshness",
     "GraphTraverseQuery",
+    "GraphTtlConfig",
     "GraphWhereAnd",
     "GraphWhereNotEqual",
     "GraphWhereNotExists",

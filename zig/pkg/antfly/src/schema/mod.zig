@@ -35,6 +35,7 @@ pub const globMatch = impl.globMatch;
 pub const patternPropertyMatches = impl.patternPropertyMatches;
 pub const shouldIgnoreSchemaValidationField = impl.shouldIgnoreSchemaValidationField;
 pub const pathContainsSchemaIgnoredField = impl.pathContainsSchemaIgnoredField;
+pub const parseTtlDurationNs = impl.parseTtlDurationNs;
 
 fn relationalUuidColumns(alloc: std.mem.Allocator, schema: ParsedTableSchema) ![]const []const u8 {
     var names: std.ArrayList([]const u8) = .empty;

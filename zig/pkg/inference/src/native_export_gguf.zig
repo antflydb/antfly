@@ -1053,6 +1053,7 @@ fn formatGlinerBundleDryRunReport(
 
     var access = try tensor_access_mod.openFromManifest(allocator, manifest);
     defer access.deinit();
+    try requireGlinerClassificationHeadArtifacts(allocator, manifest, access);
 
     const names = try access.listNames(allocator);
     defer allocator.free(names);
@@ -1102,6 +1103,7 @@ fn exportGlinerBundleToGguf(
 
     var access = try tensor_access_mod.openFromManifest(allocator, manifest);
     defer access.deinit();
+    try requireGlinerClassificationHeadArtifacts(allocator, manifest, access);
 
     try writeGlinerEncoderGguf(allocator, model_dir, output_path, manifest, access, quantization, filter);
     const head_output_path = try defaultGlinerHeadOutputPath(allocator, output_path);
@@ -1117,6 +1119,41 @@ fn exportGlinerBundleToGguf(
 fn requireLegacyGlinerExportProfile(manifest: manifest_mod.ModelManifest) !void {
     if (manifest.gliner_architecture == .boundary or std.mem.eql(u8, manifest.gliner_model_type, "gliner2.5"))
         return error.UnsupportedGlinerBoundaryExport;
+}
+
+fn requireGlinerClassificationHeadArtifacts(
+    allocator: std.mem.Allocator,
+    manifest: manifest_mod.ModelManifest,
+    access: tensor_access_mod.TensorAccess,
+) !void {
+    if (manifest.gliner_classification_head != .label_marker_mlp) return;
+    if (manifest.hidden_size != 1024 or manifest.intermediate_size != 4096 or
+        manifest.num_hidden_layers != 24 or manifest.num_attention_heads != 16 or
+        manifest.bert_vocab_size != 128011 or manifest.gliner_token_l == 0 or
+        manifest.gliner_token_sep_struct == 0)
+        return error.InvalidGlinerClassificationArtifact;
+    const Expected = struct { name: []const u8, shape: []const i64 };
+    const expected = [_]Expected{
+        .{ .name = "classifier.0.weight", .shape = &.{ 2048, 1024 } },
+        .{ .name = "classifier.0.bias", .shape = &.{2048} },
+        .{ .name = "classifier.2.weight", .shape = &.{ 1, 2048 } },
+        .{ .name = "classifier.2.bias", .shape = &.{1} },
+    };
+    const names = try access.listNames(allocator);
+    defer allocator.free(names);
+    var classifier_count: usize = 0;
+    for (names) |name| {
+        if (std.mem.startsWith(u8, name, "classifier.")) {
+            classifier_count += 1;
+        }
+    }
+    if (classifier_count != expected.len) return error.InvalidGlinerClassificationArtifact;
+    for (expected) |item| {
+        var record = access.getRecord(allocator, item.name) catch return error.InvalidGlinerClassificationArtifact;
+        defer record.deinit();
+        if (!std.mem.eql(i64, record.descriptor.shape, item.shape))
+            return error.InvalidGlinerClassificationArtifact;
+    }
 }
 
 test "gliner boundary export cannot write a legacy span bundle" {

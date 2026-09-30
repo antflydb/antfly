@@ -17901,6 +17901,26 @@ pub fn storageOwnerMergeArtifactsPage(owner_ptr: ?*anyopaque, request: *const ke
     return .ok;
 }
 
+pub fn storageOwnerMergeCleanupKeysPage(owner_ptr: ?*anyopaque, request: *const kernel_owner_abi.MergeArtifactsPageRequest, out_result: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner_ptr) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const rows = handle.db.mergeCleanupKeysPage(handle.alloc, .{ .start = request.range_start.slice(), .end = request.range_end.slice() }, if (request.after_key.len == 0) null else request.after_key.slice()) catch |err|
+        return storageOwnerStatusFromError(err);
+    defer {
+        for (rows) |row| {
+            handle.alloc.free(row.key);
+            handle.alloc.free(row.value);
+        }
+        handle.alloc.free(rows);
+    }
+    const encoded = data_raft_projection_wire.encodeGroupStatePageAlloc(handle.alloc, .{ .entries = rows, .exhausted = rows.len == 0 }) catch |err|
+        return storageOwnerStatusFromError(err);
+    out_result.* = .{ .ptr = encoded.ptr, .len = @intCast(encoded.len) };
+    return .ok;
+}
+
 test "storage owner runtime status bulk recovery bridge preserves identities capability and debt" {
     const Capture = struct {
         calls: usize = 0,
