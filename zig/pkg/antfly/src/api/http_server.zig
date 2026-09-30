@@ -16416,7 +16416,7 @@ pub const ApiHttpServer = struct {
                         const checkpoint = try self.restore_job_store.recordStagingOwner(self.alloc, restore.job_id, restore.attempt_id, @intFromEnum(phase), @intCast(owner_cursor));
                         self.alloc.free(checkpoint);
                     }
-                    return err;
+                    return @as(anyerror![]u8, err);
                 };
                 if (published) |advanced| {
                     owner_cursor += advanced;
