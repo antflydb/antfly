@@ -81,13 +81,21 @@ pub const WordTokenizer = struct {
 /// Write `config.json`, `model_manifest.json`, and `model.safetensors` under
 /// `dir`. `packing` is the JSON value of `laya.packing`, or null.
 pub fn writeModel(a: std.mem.Allocator, io: std.Io, dir: []const u8, packing: ?[]const u8, max_len: usize, seed: u64) !void {
+    return writeModelWith(a, io, dir, packing, "", max_len, seed);
+}
+
+/// `writeModel` with `laya_extra` (for example `,"decision_head":"pointer"`)
+/// appended to the `laya` config object. Pointer head tensors are always
+/// written, after every other tensor, so the other tensors' values do not
+/// depend on it.
+pub fn writeModelWith(a: std.mem.Allocator, io: std.Io, dir: []const u8, packing: ?[]const u8, laya_extra: []const u8, max_len: usize, seed: u64) !void {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const s = arena.allocator();
     const config = try std.fmt.allocPrint(s,
         \\{{"model_type":"modernbert","architectures":["ModernBertModel"],"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":2,"intermediate_size":{d},"max_position_embeddings":512,"local_attention":8,"global_attn_every_n_layers":3,"layer_norm_eps":1e-5,"pad_token_id":0,"cls_token_id":2,"sep_token_id":3,
-        \\"laya":{{"head_layers":2,"max_len":{d},"head_max_len":48,"act_costs":{{"escalate":0.5}},"mask_token":"[MASK]"{s}{s}}}}}
-    , .{ vocab_size, hidden, layers, intermediate, max_len, if (packing != null) ",\"packing\":" else "", packing orelse "" });
+        \\"laya":{{"head_layers":2,"max_len":{d},"head_max_len":48,"act_costs":{{"escalate":0.5}},"mask_token":"[MASK]"{s}{s}{s}}}}}
+    , .{ vocab_size, hidden, layers, intermediate, max_len, if (packing != null) ",\"packing\":" else "", packing orelse "", laya_extra });
     const manifest =
         \\{"type":"classifier","tasks":["extract"],"capabilities":["classification","typed_decisions"],"inputs":["text"],"source":{"repository":"synthetic-laya","revision":"seeded"}}
     ;
@@ -145,6 +153,13 @@ pub fn writeModel(a: std.mem.Allocator, io: std.Io, dir: []const u8, packing: ?[
     try Add.tensor(&tensors, s, random, "act_head.0.bias", &.{256}, 0, 0.05);
     try Add.tensor(&tensors, s, random, "act_head.2.weight", &.{ n_act, 256 }, 0, 0.1);
     try Add.tensor(&tensors, s, random, "act_head.2.bias", &.{n_act}, 0, 0.05);
+    try Add.tensor(&tensors, s, random, "pointer.norm.weight", &.{d_}, 1, 0.05);
+    try Add.tensor(&tensors, s, random, "pointer.norm.bias", &.{d_}, 0, 0.05);
+    for ([_][]const u8{ "pointer.q", "pointer.k" }) |prefix| {
+        var name: [64]u8 = undefined;
+        try Add.tensor(&tensors, s, random, try std.fmt.bufPrint(&name, "{s}.weight", .{prefix}), &.{ 256, d_ }, 0, 0.2);
+        try Add.tensor(&tensors, s, random, try std.fmt.bufPrint(&name, "{s}.bias", .{prefix}), &.{256}, 0, 0.05);
+    }
     const weights = try std.fs.path.join(s, &.{ dir, "model.safetensors" });
     try checkpoint.saveControlled(s, weights, tensors.items, null, false);
 }

@@ -50,7 +50,7 @@ const Harness = struct {
         errdefer owner.deinit();
         const vtable = try scratch.create(@import("../../ops/ops.zig").ComputeBackend.VTable);
         @import("cpu.zig").install(&owner.cb, vtable);
-        const trainer = try train.controller.Trainer.init(a, &owner.cb, parameters, .{ .execution = .native, .limits = .{ .max_state_bytes = 1024 * 1024 * 1024 }, .groups = &.{ .{ .schedule = .{ .constant = 0 } }, .{ .schedule = .{ .constant = 0 } } } });
+        const trainer = try train.controller.Trainer.init(a, &owner.cb, parameters, .{ .execution = .native, .limits = .{ .max_state_bytes = 1024 * 1024 * 1024 }, .groups = &.{ .{ .schedule = .{ .constant = 0 } }, .{ .schedule = .{ .constant = 0 } }, .{ .schedule = .{ .constant = 0 } } } });
         return .{ .program = program, .owner = owner, .trainer = trainer, .store = store, .vtable = vtable };
     }
     fn deinit(self: *Harness) void {
@@ -83,8 +83,11 @@ test "laya packed training graph matches packed serving logits, alone and in a p
     var words = synthetic.WordTokenizer{};
     const tok = words.tokenizer();
     // `fuse_layers` 3 fuses the head and the top encoder layer.
-    for ([_][]const u8{ "{\"mode\":\"question\"}", "{\"mode\":\"candidate\"}", "{\"mode\":\"question\",\"fuse_layers\":3}", "{\"mode\":\"question\",\"question_first\":true}", "{\"mode\":\"candidate\",\"question_first\":true}" }) |packing| for ([_]bool{ false, true }) |use_fused_attention| {
-        try synthetic.writeModel(a, std.testing.io, dir, packing, 128, 719);
+    const Case = struct { packing: []const u8, extra: []const u8 = "" };
+    const pointer = ",\"decision_head\":\"pointer\"";
+    for ([_]Case{ .{ .packing = "{\"mode\":\"question\"}" }, .{ .packing = "{\"mode\":\"candidate\"}" }, .{ .packing = "{\"mode\":\"question\",\"fuse_layers\":3}" }, .{ .packing = "{\"mode\":\"question\",\"question_first\":true}" }, .{ .packing = "{\"mode\":\"candidate\",\"question_first\":true}" }, .{ .packing = "{\"mode\":\"question\"}", .extra = pointer }, .{ .packing = "{\"mode\":\"question\",\"question_first\":true}", .extra = pointer } }) |case| for ([_]bool{ false, true }) |use_fused_attention| {
+        const packing = case.packing;
+        try synthetic.writeModelWith(a, std.testing.io, dir, packing, case.extra, 128, 719);
         const config = try modern.parseConfig(scratch, try files.readFileFromDir(scratch, dir, "config.json"));
         const laya = config.laya.?;
         var examples: [states.len]train.Example = undefined;
@@ -123,10 +126,154 @@ test "laya packed training graph matches packed serving logits, alone and in a p
             }
             try std.testing.expectEqual(@as(usize, l.questions), decision);
         }
-        std.debug.print("Laya packed {s} (fused attention {}): training-graph vs serving max logit error={d}\n", .{ packing, use_fused_attention, worst });
+        std.debug.print("Laya packed {s}{s} (fused attention {}): training-graph vs serving max logit error={d}\n", .{ packing, case.extra, use_fused_attention, worst });
         try std.testing.expect(worst < 1e-4);
         try tmp.dir.deleteFile(std.testing.io, "model.safetensors");
     };
+}
+
+// Resident Metal training gathers the requested rows of a LayerNorm output,
+// as it does of any other tensor (it used to return row 0 for every index).
+test "laya resident Metal gathers rows of a LayerNorm output" {
+    if (!@import("build_options").enable_metal or !@import("../../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const interpreter = @import("../../graph/interpreter.zig");
+    const ml = @import("ml").graph;
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const rows = 6;
+    const width = 64;
+    const table_values = try scratch.alloc(f32, rows * width);
+    for (table_values, 0..) |*v, i| v.* = @as(f32, @floatFromInt((i * 37) % 23)) * 0.1 - 1 + @as(f32, @floatFromInt(i / width));
+    const gamma_values = try scratch.alloc(f32, width);
+    @memset(gamma_values, 1);
+    const beta_values = try scratch.alloc(f32, width);
+    @memset(beta_values, 0);
+    const picks = [_]i32{ 4, 1, 5, 2 };
+    var outputs: [2][2][]f32 = undefined;
+    for ([_]train.controller.Execution{ .native, .resident_metal }, &outputs) |execution, *out| {
+        var graph = ml.Graph.init(a);
+        defer graph.deinit();
+        var b = ml.Builder.init(&graph);
+        const table = try b.parameter("table", ml.Shape.init(.f32, &.{ rows, width }));
+        const gamma = try b.parameter("gamma", ml.Shape.init(.f32, &.{width}));
+        const beta = try b.parameter("beta", ml.Shape.init(.f32, &.{width}));
+        const indices = try b.parameter("__indices", ml.Shape.init(.i32, &.{picks.len}));
+        const normalized = b.graph.node(try b.layerNorm(table, gamma, beta, width, 1e-5)).vjp_alternate;
+        const direct = try b.gather(table, indices, ml.Shape.init(.f32, &.{ picks.len, width }));
+        const of_norm = try b.gather(normalized, indices, ml.Shape.init(.f32, &.{ picks.len, width }));
+        try graph.markOutput(direct);
+        try graph.markOutput(of_norm);
+        const names = [_][]const u8{ "table", "gamma", "beta" };
+        const dims = [_][]const i32{ &.{ rows, width }, &.{width}, &.{width} };
+        const values = [_][]const f32{ table_values, gamma_values, beta_values };
+        const originals = try scratch.alloc(run.Parameter, 3);
+        const selected = try scratch.alloc(train.controller.Parameter, 3);
+        for (names, dims, values, originals, selected) |name, d, v, *o, *sel| {
+            o.* = .{ .name = name, .canonical_name = name, .dimensions = d, .values = v, .kind = .original };
+            sel.* = .{ .name = name, .dimensions = d, .values = v, .group = 0 };
+        }
+        var store = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+        const owner = try backend.Owner.init(a, &store, originals, selected, execution, .{}, null);
+        defer owner.deinit();
+        var cpu_vtable: @import("../../ops/ops.zig").ComputeBackend.VTable = undefined;
+        @import("cpu.zig").install(&owner.cb, &cpu_vtable);
+        const cb = &owner.cb;
+        var trainer = try train.controller.Trainer.init(a, cb, selected, .{ .execution = execution, .limits = .{ .max_state_bytes = 64 * 1024 * 1024 }, .groups = &.{.{ .schedule = .{ .constant = 0 } }} });
+        defer trainer.deinit();
+        var binding = try trainer.bind(&graph, null);
+        defer binding.deinit();
+        const index_value = (try cb.fromInt32Shape(&picks, &.{picks.len})) orelse return error.SkipZigTest;
+        defer cb.free(index_value);
+        const combined = try std.mem.concat(scratch, interpreter.RuntimeInput, &.{ binding.inputs, &.{.{ .node_id = indices, .value = index_value }} });
+        var result = try train.executeFramed(a, &graph, cb, combined);
+        defer result.deinit(cb);
+        for (out, result.outputs[0..2]) |*dst, output| dst.* = try cb.toFloat32(output, scratch);
+    }
+    for (0..2) |which| {
+        var worst: f32 = 0;
+        for (outputs[0][which], outputs[1][which]) |want, got| worst = @max(worst, @abs(want - got));
+        std.debug.print("Laya resident gather {s}: native vs Metal max error={d}\n", .{ if (which == 0) "of the table" else "of a LayerNorm output", worst });
+        try std.testing.expect(worst < 1e-4);
+    }
+}
+
+// Every parameter gradient of a packed pointer-head model agrees between the
+// native and the resident Metal training backends. Guards the resident Metal
+// gather-from-LayerNorm fault that made every pointer score identical.
+test "laya pointer head gradients agree between native and resident Metal" {
+    if (!@import("build_options").enable_metal or !@import("../../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const interpreter = @import("../../graph/interpreter.zig");
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", scratch);
+    var words = synthetic.WordTokenizer{};
+    const tok = words.tokenizer();
+    try synthetic.writeModelWith(a, std.testing.io, dir, "{\"mode\":\"question\"}", ",\"decision_head\":\"pointer\"", 128, 719);
+    const config = try modern.parseConfig(scratch, try files.readFileFromDir(scratch, dir, "config.json"));
+    var examples: [states.len]train.Example = undefined;
+    for (&examples, states) |*e, state| e.* = try packedExample(scratch, (try tree.build(scratch, tok, config.laya.?, state, &questions, null))[0]);
+    const l = try train.bucketedLayout(&examples, config);
+    var results: [2][][]f32 = undefined;
+    var names: [][]const u8 = undefined;
+    for ([_]train.controller.Execution{ .native, .resident_metal }, &results) |execution, *out| {
+        var program = try train.Program.init(a, config, l, 0);
+        defer program.deinit();
+        var weights = try safetensors.MMapReader.openFileAbsolute(a, try std.fs.path.join(scratch, &.{ dir, "model.safetensors" }));
+        defer weights.deinit();
+        const parameters = try train.parameters(scratch, &program.graph, &weights, 0, null, 0);
+        const originals = try scratch.alloc(run.Parameter, parameters.len);
+        for (parameters, originals) |p, *o| o.* = .{ .name = p.name, .canonical_name = p.name, .dimensions = p.dimensions, .values = p.values, .kind = .original };
+        var store = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+        const owner = try backend.Owner.init(a, &store, originals, parameters, execution, .{}, null);
+        defer owner.deinit();
+        var cpu_vtable: @import("../../ops/ops.zig").ComputeBackend.VTable = undefined;
+        @import("cpu.zig").install(&owner.cb, &cpu_vtable);
+        const cb = &owner.cb;
+        var trainer = try train.controller.Trainer.init(a, cb, parameters, .{ .execution = execution, .limits = .{ .max_state_bytes = 1024 * 1024 * 1024 }, .groups = &.{ .{ .schedule = .{ .constant = 0 } }, .{ .schedule = .{ .constant = 0 } }, .{ .schedule = .{ .constant = 0 } } } });
+        defer trainer.deinit();
+        var prng = std.Random.DefaultPrng.init(715);
+        const runtime = try train.inputs(scratch, cb, &program.graph, program.built, config, &examples, prng.random(), false, false);
+        defer for (runtime) |input| cb.free(input.value);
+        var binding = try trainer.bind(&program.graph, null);
+        defer binding.deinit();
+        const combined = try std.mem.concat(scratch, interpreter.RuntimeInput, &.{ binding.inputs, runtime });
+        const backward_inputs = try scratch.alloc(interpreter.RuntimeInput, combined.len + 1);
+        for (combined, backward_inputs[0..combined.len]) |input, *dst| dst.* = .{ .node_id = program.gradients.id_map[input.node_id], .value = input.value };
+        const cotangent = try scratch.alloc(f32, l.questions * l.options);
+        for (cotangent, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) * 0.25;
+        const seed = try cb.fromFloat32Shape(cotangent, &.{ @intCast(l.questions), @intCast(l.options) });
+        defer cb.free(seed);
+        backward_inputs[combined.len] = .{ .node_id = program.gradients.id_map[program.seed], .value = seed };
+        var backward = try train.executeFramed(a, &program.gradients.graph, cb, backward_inputs);
+        defer backward.deinit(cb);
+        out.* = try scratch.alloc([]f32, program.wrt.len);
+        names = try scratch.alloc([]const u8, program.wrt.len);
+        for (program.wrt, backward.outputs[0..program.wrt.len], out.*, names) |id, output, *dst, *name| {
+            dst.* = try cb.toFloat32(output, scratch);
+            name.* = try scratch.dupe(u8, program.graph.parameterName(program.graph.node(id)));
+        }
+    }
+    var mismatches: usize = 0;
+    for (names, results[0], results[1]) |name, want, got| {
+        var error_sq: f64 = 0;
+        var want_sq: f64 = 0;
+        for (want, got) |x, y| {
+            error_sq += @as(f64, x - y) * (x - y);
+            want_sq += @as(f64, x) * x;
+        }
+        const relative = @sqrt(error_sq / @max(want_sq, 1e-30));
+        if (relative > 1e-3) {
+            std.debug.print("Laya pointer gradient mismatch {s}: relative L2 {d} (|native|={d})\n", .{ name, relative, @sqrt(want_sq) });
+            mismatches += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), mismatches);
 }
 
 test "laya training converts an unpacked checkpoint into a served packed model" {
@@ -149,6 +296,13 @@ test "laya training exports per-question upper layers that serve exactly" {
     try exerciseUnpackedToPackedParity(true, false, 3);
 }
 
+// Pointer head (`laya.decision_head`) on a scorer checkpoint: the head is
+// initialized, trained, exported with the model, and served exactly.
+test "laya training exports a new pointer head that serves exactly" {
+    try exerciseParity(false, false, 0, .pointer);
+    try exerciseParity(true, false, 0, .pointer);
+}
+
 // Regression coverage for the fused-attention eval dropout leak: a
 // `Program`'s graph (and the fused op's graph-time `dropout_probability`)
 // is built once and reused for both training steps and `predict` eval, so
@@ -163,6 +317,10 @@ test "laya training converts an unpacked checkpoint into a served packed model (
 }
 
 fn exerciseUnpackedToPackedParity(force_fused_attention: bool, trunk_sees_questions: bool, fuse_layers: u32) !void {
+    return exerciseParity(force_fused_attention, trunk_sees_questions, fuse_layers, null);
+}
+
+fn exerciseParity(force_fused_attention: bool, trunk_sees_questions: bool, fuse_layers: u32, decision_head: ?model.DecisionHead) !void {
     const root = platform.env.getenv("ANTFLY_LAYA_REFERENCE") orelse return error.SkipZigTest;
     const job = @import("job.zig");
     const hf = @import("inference_hf_tokenizer");
@@ -187,6 +345,7 @@ fn exerciseUnpackedToPackedParity(force_fused_attention: bool, trunk_sees_questi
         .force_fused_attention = force_fused_attention,
         .trunk_sees_questions = trunk_sees_questions,
         .fuse_layers = fuse_layers,
+        .decision_head = decision_head,
     };
     var admission = @import("../../runtime/tier/memory.zig").AdmissionController{};
     try job.execute(a, io, c, &admission);
@@ -196,6 +355,25 @@ fn exerciseUnpackedToPackedParity(force_fused_attention: bool, trunk_sees_questi
     const cfg = factory.getLayaConfig(session) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(trunk_sees_questions, cfg.packing.trunk_sees_questions);
     try std.testing.expectEqual(fuse_layers, cfg.packing.fuse_layers);
+    try std.testing.expectEqual(decision_head orelse .scorer, cfg.decision_head);
+    if (decision_head == .pointer) {
+        // A new pointer head starts as a uniform decision (zero query
+        // projection over normalized rows), not a saturated softmax.
+        const Report = struct { initial_eval: struct { soft_ce: f64 } };
+        const report = try std.json.parseFromSlice(Report, scratch, try files.readFile(scratch, try std.fs.path.join(scratch, &.{ c.output_dir, "report.json" })), .{ .ignore_unknown_fields = true });
+        std.debug.print("Laya new pointer head initial soft CE={d}\n", .{report.value.initial_eval.soft_ce});
+        try std.testing.expect(report.value.initial_eval.soft_ce < 5);
+        // Training moved the zero-initialized query projection.
+        var weights = try safetensors.MMapReader.openFileAbsolute(a, try std.fs.path.join(scratch, &.{ model_path, "model.safetensors" }));
+        defer weights.deinit();
+        var q = try weights.readTensor("pointer.q.weight");
+        defer q.deinit();
+        const values = try train.floatValues(scratch, q);
+        var largest: f32 = 0;
+        for (values) |v| largest = @max(largest, @abs(v));
+        std.debug.print("Laya new pointer head trained |pointer.q| max={d}\n", .{largest});
+        try std.testing.expect(largest > 0);
+    }
     try std.testing.expectEqual(model.PackingMode.question, cfg.packing.mode);
     // Serving the exported packed model reproduces the job's final evaluation.
     const Prediction = struct { kind: model.QuestionType, logits: []const f32, target: []const f32 };
