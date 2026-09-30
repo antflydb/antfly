@@ -422,6 +422,8 @@ const DataRaftBatchForwardState = struct {
 };
 const trusted_principal_secret_key = "antfly.trusted_principal.secret";
 const trusted_principal_issuer_key = "antfly.trusted_principal.issuer";
+const setting_authority_secret_key = "antfly.setting_authority.secret";
+const setting_authority_issuer_key = "antfly.setting_authority.issuer";
 const internal_service_secret_key = "antfly.internal_service.secret";
 const internal_service_verification_secret_key = "antfly.internal_service.verification_secret";
 const internal_service_issuer_key = "antfly.internal_service.issuer";
@@ -1321,6 +1323,7 @@ const RaftTableApplyStateMachine = struct {
         InvalidRelationalExpressionInput,
         InvalidRelationalGeneratedValue,
         GeneratedColumnRewriteRequired,
+        InitialChildProvisionAlreadyCommitted,
 
         fn fromError(err: anyerror) ?ExpectedApplyFailure {
             inline for (@typeInfo(@import("../storage/db/online_source_contract.zig").Rejection).error_set.?) |field| {
@@ -1354,6 +1357,7 @@ const RaftTableApplyStateMachine = struct {
                 // of the replicated command. Retrying it cannot repair input.
                 // Storage corruption and resource pressure remain retryable.
                 error.InvalidBatchRequest => .invalid_batch_request,
+                error.InitialChildProvisionAlreadyCommitted => .InitialChildProvisionAlreadyCommitted,
                 error.IntegrityTopologyBusy, error.TransactionTopologyBusy => .integrity_topology_busy,
                 error.IntegrityTopologyChanged, error.IntegrityTopologyFenceMissing => .integrity_topology_changed,
                 error.IntegrityTopologyCompleted => .integrity_topology_completed,
@@ -1399,6 +1403,7 @@ const RaftTableApplyStateMachine = struct {
                 .txn_not_found => error.TxnNotFound,
                 .transaction_too_large => error.TransactionTooLarge,
                 .invalid_batch_request => error.InvalidBatchRequest,
+                .InitialChildProvisionAlreadyCommitted => error.InitialChildProvisionAlreadyCommitted,
                 .integrity_topology_busy => error.IntegrityTopologyBusy,
                 .integrity_topology_changed => error.IntegrityTopologyChanged,
                 .integrity_topology_completed => error.IntegrityTopologyCompleted,
@@ -23697,8 +23702,9 @@ pub const DataServer = struct {
             cfg.api_server_cfg.internal_service_secret,
             cfg.api_server_cfg.internal_service_issuer,
         );
-        remote_metadata.setting_authority_secret = cfg.api_server_cfg.trusted_principal_secret;
-        remote_metadata.setting_authority_issuer = cfg.api_server_cfg.trusted_principal_issuer;
+        const setting_authority = cfg.api_server_cfg.effectiveSettingAuthority();
+        remote_metadata.setting_authority_secret = if (setting_authority) |authority| authority.secret else null;
+        remote_metadata.setting_authority_issuer = if (setting_authority) |authority| authority.issuer else null;
         remote_metadata.local_node_id = if (cfg.store_registration) |registration| registration.node_id else 0;
         errdefer remote_metadata.deinit();
 
@@ -30443,6 +30449,10 @@ pub fn runFromIterator(
         if (secret_store_initialized) &secret_store else null,
     );
     defer if (trusted_principal_secret) |value| alloc.free(value);
+    const setting_authority_secret = try resolveTrustedPrincipalConfigValue(alloc, if (secret_store_initialized) &secret_store else null, setting_authority_secret_key);
+    defer if (setting_authority_secret) |value| alloc.free(value);
+    const setting_authority_issuer = try resolveTrustedPrincipalConfigValue(alloc, if (secret_store_initialized) &secret_store else null, setting_authority_issuer_key);
+    defer if (setting_authority_issuer) |value| alloc.free(value);
     const internal_service_secret = try resolveTrustedPrincipalConfigValue(
         alloc,
         if (secret_store_initialized) &secret_store else null,
@@ -30494,6 +30504,8 @@ pub fn runFromIterator(
         );
         return err;
     };
+    try internal_service_auth.validateCredentialIsolation(internal_service_secret, setting_authority_secret);
+    try internal_service_auth.validateCredentialIsolation(internal_service_verification_secret, setting_authority_secret);
     internal_service_auth.validateCredentialIsolation(
         internal_service_verification_secret,
         trusted_principal_secret,
@@ -30631,6 +30643,8 @@ pub fn runFromIterator(
             .backup_operation_timeout_ms = if (loaded_config) |*cfg| cfg.backup.operation_timeout_ms else antfly.common.config.default_backup_operation_timeout_ms,
             .trusted_principal_secret = trusted_principal_secret,
             .trusted_principal_issuer = trusted_principal_issuer,
+            .setting_authority_secret = setting_authority_secret,
+            .setting_authority_issuer = setting_authority_issuer,
             .internal_service_secret = internal_service_secret,
             .internal_service_verification_secret = internal_service_verification_secret,
             .internal_service_issuer = internal_service_issuer,
@@ -37092,6 +37106,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(?RaftTableApplyStateMachine.ExpectedApplyFailure, null), RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(error.OnlineSourcePinPending));
             try std.testing.expectEqual(@as(?RaftTableApplyStateMachine.ExpectedApplyFailure, null), RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(error.InvalidData));
             try std.testing.expectEqual(error.GenerationRetired, RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(error.GenerationRetired).?.toError());
+            try std.testing.expectEqual(error.InitialChildProvisionAlreadyCommitted, RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(error.InitialChildProvisionAlreadyCommitted).?.toError());
             inline for (@typeInfo(@import("../schema/relational_expression_errors.zig").Error).error_set.?) |field| {
                 const reason = @field(@import("../schema/relational_expression_errors.zig").Error, field.name);
                 try std.testing.expectEqual(reason, RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(reason).?.toError());

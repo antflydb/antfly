@@ -633,7 +633,15 @@ test "initial self FK resumes the second hidden range after a durable owner rece
     const first_command = try std.json.Stringify.valueAlloc(alloc, fk_generation_publication.InitialCommand{ .plan_id = id, .child_table_id = child.table_id, .expected_revision = 1, .action = .child_provisioned, .child_receipt = first_receipt }, .{});
     defer alloc.free(first_command);
     try store.applyStandaloneCommand(group_id, .{ .apply_fk_initial_create = first_command });
-    try std.testing.expectError(error.GenerationPublicationChanged, store.applyStandaloneCommand(group_id, .{ .apply_fk_initial_create = first_command }));
+    try std.testing.expectError(error.GenerationPublicationChanged, store.preflightFkInitialCreateCommand(group_id, first_command));
+    try store.applyStandaloneCommand(group_id, .{ .apply_fk_initial_create = first_command });
+    // Two supervisors may submit this same revision before either receives
+    // the first commit. The losing committed entry must advance as a no-op.
+    {
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        try store.applyCommittedFkInitialCreateTxn(&txn, group_id, first_command);
+    }
     store.deinit();
     store_open = false;
     var recovered = try RaftApplyStore.init(alloc, .{ .root_dir = root });
@@ -8971,6 +8979,11 @@ pub const RaftApplyStore = struct {
                 if (receipt.action != .cancel)
                     try self.requireInitialChildRootReceiptTxn(txn, group_id, receipt);
             };
+            // A competing proposer may already have committed this revision.
+            // This check precedes all writes; committed Raft replay can skip
+            // only that stale command while preserving all other validation.
+            if (command.expected_revision != previous.revision)
+                return error.StaleInitialFkCreateCommand;
             publication = try previous.apply(a, command);
             if (command.action == .seal_support or publication.phase == .canceled) {
                 // The support-seal changes the immutable plan digest before
@@ -9042,6 +9055,9 @@ pub const RaftApplyStore = struct {
     /// aborted: validation and the candidate's writes share one code path,
     /// but no hidden reservation becomes visible before Raft commits it.
     pub fn preflightFkInitialCreateCommand(self: *RaftApplyStore, group_id: u64, bytes: []const u8) !void {
+        const io = self.io_impl.io();
+        self.apply_mutex.lockUncancelable(io);
+        defer self.apply_mutex.unlock(io);
         var txn = try self.store.beginWriteTxn();
         // The real apply path buffers notifications until commit. Preflight
         // runs the same mutation helpers against an aborted transaction, so
@@ -9055,7 +9071,10 @@ pub const RaftApplyStore = struct {
             self.active_outcome = null;
             discarded.deinit();
         }
-        try self.applyFkInitialCreateTxn(&txn, group_id, bytes);
+        self.applyFkInitialCreateTxn(&txn, group_id, bytes) catch |err| switch (err) {
+            error.StaleInitialFkCreateCommand => return error.GenerationPublicationChanged,
+            else => return err,
+        };
         if (discarded.failure) |err| return err;
     }
 
@@ -9076,6 +9095,7 @@ pub const RaftApplyStore = struct {
         else
             null;
         self.applyFkInitialCreateTxn(txn, group_id, bytes) catch |err| {
+            if (err == error.StaleInitialFkCreateCommand) return;
             // Attestation is checked before any writes. A placement/reporter
             // replacement between preflight and apply is a stale receipt, not
             // a reason to halt the metadata log.

@@ -1660,6 +1660,8 @@ pub const ApiHttpServerConfig = struct {
     ard_public_catalog_enabled: bool = false,
     trusted_principal_secret: ?[]const u8 = null,
     trusted_principal_issuer: ?[]const u8 = null,
+    setting_authority_secret: ?[]const u8 = null,
+    setting_authority_issuer: ?[]const u8 = null,
     /// Local/standalone sources may authorize publication without an HTTP
     /// grant. Distributed runtimes explicitly clear this when their distinct
     /// trusted authority is unconfigured; internal RPC identity is not a substitute.
@@ -1780,11 +1782,23 @@ pub const ApiHttpServerConfig = struct {
     /// Cache budgets and concurrency are intentionally not HTTP/API config.
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
 
+    pub const SettingAuthority = struct { secret: []const u8, issuer: []const u8 };
+
+    pub fn effectiveSettingAuthority(self: *const ApiHttpServerConfig) ?SettingAuthority {
+        if (self.setting_authority_secret != null or self.setting_authority_issuer != null) {
+            const secret = self.setting_authority_secret orelse return null;
+            const issuer = self.setting_authority_issuer orelse return null;
+            if (secret.len == 0 or issuer.len == 0) return null;
+            return .{ .secret = secret, .issuer = issuer };
+        }
+        const secret = self.trusted_principal_secret orelse return null;
+        const issuer = self.trusted_principal_issuer orelse return null;
+        if (secret.len == 0 or issuer.len == 0) return null;
+        return .{ .secret = secret, .issuer = issuer };
+    }
+
     pub fn configureRemoteCatalogPublicationAuthority(self: *ApiHttpServerConfig) void {
-        self.catalog_publication_authority_available = false;
-        const secret = self.trusted_principal_secret orelse return;
-        const issuer = self.trusted_principal_issuer orelse return;
-        self.catalog_publication_authority_available = secret.len > 0 and issuer.len > 0;
+        self.catalog_publication_authority_available = self.effectiveSettingAuthority() != null;
     }
 };
 
@@ -1808,9 +1822,16 @@ test "unconfigured remote catalog authority skips background work without borrow
     cfg.trusted_principal_issuer = "cluster";
     cfg.configureRemoteCatalogPublicationAuthority();
     try std.testing.expect(cfg.catalog_publication_authority_available);
+    cfg.setting_authority_issuer = null;
+    cfg.configureRemoteCatalogPublicationAuthority();
+    try std.testing.expect(!cfg.catalog_publication_authority_available);
     cfg.trusted_principal_secret = "";
     cfg.configureRemoteCatalogPublicationAuthority();
     try std.testing.expect(!cfg.catalog_publication_authority_available);
+    cfg.setting_authority_secret = "separate-setting-authority";
+    cfg.setting_authority_issuer = "cluster";
+    cfg.configureRemoteCatalogPublicationAuthority();
+    try std.testing.expect(cfg.catalog_publication_authority_available);
 }
 
 pub const RaftQuarantineAdminSource = struct {
@@ -33842,6 +33863,7 @@ test "continuous HA allows a configured RemoteApply batch write" {
     var server = ApiHttpServer.init(alloc, .{
         .ha_failover_safe_mutations_only = true,
         .ha_remote_apply_mutations_enabled = true,
+        .deployment_mode = .standalone,
     }, source.iface(), null, table_source.source());
     defer server.deinit();
     const body = try test_contract_helpers.normalizeBatchRequest(alloc, "{\"inserts\":{\"doc:ha\":{\"title\":\"remote-apply\"}}}");
@@ -39391,7 +39413,7 @@ test "api http server surfaces structured doc identity conflicts for transaction
 
     var source = FakeSource{};
     var writes = FakeWrites{};
-    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.source());
+    var server = ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone }, source.iface(), null, writes.source());
     defer server.deinit();
 
     const commit_body = try test_contract_helpers.encodeTransactionCommitRequest(

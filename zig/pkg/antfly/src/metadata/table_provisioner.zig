@@ -2019,7 +2019,7 @@ fn implementationTests() type {
             const count: usize = if (benchmark) 2000 else 16;
             const tables = try a.alloc(table_manager.TableRecord, table_count);
             defer a.free(tables);
-            for (tables, 0..) |*table, i| table.* = .{ .table_id = i + 1, .name = "tenant", .schema_json = "{\"version\":1}", .read_schema_json = "{\"version\":0}" };
+            for (tables, 0..) |*table, i| table.* = .{ .table_id = i + 1, .name = "tenant", .schema_json = "{\"version\":1}", .read_schema_json = "{\"version\":0}", .indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"}}" };
             const ranges = try a.alloc(table_manager.RangeRecord, count);
             defer a.free(ranges);
             const hosted = try a.alloc(u64, count);
@@ -2082,6 +2082,7 @@ fn implementationTests() type {
                 .name = "docs",
                 .schema_json = "{\"version\":1}",
                 .read_schema_json = "{\"version\":0}",
+                .indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"}}",
             }};
             const ranges = [_]table_manager.RangeRecord{
                 .{ .group_id = 7, .table_id = 11, .start_key = "", .end_key = "m" },

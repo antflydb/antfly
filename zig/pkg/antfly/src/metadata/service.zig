@@ -3382,10 +3382,11 @@ fn runtimeStatusProtocolSafeCommand(
             const supported_version = highestSupportedRuntimeStatusVersion(service, required_version);
             if (supported_version == required_version and !storeHasRuntimeEmbeddingActivity(record)) return command;
             // Native projection/authority fields are readiness fences. False
-            // is not a conservative downgrade, so registration must wait for
-            // the framed profile just like an upsert.
-            if (required_version == metadata_runtime_status_protocol.current_record_version and
-                supported_version != required_version)
+            // is not a conservative downgrade, so registration must retain
+            // every mandatory profile fact just like an upsert.
+            const mandatory_version = runtimeStatusMandatoryRecordVersion(record);
+            if (metadata_runtime_status_protocol.profileSatisfies(mandatory_version, metadata_runtime_status_protocol.framed_index_record_version) and
+                !metadata_runtime_status_protocol.profileSatisfies(supported_version, mandatory_version))
             {
                 return error.RuntimeStatusProtocolUnavailable;
             }
@@ -13605,19 +13606,19 @@ test "metadata service defers reporter fence transitions while activation is unk
     try std.testing.expectEqual(@as(u64, 0), projected[1].reporter_incarnation);
 }
 
-test "relational integrity metadata topology heartbeat selects current profile and preserves group reports" {
+test "relational integrity metadata topology heartbeat selects framed profile and preserves group reports" {
     const alloc = std.testing.allocator;
     const FakeService = struct {
         alloc: std.mem.Allocator,
         ready: bool = false,
-        current_profile_probes: usize = 0,
+        framed_profile_probes: usize = 0,
         upserts: usize = 0,
         groups: usize = 0,
         topology: u16 = 0,
 
         fn runtimeStatusProtocolReady(self: *@This(), required: u16) bool {
-            if (required == metadata_runtime_status_protocol.current_record_version) {
-                self.current_profile_probes += 1;
+            if (required == metadata_runtime_status_protocol.framed_index_record_version) {
+                self.framed_profile_probes += 1;
                 return self.ready;
             }
             return false;
@@ -13657,7 +13658,7 @@ test "relational integrity metadata topology heartbeat selects current profile a
         try std.testing.expectEqual(@as(usize, 1), service.upserts);
         try std.testing.expectEqual(@as(usize, 1), service.groups);
         try std.testing.expectEqual(metadata_table_manager.relational_topology_protocol_version, service.topology);
-        try std.testing.expectEqual(@as(usize, 2), service.current_profile_probes);
+        try std.testing.expectEqual(@as(usize, 2), service.framed_profile_probes);
     }
 }
 

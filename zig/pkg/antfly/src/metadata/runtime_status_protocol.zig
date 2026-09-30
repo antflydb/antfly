@@ -148,7 +148,7 @@ test "runtime status exposes only released compatibility profiles" {
     try std.testing.expectEqual(Profile.released_v0_2_0, greatestCommonProfile(15, 12).?);
     try std.testing.expectEqual(@as(?Profile, null), greatestCommonProfile(16, 14));
     try std.testing.expectEqual(Profile.inference_diagnostics, greatestCommonProfile(17, 16).?);
-    try std.testing.expectEqual(@as(?Profile, null), greatestCommonProfile(18, 16));
+    try std.testing.expectEqual(Profile.inference_diagnostics, greatestCommonProfile(18, 16).?);
 
     var rolling_common = Profile.current;
     for ([_]u16{ 16, 15, 16 }) |peer_version| {

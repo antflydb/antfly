@@ -23,8 +23,9 @@ def _constraint_status(api, table):
         if hasattr(api, "request_raw")
         else api._request("GET", path)
     )
-    if response.status_code == 409 and (
-        "constraint schema or ownership changed; refresh and retry" in response.text
+    if response.status_code == 404 or (
+        response.status_code == 409
+        and "constraint schema or ownership changed; refresh and retry" in response.text
     ):
         return None
     response.raise_for_status()
@@ -35,6 +36,7 @@ def _enforced(api, table):
     assert wait_until(
         lambda: (_constraint_status(api, table) or {}).get("state") == "enforced",
         timeout_s=30,
+        retry_not_found=True,
     )
 
 

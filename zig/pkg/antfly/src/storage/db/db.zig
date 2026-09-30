@@ -28448,6 +28448,22 @@ pub const DB = struct {
             },
             .apply => {},
         };
+        // Two supervisors can preflight the same empty child before either
+        // proposal commits. The later Raft entry is a deterministic rejected
+        // command once the first provision's hidden receipt is durable.
+        if (!input.native) if (try self.core.getStoreValue(self.alloc, hidden.key)) |prior_raw| {
+            defer self.alloc.free(prior_raw);
+            const prior = try hidden.Record.decode(prior_raw);
+            if (std.mem.eql(u8, &prior.plan_id, &input.plan_id) and
+                std.mem.eql(u8, &prior.plan_digest, &input.plan_digest) and
+                prior.namespace.eql(input.fence.namespace) and
+                prior.schema_version == runtime_schema.version and
+                std.mem.eql(u8, &prior.schema_digest, &input.schema_digest) and
+                std.mem.eql(u8, &prior.public_schema_json_digest, &input.public_schema_json_digest) and
+                std.mem.eql(u8, &prior.catalog_digest, &input.catalog_digest) and
+                prior.provision_term != 0 and prior.provision_index != 0)
+                return error.InitialChildProvisionAlreadyCommitted;
+        };
         if (try self.core.getStoreValue(self.alloc, public_schema_json_key)) |prior_schema| {
             self.alloc.free(prior_schema);
             return error.InitialChildPublicationChanged;

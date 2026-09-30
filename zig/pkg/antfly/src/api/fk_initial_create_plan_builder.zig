@@ -94,8 +94,8 @@ fn namespaceId(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, cont
         .database = target.database,
         .name = target.namespace,
     } });
-    const resources = try std.json.parseFromSliceLeaky([]domain.Resource, alloc, bytes, .{ .allocate = .alloc_always });
-    for (resources) |resource| {
+    const state = try std.json.parseFromSliceLeaky(domain.State, alloc, bytes, .{ .allocate = .alloc_always });
+    for (state.resources) |resource| {
         if (resource.kind == .namespace and std.mem.eql(u8, resource.name, target.namespace)) return resource.id;
     }
     return error.NamespaceNotFound;

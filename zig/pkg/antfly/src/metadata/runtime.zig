@@ -80,6 +80,8 @@ const metadata_raft_election_max_ticks = 60;
 const metadata_bootstrap_campaign_retry_min_interval_ns: u64 = 500 * std.time.ns_per_ms;
 const trusted_principal_secret_key = "antfly.trusted_principal.secret";
 const trusted_principal_issuer_key = "antfly.trusted_principal.issuer";
+const setting_authority_secret_key = "antfly.setting_authority.secret";
+const setting_authority_issuer_key = "antfly.setting_authority.issuer";
 const internal_service_secret_key = "antfly.internal_service.secret";
 const internal_service_verification_secret_key = "antfly.internal_service.verification_secret";
 const internal_service_issuer_key = "antfly.internal_service.issuer";
@@ -1087,6 +1089,10 @@ pub fn runFromIterator(
         if (secret_store_initialized) &secret_store else null,
     );
     defer if (trusted_principal_secret) |value| alloc.free(value);
+    const setting_authority_secret = try resolveMetadataRuntimeSecretValue(alloc, if (secret_store_initialized) &secret_store else null, setting_authority_secret_key);
+    defer if (setting_authority_secret) |value| alloc.free(value);
+    const setting_authority_issuer = try resolveMetadataRuntimeSecretValue(alloc, if (secret_store_initialized) &secret_store else null, setting_authority_issuer_key);
+    defer if (setting_authority_issuer) |value| alloc.free(value);
     const internal_service_secret = try resolveMetadataRuntimeSecretValue(
         alloc,
         if (secret_store_initialized) &secret_store else null,
@@ -1138,6 +1144,8 @@ pub fn runFromIterator(
         );
         return err;
     };
+    try internal_service_auth.validateCredentialIsolation(internal_service_secret, setting_authority_secret);
+    try internal_service_auth.validateCredentialIsolation(internal_service_verification_secret, setting_authority_secret);
     internal_service_auth.validateCredentialIsolation(
         internal_service_verification_secret,
         trusted_principal_secret,
@@ -1274,6 +1282,8 @@ pub fn runFromIterator(
             .experimental = cli.experimental,
             .trusted_principal_secret = trusted_principal_secret,
             .trusted_principal_issuer = trusted_principal_issuer,
+            .setting_authority_secret = setting_authority_secret,
+            .setting_authority_issuer = setting_authority_issuer,
             .internal_service_secret = internal_service_secret,
             .internal_service_verification_secret = internal_service_verification_secret,
             .internal_service_issuer = internal_service_issuer,

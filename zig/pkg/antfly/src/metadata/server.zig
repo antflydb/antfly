@@ -124,8 +124,9 @@ pub const MetadataServer = struct {
         var service_cfg = cfg.service;
         service_cfg.internal_service_secret = cfg.api_server_cfg.internal_service_secret;
         service_cfg.internal_service_issuer = cfg.api_server_cfg.internal_service_issuer;
-        service_cfg.setting_authority_secret = cfg.api_server_cfg.trusted_principal_secret;
-        service_cfg.setting_authority_issuer = cfg.api_server_cfg.trusted_principal_issuer;
+        const setting_authority = cfg.api_server_cfg.effectiveSettingAuthority();
+        service_cfg.setting_authority_secret = if (setting_authority) |authority| authority.secret else null;
+        service_cfg.setting_authority_issuer = if (setting_authority) |authority| authority.issuer else null;
         service_cfg.destination_authorizer = .{
             .manager = cfg.api_server_cfg.user_manager,
             .auth_enabled = cfg.api_server_cfg.auth_enabled,
@@ -238,8 +239,8 @@ pub const MetadataServer = struct {
                 alloc,
                 .{
                     .internal_service_auth_capability = cfg.api_server_cfg.internal_service_auth_capability,
-                    .setting_authority_secret = cfg.api_server_cfg.trusted_principal_secret,
-                    .setting_authority_issuer = cfg.api_server_cfg.trusted_principal_issuer,
+                    .setting_authority_secret = if (setting_authority) |authority| authority.secret else null,
+                    .setting_authority_issuer = if (setting_authority) |authority| authority.issuer else null,
                     .secret_store = cfg.api_server_cfg.secret_store,
                 },
                 metadata_http_server.AdminSource.fromMetadataHttpService(svc),

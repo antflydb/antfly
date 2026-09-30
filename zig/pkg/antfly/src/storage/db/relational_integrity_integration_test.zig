@@ -748,6 +748,7 @@ test "initial FK child owner stays hidden across restart until replicated releas
         } };
         try db.batchRaftReplicatedApply(.{ .relational_topology = provision }, .{ .term = 2, .index = 1 });
         try db.batchRaftReplicatedApply(.{ .relational_topology = provision }, .{ .term = 2, .index = 1 });
+        try std.testing.expectError(error.InitialChildProvisionAlreadyCommitted, db.batchRaftReplicatedApply(.{ .relational_topology = provision }, .{ .term = 2, .index = 2 }));
         try std.testing.expectError(error.InitialChildNotPublished, db.batch(.{ .writes = &.{.{ .key = "leak", .value = "{}" }} }));
         try std.testing.expectError(error.InitialChildNotPublished, db.lookup(alloc, "leak", .{}));
         // The release controller must be able to probe self-parent witness

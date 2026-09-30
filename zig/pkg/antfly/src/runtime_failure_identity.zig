@@ -34,6 +34,7 @@ const mappings = [_]Mapping{
     .{ .status = .artifact_catalog_corrupt, .err = error.ArtifactCatalogCorrupt },
     .{ .status = .artifact_catalog_epoch_exhausted, .err = error.ArtifactCatalogEpochExhausted },
     .{ .status = .initial_child_publication_changed, .err = error.InitialChildPublicationChanged },
+    .{ .status = .initial_child_provision_already_committed, .err = error.InitialChildProvisionAlreadyCommitted },
     .{ .status = .invalid_initial_child_publication, .err = error.InvalidInitialChildPublication },
     .{ .status = .initial_fk_retirement_proof_unavailable, .err = error.InitialFkRetirementProofUnavailable },
     .{ .status = .invalid_initial_fk_retirement_ticket, .err = error.InvalidInitialFkRetirementTicket },
@@ -976,6 +977,8 @@ test "registered storage-kernel errors are unique and round trip without losing 
     try std.testing.expectEqual(abi.Status.generation_retired, retired.status);
     try validateFailureEnvelope(retired.status, &retired, abi.abi_version);
     try std.testing.expectError(error.GenerationRetired, statusToError(retired.status));
+    try std.testing.expectEqual(abi.Status.initial_child_provision_already_committed, statusFromError(error.InitialChildProvisionAlreadyCommitted));
+    try std.testing.expectError(error.InitialChildProvisionAlreadyCommitted, statusToError(.initial_child_provision_already_committed));
     // A newly created/rebuilt ANN index has no serving generation yet. This
     // expected state must survive both compiled query boundaries as a retry,
     // rather than becoming an unregistered StorageKernelFailure (HTTP 500).

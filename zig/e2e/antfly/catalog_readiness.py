@@ -44,8 +44,8 @@ def wait_for_catalog_protocol(cluster, *, timeout_s=15.0):
             if (
                 status.get("metadata_raft_role") == "leader"
                 and status.get("metadata_incarnation")
-                and status.get("runtime_status_protocol_ready_version")
-                == DENSE_NATIVE_STATUS_PROFILE
+                and status.get("runtime_status_protocol_ready_version", 0)
+                >= DENSE_NATIVE_STATUS_PROFILE
             ):
                 return index
         remaining = deadline - time.monotonic()

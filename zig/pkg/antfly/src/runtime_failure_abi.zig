@@ -723,6 +723,7 @@ pub const Status = enum(u32) {
     invalid_control_receipt_position = 764,
     invalid_graph_transfer = 765,
     graph_generation_mismatch = 766,
+    initial_child_provision_already_committed = 767,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

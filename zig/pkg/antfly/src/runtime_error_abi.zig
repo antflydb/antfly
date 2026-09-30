@@ -31,6 +31,10 @@ test "FK publication progress and corrupt retirement proofs retain distinct boun
     try std.testing.expectEqual(@intFromEnum(Code.conflict), changed.code);
     try std.testing.expectEqual(@intFromEnum(Code.corrupt), corrupted.code);
     try std.testing.expect(pending.detail != changed.detail and changed.detail != corrupted.detail);
+    const publication_changed = statusFromError(error.GenerationPublicationChanged);
+    try std.testing.expectEqual(error.GenerationPublicationChanged, errorFromStatus(publication_changed));
+    const duplicate_child = statusFromError(error.InitialChildProvisionAlreadyCommitted);
+    try std.testing.expectEqual(error.InitialChildProvisionAlreadyCommitted, errorFromStatus(duplicate_child));
 }
 
 pub const Code = enum(c_int) {
@@ -696,6 +700,8 @@ pub const Detail = enum(c_int) {
     invalid_control_receipt_position,
     invalid_graph_transfer,
     graph_generation_mismatch,
+    generation_publication_changed,
+    initial_child_provision_already_committed,
 };
 
 pub const Status = extern struct {
@@ -715,6 +721,8 @@ pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
         error.SettingAuthorityUnavailable => status(.unavailable, .setting_authority_unavailable),
         error.InvalidGenerationPublication => status(.invalid_argument, .invalid_generation_publication),
+        error.GenerationPublicationChanged => status(.conflict, .generation_publication_changed),
+        error.InitialChildProvisionAlreadyCommitted => status(.conflict, .initial_child_provision_already_committed),
         error.InvalidRetirementSummary => status(.corrupt, .invalid_retirement_summary),
         error.InvalidControlReceiptPosition => status(.corrupt, .invalid_control_receipt_position),
         error.InvalidGraphTransfer => status(.invalid_argument, .invalid_graph_transfer),
@@ -1385,6 +1393,8 @@ pub fn errorFromStatus(value: Status) anyerror {
 
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
+        .generation_publication_changed => "GenerationPublicationChanged",
+        .initial_child_provision_already_committed => "InitialChildProvisionAlreadyCommitted",
         .initial_child_publication_changed => "InitialChildPublicationChanged",
         .invalid_initial_child_publication => "InvalidInitialChildPublication",
         .initial_fk_retirement_proof_unavailable => "InitialFkRetirementProofUnavailable",
