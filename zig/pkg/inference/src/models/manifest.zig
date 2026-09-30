@@ -354,6 +354,8 @@ pub const ModelManifest = struct {
     /// (e.g. GLiNER2.5-Decide). Its classification runs the upstream
     /// `classifier` head on the schema_version:2 route.
     gliner_span_declared: bool = false,
+    /// The config declares a valid ModernBERT Laya decision head.
+    laya_declared: bool = false,
     gliner_default_labels: [][]const u8 = &.{},
     gliner_relation_labels: [][]const u8 = &.{},
     gliner_relation_threshold: f32 = 0.0,
@@ -1689,13 +1691,14 @@ fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const
         if (!std.mem.eql(u8, manifest.gliner_model_type, "gliner2") or
             manifest.gliner_token_l == 0 or manifest.gliner_token_sep_struct == 0)
             return error.InvalidModelManifest;
-        if (manifest.capabilities.len != 1 or manifest.tasks.len != 1 or
+        if (!manifest.hasCapability("classification") or !manifest.hasTask("extract") or
+            manifest.capabilities.len > 2 or manifest.tasks.len > 2 or
             manifest.inputs.len != 1 or !std.mem.eql(u8, manifest.inputs[0], "text"))
             return error.InvalidModelManifest;
         for (manifest.capabilities) |capability|
-            if (!std.mem.eql(u8, capability, "classification")) return error.InvalidModelManifest;
+            if (!std.mem.eql(u8, capability, "classification") and !std.mem.eql(u8, capability, "typed_decisions")) return error.InvalidModelManifest;
         for (manifest.tasks) |task|
-            if (!std.mem.eql(u8, task, "extract")) return error.InvalidModelManifest;
+            if (!std.mem.eql(u8, task, "extract") and !std.mem.eql(u8, task, "decide")) return error.InvalidModelManifest;
         if (manifest.model_manifest_declarations.model_type and manifest.model_type != .extractor)
             return error.InvalidModelManifest;
         manifest.model_type = .extractor;
@@ -2370,12 +2373,32 @@ fn findFirstGgufInDir(allocator: std.mem.Allocator, base_dir: []const u8, want_p
     return result;
 }
 
+fn configDeclaresLaya(obj: std.json.ObjectMap) bool {
+    const model_type = obj.get("model_type") orelse return false;
+    if (model_type != .string or
+        (!std.mem.eql(u8, model_type.string, "modernbert") and !std.mem.eql(u8, model_type.string, "modern_bert"))) return false;
+    const raw = obj.get("laya") orelse return false;
+    _ = @import("laya.zig").Config.parse(raw) catch return false;
+    return true;
+}
+
+test "decision architecture declaration requires a Laya ModernBERT config" {
+    const a = std.testing.allocator;
+    var good = try std.json.parseFromSlice(std.json.Value, a, "{\"model_type\":\"modernbert\",\"laya\":{}}", .{});
+    defer good.deinit();
+    try std.testing.expect(configDeclaresLaya(good.value.object));
+    var bad = try std.json.parseFromSlice(std.json.Value, a, "{\"model_type\":\"bert\",\"laya\":{}}", .{});
+    defer bad.deinit();
+    try std.testing.expect(!configDeclaresLaya(bad.value.object));
+}
+
 fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_bytes: []const u8) !void {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
     defer parsed.deinit();
 
     if (parsed.value != .object) return error.InvalidModelConfig;
     const obj = parsed.value.object;
+    manifest.laya_declared = configDeclaresLaya(obj);
     const jina_v5_embedding_config = isJinaV5TextEmbeddingConfig(&obj);
     applyVisionTargetFromModelConfig(manifest, obj);
 
@@ -2572,6 +2595,7 @@ fn parseListingConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator
 
     if (parsed.value != .object) return error.InvalidModelConfig;
     const obj = parsed.value.object;
+    manifest.laya_declared = configDeclaresLaya(obj);
     applyVisionTargetFromModelConfig(manifest, obj);
 
     if (obj.get("architectures")) |v| {
@@ -4134,6 +4158,22 @@ test "explicit GLiNER label-marker decision head is extraction-v2 classification
     invalid.gliner_token_l = 128007;
     invalid.gliner_token_sep_struct = 128001;
     try std.testing.expectError(error.InvalidModelManifest, applyImplicitModelTypeHints(&invalid, "/models/local/decide"));
+}
+
+test "explicit GLiNER label-marker decision head supports typed decisions" {
+    const a = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = a };
+    defer manifest.deinit();
+    try parseModelManifestJson(&manifest, a,
+        \\{"type":"extractor","tasks":["extract","decide"],"capabilities":["classification","typed_decisions"],"inputs":["text"],"gliner_classification_head":"label_marker_mlp"}
+    );
+    manifest.gliner_model_type = try a.dupe(u8, "gliner2");
+    manifest.gliner_token_l = 128007;
+    manifest.gliner_token_sep_struct = 128001;
+    try applyImplicitModelTypeHints(&manifest, "/models/local/decide");
+    try std.testing.expect(manifest.hasTask("decide"));
+    try std.testing.expect(manifest.hasCapability("typed_decisions"));
+    try std.testing.expectEqual(GlinerClassificationHead.label_marker_mlp, manifest.gliner_classification_head);
 }
 
 test "Decide listing reads small marker sidecar for declared classification head" {

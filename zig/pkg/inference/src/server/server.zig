@@ -54,6 +54,7 @@ const extraction_v2 = @import("../extractors/extraction_v2.zig");
 const boundary_executor = @import("../extractors/gliner_boundary_executor.zig");
 const decision_executor = @import("../extractors/gliner_decision_executor.zig");
 const span_v2_executor = @import("../extractors/gliner_span_v2_executor.zig");
+const decide_mod = @import("../extractors/decide.zig");
 const BoundedRequestAllocator = @import("../runtime/bounded_allocator.zig").BoundedAllocator;
 const image_pipeline = @import("../pipelines/image.zig");
 const sparse_embedding_mod = @import("../pipelines/sparse_embedding.zig");
@@ -3154,6 +3155,7 @@ const ModelCounts = struct {
     readers: usize = 0,
     transcribers: usize = 0,
     extractors: usize = 0,
+    deciders: usize = 0,
 
     fn total(self: @This()) usize {
         return self.embedders +
@@ -3163,7 +3165,7 @@ const ModelCounts = struct {
             self.rewriters +
             self.readers +
             self.transcribers +
-            self.extractors;
+            self.extractors + self.deciders;
     }
 };
 
@@ -3198,14 +3200,14 @@ const ReadinessInventory = struct {
 const readiness_inventory_refresh_interval_ms: u64 = 60_000;
 
 fn incrementModelCount(counts: *ModelCounts, task: []const u8) void {
-    if (std.mem.eql(u8, task, "embedders")) counts.embedders += 1 else if (std.mem.eql(u8, task, "rerankers")) counts.rerankers += 1 else if (std.mem.eql(u8, task, "chunkers")) counts.chunkers += 1 else if (std.mem.eql(u8, task, "generators")) counts.generators += 1 else if (std.mem.eql(u8, task, "rewriters")) counts.rewriters += 1 else if (std.mem.eql(u8, task, "readers")) counts.readers += 1 else if (std.mem.eql(u8, task, "transcribers")) counts.transcribers += 1 else if (std.mem.eql(u8, task, "extractors")) counts.extractors += 1;
+    if (std.mem.eql(u8, task, "embedders")) counts.embedders += 1 else if (std.mem.eql(u8, task, "rerankers")) counts.rerankers += 1 else if (std.mem.eql(u8, task, "chunkers")) counts.chunkers += 1 else if (std.mem.eql(u8, task, "generators")) counts.generators += 1 else if (std.mem.eql(u8, task, "rewriters")) counts.rewriters += 1 else if (std.mem.eql(u8, task, "readers")) counts.readers += 1 else if (std.mem.eql(u8, task, "transcribers")) counts.transcribers += 1 else if (std.mem.eql(u8, task, "extractors")) counts.extractors += 1 else if (std.mem.eql(u8, task, "deciders")) counts.deciders += 1;
 }
 
 fn collectModelCounts(node: *Node, allocator: std.mem.Allocator, io: std.Io) ModelCounts {
     const task_names = [_][]const u8{
-        "embedders",  "rerankers",    "chunkers",
-        "generators", "extractors",   "rewriters",
-        "readers",    "transcribers",
+        "embedders",  "rerankers",  "chunkers",
+        "generators", "extractors", "deciders",
+        "rewriters",  "readers",    "transcribers",
     };
     var counts = ModelCounts{};
 
@@ -3274,9 +3276,9 @@ fn collectModelCounts(node: *Node, allocator: std.mem.Allocator, io: std.Io) Mod
 
 fn collectDiscoveredModelCounts(models_dir: []const u8, allocator: std.mem.Allocator, io: std.Io) !ModelCounts {
     const task_names = [_][]const u8{
-        "embedders",  "rerankers",    "chunkers",
-        "generators", "extractors",   "rewriters",
-        "readers",    "transcribers",
+        "embedders",  "rerankers",  "chunkers",
+        "generators", "extractors", "deciders",
+        "rewriters",  "readers",    "transcribers",
     };
     var counts = ModelCounts{};
 
@@ -8761,7 +8763,7 @@ pub const Node = struct {
         control: ?InferenceExecutionControl,
     ) !extracting_api.Response {
         var failure = extraction_v2.FailureContext{};
-        return self.extractV2WithAdmission(allocator, .{ .json = request_json }, .direct, control, &failure, null);
+        return self.extractV2WithAdmission(allocator, .{ .json = request_json }, .direct, control, &failure, null, "extract");
     }
 
     fn extractV2WithAdmission(
@@ -8772,8 +8774,12 @@ pub const Node = struct {
         supplied_control: ?InferenceExecutionControl,
         failure: *extraction_v2.FailureContext,
         response_limit: ?usize,
+        metric_task: []const u8,
     ) !extracting_api.Response {
-        self.metrics.incRequest(if (admission_owner == .direct) "extract.local" else "extract");
+        self.metrics.incRequest(if (std.mem.eql(u8, metric_task, "decide"))
+            (if (admission_owner == .direct) "decide.local" else "decide")
+        else
+            (if (admission_owner == .direct) "extract.local" else "extract"));
         defer self.metrics.decActive();
         var trace = self.metrics.extraction_v2.begin(if (admission_owner == .direct) .direct else .http);
         var trace_error: ?anyerror = null;
@@ -8873,6 +8879,11 @@ pub const Node = struct {
             return err;
         };
         if (!is_laya) return null;
+        // The span decision checkpoint also declares typed_decisions. Its
+        // extraction path is the GLiNER classifier, not the Laya pipeline.
+        var listing = try manifest_mod.loadListingFromDir(scratch, path);
+        defer listing.deinit();
+        if (!listing.laya_declared) return null;
         const laya = @import("../extractors/laya.zig");
         var arena = std.heap.ArenaAllocator.init(scratch);
         defer arena.deinit();
@@ -9186,7 +9197,7 @@ pub const Node = struct {
         const schema_version = request.schema_version orelse 1;
         if (schema_version == 2) {
             var failure = extraction_v2.FailureContext{};
-            return self.extractV2WithAdmission(allocator, .{ .typed = .{ .model_name = model_name, .request = request } }, admission_owner, supplied_control, &failure, request.max_response_bytes);
+            return self.extractV2WithAdmission(allocator, .{ .typed = .{ .model_name = model_name, .request = request } }, admission_owner, supplied_control, &failure, request.max_response_bytes, "extract");
         }
         if (supplied_control) |active| try active.check();
         if (schema_version != 1) return error.UnsupportedExtractionSchemaVersion;
@@ -18866,7 +18877,7 @@ pub const Node = struct {
                 return extractionV2FailureResponse(ctx, error.UnsupportedExtractionInput, .{});
             };
             var failure = extraction_v2.FailureContext{};
-            var response = self.extractV2WithAdmission(ctx.allocator, .{ .json = effective_request_json }, .http_route, execution_control, &failure, null) catch |err|
+            var response = self.extractV2WithAdmission(ctx.allocator, .{ .json = effective_request_json }, .http_route, execution_control, &failure, null, "extract") catch |err|
                 return extractionV2FailureResponse(ctx, err, failure);
             defer response.deinit();
             try ctx.setHeader("content-type", "application/json");
@@ -19137,6 +19148,64 @@ pub const Node = struct {
         return self.extractJSON(ctx);
     }
 
+    /// Embedded callers use the same validated contract and admission path as
+    /// HTTP. The returned JSON is owned by `allocator`.
+    pub fn decideDirectJsonWithControl(self: *Node, allocator: std.mem.Allocator, request_json: []const u8, control: ?InferenceExecutionControl) ![]u8 {
+        return self.decideJsonWithAdmission(allocator, request_json, .direct, control);
+    }
+
+    fn decideJsonWithAdmission(self: *Node, allocator: std.mem.Allocator, request_json: []const u8, owner: ExtractionAdmissionOwner, control: ?InferenceExecutionControl) ![]u8 {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const request = try decide_mod.parse(a, request_json);
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const io = self.inferenceIo(a, null, &owned_io);
+        const path = try self.resolveRequestModelPath(a, io, request.model, "extractors");
+        var manifest = try manifest_mod.loadListingFromDir(a, path);
+        defer manifest.deinit();
+        if (!manifest.hasCapability("typed_decisions")) return error.UnsupportedDecideModel;
+        const gliner = manifest.gliner_architecture == .span and manifest.gliner_span_declared;
+        if (!gliner and !manifest.laya_declared) return error.UnsupportedDecideModel;
+        const extraction_input = try decide_mod.extractionInput(a, request, gliner);
+        const contract = try resolvedInferenceExecutorContract(self, "decide", &manifest);
+        var max_labels: usize = 0;
+        for (request.questions) |question| max_labels = @max(max_labels, question.labels.len);
+        try validateTextExecutorInvocation(contract, 1, &.{request.state}, 0, 0, max_labels, extraction_input.schema_bytes);
+        var failure = extraction_v2.FailureContext{};
+        var extraction = try self.extractV2WithAdmission(a, .{ .json = extraction_input.json }, owner, control, &failure, null, "decide");
+        defer extraction.deinit();
+        const response_json = try decide_mod.responseJson(a, request, extraction.json, gliner);
+        return allocator.dupe(u8, response_json);
+    }
+
+    pub fn decide(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const request_json = (try ctx.body()) orelse return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "Request body required" });
+        const response_json = self.decideJsonWithAdmission(ctx.allocator, request_json, .http_route, httpInferenceExecutionControl(self, ctx)) catch |err| return decideFailureResponse(ctx, err);
+        defer ctx.allocator.free(response_json);
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.response.body(response_json);
+        return ctx.response.build();
+    }
+
+    fn decideFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        return switch (err) {
+            error.DecideRequestLimitExceeded => ctx.status(413).json(.{ .@"error" = "REQUEST_TOO_LARGE", .message = @errorName(err) }),
+            error.InvalidDecideRequest => ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) }),
+            error.ModelNotFound => ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = @errorName(err) }),
+            error.InvalidModelIdentifier,
+            error.ModelOutsideModelsDir,
+            error.ModelNotSpecified,
+            error.FileNotFound,
+            error.NotDir,
+            error.AmbiguousModelIdentifier,
+            => requestModelResolutionError(ctx, err),
+            error.UnsupportedDecideModel => ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = @errorName(err) }),
+            else => extractionV2FailureResponse(ctx, err, .{}),
+        };
+    }
+
     fn downloadImagesForExtraction(
         self: *Node,
         ctx: *httpx.Context,
@@ -19240,8 +19309,9 @@ pub const Node = struct {
         }
 
         const task_names = [_][]const u8{
-            "embedders",  "rerankers", "chunkers", "generators",
-            "extractors", "rewriters", "readers",  "transcribers",
+            "embedders",    "rerankers", "chunkers",  "generators",
+            "extractors",   "deciders",  "rewriters", "readers",
+            "transcribers",
         };
         // Keep models alive through unlocked listing work without counting
         // observation as inference use or extending their idle residency.
@@ -21828,6 +21898,11 @@ fn taskMatchesModelListing(
     // to an empty tasks/capabilities set below and is excluded the same way
     // every other unsupported model is.
     if (std.mem.eql(u8, gliner_model_type, "gliner2.5") and !gliner_boundary_model.runtime_available) return false;
+    if (std.mem.eql(u8, task, "deciders")) {
+        if (!model_caps.hasCapability(capabilities, "typed_decisions")) return false;
+        for (tasks) |candidate| if (std.mem.eql(u8, candidate, "decide")) return true;
+        return false;
+    }
     // Classification is a public extraction capability. Keep `classifier` as
     // an internal pipeline kind without publishing a parallel API/catalog task.
     if (std.mem.eql(u8, task, "classifiers")) return false;
@@ -21896,6 +21971,9 @@ fn manifestMatchesModelListingTask(
     manifest: *const manifest_mod.ModelManifest,
 ) bool {
     if (std.mem.eql(u8, task, "readers") and isQwen3VlReadModel(manifest)) return true;
+    if (std.mem.eql(u8, task, "deciders") and
+        !manifest.laya_declared and
+        !(manifest.gliner_architecture == .span and manifest.gliner_span_declared)) return false;
     return taskMatchesModelListing(
         task,
         model_kind,
@@ -22076,6 +22154,7 @@ fn normalizedInferenceTask(task: []const u8) ?[]const u8 {
         .{ "rerankers", "rerank" },
         .{ "chunkers", "chunk" },
         .{ "extractors", "extract" },
+        .{ "deciders", "decide" },
         .{ "rewriters", "rewrite" },
         .{ "transcribers", "transcribe" },
     };
@@ -22135,6 +22214,7 @@ pub fn resolvedExecutorModalities(
         .text = manifest_text,
         .image = executor_kind.scoresRerankImages(),
     };
+    if (std.mem.eql(u8, resolved_task, "decide")) return .{ .text = manifest_text };
     if (std.mem.eql(u8, resolved_task, "extract")) return .{
         .text = manifest_text,
         .image = manifest_image,
@@ -22159,7 +22239,7 @@ pub fn resolvedTaskResultCardinality(resolved_task: []const u8) []const u8 {
 }
 
 pub fn resolvedTaskPromptPolicy(resolved_task: []const u8) []const u8 {
-    return if (std.mem.eql(u8, resolved_task, "extract"))
+    return if (std.mem.eql(u8, resolved_task, "extract") or std.mem.eql(u8, resolved_task, "decide"))
         "structured_schema"
     else if (std.mem.eql(u8, resolved_task, "chunk") or std.mem.eql(u8, resolved_task, "transcribe"))
         "model_default"
@@ -22479,6 +22559,7 @@ pub fn resolvedTaskOutput(resolved_task: []const u8) []const u8 {
     if (std.mem.eql(u8, resolved_task, "rerank")) return "ranked_items";
     if (std.mem.eql(u8, resolved_task, "chunk")) return "chunks";
     if (std.mem.eql(u8, resolved_task, "extract")) return "extraction";
+    if (std.mem.eql(u8, resolved_task, "decide")) return "decisions";
     if (std.mem.eql(u8, resolved_task, "rewrite")) return "rewritten_text";
     if (std.mem.eql(u8, resolved_task, "transcribe")) return "transcription";
     unreachable;
@@ -22834,7 +22915,7 @@ pub fn resolveInferenceBatchCapabilities(
     var max_text_bytes_per_item: ?usize = null;
     var max_input_tokens_per_item: ?usize = null;
     var max_output_tokens_per_item: ?usize = if (std.mem.eql(u8, resolved_task, "read")) max_read_tokens else null;
-    var max_candidates_per_request: ?usize = if (std.mem.eql(u8, resolved_task, "extract")) max_classification_labels else null;
+    var max_candidates_per_request: ?usize = if (std.mem.eql(u8, resolved_task, "extract")) max_classification_labels else if (std.mem.eql(u8, resolved_task, "decide")) 64 else null;
     var max_schema_bytes: ?usize = null;
 
     for (manifest_capabilities) |capability| {
@@ -23767,6 +23848,7 @@ fn inferenceHttpRouteAdmission(comptime method: []const u8, comptime path: []con
             std.mem.eql(u8, path, "/transcription/sessions/:session_id/stream") or
             std.mem.eql(u8, path, "/embed") or
             std.mem.eql(u8, path, "/embeddings") or
+            std.mem.eql(u8, path, "/decide") or
             std.mem.eql(u8, path, "/extract") or
             std.mem.eql(u8, path, "/generate") or
             std.mem.eql(u8, path, "/generate/batch") or
@@ -28364,6 +28446,27 @@ test "taskMatchesModelListing exposes extraction-capable models only as extracto
     try std.testing.expect(!taskMatchesModelListing("extractors", "classifier", "", &.{"classify"}, &.{}, false));
     try std.testing.expect(!taskMatchesModelListing("classifiers", "classifier", "", &.{"classify"}, &.{}, true));
     try std.testing.expect(!taskMatchesModelListing("classifiers", "extractor", "gliner2", &.{}, &.{"classification"}, true));
+    try std.testing.expect(taskMatchesModelListing("deciders", "extractor", "", &.{ "extract", "decide" }, &.{"typed_decisions"}, false));
+    try std.testing.expect(!taskMatchesModelListing("deciders", "extractor", "", &.{"extract"}, &.{"typed_decisions"}, false));
+    try std.testing.expect(!taskMatchesModelListing("deciders", "extractor", "", &.{"decide"}, &.{"classification"}, false));
+}
+
+test "decider listing requires a registered decision architecture" {
+    var tasks = [_][]const u8{ "extract", "decide" };
+    var capabilities = [_][]const u8{"typed_decisions"};
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .extractor,
+        .tasks = &tasks,
+        .capabilities = &capabilities,
+    };
+    try std.testing.expect(!manifestMatchesModelListingTask("deciders", "extractor", &manifest));
+    manifest.laya_declared = true;
+    try std.testing.expect(manifestMatchesModelListingTask("deciders", "extractor", &manifest));
+    manifest.laya_declared = false;
+    manifest.gliner_architecture = .span;
+    manifest.gliner_span_declared = true;
+    try std.testing.expect(manifestMatchesModelListingTask("deciders", "extractor", &manifest));
 }
 
 test "classification extraction applies top-k to single-label and threshold to multi-label taxonomies" {
@@ -28524,6 +28627,26 @@ test "ambiguous model resolution returns an actionable conflict response" {
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, ambiguous_model_error_message) != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "owner/name:variant") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "MODEL_RESOLUTION_FAILED") == null);
+}
+
+test "decide maps model resolution errors to client responses" {
+    const cases = [_]struct { anyerror, u16, []const u8 }{
+        .{ error.InvalidModelIdentifier, 400, "INVALID_REQUEST" },
+        .{ error.ModelOutsideModelsDir, 400, "INVALID_REQUEST" },
+        .{ error.ModelNotFound, 404, "MODEL_NOT_FOUND" },
+        .{ error.AmbiguousModelIdentifier, 409, "AMBIGUOUS_MODEL" },
+        .{ error.InvalidDecideOutput, 500, "INFERENCE_FAILED" },
+    };
+    for (cases) |case| {
+        var request = try httpx.Request.init(std.testing.allocator, .POST, "/ai/v1/decide");
+        defer request.deinit();
+        var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try Node.decideFailureResponse(&ctx, case[0]);
+        defer response.deinit();
+        try std.testing.expectEqual(case[1], response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, case[2]) != null);
+    }
 }
 
 test "HTTP model resolution is canonical and contained while trusted resolution accepts absolute paths" {
