@@ -8971,6 +8971,40 @@ test "CUDA A4B serving reuses retained workspace and unwinds failed requests" {
         try std.testing.expectEqual(@as(usize, 1024), limits.host_limit_bytes);
         try std.testing.expectEqual(@as(usize, @intCast(config.memory_budget_bytes)), limits.backend_limit_bytes);
         try std.testing.expectEqual(limits.host_limit_bytes + limits.backend_limit_bytes, limits.combined_limit_bytes);
+        // Plan a real long prompt before borrowing. The generic scratch cap
+        // permits a chunk larger than the session's retained workspace.
+        const gpt_config = @import("../models/gpt.zig").Config{
+            .family = .gemma,
+            .hidden_size = 2816,
+            .num_hidden_layers = 30,
+            .num_attention_heads = 16,
+            .num_key_value_heads = 1,
+            .vocab_size = 262144,
+            .num_local_experts = 128,
+            .num_experts_per_tok = 8,
+            .num_shared_experts = 1,
+            .expert_intermediate_size = 704,
+        };
+        const components = [_]memory.GptGenerationBudgetComponent{.{
+            .backend = .cuda,
+            .kv_dtype = .f16,
+            .config = gpt_config,
+            .workspace_capacity = session.generationWorkspaceCapacity(),
+        }};
+        var sizing_limits = limits;
+        sizing_limits.scratch_limit_bytes = 384 * 1024 * 1024;
+        var sizing = memory.RunBudget.init(sizing_limits);
+        const prefill = try memory.reserveGptGenerationPrefill(&sizing, &components, 2048, 1, 2048);
+        try std.testing.expect(prefill.max_chunk_rows < 2048);
+        const estimate = try memory.estimateGptGeneration(.cuda, .f16, gpt_config, 2048, 1, prefill.max_chunk_rows);
+        try std.testing.expect(estimate.scratch_bytes <= workspace.capacity.backend_scratch_bytes);
+        var prompt_lease = try manager.acquireGenerationResources(&.{.{
+            .session = session,
+            .resources = .{ .backend_class = .gpu, .limits = limits, .amounts = .fromEstimate(estimate) },
+        }});
+        try std.testing.expectEqualDeep(plan.resident, controller.snapshot());
+        prompt_lease.release();
+        try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, workspace.borrowed.snapshot());
         const one_byte = memory.AdmissionAmounts{ .backend_scratch_bytes = 1 };
         // AJ's reproduction: preserving the floor alone still double-charges.
         try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryAcquire(.gpu, limits, one_byte, false));

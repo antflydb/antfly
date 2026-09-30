@@ -309,6 +309,8 @@ pub const DenialLimit = enum {
     combined_total,
     kv_total,
     scratch_total,
+    workspace_kv,
+    workspace_scratch,
     shared_cache_host,
     shared_cache_backend,
 };
@@ -2712,6 +2714,24 @@ pub const GptGenerationBudgetComponent = struct {
     kv_dtype: kv_pool.KvDType,
     config: gpt_mod.Config,
     kv_capacity_policy: GenerationKvCapacityPolicy = .full_history,
+    /// Per-session credit already charged to the resident model lease. These
+    /// bounds constrain chunk selection independently of the process envelope.
+    /// Null means ordinary admission; zero capacity provides no workspace.
+    workspace_capacity: ?AdmissionAmounts = null,
+
+    fn reserveEstimate(self: @This(), budget: *RunBudget, estimate: Estimate) !void {
+        if (self.workspace_capacity) |capacity| {
+            if (estimate.kv_tier == .backend and estimate.kv_bytes > capacity.backend_kv_bytes) {
+                budget.recordDenial(.workspace_kv, .{ .kind = .kv, .tier = .backend, .bytes = estimate.kv_bytes }, 0, estimate.kv_bytes, capacity.backend_kv_bytes);
+                return error.MemoryBudgetExceeded;
+            }
+            if (estimate.scratch_tier == .backend and estimate.scratch_bytes > capacity.backend_scratch_bytes) {
+                budget.recordDenial(.workspace_scratch, .{ .kind = .scratch, .tier = .backend, .bytes = estimate.scratch_bytes }, 0, estimate.scratch_bytes, capacity.backend_scratch_bytes);
+                return error.MemoryBudgetExceeded;
+            }
+        }
+        try budget.reserveEstimate(estimate);
+    }
 };
 
 pub const GptGenerationPrefillAdmission = struct {
@@ -2755,7 +2775,7 @@ pub fn reserveGptGenerationPrefill(
         var trial = budget.*;
         var failed = false;
         for (components) |component| {
-            trial.reserveEstimate(try estimateGptGenerationForKvPolicy(
+            component.reserveEstimate(&trial, try estimateGptGenerationForKvPolicy(
                 component.backend,
                 component.kv_dtype,
                 component.config,
@@ -4117,6 +4137,43 @@ test "cuda Gemma4 measured 512 ceiling returns plan scratch metadata" {
     try std.testing.expectEqual(@as(usize, 512), admission.max_chunk_rows);
     try std.testing.expect(admission.max_scratch_bytes > 0);
     try std.testing.expectEqual(admission.max_scratch_bytes, budget.scratchTotalBytes());
+}
+
+test "generation budget respects each workspace and stricter operator caps" {
+    const cfg = gpt_mod.Config{
+        .hidden_size = 8,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 1,
+        .attention_head_dim = 8,
+        .vocab_size = 1,
+    };
+    const small = try estimateGptGeneration(.cuda, .f16, cfg, 512, 1, 64);
+    var components = [_]GptGenerationBudgetComponent{
+        .{ .backend = .cuda, .kv_dtype = .f16, .config = cfg, .workspace_capacity = .{ .backend_kv_bytes = small.kv_bytes, .backend_scratch_bytes = small.scratch_bytes * 8 } },
+        .{ .backend = .cuda, .kv_dtype = .f16, .config = cfg, .workspace_capacity = .{ .backend_kv_bytes = small.kv_bytes, .backend_scratch_bytes = small.scratch_bytes } },
+    };
+    // The larger target allowance must not hide the draft's smaller workspace.
+    var budget = RunBudget.init(.{});
+    try std.testing.expectEqual(@as(usize, 64), try reserveGptGenerationAtLargestChunk(&budget, &components, 512, 1, 512));
+    try std.testing.expectEqual(small.scratch_bytes * 2, budget.scratchTotalBytes());
+    // Explicit request caps still constrain the sum of both components.
+    const minimum = try estimateGptGeneration(.cuda, .f16, cfg, 512, 1, 32);
+    budget = RunBudget.init(.{ .scratch_limit_bytes = minimum.scratch_bytes * 2 });
+    try std.testing.expectEqual(@as(usize, 32), try reserveGptGenerationAtLargestChunk(&budget, &components, 512, 1, 512));
+    // Zero credit is a hard bound, unlike zero in the process-wide Limits.
+    components[1].workspace_capacity.?.backend_scratch_bytes = 0;
+    budget = RunBudget.init(.{});
+    try std.testing.expectError(error.MemoryBudgetExceeded, reserveGptGenerationAtLargestChunk(&budget, &components, 512, 1, 512));
+    try std.testing.expectEqual(@as(usize, 0), budget.kvTotalBytes());
+    try std.testing.expectEqual(@as(usize, 0), budget.scratchTotalBytes());
+    try std.testing.expectEqual(DenialLimit.workspace_scratch, budget.last_denial.?.limit);
+    components[1].workspace_capacity.?.backend_scratch_bytes = small.scratch_bytes;
+    components[1].workspace_capacity.?.backend_kv_bytes = small.kv_bytes - 1;
+    budget = RunBudget.init(.{});
+    try std.testing.expectError(error.MemoryBudgetExceeded, reserveGptGenerationAtLargestChunk(&budget, &components, 512, 1, 512));
+    try std.testing.expectEqual(DenialLimit.workspace_kv, budget.last_denial.?.limit);
+    try std.testing.expectEqual(@as(usize, 0), budget.kvTotalBytes());
+    try std.testing.expectEqual(@as(usize, 0), budget.scratchTotalBytes());
 }
 
 test "generation budget rolls back all components when the minimum chunk fails" {

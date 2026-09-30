@@ -5385,6 +5385,7 @@ pub const Node = struct {
                 .kv_dtype = kv_dtype,
                 .config = gpt_config,
                 .kv_capacity_policy = kv_capacity_policy,
+                .workspace_capacity = model.session.generationWorkspaceCapacity(),
             },
         };
         const direct_prefill_ceiling = @min(
@@ -12516,6 +12517,7 @@ pub const Node = struct {
             .kv_dtype = kv_dtype,
             .config = gpt_config,
             .kv_capacity_policy = target_kv_capacity_policy,
+            .workspace_capacity = model.session.generationWorkspaceCapacity(),
         };
         var budget_component_count: usize = 1;
         if (draft_model_for_generation != null) {
@@ -12523,6 +12525,7 @@ pub const Node = struct {
                 .backend = draft_backend_kind.?,
                 .kv_dtype = draft_kv_dtype.?,
                 .config = draft_gpt_config.?,
+                .workspace_capacity = draft_model_for_generation.?.session.generationWorkspaceCapacity(),
             };
             budget_component_count = 2;
         }
@@ -14532,7 +14535,7 @@ pub const Node = struct {
                 }
                 var runnable_count: usize = 0;
                 const budget_components = [_]runtime.tier.memory.GptGenerationBudgetComponent{
-                    .{ .backend = backend_kind, .kv_dtype = kv_dtype, .config = gpt_config },
+                    .{ .backend = backend_kind, .kv_dtype = kv_dtype, .config = gpt_config, .workspace_capacity = model.session.generationWorkspaceCapacity() },
                 };
                 for (group_indices.items, 0..) |idx, pos| {
                     if (!pending[idx]) continue;

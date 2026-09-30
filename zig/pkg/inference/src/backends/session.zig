@@ -569,6 +569,12 @@ pub const Session = struct {
     /// Borrowed from the model/runtime owner; stable for every session copy.
     execution_gate: ?*std.atomic.Mutex = null,
 
+    /// Stable planning capacity, shared by all copies of this session. Live
+    /// contention is resolved by workspace acquisition after chunk selection.
+    pub fn generationWorkspaceCapacity(self: Session) ?memory.AdmissionAmounts {
+        return if (self.generation_workspace) |workspace| workspace.capacity else null;
+    }
+
     pub const VTable = struct {
         hasLayaDecisions: ?*const fn (ptr: *anyopaque) bool = null,
         runLayaDecisions: ?*const fn (ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) anyerror!?[]Tensor = null,
