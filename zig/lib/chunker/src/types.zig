@@ -17,6 +17,14 @@ const std = @import("std");
 pub const max_chunk_results: usize = 4096;
 pub const max_chunk_target_tokens: usize = 1_000_000;
 pub const max_chunk_audio_window_ms: usize = 24 * 60 * 60 * 1000;
+/// Frame-count ceiling for GIF chunking when the caller leaves `max_chunks`
+/// unset. Animated GIFs decode every frame to raw RGBA before chunking, so
+/// unlike text (already fully resident, and now unbounded by default) this
+/// number bounds real decode work/memory — a decompression-bomb guard, not
+/// the "silent truncation" default this removes for text. Kept as its own
+/// named constant (rather than reading `FixedChunkConfig{}.max_chunks`) so
+/// the two defaults can no longer drift together by accident.
+pub const default_gif_max_frames: usize = 50;
 /// Hard retained-output ceiling used by direct/local fixed multimodal calls.
 /// HTTP callers may select a smaller request-scoped ceiling.
 pub const default_max_chunk_owned_output_bytes: usize = 100 * 1024 * 1024;
@@ -74,7 +82,9 @@ pub const Chunk = struct {
 pub const FixedTextConfig = struct {
     target_tokens: usize = 500,
     overlap_tokens: usize = 50,
-    max_chunks: usize = 50,
+    /// 0 = unlimited: chunk the entire unit. An explicit value is still
+    /// bounded by `max_chunk_results` in `validate()`.
+    max_chunks: usize = 0,
     separator: []const u8 = "\n\n",
 
     pub fn validate(self: @This()) !void {
@@ -101,7 +111,11 @@ pub const AudioChunkOptions = struct {
 
 pub const FixedChunkConfig = struct {
     model: []const u8 = "fixed",
-    max_chunks: usize = 50,
+    /// 0 = unlimited for text (see `FixedTextConfig.max_chunks`) and for WAV
+    /// windows (`chunkWav` already only enforces this when > 0). GIF frame
+    /// decoding uses the dedicated `default_gif_max_frames` instead of this
+    /// default — see that constant's doc comment.
+    max_chunks: usize = 0,
     threshold: ?f32 = null,
     text: FixedTextConfig = .{},
     audio: AudioChunkOptions = .{},

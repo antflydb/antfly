@@ -29435,7 +29435,7 @@ fn chunkInputWorkingAdmission(
         );
         const frame_pixels = std.math.mul(usize, @as(usize, info.width), @as(usize, info.height)) catch
             return error.ImageTooLarge;
-        const max_frames = if (config.max_chunks > 0) config.max_chunks else (lib_chunker.FixedChunkConfig{}).max_chunks;
+        const max_frames = if (config.max_chunks > 0) config.max_chunks else lib_chunker.default_gif_max_frames;
         const potential_pixels = std.math.mul(usize, frame_pixels, max_frames) catch
             std.math.maxInt(usize);
         const admitted_pixels = @min(

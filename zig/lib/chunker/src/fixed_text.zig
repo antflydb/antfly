@@ -31,7 +31,7 @@ pub fn chunkText(alloc: Allocator, text: []const u8, cfg: types.FixedTextConfig)
 
     const target_tokens = if (cfg.target_tokens > 0) cfg.target_tokens else 500;
     const overlap_tokens = cfg.overlap_tokens;
-    const max_chunks = if (cfg.max_chunks > 0) cfg.max_chunks else 50;
+    const max_chunks = cfg.max_chunks; // 0 = unlimited (chunk the whole unit)
     const separator = if (cfg.separator.len > 0) cfg.separator else "\n\n";
     if (overlap_tokens >= target_tokens) return error.InvalidChunkOverlap;
 
@@ -66,7 +66,7 @@ pub fn chunkText(alloc: Allocator, text: []const u8, cfg: types.FixedTextConfig)
             try chunks.append(alloc, buildChunk(text, current.items, chunk_id));
             previous_start = current.items[0].start;
             chunk_id += 1;
-            if (chunks.items.len >= max_chunks) return try chunks.toOwnedSlice(alloc);
+            if (max_chunks != 0 and chunks.items.len >= max_chunks) return try chunks.toOwnedSlice(alloc);
 
             previous_text = chunks.items[chunks.items.len - 1].text.?;
             current.clearRetainingCapacity();
@@ -95,7 +95,7 @@ pub fn chunkText(alloc: Allocator, text: []const u8, cfg: types.FixedTextConfig)
         });
     }
 
-    if (current.items.len > 0 and chunks.items.len < max_chunks) {
+    if (current.items.len > 0 and (max_chunks == 0 or chunks.items.len < max_chunks)) {
         try chunks.append(alloc, buildChunk(text, current.items, chunk_id));
     }
 
@@ -366,6 +366,32 @@ test "fixed text chunker splits by token target" {
     try std.testing.expect(chunks.len >= 2);
     try std.testing.expectEqualStrings("text/plain", chunks[0].mime_type);
     try std.testing.expectEqual(@as(?u32, 0), chunks[0].start_char);
+}
+
+test "fixed text chunker has no implicit max_chunks cap" {
+    const alloc = std.testing.allocator;
+    // 120 short paragraphs; at target_tokens=4 this produced exactly 50
+    // chunks (and silently dropped the rest) before the fix.
+    var buf = std.ArrayListUnmanaged(u8).empty;
+    defer buf.deinit(alloc);
+    for (0..120) |i| {
+        try buf.print(alloc, "para{d} alpha beta gamma\n\n", .{i});
+    }
+    const chunks = try chunkText(alloc, buf.items, .{ .target_tokens = 4, .overlap_tokens = 0 });
+    defer alloc.free(chunks);
+    try std.testing.expect(chunks.len > 50);
+    // last chunk must reach (or nearly reach) the end of input — nothing silently dropped.
+    try std.testing.expect(chunks[chunks.len - 1].end_char.? > buf.items.len - 64);
+}
+
+test "fixed text chunker still honors an explicit max_chunks cap" {
+    const alloc = std.testing.allocator;
+    var buf = std.ArrayListUnmanaged(u8).empty;
+    defer buf.deinit(alloc);
+    for (0..120) |i| try buf.print(alloc, "para{d} alpha beta gamma\n\n", .{i});
+    const chunks = try chunkText(alloc, buf.items, .{ .target_tokens = 4, .overlap_tokens = 0, .max_chunks = 10 });
+    defer alloc.free(chunks);
+    try std.testing.expectEqual(@as(usize, 10), chunks.len);
 }
 
 test "fixed text chunker rejects invalid overlap" {
