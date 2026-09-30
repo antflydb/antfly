@@ -1459,11 +1459,35 @@ pub fn create(b: *std.Build) ?Artifacts {
         standalone_initial_fk_tests.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(@as(@import("pkg/antfly/build/runtime.zig").RuntimeLibraryUnit, unit))].?);
     const run_standalone_initial_fk_tests = antfly_tests_build.addFilteredTestRunArtifact(b, standalone_initial_fk_tests);
     b.step("antfly-standalone-initial-fk-test", "Run linked native standalone initial-FK owner publication tests").dependOn(&run_standalone_initial_fk_tests.step);
-    const graph_transfer_tests = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/graph_transfer_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    }) });
+    // graph_transfer_test.zig's seed files reach, through ordinary relative
+    // imports, into the same wide storage graph the main test root depends
+    // on (down to db.zig and its own antfly_hash/vopr uses). A standalone
+    // module with a hand-picked or copied dependency subset collides on file
+    // ownership the moment that closure overlaps a big named import's own
+    // relative reach (e.g. vopr's own path back to root.zig's
+    // antfly_root-aliased files). Reuse antfly_test_mod itself, already
+    // self-consistently wired for exactly this file graph, and narrow the
+    // compiled test set with exact filters instead.
+    const graph_transfer_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{
+            "ordered artifact inventory graph mutation scopes fence physical and embedded owners on tombstones",
+            "physical artifact catalog view rejects truncation and trailing data",
+            "online graph transfer rebinds edge bytes and rejects stale incarnations",
+            "online graph transfer preserves manifests contenders counts and tombstones",
+            "online graph transfer rejects foreign ownership hidden in a manifest",
+            "online graph transfer pinned plan preserves distinct logical endpoints",
+            "online graph transfer requires explicit source effect protocol for values and tombstones",
+            "source artifact batch rejects impossible counts before allocation",
+            "source artifact batch validates full ordered graph framing before exposing a prefix",
+            "source artifact descriptors resume short reads without materializing values",
+            "ordered artifact inventory source layout cache is owned and copy-attempt bound",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
     const run_graph_transfer_tests = b.addRunArtifact(graph_transfer_tests);
     b.step("antfly-graph-transfer-test", "Validate certified graph artifact generation transfer").dependOn(&run_graph_transfer_tests.step);
     owner_tests.unit_test_step.dependOn(&run_graph_transfer_tests.step);

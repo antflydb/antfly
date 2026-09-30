@@ -254,6 +254,7 @@ comptime {
     _ = @import("hot_standby/operator.zig");
     _ = @import("hot_standby/owner_job_gate.zig");
     _ = @import("hot_standby/primary.zig");
+    _ = @import("hot_standby/primary_effect.zig");
     _ = @import("hot_standby/public_gate_state.zig");
     _ = @import("hot_standby/read_gate.zig");
     _ = @import("hot_standby/rejoin.zig");

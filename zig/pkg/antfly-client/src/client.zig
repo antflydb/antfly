@@ -296,7 +296,7 @@ pub const AntflyClient = struct {
     }
 
     pub fn closePreparedSQL(self: *AntflyClient, prepared_id: []const u8) !openapi.ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
-        return self.inner.closePreparedSQL(prepared_id);
+        return self.inner.closePreparedSQL(prepared_id, null);
     }
 
     fn sqlPost(self: *AntflyClient, comptime T: type, path: []const u8, request: anytype) !openapi.ApiResponse(T) {
