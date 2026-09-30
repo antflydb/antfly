@@ -277,6 +277,33 @@ test "distributed txn rewrite admission closes current and historical dependenci
         try std.testing.expectEqual(@as(usize, 1), target.rewrite_sources.len);
         try std.testing.expect(target.rewrite_sources[0].fence.eql(target.replace.?.fences[0]));
     }
+    // Frozen live source-copy artifacts retain their own authenticated proof,
+    // not the accepted-generation records of a repository backup. Historical
+    // FK schemas must remain valid through this transition as well.
+    var frozen = plan;
+    const frozen_targets = try alloc.dupe(stages.Target, plan.targets);
+    frozen.targets = frozen_targets;
+    frozen.preparing_sources = false;
+    frozen.cohort_digest = @splat(9);
+    for (frozen_targets) |*target| {
+        const scope = target.rewrite_sources[0];
+        const artifacts = try alloc.alloc(stages.SourceArtifact, 1);
+        artifacts[0] = .{
+            .target_group_id = scope.fence.peer_group_id,
+            .source_namespace = scope.fence.namespace,
+            .format = .portable,
+            .snapshot_path = "source.afb2",
+            .artifact_size_bytes = 100,
+            .artifact_sha256 = @splat(5),
+            .rewrite = .{ .program_digest = target.rewrite.?.program_digest, .retained_pin = scope.pin(), .snapshot_certificate = @splat(5), .retained_epoch = scope.consumer_epoch, .retained_start = 1, .source_applied_index = 20, .source_scope = scope },
+        };
+        target.source_artifacts = artifacts;
+    }
+    try frozen.validate(alloc);
+    const unbound = try alloc.dupe(stages.SourceArtifact, frozen.targets[0].source_artifacts);
+    unbound[0].rewrite = null;
+    frozen_targets[0].source_artifacts = unbound;
+    try std.testing.expectError(error.InvalidRestoreStaging, frozen.validate(alloc));
     observer.eligible = false;
     try std.testing.expectError(error.UnsupportedRestoreSource, build(alloc, plan.id, cohort, &ranges, "parents", proposed, &observer));
     try std.testing.expectEqual(observer.calls, observer.released);

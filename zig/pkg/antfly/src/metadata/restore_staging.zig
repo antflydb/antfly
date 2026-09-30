@@ -748,7 +748,12 @@ pub const Plan = struct {
                     if (target.source_generation_admissions.len != 0 and
                         !std.mem.eql(u8, parent.name, fk.parent_table)) return error.RestoreDependencyMissing;
                     try @import("../schema/relational_foreign_key_target.zig").validate(alloc, schema_json, parent.name, parent.schema_json);
-                    if (target.source_artifacts.len != 0 and target.source_artifacts[0].format == .portable) {
+                    // Repository portable backups restore accepted-generation
+                    // proofs. Live rewrites instead bind authenticated source
+                    // pins/certificates above and rebuild claims behind the
+                    // cohort validation and final-cut barriers. Their decoder
+                    // artifacts must not import source admission authority.
+                    if (target.rewrite == null and target.source_artifacts.len != 0 and target.source_artifacts[0].format == .portable) {
                         const selected = selected_parent orelse return error.RestoreDependencyMissing;
                         if (selected.source_generation_admissions.len == 0) return error.RestoreSourceProofMissing;
                         const source_generation = try foreignGenerationForTableId(alloc, target, target.source_table_id, fk.name);

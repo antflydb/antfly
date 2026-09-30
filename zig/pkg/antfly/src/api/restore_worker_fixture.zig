@@ -890,7 +890,10 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
     // unwinding for every allocation. Keep safety and leak checks enabled;
     // ordinary correctness fixtures retain the testing allocator's traces.
     var benchmark_allocator: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
-    defer if (policy.benchmark_rows > 1) std.debug.assert(benchmark_allocator.deinit() == .ok);
+    defer if (policy.benchmark_rows > 1) {
+        const allocator_status = benchmark_allocator.deinit();
+        std.debug.assert(allocator_status == .ok);
+    };
     const alloc = if (policy.benchmark_rows > 1) benchmark_allocator.allocator() else std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();

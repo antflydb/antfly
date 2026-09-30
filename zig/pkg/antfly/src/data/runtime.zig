@@ -4818,6 +4818,11 @@ fn isRetryableMetadataBootstrapError(err: anyerror) bool {
         // published. The fenced read is intentionally rejected; retrying the
         // next control round obtains a snapshot from the new cache generation.
         error.MetadataSnapshotHeadMismatch,
+        // A tagged hidden placement can outlive its private descriptor while
+        // initial publication is canceled or its retirement is reconciled.
+        // No new owner is admitted without the descriptor; keep established
+        // groups serving and let the existing control/retirement paths retry.
+        error.InitialFkOwnerAuthorityUnavailable,
         // Metadata listeners can accept connections before their first
         // authoritative incarnation has been established. Data nodes that
         // start in that window must retry; an actual incarnation mismatch or
@@ -18876,6 +18881,24 @@ pub const DataServer = struct {
         return false;
     }
 
+    fn requireInitialOwnerAuthority(
+        snapshot: *const antfly.metadata_api.AdminSnapshot,
+        intents: []const antfly.raft.PlacementIntent,
+        owners: []const @import("private_provisioning.zig").InitialOwner,
+        retained: []const u64,
+    ) !void {
+        for (intents) |intent| {
+            if (groupIdInSlice(retained, intent.record.group_id)) continue;
+            if (intent.record.initial_fk_root_generation == 0 or
+                snapshotTableNameForGroup(snapshot, intent.record.group_id) != null) continue;
+            const found = for (owners) |owner| {
+                if (owner.range.group_id == intent.record.group_id and
+                    owner.descriptor.child_table_id == owner.table.table_id) break true;
+            } else false;
+            if (!found) return error.InitialFkOwnerAuthorityUnavailable;
+        }
+    }
+
     fn replicaRetirementTableName(
         snapshot: *const antfly.metadata_api.AdminSnapshot,
         previous: *const std.AutoHashMapUnmanaged(u64, []u8),
@@ -19332,16 +19355,7 @@ pub const DataServer = struct {
             // range merely because its private descriptor is absent or was
             // canceled between the two reads. Split/restore destinations have
             // their own admission protocols and carry no initial-FK generation.
-            for (next_cached_local_intents) |intent| {
-                if (groupIdInSlice(retained_hidden.items, intent.record.group_id)) continue;
-                if (intent.record.initial_fk_root_generation == 0 or
-                    snapshotTableNameForGroup(snapshot, intent.record.group_id) != null) continue;
-                const found = for (private_initial_owners) |owner| {
-                    if (owner.range.group_id == intent.record.group_id and
-                        owner.descriptor.child_table_id == owner.table.table_id) break true;
-                } else false;
-                if (!found) return error.InvalidGenerationPublication;
-            }
+            try requireInitialOwnerAuthority(snapshot, next_cached_local_intents, private_initial_owners, retained_hidden.items);
         }
         var next_group_table_names = try self.buildLocalDataRaftGroupTableNames(snapshot, next_cached_local_intents, private_initial_owners, retained_hidden.items);
         defer {
@@ -23956,6 +23970,10 @@ const activation_admission_tests = if (@import("builtin").is_test and implementa
         try std.testing.expect(!DataServer.needsPrivateInitialOwnerSnapshot(&snapshot, &.{ordinary}));
         const hidden = antfly.raft.PlacementIntent{ .record = .{ .group_id = 8, .replica_id = 1, .local_node_id = 9, .initial_fk_root_generation = 4 } };
         try std.testing.expect(DataServer.needsPrivateInitialOwnerSnapshot(&snapshot, &.{hidden}));
+        try DataServer.requireInitialOwnerAuthority(&snapshot, &.{ordinary}, &.{}, &.{});
+        try std.testing.expectError(error.InitialFkOwnerAuthorityUnavailable, DataServer.requireInitialOwnerAuthority(&snapshot, &.{hidden}, &.{}, &.{}));
+        try std.testing.expect(isRetryableMetadataBootstrapError(error.InitialFkOwnerAuthorityUnavailable));
+        try std.testing.expect(!isRetryableMetadataBootstrapError(error.InvalidGenerationPublication));
     }
 
     test "distributed online merge admission declines both owners and direct source proposals" {

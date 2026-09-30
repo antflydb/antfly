@@ -76,6 +76,25 @@ snapshots on a transport failure; the data ReadIndex gate reports whether it
 was still awaiting quorum or local application. Qualification remains pending
 until that failure is diagnosed and the final source passes its clean soak.
 
+Merged-main recovery smoke testing also exposed three deterministic integration
+failures. Initial FK publication now removes a changed table's legacy listing
+entry in the same transaction that installs its system-catalog binding, so the
+authoritative binding and derived listing cannot disagree. A hidden initial-FK
+placement with an absent private descriptor remains unadmitted and retries
+through the existing bounded control backoff; it no longer terminates an
+otherwise serving data process. Malformed generation authority remains fatal.
+Finally, authenticated live rewrite source-copy artifacts remain logical
+decoders: export excludes physical accepted-generation keys, and plan validation
+uses their fenced pin/certificate proof rather than repository-cohort admission
+proofs. Ordinary portable backups still require those admission proofs.
+
+The retained-transfer fixtures use canonical artifact keys owned by their
+logical source document, including multi-fragment proofs across crash/reopen.
+The restore benchmark uses a checked allocator without per-allocation stack
+unwinding; its unchanged 30-second deadline now measures restore work rather
+than Mach-O debug-symbol lookup. These focused suites pass, but their results
+are separate from the pending final-binary recovery soak.
+
 ## 2026-09-29: progressive native publication across process restart
 
 [Main e2e-full run 36526714836, job 109286926408](https://github.com/antflydb/antfly/actions/runs/36526714836/job/109286926408)
