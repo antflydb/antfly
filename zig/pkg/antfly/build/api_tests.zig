@@ -2096,10 +2096,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-api-sql-primary-key-rewrite-test", "Run mounted SQL primary-key rewrite publication and failure cases")
         .dependOn(&addFilteredTestRunArtifact(b, sql_primary_key_rewrite_tests).step);
+    // Hosted recovery fixtures retain assertions and diagnostics even when
+    // CI builds them alongside an optimized, stripped server. The linked
+    // production provider archives keep the server build configuration.
     const hosted_initial_fk_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_hosted_initial_fk_test_root.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
+        .strip = false,
     });
     test_imports.configureConsumer(b, hosted_initial_fk_test_mod);
     @import("storage.zig").configureLmdb(b, hosted_initial_fk_test_mod, options.lmdb_engine, true);
@@ -2109,7 +2113,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const hosted_fk_usermgr_storage = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
+        .strip = false,
     });
     hosted_fk_usermgr_storage.addImport("antfly_root", hosted_initial_fk_test_mod);
     hosted_fk_usermgr_storage.addImport("antfly_platform", antfly_imports.platform);
@@ -2155,7 +2160,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const hosted_fk_drop_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_hosted_fk_drop_test_root.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
+        .strip = false,
     });
     test_imports.configureConsumer(b, hosted_fk_drop_test_mod);
     @import("storage.zig").configureLmdb(b, hosted_fk_drop_test_mod, options.lmdb_engine, true);
@@ -2165,7 +2171,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const hosted_fk_drop_usermgr_storage = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
+        .strip = false,
     });
     hosted_fk_drop_usermgr_storage.addImport("antfly_root", hosted_fk_drop_test_mod);
     hosted_fk_drop_usermgr_storage.addImport("antfly_platform", antfly_imports.platform);
@@ -2196,7 +2203,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const hosted_self_fk_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_hosted_self_fk_test_root.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
+        .strip = false,
     });
     test_imports.configureConsumer(b, hosted_self_fk_test_mod);
     @import("storage.zig").configureLmdb(b, hosted_self_fk_test_mod, options.lmdb_engine, true);
@@ -2206,7 +2214,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const hosted_self_fk_usermgr_storage = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
+        .strip = false,
     });
     hosted_self_fk_usermgr_storage.addImport("antfly_root", hosted_self_fk_test_mod);
     hosted_self_fk_usermgr_storage.addImport("antfly_platform", antfly_imports.platform);

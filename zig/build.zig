@@ -1648,7 +1648,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     for ([_][]const u8{
         "antfly-raft-transport-test",  "standby-vopr-test",                "vopr-runtime-test",
         "restore-admission-vopr-test", "vopr-determinism-audit",           "vopr-build",
-        "antfly",                      "antfly-storage-owner-source-test",
+        "antfly",                      "antfly-storage-owner-source-test", "antfly-hosted-fk-recovery-binaries",
     }) |name| {
         assignDefaultAggregateMaxRss(
             b,
