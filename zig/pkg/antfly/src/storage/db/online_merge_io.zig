@@ -66,6 +66,24 @@ pub fn executeJson(db: *DB, alloc: Allocator, request: wire.Request, cancellatio
     }
     return switch (request.operation) {
         .admission => admissionFactsJson(db, alloc, request, cancellation),
+        .artifact_catalog => blk: {
+            var command = try db.artifactInventoryCommand(alloc);
+            defer command.catalogs.deinit(alloc);
+            break :blk try std.json.Stringify.valueAlloc(alloc, command, .{});
+        },
+        .source_catalog => blk: {
+            const progress = try db.onlineSourceStatus(request.scope);
+            if (progress.phase == .released or progress.snapshot_phase != .published) return error.OnlineSourceScopeChanged;
+            const expected = progress.artifact_catalog orelse return error.ArtifactCatalogDrift;
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            var ordered = (try @import("artifact_inventory.zig").load(alloc, &read)) orelse return error.ArtifactCatalogDrift;
+            defer ordered.deinit();
+            if (!std.meta.eql(ordered.value.command.binding, expected)) return error.ArtifactCatalogDrift;
+            // These are the immutable bytes bound before snapshot publication,
+            // not a newly derived successor of the live catalog.
+            break :blk std.json.Stringify.valueAlloc(alloc, ordered.value.command.catalogs, .{ .emit_strings_as_arrays = true });
+        },
         .status => |side| if (side == .donor) sourceStatusJson(db, alloc, request.scope, cancellation) else receiverStatusJson(db, alloc, request.scope, cancellation),
         .tail => |receipt| prepareTailJson(db, alloc, request.scope, receipt, cancellation),
         .rewrite_tail => |page| rewriteTailJson(db, alloc, request.scope, page.after, page.offset, page.max_bytes, cancellation),
@@ -97,16 +115,21 @@ fn rewriteTailJson(db: *DB, alloc: Allocator, scope: source.Scope, after: u64, o
     }
     const Chunk = @import("relational_rewrite_contract.zig").TailChunk;
     if (cache.session == null) return std.json.Stringify.valueAlloc(alloc, @as(?Chunk, null), .{});
-    const reader = cache.session.?.reader;
-    if (offset >= reader.encoded_frame.len) return error.RetainedEffectsCursorMismatch;
-    const end = @min(reader.encoded_frame.len, @as(usize, offset) + max_bytes);
-    return std.json.Stringify.valueAlloc(alloc, Chunk{ .pin = scope.pin(), .sequence = sequence, .frame_digest = reader.frame_digest, .total = @intCast(reader.encoded_frame.len), .offset = offset, .data = reader.encoded_frame[offset..end] }, .{});
+    const session = &cache.session.?;
+    const total = session.frameTotal();
+    if (offset >= total) return error.RetainedEffectsCursorMismatch;
+    const data = try alloc.alloc(u8, @min(total - offset, max_bytes));
+    defer alloc.free(data);
+    if (try session.readEncoded(offset, data) != data.len) return error.RetainedEffectsCorrupt;
+    const descriptor = session.frameDescriptor();
+    return std.json.Stringify.valueAlloc(alloc, Chunk{ .pin = scope.pin(), .sequence = sequence, .frame_digest = session.frameDigest(), .total = @intCast(total), .offset = offset, .data = data, .frame_format = if (descriptor != null) .chunked else .contiguous, .descriptor = if (offset == 0) descriptor else null }, .{});
 }
 
 fn admissionFactsJson(db: *DB, alloc: Allocator, request: wire.Request, cancellation: types.CancellationToken) ![]u8 {
+    _ = try db.advanceArtifactFootprintPage();
     db.core.lockApplyShared();
     defer db.core.unlockApplyShared();
-    var txn = try db.core.store.beginProbeTxn();
+    var txn = try db.core.store.beginReadTxn();
     defer txn.abort();
     // Exactly the mutation-side rule: absence is legal only for a durably
     // initialized document owner, never a missing relational catalog.
@@ -140,14 +163,30 @@ fn admissionFactsJson(db: *DB, alloc: Allocator, request: wire.Request, cancella
     }
     var eligible = table_facts.mode_initialized and
         integrity_ready and !try @import("relational_integrity_retirement.zig").active(&txn) and
-        try rowDerivedTransferIndexesAssumeApply(db, alloc, true);
+        try rowDerivedTransferIndexesAssumeApply(db, alloc, request.scope.authority == .raft);
+    var artifact_preview = db.artifactInventoryCommand(alloc) catch |err| switch (err) {
+        error.OnlineMergeArtifactTailsUnsupported => null,
+        else => return err,
+    };
+    defer if (artifact_preview) |*preview| preview.catalogs.deinit(alloc);
+    const artifact_ready = if (artifact_preview) |preview| try db.artifactMaterializationsReady(&txn, preview.catalogs) else false;
+    if (request.scope.authority == .raft and request.scope.fence.role == .merge_source)
+        eligible = eligible and artifact_ready;
     if (try topology.current(&txn) != null) return error.IntegrityTopologyBusy;
     if (retained) |value| if (value.active()) {
         return error.IntegrityTopologyBusy;
     };
     const merge = @import("merge_state.zig");
     const merge_raw = txn.get(merge.key) catch |err| switch (err) {
-        error.NotFound => null,
+        // Match the committed source-admission cut and merge checkpoint
+        // loader: pre-protection receiver state remains authoritative in its
+        // legacy key until an atomic migration removes that key. A positive
+        // discovery fact must not create an online metadata record which the
+        // later source admission can never commit.
+        error.NotFound => txn.get(merge.legacy_key) catch |legacy_err| switch (legacy_err) {
+            error.NotFound => null,
+            else => return legacy_err,
+        },
         else => return err,
     };
     if (merge_raw) |raw| {
@@ -186,6 +225,7 @@ fn admissionFactsJson(db: *DB, alloc: Allocator, request: wire.Request, cancella
         .eligible = eligible,
         .catalog_digest = digest,
         .integrity = integrity_binding,
+        .artifact_catalog = if (artifact_ready) artifact_preview.?.binding else null,
         .next_topology_epoch = try topology.nextEpoch(&txn),
         .next_consumer_epoch = next_consumer,
         .donor_term = term,
@@ -205,6 +245,7 @@ test "relational index system online admission facts are unbound read only and r
     try db.updateRange(.{ .start = "m", .end = "z" });
     // Ordinary document owners need no coordinated integrity catalog.
     try db.core.store.delete(@import("relational_integrity_catalog.zig").key);
+    try db.addIndex(.{ .name = "text_before_admit", .kind = .full_text, .config_json = "{}" });
     const request: wire.Request = .{ .scope = .{
         .fence = .{ .admission_epoch = 0, .attempt = 0, .transition_id = 7, .owner_group_id = 2, .peer_group_id = 3, .role = .merge_source, .namespace = db.core.identity_namespace, .catalog_digest = @splat(0) },
         .receiver_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 },
@@ -221,6 +262,8 @@ test "relational index system online admission facts are unbound read only and r
         }
     };
     const before = db.core.store.lastReplaySequence(0);
+    var artifact_command = try db.artifactInventoryCommand(alloc);
+    defer artifact_command.catalogs.deinit(alloc);
     const facts = try Fetch.run(&db, request);
     try std.testing.expect(facts.eligible);
     try std.testing.expectEqual(@as(u64, 0), facts.donor_term);
@@ -250,6 +293,12 @@ test "relational index system online admission facts are unbound read only and r
     bound.copy_attempt = .{ .donor_term = 2, .sequence = facts.next_copy_sequence };
     var checkpoint: types.MergeReplicationCheckpoint = .{ .kind = .accept, .transition_id = 8, .donor_group_id = 4, .receiver_group_id = 2, .receiver_base_start = "m", .receiver_base_end = "z", .merged_start = "a", .merged_end = "z" };
     try db.batch(.{ .merge_checkpoint = checkpoint });
+    const active_merge_raw = try db.core.store.get(alloc, @import("merge_state.zig").key);
+    defer alloc.free(active_merge_raw);
+    // A receiver has no source-retention marker. The durable merge checkpoint
+    // itself must prevent graph/artifact catalog changes during copy and tail.
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.addIndex(.{ .name = "graph_during_copy", .kind = .graph, .config_json = "{}" }));
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.deleteIndex("text_before_admit"));
     try std.testing.expectError(error.IntegrityTopologyBusy, Fetch.run(&db, request));
     var same_ordinary = request;
     same_ordinary.scope.fence.transition_id = 8;
@@ -259,14 +308,56 @@ test "relational index system online admission facts are unbound read only and r
     same_ordinary.scope.receiver_namespace = db.core.identity_namespace;
     same_ordinary.operation = .{ .admission = .receiver };
     try std.testing.expect(!(try Fetch.run(&db, same_ordinary)).eligible);
-    try std.testing.expectError(error.IntegrityTopologyBusy, db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = bound } } }, .{ .term = 2, .index = 1 }));
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.batchRaftReplicatedApply(.{ .artifact_catalog = artifact_command, .online_source = .{ .admit = .{ .scope = bound, .artifact_catalog = facts.artifact_catalog } } }, .{ .term = 2, .index = 1 }));
     try db.batchRaftReplicatedApply(.{}, .{ .term = 2, .index = 1 });
     try std.testing.expectEqual(@as(u64, 1), (try db.raftAppliedEntry()).?.index);
     checkpoint.kind = .rollback;
     try db.batch(.{ .merge_checkpoint = checkpoint });
-    try std.testing.expect((try Fetch.run(&db, request)).eligible);
-    try db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = bound } } }, .{ .term = 2, .index = 2 });
+    const rolled_back_merge_raw = try db.core.store.get(alloc, @import("merge_state.zig").key);
+    defer alloc.free(rolled_back_merge_raw);
+    try db.core.store.delete(@import("merge_state.zig").key);
+    try db.core.store.put(@import("merge_state.zig").legacy_key, active_merge_raw);
     try std.testing.expectError(error.IntegrityTopologyBusy, Fetch.run(&db, request));
+    try std.testing.expect(!(try Fetch.run(&db, same_ordinary)).eligible);
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.batchRaftReplicatedApply(.{ .artifact_catalog = artifact_command, .online_source = .{ .admit = .{ .scope = bound, .artifact_catalog = facts.artifact_catalog } } }, .{ .term = 2, .index = 2 }));
+    try std.testing.expectEqual(@as(u64, 1), (try db.raftAppliedEntry()).?.index);
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect((try @import("../retained_effects.zig").load(&read)) == null);
+        try std.testing.expect((try @import("../source_pin_state.zig").load(&read)) == null);
+    }
+    try db.core.store.delete(@import("merge_state.zig").legacy_key);
+    try db.core.store.put(@import("merge_state.zig").key, rolled_back_merge_raw);
+    try std.testing.expect((try Fetch.run(&db, request)).eligible);
+    // The ordered catalog and admission commit together. Followers reconcile
+    // the exact committed inventory before admitting, while native rewrite
+    // admission repeats its local artifact predicate (covered below).
+    try db.batchRaftReplicatedApply(.{ .artifact_catalog = artifact_command, .online_source = .{ .admit = .{ .scope = bound, .artifact_catalog = facts.artifact_catalog } } }, .{ .term = 2, .index = 2 });
+    try std.testing.expectError(error.IntegrityTopologyBusy, Fetch.run(&db, request));
+    // Once admission has retained the source, a new graph index or
+    // independently produced enrichment would invalidate the row-derived
+    // artifact proof. The same guard applies to ordinary catalog DDL, not
+    // only Raft topology commands; rejected DDL must not alter the catalog.
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.addIndex(.{ .name = "graph_after_admit", .kind = .graph, .config_json = "{}" }));
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.deleteIndex("text_before_admit"));
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.addEnrichment(.{ .name = "chunks_after_admit", .kind = .chunk, .field = "body", .chunk_size = 8, .chunk_overlap = 2, .full_text_index = true }));
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.addResolver(.{ .name = "resolver_after_admit", .table = "entities", .source_artifact = "relations", .resolution_artifact = "resolved", .key_template = "{{ _entity.label }}", .config_generation = 1 }));
+    {
+        const indexes = try db.core.listIndexes(alloc);
+        defer types.freeIndexConfigs(alloc, indexes);
+        try std.testing.expectEqual(@as(usize, 1), indexes.len);
+        try std.testing.expectEqualStrings("text_before_admit", indexes[0].name);
+        const enrichments = try db.core.listEnrichments(alloc);
+        defer types.freeEnrichmentConfigs(alloc, enrichments);
+        try std.testing.expectEqual(@as(usize, 0), enrichments.len);
+        const resolvers = try db.core.listResolvers(alloc);
+        defer {
+            for (resolvers) |*resolver| resolver.deinit(alloc);
+            if (resolvers.len != 0) alloc.free(resolvers);
+        }
+        try std.testing.expectEqual(@as(usize, 0), resolvers.len);
+    }
     checkpoint.kind = .accept;
     checkpoint.transition_id = 9;
     // Merely retaining a source (without an active topology freeze) must
@@ -315,6 +406,255 @@ test "relational index system online admission facts are unbound read only and r
     enriched.close();
     enriched = try DB.open(alloc, enriched_path, enriched_options);
     try std.testing.expect(!(try Fetch.run(&enriched, request)).eligible);
+}
+
+test "relational index system native source admission rechecks artifact DDL at commit" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/native-source-artifact-recheck", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try DB.open(alloc, path, .{
+        .online_source_authority = .native,
+        .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 },
+        .primary_backend = .{ .lsm = .{} },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+    });
+    defer db.close();
+    try db.setSchemaJson(alloc, "{}");
+    try db.updateRange(.{ .start = "m", .end = "z" });
+    const identity = try db.relationalTopologyIdentity();
+    const scope: source.Scope = .{
+        .authority = .native,
+        .fence = .{
+            .admission_epoch = identity.next_epoch,
+            .attempt = 1,
+            .transition_id = 7,
+            .owner_group_id = 2,
+            .peer_group_id = 3,
+            .role = .rewrite_source,
+            .namespace = db.core.identity_namespace,
+            .catalog_digest = identity.catalog_digest,
+        },
+        .receiver_namespace = .{ .table_id = 9, .shard_id = 3, .range_id = 3 },
+        .consumer_epoch = 1,
+        .copy_attempt = .{ .sequence = 1 },
+    };
+    // The discovery snapshot preceded a separately committed enrichment
+    // config. Native admission must see it inside the final serialized cut.
+    try db.addEnrichment(.{ .name = "chunks_before_admit", .kind = .chunk, .field = "body", .chunk_size = 8, .chunk_overlap = 2, .full_text_index = true });
+    try std.testing.expectError(error.OnlineSourceScopeChanged, db.batch(.{ .online_source = .{ .admit = .{ .scope = scope } } }));
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect((try @import("../retained_effects.zig").load(&read)) == null);
+        try std.testing.expect((try @import("../source_pin_state.zig").load(&read)) == null);
+    }
+}
+
+test "relational index system native source admission rechecks artifact DDL cleanup debt" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cleanup-admission", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try DB.open(alloc, path, .{
+        .online_source_authority = .native,
+        .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 },
+        .primary_backend = .{ .lsm = .{} },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+    });
+    defer db.close();
+    try db.setSchemaJson(alloc, "{}");
+    try db.addIndex(.{ .name = "retired_graph", .kind = .graph, .config_json = "{}" });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc", .value = "{}" }},
+        .graph_writes = &.{.{ .index_name = "retired_graph", .source = "doc", .target = "target", .edge_type = "links" }},
+    });
+    const keys = @import("../internal_keys.zig");
+    const artifact_key = try keys.graphEdgeArtifactKeyAlloc(alloc, "doc", "retired_graph", "links", "target");
+    defer alloc.free(artifact_key);
+    const admission_key = try keys.managedIndexAdmissionKeyAlloc(alloc, "retired_graph");
+    defer alloc.free(admission_key);
+    // Exercise the real atomic catalog-removal/cleanup commit, then stop
+    // before the public wrapper schedules background cleanup (crash cut).
+    {
+        const manager = @import("catalog/index_manager.zig");
+        manager.test_inject_generated_artifact_cleanup_error = error.TestPostCommitArtifactCleanup;
+        defer manager.test_inject_generated_artifact_cleanup_error = null;
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        try std.testing.expect(try db.core.deleteManagedIndex("retired_graph", admission_key));
+    }
+    try std.testing.expect(db.core.index_manager.graphIndex("retired_graph") == null);
+    const stale = try db.core.store.get(alloc, artifact_key);
+    defer alloc.free(stale);
+    try std.testing.expect(stale.len != 0);
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, requireRowDerivedIndexes(&db, alloc));
+    const identity = try db.relationalTopologyIdentity();
+    const scope: source.Scope = .{
+        .authority = .native,
+        .fence = .{ .admission_epoch = identity.next_epoch, .attempt = 1, .transition_id = 7, .owner_group_id = 2, .peer_group_id = 3, .role = .rewrite_source, .namespace = db.core.identity_namespace, .catalog_digest = identity.catalog_digest },
+        .receiver_namespace = .{ .table_id = 9, .shard_id = 3, .range_id = 3 },
+        .consumer_epoch = 1,
+        .copy_attempt = .{ .sequence = 1 },
+    };
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.batch(.{ .online_source = .{ .admit = .{ .scope = scope } } }));
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect((try @import("../retained_effects.zig").load(&read)) == null);
+        try std.testing.expect((try @import("../source_pin_state.zig").load(&read)) == null);
+    }
+    var cleanup_idle = false;
+    for (0..64) |_| {
+        // The DB state machine also finalizes the physical generation and
+        // retires its durable cleanup record; draining bytes alone is not a
+        // proof that all cleanup obligations have completed.
+        if (try db.advanceGeneratedArtifactCleanupPage(null) == .idle) {
+            cleanup_idle = true;
+            break;
+        }
+    }
+    try std.testing.expect(cleanup_idle);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, artifact_key));
+    try requireRowDerivedIndexes(&db, alloc);
+    // Even malformed cleanup debt remains fail-closed without decoding it.
+    const malformed_key = try keys.indexArtifactCleanupKeyAlloc(alloc, "unknown", 1);
+    defer alloc.free(malformed_key);
+    try db.core.store.put(malformed_key, "invalid");
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, requireRowDerivedIndexes(&db, alloc));
+}
+
+test "relational index system native source admission rejects portable latent graph without catalog or cleanup debt" {
+    const alloc = std.testing.allocator;
+    const footprint = @import("../artifact_footprint.zig");
+    const backup = @import("../portable_backup.zig");
+    const keys = @import("../internal_keys.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const from_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/footprint-from", .{tmp.sub_path});
+    defer alloc.free(from_path);
+    const to_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/footprint-to", .{tmp.sub_path});
+    defer alloc.free(to_path);
+    const options: @import("antfly_source_root").antfly_sources.physical_db.OpenOptions = .{
+        .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 },
+        .primary_backend = .{ .lsm = .{} },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+    };
+    var from = try DB.open(alloc, from_path, options);
+    defer from.close();
+    try from.setSchemaJson(alloc, "{}");
+    const graph_key = try keys.graphEdgeArtifactKeyAlloc(alloc, "a", "removed_index", "edge", "b");
+    defer alloc.free(graph_key);
+    const codec = @import("enrichment/artifact_codec.zig");
+    const graph_value = try codec.encodeGraphEdgeAlloc(alloc, null, 1, 1, 1, 1, "{}");
+    defer alloc.free(graph_value);
+    // This is the actual legal portable export shape: graph bytes survive
+    // independently of the current index catalog and retirement journal.
+    try from.core.store.put(graph_key, graph_value);
+    var archive: std.ArrayList(u8) = .empty;
+    defer archive.deinit(alloc);
+    try backup.exportPortable(alloc, from.core.store, &archive);
+    var to = try DB.open(alloc, to_path, options);
+    defer to.close();
+    try backup.importPortable(alloc, to.core.store, archive.items);
+    const imported = try to.core.store.get(alloc, graph_key);
+    defer alloc.free(imported);
+    try std.testing.expect(codec.isPortableUnboundGraphEdge(imported));
+    try std.testing.expect(to.core.index_manager.graphIndex("removed_index") == null);
+    const cleanup_prefix = try keys.indexArtifactCleanupRootPrefixAlloc(alloc);
+    defer alloc.free(cleanup_prefix);
+    const cleanup = try to.core.store.scanPrefixKeysPage(alloc, cleanup_prefix, null, 1);
+    defer {
+        for (cleanup) |item| alloc.free(item);
+        alloc.free(cleanup);
+    }
+    try std.testing.expectEqual(@as(usize, 0), cleanup.len);
+    // Coordinated mode is the real protocol-14 family predicate, not merely
+    // the native rewrite restriction. No protocol-15 capability is advertised.
+    try std.testing.expect(!try rowDerivedTransferIndexesAssumeApply(&to, alloc, true));
+    try std.testing.expectError(error.OnlineSourceScopeChanged, requireAdmissibleSourceAtCommitAssumeApply(&to, alloc));
+    try std.testing.expect(!backup.isPortableMetadataKey(footprint.key));
+    try std.testing.expect(!backup.isPortableMetadataKey(footprint.scan_key));
+    try std.testing.expectError(error.InvalidIntegrityOperation, to.batch(.{ .writes = &.{.{ .key = footprint.key, .value = &(footprint.State{ .certified = footprint.all }).encode() }} }));
+    to.close();
+    to = try DB.open(alloc, to_path, options);
+    try std.testing.expect(!try rowDerivedTransferIndexesAssumeApply(&to, alloc, true));
+}
+
+test "relational index system native source admission resumes bounded footprint reconciliation and rejects stale absence" {
+    const alloc = std.testing.allocator;
+    const footprint = @import("../artifact_footprint.zig");
+    const keys = @import("../internal_keys.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/footprint-reconcile", .{tmp.sub_path});
+    defer alloc.free(path);
+    const options: @import("antfly_source_root").antfly_sources.physical_db.OpenOptions = .{
+        .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 },
+        .primary_backend = .{ .lsm = .{} },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+    };
+    var db = try DB.open(alloc, path, options);
+    defer db.close();
+    try db.setSchemaJson(alloc, "{}");
+    for (0..300) |i| {
+        const name = try std.fmt.allocPrint(alloc, "row-{d:0>4}", .{i});
+        defer alloc.free(name);
+        const stored = try keys.documentKeyAlloc(alloc, name);
+        defer alloc.free(stored);
+        try db.core.store.put(stored, "{}");
+    }
+    // Legal physical keys need not fit the old 8 KiB maintenance cursor.
+    const large_name = try alloc.alloc(u8, 96 * 1024);
+    defer alloc.free(large_name);
+    @memset(large_name, 'z');
+    const large_stored = try keys.documentKeyAlloc(alloc, large_name);
+    defer alloc.free(large_stored);
+    try db.core.store.put(large_stored, "{}");
+    // An old root has no imported/imagined absence certificate.
+    try db.core.store.delete(footprint.key);
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, rowDerivedTransferIndexesAssumeApply(&db, alloc, true));
+    try std.testing.expect(!try footprint.reconcilePage(alloc, db.core.store));
+    const cursor = try db.core.store.get(alloc, footprint.scan_key);
+    defer alloc.free(cursor);
+    db.close();
+    db = try DB.open(alloc, path, options);
+    const reopened_cursor = try db.core.store.get(alloc, footprint.scan_key);
+    defer alloc.free(reopened_cursor);
+    try std.testing.expectEqualSlices(u8, cursor, reopened_cursor);
+    // Insert behind the persisted cursor. The old scan cannot certify this
+    // family's absence even though subsequent pages never see the new key.
+    const graph_key = try keys.graphEdgeArtifactKeyAlloc(alloc, "a", "hidden_graph", "edge", "b");
+    defer alloc.free(graph_key);
+    {
+        var aborted = try db.core.store.beginWriteTxn();
+        try aborted.put(graph_key, "uncommitted graph");
+        aborted.abort();
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(u64, 0), (try footprint.load(&read)).epochs[@intFromEnum(footprint.Family.graph)]);
+        try std.testing.expectError(error.NotFound, read.get(graph_key));
+    }
+    try db.core.store.put(graph_key, "malformed bytes still occupy graph family");
+    for (0..32) |_| {
+        if (try footprint.reconcilePage(alloc, db.core.store)) break;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expect(!try rowDerivedTransferIndexesAssumeApply(&db, alloc, true));
+    try db.core.store.delete(graph_key);
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, rowDerivedTransferIndexesAssumeApply(&db, alloc, true));
+    for (0..32) |_| {
+        if (try footprint.reconcilePage(alloc, db.core.store)) break;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expect(try rowDerivedTransferIndexesAssumeApply(&db, alloc, true));
+    // Publication invalidation also defeats an earlier completed proof.
+    try footprint.invalidate(db.core.store);
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, rowDerivedTransferIndexesAssumeApply(&db, alloc, true));
 }
 
 test "relational index system online receiver status preserves persisted positioned rows after reopen" {
@@ -383,6 +723,11 @@ fn sourceStatusJson(db: *DB, alloc: Allocator, scope: source.Scope, cancellation
         error.OnlineSourceScopeChanged => null,
         else => return err,
     };
+    // Once admitted, legal vector mutations may keep the vector family dirty.
+    // They do not invalidate the already-certified absence of unsupported
+    // families. Do not run unrelated maintenance through a prepared source pin.
+    if (preliminary == null or preliminary.?.phase == .released)
+        _ = try db.advanceArtifactFootprintPage();
     // Published certificates are replicated ledger state, not local sidecar
     // availability. Normal tail/status polling performs no filesystem work.
     const certificate = if (preliminary != null and preliminary.?.published_certificate != null)
@@ -414,7 +759,7 @@ fn sourceStatusJson(db: *DB, alloc: Allocator, scope: source.Scope, cancellation
         .fence = try topology.current(&txn),
         .next_epoch = try topology.nextEpoch(&txn),
         .drained = !try manager.hasTopologySensitiveTransactions(),
-        .row_derived_indexes = try rowDerivedTransferIndexesAssumeApply(db, alloc, true),
+        .row_derived_indexes = try rowDerivedTransferIndexesAssumeApply(db, alloc, scope.authority == .raft),
     };
     try cancellation.check();
     return std.json.Stringify.valueAlloc(alloc, response, .{});
@@ -422,6 +767,39 @@ fn sourceStatusJson(db: *DB, alloc: Allocator, scope: source.Scope, cancellation
 
 pub fn rowDerivedIndexesAssumeApply(db: *DB, alloc: Allocator) !bool {
     return rowDerivedTransferIndexesAssumeApply(db, alloc, false);
+}
+
+/// Discovery facts are advisory. Repeat their mutable eligibility checks
+/// inside the serialized source-admission cut, after taking the index catalog
+/// mutex and apply lock, so later graph/resolver/enrichment DDL cannot turn a
+/// stale positive observation into an untransferable committed source pin.
+pub fn requireAdmissibleSourceAtCommitAssumeApply(db: *DB, alloc: Allocator) !void {
+    var txn = try db.core.store.beginProbeTxn();
+    defer txn.abort();
+    const table = @import("table_catalog.zig");
+    const table_bytes = txn.get(table.key) catch |err| switch (err) {
+        error.NotFound => return error.IntegrityCatalogChanged,
+        else => return err,
+    };
+    const table_facts = try table.Catalog.decode(table_bytes);
+    if (!table_facts.mode_initialized or try @import("relational_integrity_retirement.zig").active(&txn))
+        return error.OnlineSourceScopeChanged;
+    if (db.core.acquireSchemaView()) |view_value| {
+        var view = view_value;
+        defer view.release();
+        if (view.hasCoordinatedConstraints()) {
+            const catalog = txn.get(@import("relational_integrity_catalog.zig").key) catch |err| switch (err) {
+                error.NotFound => return error.IntegrityCatalogChanged,
+                else => return err,
+            };
+            var compiled = try @import("relational_integrity_catalog.zig").decode(alloc, catalog);
+            defer compiled.deinit();
+            if ((try @import("relational_integrity_activation.zig").status(&txn, compiled)).state != .enforced)
+                return error.IntegrityCatalogChanged;
+        }
+    } else if (table_facts.storage_mode == .relational) return error.IntegrityCatalogChanged;
+    if (!try rowDerivedTransferIndexesAssumeApply(db, alloc, true))
+        return error.OnlineSourceScopeChanged;
 }
 
 fn rowDerivedTransferIndexesAssumeApply(db: *DB, alloc: Allocator, coordinated: bool) !bool {
@@ -437,6 +815,30 @@ fn rowDerivedTransferIndexesAssumeApply(db: *DB, alloc: Allocator, coordinated: 
         },
         .none, .mem => return false,
     }
+    // Catalog removal and this cleanup record commit atomically. A graph-free
+    // catalog is not a row-derived proof while old graph ownership/manifests
+    // remain. One metadata-prefix seek detects debt (including malformed
+    // records) without scanning primary documents under the apply fence.
+    {
+        const prefix = try @import("../internal_keys.zig").indexArtifactCleanupRootPrefixAlloc(alloc);
+        defer alloc.free(prefix);
+        var cleanup_read = try db.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+        defer cleanup_read.abort();
+        var cursor = try cleanup_read.openCursor();
+        defer cursor.close();
+        if (try cursor.seekAtOrAfter(prefix)) |entry| if (std.mem.startsWith(u8, entry.key, prefix)) return error.StorageReadTemporarilyUnavailable;
+    }
+    {
+        const footprint = @import("../artifact_footprint.zig");
+        var read = try db.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+        defer read.abort();
+        const facts = try footprint.load(&read);
+        // Protocol 14 carries direct vectors, never latent graph/generated/
+        // resolver records. A graph-free catalog is not evidence of absence.
+        const required = footprint.all & ~(if (coordinated) footprint.bit(.vector) else @as(u8, 0));
+        if (facts.certified & facts.present & required != 0) return false;
+        if (facts.certified & required != required) return error.StorageReadTemporarilyUnavailable;
+    }
     if (db.core.acquireSchemaView()) |view_value| {
         var view = view_value;
         defer view.release();
@@ -451,15 +853,33 @@ fn rowDerivedTransferIndexesAssumeApply(db: *DB, alloc: Allocator, coordinated: 
     const enrichments = try db.core.listEnrichments(alloc);
     defer types.freeEnrichmentConfigs(alloc, enrichments);
     if (enrichments.len != 0) return false;
+    // Resolver decisions and promotions can materialize graph artifacts
+    // independently of primary-row Raft effects. An index list alone does not
+    // prove their absence: resolver configuration is a separate catalog.
+    const resolvers = try db.core.listResolvers(alloc);
+    defer {
+        for (resolvers) |*resolver| resolver.deinit(alloc);
+        if (resolvers.len != 0) alloc.free(resolvers);
+    }
+    if (resolvers.len != 0) return false;
     const indexes = try db.core.listIndexes(alloc);
     defer types.freeIndexConfigs(alloc, indexes);
-    for (indexes) |index| if (index.kind != .full_text) return false;
+    for (indexes) |index| if (index.kind != .full_text) {
+        // Native rewrite authorities do not order vector publication through
+        // a Raft marker. Only the distributed merge family can retain REF4.
+        if (!coordinated or !@import("online_vector_artifacts.zig").isEnabled() or
+            !try @import("catalog/index_manager.zig").onlineDirectVectorConfig(alloc, index)) return false;
+    };
+    // Protocol 14 snapshots and retains historical vector names even when
+    // no current vector index consumes them. Native row-only transfers still
+    // require vector absence through the footprint mask above.
     // Relational indexes live in the immutable relational catalog, not this
     // artifact index list; primary afterimages rebuild their derived entries.
     return true;
 }
 
 pub fn requireRowDerivedIndexes(db: *DB, alloc: Allocator) !void {
+    _ = try db.advanceArtifactFootprintPage();
     db.core.lockApplyShared();
     defer db.core.unlockApplyShared();
     if (!try rowDerivedIndexesAssumeApply(db, alloc)) return error.TableTopologyProtocolUpgradeRequired;
@@ -468,10 +888,19 @@ pub fn requireRowDerivedIndexes(db: *DB, alloc: Allocator) !void {
 /// Coordinated transfer is authorized by the immutable published certificate,
 /// never by relaxing automatic admission or trusting a caller's live catalog.
 pub fn requireSnapshotIndexes(db: *DB, alloc: Allocator, identity: pages.Source, certificate: @import("../source_snapshot.zig").Certificate) !void {
-    if (!std.meta.eql(identity.integrity, certificate.integrity) or !std.mem.eql(u8, &identity.pin_digest, &try certificate.digest())) return error.SourceSnapshotCutMismatch;
+    if (!std.meta.eql(identity.integrity, certificate.integrity) or identity.provenance_required != certificate.provenance_required or !std.mem.eql(u8, &identity.pin_digest, &try certificate.digest())) return error.SourceSnapshotCutMismatch;
     db.core.lockApplyShared();
     defer db.core.unlockApplyShared();
-    if (!try rowDerivedTransferIndexesAssumeApply(db, alloc, certificate.integrity != null)) return error.TableTopologyProtocolUpgradeRequired;
+    if (!try rowDerivedTransferIndexesAssumeApply(db, alloc, certificate.integrity != null or identity.artifact_catalog != null)) return error.TableTopologyProtocolUpgradeRequired;
+    if (identity.artifact_catalog) |binding| {
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        try @import("artifact_inventory.zig").requireReady(alloc, &txn, scope_namespace: {
+            var namespace: [24]u8 = undefined;
+            @import("doc_identity.zig").encodeNamespace(&namespace, identity.namespace);
+            break :scope_namespace namespace;
+        }, binding);
+    }
     if (certificate.integrity != null) {
         var txn = try db.core.store.beginProbeTxn();
         defer txn.abort();
@@ -507,10 +936,12 @@ fn receiverStatusJson(db: *DB, alloc: Allocator, scope: source.Scope, cancellati
 }
 
 fn validatePublished(scope: source.Scope, progress: source.Progress, identity: pages.Source) !void {
+    if (!std.meta.eql(progress.artifact_catalog, identity.artifact_catalog)) return error.SourceSnapshotCutMismatch;
     if (progress.phase == .released or progress.snapshot_phase != .published or identity.retention == null or
         !identity.namespace.eql(scope.fence.namespace) or identity.retention.?.epoch != scope.consumer_epoch or identity.retention.?.after_sequence != progress.start or
         identity.applied_index != progress.admitted_applied_index or !std.mem.eql(u8, &identity.pin_digest, &progress.snapshot_certificate)) return error.SourceSnapshotCutMismatch;
-    if (!std.meta.eql(identity.integrity, if (progress.published_certificate) |certificate| certificate.integrity else null)) return error.SourceSnapshotCutMismatch;
+    if (!std.meta.eql(identity.integrity, if (progress.published_certificate) |certificate| certificate.integrity else null) or
+        identity.provenance_required != (if (progress.published_certificate) |certificate| certificate.provenance_required else false)) return error.SourceSnapshotCutMismatch;
 }
 
 fn encodePrepared(alloc: Allocator, scope: source.Scope, request: ?types.BatchRequest) ![]u8 {
@@ -553,9 +984,7 @@ fn prepareTailJson(db: *DB, alloc: Allocator, scope: source.Scope, receipt: page
     var skipped: usize = 0;
     while (session.offset < receipt.tail_offset and skipped < pages.max_rows) : (skipped += 1) {
         try cancellation.check();
-        const effect = (try session.reader.next()) orelse return error.RetainedEffectsCorrupt;
-        session.previous_primary = effect.key;
-        session.offset += 1;
+        try session.skipOne();
     }
     if (session.offset != receipt.tail_offset) return encodePrepared(alloc, scope, null);
     cache.fragment = (try session.next(db.alloc, pages.max_rows, pages.max_bytes, cancellation)) orelse return error.RetainedEffectsCorrupt;
@@ -563,7 +992,7 @@ fn prepareTailJson(db: *DB, alloc: Allocator, scope: source.Scope, receipt: page
     return encodeFragment(alloc, scope, &cache.fragment.?, receipt);
 }
 
-fn encodeFragment(alloc: Allocator, scope: source.Scope, fragment: *const tail.Fragment, receipt: pages.Progress) ![]u8 {
+fn encodeFragment(alloc: Allocator, scope: source.Scope, fragment: *tail.Fragment, receipt: pages.Progress) ![]u8 {
     const context: types.MergeReplicationContext = .{ .transition_id = scope.fence.transition_id, .donor_group_id = scope.fence.owner_group_id, .receiver_group_id = scope.fence.peer_group_id, .identity_namespace = scope.receiver_namespace, .copy_attempt = scope.copy_attempt };
     const sequence = try std.math.add(u64, receipt.sequence, 1);
     const request = fragment.request(receipt.source, context, sequence) catch |err| switch (err) {

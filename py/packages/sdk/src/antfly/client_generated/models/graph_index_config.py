@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from ..models.graph_artifact_source_config import GraphArtifactSourceConfig
     from ..models.graph_index_config_metrics import GraphIndexConfigMetrics
     from ..models.graph_resolver_config import GraphResolverConfig
+    from ..models.graph_ttl_config import GraphTtlConfig
 
 
 T = TypeVar("T", bound="GraphIndexConfig")
@@ -26,6 +27,8 @@ class GraphIndexConfig:
     """Configuration for graph index type
 
     Attributes:
+        ttl (GraphTtlConfig | Unset):
+        ttl_duration (str | Unset): Compatibility alias for ttl.duration. Do not specify together with ttl.
         metrics (GraphIndexConfigMetrics | Unset): Named published graph metrics. Serverless supports background refresh
             only and limits configurations to 16 metrics per graph, 64 total per publication, 64 types per filter, and 128
             UTF-8 bytes per metric name.
@@ -54,6 +57,8 @@ class GraphIndexConfig:
         resolvers (list[GraphResolverConfig] | Unset):
     """
 
+    ttl: GraphTtlConfig | Unset = UNSET
+    ttl_duration: str | Unset = UNSET
     metrics: GraphIndexConfigMetrics | Unset = UNSET
     sources: list[GraphArtifactSourceConfig] | Unset = UNSET
     summarizer: GeneratorConfig | Unset = UNSET
@@ -67,6 +72,12 @@ class GraphIndexConfig:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        ttl: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.ttl, Unset):
+            ttl = self.ttl.to_dict()
+
+        ttl_duration = self.ttl_duration
+
         metrics: dict[str, Any] | Unset = UNSET
         if not isinstance(self.metrics, Unset):
             metrics = self.metrics.to_dict()
@@ -115,6 +126,10 @@ class GraphIndexConfig:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if ttl is not UNSET:
+            field_dict["ttl"] = ttl
+        if ttl_duration is not UNSET:
+            field_dict["ttl_duration"] = ttl_duration
         if metrics is not UNSET:
             field_dict["metrics"] = metrics
         if sources is not UNSET:
@@ -147,8 +162,18 @@ class GraphIndexConfig:
         from ..models.graph_artifact_source_config import GraphArtifactSourceConfig
         from ..models.graph_index_config_metrics import GraphIndexConfigMetrics
         from ..models.graph_resolver_config import GraphResolverConfig
+        from ..models.graph_ttl_config import GraphTtlConfig
 
         d = dict(src_dict)
+        _ttl = d.pop("ttl", UNSET)
+        ttl: GraphTtlConfig | Unset
+        if isinstance(_ttl, Unset):
+            ttl = UNSET
+        else:
+            ttl = GraphTtlConfig.from_dict(_ttl)
+
+        ttl_duration = d.pop("ttl_duration", UNSET)
+
         _metrics = d.pop("metrics", UNSET)
         metrics: GraphIndexConfigMetrics | Unset
         if isinstance(_metrics, Unset):
@@ -216,6 +241,8 @@ class GraphIndexConfig:
                 resolvers.append(resolvers_item)
 
         graph_index_config = cls(
+            ttl=ttl,
+            ttl_duration=ttl_duration,
             metrics=metrics,
             sources=sources,
             summarizer=summarizer,

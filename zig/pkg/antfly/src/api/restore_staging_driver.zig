@@ -157,11 +157,33 @@ pub fn buildPlan(arena: std.mem.Allocator, id: staging.Id, cohort_digest: stagin
             }
         }
         metadata.sortKeyspaceRanges(metadata.RangeRecord, ranges);
+        if (manifest.format == .portable) {
+            var source_schema = try @import("../schema/mod.zig").parseValidatedTableSchema(arena, manifest.schema_json);
+            defer source_schema.deinit(arena);
+            if ((source.seals.len != 0 or source_schema.storage_mode == .relational) and
+                (manifest.shards.len == 0 or manifest.shards[0].accepted_generation_summary_digest == null))
+                return error.RestoreSourceProofMissing;
+        }
+        const admissions: []staging.SourceRangeGenerationAdmissions = if (manifest.format == .portable and manifest.shards.len != 0 and manifest.shards[0].accepted_generation_summary_digest != null) blk: {
+            if (source.namespaces.len != manifest.shards.len) return error.RestoreSourceProofMissing;
+            const proofs = try arena.alloc(staging.SourceRangeGenerationAdmissions, manifest.shards.len);
+            for (manifest.shards, proofs, 0..) |shard, *proof, ordinal| {
+                proof.* = .{
+                    .target_group_id = identity(id, source.source_table_id, @intCast(ordinal), "group"),
+                    .source_namespace = source.namespaces[ordinal],
+                    .entries = shard.accepted_generation_summary,
+                    .digest = shard.accepted_generation_summary_digest orelse return error.RestoreSourceProofMissing,
+                };
+            }
+            break :blk proofs;
+        } else &.{};
         var target: staging.Target = .{
             .source_table_id = source.source_table_id,
+            .source_table_name = if (admissions.len != 0) manifest.table_name else "",
             .table = .{ .table_id = table_id, .name = source.destination_name orelse manifest.table_name, .description = manifest.description, .schema_json = manifest.schema_json, .read_schema_json = manifest.read_schema_json, .indexes_json = manifest.indexes_json, .replication_sources_json = if (manifest.replication_sources_json.len == 0) "[]" else manifest.replication_sources_json, .placement_role = if (existing) |table| table.placement_role else "data", .desired_replica_count = if (existing) |table| table.desired_replica_count else 3, .min_ranges = @intCast(ranges.len) },
             .ranges = ranges,
             .source_artifacts = artifacts,
+            .source_generation_admissions = admissions,
         };
         if (source.catalog_binding) |binding| {
             target.catalog_binding = binding;
@@ -177,6 +199,7 @@ pub fn buildPlan(arena: std.mem.Allocator, id: staging.Id, cohort_digest: stagin
         try targets.append(arena, target);
     }
     if (targets.items.len == 0) return .{ .plan = null, .skipped = skipped.items };
+    try staging.prepareTargetProjectionsAlloc(arena, targets.items);
     const plan: staging.Plan = .{ .id = id, .cohort_digest = cohort_digest, .targets = targets.items, .skipped_tables = skipped.items };
     try plan.validate(arena);
     return .{ .plan = plan, .skipped = skipped.items };

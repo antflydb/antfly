@@ -266,6 +266,7 @@ pub fn cloneDerivedGraphWrite(alloc: Allocator, write: graph_edge_types.GraphEdg
         .weight = write.weight,
         .created_at = write.created_at,
         .updated_at = write.updated_at,
+        .ttl_created_ns = write.ttl_created_ns,
         .metadata_json = metadata_json,
         .owner = owner,
     };
@@ -451,7 +452,7 @@ const binary_magic = "ADLG";
 // v6 adds the graph mutation owner (entity-sourced relations,
 // zig/AUTOSCHEMA.md); older records decode with an empty owner, the legacy
 // source-is-owner shape.
-const binary_version: u16 = 6;
+const binary_version: u16 = 7;
 const min_supported_binary_version: u16 = 2;
 
 pub fn encodeLogRecord(alloc: Allocator, batch: DerivedBatch) ![]u8 {
@@ -530,6 +531,7 @@ pub fn encodeLogRecordInto(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), b
         try appendInt(out, alloc, u64, write.updated_at);
         try writeBytes(out, alloc, write.metadata_json);
         try writeBytes(out, alloc, write.owner);
+        try appendInt(out, alloc, u64, write.ttl_created_ns);
     }
 
     try appendInt(out, alloc, u32, @intCast(batch.graph_deletes.len));
@@ -850,6 +852,7 @@ fn decodeBinaryLogRecord(alloc: Allocator, payload: []const u8) !DecodedLogRecor
             .updated_at = try reader.readInt(u64),
             .metadata_json = try reader.readBytesOrEmpty(alloc),
             .owner = if (version >= 6) try reader.readBytesOrEmpty(alloc) else "",
+            .ttl_created_ns = if (version >= 7) try reader.readInt(u64) else 0,
         };
         initialized_graph_writes += 1;
     }

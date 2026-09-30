@@ -626,6 +626,7 @@ pub const Batch = struct {
         delete: *const fn (*anyopaque, []const u8) anyerror!void,
         open_cursor: ?*const fn (Allocator, *anyopaque) anyerror!Cursor = null,
         set_replay_opaque: ?*const fn (*anyopaque, u64, []const u8) anyerror!void = null,
+        set_commit_participant: ?*const fn (*anyopaque, @import("commit_participant.zig").Participant) anyerror!void = null,
         contains_many_sorted: ?*const fn (*anyopaque, []const []const u8, []bool) anyerror!void = null,
     };
 
@@ -695,7 +696,48 @@ pub const Batch = struct {
         const set_replay_opaque = self.vtable.set_replay_opaque orelse return error.Unsupported;
         try set_replay_opaque(self.ptr, sequence, payload);
     }
+
+    /// Optional facade capability, not a raw-engine callback. Unsupported
+    /// backends must fail rather than silently omit atomic acceptance work.
+    pub fn setCommitParticipant(self: *Batch, participant: @import("commit_participant.zig").Participant) !void {
+        const attach = self.vtable.set_commit_participant orelse return error.Unsupported;
+        try attach(self.ptr, participant);
+    }
 };
+
+test "ordered artifact inventory erased batches reject unsupported commit participants" {
+    const Raw = struct {
+        pub fn abort(_: *@This()) void {}
+        pub fn commit(_: *@This()) !void {}
+        pub fn get(_: *@This(), _: []const u8) ![]const u8 {
+            return error.NotFound;
+        }
+        pub fn put(_: *@This(), _: []const u8, _: []const u8) !void {}
+        pub fn delete(_: *@This(), _: []const u8) !void {}
+    };
+    const Observer = struct {
+        fn touch(ptr: *anyopaque) void {
+            const count: *usize = @ptrCast(@alignCast(ptr));
+            count.* += 1;
+        }
+        fn observe(ptr: *anyopaque, _: []const u8, _: ?[]const u8) void {
+            touch(ptr);
+        }
+        fn stage(ptr: *anyopaque, _: @import("commit_participant.zig").View, _: []const u8) !void {
+            touch(ptr);
+        }
+    };
+    var calls: usize = 0;
+    var batch = try batchFrom(std.testing.allocator, Raw{});
+    defer batch.abort();
+    try std.testing.expectError(error.Unsupported, batch.setCommitParticipant(.{
+        .ptr = &calls,
+        .reset = Observer.touch,
+        .observe = Observer.observe,
+        .stage = Observer.stage,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), calls);
+}
 
 pub const NamespaceBatch = struct {
     allocator: Allocator,
@@ -1615,6 +1657,10 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             }
             return error.Unsupported;
         }
+
+        fn setCommitParticipant(ptr: *anyopaque, participant: @import("commit_participant.zig").Participant) anyerror!void {
+            return unbox(ptr).handle.setCommitParticipant(participant);
+        }
     };
 
     return .{
@@ -1630,6 +1676,7 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             .delete = vt.delete,
             .open_cursor = if (@hasDecl(Handle, "openCursor")) vt.openCursor else null,
             .set_replay_opaque = if (@hasDecl(Handle, "setReplayOpaque")) vt.setReplayOpaque else null,
+            .set_commit_participant = if (@hasDecl(Handle, "setCommitParticipant")) vt.setCommitParticipant else null,
             .contains_many_sorted = if (@hasDecl(Handle, "containsManySorted")) vt.containsManySorted else null,
         },
     };

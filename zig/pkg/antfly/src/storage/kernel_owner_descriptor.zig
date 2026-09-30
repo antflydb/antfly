@@ -38,6 +38,7 @@ pub const Descriptor = struct {
     /// Immutable, privately authenticated restore authority. Never populated
     /// from the public catalog or a client-supplied table definition.
     restore_bootstrap_json: []const u8 = "",
+    initial_child_bootstrap_json: []const u8 = "",
     restore_cancel_recovery: bool = false,
     restore_ha_replay: bool = false,
     table_storage: ?@import("../common/table_storage.zig").Settings = null,

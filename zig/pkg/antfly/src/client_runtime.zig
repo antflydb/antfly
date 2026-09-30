@@ -74,6 +74,7 @@ pub fn runFromIterator(
     if (std.mem.eql(u8, command, "index")) return cli.index.run(init.gpa, io, &client, args);
     if (std.mem.eql(u8, command, "artifact")) return cli.artifact.run(init.gpa, io, &client, args);
     if (std.mem.eql(u8, command, "query")) return cli.query.run(init.gpa, io, &client, args);
+    if (std.mem.eql(u8, command, "sql")) return cli.sql.run(init.gpa, io, &client, args);
     if (std.mem.eql(u8, command, "lookup")) return cli.query.lookup(init.gpa, io, &client, args);
     if (std.mem.eql(u8, command, "load")) return cli.data.load(init.gpa, io, &client, args);
     if (std.mem.eql(u8, command, "insert")) return cli.data.insert(init.gpa, io, &client, args);

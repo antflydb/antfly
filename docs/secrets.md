@@ -124,6 +124,14 @@ node-to-node `/internal/v1` RPC. This credential is a separate trust domain
 from `antfly.trusted_principal.*`, which may be held by an ingress gateway or
 managed control plane and must never grant raw storage authority.
 
+SQL setting and catalog publication grants can use a separate shared
+`antfly.setting_authority.secret` and `antfly.setting_authority.issuer` on
+metadata and data nodes (`ANTFLY_SETTING_AUTHORITY_SECRET` and
+`ANTFLY_SETTING_AUTHORITY_ISSUER` without a secret store). Keep the secret
+distinct from the internal-service credential. If these values are absent,
+the trusted-principal secret and issuer are used for the grants. The separate
+setting authority credential does not enable public API authentication.
+
 Provision the same values on every metadata and data node before starting a
 distributed cluster:
 

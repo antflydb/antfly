@@ -680,7 +680,7 @@ func zigWarmModelKind(tasks []string) string {
 		tasks []string
 		kind  string
 	}{
-		{[]string{"extract", "extractors", "recognize", "recognizer"}, "extractor"},
+		{[]string{"extract", "extractors", "decide", "deciders", "recognize", "recognizer"}, "extractor"},
 		{[]string{"rerank", "rerankers"}, "reranker"},
 		{[]string{"classify", "classifiers"}, "classifier"},
 		{[]string{"generate", "generators"}, "generator"},

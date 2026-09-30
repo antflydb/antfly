@@ -314,6 +314,10 @@ test {
 
     // Public API
     _ = public_api;
+    _ = public_api.row_policy_install;
+    _ = public_api.relational_fk_generation_publication;
+    _ = public_api.row_policy_publication_coordinator;
+    _ = public_api.fk_generation_publication_coordinator;
     _ = public_api.http_server;
     _ = public_api.internal_query_operations;
     _ = public_api.tables;
@@ -429,3 +433,7 @@ test {
 
 /// Implementation source choices for this compilation root.
 pub const antfly_sources = @import("source_owner_physical.zig");
+
+test "online graph snapshot native receiver module" {
+    _ = @import("storage/db/online_graph_receiver_test.zig");
+}

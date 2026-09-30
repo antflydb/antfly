@@ -26,6 +26,9 @@ test {
 
 test {
     _ = @import("metadata/report_collection.zig");
+    _ = @import("metadata/fk_generation_publication.zig");
+    _ = @import("metadata/fk_initial_retirement_ack.zig");
+    _ = @import("system_catalog/operations.zig");
 }
 
 /// Implementation source choices for this compilation root.

@@ -170,6 +170,9 @@ pub const RequestOptions = struct {
     /// Per-request response ceiling, unless max_error_response_size applies.
     /// This may lower, but never raise, the client-wide maximum.
     max_response_size: ?usize = null,
+    /// Per-request retry ceiling. Zero forbids replay even when the borrowed
+    /// client is configured to retry non-idempotent methods.
+    max_retries: ?u32 = null,
     /// Override ambient cookie persistence for this request. Credentialed API
     /// clients should set this false even when borrowing a general client.
     cookies_enabled: ?bool = null,
@@ -1030,6 +1033,7 @@ pub const Client = struct {
         var req = try Request.init(self.allocator, method, full_url);
         defer req.deinit();
         req.max_response_size = reqOpts.max_response_size;
+        req.max_retries = reqOpts.max_retries;
         req.attempt_observer = reqOpts.attempt_observer orelse self.config.attempt_observer;
         req.delivery_observer = reqOpts.delivery_observer;
 
@@ -1145,6 +1149,7 @@ pub const Client = struct {
         var req = try Request.init(self.allocator, method, full_url);
         defer req.deinit();
         req.max_response_size = reqOpts.max_response_size;
+        req.max_retries = reqOpts.max_retries;
         req.attempt_observer = reqOpts.attempt_observer orelse self.config.attempt_observer;
         req.delivery_observer = reqOpts.delivery_observer;
 
@@ -1398,6 +1403,7 @@ pub const Client = struct {
 
     fn executeRequestWithRetries(self: *Self, req: *Request, timeout_override_ms: ?u64, deadline_ms: ?i64, interrupt: *RequestInterrupt) !Response {
         const policy = self.config.retry_policy;
+        const max_retries = @min(req.max_retries orelse policy.max_retries, policy.max_retries);
         const can_retry_method = (!policy.retry_only_idempotent) or req.method.isIdempotent();
 
         var attempt: u32 = 0;
@@ -1416,7 +1422,7 @@ pub const Client = struct {
                 const replayable_transport = policy.retry_on_connection_error and
                     can_retry_method and isRetryableTransportError(err);
                 if ((safe_unsent or replayable_transport) and
-                    attempt < policy.max_retries)
+                    attempt < max_retries)
                 {
                     attempt += 1;
                     const delay_ms = policy.calculateDelay(attempt);
@@ -1428,7 +1434,7 @@ pub const Client = struct {
                 return err;
             };
 
-            if (can_retry_method and attempt < policy.max_retries and policy.shouldRetryStatus(res.status.code)) {
+            if (can_retry_method and attempt < max_retries and policy.shouldRetryStatus(res.status.code)) {
                 res.deinit();
                 attempt += 1;
                 const delay_ms = policy.calculateDelay(attempt);
@@ -4159,6 +4165,22 @@ test "DNS retry backoff obeys the original request deadline and cancellation" {
         .cancellation = .fromAtomic(&cancelled),
     }));
     try std.testing.expectEqual(@as(usize, 1), DnsRetryFixture.calls.load(.acquire));
+}
+
+test "per-request retry ceiling overrides unsafe global replay policy" {
+    const io = std.testing.io;
+    var vtable = io.vtable.*;
+    vtable.netLookup = DnsRetryFixture.lookup;
+    const fault_io: Io = .{ .userdata = io.userdata, .vtable = &vtable };
+    for ([_]u32{ 0, 1, 100 }) |ceiling| {
+        DnsRetryFixture.reset(100, error.NameServerFailure);
+        var client = Client.initWithConfig(std.testing.allocator, fault_io, .{
+            .retry_policy = .{ .max_retries = 2, .initial_delay_ms = 0, .retry_only_idempotent = false },
+        });
+        defer client.deinit();
+        try std.testing.expectError(error.NameServerFailure, client.post("http://sql-retry.test/", .{ .max_retries = ceiling }));
+        try std.testing.expectEqual(@as(usize, @min(ceiling, 2) + 1), DnsRetryFixture.calls.load(.acquire));
+    }
 }
 
 test "Client config redirect policy defaults" {
