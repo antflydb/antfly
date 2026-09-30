@@ -243,6 +243,9 @@ pub const HostMetrics = struct {
     runtime_pending_snapshot_submissions: usize = 0,
     runtime_pending_apply_tasks: usize = 0,
     runtime_pending_apply_bytes: usize = 0,
+    runtime_pending_persistence_tasks: usize = 0,
+    runtime_pending_persistence_bytes: usize = 0,
+    runtime_pending_persistence_age_ms: u64 = 0,
     runtime_transport_queue_denials: usize = 0,
     runtime_apply_queue_denials: usize = 0,
     runtime_oversized_outbound_ready_rejections: usize = 0,
@@ -425,6 +428,11 @@ pub const Host = struct {
         if (self.progress_wake != null) return error.RaftProgressAlreadyOwned;
         self.progress_wake = wake;
         self.progress_wake_registered.store(true, .release);
+        // A durable WAL completion is progress debt just like new inbound
+        // traffic. Notify the existing driver immediately rather than adding
+        // a tick interval to every append. The proxy fences driver lifetime
+        // with the same inbound mutex used by registration/removal.
+        self.runtime_host.persistence_wake = .{ .ptr = self, .notify = persistenceCompleted };
         // Messages accepted before registration are already progress debt.
         if (self.pending_inbound.items.len != 0) wake.notify_fn(wake.ptr);
     }
@@ -447,6 +455,35 @@ pub const Host = struct {
         self.lockInbound();
         defer self.inbound_mutex.unlock(self.deps.io);
         self.notifyProgressLocked();
+    }
+
+    fn persistenceCompleted(ptr: *anyopaque) void {
+        const self: *Host = @ptrCast(@alignCast(ptr));
+        self.notifyProgress();
+    }
+
+    test "persistence completion wake follows the registered progress driver lifetime" {
+        const Probe = struct {
+            calls: usize = 0,
+            fn notify(ptr: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.calls += 1;
+            }
+        };
+        var host = Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{ .io = std.testing.io });
+        defer host.deinit();
+        var probe = Probe{};
+        try host.registerProgressWake(.{ .ptr = &probe, .notify_fn = Probe.notify });
+        const wake = host.runtime_host.persistence_wake.?;
+        wake.notify(wake.ptr);
+        try std.testing.expectEqual(@as(usize, 1), probe.calls);
+        host.releaseProgressWake();
+        wake.notify(wake.ptr);
+        try std.testing.expectEqual(@as(usize, 1), probe.calls);
+        try host.registerProgressWake(.{ .ptr = &probe, .notify_fn = Probe.notify });
+        defer host.releaseProgressWake();
+        wake.notify(wake.ptr);
+        try std.testing.expectEqual(@as(usize, 2), probe.calls);
     }
 
     pub fn init(alloc: std.mem.Allocator, cfg: HostConfig, deps: HostDeps) Host {
@@ -902,6 +939,10 @@ pub const Host = struct {
         return self.runtimeReplicaStatus(group_id);
     }
 
+    pub fn persistenceIsStalled(self: *const Host, timeout_ns: u64) bool {
+        return self.runtime_host.persistenceIsStalled(timeout_ns);
+    }
+
     fn runtimeReplicaStatus(self: *Host, group_id: u64) HostedReplicaStatus {
         if (self.runtime_host.group(group_id) == null) return .absent;
         if (self.runtime_host.groupQuarantine(group_id) != null) return .quarantined;
@@ -996,6 +1037,9 @@ pub const Host = struct {
         snapshot.runtime_pending_snapshot_submissions = runtime_metrics.pending_snapshot_submissions;
         snapshot.runtime_pending_apply_tasks = runtime_metrics.pending_apply_tasks;
         snapshot.runtime_pending_apply_bytes = runtime_metrics.pending_apply_bytes;
+        snapshot.runtime_pending_persistence_tasks = runtime_metrics.pending_persistence_tasks;
+        snapshot.runtime_pending_persistence_bytes = runtime_metrics.pending_persistence_bytes;
+        snapshot.runtime_pending_persistence_age_ms = runtime_metrics.pending_persistence_age_ms;
         snapshot.pending_inbound_snapshot_bytes = runtime_metrics.pending_snapshot_bytes;
         snapshot.inbound_snapshot_admission_denials = runtime_metrics.snapshot_admission_denials;
         snapshot.runtime_transport_queue_denials = runtime_metrics.transport_queue_denials;

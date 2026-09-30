@@ -4429,7 +4429,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const raft_host_progress_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "raft integration module compiles", "host drops stale inbound", "host queues live snapshot" },
+        .filters = &.{ "raft integration module compiles", "host drops stale inbound", "host queues live snapshot", "persistence completion wake" },
     });
     b.step("antfly-raft-host-progress-test", "Run host progress notification and bounded inbound drain regressions").dependOn(&b.addRunArtifact(raft_host_progress_tests).step);
 

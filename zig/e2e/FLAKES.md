@@ -1,5 +1,31 @@
 # Zig E2E flakes
 
+## 2026-09-29: Autograph and metadata recovery signatures (#919)
+
+[Run 36609343247](https://github.com/antflydb/antfly/actions/runs/36609343247)
+reported a live provisional event beside its canonical event, a snapshot-owner
+merge recovery failure, and an incomplete publication-reply-loss dependency
+cohort. Metadata WAL commits reached 12,339 ms for 41 bytes. The local baseline
+at the run's main revision passed four repetitions of each selector; it did not
+reproduce that physical sync delay. See `../FLAKES.md` for the durability and
+promotion-intent regressions and the limits of the root-cause evidence.
+
+Use the existing bounded supervisor with a frozen CPU executable named `antfly`:
+
+```sh
+SKIP_BUILD=1 ANTFLY_BIN=/absolute/path/to/bin/antfly \
+ANTFLY_E2E_REGRESSION_WORKERS=4 ANTFLY_E2E_REGRESSION_REPEATS=50 \
+ANTFLY_E2E_REGRESSION_REPORT_DIR=/tmp/issue919-soak \
+scripts/ci/zig-e2e-regression-loop.sh \
+  e2e/antfly/test_autoschema.py::test_label_routed_autograph_promotes_events_and_entities \
+  'e2e/antfly/test_online_merge_recovery.py::test_online_fk_merge_preserves_shadow_claims_and_retained_references[snapshot-owner]' \
+  'e2e/antfly/test_relational_integrity_recovery.py::test_schema_rewrite_recovers_dependency_cohort[publication-reply_loss]'
+```
+
+This runs 200 invocations per selector and retains one XML report per invocation
+plus bounded failure roots. Sandbox attempts that cannot bind fixture ports
+are infrastructure errors and must not be counted as completed invocations.
+
 ## 2026-09-25: progressive activation observations during admission maintenance
 
 [Main job 108330133910](https://github.com/antflydb/antfly/actions/runs/36213445604/job/108330133910)

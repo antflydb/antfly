@@ -671,9 +671,18 @@ def test_schema_rewrite_recovers_dependency_cohort(
         assert completed["result"]["committed_table_count"] == 2, completed
         for base in cluster.data_api_urls:
             for key, row in rows.items():
-                response = session.get(
-                    f"{base}/tables/{parent}/documents/{key}", timeout=5
-                )
+                try:
+                    response = session.get(
+                        f"{base}/tables/{parent}/documents/{key}", timeout=5
+                    )
+                except requests.RequestException as exc:
+                    snapshots = cluster.metadata_snapshots(request_timeout_s=1)
+                    pytest.fail(
+                        f"post-publication read failed base={base} table={parent} "
+                        f"key={key} job={completed}: {exc}\n"
+                        f"metadata_snapshots={json.dumps(snapshots, default=str)}\n"
+                        f"{cluster.debug_logs()}"
+                    )
                 assert response.status_code == 200, response.text
                 assert response.json()["g"] == row["x"] * 3, response.text
         backups._assert_constraint_rejected(

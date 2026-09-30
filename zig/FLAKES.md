@@ -1,5 +1,81 @@
 # Zig runtime flakes
 
+## 2026-09-29: metadata WAL barriers and uncertain promotion outcomes (#919)
+
+[Issue #919](https://github.com/antflydb/antfly/issues/919) records an Autograph
+duplicate and two recovery failures in run 36609343247. Metadata logs include
+a 12,339 ms physical WAL commit for 41 encoded bytes. This is not evidence of
+a large batch or a second sync hidden inside that append. Local unchanged-main
+reproduction passed four invocations of each reported selector; it did not
+reproduce the CI disk latency.
+
+Metadata Ready persistence now owns a bounded immutable WAL record
+on an I/O worker. The Raft thread publishes its MemoryStorage delta and releases
+dependent messages only after the barrier completes. Same-term heartbeats may
+continue using the already durable term; votes, append acknowledgements and
+new-term messages remain fenced. Heartbeat extraction compacts its queue once
+in linear time, retaining skipped messages in order instead of repeatedly
+shifting the queue. Completion wakes the existing progress driver
+immediately. Failure is sticky, retirement joins the operation, and shutdown
+cannot checkpoint over an unreconciled durable tail. Incoming snapshots persist
+their payload before the WAL record on the same worker. Idle maintenance
+serializes checkpoints, log truncation, applied watermarks and superseded
+payload cleanup with Ready persistence. Local snapshot compaction retains its
+immutable builder payload until asynchronous publication completes; only then
+do storage and Raft expose the new compaction boundary. Application progress
+that advances during a checkpoint is retained in memory and carried by later
+maintenance. Deferred work is admitted before another Ready, with the same byte
+ceilings and fenced oversized-task recovery. Established durable-prefix reads
+and same-term heartbeats continue while maintenance I/O is outstanding.
+Completed appends waiting for downstream admission also retain heartbeat
+progress. Election ticks pause while the node's current term/vote is still
+behind its durability barrier; an election cannot repeatedly invalidate its
+unsent vote request during a slow write. Inbound traffic continues, and an
+established leader retains its heartbeat and quorum clocks. Snapshot completion
+rechecks both apply tasks and payload bytes before publication; another group's
+backlog cannot bypass admission. Snapshot worker startup failures retain the
+existing bounded publication retry backoff. Pending task/byte/oldest-age gauges expose
+queue pressure. A lock-free oldest-barrier timestamp preserves the existing
+progress-stall readiness deadline: short Raft rounds cannot hide a stalled
+asynchronous WAL write. Completion/retirement clears the age; elapsed time
+alone does not cancel the durable owner or mark its write failed.
+
+Commit-only HardState updates no longer append or sync when term/vote and the
+referenced entries are already durable. Later records fold in the cursor;
+recovery admits only the committed prefix proved by durable application
+completion or a snapshot. This removes redundant physical commits rather than
+weakening entry, term/vote, configuration or snapshot durability.
+
+The focused regressions hold a WAL operation for 123 virtual ticks, assert
+heartbeat progress without early append acknowledgement/application, exercise
+queue rejection and fenced recovery, and verify crash recovery after a skipped
+commit-only sync. The real WAL regression also joins an outstanding append
+before retirement and reopens the durable entries. Additional regressions hold
+an election's vote write across 123 ticks, keep durable-prefix reads live during
+checkpoint/snapshot publication, and reject a completed incoming snapshot when
+either apply-task or byte admission has become unavailable.
+
+Promotion keeps one immutable admitted batch in its existing companion state
+row until both remote success and the local receipt are known. A retry recovers
+that batch before diffing a newer resolution artifact, so a lost reply cannot
+forget an earlier provisional key. A review-band decision retains its prior
+accepted receipt while the mention exists. Deterministic tests cover both gaps;
+the CI logs do not prove which of them caused the reported duplicate.
+
+This change prevents ordinary WAL I/O from blocking Raft control progress and
+removes redundant syncs. It does not establish faster underlying filesystem
+sync latency. Graceful shutdown still joins outstanding I/O and performs its
+final durability flush; it is intentionally not a fire-and-forget operation.
+Stage timings distinguish snapshot publication, WAL append, truncation and
+applied-watermark persistence when a worker exceeds 500 ms.
+
+A preliminary soak reproduced a post-publication GET timeout after the schema
+rewrite job succeeded. This differs from the original issue’s job-progress
+timeout. The test retains the exact frontend, table/key, job result and metadata
+snapshots on a transport failure; the data ReadIndex gate reports whether it
+was still awaiting quorum or local application. Qualification remains pending
+until that failure is diagnosed and the final source passes its clean soak.
+
 ## 2026-09-29: progressive native publication across process restart
 
 [Main e2e-full run 36526714836, job 109286926408](https://github.com/antflydb/antfly/actions/runs/36526714836/job/109286926408)

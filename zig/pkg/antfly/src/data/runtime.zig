@@ -9615,6 +9615,19 @@ pub const DataServer = struct {
         const registration = try apply_sm.read_barriers.register(group_id, &context_buffer);
         var waiter_live = true;
         defer if (waiter_live) apply_sm.read_barriers.cancel(registration.token);
+        errdefer |err| if (err == error.ReadIndexTimeout or (err == error.Cancelled and self.dataRaftMonotonicNs() +| (500 * std.time.ns_per_ms) >= deadline_ns)) {
+            const needs_quorum = apply_sm.read_barriers.needsReadIndex(registration.token);
+            const installed = apply_sm.read_barriers.appliedIndex(group_id);
+            if (self.data_raft_mutex.tryLock()) {
+                defer self.data_raft_mutex.unlock();
+                if (raft.host.http_host.host.runtime_host.group(group_id)) |group| {
+                    const status = group.status();
+                    std.log.warn("data read-index wait failed error={s} group_id={d} needs_quorum={} installed={d} leader={?} term={d} commit={d} applied={d}", .{
+                        @errorName(err), group_id, needs_quorum, installed, status.soft.leader_id, status.hard.current_term, status.hard.commit_index, status.applied_index,
+                    });
+                }
+            } else std.log.warn("data read-index wait failed error={s} group_id={d} needs_quorum={} installed={d} raft_lock_busy=true", .{ @errorName(err), group_id, needs_quorum, installed });
+        };
 
         // Admission is part of the same read budget as quorum/apply. A
         // resolution callback can arrive while the Raft owner is waiting for

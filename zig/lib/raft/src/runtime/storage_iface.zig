@@ -88,6 +88,49 @@ pub const ReadyPersistenceDiagnostics = struct {
     delta_bytes_since_checkpoint: u64 = 0,
 };
 
+/// One bounded persistence operation. The storage owner outlives the handle.
+/// Worker code owns only immutable encoded bytes; completion publishes log
+/// visibility on the host thread. Deinit joins outstanding I/O, including on
+/// retirement, so no completion can refer to a replacement replica.
+pub const PersistenceWake = struct {
+    ptr: *anyopaque,
+    notify: *const fn (*anyopaque) void,
+};
+
+/// A rejected maintenance admission reports pressure without starting I/O.
+/// The host can defer competing groups or quarantine a single oversized task.
+pub const PersistenceAdmission = struct {
+    max_bytes: usize,
+    observed_bytes: usize = 0,
+    pub fn admits(self: *@This(), bytes: usize) bool {
+        self.observed_bytes = bytes;
+        return bytes <= self.max_bytes;
+    }
+};
+
+pub const PendingReadyPersistence = struct {
+    ptr: *anyopaque,
+    durable_term: core.types.Term,
+    durable_vote: ?core.types.NodeId = null,
+    owned_bytes: usize = 0,
+    durable_index: core.types.Index = 0,
+    vtable: *const VTable,
+    pub const VTable = struct {
+        is_complete: *const fn (*anyopaque) bool,
+        complete: *const fn (*anyopaque) anyerror!void,
+        deinit: *const fn (*anyopaque) void,
+    };
+    pub fn isComplete(self: @This()) bool {
+        return self.vtable.is_complete(self.ptr);
+    }
+    pub fn complete(self: @This()) !void {
+        return self.vtable.complete(self.ptr);
+    }
+    pub fn deinit(self: @This()) void {
+        self.vtable.deinit(self.ptr);
+    }
+};
+
 // GroupStorage owns raft-log durability for one hosted group. Snapshot
 // publication records state at snapshot.metadata.index while compact_index is
 // the inclusive durable log-prefix boundary; entries after it remain available
@@ -99,6 +142,15 @@ pub const GroupStorage = struct {
 
     pub const VTable = struct {
         persist_ready: *const fn (ptr: *anyopaque, group_id: core.types.GroupId, ready: core.Ready) anyerror!void,
+        /// Null selects the synchronous path (e.g. a commit-only
+        /// observation). Successful admission transfers ownership to the host.
+        begin_ready: ?*const fn (*anyopaque, core.types.GroupId, core.Ready, ?PersistenceWake) anyerror!?PendingReadyPersistence = null,
+        /// Called before the next Ready, including on otherwise idle groups.
+        /// Serializes deferred checkpoints/watermarks with log persistence.
+        begin_maintenance: ?*const fn (*anyopaque, core.types.GroupId, *PersistenceAdmission, ?PersistenceWake) anyerror!?PendingReadyPersistence = null,
+        /// The caller retains the immutable payload until operation.deinit.
+        /// Completion publishes the compacted storage view on the host thread.
+        begin_compact_snapshot: ?*const fn (*anyopaque, core.types.GroupId, core.types.SnapshotMetadata, SnapshotMaterialization, core.types.Index, *PersistenceAdmission, ?PersistenceWake) anyerror!?PendingReadyPersistence = null,
         compact_snapshot: *const fn (
             ptr: *anyopaque,
             group_id: core.types.GroupId,

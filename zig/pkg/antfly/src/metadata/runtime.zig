@@ -117,6 +117,12 @@ fn metadataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
         .max_snapshot_submission_scans_per_round = 32,
         .max_pending_apply_tasks = 1024,
         .max_pending_apply_bytes = 16 * 1024 * 1024,
+        // Async Ready retains the unstable batch plus its storage message and
+        // responses. Preserve the same logical 64 MiB admission ceiling while
+        // explicitly accounting for these bounded ownership copies.
+        .max_pending_persistence_tasks = 1,
+        .max_pending_persistence_bytes = 16 * 1024 * 1024,
+        .max_single_persistence_bytes = 7 * metadata_raft_max_regular_ready_bytes + 1024 * 1024,
         .max_single_apply_ready_bytes = metadata_raft_max_single_ready_bytes,
         .max_pending_snapshot_bytes = metadata_raft_max_snapshot_transfer_bytes,
         .max_apply_tasks_per_round = 16,
@@ -206,6 +212,8 @@ const Factory = struct {
                     .peers = peers,
                     .election_tick = 30,
                     .heartbeat_tick = 1,
+                    .async_storage_writes = true,
+                    .max_uncommitted_entries_size = metadata_raft_max_regular_ready_bytes,
                     .pre_vote = true,
                     .check_quorum = true,
                     .step_down_on_removal = true,
@@ -267,10 +275,12 @@ pub const HealthSource = struct {
 
     fn checkReady(ptr: *anyopaque) bool {
         const self: *HealthSource = @ptrCast(@alignCast(ptr));
+        const persistence_timeout_ns = if (self.raft_progress) |progress| progress.stall_timeout_ns else 5 * std.time.ns_per_s;
         return (self.supervisor == null or self.supervisor.?.currentState() == .ready) and
             self.server.metadataHttpService().probeReady() and
             self.server.server.adminListenerHealthy() and
-            (self.raft_progress == null or self.raft_progress.?.isHealthy());
+            (self.raft_progress == null or self.raft_progress.?.isHealthy()) and
+            !self.server.metadataHttpService().raft.host.http_host.host.persistenceIsStalled(persistence_timeout_ns);
     }
 
     fn writeMetrics(ptr: *anyopaque, writer: *std.Io.Writer) anyerror!void {
@@ -345,6 +355,9 @@ pub const HealthSource = struct {
         try append(writer, "antfly_raft_runtime_pending_outbound_bytes", "gauge", "Approximate pending outbound raft bytes inside the runtime", @intCast(host_metrics.runtime_pending_outbound_bytes));
         try append(writer, "antfly_raft_runtime_pending_apply_tasks", "gauge", "Pending raft apply tasks inside the runtime", @intCast(host_metrics.runtime_pending_apply_tasks));
         try append(writer, "antfly_raft_runtime_pending_apply_bytes", "gauge", "Approximate pending raft apply bytes inside the runtime", @intCast(host_metrics.runtime_pending_apply_bytes));
+        try append(writer, "antfly_raft_runtime_pending_persistence_tasks", "gauge", "Pending asynchronous raft durability barriers", @intCast(host_metrics.runtime_pending_persistence_tasks));
+        try append(writer, "antfly_raft_runtime_pending_persistence_bytes", "gauge", "Accounted bytes owned by asynchronous raft durability barriers", @intCast(host_metrics.runtime_pending_persistence_bytes));
+        try append(writer, "antfly_raft_runtime_pending_persistence_age_ms", "gauge", "Age of the oldest pending asynchronous raft durability barrier in milliseconds", host_metrics.runtime_pending_persistence_age_ms);
         try append(writer, "antfly_raft_runtime_transport_queue_denials_total", "counter", "Total raft ready denials from outbound transport queue pressure", @intCast(host_metrics.runtime_transport_queue_denials));
         try append(writer, "antfly_raft_runtime_apply_queue_denials_total", "counter", "Total raft ready denials from apply queue pressure", @intCast(host_metrics.runtime_apply_queue_denials));
         try append(writer, "antfly_raft_runtime_oversized_outbound_ready_rejections_total", "counter", "Raft Ready batches rejected because outbound bytes exceeded the hard safety ceiling", @intCast(host_metrics.runtime_oversized_outbound_ready_rejections));
