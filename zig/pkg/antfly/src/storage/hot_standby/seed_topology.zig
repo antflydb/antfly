@@ -375,7 +375,7 @@ fn readFileAlloc(io: std.Io, alloc: Allocator, path: []const u8, max_bytes: usiz
 pub fn validateLogicalCatalog(alloc: Allocator, version: u16, catalog: LogicalCatalog) !void {
     if (version >= 4 and catalog.system_catalog == null) return error.InvalidSeedTopology;
     if (catalog.system_catalog) |state| {
-        @import("../../system_catalog/projection.zig").validatePolicyPrograms(alloc, state.policy_publications, catalog.policy_install_snapshots) catch |err| switch (err) {
+        @import("../../system_catalog/portable_policy_contract.zig").validatePolicyPrograms(alloc, state.policy_publications, catalog.policy_install_snapshots) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return error.InvalidSeedTopology,
         };

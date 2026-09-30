@@ -5452,7 +5452,7 @@ pub const IndexManager = struct {
             const projection_ready = entry.index.projectionConfigReady();
 
             // Carry forward user-tunable runtime knobs (the durable regeneration
-            // in api/tables.zig preserves the same set) so a schema/template
+            // in api/local_tables.zig preserves the same set) so a schema/template
             // change does not silently reset planner/adaptive tuning in place.
             new_parsed.value.adaptive = cur.adaptive;
             new_parsed.value.pathfact_policy = cur.pathfact_policy;
