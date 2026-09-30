@@ -83,6 +83,9 @@ pub const Config = struct {
     two_stage_mass_cutoff: ?f32 = null,
     /// Keep the token embeddings and the lowest N encoder layers at their
     /// source values. Backward work and optimizer state cover only the rest.
+    /// `num_hidden_layers + 1` also keeps the final norm, freezing the whole
+    /// encoder: only the decision head trains, so a trunk shared with other
+    /// heads keeps its exact output.
     freeze_layers: u32 = 0,
     /// Low-rank adaptation (models/laya/LAYA.md, "LoRA for Laya training").
     /// Null trains every unfrozen parameter directly, as before.
@@ -591,7 +594,8 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory
     const source_laya = encoder.laya orelse return error.InvalidLayaConfig;
     encoder.laya.?.packing = try packing(c, source_laya);
     const laya = encoder.laya.?;
-    if (c.freeze_layers > encoder.num_hidden_layers) return error.InvalidLayaJob;
+    if (c.freeze_layers > encoder.num_hidden_layers + 1) return error.InvalidLayaJob;
+    const freeze = if (c.freeze_layers > encoder.num_hidden_layers) training.whole_encoder else c.freeze_layers;
     for ([_][]const u8{ "attention_bias", "mlp_bias", "norm_bias" }) |key| if (config_json.value.object.get(key)) |v| {
         if (v != .bool or v.bool) return error.UnsupportedLayaEncoderBias;
     };
@@ -633,7 +637,7 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory
     if (calib_layout) |cl| try architecture.validate(encoder, cl, c.head_dropout, lora, use_fused_attention);
     for ([_][]const training.Example{ train.examples, eval.examples }) |examples| for (examples) |e| for (e.ids) |id| if (id < 0 or id >= encoder.vocab_size) return error.InvalidLayaTrainingToken;
     if (calibration) |calib| for (calib.examples) |e| for (e.ids) |id| if (id < 0 or id >= encoder.vocab_size) return error.InvalidLayaTrainingToken;
-    var cache = Cache{ .allocator = a, .config = encoder, .dropout = c.head_dropout, .freeze_layers = c.freeze_layers, .lora = lora, .use_fused_attention = use_fused_attention };
+    var cache = Cache{ .allocator = a, .config = encoder, .dropout = c.head_dropout, .freeze_layers = freeze, .lora = lora, .use_fused_attention = use_fused_attention };
     defer cache.deinit();
     // Release the raw source snapshot before optimizer initialization/restore.
     // Only owned trainable values, frozen values, and export metadata survive.
@@ -645,7 +649,7 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory
         try @import("../../models/laya.zig").validateReader(&source, laya, encoder);
         if (source.header.tensors.get("temperature")) |meta| if (!std.mem.eql(i64, meta.shape, &.{3})) return error.InvalidLayaWeights;
         const initial = try cache.get(train.examples[0..@min(train.examples.len, c.batch_size)]);
-        const selected = try training.parameters(permanent, &initial.graph, &source, c.freeze_layers, lora, c.seed);
+        const selected = try training.parameters(permanent, &initial.graph, &source, freeze, lora, c.seed);
         const export_tensors = try exportInputs(permanent, &source, selected);
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update("antfly-laya-training/v1");
@@ -671,7 +675,7 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory
     // which are uploaded once but never enter the optimizer.
     var frozen_elements: usize = 0;
     for (admitted.export_tensors) |t| {
-        if (training.frozen(t.name, c.freeze_layers, lora)) frozen_elements = try addBytes(frozen_elements, t.data.len);
+        if (training.frozen(t.name, freeze, lora)) frozen_elements = try addBytes(frozen_elements, t.data.len);
     }
     var layouts: [3]architecture.Layout = undefined;
     var layout_count: usize = 2;
@@ -682,7 +686,7 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory
         layout_count = 3;
     }
     const backend_estimate: usize = if (c.backend == .metal)
-        try estimateBackendBytes(encoder, selected, frozen_elements, layouts[0..layout_count], c.freeze_layers, use_fused_attention)
+        try estimateBackendBytes(encoder, selected, frozen_elements, layouts[0..layout_count], freeze, use_fused_attention)
     else
         0;
     if (c.backend == .metal and backend_estimate > c.max_backend_bytes) {
@@ -725,7 +729,7 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory
         for (frozen.items) |f| owner.cb.free(f.value);
         frozen.deinit(a);
     }
-    for (admitted.export_tensors) |t| if (training.frozen(t.name, c.freeze_layers, lora)) {
+    for (admitted.export_tensors) |t| if (training.frozen(t.name, freeze, lora)) {
         var dims: [8]i32 = undefined;
         if (t.shape.len > dims.len or t.data.len == 0) return error.InvalidLayaWeights;
         for (t.shape, dims[0..t.shape.len]) |dim, *dst| dst.* = std.math.cast(i32, dim) orelse return error.InvalidLayaWeights;

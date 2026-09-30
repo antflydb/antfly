@@ -497,6 +497,14 @@ test "laya frozen layers cover embeddings and the lowest encoder layers only" {
     try std.testing.expect(!train.frozen("encoder.layers.12.mlp.Wo.weight", 2, null));
     try std.testing.expect(!train.frozen("encoder.final_norm.weight", 22, null));
     try std.testing.expect(!train.frozen("head.layers.0.attn.Wqkv.weight", 22, null));
+    // The whole encoder, final norm included; the head and adapters still train.
+    try std.testing.expect(train.frozen("encoder.final_norm.weight", train.whole_encoder, null));
+    try std.testing.expect(train.frozen("encoder.layers.27.mlp.Wo.weight", train.whole_encoder, null));
+    try std.testing.expect(train.frozen("encoder.embeddings.tok_embeddings.weight", train.whole_encoder, null));
+    try std.testing.expect(!train.frozen("head.layers.0.linear1.weight", train.whole_encoder, null));
+    try std.testing.expect(!train.frozen("scorer.1.weight", train.whole_encoder, null));
+    try std.testing.expect(!train.frozen("type_emb.weight", train.whole_encoder, null));
+    try std.testing.expect(!train.frozen("encoder.layers.3.attn.Wqkv.lora_A", train.whole_encoder, null));
 }
 
 test "laya lora freezes only its targeted linear weights and biases, on top of frozen layers" {
