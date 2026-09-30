@@ -582,3 +582,13 @@ Open-Jev val 0.601 (0.441, 0.363, 0.755), soft CE 0.830, ECE 0.056.
 Mean train CE by fifth: 1.095 1.000 1.000 0.965 0.904 (packed sp16: 0.942 0.830 0.870 0.848 0.893).
 `sf16k30` (fuse_layers 30): train 11,573 s. s0-eval 0.476 (0.461, 0.385, 0.614), soft CE 1.090, ECE 0.028.
 Open-Jev val 0.605 (0.442, 0.363, 0.762), soft CE 0.835, ECE 0.052. Train CE by fifth: 1.096 0.986 1.026 0.943 0.881.
+
+Question-first and pointer head on `td/oj16k.jsonl`, soft CE, seed 42, max_packed_len 704:
+- `sq16` question_first: train 6,484 s. s0-eval 0.476 (choice 0.439, score 0.418, noul 0.592), soft CE 1.112, ECE 0.040.
+  Open-Jev val 0.621 (0.475, 0.381, 0.766), soft CE 0.844, ECE 0.077. Train CE by fifth 0.967 0.879 0.867 0.862 0.913.
+- `sptr16d` decision_head pointer (Kaiming init, pointer_lr 1e-3, merged main c3b5a1b34a): train 6,164 s.
+  s0-eval 0.334 (0.237, 0.273, 0.513), soft CE 1.189, ECE 0.046. Open-Jev val 0.546 (0.324, 0.287, 0.744),
+  soft CE 0.877, ECE 0.054. Train CE by fifth 1.445 1.159 1.110 1.015 0.930. Temperatures 2.88 3.55 2.57.
+- Discarded pointer runs: `sptr16` (unnormalized inputs, initial soft CE 17,028), `sptr16b` and `sptr16c`
+  (resident Metal gather of a LayerNorm output returned row 0; then a zero query at head_lr did not learn).
+- Earlier `sq16` attempts died to the Metal transposed-left dot regression (~60 s/step) and a full disk.
