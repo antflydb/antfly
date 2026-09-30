@@ -23,6 +23,80 @@ const schema =
     \\{"version":1,"storage_mode":"relational","default_type":"row","column_defaults":[{"column":"later","expression":{"op":"literal","type":"integer","value":"9"}}],"generated_columns":[{"column":"doubled","expression":{"op":"multiply","args":[{"op":"column","column":"id"},{"op":"literal","type":"integer","value":"2"}]}}],"relational_indexes":[{"name":"by_id","keys":[{"column":"id"}],"include_columns":["doubled"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"doubled":{"type":"integer"},"later":{"type":"integer"}},"additionalProperties":false}}}}
 ;
 
+test "relational index system merge tail streams REF5 oversized row with bounded resume chunks" {
+    const retained = @import("../retained_effects.zig");
+    const frame = @import("../retained_frame.zig");
+    const internal = @import("../internal_keys.zig");
+    const tail = @import("merge_tail_reader.zig");
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("merge-tail-ref5");
+    defer directory.cleanup();
+    const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 11, .shard_id = 101, .range_id = 101 }, .start_optional_runtimes = false };
+    var db = try db_mod.DB.open(alloc, directory.path(), options);
+    defer db.close();
+    try db.setSchemaJson(alloc, "{}");
+    // A real first primary apply persists the physical namespace before the
+    // separate retention admission. The bootstrap predates the retained cut.
+    try db.batchRaftReplicatedApply(.{ .timestamp_ns = 1, .writes = &.{.{ .key = "bootstrap", .value = "{}" }} }, .{ .term = 1, .index = 1 });
+    const identity = try db.relationalTopologyIdentity();
+    const scope: @import("online_source_contract.zig").Scope = .{
+        .consumer_epoch = 1,
+        .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
+        .receiver_namespace = .{ .table_id = 11, .shard_id = 102, .range_id = 102 },
+        .fence = .{ .role = .merge_source, .transition_id = 100, .attempt = 1, .peer_group_id = 102, .owner_group_id = 101, .namespace = identity.namespace, .catalog_digest = identity.catalog_digest, .admission_epoch = identity.next_epoch },
+    };
+    const pin: [32]u8 = @splat(7);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try retained.admitWithCapabilities(&txn, scope.namespace(), 1, pin, retained.default_limit, false, true);
+        try txn.commit();
+    }
+    const key = try internal.documentKeyAlloc(alloc, "large-row");
+    defer alloc.free(key);
+    const value = try alloc.alloc(u8, 17 * 1024 * 1024);
+    defer alloc.free(value);
+    @memset(value, 'x');
+    try db.core.store.put(key, value);
+    var read = try db.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+    var transferred = false;
+    errdefer if (!transferred) read.abort();
+    const scratch = try alloc.alloc(u8, frame.chunk_bytes);
+    errdefer if (!transferred) alloc.free(scratch);
+    var cache: frame.View.ChunkCache = .{ .bytes = scratch };
+    const retained_value = (try retained.readFrame(&read, scope.namespace(), 1, pin, 0, &cache)).?;
+    const view = switch (retained_value) {
+        .chunked => |v| v,
+        .contiguous => return error.TestUnexpectedResult,
+    };
+    var session: tail.Session = .{
+        .db = &db,
+        .txn = read,
+        .frame = retained_value,
+        .chunk_buffer = scratch,
+        .chunk_cache = cache,
+        .scope = scope,
+        .admission = .{ .namespace = scope.namespace(), .consumer_epoch = 1, .pin = pin, .start = 0, .acknowledged = 0, .snapshot_certificate = @splat(5), .admitted_applied_index = 1 },
+        .sequence = 1,
+        .total = view.effect_count,
+    };
+    transferred = true;
+    defer session.deinit();
+    var fragment = (try session.next(alloc, pages.max_rows, pages.max_bytes, .none)).?;
+    defer fragment.deinit();
+    try std.testing.expect(fragment.streamed != null);
+    try std.testing.expect(fragment.frame_complete);
+    const source: pages.Source = .{ .namespace = identity.namespace, .pin_digest = @splat(5), .applied_index = 1, .retention = .{ .epoch = 1, .after_sequence = 0 } };
+    const context: types.MergeReplicationContext = .{ .transition_id = 100, .donor_group_id = 101, .receiver_group_id = 102, .identity_namespace = scope.receiver_namespace, .copy_attempt = scope.copy_attempt };
+    try std.testing.expectError(error.MergePageChunkRequired, fragment.request(source, context, 1));
+    const chunks = try fragment.chunkRequests(source, context, 1);
+    const first = try chunks.requestAt(0);
+    try std.testing.expectEqual(@as(u64, value.len), first.merge_page.?.chunk.?.total_bytes);
+    try std.testing.expectEqualSlices(u8, value[0..pages.chunk_bytes], first.merge_page.?.chunk.?.data);
+    const resumed = try chunks.requestAt(pages.chunk_bytes);
+    try std.testing.expectEqual(@as(u64, pages.chunk_bytes), resumed.merge_page.?.chunk.?.offset);
+    try std.testing.expectEqualSlices(u8, value[pages.chunk_bytes .. 2 * pages.chunk_bytes], resumed.merge_page.?.chunk.?.data);
+}
+
 fn seal(input: types.BatchRequest) types.BatchRequest {
     var request = input;
     request.merge_page.?.digest = pages.commandDigest(request);
@@ -46,6 +120,111 @@ fn applyChunk(db: *db_mod.DB, index: *u64, lsn: *u64, standby: bool, request: ty
     defer alloc.free(encoded);
     try db.applyHAReplicationRecord(.{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = lsn.* + 1, .previous_lsn = lsn.*, .payload = encoded });
     lsn.* += 1;
+}
+
+test "relational index system merge tail source proofs stage inertly with exact page replay" {
+    const proof_batch = @import("source_proof_batch.zig");
+    const publication = @import("artifact_publication.zig");
+    const provenance = @import("artifact_producer_provenance.zig");
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("merge-proof-receiver");
+    defer directory.cleanup();
+    const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 11, .shard_id = 102, .range_id = 102 }, .start_optional_runtimes = false };
+    var db = try db_mod.DB.open(alloc, directory.path(), options);
+    defer db.close();
+    try db.updateRange(.{ .start = "m", .end = "z" });
+    var index: u64 = 0;
+    var checkpoint: types.MergeReplicationCheckpoint = .{ .kind = .accept, .transition_id = 100, .donor_group_id = 101, .receiver_group_id = 102, .receiver_base_start = "m", .receiver_base_end = "z", .merged_start = "a", .merged_end = "z" };
+    try apply(&db, &index, .{ .merge_checkpoint = checkpoint });
+    const source: pages.Source = .{ .namespace = .{ .table_id = 11, .shard_id = 101, .range_id = 101 }, .pin_digest = @splat(7), .applied_index = 20, .retention = .{ .epoch = 3, .after_sequence = 40 }, .provenance_required = true };
+    checkpoint.kind = .begin_copy;
+    checkpoint.copy_attempt = .{ .donor_term = 1, .sequence = 1 };
+    checkpoint.page_source = source;
+    checkpoint.page_receiver_namespace = options.identity_namespace.?;
+    try apply(&db, &index, .{ .merge_checkpoint = checkpoint });
+    const context: types.MergeReplicationContext = .{ .transition_id = 100, .donor_group_id = 101, .receiver_group_id = 102, .identity_namespace = options.identity_namespace.?, .copy_attempt = checkpoint.copy_attempt };
+    var page: pages.Command = .{ .source = source, .sequence = 1, .phase = .cleanup, .exhausted = true, .digest = @splat(0) };
+    try apply(&db, &index, seal(.{ .merge_replication = context, .merge_page = page }));
+    page.sequence = 2;
+    page.phase = .rows;
+    try apply(&db, &index, seal(.{ .merge_replication = context, .merge_page = page }));
+    var namespace: publication.Namespace = undefined;
+    @import("doc_identity.zig").encodeNamespace(&namespace, source.namespace);
+    const logical_source = publication.Source{ .document_key = "b", .content_digest = @splat(3), .timestamp = 1, .input_position = null };
+    const logical_effect = provenance.Effect{ .family = .document_artifact, .key = "effect", .source_index = 0, .value_digest = null, .value_bytes = 0 };
+    var logical_proof: provenance.Proof = .{ .namespace = namespace, .authority_epoch = 1, .catalog_digest = @splat(2), .producer_kind = .index, .producer_name = "index", .producer_generation = 1, .producer_artifact_name = "asset", .publication_digest = @splat(4), .input_digest = undefined, .sources = (&logical_source)[0..1], .artifact_sources = &.{}, .effects = (&logical_effect)[0..1] };
+    logical_proof.input_digest = logical_proof.inputCommand().inputDigest();
+    const raw = try provenance.encodeAlloc(alloc, logical_proof);
+    defer alloc.free(raw);
+    const value = try proof_batch.encodeValueAlloc(alloc, &.{1}, raw);
+    defer alloc.free(value);
+    const proof_key = proof_batch.mergeKey(namespace, source.pin_digest, logical_proof.publication_digest);
+    page.sequence = 3;
+    page.phase = .artifacts;
+    page.exhausted = false;
+    page.next = &proof_key;
+    page.next_snapshot_position = .{ .object = 3, .offset = 64, .remaining = 0 };
+    page.provenance_effects = &.{.{ .key = &proof_key, .value = value }};
+    const request = seal(.{ .merge_replication = context, .merge_page = page });
+    try apply(&db, &index, request);
+    const stored = try db.core.store.get(alloc, &proof_key);
+    defer alloc.free(stored);
+    try std.testing.expectEqualSlices(u8, value, stored);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, publication.authority_key));
+    db.close();
+    db = try db_mod.DB.open(alloc, directory.path(), options);
+    try apply(&db, &index, request);
+    const resumed = try db.core.store.get(alloc, &proof_key);
+    defer alloc.free(resumed);
+    try std.testing.expectEqualSlices(u8, value, resumed);
+    const large_document = try alloc.alloc(u8, 2 * pages.chunk_bytes);
+    defer alloc.free(large_document);
+    @memset(large_document, 'c');
+    const large_source = publication.Source{ .document_key = large_document, .content_digest = @splat(3), .timestamp = 1, .input_position = null };
+    var large_proof = logical_proof;
+    large_proof.publication_digest = @splat(6);
+    large_proof.sources = (&large_source)[0..1];
+    large_proof.input_digest = large_proof.inputCommand().inputDigest();
+    const large_raw = try provenance.encodeAlloc(alloc, large_proof);
+    defer alloc.free(large_raw);
+    const large_value = try proof_batch.encodeValueAlloc(alloc, &.{1}, large_raw);
+    defer alloc.free(large_value);
+    const large_key = proof_batch.mergeKey(namespace, source.pin_digest, large_proof.publication_digest);
+    page.sequence = 4;
+    page.after = &proof_key;
+    page.next = &large_key;
+    page.next_snapshot_position = .{ .object = 4, .offset = 64, .remaining = 0 };
+    page.provenance_effects = &.{.{ .key = &large_key, .value = large_value }};
+    const transfer = try pages.RowChunks(types.BatchRequest).init(seal(.{ .merge_replication = context, .merge_page = page }));
+    const first = try transfer.requestAt(0);
+    const middle = try transfer.requestAt(pages.chunk_bytes);
+    const final = try transfer.requestAt(2 * pages.chunk_bytes);
+    try apply(&db, &index, first);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, &large_key));
+    db.close();
+    db = try db_mod.DB.open(alloc, directory.path(), options);
+    try apply(&db, &index, first);
+    try apply(&db, &index, middle);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, &large_key));
+    try apply(&db, &index, final);
+    const stored_large = try db.core.store.get(alloc, &large_key);
+    defer alloc.free(stored_large);
+    try std.testing.expectEqualSlices(u8, large_value, stored_large);
+    try apply(&db, &index, final);
+    var pending = (try db.mergeCopyPageStatus(alloc)).?;
+    defer pending.deinit();
+    try std.testing.expect(pending.value.provenance_pending);
+    page.sequence = 5;
+    page.after = &large_key;
+    page.next = "";
+    page.exhausted = true;
+    page.next_snapshot_position = null;
+    page.provenance_effects = &.{};
+    try apply(&db, &index, seal(.{ .merge_replication = context, .merge_page = page }));
+    page.sequence = 6;
+    page.phase = .tail;
+    page.after = "";
+    page.tail = .{ .finish = .{ .through_sequence = 40, .applied_index = 20, .cut_digest = @splat(9) } };
+    try std.testing.expectError(error.OnlineMergeProvenanceAdoptionRequired, db.batch(seal(.{ .merge_replication = context, .merge_page = page })));
 }
 
 test "relational index system merge chunks keep rows invisible until durable verified completion" {
@@ -329,7 +508,7 @@ test "relational index system merge tail sessions decode bounded immutable fragm
         try db.batchRaftReplicatedApply(.{ .timestamp_ns = 111, .writes = &.{ .{ .key = "a", .value = "{\"id\":1}" }, .{ .key = "b", .value = "{\"id\":2}" } }, .deletes = &.{"c"} }, .{ .term = 1, .index = 2 });
         var session = (try db.beginMergeTailRead(scope, 0)).?;
         defer session.deinit();
-        const frame_digest = session.reader.frame_digest;
+        const frame_digest = session.frameDigest();
         var canceled = std.atomic.Value(bool).init(true);
         try std.testing.expectError(error.Canceled, session.next(alloc, 1, 1024, .fromAtomic(&canceled)));
         try std.testing.expectEqual(@as(u32, 0), session.offset);

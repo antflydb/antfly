@@ -46,6 +46,9 @@ class OwnerLinkFault:
         self.raft_seen = threading.Event()
         self.drop_next_reply = False
         self.reply_dropped = threading.Event()
+        self.accepted_request = None
+        self.pause_after_accept = False
+        self.allow_begin_copy = False
         self.require_durable_decision = False
         self.lose_first_committed_reply = False
         self.transaction_coordinators = {}
@@ -148,7 +151,7 @@ class OwnerLinkFault:
                 except ValueError:
                     pass
             if response.status_code >= 400 and path.endswith(
-                ("/restore-owner", "/txn-prepare")
+                ("/restore-owner", "/txn-prepare", "/batch-routed-v1")
             ):
                 self.failed_owner_responses.append(
                     (index, path, response.status_code, response.text[:256])
@@ -195,6 +198,11 @@ class OwnerLinkFault:
                 "_fault_path", ""
             ).endswith(f"/txn-{phase}")
         operation = body.get("operation", {})
+        if self.window == "accept":
+            return (
+                body.get("_merge_checkpoint", {}).get("kind") == "page_v4_accept"
+                and body.get("_artifact_catalog") is not None
+            )
         if self.window in ("publication", "snapshot"):
             return self.window in operation
         if self.window == "finalize":
@@ -203,6 +211,24 @@ class OwnerLinkFault:
 
     def block(self, index, body):
         with self.lock:
+            if (
+                self.pause_after_accept
+                and self.allow_begin_copy
+                and (
+                    body.get("operation", {}).get("checkpoint", {}).get("kind")
+                    == "begin_copy"
+                    or body.get("_merge_checkpoint", {}).get("kind")
+                    == "page_v4_begin_copy"
+                )
+            ):
+                return False
+            if self.pause_after_accept and (
+                (body.get("operation") and "status" not in body["operation"])
+                or "_merge_checkpoint" in body
+                or "_online_source" in body
+            ):
+                self.hits.add(index)
+                return True
             if self.lose_first_committed_reply:
                 return False
             if self.healed or not self.matches(body):
@@ -225,12 +251,16 @@ class OwnerLinkFault:
     def heal(self):
         with self.lock:
             self.healed = True
+            self.pause_after_accept = False
 
     def drop_reply(self, index, body):
         with self.lock:
             if not self.drop_next_reply or not self.matches(body):
                 return False
             self.drop_next_reply = False
+            if self.window == "accept":
+                self.accepted_request = (index, body.copy())
+                self.pause_after_accept = True
             self.hits.add(index)
             self.reply_dropped.set()
             return True
@@ -262,6 +292,34 @@ def test_owner_link_failed_response_diagnostics_survive_heal_and_stay_bounded():
     assert fault.failed_responses() == observations
     assert not fault.observed()
     assert not fault.transaction_observations
+
+
+def test_ordered_accept_fault_holds_effects_only_after_committed_reply_loss():
+    fault = OwnerLinkFault("accept")
+    command = {
+        "_merge_checkpoint": {"kind": "page_v4_accept"},
+        "_artifact_catalog": {"binding": {"epoch": 1}},
+    }
+    assert not fault.matches({"operation": {"checkpoint": {"kind": "accept"}}})
+    assert not fault.matches({"_merge_checkpoint": {"kind": "accept"}})
+    assert not fault.matches({"_merge_checkpoint": {"kind": "page_v4_accept"}})
+    assert fault.block(0, command)
+    fault.heal_with_lost_reply()
+    assert not fault.block(0, command)
+    assert fault.drop_reply(0, command)
+    assert fault.reply_dropped.is_set()
+    assert fault.accepted_request == (0, command)
+    assert fault.block(1, {"operation": {"snapshot": {}}})
+    assert fault.block(1, command)
+    assert not fault.block(1, {"operation": {"status": "receiver"}})
+    assert not fault.block(1, {"unrelated": True})
+    fault.allow_begin_copy = True
+    assert not fault.block(1, {"operation": {"checkpoint": {"kind": "begin_copy"}}})
+    assert not fault.block(1, {"_merge_checkpoint": {"kind": "page_v4_begin_copy"}})
+    assert fault.block(1, {"operation": {"snapshot": {}}})
+    assert fault.block(1, command)
+    fault.heal()
+    assert not fault.block(1, command)
 
 
 def test_owner_link_merge_diagnostics_retain_bounded_progress_after_heal():
@@ -578,6 +636,7 @@ def faulted_merge_cluster(owner_link_fault, three_by_three_backup_cluster):
         ("release", "coordinator"),
         ("snapshot", "raft_quorum"),
         ("release", "reply_loss"),
+        ("accept", "accept_reply_restart"),
     ],
     indirect=["owner_link_fault"],
 )
@@ -610,6 +669,110 @@ def test_online_merge_recovers_after_owner_link_outage_and_crash(
         # all earlier interruptions must leave donor routing intact.
         assert (donor not in live) == (fault.window == "release"), transition
         assert receiver in live
+        if crash == "accept_reply_restart":
+            # Ordinary creation/default selection must pin both fulltext owners
+            # without a private online opt-in. Public metadata deliberately
+            # shares index incarnations across shards; independent generation
+            # compatibility is covered by the native reconciliation regression.
+            assert cluster.online_merge_enabled is None
+            donor_binding = online["artifact_catalog"]
+            receiver_binding = online["receiver_artifact_catalog"]
+            assert int(donor_binding["epoch"]) > 0
+            assert int(receiver_binding["epoch"]) > 0
+            assert (
+                donor_binding["semantic_digest"] == receiver_binding["semantic_digest"]
+            )
+            fault.heal_with_lost_reply()
+            assert fault.reply_dropped.wait(30), (
+                f"ordered accept never committed: {fault.failed_responses()}\n"
+                f"{cluster.debug_logs()}"
+            )
+            index, captured = fault.accepted_request
+            command = captured.copy()
+            path = command.pop("_fault_path")
+            assert command["_artifact_catalog"]["binding"] == receiver_binding
+            assert (
+                command["_merge_checkpoint"]["page_source"]["artifact_catalog"]
+                == donor_binding
+            )
+            assert 0 <= index < len(cluster.data_procs), index
+            cluster.data_procs[index].kill()
+            cluster.data_procs[index].wait(timeout=10)
+            try:
+                cluster.restart_crashed_node(metadata=False, index=index)
+
+                def duplicate_accept():
+                    try:
+                        leader_status = cluster.wait_for_group_leader(
+                            receiver, timeout_s=5
+                        )
+                        owner = int(leader_status["leader_store_id"]) - 4
+                        response = requests.post(
+                            cluster.data_urls[owner] + path,
+                            headers={
+                                **backups.internal_service_headers(),
+                                "X-Antfly-Raft-Batch-Remaining-Ms": "5000",
+                                "X-Antfly-Raft-Batch-Forwards-Remaining": "2",
+                                "X-Antfly-Raft-Batch-Campaign-Allowed": "true",
+                            },
+                            json=command,
+                            timeout=5,
+                        )
+                    except (requests.RequestException, AssertionError):
+                        return False
+                    assert response.status_code in (200, 201, 202, 409, 503), (
+                        response.text
+                    )
+                    return 200 <= response.status_code < 300
+
+                # Exact retry after restart must be idempotent. All controller
+                # effects remain held at the proxy, so it cannot race cutover.
+                assert wait_until(duplicate_accept, timeout_s=45, interval_s=0.5), (
+                    cluster.debug_logs()
+                )
+                leader_status = cluster.wait_for_group_leader(receiver, timeout_s=30)
+                owner = int(leader_status["leader_store_id"]) - 4
+                # Accept reserves the range; begin_copy subsequently binds the
+                # page receipt. Permit that one command, still withholding all
+                # cleanup/snapshot/tail effects while reading its durable head.
+                with fault.lock:
+                    fault.allow_begin_copy = True
+
+                def bound_receipt():
+                    receipt = requests.post(
+                        cluster.data_urls[owner]
+                        + path.rsplit("/", 1)[0]
+                        + "/online-merge-io",
+                        headers=backups.internal_service_headers(),
+                        json={
+                            "scope": online["scope"],
+                            "operation": {"status": "receiver"},
+                        },
+                        timeout=10,
+                    )
+                    assert receipt.status_code == 200, receipt.text
+                    return receipt.json()["progress"]
+
+                progress = wait_until(bound_receipt, timeout_s=30, interval_s=0.5)
+                assert progress is not None, cluster.debug_logs()
+                assert progress["source"] == command["_merge_checkpoint"]["page_source"]
+                assert int(progress["sequence"]) == 0
+                assert progress["last_digest"] == [0] * 32
+                current = cluster.metadata_stable_leader_id(timeout_s=30)
+                recovered = cluster.metadata_snapshot(current - 1, request_timeout_s=3)
+                state = next(
+                    value["online"]
+                    for value in recovered["merge_transitions"]
+                    if int(value["donor_group_id"]) == donor
+                    and int(value["receiver_group_id"]) == receiver
+                )
+                assert state["scope"] == online["scope"]
+                assert state["artifact_catalog"] == donor_binding
+                assert state["receiver_artifact_catalog"] == receiver_binding
+                assert state["phase"] not in ("cancelled", "complete")
+            finally:
+                fault.heal()
+            return online
         if fault.window == "snapshot":
             # The immutable source already exists, and copy requests are held.
             # Exercise real retained effects, including replacement of a row
@@ -692,9 +855,52 @@ def test_online_merge_recovers_after_owner_link_outage_and_crash(
             fault.heal()
         return online
 
-    backups._exercise_online_document_merge(
-        faulted_merge_cluster, after_accept=interrupt
+    def verify_default_fulltext(cluster, session, table_name, documents):
+        response = session.get(
+            f"{cluster.data_api_urls[0]}/tables/{table_name}", timeout=10
+        )
+        assert response.status_code == 200, response.text
+        assert "full_text_index_v0" in response.json()["indexes"]
+        before = wait_until(
+            lambda: backups._lookup_doc_from_url(
+                session, cluster.data_api_urls[0], table_name, "0:small"
+            ),
+            timeout_s=30,
+            interval_s=0.5,
+        )
+        assert (
+            before is not None and before.get("title") == documents["0:small"]["title"]
+        ), "fixture source must be publicly readable before merge"
+
+    table_name = backups._exercise_online_document_merge(
+        faulted_merge_cluster,
+        after_accept=interrupt,
+        before_merge=verify_default_fulltext
+        if crash == "accept_reply_restart"
+        else None,
     )
+    if crash == "accept_reply_restart":
+
+        def indexed_source_survived():
+            response = requests.post(
+                f"{faulted_merge_cluster.data_api_urls[0]}/tables/{table_name}/query",
+                json={
+                    "full_text_search": {"field": "title", "match": "companion"},
+                    "limit": 10,
+                },
+                timeout=10,
+            )
+            if response.status_code != 200:
+                return False
+            return [
+                hit.get("_id")
+                for result in response.json().get("responses", [])
+                for hit in result.get("hits", {}).get("hits", [])
+            ] == ["0:small"]
+
+        assert wait_until(indexed_source_survived, timeout_s=45, interval_s=0.5), (
+            faulted_merge_cluster.debug_logs()
+        )
 
 
 @pytest.mark.parametrize(

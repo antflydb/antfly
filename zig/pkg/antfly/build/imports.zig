@@ -18,6 +18,7 @@ const platform_build = @import("../../../lib/platform/build_support.zig");
 const addSnowballModule = @import("snowball.zig").addSnowballModule;
 
 pub const AntflyRootImports = struct {
+    sql_parser: *std.Build.Module,
     storage_boundary: @import("storage_boundary.zig").Modules,
     cancellation: *std.Build.Module,
     cache_budget: *std.Build.Module,
@@ -219,6 +220,7 @@ pub const AntflyRootImports = struct {
     /// Remote commands depend on client contracts and transport. In particular,
     /// they do not depend on local tokenization, inference, or storage engines.
     pub fn configureCli(self: @This(), mod: *std.Build.Module, link_libc: bool) void {
+        mod.addImport("antfly_runtime_abi", self.runtime_abi);
         mod.addImport("antfly_platform", self.platform);
         mod.addImport("antfly_runtime_fs", self.runtime_fs);
         mod.addImport("httpx", self.httpx);
@@ -377,6 +379,7 @@ pub const AntflyRootImports = struct {
     }
 
     fn configureBase(self: @This(), mod: *std.Build.Module, link_libc: bool) void {
+        mod.addImport("sql_parser", self.sql_parser);
         self.storage_boundary.configureProfile(mod, false, false, self.boundary_profile);
         mod.addOptions("build_options", self.build_options);
         mod.addImport("antfly_platform", self.platform);

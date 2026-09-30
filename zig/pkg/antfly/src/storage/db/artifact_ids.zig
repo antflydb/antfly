@@ -313,10 +313,15 @@ pub fn decodeArtifactPublicIdAlloc(alloc: Allocator, artifact_id: []const u8) !?
     const document_raw = parts.next() orelse return error.InvalidArgument;
     const name_raw = parts.next() orelse return error.InvalidArgument;
 
-    var artifact_ref = types.ArtifactRef{
-        .document_id = try decodeBase64UrlComponentAlloc(alloc, document_raw),
-        .name = try decodeBase64UrlComponentAlloc(alloc, name_raw),
-        .kind = try decodeArtifactKind(kind_raw),
+    var artifact_ref: types.ArtifactRef = blk: {
+        const kind = try decodeArtifactKind(kind_raw);
+        const document_id = try decodeBase64UrlComponentAlloc(alloc, document_raw);
+        errdefer alloc.free(document_id);
+        break :blk .{
+            .document_id = document_id,
+            .name = try decodeBase64UrlComponentAlloc(alloc, name_raw),
+            .kind = kind,
+        };
     };
     errdefer artifact_ref.deinit(alloc);
 

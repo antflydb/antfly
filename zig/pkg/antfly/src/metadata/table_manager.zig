@@ -19,7 +19,7 @@ pub const artifact_sources_protocol_version: u16 = 1;
 /// The store understands native HBC authority markers, WAL recovery, and the
 /// fail-closed placement contract used during rolling upgrades.
 pub const dense_native_storage_protocol_version: u16 = 1;
-pub const relational_topology_protocol_version: u16 = 1;
+pub const relational_topology_protocol_version: u16 = 2;
 pub const embedding_activity_protocol_version: u16 = 2;
 const group_ids = @import("../common/group_ids.zig");
 const topology_records = @import("../common/topology_records.zig");
@@ -43,23 +43,7 @@ pub const TableRecord = @import("local_catalog.zig").TableRecord;
 
 pub const TableDefinition = TableRecord;
 
-pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
-    return @import("../common/vector_migration.zig").admissionsEqual(lhs.storage_migration, rhs.storage_migration) and
-        lhs.storage.dense_embeddings == rhs.storage.dense_embeddings and
-        lhs.table_id == rhs.table_id and
-        std.mem.eql(u8, lhs.name, rhs.name) and
-        std.mem.eql(u8, lhs.description, rhs.description) and
-        std.mem.eql(u8, lhs.schema_json, rhs.schema_json) and
-        std.mem.eql(u8, lhs.read_schema_json, rhs.read_schema_json) and
-        std.mem.eql(u8, lhs.relational_retirement_json, rhs.relational_retirement_json) and
-        std.mem.eql(u8, lhs.indexes_json, rhs.indexes_json) and
-        std.mem.eql(u8, lhs.replication_sources_json, rhs.replication_sources_json) and
-        std.mem.eql(u8, lhs.placement_role, rhs.placement_role) and
-        std.mem.eql(u8, lhs.restore_backup_id, rhs.restore_backup_id) and
-        std.mem.eql(u8, lhs.restore_location, rhs.restore_location) and
-        lhs.desired_replica_count == rhs.desired_replica_count and
-        lhs.min_ranges == rhs.min_ranges;
-}
+pub const tableDefinitionsEqual = @import("local_catalog.zig").tableDefinitionsEqual;
 
 pub const TableDefinitionFingerprint = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 
@@ -322,31 +306,7 @@ pub fn clearOwnedRangeRestoreIntent(alloc: std.mem.Allocator, record: *RangeReco
     record.completed_restore_fingerprint = completed_restore_fingerprint;
 }
 
-pub fn rangeRecordsEqual(lhs: RangeRecord, rhs: RangeRecord) bool {
-    return lhs.group_id == rhs.group_id and
-        lhs.range_id == rhs.range_id and
-        lhs.table_id == rhs.table_id and
-        std.mem.eql(u8, lhs.start_key, rhs.start_key) and
-        ((lhs.end_key == null and rhs.end_key == null) or
-            (lhs.end_key != null and rhs.end_key != null and std.mem.eql(u8, lhs.end_key.?, rhs.end_key.?))) and
-        lhs.doc_identity_shard_id == rhs.doc_identity_shard_id and
-        lhs.doc_identity_range_id == rhs.doc_identity_range_id and
-        lhs.split_attempt_epoch == rhs.split_attempt_epoch and
-        std.mem.eql(u8, lhs.restore_backup_id, rhs.restore_backup_id) and
-        std.mem.eql(u8, lhs.restore_artifact_backup_id, rhs.restore_artifact_backup_id) and
-        std.mem.eql(u8, lhs.restore_location, rhs.restore_location) and
-        std.mem.eql(u8, lhs.restore_snapshot_path, rhs.restore_snapshot_path) and
-        std.mem.eql(u8, lhs.restore_connection, rhs.restore_connection) and
-        lhs.restore_artifact_size_bytes == rhs.restore_artifact_size_bytes and
-        std.mem.eql(u8, lhs.restore_artifact_sha256, rhs.restore_artifact_sha256) and
-        lhs.restore_native_manifest_size_bytes == rhs.restore_native_manifest_size_bytes and
-        std.mem.eql(u8, lhs.restore_native_manifest_sha256, rhs.restore_native_manifest_sha256) and
-        std.mem.eql(
-            u8,
-            &lhs.completed_restore_fingerprint,
-            &rhs.completed_restore_fingerprint,
-        );
-}
+pub const rangeRecordsEqual = @import("local_catalog.zig").rangeRecordsEqual;
 
 /// Restore publication is monotonic: immediately after the catalog publishes
 /// an active restore intent, a data node may complete it and clear the
@@ -427,6 +387,13 @@ pub const StoreRecord = struct {
     /// Random non-zero process incarnation established by store registration.
     /// Status generations are comparable only within this incarnation.
     reporter_incarnation: u64 = 0,
+    /// Durable physical identity of the store's replica-root directory.
+    /// Unlike reporter_incarnation this survives same-disk process restart;
+    /// replacing that root must create a different value before registration.
+    replica_root_incarnation: u128 = 0,
+    /// Ed25519 verifier for retirement receipts from this exact physical root.
+    /// Once registered, the same root must never silently replace this key.
+    replica_root_public_key: [32]u8 = @splat(0),
     /// Highest status snapshot generation accepted for `reporter_incarnation`.
     status_generation: u64 = 0,
     /// Non-zero only after this store can parse, materialize, and report the
@@ -1001,6 +968,10 @@ pub const RuntimeGroupStatusReport = struct {
     /// accepted replay target for the group. Heartbeat/activity freshness is
     /// intentionally independent from this convergence proof.
     target_observation_complete: bool = true,
+    /// Applied immutable relational schema version sampled from the same
+    /// storage-owner observation as index and identity facts. Zero is unknown
+    /// for older runtime-status wire profiles, not proof of an empty schema.
+    schema_epoch: u32 = 0,
     doc_count: u64 = 0,
     disk_bytes: u64 = 0,
     disk_bytes_known: bool = false,
@@ -2276,14 +2247,9 @@ pub fn cloneRoutingRange(alloc: std.mem.Allocator, record: RangeRecord) !RangeRe
     };
 }
 
-pub fn rangeDocIdentityShardId(record: RangeRecord) u64 {
-    return if (record.doc_identity_shard_id == 0) record.group_id else record.doc_identity_shard_id;
-}
+pub const rangeDocIdentityShardId = @import("local_catalog.zig").rangeDocIdentityShardId;
 
-pub fn rangeDocIdentityRangeId(record: RangeRecord) u64 {
-    if (record.doc_identity_range_id != 0) return record.doc_identity_range_id;
-    return if (record.range_id == 0) record.group_id else record.range_id;
-}
+pub const rangeDocIdentityRangeId = @import("local_catalog.zig").rangeDocIdentityRangeId;
 
 fn rangeMatchesTransitionIdentity(
     record: RangeRecord,
@@ -2489,6 +2455,8 @@ pub fn cloneStore(alloc: std.mem.Allocator, record: StoreRecord) !StoreRecord {
         .store_id = record.store_id,
         .node_id = record.node_id,
         .reporter_incarnation = record.reporter_incarnation,
+        .replica_root_incarnation = record.replica_root_incarnation,
+        .replica_root_public_key = record.replica_root_public_key,
         .status_generation = record.status_generation,
         .artifact_sources_protocol_version = record.artifact_sources_protocol_version,
         .native_generation_restore_version = record.native_generation_restore_version,
@@ -2636,6 +2604,7 @@ pub fn cloneRuntimeGroupStatusReport(alloc: std.mem.Allocator, record: RuntimeGr
         .status_generation = record.status_generation,
         .target_observation_revision = record.target_observation_revision,
         .target_observation_complete = record.target_observation_complete,
+        .schema_epoch = record.schema_epoch,
         .doc_count = record.doc_count,
         .disk_bytes = record.disk_bytes,
         .disk_bytes_known = record.disk_bytes_known,

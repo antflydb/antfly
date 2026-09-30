@@ -309,13 +309,15 @@ pub fn collectLocalSchemaProgressWithOptions(
 
         const version = try schemaVersion(alloc, table.schema_json);
         const read_version = try schemaVersion(alloc, table.read_schema_json);
+        const target_full_text = try hasVersionedFullTextIndex(alloc, table.indexes_json, version);
         const ready = localRangeHasSchemaVersionIndex(
             alloc,
             replica_root_dir,
             table.name,
-            group_id,
+            range,
             version,
             read_version,
+            target_full_text,
             options,
         ) catch |err| switch (err) {
             // Schema progress is observational. A generation publication can
@@ -396,13 +398,15 @@ pub fn collectLocalSchemaProgressFromRuntime(
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
-    const State = struct { version: u32, read_version: u32, hosted: usize = 0, ready: bool = true };
+    const State = struct { version: u32, read_version: u32, target_full_text: bool, hosted: usize = 0, ready: bool = true };
     var states: std.AutoHashMapUnmanaged(u64, State) = .empty;
     for (tables) |table| {
         if (table.read_schema_json.len == 0) continue;
+        const version = try schemaVersion(alloc, table.schema_json);
         try states.put(a, table.table_id, .{
-            .version = try schemaVersion(alloc, table.schema_json),
+            .version = version,
             .read_version = try schemaVersion(alloc, table.read_schema_json),
+            .target_full_text = try hasVersionedFullTextIndex(a, table.indexes_json, version),
         });
     }
     if (states.count() == 0) return alloc.alloc(table_manager.SchemaProgressRecord, 0);
@@ -428,7 +432,7 @@ pub fn collectLocalSchemaProgressFromRuntime(
             state.ready = false;
             continue;
         };
-        state.ready = state.ready and runtimeHasReadySchemaVersionIndex(runtime, range, state.version, state.read_version);
+        state.ready = state.ready and runtimeHasReadySchemaVersionIndex(runtime, range, state.version, state.read_version, state.target_full_text);
     }
     var out: std.ArrayListUnmanaged(table_manager.SchemaProgressRecord) = .empty;
     errdefer out.deinit(alloc);
@@ -464,6 +468,7 @@ fn collectLocalSchemaProgressReference(
         if (table.read_schema_json.len == 0) continue;
         const version = try schemaVersion(alloc, table.schema_json);
         const read_version = try schemaVersion(alloc, table.read_schema_json);
+        const target_full_text = try hasVersionedFullTextIndex(alloc, table.indexes_json, version);
 
         var hosted_ranges: usize = 0;
         var all_ready = true;
@@ -475,7 +480,7 @@ fn collectLocalSchemaProgressReference(
                 all_ready = false;
                 continue;
             };
-            all_ready = all_ready and runtimeHasReadySchemaVersionIndex(runtime, range, version, read_version);
+            all_ready = all_ready and runtimeHasReadySchemaVersionIndex(runtime, range, version, read_version, target_full_text);
         }
         if (hosted_ranges == 0 or !all_ready) continue;
         try out.append(alloc, .{
@@ -863,12 +868,18 @@ fn localRangeHasSchemaVersionIndex(
     alloc: std.mem.Allocator,
     replica_root_dir: []const u8,
     table_name: []const u8,
-    group_id: u64,
+    range: table_manager.RangeRecord,
     schema_version: u32,
     read_schema_version: u32,
+    target_full_text: bool,
     options: ReconcileReplicaRootOptions,
 ) !bool {
+    const group_id = range.group_id;
     if (options.shard_db_adapter) |adapter| {
+        // The older adapter contract proves only a full-text index. An
+        // indexless owner must publish the V18 epoch/identity observation;
+        // do not turn an unavailable observation into filesystem authority.
+        if (!target_full_text) return false;
         return try adapter.schemaIndexReady(alloc, table_name, group_id, schema_version, read_schema_version);
     }
     if (comptime control_only_storage_sources) {
@@ -906,6 +917,18 @@ fn localRangeHasSchemaVersionIndex(
     defer db.close();
     const stats = try db.stats(alloc);
     defer db_mod.types.freeDBStats(alloc, stats);
+
+    if (!target_full_text) {
+        const identity = stats.doc_identity;
+        return stats.schema_epoch != 0 and stats.schema_epoch == schema_version and
+            identity.namespace_table_id == range.table_id and
+            identity.namespace_shard_id == table_manager.rangeDocIdentityShardId(range) and
+            identity.namespace_range_id == table_manager.rangeDocIdentityRangeId(range) and
+            identity.next_ordinal != 0 and
+            identity.next_ordinal - 1 == identity.allocated_ordinals and
+            !identity.rebuild_required and !identity.ordinal_capacity_exhausted and
+            (std.math.add(u64, identity.live_ordinals, identity.tombstone_ordinals) catch return false) == identity.allocated_ordinals;
+    }
 
     const target_index = findDbIndexStats(stats.indexes, target_name) orelse return false;
     if (!indexStatsReady(target_index)) return false;
@@ -960,6 +983,7 @@ fn runtimeHasReadySchemaVersionIndex(
     range: table_manager.RangeRecord,
     schema_version: u32,
     read_schema_version: u32,
+    target_full_text: bool,
 ) bool {
     // Schema cutover must be driven by a current observation of the complete
     // target projection. A catalog-only placeholder and a newly-created empty
@@ -977,8 +1001,17 @@ fn runtimeHasReadySchemaVersionIndex(
         @import("../api/tables.zig").default_full_text_index_name
     else
         std.fmt.bufPrint(&target_name_buf, "full_text_index_v{d}", .{schema_version}) catch return false;
-    const target = findReadyRuntimeFullTextIndex(runtime.indexes, target_name) orelse return false;
-    if (target.doc_count != runtime.doc_identity.live_ordinals) return false;
+    if (target_full_text) {
+        const target = findReadyRuntimeFullTextIndex(runtime.indexes, target_name) orelse return false;
+        if (target.doc_count != runtime.doc_identity.live_ordinals) return false;
+    } else {
+        // An explicitly indexless relational table has no full-text rebuild
+        // to wait for. Only a fresh owner observation of the exact applied
+        // immutable schema epoch may retire the previous read schema. Older
+        // wire profiles report zero and therefore fail closed here.
+        if (runtime.schema_epoch == 0 or runtime.schema_epoch != schema_version or
+            !runtime.target_observation_complete) return false;
+    }
     if (schema_version == read_schema_version) return true;
 
     var read_name_buf: [64]u8 = undefined;
@@ -988,6 +1021,29 @@ fn runtimeHasReadySchemaVersionIndex(
         std.fmt.bufPrint(&read_name_buf, "full_text_index_v{d}", .{read_schema_version}) catch return false;
     _ = findReadyRuntimeFullTextIndex(runtime.indexes, read_name) orelse return true;
     return true;
+}
+
+fn hasVersionedFullTextIndex(alloc: std.mem.Allocator, indexes_json: []const u8, version: u32) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidTableIndexMetadata,
+    };
+    var name_buf: [64]u8 = undefined;
+    const name = if (version == 0)
+        @import("../api/tables.zig").default_full_text_index_name
+    else
+        try std.fmt.bufPrint(&name_buf, "full_text_index_v{d}", .{version});
+    return try desiredIndexContains(object, name);
+}
+
+/// Only an active migration without the usual versioned full-text target
+/// needs the V18 owner-epoch proof. Ordinary store heartbeats stay on their
+/// negotiated predecessor profile during rolling upgrades.
+pub fn indexlessSchemaEpochRequired(alloc: std.mem.Allocator, table: table_manager.TableRecord) !bool {
+    if (table.read_schema_json.len == 0) return false;
+    return !try hasVersionedFullTextIndex(alloc, table.indexes_json, try schemaVersion(alloc, table.schema_json));
 }
 
 fn runtimeIdentitySummaryIsAuthoritative(
@@ -1277,7 +1333,7 @@ fn implementationTests() type {
             const count: usize = if (benchmark) 2000 else 16;
             const tables = try a.alloc(table_manager.TableRecord, table_count);
             defer a.free(tables);
-            for (tables, 0..) |*table, i| table.* = .{ .table_id = i + 1, .name = "tenant", .schema_json = "{\"version\":1}", .read_schema_json = "{\"version\":0}" };
+            for (tables, 0..) |*table, i| table.* = .{ .table_id = i + 1, .name = "tenant", .schema_json = "{\"version\":1}", .read_schema_json = "{\"version\":0}", .indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"}}" };
             const ranges = try a.alloc(table_manager.RangeRecord, count);
             defer a.free(ranges);
             const hosted = try a.alloc(u64, count);
@@ -1340,6 +1396,7 @@ fn implementationTests() type {
                 .name = "docs",
                 .schema_json = "{\"version\":1}",
                 .read_schema_json = "{\"version\":0}",
+                .indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"}}",
             }};
             const ranges = [_]table_manager.RangeRecord{
                 .{ .group_id = 7, .table_id = 11, .start_key = "", .end_key = "m" },
@@ -3409,9 +3466,10 @@ fn implementationTests() type {
                 alloc,
                 path,
                 "docs",
-                2007,
+                .{ .group_id = 2007, .range_id = 2007, .table_id = 1, .start_key = "" },
                 2,
                 1,
+                true,
                 .{},
             ));
         }
@@ -3558,7 +3616,7 @@ fn implementationTests() type {
                     .live_ordinals = 1000,
                 },
                 .indexes = @constCast(indexes[0..]),
-            }, range, 1, 0));
+            }, range, 1, 0, true));
         }
 
         test "table provisioner runtime schema progress requires authoritative O(1) identity coverage" {
@@ -3595,24 +3653,49 @@ fn implementationTests() type {
                 .indexes = &indexes,
             };
 
-            try std.testing.expect(!runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0));
+            try std.testing.expect(!runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0, true));
 
             indexes[1].doc_count = 1000;
-            try std.testing.expect(runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0));
+            try std.testing.expect(runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0, true));
 
             runtime.freshness = "stale";
-            try std.testing.expect(!runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0));
+            try std.testing.expect(!runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0, true));
 
             runtime.freshness = "fresh";
             runtime.doc_identity.allocated_ordinals = 999;
-            try std.testing.expect(!runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0));
+            try std.testing.expect(!runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0, true));
 
             runtime.doc_identity.allocated_ordinals = 0;
             runtime.doc_identity.next_ordinal = 1;
             runtime.doc_count = 0;
             runtime.doc_identity.live_ordinals = 0;
             indexes[1].doc_count = 0;
-            try std.testing.expect(runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0));
+            try std.testing.expect(runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0, true));
+        }
+
+        test "table provisioner indexless relational schema cutover requires exact fresh owner epoch" {
+            const range = table_manager.RangeRecord{ .group_id = 7, .range_id = 7, .table_id = 11, .start_key = "" };
+            var runtime = table_manager.RuntimeGroupStatusReport{
+                .table_id = range.table_id,
+                .group_id = range.group_id,
+                .freshness = "fresh",
+                .doc_identity = .{
+                    .namespace_table_id = range.table_id,
+                    .namespace_shard_id = table_manager.rangeDocIdentityShardId(range),
+                    .namespace_range_id = table_manager.rangeDocIdentityRangeId(range),
+                    .next_ordinal = 1,
+                },
+            };
+            try std.testing.expect(!runtimeHasReadySchemaVersionIndex(runtime, range, 2, 1, false));
+            runtime.schema_epoch = 1;
+            try std.testing.expect(!runtimeHasReadySchemaVersionIndex(runtime, range, 2, 1, false));
+            runtime.schema_epoch = 2;
+            try std.testing.expect(runtimeHasReadySchemaVersionIndex(runtime, range, 2, 1, false));
+            runtime.freshness = "stale";
+            try std.testing.expect(!runtimeHasReadySchemaVersionIndex(runtime, range, 2, 1, false));
+            runtime.freshness = "fresh";
+            runtime.doc_identity.namespace_range_id += 1;
+            try std.testing.expect(!runtimeHasReadySchemaVersionIndex(runtime, range, 2, 1, false));
         }
 
         test "target index reconciliation does not wait for sibling storage maintenance" {

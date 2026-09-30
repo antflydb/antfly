@@ -154,6 +154,12 @@ pub const RaftApplyStore = struct {
         return try std.json.parseFromSliceLeaky(?projection_wire.AppliedMergeSourceState, alloc, response.slice(), .{ .allocate = .alloc_always });
     }
 
+    pub fn observeMergeMembership(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !@import("../data/merge_membership_admission.zig").Observation {
+        var response = try self.projection(.{ .kind = .merge_membership, .group_id = group_id });
+        defer abi.antfly_storage_owner_buffer_destroy(&response);
+        return std.json.parseFromSliceLeaky(@import("../data/merge_membership_admission.zig").Observation, alloc, response.slice(), .{});
+    }
+
     pub fn currentMergeReceiverState(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !?@import("db/merge_contract.zig").State {
         var response = try self.projection(.{ .kind = .current_merge_receiver, .group_id = group_id });
         defer abi.antfly_storage_owner_buffer_destroy(&response);

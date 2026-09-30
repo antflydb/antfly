@@ -48,6 +48,7 @@ pub const Certificate = struct {
     schema_manifest_digest: [32]u8,
     ordered_content_digest: [32]u8,
     integrity: ?IntegrityBinding = null,
+    provenance_required: bool = false,
 
     pub fn encode(self: Certificate) ![encoded_size]u8 {
         try self.cut.validate();
@@ -69,13 +70,14 @@ pub const Certificate = struct {
             @memcpy(bytes[128..160], &binding.catalog_digest);
             @memcpy(bytes[160..192], &binding.generation_set);
         }
+        bytes[5] = @intFromBool(self.provenance_required);
         Sha256.hash(bytes[0..192], bytes[192..224], .{});
         return bytes;
     }
 
     pub fn decode(bytes: []const u8) !Certificate {
         if (bytes.len != encoded_size or !std.mem.eql(u8, bytes[0..4], "ASS2") or
-            bytes[4] > 1 or !std.mem.allEqual(u8, bytes[5..8], 0) or
+            bytes[4] > 1 or bytes[5] > 1 or !std.mem.allEqual(u8, bytes[6..8], 0) or
             (bytes[4] == 0 and !std.mem.allEqual(u8, bytes[128..192], 0))) return error.InvalidSourceSnapshot;
         var expected: [32]u8 = undefined;
         Sha256.hash(bytes[0..192], &expected, .{});
@@ -91,6 +93,7 @@ pub const Certificate = struct {
             .schema_manifest_digest = bytes[64..96].*,
             .ordered_content_digest = bytes[96..128].*,
             .integrity = if (bytes[4] == 1) .{ .catalog_digest = bytes[128..160].*, .generation_set = bytes[160..192].* } else null,
+            .provenance_required = bytes[5] == 1,
         };
         _ = try result.encode();
         return result;
@@ -194,7 +197,14 @@ pub const Builder = struct {
                 if (next.certificate.integrity == null) return error.InvalidSourceSnapshot;
                 try next.append(kind, "", payload);
             },
-            0x01, 0x02, 0x03, 0x10...0x17, 0x19, 0x1a, 0xf0 => try next.append(kind, "", payload),
+            // Source-copy graph ownership and inert producer provenance are
+            // authenticated parts of the logical cut, even though ordinary
+            // restore must reject either private stream.
+            0x1d => {
+                next.certificate.provenance_required = true;
+                try next.append(kind, "", payload);
+            },
+            0x01, 0x02, 0x03, 0x10...0x17, 0x19, 0x1a, 0x1c, 0xf0 => try next.append(kind, "", payload),
             else => return error.InvalidSourceSnapshot,
         }
         self.* = next;
@@ -235,6 +245,15 @@ test "source snapshot certificate binds namespace independent clocks and corrupt
     changed = certificate;
     changed.schema_manifest_digest[0] ^= 1;
     try std.testing.expect(!certificate.eql(changed));
+    var with_provenance = try Builder.init(cut);
+    try with_provenance.addBlock(1, "{}");
+    try with_provenance.addBlock(0x10, "typed historical rows");
+    try with_provenance.addBlock(0x1d, &.{ 0, 0, 0, 0 });
+    try with_provenance.addBlock(0xff, &(@as([24]u8, @splat(0))));
+    const proof_certificate = try with_provenance.finish();
+    try std.testing.expect(proof_certificate.provenance_required);
+    try std.testing.expect(!certificate.eql(proof_certificate));
+    try std.testing.expect((try Certificate.decode(&try proof_certificate.encode())).provenance_required);
     encoded[80] ^= 1;
     try std.testing.expectError(error.SourceSnapshotCorrupt, Certificate.decode(&encoded));
     try std.testing.expectError(error.InvalidSourceSnapshot, builder.addBlock(0x10, "late row"));
@@ -246,6 +265,28 @@ test "source snapshot malformed metadata never advances progress" {
     const before = builder.certificate;
     try std.testing.expectError(error.InvalidSourceSnapshot, builder.addBlock(0x18, &.{ 255, 255, 255, 255 }));
     try std.testing.expect(before.eql(builder.certificate));
+}
+
+test "source snapshot binds source graph ownership blocks to the transferable cut" {
+    const cut: Cut = .{ .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .applied_index = 1, .retained_start = 0 };
+    var first = try Builder.init(cut);
+    try first.addBlock(1, "{}");
+    try first.addBlock(0x1c, "graph ownership A");
+    try first.addBlock(0xff, &(@as([24]u8, @splat(0))));
+    const certificate = try first.finish();
+    const encoded = try certificate.encode();
+    try std.testing.expect(certificate.eql(try Certificate.decode(&encoded)));
+
+    var changed = try Builder.init(cut);
+    try changed.addBlock(1, "{}");
+    try changed.addBlock(0x1c, "graph ownership B");
+    try changed.addBlock(0xff, &(@as([24]u8, @splat(0))));
+    try std.testing.expect(!certificate.eql(try changed.finish()));
+
+    var omitted = try Builder.init(cut);
+    try omitted.addBlock(1, "{}");
+    try omitted.addBlock(0xff, &(@as([24]u8, @splat(0))));
+    try std.testing.expect(!certificate.eql(try omitted.finish()));
 }
 
 test "relational index system source snapshot integrity generation comes only from immutable manifest and binds content" {

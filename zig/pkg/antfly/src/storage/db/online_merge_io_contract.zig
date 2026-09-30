@@ -26,6 +26,8 @@ pub const Request = struct {
     scope: source.Scope,
     operation: union(enum) {
         admission: Side,
+        artifact_catalog: Side,
+        source_catalog: void,
         status: Side,
         tail: pages.Progress,
         snapshot: SnapshotRequest,
@@ -40,8 +42,8 @@ pub const Request = struct {
 
     pub fn ownerGroup(self: Request) u64 {
         return switch (self.operation) {
-            .admission, .status => |side| if (side == .donor) self.scope.fence.owner_group_id else self.scope.fence.peer_group_id,
-            .tail, .snapshot, .integrity, .publication, .artifact, .revoke, .rewrite_tail => self.scope.fence.owner_group_id,
+            .admission, .artifact_catalog, .status => |side| if (side == .donor) self.scope.fence.owner_group_id else self.scope.fence.peer_group_id,
+            .tail, .snapshot, .integrity, .publication, .artifact, .revoke, .rewrite_tail, .source_catalog => self.scope.fence.owner_group_id,
             .cleanup, .checkpoint => self.scope.fence.peer_group_id,
         };
     }
@@ -57,9 +59,9 @@ pub const Request = struct {
         } else if (self.scope.fence.role != .merge_source or self.operation == .rewrite_tail) return error.InvalidOnlineSourceCommand;
         if (self.operation == .rewrite_tail) {
             const page = self.operation.rewrite_tail;
-            if (page.max_bytes == 0 or page.max_bytes > 64 * 1024 or page.offset > 16 * 1024 * 1024) return error.InvalidOnlineSourceCommand;
+            if (page.max_bytes == 0 or page.max_bytes > 64 * 1024 or page.offset > @import("../retained_frame.zig").max_logical_bytes) return error.InvalidOnlineSourceCommand;
         }
-        if (self.operation == .admission) {
+        if (self.operation == .admission or self.operation == .artifact_catalog) {
             // This is an identity-scoped observation, never a mutation grant.
             // Requiring explicit unbound fields prevents reuse as admission.
             if (self.scope.consumer_epoch != 0 or self.scope.copy_attempt.donor_term != 0 or self.scope.copy_attempt.sequence != 0 or
@@ -117,6 +119,7 @@ pub fn validateReceiptScope(scope: source.Scope, receipt: pages.Progress) !void 
 }
 
 pub const AdmissionFacts = struct {
+    artifact_catalog: ?@import("artifact_inventory.zig").Binding = null,
     authority: source.Authority = .raft,
     /// Rewrite-only immutable public mappings for every durable native epoch.
     /// The caller owns the decoded response, not a borrowed native DB view.

@@ -2338,6 +2338,92 @@ pub const Client = struct {
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
     }
 
+    /// Publish or remove a durable SQL setting
+    /// POST /db/v1/settings
+    pub fn administerSqlSettings(self: *@This(), body: types.SqlSettingMutationRequest) !ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/settings", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(std.json.ArrayHashMap(std.json.Value)).fromResponse(self.allocator, &resp);
+    }
+
+    /// Execute a SQL statement
+    /// POST /db/v1/sql
+    pub fn executeSQL(self: *@This(), body: types.SQLRequest) !ApiResponse(types.SQLResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/sql", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders(), .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .max_response_size = 16777216 });
+        return ApiResponse(types.SQLResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Open a durable idle HTTP SQL connection
+    /// POST /db/v1/sql/connections
+    pub fn openSQLConnection(self: *@This(), body: ?types.SQLConnectionOpenRequest) !ApiResponse(types.SQLConnectionResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/sql/connections", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = if (body) |value| try httpx.json.Json.stringifyRequest(self.allocator, value) else null;
+        defer if (json_body) |value| self.allocator.free(value);
+        var resp = if (json_body) |value|
+            try self.http.post(url, .{ .json = value, .headers = self.authHeaders(), .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .max_response_size = 16777216 })
+        else
+            try self.http.post(url, .{ .headers = self.authHeaders(), .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .max_response_size = 16777216 });
+        return ApiResponse(types.SQLConnectionResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Close an idle SQL connection and its prepared resources
+    /// DELETE /db/v1/sql/connections/{connection_id}
+    pub fn closeSQLConnection(self: *@This(), connection_id: []const u8) !ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
+        const encoded_connection_id = try httpx.PercentEncoding.encode(self.allocator, connection_id);
+        defer self.allocator.free(encoded_connection_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/sql/connections/{s}", .{ self.base_url, encoded_connection_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.delete(url, .{ .headers = self.authHeaders(), .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .max_response_size = 16777216 });
+        return ApiResponse(std.json.ArrayHashMap(std.json.Value)).fromResponse(self.allocator, &resp);
+    }
+
+    /// Create a durable prepared SQL resource
+    /// POST /db/v1/sql/prepared
+    pub fn prepareSQL(self: *@This(), body: types.SQLPrepareRequest) !ApiResponse(types.SQLPreparedResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/sql/prepared", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders(), .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .max_response_size = 16777216 });
+        return ApiResponse(types.SQLPreparedResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Release a durable prepared SQL resource
+    /// DELETE /db/v1/sql/prepared/{prepared_id}
+    pub fn closePreparedSQL(self: *@This(), prepared_id: []const u8, x_antfly_sql_connection_id: ?[]const u8) !ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
+        const encoded_prepared_id = try httpx.PercentEncoding.encode(self.allocator, prepared_id);
+        defer self.allocator.free(encoded_prepared_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/sql/prepared/{s}", .{ self.base_url, encoded_prepared_id });
+        defer self.allocator.free(url);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (x_antfly_sql_connection_id) |value| try request_headers.append(self.allocator, .{ "X-Antfly-SQL-Connection-Id", value });
+        var resp = try self.http.delete(url, .{ .headers = request_headers.items, .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .max_response_size = 16777216 });
+        return ApiResponse(std.json.ArrayHashMap(std.json.Value)).fromResponse(self.allocator, &resp);
+    }
+
+    /// Execute a durable prepared SQL resource
+    /// POST /db/v1/sql/prepared/{prepared_id}/execute
+    pub fn executePreparedSQL(self: *@This(), prepared_id: []const u8, body: types.SQLPreparedExecutionRequest) !ApiResponse(types.SQLResponse) {
+        const encoded_prepared_id = try httpx.PercentEncoding.encode(self.allocator, prepared_id);
+        defer self.allocator.free(encoded_prepared_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/sql/prepared/{s}/execute", .{ self.base_url, encoded_prepared_id });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders(), .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .max_response_size = 16777216 });
+        return ApiResponse(types.SQLResponse).fromResponse(self.allocator, &resp);
+    }
+
     /// Get cluster status
     /// GET /db/v1/status
     pub fn getStatus(self: *@This()) !ApiResponse(types.ClusterStatus) {
@@ -2345,6 +2431,28 @@ pub const Client = struct {
         defer self.allocator.free(url);
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.ClusterStatus).fromResponse(self.allocator, &resp);
+    }
+
+    /// Approve a physical store-root signing identity
+    /// POST /db/v1/store-roots/enroll
+    pub fn enrollStoreRoot(self: *@This(), body: types.StoreRootEnrollmentRequest) !ApiResponse(types.StoreRootEnrollmentIdentity) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/store-roots/enroll", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders(), .max_retries = 0 });
+        return ApiResponse(types.StoreRootEnrollmentIdentity).fromResponse(self.allocator, &resp);
+    }
+
+    /// Check one exact physical store-root enrollment
+    /// POST /db/v1/store-roots/enrollment-status
+    pub fn getStoreRootEnrollmentStatus(self: *@This(), body: types.StoreRootEnrollmentIdentity) !ApiResponse(types.StoreRootEnrollmentIdentity) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/store-roots/enrollment-status", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.StoreRootEnrollmentIdentity).fromResponse(self.allocator, &resp);
     }
 
     /// List all tables

@@ -112,7 +112,7 @@ pub fn resolverForArtifactKind(
     return null;
 }
 
-fn resolverMatchesArtifact(cfg: *const ResolverConfig, source_artifact_kind: SourceArtifactKind, artifact_name: []const u8) bool {
+pub fn resolverMatchesArtifact(cfg: *const ResolverConfig, source_artifact_kind: SourceArtifactKind, artifact_name: []const u8) bool {
     return cfg.source_artifact_kind.matches(source_artifact_kind) and std.mem.eql(u8, cfg.source_artifact, artifact_name);
 }
 
@@ -149,13 +149,13 @@ fn freeSiblingClaimedLabels(gpa: std.mem.Allocator, labels: []const []const u8) 
     if (labels.len > 0) gpa.free(labels);
 }
 
-const ParsedSourceArtifactKey = struct {
+pub const ParsedSourceArtifactKey = struct {
     doc_key: []u8,
     artifact_name: []u8,
     source_artifact_kind: SourceArtifactKind,
     resolution_scope_key: []u8,
 
-    fn deinit(self: *ParsedSourceArtifactKey, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *ParsedSourceArtifactKey, alloc: std.mem.Allocator) void {
         alloc.free(self.doc_key);
         alloc.free(self.artifact_name);
         alloc.free(self.resolution_scope_key);
@@ -163,7 +163,7 @@ const ParsedSourceArtifactKey = struct {
     }
 };
 
-fn parseSourceArtifactKeyAlloc(alloc: std.mem.Allocator, key: []const u8) !?ParsedSourceArtifactKey {
+pub fn parseSourceArtifactKeyAlloc(alloc: std.mem.Allocator, key: []const u8) !?ParsedSourceArtifactKey {
     var artifact_ref = (artifact_ids.decodeArtifactRefAlloc(alloc, key) catch |err| switch (err) {
         error.InvalidInternalUserKey => return null,
         else => return err,
@@ -244,7 +244,7 @@ pub const ProcessOutcome = struct {
     resolution_value: ?[]u8 = null,
 };
 
-const PersistenceMode = enum { immediate, deferred };
+pub const PersistenceMode = enum { immediate, deferred };
 
 /// Process a changed extraction (asset) artifact key: look up the resolver that
 /// consumes it and run the resolution stage to idempotently (re)persist the
@@ -317,7 +317,7 @@ fn siblingResolutionsJsonAlloc(
     return try std.json.Stringify.valueAlloc(gpa, std.json.Value{ .object = map }, .{});
 }
 
-fn processChangedExtractionWithConfig(
+pub fn processChangedExtractionWithConfig(
     gpa: std.mem.Allocator,
     resolvers: []const ResolverConfig,
     cfg: *const ResolverConfig,
@@ -1268,7 +1268,7 @@ pub fn processRecordKeys(
 /// artifact of any configured resolver. A chunk- or unit-scoped resolution
 /// embeds the full source artifact key as its scope; a document-scoped one
 /// rebuilds the asset key from the owning resolver's source artifact name.
-fn sourceExtractionKeyForResolutionKeyAlloc(
+pub fn sourceExtractionKeyForResolutionKeyAlloc(
     gpa: std.mem.Allocator,
     resolvers: []const ResolverConfig,
     changed_key: []const u8,
@@ -1741,6 +1741,14 @@ pub fn listPendingReviews(
 
 pub const default_max_records_per_window: usize = 1024;
 
+/// Optional ordered owner writer. False means no ordered producer authority
+/// exists and the native legacy path remains applicable. True means every
+/// required output has a durable local receipt, never merely queue admission.
+pub const OrderedWriter = struct {
+    ptr: *anyopaque,
+    process: *const fn (*anyopaque, Allocator, []const ResolverConfig, resolver_lib.ArtifactStore, ?resolver_lib.CandidateProvider, []const []const u8, ?CandidateSource, ?embedder_mod.DenseEmbedder) anyerror!bool,
+};
+
 /// Iterate replay records matching the resolution hint from `from_sequence`,
 /// resolve each record's changed extraction artifacts, and journal the
 /// resolution writes via `write_fn`. Returns the highest sequence processed, or
@@ -1759,6 +1767,23 @@ pub fn catchUpWindow(
     candidate_source: ?CandidateSource,
     embedder: ?embedder_mod.DenseEmbedder,
 ) !u64 {
+    return catchUpWindowWithOrdered(gpa, replay_source, resolvers, store, provider, from_sequence, max_records, write_ctx, write_fn, candidate_source, embedder, null);
+}
+
+fn catchUpWindowWithOrdered(
+    gpa: Allocator,
+    replay_source: replay_source_mod.Source,
+    resolvers: []const ResolverConfig,
+    store: resolver_lib.ArtifactStore,
+    provider: ?resolver_lib.CandidateProvider,
+    from_sequence: u64,
+    max_records: usize,
+    write_ctx: *anyopaque,
+    write_fn: DerivedRecordWriter,
+    candidate_source: ?CandidateSource,
+    embedder: ?embedder_mod.DenseEmbedder,
+    ordered: ?OrderedWriter,
+) !u64 {
     const Ctx = struct {
         gpa: Allocator,
         resolvers: []const ResolverConfig,
@@ -1768,6 +1793,7 @@ pub fn catchUpWindow(
         write_fn: DerivedRecordWriter,
         candidate_source: ?CandidateSource,
         embedder: ?embedder_mod.DenseEmbedder,
+        ordered: ?OrderedWriter,
         seen_sequences: *std.AutoHashMapUnmanaged(u64, void),
         max_seen: u64,
 
@@ -1777,6 +1803,12 @@ pub fn catchUpWindow(
             if (seen.found_existing) return;
             var decoded = try change_journal_mod.decodeRecord(self.gpa, payload);
             defer decoded.deinit();
+            if (self.ordered) |writer| {
+                if (try writer.process(writer.ptr, self.gpa, self.resolvers, self.store, self.provider, decoded.record.changed_artifact_keys, self.candidate_source, self.embedder)) {
+                    self.max_seen = @max(self.max_seen, sequence);
+                    return;
+                }
+            }
             try processRecordKeys(
                 self.gpa,
                 self.resolvers,
@@ -1801,6 +1833,7 @@ pub fn catchUpWindow(
         .write_fn = write_fn,
         .candidate_source = candidate_source,
         .embedder = embedder,
+        .ordered = ordered,
         .seen_sequences = undefined,
         // from_sequence is exclusive; with no records, return it unchanged.
         .max_seen = from_sequence,
@@ -1895,6 +1928,7 @@ pub const ResolutionRuntime = struct {
     index_manager: *index_manager_mod.IndexManager,
     write_ctx: *anyopaque,
     write_fn: DerivedRecordWriter,
+    ordered_writer: ?OrderedWriter = null,
     io: ?Io,
     /// Optional cross-shard candidate source injected by the api/serving layer;
     /// null means local-only blocking (the worker's own store). Must outlive the
@@ -2082,7 +2116,7 @@ pub const ResolutionRuntime = struct {
                 .store = &self.store_handle.store,
                 .index_manager = self.index_manager,
             };
-            const max_seen = try catchUpWindow(
+            const max_seen = try catchUpWindowWithOrdered(
                 self.alloc,
                 self.replay_source,
                 resolvers,
@@ -2096,6 +2130,7 @@ pub const ResolutionRuntime = struct {
                 self.write_fn,
                 self.candidate_source,
                 self.embedder,
+                self.ordered_writer,
             );
             if (max_seen <= applied) {
                 // No matching records in (applied, target]; advance to target.

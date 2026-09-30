@@ -242,6 +242,10 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
             return error.ReadIndexTimeout;
         }
 
+        fn noRowPolicy(_: *u32) anyerror!void {
+            return error.RowPolicyCatalogChanged;
+        }
+
         fn storageBusy(_: *u32) anyerror!void {
             return error.StorageBusy;
         }
@@ -320,6 +324,10 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
     try std.testing.expectError(
         error.ReadIndexTimeout,
         TestBoundary.call("fail", &callbacks.foreignDispatch, &callbacks.readIndexTimeout, .{&base}),
+    );
+    try std.testing.expectError(
+        error.RowPolicyCatalogChanged,
+        TestBoundary.call("fail", &callbacks.foreignDispatch, &callbacks.noRowPolicy, .{&base}),
     );
     try std.testing.expectError(
         error.StorageBusy,

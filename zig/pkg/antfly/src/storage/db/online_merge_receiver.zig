@@ -184,7 +184,7 @@ fn checkpoint(db: *DB, alloc: Allocator, request: wire.Request, state: ?merge.St
     defer fold.deinit(alloc);
     try validateState(request, fold.state);
     if (command.kind != .accept and !std.meta.eql(fold.state.copy_attempt, command.copy_attempt)) return error.MergeCopyFenced;
-    if (command.kind == .begin_copy or (command.kind == .accept and command.page_source != null and command.page_source.?.integrity != null)) {
+    if (command.kind == .begin_copy or (command.kind == .accept and command.page_source != null and (command.page_source.?.integrity != null or command.page_source.?.artifact_catalog != null))) {
         if (command.kind == .begin_copy) if (state) |current| if (current.copy_attempt.sequence != 0 and !std.meta.eql(current.copy_attempt, command.copy_attempt)) return error.MergeCopyFenced;
         const source = command.page_source orelse return error.InvalidMergePage;
         try source.validate();

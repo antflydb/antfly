@@ -35,6 +35,30 @@ test "bulk callback ABI retains exact consumer error identity" {
     try kernel_owner_source.ProvisionedKernelOwnerSource.validateBulkCallbackIdentityForTest();
 }
 
+test "replica retirement cold readers configure a lazy compiled context" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io_impl.io(), ".", alloc);
+    defer alloc.free(root);
+    const group_path = try std.fs.path.join(alloc, &.{ root, "group-7198" });
+    defer alloc.free(group_path);
+    inline for (.{ false, true }) |by_path| {
+        var owners = kernel_owner_source.ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+        defer owners.deinit();
+        try std.testing.expect(owners.context.handle == null);
+        const record = if (by_path)
+            try owners.readColdInitialChildRetirementRecordAtPath(alloc, group_path)
+        else
+            try owners.readInitialChildRetirementRecord(alloc, 7198);
+        try std.testing.expect(record == null);
+        try std.testing.expect(owners.context.handle != null);
+        try std.testing.expectEqual(@as(usize, 0), owners.ownerCountForTest());
+    }
+}
+
 test "replica retirement drains active compiled owners before deleting physical roots" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -88,8 +112,16 @@ test "replica retirement drains active compiled owners before deleting physical 
                 if (group_id != 7198) return error.UnexpectedGroup;
                 return .retired;
             }
+            fn initialChild(ptr: *anyopaque, allocator: std.mem.Allocator, group_id: u64) !table_writes.InitialChildRetirementObservation {
+                const owner: *kernel_owner_source.ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+                // Match the linked runtime's native proof reader. An ordinary
+                // replica is removable only after observing no cold AICH;
+                // omitting this bridge must continue to fail closed.
+                return .{ .record = try owner.readInitialChildRetirementRecord(allocator, group_id) };
+            }
         };
         _ = source.withReplicaRetirementOwnership(.{ .ptr = &source, .classify = Ownership.classify });
+        _ = source.withInitialChildRetirementReader(.{ .ptr = &owners, .read = Ownership.initialChild });
         var prepared = try source.prepareReplicaRetirements(alloc, &.{.{ .group_id = 7198, .table_name = retirement_name }});
         defer prepared.deinit();
         const Release = struct {
@@ -285,9 +317,9 @@ test "hidden constrained lookup recovers cold compiled owner from exact plan aut
     try std.testing.expectError(error.StorageKernelOwnerTransitionRequired, owners.primeRestoreOwner(7196, "hidden", stale_descriptor));
     try std.testing.expectError(error.StorageKernelOwnerTransitionRequired, owners.restoreOwnerControl(alloc, 7196, "hidden", stale_descriptor, .{ .scope = scope, .action = .begin }, null, .{}, .{}));
     _ = try owners.restoreOwnerControl(alloc, 7196, "hidden", descriptor, .{ .scope = scope, .action = .begin }, null, .{}, .{});
-    const before = try (staging.Progress{ .scope = scope }).encode(alloc);
+    const before = try (staging.Progress{ .scope = scope, .phase = .importing, .source_generation_proofs_complete = true }).encode(alloc);
     defer alloc.free(before);
-    const imported = try (staging.Progress{ .scope = scope, .phase = .imported }).encode(alloc);
+    const imported = try (staging.Progress{ .scope = scope, .phase = .imported, .source_generation_proofs_complete = true }).encode(alloc);
     defer alloc.free(imported);
     try owners.applyPreparedReplicatedBatchGroupLocal(alloc, 7196, "hidden", descriptor, .{
         .restore_staging = .{ .import_page = .{ .expected = staging.digest(before), .next = imported, .scope = scope.digest(), .timestamps = &.{} } },
@@ -344,6 +376,45 @@ test "hidden constrained lookup recovers cold compiled owner from exact plan aut
     wrong_status = status_request;
     wrong_status.restore_staging_scope = @splat(0xbb);
     try std.testing.expectError(error.RestoreStagingScopeChanged, owners.writeSource().txnStatusGroupLocalWithRequest(alloc, 7196, "hidden", wrong_status, .{}));
+    // Restore validation uses scoped batch controls, not the direct native
+    // transaction callbacks above. Exercise both decisions through that route
+    // and lose their successful reply across a cold owner restart.
+    for ([_]db_mod.types.TxnStatus{ .aborted, .committed }, 0..) |decision, attempt| {
+        authority.expected_use = .mutate;
+        const batch_txn: db_mod.types.TxnId = @splat(@as(u8, @intCast(0x72 + attempt)));
+        const begin: db_mod.types.BatchRequest = .{
+            .restore_staging_scope = scope.digest(),
+            .restore_staging_plan_id = scope.plan_id,
+            .transaction = .{ .begin = .{ .txn_id = batch_txn, .begin_timestamp = 10, .created_at_ns = 10, .topology_epoch = 1, .retain_terminal = true, .participants = &.{participant} } },
+        };
+        var stale_begin = begin;
+        stale_begin.restore_staging_plan_id = @splat(0xaa);
+        try std.testing.expectError(error.RestoreStagingScopeChanged, owners.writeSource().batchGroupLocal(alloc, 7196, "hidden", stale_begin));
+        _ = (try owners.writeSource().batchGroupLocal(alloc, 7196, "hidden", begin)) orelse return error.TestUnexpectedResult;
+        _ = (try owners.writeSource().batchGroupLocal(alloc, 7196, "hidden", .{
+            .restore_staging_scope = scope.digest(),
+            .restore_staging_plan_id = scope.plan_id,
+            .transaction = .{ .prepare = .{ .txn_id = batch_txn, .topology_epoch = 1 } },
+        })) orelse return error.TestUnexpectedResult;
+        const resolve: db_mod.types.BatchRequest = .{
+            .restore_staging_scope = scope.digest(),
+            .restore_staging_plan_id = scope.plan_id,
+            .transaction = .{ .resolve = .{ .txn_id = batch_txn, .status = decision, .commit_version = 11 } },
+        };
+        authority.expected_use = .resolve;
+        _ = (try owners.writeSource().batchGroupLocal(alloc, 7196, "hidden", resolve)) orelse return error.TestUnexpectedResult;
+        owners.deinit();
+        owners = Source.init(alloc, root, table_catalog.emptyCatalogSource(), barrier);
+        _ = owners.withRestoreDescriptorRecovery(.{ .ptr = &authority, .recover_fn = Authority.recover });
+        authority.expected_use = .resolve;
+        _ = (try owners.writeSource().batchGroupLocal(alloc, 7196, "hidden", resolve)) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(decision, (try owners.writeSource().txnStatusGroupLocalWithRequest(alloc, 7196, "hidden", .{
+            .txn_id = batch_txn,
+            .restore_staging_scope = scope.digest(),
+            .restore_staging_plan_id = scope.plan_id,
+        }, .{})).?);
+        try std.testing.expectError(error.TableNotFound, owners.readSource().lookupGroupLocal(alloc, 7196, "hidden", "a", .{}, .read_index));
+    }
 }
 
 test "transition lease reads unpublished owner metadata without admitting document reads" {

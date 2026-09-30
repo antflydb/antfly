@@ -37,7 +37,7 @@ const magic = "AFIDXRP1";
 // admission. It deliberately does not overload the shadow candidate's build
 // cursor: source replay precedes candidate creation and has a different crash
 // boundary.
-const format_version: u32 = 12;
+const format_version: u32 = 13;
 const max_file_bytes: usize = 16 * 1024 * 1024;
 const max_entries: usize = 65_536;
 const max_index_name_bytes: usize = 4 * 1024;
@@ -112,6 +112,9 @@ pub const Trigger = enum(u8) {
     /// independent work class determines that this is initial materialization,
     /// not repair; the trigger preserves the exact control-plane cause.
     catalog_admission = 10,
+    /// Build receiver-local historical projection evidence without claiming
+    /// the currently serving index is corrupt or an operator requested it.
+    artifact_baseline_adoption = 11,
 };
 
 /// Durable scheduler work and its user-visible meaning are separate from the
@@ -200,6 +203,7 @@ pub const IndexRepairIntent = struct {
     previous_active_relative_path: ?[]u8 = null,
     detected_sequence: u64,
     build_floor_sequence: u64 = 0,
+    build_source_guard: ?@import("../artifact_source_gap.zig").Guard = null,
     /// Last source-store key durably incorporated into a reopenable building
     /// candidate. Resume scans begin strictly after this key. The cumulative
     /// count is diagnostic/accounting state and is not used for correctness.
@@ -700,6 +704,7 @@ fn findIndexByRepairId(state: *const State, repair_id: u128) ?usize {
 
 fn validateEntry(entry: Entry) !void {
     const intent = entry.intent;
+    if (intent.build_source_guard) |guard| _ = guard.encode() catch return error.InvalidIndexRepairState;
     if (intent.version != 1 or intent.repair_id == 0 or intent.db_identity == 0 or intent.replica_id == 0) return error.InvalidIndexRepairState;
     if (intent.index_name.len == 0 or intent.index_name.len > max_index_name_bytes) return error.InvalidIndexRepairState;
     if (intent.candidate_relative_path) |path| try validateCandidateRelativePath(intent.index_name, path);
@@ -856,6 +861,8 @@ fn encode(alloc: Allocator, state: *const State) ![]u8 {
         try appendInt(alloc, &out, u8, @intFromEnum(intent.automation));
         try appendOptionalString(alloc, &out, intent.last_error, max_error_bytes);
         try appendInt(alloc, &out, u8, @intFromEnum(intent.work_class));
+        try appendInt(alloc, &out, u8, @intFromBool(intent.build_source_guard != null));
+        if (intent.build_source_guard) |guard| try out.appendSlice(alloc, &try guard.encode());
         try appendInt(alloc, &out, u8, if (entry.pin != null) 1 else 0);
         if (entry.pin) |pin| {
             try appendInt(alloc, &out, u8, pin.version);
@@ -958,6 +965,17 @@ fn decode(alloc: Allocator, raw: []const u8) !State {
         intent.last_error = try readOptionalString(alloc, raw[0..payload_end], &pos, max_error_bytes);
         if (decoded_format_version >= 12) {
             intent.work_class = try readEnum(WorkClass, raw[0..payload_end], &pos);
+        }
+        if (decoded_format_version >= 13) {
+            const present = try readInt(raw[0..payload_end], &pos, u8);
+            if (present > 1) return error.InvalidIndexRepairState;
+            if (present == 1) {
+                const SourceGuard = @import("../artifact_source_gap.zig").Guard;
+                const size = @sizeOf(SourceGuard.Encoded);
+                if (pos > payload_end or size > payload_end - pos) return error.InvalidIndexRepairState;
+                intent.build_source_guard = SourceGuard.decode(raw[pos..][0..size]) catch return error.InvalidIndexRepairState;
+                pos += size;
+            }
         }
         const has_pin = try readInt(raw[0..payload_end], &pos, u8);
         if (has_pin > 1) return error.InvalidIndexRepairState;
@@ -1116,6 +1134,7 @@ test "index repair state persists intent and provisional replay pin atomically" 
     var entry = try testEntry(alloc, identity, .building);
     defer entry.deinit(alloc);
     entry.intent.build_floor_sequence = 11;
+    entry.intent.build_source_guard = .{ .boundary = .{ .authority = .{ .namespace = @splat(1), .epoch = 2, .catalog_digest = @splat(3) }, .replay_sequence = 4 }, .gap_epoch = 5 };
     entry.intent.build_resume_key = try alloc.dupe(u8, "artifact-key:42");
     entry.intent.build_reprocessed = 42;
     entry.intent.source_replay_resume_key = try alloc.dupe(u8, "document-key:17");
@@ -1146,6 +1165,7 @@ test "index repair state persists intent and provisional replay pin atomically" 
     try std.testing.expectEqual(@as(usize, 1), reopened.entries.items.len);
     try std.testing.expectEqual(@as(?u64, 0), reopened.minimumRetainAfterSequence());
     try std.testing.expectEqual(Phase.building, reopened.entries.items[0].intent.phase);
+    try std.testing.expectEqualDeep(entry.intent.build_source_guard, reopened.entries.items[0].intent.build_source_guard);
     try std.testing.expectEqualStrings("artifact-key:42", reopened.entries.items[0].intent.build_resume_key.?);
     try std.testing.expectEqual(@as(u64, 42), reopened.entries.items[0].intent.build_reprocessed);
     try std.testing.expectEqualStrings("document-key:17", reopened.entries.items[0].intent.source_replay_resume_key.?);

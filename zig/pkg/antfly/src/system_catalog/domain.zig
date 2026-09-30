@@ -225,6 +225,9 @@ pub const State = struct {
     revision: u64 = 0,
     next_id: u64 = 3,
     resources: []const Resource = &.{},
+    settings: []const @import("settings.zig").Record = &.{},
+    policies: []const @import("policies.zig").Record = &.{},
+    policy_publications: []const @import("policies.zig").Publication = &.{},
 
     pub fn find(self: @This(), kind: Kind, parent_id: u64, name: []const u8) ?Resource {
         for (self.resources) |r| if (r.kind == kind and r.parent_id == parent_id and std.mem.eql(u8, r.name, name)) return r;
@@ -420,11 +423,60 @@ pub const IndexedState = struct {
 /// transaction reserves indexes and clones only changed records before apply.
 /// Readers borrow it under the metadata mutex. Undo and commit cannot allocate.
 pub const MutableState = struct {
+    pub const OwnedSettings = std.json.Parsed([]const @import("settings.zig").Record);
+    pub const OwnedPolicies = std.json.Parsed([]const @import("policies.zig").Record);
+    pub const OwnedPublications = std.json.Parsed([]const @import("policies.zig").Publication);
     alloc: std.mem.Allocator,
     value: State,
     index: StateIndex,
     rows: std.ArrayListUnmanaged(Resource),
     positions: std.AutoHashMapUnmanaged(StateIndex.Id, usize),
+    // Settings in imported snapshots are normally backed by a temporary JSON
+    // arena. Keep an independent copy for the lifetime of the writer state.
+    owned_settings: ?OwnedSettings = null,
+    owned_policies: ?OwnedPolicies = null,
+    owned_publications: ?OwnedPublications = null,
+
+    pub fn clonePublications(alloc: std.mem.Allocator, publications: []const @import("policies.zig").Publication) !OwnedPublications {
+        if (publications.len > 1024) return error.RowPolicyLimitExceeded;
+        const bytes = try std.json.Stringify.valueAlloc(alloc, publications, .{});
+        defer alloc.free(bytes);
+        var owned = try std.json.parseFromSlice([]const @import("policies.zig").Publication, alloc, bytes, .{ .allocate = .alloc_always });
+        errdefer owned.deinit();
+        for (owned.value, 0..) |publication, i| {
+            try publication.validateShape();
+            for (owned.value[0..i]) |prior| if (prior.table_id == publication.table_id) return error.InvalidRowPolicyPublication;
+        }
+        return owned;
+    }
+
+    pub fn clonePolicies(alloc: std.mem.Allocator, records: []const @import("policies.zig").Record) !OwnedPolicies {
+        if (records.len > 1024) return error.RowPolicyLimitExceeded;
+        const bytes = try std.json.Stringify.valueAlloc(alloc, records, .{});
+        defer alloc.free(bytes);
+        var owned = try std.json.parseFromSlice([]const @import("policies.zig").Record, alloc, bytes, .{ .allocate = .alloc_always });
+        errdefer owned.deinit();
+        for (owned.value, 0..) |policy, i| {
+            try policy.validateShape();
+            for (owned.value[0..i]) |prior| if (prior.id == policy.id or (prior.table_id == policy.table_id and std.ascii.eqlIgnoreCase(prior.name, policy.name))) return error.InvalidRowPolicyRecord;
+        }
+        return owned;
+    }
+
+    pub fn cloneSettings(alloc: std.mem.Allocator, records: []const @import("settings.zig").Record) !OwnedSettings {
+        if (records.len > 1024) return error.SettingLimitExceeded;
+        const bytes = try std.json.Stringify.valueAlloc(alloc, records, .{});
+        defer alloc.free(bytes);
+        var owned = try std.json.parseFromSlice([]const @import("settings.zig").Record, alloc, bytes, .{ .allocate = .alloc_always });
+        errdefer owned.deinit();
+        for (owned.value, 0..) |setting, i| {
+            try setting.validate();
+            for (owned.value[0..i]) |prior| {
+                if (prior.identity.id == setting.identity.id or std.ascii.eqlIgnoreCase(prior.name, setting.name)) return error.InvalidSettingRecord;
+            }
+        }
+        return owned;
+    }
 
     pub fn clone(alloc: std.mem.Allocator, state: State) !MutableState {
         var self = MutableState{ .alloc = alloc, .value = state, .index = .{}, .rows = .empty, .positions = .empty };
@@ -444,12 +496,27 @@ pub const MutableState = struct {
             self.positions.putAssumeCapacity(.{ .kind = r.kind, .id = r.id }, self.rows.items.len);
             self.rows.appendAssumeCapacity(owned);
         }
+        if (state.settings.len != 0) {
+            self.owned_settings = try cloneSettings(alloc, state.settings);
+            self.value.settings = self.owned_settings.?.value;
+        }
+        if (state.policies.len != 0) {
+            self.owned_policies = try clonePolicies(alloc, state.policies);
+            self.value.policies = self.owned_policies.?.value;
+        }
+        if (state.policy_publications.len != 0) {
+            self.owned_publications = try clonePublications(alloc, state.policy_publications);
+            self.value.policy_publications = self.owned_publications.?.value;
+        }
         self.value.resources = self.rows.items;
         self.index = try StateIndex.init(alloc, self.value);
         return self;
     }
     pub fn deinit(self: *MutableState) void {
         self.index.deinit(self.alloc);
+        if (self.owned_settings) |*settings| settings.deinit();
+        if (self.owned_policies) |*policies| policies.deinit();
+        if (self.owned_publications) |*publications| publications.deinit();
         for (self.rows.items) |r| freeResource(self.alloc, r);
         self.rows.deinit(self.alloc);
         self.positions.deinit(self.alloc);
@@ -865,6 +932,41 @@ pub const TableStatusTarget = union(enum) {
 };
 
 pub const Call = union(enum) {
+    setting_snapshot: @import("settings.zig").Scope,
+    policy_snapshot: @import("policies.zig").SnapshotRequest,
+    policy_install_snapshot: @import("policies.zig").InstallRequest,
+    policy_publication_status: u64,
+    /// Narrow, linearizable supervisor work queue; excludes policy definitions.
+    policy_publication_work: u64,
+    /// Trusted metadata ingress derives the owner cut; callers supply no
+    /// owner descriptors or policy bundle bytes.
+    policy_publication_begin: @import("policies.zig").BeginRequest,
+    /// Administrator-authored draft definition. Never activates enforcement.
+    policy_definition_mutate: @import("policies.zig").Command,
+    /// Private coordinator-only transition. Never accepted from public SQL.
+    policy_publication_mutate: @import("policies.zig").PublicationCommand,
+    fk_generation_publication_begin: @import("../metadata/fk_generation_publication.zig").Plan,
+    fk_generation_publication_mutate: @import("../metadata/fk_generation_publication.zig").Command,
+    fk_generation_publication_status: u64,
+    fk_generation_publication_work: u64,
+    fk_generation_publication_decision: @import("../metadata/fk_generation_publication.zig").DecisionRequest,
+    fk_generation_publication_source_decision: @import("../metadata/fk_generation_publication.zig").SourceDecisionRequest,
+    fk_initial_create_prepare: @import("../metadata/fk_generation_publication.zig").InitialCreatePrepareRequest,
+    fk_initial_child_decision: @import("../metadata/fk_generation_publication.zig").InitialChildDecisionRequest,
+    fk_initial_create_begin: @import("../metadata/fk_generation_publication.zig").InitialCreatePlan,
+    fk_initial_create_mutate: @import("../metadata/fk_generation_publication.zig").InitialCommand,
+    fk_initial_create_status: u64,
+    fk_generation_table_locked: u64,
+    fk_initial_create_work: u64,
+    fk_initial_parent_decision: @import("../metadata/fk_generation_publication.zig").DecisionRequest,
+    /// Internal, read-only discovery. A ticket is not authority to unlink.
+    fk_initial_retirement_page: @import("../metadata/fk_initial_retirement_wire.zig").PageRequest,
+    store_root_enroll: @import("../metadata/store_root_enrollment.zig").Request,
+    /// Exact, linearizable read used to resolve an ambiguous enrollment response.
+    store_root_enrollment_status: @import("../metadata/store_root_enrollment.zig").Identity,
+    fk_initial_retirement_signed_page: @import("../metadata/fk_initial_retirement_wire.zig").SignedPageRequest,
+    fk_initial_retirement_ack: @import("../metadata/fk_initial_retirement_wire.zig").AckRequest,
+    setting_mutate: @import("settings.zig").Request,
     list_tables: TableList,
     export_snapshot: void,
     read: Read,
@@ -877,20 +979,89 @@ pub const Call = union(enum) {
     table_status: TableStatusTarget,
     write_validation: []const u8,
     write_validation_revision: void,
+
+    pub fn requiresAdministrativeGrant(self: @This()) bool {
+        return switch (self) {
+            .setting_mutate, .policy_definition_mutate, .policy_publication_mutate, .policy_publication_begin, .fk_generation_publication_begin, .fk_generation_publication_mutate, .fk_initial_create_begin, .fk_initial_create_mutate, .store_root_enroll, .store_root_enrollment_status => true,
+            else => false,
+        };
+    }
+
+    /// Additional body-bound read grant for principal or owner-sensitive
+    /// catalog reads. The principal-independent policy publication stamp is
+    /// deliberately excluded: its transport still requires an authenticated
+    /// internal service, but ordinary table reads need no setting authority.
+    pub fn requiresSettingAuthorityReadGrant(self: @This()) bool {
+        return switch (self) {
+            .setting_snapshot,
+            .policy_snapshot,
+            .policy_install_snapshot,
+            .policy_publication_work,
+            .fk_generation_publication_status,
+            .fk_generation_publication_work,
+            .fk_generation_publication_decision,
+            .fk_generation_publication_source_decision,
+            .fk_initial_create_prepare,
+            .fk_initial_child_decision,
+            .fk_initial_create_status,
+            .fk_generation_table_locked,
+            .fk_initial_create_work,
+            .fk_initial_parent_decision,
+            => true,
+            else => false,
+        };
+    }
+
+    pub fn isMutation(self: @This()) bool {
+        return self == .mutate or self == .fk_initial_retirement_ack or
+            (self != .store_root_enrollment_status and self.requiresAdministrativeGrant());
+    }
 };
+
+test "system catalog policy publication status is a service-only read, not a setting grant" {
+    const status: Call = .{ .policy_publication_status = 7 };
+    try std.testing.expect(!status.isMutation());
+    try std.testing.expect(!status.requiresAdministrativeGrant());
+    try std.testing.expect(!status.requiresSettingAuthorityReadGrant());
+    try std.testing.expect((Call{ .policy_publication_work = 0 }).requiresSettingAuthorityReadGrant());
+    try std.testing.expect((Call{ .policy_install_snapshot = undefined }).requiresSettingAuthorityReadGrant());
+    try std.testing.expect((Call{ .setting_snapshot = undefined }).requiresSettingAuthorityReadGrant());
+    try std.testing.expect((Call{ .fk_generation_publication_status = undefined }).requiresSettingAuthorityReadGrant());
+    try std.testing.expect((Call{ .policy_publication_begin = undefined }).requiresAdministrativeGrant());
+}
+
+test "store-root enrollment status is an admin-bound read, not a mutation" {
+    const query: Call = .{ .store_root_enrollment_status = .{
+        .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+        .node_id = 3,
+        .store_id = 5,
+        .root_incarnation = 7,
+        .public_key = @splat(1),
+    } };
+    try std.testing.expect(query.requiresAdministrativeGrant());
+    try std.testing.expect(!query.isMutation());
+}
 
 pub fn httpStatus(err: anyerror) u16 {
     return switch (err) {
         error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogNotFound, error.TableNotFound => 404,
-        error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.TablespaceInUse, error.NamespaceNotEmpty, error.DatabaseNotEmpty, error.ProtectedCatalogResource, error.TableAlreadyExists => 409,
-        error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.InvalidCreateTableRequest => 400,
-        error.CatalogCommandTooLarge, error.CreateTableRequestTooLarge => 413,
-        error.TableTopologyProtocolUpgradeRequired => 426,
+        error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.GenerationPublicationChanged, error.GenerationPublicationNotFound, error.ForeignKeyGenerationPublicationRequired, error.RowPolicyCatalogChanged, error.RowPolicyInstallationPending, error.RowPolicyReadersActive, error.TablespaceInUse, error.NamespaceNotEmpty, error.DatabaseNotEmpty, error.ProtectedCatalogResource, error.TableAlreadyExists => 409,
+        error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidGenerationPublication, error.InvalidInitialFkRetirementPage, error.InvalidRowPolicyPublication, error.InvalidRowPolicyRecord, error.InvalidSettingRecord, error.InvalidSettingValue, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.InvalidCreateTableRequest => 400,
+        error.CatalogCommandTooLarge, error.CreateTableRequestTooLarge, error.RowPolicyLimitExceeded => 413,
+        error.TableTopologyProtocolUpgradeRequired, error.RowPolicyUnsupported => 426,
         error.Forbidden => 403,
+        error.InvalidInitialFkRetirementSignature, error.InitialFkRetirementSigningKeyUnavailable => 403,
+        error.StoreRootEnrollmentChanged => 409,
+        error.InvalidStoreRootEnrollment, error.InvalidInitialFkRetirementAck => 400,
+        error.InitialChildRootReceiptChanged, error.InitialFkRetirementReporterChanged, error.InitialFkRetirementWorkChanged, error.InitialFkRetirementPublicationChanged, error.InitialFkRetirementReservationChanged => 409,
         error.UnsupportedOperation, error.MetadataIncarnationUnavailable, error.InvalidMetadataIncarnation, error.MetadataIncarnationMismatch, error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired, error.CatalogRoutingSnapshotTimeout, error.ResourceTemporarilyUnavailable => 503,
         error.MetadataMutationOutcomeUnknown, error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.Timeout, error.Cancelled, error.Canceled, error.DeadlineExceeded => 503,
         else => 500,
     };
+}
+
+test "invalid initial FK retirement page is a client error" {
+    try std.testing.expectEqual(@as(u16, 400), httpStatus(error.InvalidInitialFkRetirementPage));
 }
 
 /// Only trusted native ingress constructs these immutable routing identities.
@@ -995,6 +1166,21 @@ pub fn cloneStateAlloc(alloc: std.mem.Allocator, state: State) !std.json.Parsed(
     return std.json.parseFromSlice(State, alloc, bytes, .{ .allocate = .alloc_always });
 }
 
+test "standalone mutable catalog owns imported setting defaults" {
+    const alloc = std.testing.allocator;
+    var imported = try cloneStateAlloc(alloc, .{ .settings = &.{.{
+        .identity = .{ .id = 3, .generation = 1 },
+        .name = "app.tenant",
+        .kind = .string,
+        .default = .{ .string = "global" },
+        .role_defaults = &.{.{ .principal = "alice", .database = "main", .value = .{ .string = "private" } }},
+    }} });
+    var state = try MutableState.clone(alloc, imported.value);
+    imported.deinit();
+    defer state.deinit();
+    try std.testing.expectEqualStrings("private", state.value.settings[0].effective("alice", "main").role_default.?.string);
+}
+
 pub fn applyDeltaStateAlloc(alloc: std.mem.Allocator, state: State, delta: Delta) !std.json.Parsed(State) {
     var resources = std.ArrayListUnmanaged(Resource).empty;
     defer resources.deinit(alloc);
@@ -1008,7 +1194,7 @@ pub fn applyDeltaStateAlloc(alloc: std.mem.Allocator, state: State, delta: Delta
         if (!replaced.contains(.{ .kind = resource.kind, .id = resource.id })) try resources.append(alloc, resource);
     }
     try resources.appendSlice(alloc, delta.upserts);
-    return cloneStateAlloc(alloc, .{ .revision = try std.math.add(u64, state.revision, 1), .next_id = delta.next_id, .resources = resources.items });
+    return cloneStateAlloc(alloc, .{ .revision = try std.math.add(u64, state.revision, 1), .next_id = delta.next_id, .resources = resources.items, .settings = state.settings, .policies = state.policies });
 }
 
 pub fn tableResourceMatches(grant: []const u8, target: []const u8) bool {
@@ -1157,6 +1343,29 @@ test "system catalog tenant churn reclaims committed and rolled back parent buck
         try std.testing.expectEqual(initial, state.index.children.count());
         try std.testing.expectEqual(@as(usize, 2), state.value.resources.len);
     }
+}
+
+test "mutable catalog owns publication owner cuts beyond imported snapshot lifetime" {
+    const alloc = std.testing.allocator;
+    const publications = [_]@import("policies.zig").Publication{.{
+        .table_id = 7,
+        .schema_version = 2,
+        .schema_digest = @splat(0xab),
+        .generation = 1,
+        .catalog_epoch = 3,
+        .phase = .pending_install,
+        .required_owners = &.{.{ .group_id = 11, .descriptor_digest = @splat(0xcd) }},
+        .acknowledged_owners = &.{},
+    }};
+    const bytes = try std.json.Stringify.valueAlloc(alloc, publications, .{});
+    defer alloc.free(bytes);
+    var imported = try std.json.parseFromSlice([]const @import("policies.zig").Publication, alloc, bytes, .{ .allocate = .alloc_always });
+    var mutable = try MutableState.clone(alloc, .{ .policy_publications = imported.value });
+    defer mutable.deinit();
+    imported.deinit();
+    try std.testing.expectEqual(@as(u64, 7), mutable.value.policy_publications[0].table_id);
+    try std.testing.expectEqual(@as(u64, 11), mutable.value.policy_publications[0].required_owners[0].group_id);
+    try std.testing.expectEqual(@as(u8, 0xcd), mutable.value.policy_publications[0].required_owners[0].descriptor_digest[0]);
 }
 
 pub const Meta = struct {

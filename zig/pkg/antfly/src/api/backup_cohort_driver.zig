@@ -80,7 +80,7 @@ pub fn Session(comptime Source: type) type {
                     try request.ensureActive();
                     var response = (try read.topologyStatus(alloc, table.name, range.start_key, "{\"mode\":\"identity\"}")) orelse return error.TableNotFound;
                     defer response.deinit(alloc);
-                    const Identity = struct { namespace: identity.Namespace, catalog_digest: [32]u8, next_epoch: u64, backup_seal_supported: bool = false };
+                    const Identity = @import("../storage/db/relational_integrity_topology_contract.zig").Identity;
                     const native = try std.json.parseFromSlice(Identity, a, response.json, .{ .allocate = .alloc_always });
                     if (!native.value.backup_seal_supported) return error.BackupSealBackendUnsupported;
                     if (native.value.namespace.table_id != table.table_id) return error.CatalogChanged;

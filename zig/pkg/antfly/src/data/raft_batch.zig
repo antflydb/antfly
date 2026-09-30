@@ -21,6 +21,7 @@ const internal_batch_forwarding = @import("../api/internal_batch_forwarding.zig"
 
 pub const acknowledge_many_protocol_version = @import("../common/data_raft_protocol.zig").batch_acknowledge_many_protocol_version;
 pub const protocol_version = internal_batch_forwarding.raft_batch_protocol_version;
+pub const artifact_catalog_protocol_version = internal_batch_forwarding.raft_batch_artifact_catalog_protocol_version;
 pub const timestamp_protocol_version = internal_batch_forwarding.raft_batch_timestamp_protocol_version;
 pub const activation_barrier_protocol_version = internal_batch_forwarding.raft_batch_activation_barrier_protocol_version;
 pub const merge_transition_protocol_version = internal_batch_forwarding.raft_batch_merge_transition_protocol_version;
@@ -33,6 +34,7 @@ pub const source_pin_protocol_version = internal_batch_forwarding.raft_batch_sou
 pub const relational_transfer_protocol_version = internal_batch_forwarding.raft_batch_relational_transfer_protocol_version;
 pub const source_scope_protocol_version = internal_batch_forwarding.raft_batch_source_scope_protocol_version;
 pub const merge_chunk_protocol_version = internal_batch_forwarding.raft_batch_merge_chunk_protocol_version;
+pub const merge_proof_adoption_protocol_version = internal_batch_forwarding.raft_batch_merge_proof_adoption_protocol_version;
 
 pub const OwnedStorageOwnerDescriptor = struct {
     descriptor: descriptor_contract.Descriptor,
@@ -45,6 +47,7 @@ pub const OwnedStorageOwnerDescriptor = struct {
         alloc.free(self.descriptor.schema_json);
         alloc.free(self.descriptor.indexes_json);
         alloc.free(self.descriptor.restore_bootstrap_json);
+        alloc.free(self.descriptor.initial_child_bootstrap_json);
         descriptor_contract.freeInitialRange(alloc, self.descriptor.initial_range);
         self.* = undefined;
     }
@@ -125,6 +128,8 @@ fn cloneStorageOwnerDescriptor(
     errdefer alloc.free(indexes_json);
     const restore_bootstrap_json = try alloc.dupe(u8, descriptor.restore_bootstrap_json);
     errdefer alloc.free(restore_bootstrap_json);
+    const initial_child_bootstrap_json = try alloc.dupe(u8, descriptor.initial_child_bootstrap_json);
+    errdefer alloc.free(initial_child_bootstrap_json);
     const initial_range = try descriptor_contract.cloneInitialRange(alloc, descriptor.initial_range);
     return .{ .descriptor = .{
         .lsm_root_generation = descriptor.lsm_root_generation,
@@ -133,6 +138,7 @@ fn cloneStorageOwnerDescriptor(
         .schema_json = schema_json,
         .indexes_json = indexes_json,
         .restore_bootstrap_json = restore_bootstrap_json,
+        .initial_child_bootstrap_json = initial_child_bootstrap_json,
         .initial_range = initial_range,
         .restore_cancel_recovery = descriptor.restore_cancel_recovery,
         .restore_ha_replay = descriptor.restore_ha_replay,
@@ -196,6 +202,29 @@ fn consumerTests() type {
     const test_owner_root = @import("antfly_source_root");
     if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
     const Suite = struct {
+        test "ordered artifact merge adoption uses private raft batch encoding" {
+            const alloc = std.testing.allocator;
+            const request: db_mod.types.BatchRequest = .{ .merge_proof_adoption = .{
+                .transition_id = 7,
+                .attempt = .{ .donor_term = 3, .sequence = 4 },
+                .source_pin = @splat(1),
+                .proof_digest = @splat(2),
+                .record_digest = @splat(3),
+            } };
+            const batch_json = try batch_api.encodeBatchRequest(alloc, request);
+            defer alloc.free(batch_json);
+            try std.testing.expectError(error.InvalidBatchRequest, batch_api.parseBatchRequest(alloc, batch_json));
+            const encoded = try encode(alloc, "docs", request);
+            defer alloc.free(encoded);
+            var decoded = try decode(alloc, encoded);
+            defer decoded.deinit(alloc);
+            try std.testing.expectEqualDeep(request.merge_proof_adoption.?, decoded.batch.req.merge_proof_adoption.?);
+            try std.testing.expectError(error.InvalidBatchRequest, encode(alloc, "docs", .{
+                .merge_proof_adoption = request.merge_proof_adoption,
+                .deletes = &.{"doc"},
+            }));
+        }
+
         test "raft protocol barrier is fail closed for legacy batch parsers" {
             try std.testing.expect(activation_barrier_protocol_version > timestamp_protocol_version);
             try std.testing.expect(merge_transition_protocol_version > activation_barrier_protocol_version);
@@ -204,7 +233,8 @@ fn consumerTests() type {
             try std.testing.expect(merge_copy_attempt_protocol_version > merge_artifacts_protocol_version);
             try std.testing.expect(merge_page_protocol_version > merge_copy_attempt_protocol_version);
             try std.testing.expect(source_scope_protocol_version > relational_transfer_protocol_version);
-            try std.testing.expectEqual(protocol_version, acknowledge_many_protocol_version);
+            try std.testing.expectEqual(protocol_version, artifact_catalog_protocol_version);
+            try std.testing.expect(protocol_version >= acknowledge_many_protocol_version);
             try std.testing.expect(acknowledge_many_protocol_version > source_scope_protocol_version);
             try std.testing.expectEqual(source_scope_protocol_version, source_pin_protocol_version);
             const encoded = try encodeProtocolBarrier(std.testing.allocator, "docs", timestamp_protocol_version);
@@ -456,6 +486,7 @@ fn consumerTests() type {
                 .schema_json = "{\"fields\":{\"title\":{\"type\":\"string\"}}}",
                 .indexes_json = "{\"title\":{\"type\":\"full_text\"}}",
                 .restore_bootstrap_json = "{\"scope\":\"exact immutable owner proof\"}",
+                .initial_child_bootstrap_json = "{\"plan_id\":\"exact hidden child proof\"}",
                 .restore_cancel_recovery = true,
             };
             const encoded = try encodeWithStorageOwnerDescriptor(
@@ -475,6 +506,7 @@ fn consumerTests() type {
             try std.testing.expectEqualStrings(descriptor.schema_json, actual.descriptor.schema_json);
             try std.testing.expectEqualStrings(descriptor.indexes_json, actual.descriptor.indexes_json);
             try std.testing.expectEqualStrings(descriptor.restore_bootstrap_json, actual.descriptor.restore_bootstrap_json);
+            try std.testing.expectEqualStrings(descriptor.initial_child_bootstrap_json, actual.descriptor.initial_child_bootstrap_json);
             try std.testing.expectEqual(descriptor.restore_cancel_recovery, actual.descriptor.restore_cancel_recovery);
         }
 

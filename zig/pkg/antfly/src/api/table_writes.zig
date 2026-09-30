@@ -66,6 +66,27 @@ const table_reads = @import("antfly_source_root").antfly_sources.table_reads;
 const storage_snapshot_source = @import("storage_snapshot_source.zig");
 const storage_maintenance_source = @import("storage_maintenance_source.zig");
 const table_write_source = @import("table_write_source.zig");
+
+// ProvisionSummary.indexes_pending is the coarse maintenance retry debt,
+// not a public index count. A busy owner has not proved its catalog complete
+// even when no individual index was inspected. Keep one retry token until a
+// full pass succeeds; never turn a degraded owner into endless pending work.
+fn structuralReconcilePending(result: table_write_source.LocalStructuralReconcileResult) !usize {
+    return switch (result.state) {
+        .complete => @intCast(result.indexes_pending),
+        .busy, .repair_pending, .restore_repair_pending => @intCast(@max(1, result.indexes_pending)),
+        .degraded => error.StorageKernelReconcileDegraded,
+    };
+}
+
+test "owner catalog busy without index debt keeps provisioning retry until full reconciliation" {
+    try std.testing.expectEqual(@as(usize, 1), try structuralReconcilePending(.{ .state = .busy }));
+    try std.testing.expectEqual(@as(usize, 1), try structuralReconcilePending(.{ .state = .repair_pending }));
+    try std.testing.expectEqual(@as(usize, 1), try structuralReconcilePending(.{ .state = .restore_repair_pending }));
+    try std.testing.expectEqual(@as(usize, 3), try structuralReconcilePending(.{ .state = .busy, .indexes_pending = 3 }));
+    try std.testing.expectEqual(@as(usize, 0), try structuralReconcilePending(.{ .state = .complete }));
+    try std.testing.expectError(error.StorageKernelReconcileDegraded, structuralReconcilePending(.{ .state = .degraded }));
+}
 const http_routes = @import("http_routes.zig");
 const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 const transaction_recovery_source = @import("transaction_recovery_source.zig");
@@ -715,6 +736,7 @@ const replica_retirement_magic_v1 = "AFRTRM1\x00";
 const replica_retirement_magic_v2 = "AFRTRM2\x00";
 const replica_retirement_magic = "AFRTRM3\x00";
 const replica_retirement_batch_magic = "AFRTBT1\x00";
+const replica_retirement_batch_magic_v2 = "AFRTBT2\x00";
 const replica_retirement_batch_prefix = "batch-";
 const max_replica_retirement_table_name_bytes: usize = 64 * 1024;
 const max_replica_retirement_batch_entries: usize = 64 * 1024;
@@ -725,7 +747,7 @@ const max_dropped_table_repair_name_bytes: usize = 16 * 1024;
 const replica_retirement_batch_base_encoded_len: usize =
     replica_retirement_batch_magic.len + 1 + 4 + std.crypto.hash.sha2.Sha256.digest_length;
 
-fn addReplicaRetirementBatchEncodedEntry(current: usize, table_name: ?[]const u8) !usize {
+fn addReplicaRetirementBatchEncodedEntry(current: usize, table_name: ?[]const u8, version_two: bool, proof: ?InitialFkRetirementProof) !usize {
     const name_len = if (table_name) |name| blk: {
         if (name.len == 0 or name.len > max_replica_retirement_table_name_bytes)
             return error.InvalidReplicaRetirementTableName;
@@ -735,6 +757,11 @@ fn addReplicaRetirementBatchEncodedEntry(current: usize, table_name: ?[]const u8
         return error.ReplicaRetirementBatchTooLarge;
     encoded_len = std.math.add(usize, encoded_len, name_len) catch
         return error.ReplicaRetirementBatchTooLarge;
+    if (version_two) {
+        if (proof) |value| try value.validate();
+        encoded_len = std.math.add(usize, encoded_len, 1 + if (proof != null) InitialFkRetirementProof.encoded_len else @as(usize, 0)) catch
+            return error.ReplicaRetirementBatchTooLarge;
+    }
     if (encoded_len > max_replica_retirement_batch_bytes)
         return error.ReplicaRetirementBatchTooLarge;
     return encoded_len;
@@ -1331,6 +1358,7 @@ fn replicaRetirementIntentPath(
 const PersistedReplicaRetirementIntent = struct {
     group_id: u64,
     table_name: ?[]u8,
+    initial_fk_proof: ?InitialFkRetirementProof = null,
     path: []u8,
     created: bool,
 
@@ -1340,6 +1368,146 @@ const PersistedReplicaRetirementIntent = struct {
         self.* = undefined;
     }
 };
+
+/// Immutable metadata identity carried by a crash-safe local retirement
+/// intent. The owning metadata publication, not this sidecar, decides whether
+/// cancellation committed; the cold physical AICH record must match it too.
+pub const InitialFkRetirementProof = struct {
+    child_table_id: u64,
+    plan_id: [16]u8,
+    plan_digest: [32]u8,
+
+    const encoded_len = 8 + 16 + 32;
+
+    pub fn validate(self: @This()) !void {
+        if (self.child_table_id == 0 or std.mem.allEqual(u8, &self.plan_id, 0) or
+            std.mem.allEqual(u8, &self.plan_digest, 0)) return error.InvalidReplicaRetirementIntent;
+    }
+
+    fn encode(self: @This()) ![encoded_len]u8 {
+        try self.validate();
+        var bytes: [encoded_len]u8 = undefined;
+        std.mem.writeInt(u64, bytes[0..8], self.child_table_id, .little);
+        @memcpy(bytes[8..24], &self.plan_id);
+        @memcpy(bytes[24..56], &self.plan_digest);
+        return bytes;
+    }
+
+    fn decode(bytes: []const u8) !@This() {
+        if (bytes.len != encoded_len) return error.InvalidReplicaRetirementIntent;
+        const result: @This() = .{
+            .child_table_id = std.mem.readInt(u64, bytes[0..8], .little),
+            .plan_id = bytes[8..24].*,
+            .plan_digest = bytes[24..56].*,
+        };
+        try result.validate();
+        return result;
+    }
+};
+
+pub const InitialChildRetirementObservation = struct {
+    /// Durable local replica-catalog marker, not metadata's current desired
+    /// placement. It survives process restart and protects an AICH that has
+    /// not yet been provisioned or is temporarily unreadable.
+    initial_fk_root_generation: u64 = 0,
+    record: ?@import("../storage/db/relational_initial_child_publication.zig").Record = null,
+};
+
+pub const InitialChildRetirementReader = struct {
+    ptr: *anyopaque,
+    read: *const fn (*anyopaque, std.mem.Allocator, u64) anyerror!InitialChildRetirementObservation,
+};
+
+fn requireInitialChildRetirementRecord(
+    observation: InitialChildRetirementObservation,
+    proof: ?InitialFkRetirementProof,
+) !void {
+    return requireInitialChildRetirementRecordForPurpose(observation, proof, .physical_cleanup);
+}
+
+const InitialChildRetirementPurpose = enum { prepare_intent, physical_cleanup };
+
+fn requireInitialChildRetirementRecordForPurpose(
+    observation: InitialChildRetirementObservation,
+    proof: ?InitialFkRetirementProof,
+    purpose: InitialChildRetirementPurpose,
+) !void {
+    const value = observation.record orelse {
+        if (observation.initial_fk_root_generation != 0) return error.InitialChildRetirementProofUnavailable;
+        return;
+    };
+    if (value.phase != .released and proof == null) return error.InitialFkRetirementTicketRequired;
+    if (proof) |expected| {
+        // A prepared journal is written BEFORE the cancel metadata CAS; it
+        // binds identity but authorizes no unlink. Recovery independently
+        // requires terminal metadata ownership plus the canceled cold record.
+        // A released owner can never be canceled by this journal protocol.
+        if (value.phase == .released or (purpose == .physical_cleanup and value.phase != .canceled))
+            return error.InitialChildPublicationChanged;
+        if (value.namespace.table_id != expected.child_table_id or
+            !std.mem.eql(u8, &value.plan_id, &expected.plan_id) or
+            !std.mem.eql(u8, &value.plan_digest, &expected.plan_digest))
+            return error.InitialChildPublicationChanged;
+    }
+}
+
+fn testPrivateInitialChildRetirementProof() !void {
+    const Record = @import("../storage/db/relational_initial_child_publication.zig").Record;
+    var record: Record = .{
+        .phase = .hidden,
+        .plan_id = @splat(1),
+        .plan_digest = @splat(2),
+        .namespace = .{ .table_id = 7, .shard_id = 9, .range_id = 11 },
+        .schema_version = 1,
+        .row_count = 0,
+        .schema_digest = @splat(3),
+        .public_schema_json_digest = @splat(4),
+        .catalog_digest = @splat(5),
+        .provision_term = 2,
+        .provision_index = 3,
+    };
+    try std.testing.expectError(error.InitialFkRetirementTicketRequired, requireInitialChildRetirementRecord(.{ .initial_fk_root_generation = 4, .record = record }, null));
+    const proof: InitialFkRetirementProof = .{
+        .child_table_id = 7,
+        .plan_id = record.plan_id,
+        .plan_digest = record.plan_digest,
+    };
+    try std.testing.expectError(error.InitialChildPublicationChanged, requireInitialChildRetirementRecord(.{ .initial_fk_root_generation = 4, .record = record }, proof));
+    try requireInitialChildRetirementRecordForPurpose(.{ .initial_fk_root_generation = 4, .record = record }, proof, .prepare_intent);
+    var wrong = proof;
+    wrong.plan_digest = @splat(99);
+    try std.testing.expectError(error.InitialChildPublicationChanged, requireInitialChildRetirementRecordForPurpose(.{ .initial_fk_root_generation = 4, .record = record }, wrong, .prepare_intent));
+    record.phase = .canceled;
+    record.phase_term = 2;
+    record.phase_index = 4;
+    try std.testing.expectError(error.InitialFkRetirementTicketRequired, requireInitialChildRetirementRecord(.{ .initial_fk_root_generation = 4, .record = record }, null));
+    try requireInitialChildRetirementRecord(.{ .initial_fk_root_generation = 4, .record = record }, proof);
+    try std.testing.expectError(error.InitialChildPublicationChanged, requireInitialChildRetirementRecord(.{ .record = record }, .{
+        .child_table_id = 7,
+        .plan_id = @splat(8),
+        .plan_digest = record.plan_digest,
+    }));
+    record.phase = .released;
+    try std.testing.expectError(error.InitialChildPublicationChanged, requireInitialChildRetirementRecordForPurpose(.{ .initial_fk_root_generation = 4, .record = record }, proof, .prepare_intent));
+    try requireInitialChildRetirementRecord(.{ .initial_fk_root_generation = 4, .record = record }, null);
+    try std.testing.expectError(error.InitialChildPublicationChanged, requireInitialChildRetirementRecord(.{ .initial_fk_root_generation = 4, .record = record }, proof));
+    try requireInitialChildRetirementRecord(.{}, null);
+    try std.testing.expectError(error.InitialChildRetirementProofUnavailable, requireInitialChildRetirementRecord(.{ .initial_fk_root_generation = 4 }, null));
+}
+
+test "private initial child retirement requires explicit proof until publication" {
+    try testPrivateInitialChildRetirementProof();
+}
+
+fn initialFkRetirementProofsEqual(lhs: ?InitialFkRetirementProof, rhs: ?InitialFkRetirementProof) bool {
+    if (lhs == null or rhs == null) return lhs == null and rhs == null;
+    return std.meta.eql(lhs.?, rhs.?);
+}
+
+fn replicaRetirementBatchMagic(intents: []const PersistedReplicaRetirementIntent) []const u8 {
+    for (intents) |intent| if (intent.initial_fk_proof != null) return replica_retirement_batch_magic_v2;
+    return replica_retirement_batch_magic;
+}
 
 const ReplicaRetirementIntentPhase = enum(u8) {
     prepared = 1,
@@ -1384,7 +1552,8 @@ fn replicaRetirementBatchPath(
     intents: []const PersistedReplicaRetirementIntent,
 ) ![]u8 {
     var checksum = std.crypto.hash.sha2.Sha256.init(.{});
-    checksum.update(replica_retirement_batch_magic);
+    const magic = replicaRetirementBatchMagic(intents);
+    checksum.update(magic);
     var encoded_count: [4]u8 = undefined;
     std.mem.writeInt(u32, &encoded_count, @intCast(intents.len), .little);
     checksum.update(&encoded_count);
@@ -1396,6 +1565,10 @@ fn replicaRetirementBatchPath(
         std.mem.writeInt(u32, &encoded_name_len, @intCast(if (intent.table_name) |name| name.len else 0), .little);
         checksum.update(&encoded_name_len);
         if (intent.table_name) |name| checksum.update(name);
+        if (std.mem.eql(u8, magic, replica_retirement_batch_magic_v2)) {
+            checksum.update(&[_]u8{@intFromBool(intent.initial_fk_proof != null)});
+            if (intent.initial_fk_proof) |proof| checksum.update(&try proof.encode());
+        }
     }
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     checksum.final(&digest);
@@ -1418,13 +1591,15 @@ fn writeReplicaRetirementBatch(
 ) !void {
     if (intents.len == 0 or intents.len > max_replica_retirement_batch_entries)
         return error.ReplicaRetirementBatchTooLarge;
+    const magic = replicaRetirementBatchMagic(intents);
+    const version_two = std.mem.eql(u8, magic, replica_retirement_batch_magic_v2);
     var encoded_len: usize = replica_retirement_batch_base_encoded_len;
     var previous_group_id: ?u64 = null;
     for (intents) |intent| {
         if (previous_group_id != null and previous_group_id.? >= intent.group_id)
             return error.InvalidReplicaRetirementIntent;
         previous_group_id = intent.group_id;
-        encoded_len = try addReplicaRetirementBatchEncodedEntry(encoded_len, intent.table_name);
+        encoded_len = try addReplicaRetirementBatchEncodedEntry(encoded_len, intent.table_name, version_two, intent.initial_fk_proof);
     }
 
     const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{d}", .{ path, platform_time.monotonicNs() });
@@ -1439,10 +1614,10 @@ fn writeReplicaRetirementBatch(
         const encoded_phase = [_]u8{@intFromEnum(phase)};
         var encoded_count: [4]u8 = undefined;
         std.mem.writeInt(u32, &encoded_count, @intCast(intents.len), .little);
-        checksum.update(replica_retirement_batch_magic);
+        checksum.update(magic);
         checksum.update(&encoded_phase);
         checksum.update(&encoded_count);
-        try writer.interface.writeAll(replica_retirement_batch_magic);
+        try writer.interface.writeAll(magic);
         try writer.interface.writeAll(&encoded_phase);
         try writer.interface.writeAll(&encoded_count);
         for (intents) |intent| {
@@ -1453,9 +1628,18 @@ fn writeReplicaRetirementBatch(
             checksum.update(&encoded_group_id);
             checksum.update(&encoded_name_len);
             if (intent.table_name) |name| checksum.update(name);
+            if (version_two) {
+                const flag = [_]u8{@intFromBool(intent.initial_fk_proof != null)};
+                checksum.update(&flag);
+                if (intent.initial_fk_proof) |proof| checksum.update(&try proof.encode());
+            }
             try writer.interface.writeAll(&encoded_group_id);
             try writer.interface.writeAll(&encoded_name_len);
             if (intent.table_name) |name| try writer.interface.writeAll(name);
+            if (version_two) {
+                try writer.interface.writeAll(&[_]u8{@intFromBool(intent.initial_fk_proof != null)});
+                if (intent.initial_fk_proof) |proof| try writer.interface.writeAll(&try proof.encode());
+            }
         }
         var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
         checksum.final(&digest);
@@ -1475,8 +1659,10 @@ fn loadReplicaRetirementBatch(alloc: std.mem.Allocator, io: std.Io, path: []cons
     };
     defer alloc.free(encoded);
     const header_len = replica_retirement_batch_magic.len + 1 + 4;
-    if (encoded.len < header_len + std.crypto.hash.sha2.Sha256.digest_length or
-        !std.mem.eql(u8, encoded[0..replica_retirement_batch_magic.len], replica_retirement_batch_magic))
+    if (encoded.len < header_len + std.crypto.hash.sha2.Sha256.digest_length)
+        return error.InvalidReplicaRetirementIntent;
+    const version_two = std.mem.eql(u8, encoded[0..replica_retirement_batch_magic.len], replica_retirement_batch_magic_v2);
+    if (!version_two and !std.mem.eql(u8, encoded[0..replica_retirement_batch_magic.len], replica_retirement_batch_magic))
         return error.InvalidReplicaRetirementIntent;
     const phase: ReplicaRetirementIntentPhase = switch (encoded[replica_retirement_batch_magic.len]) {
         @intFromEnum(ReplicaRetirementIntentPhase.prepared) => .prepared,
@@ -1518,16 +1704,29 @@ fn loadReplicaRetirementBatch(alloc: std.mem.Allocator, io: std.Io, path: []cons
         previous_group_id = group_id;
         const table_name = if (name_len == 0) null else try alloc.dupe(u8, encoded[offset .. offset + name_len]);
         errdefer if (table_name) |name| alloc.free(name);
-        // The batch owns its path once; entries retain only the cleanup
-        // identity and avoid O(entries * path length) recovery memory.
+        offset += name_len;
+        var proof: ?InitialFkRetirementProof = null;
+        if (version_two) {
+            if (offset == payload_end) return error.InvalidReplicaRetirementIntent;
+            const flag = encoded[offset];
+            offset += 1;
+            if (flag > 1) return error.InvalidReplicaRetirementIntent;
+            if (flag == 1) {
+                if (offset + InitialFkRetirementProof.encoded_len > payload_end) return error.InvalidReplicaRetirementIntent;
+                proof = try InitialFkRetirementProof.decode(encoded[offset..][0..InitialFkRetirementProof.encoded_len]);
+                offset += InitialFkRetirementProof.encoded_len;
+            }
+        }
+        // Allocate only after every fallible per-entry decode. A malformed
+        // proof must not leak a path that was never transferred to the batch.
         const owned_path = try alloc.alloc(u8, 0);
         intents[initialized] = .{
             .group_id = group_id,
             .table_name = table_name,
+            .initial_fk_proof = proof,
             .path = owned_path,
             .created = false,
         };
-        offset += name_len;
     }
     if (offset != payload_end) return error.InvalidReplicaRetirementIntent;
     return .{ .phase = phase, .intents = intents };
@@ -2332,7 +2531,10 @@ pub const ProvisionedTableWriteCache = struct {
         }
     };
 
-    fn applyRuntimeHooksToDb(self: *ProvisionedTableWriteCache, db: *db_mod.DB, group_id: u64, owner_state: ?*PromotionOwnerState) void {
+    fn applyRuntimeHooksToDb(self: *ProvisionedTableWriteCache, db: *db_mod.DB, table_name: []const u8, group_id: u64, owner_state: ?*PromotionOwnerState) void {
+        // Every managed owner, including adopted startup/restore owners, must
+        // bind signed policy proofs to its stable cache-entry table identity.
+        db.row_policy_table_name = table_name;
         db.setCoordinatedTtl(self.coordinated_ttl, group_id);
         db.setResolutionCandidateSource(self.resolution_candidate_source);
         db.setEntitySink(self.entity_sink);
@@ -2403,7 +2605,7 @@ pub const ProvisionedTableWriteCache = struct {
             return;
         }
         for (self.entries.items) |entry| {
-            self.applyRuntimeHooksToDb(&entry.db, entry.group_id, &entry.promotion_owner_state);
+            self.applyRuntimeHooksToDb(&entry.db, entry.table_name, entry.group_id, &entry.promotion_owner_state);
         }
     }
 
@@ -2963,6 +3165,7 @@ pub const ProvisionedTableWriteCache = struct {
                 ha_write_gate: ?db_mod.HAWriteGate,
                 ha_async_mirror: ?db_mod.HAAsyncEffectMirror,
                 inference_api_url: ?[]const u8,
+                policy_table_name: []const u8,
             ) !OpenedDb {
                 const effective_ha_mirror = haMirrorForManagedDbOpenMode(open_mode, ha_async_mirror);
                 var db = if (indexes_json) |managed_indexes_json|
@@ -3018,6 +3221,9 @@ pub const ProvisionedTableWriteCache = struct {
                     });
                 errdefer db.close();
                 try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
+                const owned_policy_table_name = try allocator.dupe(u8, policy_table_name);
+                db.owned_row_policy_table_name = owned_policy_table_name;
+                db.row_policy_table_name = owned_policy_table_name;
                 return .{
                     .db = db,
                     .start_bulk_session = switch (open_mode) {
@@ -3061,6 +3267,7 @@ pub const ProvisionedTableWriteCache = struct {
                 self.ha_write_gate,
                 self.ha_async_mirror,
                 self.inference_api_url,
+                table_name,
             );
             const owned_db = try self.alloc.create(db_mod.DB);
             errdefer self.alloc.destroy(owned_db);
@@ -3116,6 +3323,7 @@ pub const ProvisionedTableWriteCache = struct {
             self.ha_write_gate,
             self.ha_async_mirror,
             self.inference_api_url,
+            table_name,
         );
         errdefer opened.db.close();
         const start_bulk_session = opened.start_bulk_session and self.bulkIngestSessionReadyForTable(table_name);
@@ -3137,7 +3345,7 @@ pub const ProvisionedTableWriteCache = struct {
             .active_leases = 1,
             .bulk_ingest_session_open = start_bulk_session,
         };
-        self.applyRuntimeHooksToDb(&owned_entry.db, group_id, &owned_entry.promotion_owner_state);
+        self.applyRuntimeHooksToDb(&owned_entry.db, owned_entry.table_name, group_id, &owned_entry.promotion_owner_state);
         try owned_entry.db.activateResolverReplayRuntimes();
         try self.entries.append(self.alloc, owned_entry);
         // Artifact-issue mutations invalidate their compact status summary in
@@ -3508,7 +3716,7 @@ pub const ProvisionedTableWriteCache = struct {
             .active_leases = 1,
             .bulk_ingest_session_open = start_bulk_session,
         };
-        self.applyRuntimeHooksToDb(&owned_entry.db, group_id, &owned_entry.promotion_owner_state);
+        self.applyRuntimeHooksToDb(&owned_entry.db, owned_entry.table_name, group_id, &owned_entry.promotion_owner_state);
         try owned_entry.db.activateResolverReplayRuntimes();
         prepared.schema_json = null;
         errdefer owned_entry.deinit(self.alloc, self.backend_runtime);
@@ -3567,7 +3775,7 @@ pub const ProvisionedTableWriteCache = struct {
             .allow_generation_adoption = true,
             .allow_active_generation_adoption = true,
         };
-        self.applyRuntimeHooksToDb(&owned_entry.db, group_id, &owned_entry.promotion_owner_state);
+        self.applyRuntimeHooksToDb(&owned_entry.db, owned_entry.table_name, group_id, &owned_entry.promotion_owner_state);
         try owned_entry.db.activateResolverReplayRuntimes();
         errdefer owned_entry.deinit(self.alloc, self.backend_runtime);
 
@@ -6192,8 +6400,13 @@ pub const ProvisionedTableWriteSource = struct {
 
         ptr: *anyopaque,
         classify: *const fn (ptr: *anyopaque, group_id: u64) anyerror!State,
+        classify_initial_fk: ?*const fn (ptr: *anyopaque, group_id: u64, proof: InitialFkRetirementProof) anyerror!State = null,
 
-        fn state(self: @This(), group_id: u64) !State {
+        fn state(self: @This(), group_id: u64, proof: ?InitialFkRetirementProof) !State {
+            if (proof) |value| {
+                const classifier = self.classify_initial_fk orelse return error.ReplicaRetirementOwnershipUnavailable;
+                return try classifier(self.ptr, group_id, value);
+            }
             return try self.classify(self.ptr, group_id);
         }
     };
@@ -6220,6 +6433,7 @@ pub const ProvisionedTableWriteSource = struct {
         /// produced the placement removal. Null is reserved for legacy repair
         /// records and deliberately falls back to conservative coordination.
         table_name: ?[]const u8 = null,
+        initial_fk_proof: ?InitialFkRetirementProof = null,
     };
 
     fn preflightReplicaRetirementBatch(targets: []const ReplicaRetirementTarget) !void {
@@ -6228,8 +6442,11 @@ pub const ProvisionedTableWriteSource = struct {
             return error.ReplicaRetirementBatchTooLarge;
 
         var encoded_len: usize = replica_retirement_batch_base_encoded_len;
+        const version_two = for (targets) |target| {
+            if (target.initial_fk_proof != null) break true;
+        } else false;
         for (targets) |target| {
-            encoded_len = try addReplicaRetirementBatchEncodedEntry(encoded_len, target.table_name);
+            encoded_len = try addReplicaRetirementBatchEncodedEntry(encoded_len, target.table_name, version_two, target.initial_fk_proof);
         }
     }
 
@@ -6831,11 +7048,15 @@ pub const ProvisionedTableWriteSource = struct {
     local_change_hook: ?LocalChangeHook = null,
     local_index_repair_debt_hook: ?LocalIndexRepairDebtHook = null,
     raft_batcher: ?RaftBatcher = null,
+    /// Set only after startup proves this process is the non-Raft standalone
+    /// data owner. A temporarily absent Raft callback is not that proof.
+    standalone_sql_range_guards: bool = false,
     local_write_owner: ?*ProvisionedTableWriteSource = null,
     /// Optional local physical-operation provider. Top-level routing,
     /// coalescing, admission, and lifecycle remain on this source; a compiled
     /// storage owner supplies only group-local operations.
     local_write_source: ?TableWriteSource = null,
+    initial_child_retirement_reader: ?InitialChildRetirementReader = null,
     storage_snapshot_source: ?storage_snapshot_source.Source = null,
     storage_maintenance_source: ?storage_maintenance_source.Source = null,
     seed_create_table_writers: bool = true,
@@ -7550,6 +7771,11 @@ pub const ProvisionedTableWriteSource = struct {
         return self;
     }
 
+    pub fn withStandaloneSqlRangeGuards(self: *ProvisionedTableWriteSource, enabled: bool) *ProvisionedTableWriteSource {
+        self.standalone_sql_range_guards = enabled;
+        return self;
+    }
+
     pub const StorageOwnerTransactionRecoveryOptions = transaction_recovery_source.Options;
 
     pub fn transactionRecoverySource(self: *ProvisionedTableWriteSource) transaction_recovery_source.Source {
@@ -7815,6 +8041,14 @@ pub const ProvisionedTableWriteSource = struct {
         source_override: ?TableWriteSource,
     ) *ProvisionedTableWriteSource {
         self.local_write_source = source_override;
+        return self;
+    }
+
+    pub fn withInitialChildRetirementReader(
+        self: *ProvisionedTableWriteSource,
+        reader: InitialChildRetirementReader,
+    ) *ProvisionedTableWriteSource {
+        self.initial_child_retirement_reader = reader;
         return self;
     }
 
@@ -8285,13 +8519,96 @@ pub const ProvisionedTableWriteSource = struct {
         return retry_required;
     }
 
+    /// A placement omission or a committed generic retirement journal is not
+    /// authority to erase a still-private initial-FK owner. Inspect the cold
+    /// durable publication record even when this process has no cached owner
+    /// (for example after a restart). Published children resume the ordinary
+    /// replica lifecycle; hidden/canceled children require an explicit
+    /// metadata-bound retirement proof.
+    fn requireInitialChildRetirementProof(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        proof: ?InitialFkRetirementProof,
+        purpose: InitialChildRetirementPurpose,
+    ) !void {
+        const group_path = try std.fmt.allocPrint(alloc, "{s}/group-{d}", .{ self.replica_root_dir, group_id });
+        defer alloc.free(group_path);
+        const io = self.tableActivityIo();
+        _ = std.Io.Dir.cwd().statFile(io, group_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(db_path);
+        const db_present = if (std.Io.Dir.cwd().statFile(io, db_path, .{ .follow_symlinks = false })) |_| true else |err| switch (err) {
+            error.FileNotFound => false,
+            else => return err,
+        };
+        const observation = if (self.initial_child_retirement_reader) |reader|
+            try reader.read(reader.ptr, alloc, group_id)
+        else if (comptime control_only_storage_sources)
+            return error.InitialChildRetirementProofUnavailable
+        else blk: {
+            if (!db_present) break :blk InitialChildRetirementObservation{};
+            var db = try db_mod.DB.open(alloc, db_path, .{
+                .backend_runtime = self.backend_runtime,
+                .open_mode = .query_readonly,
+                .primary_only_readonly = true,
+                .start_index_workers = false,
+                .start_optional_runtimes = false,
+            });
+            defer db.close();
+            break :blk InitialChildRetirementObservation{ .record = try db.readInitialChildPublicationRecord() };
+        };
+        if (!db_present and observation.initial_fk_root_generation != 0)
+            return error.InitialChildRetirementProofUnavailable;
+        try requireInitialChildRetirementRecordForPurpose(observation, proof, purpose);
+    }
+
     fn executeReplicaRetirementCleanup(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
         group_id: u64,
         table_name: ?[]const u8,
+        initial_fk_proof: ?InitialFkRetirementProof,
+    ) !void {
+        return self.executeReplicaRetirementCleanupWithAction(alloc, group_id, table_name, initial_fk_proof, null);
+    }
+
+    pub const QuiescedReplicaAction = struct {
+        ptr: *anyopaque,
+        run: *const fn (*anyopaque) anyerror!void,
+    };
+
+    /// The caller holds the exact replica placement/Raft lease. This seam
+    /// drains physical owners and caches, then runs the ticket-bound durable
+    /// rename while those reservations remain held. It never schedules the
+    /// generic retirement journal, whose identity is weaker than the ticket.
+    pub fn withQuiescedInitialFkReplica(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        proof: InitialFkRetirementProof,
+        action: QuiescedReplicaAction,
+    ) !void {
+        try proof.validate();
+        return self.executeReplicaRetirementCleanupWithAction(alloc, group_id, null, proof, action);
+    }
+
+    fn executeReplicaRetirementCleanupWithAction(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: ?[]const u8,
+        initial_fk_proof: ?InitialFkRetirementProof,
+        action: ?QuiescedReplicaAction,
     ) !void {
         if (group_id == 0) return error.InvalidArgument;
+        // A custom ticket-bound continuation performs its own cold exact
+        // proof, may durably cancel hidden AICH, and rechecks canceled state
+        // before unlink. Generic retirement still requires prior cancellation.
+        if (action == null) try self.requireInitialChildRetirementProof(alloc, group_id, initial_fk_proof, .physical_cleanup);
         try self.beginReplicaRetirementActivity(group_id, table_name);
         var retirement_active = true;
         errdefer if (retirement_active) self.endReplicaRetirementActivity(group_id);
@@ -8341,7 +8658,10 @@ pub const ProvisionedTableWriteSource = struct {
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         self.invalidateSharedPathCaches(path);
-        const trash_path = try moveRetiredReplicaPathToTrash(alloc, self.replica_root_dir, group_id);
+        const trash_path = if (action) |custom| blk: {
+            try custom.run(custom.ptr);
+            break :blk null;
+        } else try moveRetiredReplicaPathToTrash(alloc, self.replica_root_dir, group_id);
 
         // The atomic rename is the logical deletion boundary. Release cache
         // and activity reservations before potentially slow recursive I/O;
@@ -8405,7 +8725,7 @@ pub const ProvisionedTableWriteSource = struct {
         defer alloc.free(states);
         var has_committed_removal = false;
         for (loaded_batch.intents, states) |intent, *state| {
-            state.* = ownership.state(intent.group_id) catch |err| {
+            state.* = ownership.state(intent.group_id, intent.initial_fk_proof) catch |err| {
                 std.log.warn("replica-retirement batch ownership classification deferred group_id={d} path={s} err={s}", .{
                     intent.group_id,
                     path,
@@ -8430,7 +8750,7 @@ pub const ProvisionedTableWriteSource = struct {
         for (loaded_batch.intents, states) |intent, state| switch (state) {
             .retained => {},
             .retiring => retry_required = true,
-            .retired => self.executeReplicaRetirementCleanup(alloc, intent.group_id, intent.table_name) catch |err| {
+            .retired => self.executeReplicaRetirementCleanup(alloc, intent.group_id, intent.table_name, intent.initial_fk_proof) catch |err| {
                 std.log.warn("replica retirement batch cleanup deferred group_id={d} path={s} err={s}", .{
                     intent.group_id,
                     path,
@@ -8531,7 +8851,7 @@ pub const ProvisionedTableWriteSource = struct {
                 std.debug.assert(removed);
                 self.replica_retirement_intent_mutex.unlock();
             }
-            const state = ownership.state(group_id) catch |err| {
+            const state = ownership.state(group_id, null) catch |err| {
                 std.log.warn("replica-retirement ownership classification deferred group_id={d} path={s} err={s}", .{ group_id, path, @errorName(err) });
                 retry_required = true;
                 continue;
@@ -8558,7 +8878,7 @@ pub const ProvisionedTableWriteSource = struct {
                 retry_required = true;
                 continue;
             }
-            self.executeReplicaRetirementCleanup(alloc, group_id, intent.table_name) catch |err| {
+            self.executeReplicaRetirementCleanup(alloc, group_id, intent.table_name, null) catch |err| {
                 std.log.warn("replica retirement deferred group_id={d} path={s} err={s}", .{ group_id, path, @errorName(err) });
                 retry_required = true;
                 continue;
@@ -8606,6 +8926,11 @@ pub const ProvisionedTableWriteSource = struct {
             .alloc = alloc,
             .intents = try alloc.alloc(PersistedReplicaRetirementIntent, 0),
         };
+        // Bind exact cold identity before creating a prepared journal. A hidden
+        // owner may be journaled before the cancel CAS, but physical cleanup
+        // separately requires durable cancellation and terminal ownership.
+        for (targets) |target|
+            try self.requireInitialChildRetirementProof(alloc, target.group_id, target.initial_fk_proof, .prepare_intent);
 
         // Clone and canonicalize caller memory before reserving any shared
         // state. The short ownership phase below contains no filesystem work.
@@ -8624,6 +8949,7 @@ pub const ProvisionedTableWriteSource = struct {
             intent.* = .{
                 .group_id = target.group_id,
                 .table_name = name,
+                .initial_fk_proof = target.initial_fk_proof,
                 // The shared path is owned once by PreparedReplicaRetirements.
                 .path = try alloc.alloc(u8, 0),
                 .created = false,
@@ -8685,7 +9011,8 @@ pub const ProvisionedTableWriteSource = struct {
                 return error.InvalidReplicaRetirementIntent;
             for (persisted.intents, intents) |stored, requested| {
                 if (stored.group_id != requested.group_id or
-                    !optionalBytesEqual(stored.table_name, requested.table_name))
+                    !optionalBytesEqual(stored.table_name, requested.table_name) or
+                    !initialFkRetirementProofsEqual(stored.initial_fk_proof, requested.initial_fk_proof))
                     return error.InvalidReplicaRetirementIntent;
             }
         } else |err| switch (err) {
@@ -13131,8 +13458,9 @@ pub const ProvisionedTableWriteSource = struct {
                 )) orelse return error.StorageKernelOwnerUnavailable;
                 summary.indexes_added += @intCast(result.indexes_added);
                 summary.indexes_removed += @intCast(result.indexes_removed);
-                summary.indexes_pending += @intCast(result.indexes_pending);
-                if (result.indexes_pending != 0) {
+                const pending = try structuralReconcilePending(result);
+                summary.indexes_pending += pending;
+                if (pending != 0) {
                     self.notifyLocalIndexRepairDebt(table.name, group_id, .signal_runnable);
                 }
             }
@@ -19812,7 +20140,12 @@ pub const ProvisionedTableWriteSource = struct {
     pub fn source(self: *ProvisionedTableWriteSource) TableWriteSource {
         return .{
             .ptr = self,
+            .supports_sql_range_guards = if (self.raft_batcher) |batcher|
+                batcher.vtable.batch_group_routed_with_cancellation != null
+            else
+                self.standalone_sql_range_guards and (self.groupLocalWriteSource() != null or self.write_cache != null),
             .vtable = &.{
+                .activate_range_tracking = activateRangeTracking,
                 .create_table = createTable,
                 .update_schema = updateSchema,
                 .create_index = createIndex,
@@ -19840,6 +20173,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .finish_bulk_ingest = finishBulkIngest,
                 .abort_bulk_ingest = abortBulkIngest,
                 .batch_group_local = batchGroupLocal,
+                .replicated_batch_group_local = replicatedPolicyControlGroupLocal,
                 .txn_begin_group_local = txnBeginGroupLocal,
                 .txn_begin_group_local_with_pre_decision_context = txnBeginGroupLocalWithPreDecisionContext,
                 .txn_prepare_group_local = txnPrepareGroupLocal,
@@ -21206,6 +21540,39 @@ pub const ProvisionedTableWriteSource = struct {
         return try self.batchWithVisibilityCancellation(alloc, table_name, req, .none);
     }
 
+    fn activateRangeTracking(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, context: @import("operation.zig").RequestContext) !void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try context.ensureActive();
+        const batcher = self.raft_batcher;
+        if (batcher) |owner| {
+            if (owner.vtable.batch_group_routed_with_cancellation == null) return error.SqlRangeTrackingRequired;
+        } else if (!self.standalone_sql_range_guards or (self.groupLocalWriteSource() == null and self.write_cache == null)) return error.SqlRangeTrackingRequired;
+        try enforceHAWriteGateOptional(self.ha_write_gate);
+        var routing = (try table_catalog.tableRoutingSnapshotForWrite(alloc, self.catalog, table, self.catalog.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io }))) orelse return error.TableNotFound;
+        defer routing.deinit(alloc);
+        if (!routing.coversKeyspace() or routing.ranges.len > 256) return error.CatalogGenerationChanged;
+        for (routing.ranges) |range| {
+            try context.ensureActive();
+            const route = routing.resolveRouteForKey(range.start_key) orelse return error.CatalogGenerationChanged;
+            var fence = routing.fenceForRoute(route);
+            fence.admission_deadline_ns = context.deadline_ns;
+            fence.admission_deadline_io = context.deadline_io;
+            fence.admission_cancellation = context.cancellation;
+            if (batcher) |owner| {
+                try owner.batchGroupRoutedWithCancellation(alloc, fence, table, .{ .activate_range_tracking = true }, context.cancellation);
+            } else {
+                // Standalone owns every local range directly. Hold the same
+                // table admission used by restore and split while validating
+                // this exact catalog route and committing the durable marker.
+                // The owner DB serializes activation against guarded prepares.
+                const deadline = self.catalog.routeFenceDeadline(fence) orelse std.math.maxInt(u64);
+                var admission = try self.acquireRoutedWriteAdmission(alloc, table, fence, deadline, context.cancellation);
+                defer admission.deinit();
+                _ = (try self.source().batchGroupLocal(alloc, route.group_id, table, .{ .activate_range_tracking = true })) orelse return error.StorageKernelOwnerUnavailable;
+            }
+        }
+    }
+
     fn batchWithVisibilityCancellation(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
@@ -21213,8 +21580,11 @@ pub const ProvisionedTableWriteSource = struct {
         req: db_mod.types.BatchRequest,
         cancellation: db_mod.types.CancellationToken,
     ) !?void {
+        // Capability activation is an explicit owner-routed command, never an
+        // empty ordinary batch whose grouping could silently discard it.
+        if (req.activate_range_tracking) return error.SqlRangeTrackingRequired;
         try @import("../storage/db/online_source_contract.zig").validateRequest(req);
-        const control_group: ?u64 = if (req.online_source) |command| command.scope().fence.owner_group_id else if (req.relational_topology) |command| command.fence.owner_group_id else null;
+        const control_group: ?u64 = if (req.online_source) |command| command.scope().fence.owner_group_id else if (req.relational_topology) |command| command.fence.owner_group_id else if (req.relational_generation_gc) |page| page.owner_group_id else null;
         if (control_group) |group_id| {
             try enforceHAWriteGateOptional(self.ha_write_gate);
             if (self.raft_batcher) |batcher| {
@@ -21947,7 +22317,8 @@ pub const ProvisionedTableWriteSource = struct {
         if (tables.len != 1) return null;
 
         const table_req = tables[0];
-        if (table_req.integrity.len != 0 or table_req.integrity_commands.len != 0 or table_req.relational_activation != null or table_req.relational_retirement != null or table_req.relational_index_maintenance != null or table_req.relational_schema_version != null) return null;
+        if (table_req.range_guards.len != 0) return null;
+        if (table_req.integrity.len != 0 or table_req.integrity_commands.len != 0 or table_req.relational_activation != null or table_req.relational_retirement != null or table_req.relational_index_maintenance != null or table_req.relational_schema_version != null or table_req.schema_version != null) return null;
         const has_mutations = table_req.writes.len != 0 or
             table_req.deletes.len != 0 or
             table_req.transforms.len != 0;
@@ -22030,7 +22401,8 @@ pub const ProvisionedTableWriteSource = struct {
         if (tables.len == 0) return .{ .committed = .{ .participant_count = 0 } };
         if (tables.len != 1) return null;
         const table_req = tables[0];
-        if (table_req.predicates.len != 0 or table_req.integrity.len != 0 or table_req.integrity_commands.len != 0 or table_req.relational_activation != null or table_req.relational_retirement != null or table_req.relational_index_maintenance != null or table_req.relational_schema_version != null) return null;
+        if (table_req.range_guards.len != 0) return null;
+        if (table_req.predicates.len != 0 or table_req.integrity.len != 0 or table_req.integrity_commands.len != 0 or table_req.relational_activation != null or table_req.relational_retirement != null or table_req.relational_index_maintenance != null or table_req.relational_schema_version != null or table_req.schema_version != null) return null;
         if (try tableCommitHasGraphProjectionTransform(table_req)) return null;
 
         var routing = (try table_catalog.tableRoutingSnapshotForWrite(
@@ -22102,6 +22474,68 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.groupLocalWriteSource()) |owner| return try owner.batchGroupLocal(alloc, group_id, table_name, req);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         return try self.applyReplicatedBatchGroupLocal(alloc, group_id, table_name, req);
+    }
+
+    /// The monolithic standalone owner has no data-Raft or compiled kernel
+    /// source. Its private policy coordinator still needs the exact immutable
+    /// metadata bundle committed with an owner-local entry identity. Do not
+    /// turn this into a general client-controlled replicated batch adapter.
+    fn replicatedPolicyControlGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.BatchRequest,
+        metadata_prepared: bool,
+        entry: ?db_mod.types.RaftAppliedEntryIdentity,
+    ) !?void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime control_only_storage_sources) {
+            const owner = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+            return try owner.replicatedBatchGroupLocal(alloc, group_id, table_name, req, metadata_prepared, entry);
+        } else {
+            if (metadata_prepared or self.raft_batcher != null or
+                (self.ha_write_gate != null and self.ha_async_mirror == null) or
+                req.row_policy_publication == null or req.row_policy_install_bundle.len == 0 or
+                req.row_policy_principal_proof.len != 0 or req.row_policy_database.len != 0 or
+                req.row_policy_admitted_at_seconds != 0 or req.range_guards.len != 0 or
+                req.activate_range_tracking or req.schema_version != null or req.online_source != null or
+                req.restore_staging != null or req.restore_staging_scope != null or
+                req.restore_staging_plan_id != null or req.relational_topology != null or
+                req.relational_generation_gc != null or req.relational_schema_version != null or
+                req.relational_integrity_generation_set != null or req.relational_repair or
+                req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
+                req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.predicates.len != 0 or
+                req.integrity.len != 0 or req.integrity_commands.len != 0 or
+                req.relational_activation != null or req.relational_retirement != null or
+                req.relational_index_maintenance != null or req.timestamp_ns != 0 or
+                req.sync_level != .write or req.reject_graph_transform_projections or
+                req.split_checkpoint != null or req.split_replication != null or
+                req.split_transition != null or req.merge_source_transition != null or
+                req.merge_checkpoint != null or req.merge_replication != null or
+                req.merge_page != null or req.merge_artifacts.len != 0 or req.transaction != null)
+                return error.RowPolicyUnsupported;
+            // A local policy phase is HA-safe only when the opened owner can
+            // durably mirror its receipt into the same fenced primary log as
+            // the metadata decision. The DB checks the pinned gate again at
+            // commit, after this preflight and any cache/open work.
+            if (self.ha_async_mirror) |mirror| {
+                if (self.ha_write_gate == null) return error.RowPolicyUnsupported;
+                if (mirror.primary.identity.table_id != 0 or mirror.primary.identity.shard_id != 0)
+                    return error.RowPolicyUnsupported;
+            }
+            try enforceHAWriteGateOptional(self.ha_write_gate);
+            const applied = entry orelse return error.InvalidBatchRequest;
+            const cache = self.write_cache orelse return error.RowPolicyUnsupported;
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+            defer alloc.free(path);
+            self.beginGroupOperation(table_name, group_id);
+            defer self.endGroupOperation(table_name, group_id);
+            var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default_async, null, null);
+            defer cached.deinit(alloc);
+            _ = try cached.db.applyReplicatedRowPolicyPublication(req.row_policy_install_bundle, req.row_policy_publication.?, applied);
+            return {};
+        }
     }
 
     pub fn applyReplicatedBatchGroupLocal(
@@ -22953,6 +23387,14 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try ensurePreDecisionContextActive(context);
+        if (req.range_guards.len != 0 and context.route_fence == null) return error.CatalogRouteFenceRequired;
+        var guarded_admission: ?RoutedWriteAdmission = null;
+        defer if (guarded_admission) |*admission| admission.deinit();
+        if (context.route_fence) |fence| {
+            if (req.restore_staging_scope != null or fence.route.group_id != group_id or fence.topology_epoch != topology_epoch) return error.TopologyChanged;
+            const deadline = self.catalog.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io }) orelse self.catalog.budget(null).nowNs() +| std.time.ns_per_s * 5;
+            guarded_admission = try self.acquireRoutedWriteAdmission(alloc, table_name, fence, deadline, context.cancellation);
+        }
         try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
@@ -22960,6 +23402,9 @@ pub const ProvisionedTableWriteSource = struct {
         if (req.restore_staging_scope != null) {
             if (req.relational_index_maintenance != null) return error.InvalidBatchRequest;
             try self.applyRestoreStagingBatch(alloc, table_name, group_id, .{
+                .row_policy_principal_proof = req.row_policy_principal_proof,
+                .row_policy_database = req.row_policy_database,
+                .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
                 .writes = transactionWritesAsBatchWrites(req.writes),
                 .deletes = req.deletes,
                 .transforms = req.transforms,
@@ -22967,9 +23412,11 @@ pub const ProvisionedTableWriteSource = struct {
                 .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
                 .integrity = req.integrity,
                 .integrity_commands = req.integrity_commands,
+                .range_guards = req.range_guards,
                 .relational_activation = req.relational_activation,
                 .relational_retirement = req.relational_retirement,
                 .relational_index_maintenance = req.relational_index_maintenance,
+                .schema_version = req.schema_version,
                 .relational_schema_version = req.relational_schema_version,
                 .relational_integrity_generation_set = req.relational_integrity_generation_set,
                 .restore_staging_scope = req.restore_staging_scope,
@@ -22982,6 +23429,9 @@ pub const ProvisionedTableWriteSource = struct {
         try ensurePreDecisionContextActive(context);
         if (self.raft_batcher) |batcher| {
             try batcher.batchGroupLocalWithPreDecisionContext(alloc, group_id, table_name, .{
+                .row_policy_principal_proof = req.row_policy_principal_proof,
+                .row_policy_database = req.row_policy_database,
+                .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
                 .writes = transactionWritesAsBatchWrites(req.writes),
                 .deletes = req.deletes,
                 .transforms = req.transforms,
@@ -22989,8 +23439,10 @@ pub const ProvisionedTableWriteSource = struct {
                 .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
                 .integrity = req.integrity,
                 .integrity_commands = req.integrity_commands,
+                .range_guards = req.range_guards,
                 .relational_activation = req.relational_activation,
                 .relational_retirement = req.relational_retirement,
+                .schema_version = req.schema_version,
                 .relational_schema_version = req.relational_schema_version,
                 .relational_index_maintenance = req.relational_index_maintenance,
                 .relational_integrity_generation_set = req.relational_integrity_generation_set,
@@ -25561,8 +26013,9 @@ pub const HostedProvisionedTableWriteSource = struct {
         req: db_mod.types.BatchRequest,
     ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (req.activate_range_tracking) return error.SqlRangeTrackingRequired;
         try @import("../storage/db/online_source_contract.zig").validateRequest(req);
-        const control_group: ?u64 = if (req.online_source) |command| command.scope().fence.owner_group_id else if (req.relational_topology) |command| command.fence.owner_group_id else null;
+        const control_group: ?u64 = if (req.online_source) |command| command.scope().fence.owner_group_id else if (req.relational_topology) |command| command.fence.owner_group_id else if (req.relational_generation_gc) |page| page.owner_group_id else null;
         if (control_group) |group_id| {
             var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.GroupLeaderUnavailable;
             defer route.deinit(alloc);
@@ -26181,6 +26634,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try ensurePreDecisionContextActive(context);
         if (comptime control_only_storage_sources) {
+            if (context.route_fence != null or req.range_guards.len != 0) return error.CatalogRouteFenceUnsupported;
             if (topology_epoch != 0)
                 try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
             const local_source = self.groupLocalWriteSource() orelse
@@ -26196,6 +26650,11 @@ pub const HostedProvisionedTableWriteSource = struct {
         // Keep the catalog fence and transaction mutation inside one root
         // writer lease. Split/merge cannot snapshot this root between the
         // epoch check and making the transaction durable.
+        if (req.range_guards.len != 0 and context.route_fence == null) return error.CatalogRouteFenceRequired;
+        if (context.route_fence) |fence| {
+            if (fence.route.group_id != group_id or fence.topology_epoch != topology_epoch) return error.TopologyChanged;
+            try table_catalog.validateCatalogRouteFenceUntil(alloc, self.catalog, table_name, fence, self.catalog.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io }));
+        }
         if (topology_epoch != 0)
             try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
         if (!try batchUsesDurableTransactionContract(alloc, cached.db, req))
@@ -26273,6 +26732,9 @@ pub const HostedProvisionedTableWriteSource = struct {
         context: distributed_txn.PreDecisionContext,
     ) !?void {
         return try batchGroupLocalFencedWithPreDecisionContext(ptr, alloc, group_id, table_name, .{
+            .row_policy_principal_proof = req.row_policy_principal_proof,
+            .row_policy_database = req.row_policy_database,
+            .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
             .writes = transactionWritesAsBatchWrites(req.writes),
             .deletes = req.deletes,
             .transforms = req.transforms,
@@ -26280,9 +26742,11 @@ pub const HostedProvisionedTableWriteSource = struct {
             .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
             .integrity = req.integrity,
             .integrity_commands = req.integrity_commands,
+            .range_guards = req.range_guards,
             .relational_activation = req.relational_activation,
             .relational_retirement = req.relational_retirement,
             .relational_index_maintenance = req.relational_index_maintenance,
+            .schema_version = req.schema_version,
             .relational_schema_version = req.relational_schema_version,
             .relational_integrity_generation_set = req.relational_integrity_generation_set,
             .restore_staging_scope = req.restore_staging_scope,
@@ -27352,6 +27816,7 @@ fn sleepStatelessBatchRetry(source: anytype, attempt: u8) !void {
 
 fn statelessBatchMayRetry(tables: []const distributed_txn.TableCommitRequest) bool {
     for (tables) |table| {
+        if (table.range_guards.len != 0) return false;
         if (table.predicates.len != 0 or table.integrity.len != 0 or table.integrity_commands.len != 0 or table.relational_activation != null or table.relational_retirement != null or table.relational_index_maintenance != null) return false;
     }
     return true;
@@ -31344,6 +31809,36 @@ const importPortableBackupFileWithOptions = @import("local_table_writes.zig").im
 
 const freeBackupShards = local_write_contract.freeBackupShards;
 
+pub fn cloneAcceptedGenerationSummary(
+    alloc: std.mem.Allocator,
+    entries: []const @import("backup_contract.zig").SourceGenerationAdmissionSummaryEntry,
+) ![]const @import("backup_contract.zig").SourceGenerationAdmissionSummaryEntry {
+    if (entries.len == 0) return &.{};
+    const out = try alloc.alloc(@import("backup_contract.zig").SourceGenerationAdmissionSummaryEntry, entries.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |entry| {
+            alloc.free(entry.child_table_name);
+            alloc.free(entry.constraint_name);
+        }
+        alloc.free(out);
+    }
+    for (entries, out) |source, *target| {
+        const child_name = try alloc.dupe(u8, source.child_table_name);
+        errdefer alloc.free(child_name);
+        const constraint_name = try alloc.dupe(u8, source.constraint_name);
+        target.* = .{
+            .child_table_id = source.child_table_id,
+            .child_table_name = child_name,
+            .constraint_name = constraint_name,
+            .active_generation = source.active_generation,
+            .source_scope_digest = source.source_scope_digest,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
 fn cloneShardSnapshots(
     alloc: std.mem.Allocator,
     shards: []const backups_api.ShardSnapshot,
@@ -31374,8 +31869,10 @@ fn cloneShardSnapshots(
                 try alloc.dupe(u8, shard.native_manifest_sha256)
             else
                 "",
+            .accepted_generation_summary_digest = shard.accepted_generation_summary_digest,
         };
         initialized += 1;
+        out[i].accepted_generation_summary = try cloneAcceptedGenerationSummary(alloc, shard.accepted_generation_summary);
     }
     return out;
 }
@@ -38549,6 +39046,14 @@ fn consumerTests() type {
                 source: ?*ProvisionedTableWriteSource = null,
                 drained: bool = false,
 
+                fn readInitialChild(_: *anyopaque, _: std.mem.Allocator, group_id: u64) !InitialChildRetirementObservation {
+                    try std.testing.expectEqual(@as(u64, 7001), group_id);
+                    // This fixture models an ordinary replica with no private
+                    // initial-child marker; a control-only source cannot open
+                    // the on-disk DB to infer that fact itself.
+                    return .{};
+                }
+
                 fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
                     return error.UnexpectedBatch;
                 }
@@ -38581,6 +39086,7 @@ fn consumerTests() type {
             ownership.source = &source;
             _ = source.withLocalWriteSource(.{ .ptr = &ownership, .vtable = &.{ .batch = Ownership.batch, .retire_table_group_local = Ownership.retire } });
             _ = source.withReplicaRetirementOwnership(.{ .ptr = &ownership, .classify = Ownership.classify });
+            _ = source.withInitialChildRetirementReader(.{ .ptr = &ownership, .read = Ownership.readInitialChild });
             var prepared = try source.prepareReplicaRetirements(alloc, &.{.{ .group_id = 7001, .table_name = "docs" }});
             defer prepared.deinit();
             try std.testing.expect(prepared.batch_created);
@@ -38689,6 +39195,27 @@ fn consumerTests() type {
             try std.testing.expect(!try source.recoverReplicaRetirementIntents(alloc));
             try std.testing.expect(std.mem.allEqual(bool, &ownership.drained, true));
             try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), prepared.batch_path.?, .{}));
+
+            // A V2 proof failure occurs after the table name has been
+            // allocated. The decoder must release it on this error path.
+            const proof: InitialFkRetirementProof = .{
+                .child_table_id = 91,
+                .plan_id = @splat(7),
+                .plan_digest = @splat(9),
+            };
+            var proved = try source.prepareReplicaRetirements(alloc, &.{.{
+                .group_id = 7004,
+                .table_name = "docs",
+                .initial_fk_proof = proof,
+            }});
+            defer proved.deinit();
+            const bytes = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), proved.batch_path.?, alloc, .limited(max_replica_retirement_batch_bytes + 1));
+            defer alloc.free(bytes);
+            const flag_offset = replica_retirement_batch_magic_v2.len + 1 + 4 + 8 + 4 + "docs".len;
+            bytes[flag_offset] = 2;
+            std.crypto.hash.sha2.Sha256.hash(bytes[0 .. bytes.len - std.crypto.hash.sha2.Sha256.digest_length], bytes[bytes.len - std.crypto.hash.sha2.Sha256.digest_length ..][0..std.crypto.hash.sha2.Sha256.digest_length], .{});
+            try std.Io.Dir.cwd().writeFile(io_impl.io(), .{ .sub_path = proved.batch_path.?, .data = bytes });
+            try std.testing.expectError(error.InvalidReplicaRetirementIntent, loadReplicaRetirementBatch(alloc, io_impl.io(), proved.batch_path.?));
         }
 
         test "replica retirement batch size is rejected before target cloning" {
@@ -39512,6 +40039,74 @@ pub const implementation_tests = implementationTests();
 fn implementationTests() type {
     if (!(@import("builtin").is_test and !control_only_storage_sources)) return struct {};
     const Suite = struct {
+        test "private initial child retirement requires canceled local publication" {
+            try testPrivateInitialChildRetirementProof();
+        }
+
+        test "range tracking activation uses a fenced owner-routed Raft command" {
+            const Capture = struct {
+                calls: usize = 0,
+                group_id: u64 = 0,
+                local_calls: usize = 0,
+
+                fn unexpected(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.BatchRequest) !void {
+                    return error.TestUnexpectedResult;
+                }
+
+                fn routed(ptr: *anyopaque, _: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, req: db_mod.types.BatchRequest, _: db_mod.types.CancellationToken) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqualStrings("docs", table);
+                    try std.testing.expect(req.activate_range_tracking);
+                    try @import("../storage/range_protection.zig").validateRequest(req);
+                    self.calls += 1;
+                    self.group_id = fence.route.group_id;
+                }
+
+                fn local(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, table: []const u8, req: db_mod.types.BatchRequest) !?void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqualStrings("docs", table);
+                    try std.testing.expect(req.activate_range_tracking);
+                    try @import("../storage/range_protection.zig").validateRequest(req);
+                    self.local_calls += 1;
+                    self.group_id = group_id;
+                    return {};
+                }
+            };
+
+            var capture: Capture = .{};
+            var source = ProvisionedTableWriteSource.init("unused", ProvisionedWriteCoalesceTestCatalog.iface());
+            defer source.deinit();
+            try std.testing.expect(!source.source().supports_sql_range_guards);
+            try std.testing.expectError(error.SqlRangeTrackingRequired, source.source().activateRangeTracking(std.testing.allocator, "docs", .{}));
+            _ = source.withRaftBatcher(.{ .ptr = &capture, .vtable = &.{
+                .batch_group = Capture.unexpected,
+                .batch_group_local = Capture.unexpected,
+            } });
+            try std.testing.expect(!source.source().supports_sql_range_guards);
+            try std.testing.expectError(error.SqlRangeTrackingRequired, source.source().activateRangeTracking(std.testing.allocator, "docs", .{}));
+            _ = source.withRaftBatcher(.{ .ptr = &capture, .vtable = &.{
+                .batch_group = Capture.unexpected,
+                .batch_group_routed_with_cancellation = Capture.routed,
+                .batch_group_local = Capture.unexpected,
+            } });
+            try std.testing.expect(source.source().supports_sql_range_guards);
+            try source.source().activateRangeTracking(std.testing.allocator, "docs", .{});
+            try std.testing.expectEqual(@as(usize, 1), capture.calls);
+            try std.testing.expectEqual(@as(u64, 7001), capture.group_id);
+
+            // Lite has no data-Raft proposal. Its direct owner can still make
+            // the same durable activation under the catalog/table cutover
+            // admission, and only that source advertises guarded SQL.
+            _ = source.withRaftBatcher(null);
+            _ = source.withLocalWriteSource(.{ .ptr = &capture, .vtable = &.{ .batch = undefined, .batch_group_local = Capture.local } });
+            try std.testing.expect(!source.source().supports_sql_range_guards);
+            _ = source.withStandaloneSqlRangeGuards(true);
+            try std.testing.expect(source.source().supports_sql_range_guards);
+            try source.source().activateRangeTracking(std.testing.allocator, "docs", .{});
+            try std.testing.expectEqual(@as(usize, 1), capture.local_calls);
+            try std.testing.expectEqual(@as(u64, 7001), capture.group_id);
+        }
+
         test "restore staging private provisioning primes hidden owner without public catalog admission" {
             const alloc = std.testing.allocator;
             var tmp = std.testing.tmpDir(.{});

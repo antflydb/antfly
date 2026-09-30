@@ -35,6 +35,10 @@ pub const storage_backend_erased = @import("storage/backend_erased.zig");
 pub const lsm_backend = @import("storage/lsm_backend.zig");
 
 test {
+    _ = @import("api/sql_connection_record.zig");
+    _ = @import("api/sql_connections.zig");
+    _ = @import("api/kernel_owner_source.zig");
+    _ = @import("api/sql_pgwire.zig");
     _ = @import("api/table_catalog.zig");
     _ = @import("api/table_reads.zig");
     _ = @import("api/tables.zig");
@@ -43,6 +47,7 @@ test {
     _ = @import("api/distributed_entity_sink.zig");
     _ = @import("api/http_client.zig");
     _ = @import("api/distributed_join.zig");
+    _ = @import("api/relational_integrity_commit.zig");
     _ = @import("api/distributed_graph.zig");
     _ = @import("antfly_inference_query_embedding_cache");
     _ = @import("api/agent_tools.zig");

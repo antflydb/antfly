@@ -207,6 +207,16 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
                       </a>
                     </SidebarMenuButton>
                   </SidebarMenuItem>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      isActive={isPath("/sql")}
+                      tooltip="SQL workbench"
+                      onClick={() => navigate("/sql")}
+                    >
+                      <TableIcon className="size-4" />
+                      <span>SQL workbench</span>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
                 </SidebarMenu>
 
                 <div className="px-2 pt-2 pb-1 group-data-[collapsible=icon]:hidden">

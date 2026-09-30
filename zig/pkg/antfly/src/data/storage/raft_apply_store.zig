@@ -1254,6 +1254,57 @@ pub const RaftApplyStore = struct {
         return try shard_state_store.currentMergeSourceState(&group_store.store, alloc, group_id);
     }
 
+    /// Read lifecycle fences and their watermark atomically with respect to
+    /// raw apply and snapshot installation. No native DB open is needed on the
+    /// Raft owner thread. Generation preparation fails closed instead of waiting.
+    pub fn observeMergeMembership(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+    ) !@import("../merge_membership_admission.zig").Observation {
+        const admission = @import("../merge_membership_admission.zig");
+        const arbitration = @import("online_topology_arbitration.zig");
+        const io = self.runtimeIo();
+        const shard = self.batchShard(group_id);
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
+        try self.requireTransitionReadyLocked(shard, group_id);
+        const group_store = (try self.readableGroupStoreLocked(shard, group_id)) orelse return .{};
+        var result: admission.Observation = .{};
+        var key_buf: [160]u8 = undefined;
+        const watermark = group_store.store.get(alloc, try keyForGroup(&key_buf, group_id)) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        defer if (watermark) |raw| alloc.free(raw);
+        if (watermark) |raw| {
+            if (raw.len < 8) return error.InvalidDataApplyBatch;
+            result.applied_index = std.mem.readInt(u64, raw[0..8], .little);
+        }
+        const reservation = group_store.store.get(alloc, try arbitration.reservationKey(&key_buf, group_id)) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        defer if (reservation) |raw| alloc.free(raw);
+        if (reservation) |raw| {
+            const value = try arbitration.Reservation.decode(raw);
+            if (!value.released and value.scope.fence.role == .merge_source) result.source_scope = value.scope;
+        }
+        if (try shard_state_store.currentMergeReceiverState(&group_store.store, alloc, group_id)) |value| {
+            var receiver = value;
+            defer receiver.deinit(alloc);
+            if (receiver.phase != .finalized and receiver.phase != .rolled_back and receiver.phase != .none) {
+                result.receiver = .{
+                    .transition_id = receiver.transition_id,
+                    .donor_group_id = receiver.donor_group_id,
+                    .receiver_group_id = receiver.receiver_group_id,
+                    .copy_attempt = receiver.copy_attempt,
+                };
+            }
+        }
+        return result;
+    }
+
     pub fn currentMergeReceiverState(
         self: *RaftApplyStore,
         alloc: std.mem.Allocator,
@@ -2588,6 +2639,9 @@ test "data raft online topology arbitration persists exact rejection and scopes 
         .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
     };
     try Apply.request(&store, 2, .{ .online_source = .{ .admit = .{ .scope = scope } } });
+    const admitted_membership = try store.observeMergeMembership(alloc, group);
+    try std.testing.expectEqual(@as(u64, 2), admitted_membership.applied_index);
+    try std.testing.expectEqualDeep(scope, admitted_membership.source_scope.?);
     const ordinary: db_types.BatchRequest = .{ .merge_source_transition = .{ .kind = .prepare, .transition_id = 99, .receiver_group_id = 602 } };
     try Apply.request(&store, 3, ordinary);
     try std.testing.expectEqual(@as(?@import("../../storage/data_raft_projection_wire.zig").TopologyRejection, .busy), try store.topologyRejection(alloc, group, 3));
@@ -2597,6 +2651,9 @@ test "data raft online topology arbitration persists exact rejection and scopes 
     try std.testing.expect((try store.currentSplitState(alloc, group)) == null);
     store.deinit();
     store = try RaftApplyStore.init(alloc, .{ .root_dir = root, .native_source_delegate = true });
+    const reopened_membership = try store.observeMergeMembership(alloc, group);
+    try std.testing.expectEqual(@as(u64, 4), reopened_membership.applied_index);
+    try std.testing.expectEqualDeep(scope, reopened_membership.source_scope.?);
     try std.testing.expectEqual(@as(?@import("../../storage/data_raft_projection_wire.zig").TopologyRejection, .busy), try store.topologyRejection(alloc, group, 3));
     // Exact replay preserves its rejection even if a later command releases.
     try Apply.request(&store, 4, .{ .split_transition = .{ .kind = .prepare, .transition_id = 92, .attempt_epoch = 1, .destination_group_id = 602, .split_key = "doc:m" } });
@@ -2604,8 +2661,12 @@ test "data raft online topology arbitration persists exact rejection and scopes 
     var wrong = scope;
     wrong.copy_attempt.sequence += 1;
     try Apply.request(&store, 6, .{ .online_source = .{ .release = wrong } });
+    try std.testing.expectEqualDeep(scope, (try store.observeMergeMembership(alloc, group)).source_scope.?);
     try std.testing.expectEqual(@as(?@import("../../storage/data_raft_projection_wire.zig").TopologyRejection, .scope_changed), try store.topologyRejection(alloc, group, 6));
     try Apply.request(&store, 7, .{ .relational_topology = .{ .fence = scope.fence, .action = .abort_transition } });
+    const released_membership = try store.observeMergeMembership(alloc, group);
+    try std.testing.expectEqual(@as(u64, 7), released_membership.applied_index);
+    try std.testing.expect(released_membership.source_scope == null);
     try Apply.request(&store, 8, ordinary);
     try std.testing.expect((try store.topologyRejection(alloc, group, 8)) == null);
     try std.testing.expectEqual(@as(u64, 99), (try store.currentMergeSourceState(alloc, group)).?.transition_id);
@@ -2678,6 +2739,9 @@ test "data raft online topology arbitration persists exact rejection and scopes 
     var accepted = (try store.currentMergeReceiverState(alloc, group)).?;
     defer accepted.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 120), accepted.transition_id);
+    const receiver_membership = try store.observeMergeMembership(alloc, group);
+    try std.testing.expectEqual(@as(u64, 18), receiver_membership.applied_index);
+    try std.testing.expectEqual(@as(u64, 120), receiver_membership.receiver.?.transition_id);
 }
 
 test "data raft apply store persists batches across reopen" {

@@ -78,6 +78,11 @@ fi
 zig version
 
 build_steps=(antfly)
+case "${ANTFLY_CI_BUILD_FK_RECOVERY:-false}" in
+  true) build_steps+=(antfly-hosted-fk-recovery-binaries) ;;
+  false) ;;
+  *) echo "ANTFLY_CI_BUILD_FK_RECOVERY must be true or false" >&2; exit 2 ;;
+esac
 if [[ "$build_capi" == "true" ]]; then
   build_steps+=(capi capi-smoke)
 fi

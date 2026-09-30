@@ -22,6 +22,71 @@ const wal_client = @import("kernel_wal_client.zig");
 const data_apply_client = @import("data_raft_apply_client.zig");
 const metadata_apply_client = @import("metadata_raft_apply_client.zig");
 
+test "opaque owner retained relational read crosses checked archive boundary" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(path);
+    var context: client.Context = .{};
+    try context.ensure();
+    defer context.deinit();
+    var owner = try client.Owner.open(.{
+        .context = context.handle,
+        .path = .fromSlice(path),
+        .table_name = .fromSlice("rows"),
+        .group_id = 72,
+        .has_identity_namespace = 1,
+        .identity_table_id = 7,
+        .identity_shard_id = 172,
+        .identity_range_id = 272,
+        .schema_json = .fromSlice(
+            \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+        ),
+    });
+    defer owner.deinit();
+    var inserted = try owner.batchJson("rows",
+        \\{"inserts":{"a":{"id":9007199254740993},"b":{"id":42}},"sync_level":"write"}
+    );
+    inserted.deinit();
+    const provider = try @import("relational_read_provider.zig").acquire(owner.handle);
+    const view = try provider.open(alloc, "rows", "", "", .{ .relational_query = .{ .schema_version = 1, .fields = &.{"id"} }, .limit = 1 });
+    defer view.deinit();
+    const normalized = try view.normalize(alloc, &.{.{ .key = "c", .value = "{\"id\":9007199254740993}" }});
+    defer {
+        for (normalized) |row| {
+            alloc.free(row.key);
+            alloc.free(row.value);
+            for (row.json_null_fields) |field| alloc.free(field);
+            if (row.json_null_fields.len != 0) alloc.free(row.json_null_fields);
+        }
+        alloc.free(normalized);
+    }
+    try std.testing.expectEqual(@as(usize, 1), normalized.len);
+    try std.testing.expectEqualStrings("c", normalized[0].key);
+    try std.testing.expect(std.mem.indexOf(u8, normalized[0].value, "9007199254740993") != null);
+    var first = try view.next(alloc, 1);
+    defer first.deinit();
+    try std.testing.expectEqual(@as(usize, 1), first.rows.len);
+    try std.testing.expectEqualStrings("a", first.rows[0].id);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), first.rows[0].value.object.get("id").?.integer);
+    try std.testing.expect(first.after != null);
+    var updated = try owner.batchJson("rows",
+        \\{"inserts":{"b":{"id":99}},"sync_level":"write"}
+    );
+    updated.deinit();
+    var second = try view.next(alloc, 1);
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 1), second.rows.len);
+    try std.testing.expectEqualStrings("b", second.rows[0].id);
+    try std.testing.expectEqual(@as(i64, 42), second.rows[0].value.object.get("id").?.integer);
+    var end = try view.next(alloc, 1);
+    defer end.deinit();
+    try std.testing.expectEqual(@as(usize, 0), end.rows.len);
+    try std.testing.expect(end.after == null);
+    try std.testing.expectError(error.PreparedGenerationChanged, provider.open(alloc, "rows", "", "", .{ .relational_query = .{ .schema_version = 2, .fields = &.{} }, .limit = 1 }));
+}
+
 test "opaque owner retains newer durable schema when reopening a stale descriptor" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -47,11 +112,13 @@ test "opaque owner retains newer durable schema when reopening a stale descripto
         var owner = try client.Owner.open(options);
         owner.deinit();
     }
-    // Raft catch-up can reopen a pinned descriptor from an older entry after
-    // reconciliation has advanced the durable schema. That open must succeed
-    // without downgrading the installed schema or losing the existing row.
+    // A stale ordinary descriptor must reload the authoritative catalog, not
+    // silently open a different layout. Only explicit historical Raft apply
+    // may reopen the pinned old descriptor while retaining the durable schema.
     var stale = options;
     stale.schema_json = .fromSlice("{\"version\":1}");
+    try std.testing.expectError(error.StorageBusy, client.Owner.open(stale));
+    stale.historical_raft_apply = 1;
     {
         var owner = try client.Owner.open(stale);
         owner.deinit();
@@ -63,9 +130,12 @@ test "opaque owner retains newer durable schema when reopening a stale descripto
         defer row.deinit();
         try std.testing.expect(std.mem.indexOf(u8, row.bytes(), "\"n\":1") != null);
     }
-    // A fresh owner has not made the pinned descriptor invalid either.
+    // Reopening through the current descriptor does not invalidate historical
+    // replay authority, nor grant that authority to ordinary opens.
     var owner = try client.Owner.open(stale);
     owner.deinit();
+    stale.historical_raft_apply = 0;
+    try std.testing.expectError(error.StorageBusy, client.Owner.open(stale));
 }
 
 test "opaque owner standalone rewrite authority is durable and cannot be selected by a request" {
@@ -3231,6 +3301,79 @@ test "opaque metadata standby acknowledgement cannot retire an outbox across pro
     try source.flushHAOutbox();
     try std.testing.expectEqual(prior_lsn, primary.lastLsn());
     _ = try source.exportHACheckpoint(std.testing.io, root ++ "/checkpoint");
+}
+
+test "opaque metadata initial FK reservation preserves placement authority across snapshot" {
+    const alloc = std.testing.allocator;
+    const publication = @import("../metadata/fk_generation_publication.zig");
+    const catalog = @import("../system_catalog/domain.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const source_path = try std.fmt.allocPrint(alloc, "{s}/source", .{root});
+    defer alloc.free(source_path);
+    const restored_path = try std.fmt.allocPrint(alloc, "{s}/restored", .{root});
+    defer alloc.free(restored_path);
+    var store = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = source_path, .no_sync = true });
+    defer store.deinit();
+    const group = @import("../common/group_ids.zig").main_metadata_group_id;
+    try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = "11111111111111111111111111111111".* });
+    const schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"self_fk","child_columns":["parent_id"],"parent_table":"nodes","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent_id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const prepared_json = try store.fkInitialCreatePrepareJson(alloc, group, .{
+        .namespace_id = catalog.default_namespace_id,
+        .logical_name = "nodes",
+        .candidate = .{ .table_id = 0, .name = "", .schema_json = schema },
+    });
+    defer alloc.free(prepared_json);
+    var prepared = try std.json.parseFromSlice(publication.InitialCreatePrepare, alloc, prepared_json, .{});
+    defer prepared.deinit();
+    var child = prepared.value.child;
+    const replacement = try std.fmt.allocPrint(alloc, "\"parent_table\":\"{s}\"", .{child.name});
+    defer alloc.free(replacement);
+    const bound_schema = try std.mem.replaceOwned(u8, alloc, schema, "\"parent_table\":\"nodes\"", replacement);
+    defer alloc.free(bound_schema);
+    child.schema_json = bound_schema;
+    const derived = try publication.deriveInitialTransitions(alloc, child.table_id, child.name, child.schema_json);
+    defer publication.freeDerivedTransitions(alloc, derived);
+    const plan: publication.InitialCreatePlan = .{
+        .id = @splat(1),
+        .retirement_scope = .hosted_store,
+        .catalog_id = prepared.value.catalog_id,
+        .expected_catalog_revision = prepared.value.expected_catalog_revision,
+        .child = child,
+        .child_ranges = prepared.value.child_ranges,
+        .parents = &.{},
+        .self_transitions = &.{derived[0].transition},
+        .logical_name = "nodes",
+        .namespace_id = catalog.default_namespace_id,
+    };
+    const hidden_group = plan.child_ranges[0].group_id;
+    try std.testing.expect((try store.initialGroupReservation(group, hidden_group)) == null);
+    const begin = try std.json.Stringify.valueAlloc(alloc, publication.InitialCommand{ .plan_id = plan.id, .child_table_id = child.table_id, .expected_revision = 0, .action = .begin, .plan = plan }, .{});
+    defer alloc.free(begin);
+    try store.applyStandaloneCommand(group, .{ .apply_fk_initial_create = begin });
+    const expected: publication.InitialGroupReservation = .{
+        .plan_id = plan.id,
+        .child_table_id = child.table_id,
+        .range_id = plan.child_ranges[0].range_id,
+        .plan_digest = try plan.digest(alloc),
+        .retirement_scope = .hosted_store,
+    };
+    const snapshot = try store.snapshotBuilder().buildSnapshot(alloc, group);
+    defer alloc.free(snapshot);
+    var restored = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = restored_path, .no_sync = true });
+    defer restored.deinit();
+    try std.testing.expect(try restored.snapshotBuilder().installSnapshot(alloc, group, 1, snapshot));
+    for ([_]*metadata_apply_client.RaftApplyStore{ &store, &restored }) |owner| {
+        const actual = (try owner.initialGroupReservation(group, hidden_group)) orelse return error.MissingInitialPlacementAuthority;
+        try std.testing.expectEqualDeep(expected, actual);
+        try std.testing.expect(publication.InitialPlacementProof.fromReservation(actual).activeMatches(expected));
+        try std.testing.expect((try owner.initialGroupReservation(group + 1, hidden_group)) == null);
+        try std.testing.expect((try owner.initialGroupReservation(group, hidden_group + 1)) == null);
+    }
 }
 
 test "opaque metadata staging authority and binary receipts survive compiled projection and snapshot" {

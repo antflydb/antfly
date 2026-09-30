@@ -129,7 +129,7 @@ pub fn namespaceBytes(value: identity.Namespace) [24]u8 {
 }
 
 pub const Command = union(enum) {
-    admit: struct { scope: Scope, limit: u64 = 256 * 1024 * 1024 },
+    admit: struct { scope: Scope, limit: u64 = 256 * 1024 * 1024, artifact_catalog: ?@import("artifact_inventory.zig").Binding = null },
     acknowledge: struct { scope: Scope, previous: u64, next: u64 },
     release: Scope,
     final_fence: struct { scope: Scope, expected_sequence: u64 },
@@ -146,7 +146,10 @@ pub const Command = union(enum) {
     pub fn validate(self: Command) !void {
         try self.scope().validate();
         switch (self) {
-            .admit => |value| if (value.limit < 16 * 1024 * 1024) return error.InvalidOnlineSourceCommand,
+            .admit => |value| {
+                if (value.limit < 16 * 1024 * 1024) return error.InvalidOnlineSourceCommand;
+                if (value.artifact_catalog) |binding| if (!binding.valid()) return error.InvalidOnlineSourceCommand;
+            },
             .acknowledge => |value| if (value.next < value.previous) return error.InvalidOnlineSourceCommand,
             .reclaim => |value| if (value.frame_limit == 0 or value.frame_limit > 128 or value.byte_limit == 0 or value.byte_limit > 16 * 1024 * 1024) return error.InvalidOnlineSourceCommand,
             .publish_certificate => |value| {
@@ -165,10 +168,10 @@ pub fn validateRequest(req: anytype) !void {
     const command = req.online_source orelse return;
     try command.validate();
     if (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
-        req.relational_schema_version != null or req.relational_integrity_generation_set != null or req.timestamp_ns != 0 or
+        req.schema_version != null or req.relational_schema_version != null or req.relational_integrity_generation_set != null or req.timestamp_ns != 0 or
         req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.integrity.len != 0 or
         req.integrity_commands.len != 0 or req.predicates.len != 0 or req.transaction != null or
-        req.restore_staging != null or req.restore_staging_scope != null or req.restore_staging_plan_id != null or req.relational_topology != null or
+        req.restore_staging != null or req.restore_staging_scope != null or req.restore_staging_plan_id != null or req.relational_topology != null or req.relational_generation_gc != null or
         req.relational_activation != null or req.relational_retirement != null or req.relational_index_maintenance != null or
         req.relational_repair or req.split_checkpoint != null or req.split_replication != null or req.split_transition != null or
         req.merge_checkpoint != null or req.merge_replication != null or req.merge_source_transition != null or req.merge_page != null or

@@ -254,6 +254,12 @@ pub const ReplicationSourceActionHint = struct {
     reseed_exact_cutover_path: []u8,
 };
 
+/// Internal admission result. A successful response means the current
+/// metadata membership has durably activated the store-root UUID decoder.
+pub const StoreRootReadiness = struct {
+    activated_version: u16,
+};
+
 pub const AdminSnapshot = struct {
     /// Compact observational peer view. Never substitutes for a catalog view.
     peer_view: bool = false,
@@ -374,19 +380,11 @@ pub const CatalogRouteQuery = struct {
     group_id: u64 = 0,
 };
 
-pub const CatalogIdentityNamespace = struct {
-    table_id: u64,
-    shard_id: u64,
-    range_id: u64,
-};
+pub const CatalogIdentityNamespace = @import("catalog_route_contract.zig").CatalogIdentityNamespace;
 
-pub const CatalogGroupRoute = struct {
-    group_id: u64,
-    range_id: u64,
-    identity_namespace: CatalogIdentityNamespace,
-};
+pub const CatalogGroupRoute = @import("catalog_route_contract.zig").CatalogGroupRoute;
 
-pub const catalog_route_fence_protocol_current: u16 = 1;
+pub const catalog_route_fence_protocol_current = @import("catalog_route_contract.zig").catalog_route_fence_protocol_current;
 pub const catalog_route_fence_header = "X-Antfly-Catalog-Route-Fence";
 pub const catalog_route_fence_ack_header = "X-Antfly-Catalog-Route-Fence-Ack";
 pub const catalog_route_fence_ack_value = "1";
@@ -402,66 +400,7 @@ pub const catalog_route_max_deadline_ms: u32 = 30_000;
 /// group-local read. The receiver validates this against its compact routing
 /// projection before opening storage, so an independently cached admin
 /// snapshot can never select a different table generation.
-pub const CatalogRouteFence = struct {
-    protocol: u16 = catalog_route_fence_protocol_current,
-    metadata_group_id: u64,
-    metadata_incarnation: ?MetadataClusterIncarnation = null,
-    catalog_revision: u64,
-    table_id: u64,
-    topology_epoch: u64,
-    route: CatalogGroupRoute,
-    /// Receiver-local admission context. These fields are intentionally
-    /// excluded from the wire representation: monotonic clocks and borrowed
-    /// cancellation callbacks are process-local capabilities.
-    admission_deadline_ns: ?u64 = null,
-    admission_deadline_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
-    admission_cancellation: CancellationToken = .none,
-
-    const Wire = struct {
-        protocol: u16 = catalog_route_fence_protocol_current,
-        metadata_group_id: u64,
-        metadata_incarnation: ?MetadataClusterIncarnation = null,
-        catalog_revision: u64,
-        table_id: u64,
-        topology_epoch: u64,
-        route: CatalogGroupRoute,
-    };
-
-    fn wire(self: @This()) Wire {
-        return .{
-            .protocol = self.protocol,
-            .metadata_group_id = self.metadata_group_id,
-            .metadata_incarnation = self.metadata_incarnation,
-            .catalog_revision = self.catalog_revision,
-            .table_id = self.table_id,
-            .topology_epoch = self.topology_epoch,
-            .route = self.route,
-        };
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.write(self.wire());
-    }
-
-    pub fn jsonParse(alloc: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        const value = try std.json.innerParse(Wire, alloc, source, options);
-        return .{
-            .protocol = value.protocol,
-            .metadata_group_id = value.metadata_group_id,
-            .metadata_incarnation = value.metadata_incarnation,
-            .catalog_revision = value.catalog_revision,
-            .table_id = value.table_id,
-            .topology_epoch = value.topology_epoch,
-            .route = value.route,
-        };
-    }
-
-    pub fn validate(self: @This()) !void {
-        if (self.protocol != catalog_route_fence_protocol_current) return error.UnsupportedCatalogRouteFence;
-        if (self.metadata_group_id == 0 or self.table_id == 0 or self.route.group_id == 0) return error.InvalidCatalogRouteFence;
-        if (self.route.identity_namespace.table_id != self.table_id) return error.InvalidCatalogRouteFence;
-    }
-};
+pub const CatalogRouteFence = @import("catalog_route_contract.zig").CatalogRouteFence;
 
 pub const CatalogRoutePlan = struct {
     metadata_group_id: u64,

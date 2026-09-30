@@ -112,25 +112,25 @@ pub const MetadataControlLoop = struct {
     /// refresh, desired mutation, plan construction, and proposal admission in
     /// one critical section without recursively acquiring the lock.
     pub fn reconcilePreparedCatalogLocked(self: *MetadataControlLoop, service: anytype) !ReconcileSummary {
-        return self.reconcilePreparedCatalogLockedImpl(service, null);
+        return self.reconcilePreparedCatalogLockedImpl(service, null, null);
     }
 
-    /// Request-scoped catalog workflows need proof that the final command in a
-    /// legacy multi-entry plan applied before inspecting the projection. Real
-    /// services provide one terminal Raft receipt; small embedders and control
-    /// loop test doubles retain the original synchronous seam.
-    pub fn reconcilePreparedCatalogLockedWithContext(
+    /// Transfers the caller's catalog gate to a request-scoped batch. Real
+    /// services release it after admission and before waiting for Raft apply.
+    pub fn reconcilePreparedCatalogLockedWithContextAndGate(
         self: *MetadataControlLoop,
         service: anytype,
         request: api_operation.RequestContext,
+        held_catalog_gate: *bool,
     ) !ReconcileSummary {
-        return self.reconcilePreparedCatalogLockedImpl(service, request);
+        return self.reconcilePreparedCatalogLockedImpl(service, request, held_catalog_gate);
     }
 
     fn reconcilePreparedCatalogLockedImpl(
         self: *MetadataControlLoop,
         service: anytype,
         request: ?api_operation.RequestContext,
+        held_catalog_gate: ?*bool,
     ) !ReconcileSummary {
         self.installMedianKeyLookup(service);
         var current = try self.state.captureCurrent(service);
@@ -168,14 +168,24 @@ pub const MetadataControlLoop = struct {
                 .pointer => |pointer| pointer.child,
                 else => @TypeOf(service),
             };
-            if (@hasDecl(Service, "applyReconciliationPlanAndWaitAppliedWithContext")) {
+            if (@hasDecl(Service, "applyReconciliationPlanAndWaitAppliedCatalogLockedWithContext") and held_catalog_gate != null) {
+                try service.applyReconciliationPlanAndWaitAppliedCatalogLockedWithContext(&plan, request_context, held_catalog_gate.?);
+            } else if (@hasDecl(Service, "applyReconciliationPlanAndWaitAppliedWithContext")) {
                 try service.applyReconciliationPlanAndWaitAppliedWithContext(&plan, request_context);
             } else {
                 try request_context.ensureActive();
                 try service.applyReconciliationPlan(&plan);
             }
         } else {
-            try service.applyReconciliationPlan(&plan);
+            const Service = switch (@typeInfo(@TypeOf(service))) {
+                .pointer => |pointer| pointer.child,
+                else => @TypeOf(service),
+            };
+            if (comptime @hasDecl(Service, "applyReconciliationPlanCatalogLocked")) {
+                try service.applyReconciliationPlanCatalogLocked(&plan);
+            } else {
+                try service.applyReconciliationPlan(&plan);
+            }
         }
         return summary;
     }
@@ -454,7 +464,12 @@ test "metadata control loop plans placement intents from desired topology and ca
             return null;
         }
 
-        pub fn applyReconciliationPlan(self: *@This(), plan: *const metadata_reconciler.ReconciliationPlan) !void {
+        pub fn applyReconciliationPlan(self: *@This(), _: *const metadata_reconciler.ReconciliationPlan) !void {
+            if (self.catalog_locked) return error.RecursiveCatalogLock;
+            return error.ExpectedCatalogLockedPlanSeam;
+        }
+
+        pub fn applyReconciliationPlanCatalogLocked(self: *@This(), plan: *const metadata_reconciler.ReconciliationPlan) !void {
             if (!self.catalog_locked) return error.CatalogSnapshotNotLocked;
             self.placement_upserts += plan.placement_upserts.len;
         }

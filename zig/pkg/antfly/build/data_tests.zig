@@ -37,6 +37,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const data_runtime_test_mod = options.data_runtime_test_mod;
     const data_storage_test_mod = options.data_storage_test_mod;
     const lib_data_runtime_default_filters = [_][]const u8{
+        "data runtime ordered artifact upload handoff",
+        "data runtime hosted FK retirement",
+        "pure topology control bypasses only ordinary dense repair writer preflight",
         "data ownership fallback requires a single store across all roles",
         "data relational maintenance yields to raft persistence and follows elections",
         "data runtime background worker capacity is reserved and closes with its owner",
@@ -74,6 +77,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data runtime storage ownership fingerprint excludes transient placement progress",
         "owned local group status refresh releases merged status lifecycle strings",
         "data runtime retries storage ownership invalidation before publishing fingerprint",
+        "data store registration rejects same-process physical root replacement",
+        "unconfirmed hidden initial placement cannot retire admitted ordinary replica",
         "data descriptor factory separates bootstrap voters from transport peers",
         "data descriptor factory restores persisted voters before metadata peer discovery",
         "data runtime remote admin snapshot clone owns parser-backed slices",
@@ -177,6 +182,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data raft read safety deadline and cancellation cover owner lock admission",
         "data raft read safety barrier completes only after matching ReadState apply",
         "data raft native snapshot requires an install completion receipt",
+        "data runtime native FK retirement preserves source ownership and exact cold path",
         "data raft read safety barrier rejects pre-restart responses for both read paths",
         "data raft ticker advances consensus independently of control rounds",
         "local raft admission leaves global metadata refresh to control",
@@ -189,6 +195,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "raft protocol barrier rejects unsupported future versions",
         "raft proposal materializes a default batch timestamp exactly once",
         "online merge admission distinguishes unsupported peers and fences leader authority",
+        "distributed online merge admission declines both owners and direct source proposals",
         "data raft raw topology rejection advances delegate with exact typed outcome",
         "raft batch protocol preflight fingerprint fences every applying replica set",
         "raft batch protocol plan resolves only current group applying peers",
@@ -267,8 +274,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lib_data_runtime_tests = @import("linked_tests.zig").runPair(b, lib_data_runtime_tests, implementation_tests);
     const lib_data_runtime_test_step = b.step("antfly-data-runtime-test", "Run focused data runtime tests");
     lib_data_runtime_test_step.dependOn(&run_lib_data_runtime_tests.step);
+    const private_initial_owner_predicate_tests = b.addTest(.{
+        .name = "data-private-initial-owner-predicate-tests",
+        .root_module = options.data_implementation_module,
+        .filters = &.{"ordinary unpublished placement does not require a private initial FK owner snapshot"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-data-private-initial-owner-predicate-test", "Verify hidden initial-FK owner preflight excludes ordinary unpublished placements")
+        .dependOn(&addFilteredTestRunArtifact(b, private_initial_owner_predicate_tests).step);
 
     const lib_data_storage_default_filters = [_][]const u8{
+        "membership reducer",
+        "FK retirement worker",
+        "data raft online topology arbitration persists exact rejection and scopes release across reopen",
         // Regressions previously selected only by unit-test-progress.
         "split status decodes an omitted nullable source phase",
         "derive merge transition phases",
@@ -410,7 +428,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     return .{
         .consumer = lib_data_runtime_tests,
-        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{lib_data_runtime_tests.executable}) catch @panic("OOM"),
+        // The physical implementation suite also reaches the opaque owner
+        // clients through shared runtime tests. Link the same production
+        // provider archives as the consumer executable; keeping its physical
+        // source selection does not itself satisfy those extern symbols.
+        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ lib_data_runtime_tests.executable, implementation_tests }) catch @panic("OOM"),
         .run_lib_data_runtime_tests = run_lib_data_runtime_tests,
         .run_lib_data_storage_tests = run_lib_data_storage_tests,
     };

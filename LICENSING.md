@@ -9,7 +9,9 @@ the explicit Apache source list below identify exceptions.
 The embedded database engine, Antfly Lite file-oriented CLI, native `libantfly`,
 Zig embedding package, language bindings, and inference implementation and
 executable are Apache-2.0. The engine includes local storage, search/indexing,
-schemas, transactions, enrichment, maintenance, and portable backups.
+schemas, transactions, enrichment, maintenance, portable backups, and the SQL
+compiler and execution engine used by the embedded C API. SQL HTTP/pgwire
+adapters and distributed SQL coordination remain server-owned.
 
 Shared engine sources currently remain under `zig/pkg/antfly` to preserve
 imports and avoid duplicating implementations. Their exact license scope is

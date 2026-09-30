@@ -62,6 +62,7 @@ PACKAGE_ENTRYPOINTS = (
 # Generated data modules resolve to their producers. Only Zig's standard library
 # and build-generated configuration constants terminate traversal.
 SOURCE_MODULES = {
+    "sql_parser": ("zig/lib/sql/root.zig",),
     "antfly_public_server_openapi": (
         "zig/pkg/antfly-server-api/src/openapi/generated/antfly_public_server_openapi/root.zig",
     ),

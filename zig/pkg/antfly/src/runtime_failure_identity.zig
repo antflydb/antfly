@@ -30,9 +30,61 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .setting_authority_unavailable, .err = error.SettingAuthorityUnavailable },
+    .{ .status = .online_merge_artifact_tails_unsupported, .err = error.OnlineMergeArtifactTailsUnsupported },
+    .{ .status = .artifact_catalog_corrupt, .err = error.ArtifactCatalogCorrupt },
+    .{ .status = .artifact_catalog_epoch_exhausted, .err = error.ArtifactCatalogEpochExhausted },
+    .{ .status = .initial_child_publication_changed, .err = error.InitialChildPublicationChanged },
+    .{ .status = .initial_child_provision_already_committed, .err = error.InitialChildProvisionAlreadyCommitted },
+    .{ .status = .invalid_initial_child_publication, .err = error.InvalidInitialChildPublication },
+    .{ .status = .initial_fk_retirement_proof_unavailable, .err = error.InitialFkRetirementProofUnavailable },
+    .{ .status = .invalid_initial_fk_retirement_ticket, .err = error.InvalidInitialFkRetirementTicket },
+    .{ .status = .invalid_initial_fk_retirement_intent, .err = error.InvalidInitialFkRetirementIntent },
+    .{ .status = .initial_fk_retirement_path_changed, .err = error.InitialFkRetirementPathChanged },
+    .{ .status = .artifact_catalog_drift, .err = error.ArtifactCatalogDrift },
+    .{ .status = .invalid_artifact_catalog_command, .err = error.InvalidArtifactCatalogCommand },
+    .{ .status = .artifact_catalog_epoch_changed, .err = error.ArtifactCatalogEpochChanged },
+    .{ .status = .artifact_catalog_scope_changed, .err = error.ArtifactCatalogScopeChanged },
+    .{ .status = .online_merge_artifact_catalog_changed, .err = error.OnlineMergeArtifactCatalogChanged },
+    .{ .status = .store_root_enrollment_changed, .err = error.StoreRootEnrollmentChanged },
+    .{ .status = .invalid_store_root_enrollment, .err = error.InvalidStoreRootEnrollment },
+    .{ .status = .initial_child_root_receipt_changed, .err = error.InitialChildRootReceiptChanged },
+    .{ .status = .invalid_initial_fk_retirement_signature, .err = error.InvalidInitialFkRetirementSignature },
+    .{ .status = .initial_fk_retirement_signing_key_unavailable, .err = error.InitialFkRetirementSigningKeyUnavailable },
+    .{ .status = .initial_fk_retirement_reporter_changed, .err = error.InitialFkRetirementReporterChanged },
+    .{ .status = .initial_fk_retirement_work_changed, .err = error.InitialFkRetirementWorkChanged },
+    .{ .status = .initial_fk_retirement_publication_changed, .err = error.InitialFkRetirementPublicationChanged },
+    .{ .status = .initial_fk_retirement_reservation_changed, .err = error.InitialFkRetirementReservationChanged },
+    .{ .status = .invalid_initial_fk_retirement_ack, .err = error.InvalidInitialFkRetirementAck },
+    .{ .status = .invalid_initial_fk_retirement_page, .err = error.InvalidInitialFkRetirementPage },
+    .{ .status = .initial_fk_retirement_root_changed, .err = error.InitialFkRetirementRootChanged },
+    .{ .status = .replica_retirement_recovery_in_progress, .err = error.ReplicaRetirementRecoveryInProgress },
+    .{ .status = .membership_change_fenced, .err = error.MembershipChangeFenced },
     .{ .status = .catalog_already_exists, .err = error.CatalogAlreadyExists },
     .{ .status = .catalog_command_too_large, .err = error.CatalogCommandTooLarge },
     .{ .status = .catalog_generation_changed, .err = error.CatalogGenerationChanged },
+    .{ .status = .generation_publication_not_found, .err = error.GenerationPublicationNotFound },
+    .{ .status = .generation_publication_changed, .err = error.GenerationPublicationChanged },
+    .{ .status = .invalid_generation_publication, .err = error.InvalidGenerationPublication },
+    .{ .status = .invalid_retirement_summary, .err = error.InvalidRetirementSummary },
+    .{ .status = .invalid_control_receipt_position, .err = error.InvalidControlReceiptPosition },
+    .{ .status = .invalid_graph_transfer, .err = error.InvalidGraphTransfer },
+    .{ .status = .graph_generation_mismatch, .err = error.GraphGenerationMismatch },
+    .{ .status = .generation_admission_acknowledgement_pending, .err = error.GenerationAdmissionAcknowledgementPending },
+    .{ .status = .generation_admission_changed, .err = error.GenerationAdmissionChanged },
+    .{ .status = .generation_admission_pending, .err = error.GenerationAdmissionPending },
+    .{ .status = .generation_admission_revision_exhausted, .err = error.GenerationAdmissionRevisionExhausted },
+    .{ .status = .invalid_generation_admission, .err = error.InvalidGenerationAdmission },
+    .{ .status = .generation_admission_activation_required, .err = error.GenerationAdmissionActivationRequired },
+    .{ .status = .generation_retirement_acknowledgement_pending, .err = error.GenerationRetirementAcknowledgementPending },
+    .{ .status = .generation_retirement_changed, .err = error.GenerationRetirementChanged },
+    .{ .status = .generation_retirement_handoff_required, .err = error.GenerationRetirementHandoffRequired },
+    .{ .status = .generation_retirement_pending, .err = error.GenerationRetirementPending },
+    .{ .status = .generation_retirement_revision_exhausted, .err = error.GenerationRetirementRevisionExhausted },
+    .{ .status = .invalid_generation_retirement, .err = error.InvalidGenerationRetirement },
+    .{ .status = .initial_child_publication_missing, .err = error.InitialChildPublicationMissing },
+    .{ .status = .initial_child_not_published, .err = error.InitialChildNotPublished },
+    .{ .status = .generation_retired, .err = error.GenerationRetired },
     .{ .status = .catalog_id_exhausted, .err = error.CatalogIdExhausted },
     .{ .status = .catalog_not_found, .err = error.CatalogNotFound },
     .{ .status = .catalog_projection_refresh_required, .err = error.CatalogProjectionRefreshRequired },
@@ -72,6 +124,7 @@ const mappings = [_]Mapping{
     .{ .status = .relational_expression_budget_exceeded, .err = error.RelationalExpressionBudgetExceeded },
     .{ .status = .relational_index_key_too_large, .err = error.RelationalIndexKeyTooLarge },
     .{ .status = .invalid_relational_expression_input, .err = error.InvalidRelationalExpressionInput },
+    .{ .status = .invalid_relational_row, .err = error.InvalidRelationalRow },
     .{ .status = .invalid_relational_generated_value, .err = error.InvalidRelationalGeneratedValue },
     .{ .status = .generated_column_rewrite_required, .err = error.GeneratedColumnRewriteRequired },
     .{ .status = .relational_index_not_ready, .err = error.RelationalIndexNotReady },
@@ -614,6 +667,7 @@ const mappings = [_]Mapping{
     .{ .status = .invalid_online_source_command, .err = error.InvalidOnlineSourceCommand },
     .{ .status = .online_source_corrupt, .err = error.OnlineSourceCorrupt },
     .{ .status = .online_source_scope_changed, .err = error.OnlineSourceScopeChanged },
+    .{ .status = .online_merge_artifact_catalog_uncoordinated, .err = error.OnlineMergeArtifactCatalogUncoordinated },
     .{ .status = .invalid_retained_effects_admission, .err = error.InvalidRetainedEffectsAdmission },
     .{ .status = .retained_effects_consumer_limit, .err = error.RetainedEffectsConsumerLimit },
     .{ .status = .retained_effects_corrupt, .err = error.RetainedEffectsCorrupt },
@@ -666,6 +720,16 @@ const mappings = [_]Mapping{
     .{ .status = .vector_store_requires_empty_table, .err = error.VectorStoreRequiresEmptyTable },
     .{ .status = .vector_store_requires_local_single_shard_table, .err = error.VectorStoreRequiresLocalSingleShardTable },
     .{ .status = .vector_store_requires_offline_command, .err = error.VectorStoreRequiresOfflineCommand },
+    .{ .status = .row_policy_authentication_required, .err = error.RowPolicyAuthenticationRequired },
+    .{ .status = .row_policy_authority_unavailable, .err = error.RowPolicyAuthorityUnavailable },
+    .{ .status = .row_policy_catalog_changed, .err = error.RowPolicyCatalogChanged },
+    .{ .status = .row_policy_readers_active, .err = error.RowPolicyReadersActive },
+    .{ .status = .row_policy_topology_unsupported, .err = error.RowPolicyTopologyUnsupported },
+    .{ .status = .row_policy_mutation_unsupported, .err = error.RowPolicyMutationUnsupported },
+    .{ .status = .row_policy_denied, .err = error.RowPolicyDenied },
+    .{ .status = .invalid_row_policy_receipt, .err = error.InvalidRowPolicyReceipt },
+    .{ .status = .invalid_row_policy_bundle, .err = error.InvalidRowPolicyBundle },
+    .{ .status = .row_policy_unsupported, .err = error.RowPolicyUnsupported },
     .{ .status = .raft_batch_write_outcome_unknown, .err = error.RaftBatchWriteOutcomeUnknown },
     .{ .status = .unsupported_raft_batch_protocol_version, .err = error.UnsupportedRaftBatchProtocolVersion },
 };
@@ -907,11 +971,24 @@ pub fn validateForTest() !void {
 }
 
 test "registered storage-kernel errors are unique and round trip without losing identity" {
+    // A stale FK attachment must remain a semantic rejection across the
+    // storage-owner ABI. Collapsing it to StorageKernelFailure can poison a
+    // replicated apply entry and stall every later proposal on that owner.
+    const retired = failureFromError(error.GenerationRetired, .storage_owner, abi.abi_version, 23);
+    try std.testing.expectEqual(abi.Status.generation_retired, retired.status);
+    try validateFailureEnvelope(retired.status, &retired, abi.abi_version);
+    try std.testing.expectError(error.GenerationRetired, statusToError(retired.status));
+    try std.testing.expectEqual(abi.Status.initial_child_provision_already_committed, statusFromError(error.InitialChildProvisionAlreadyCommitted));
+    try std.testing.expectError(error.InitialChildProvisionAlreadyCommitted, statusToError(.initial_child_provision_already_committed));
     // A newly created/rebuilt ANN index has no serving generation yet. This
     // expected state must survive both compiled query boundaries as a retry,
     // rather than becoming an unregistered StorageKernelFailure (HTTP 500).
     try std.testing.expectEqual(abi.Status.index_rebuilding, statusFromError(error.IndexRebuilding));
     try std.testing.expectError(error.IndexRebuilding, statusToError(.index_rebuilding));
+    // A fixed rewrite source row that violates the target layout must reach
+    // restore validation as its exact error, not generic kernel pressure.
+    try std.testing.expectEqual(abi.Status.invalid_relational_row, statusFromError(error.InvalidRelationalRow));
+    try std.testing.expectError(error.InvalidRelationalRow, statusToError(.invalid_relational_row));
     try validateForTest();
 }
 

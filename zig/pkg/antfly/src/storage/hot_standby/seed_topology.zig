@@ -54,6 +54,7 @@ pub const LogicalCatalog = struct {
     epoch: u64,
     // Optional only for reading v3 seeds. V4 always carries the catalog.
     system_catalog: ?@import("../../system_catalog/domain.zig").State = null,
+    policy_install_snapshots: []const @import("../../system_catalog/policies.zig").InstallSnapshot = &.{},
     tables: []const topology_records.TableRecord,
     ranges: []const topology_records.RangeRecord,
     extension_packages: []const extensions.PackageManifest = &.{},
@@ -383,6 +384,10 @@ fn readFileAlloc(io: std.Io, alloc: Allocator, path: []const u8, max_bytes: usiz
 pub fn validateLogicalCatalog(alloc: Allocator, version: u16, catalog: LogicalCatalog) !void {
     if (version >= 4 and catalog.system_catalog == null) return error.InvalidSeedTopology;
     if (catalog.system_catalog) |state| {
+        @import("../../system_catalog/portable_policy_contract.zig").validatePolicyPrograms(alloc, state.policy_publications, catalog.policy_install_snapshots) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidSeedTopology,
+        };
         if (state.next_id < 3) return error.InvalidSeedTopology;
         const domain = @import("../../system_catalog/domain.zig");
         var index = try domain.StateIndex.init(alloc, state);
@@ -400,7 +405,7 @@ pub fn validateLogicalCatalog(alloc: Allocator, version: u16, catalog: LogicalCa
             }
             if (resource.tablespace_id != 0 and index.byId(.tablespace, resource.tablespace_id) == null) return error.InvalidSeedTopology;
         }
-    }
+    } else if (catalog.policy_install_snapshots.len != 0) return error.InvalidSeedTopology;
 }
 
 pub fn validateTableIdentityName(name: []const u8) !void {

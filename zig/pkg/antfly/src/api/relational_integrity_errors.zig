@@ -41,6 +41,7 @@ pub const Error = error{
     ForeignKeyParentMissing,
     ForeignKeyCoordinationRequired,
     ForeignKeyReferenced,
+    GenerationRetired,
     UniqueConstraintViolation,
     ForeignKeyActionInProgress,
     PreparedGenerationChanged,

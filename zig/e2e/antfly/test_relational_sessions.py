@@ -65,7 +65,7 @@ def _ready(cluster, session, table):
         )
         if response.status_code == 200:
             return response.json().get("state") == "enforced"
-        assert response.status_code in (409, 503, 504), response.text
+        assert response.status_code in (404, 409, 503, 504), response.text
         return False
 
     assert wait_until(lambda: cluster.fully_replicated_topology(table), timeout_s=90), (

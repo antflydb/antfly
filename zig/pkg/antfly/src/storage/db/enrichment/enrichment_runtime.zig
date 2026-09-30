@@ -25,6 +25,8 @@ const inference_request_context = @import("antfly_inference_execution_context");
 const common_secrets = @import("../../../common/secrets.zig");
 const backend_erased = @import("../../backend_erased.zig");
 const docstore_mod = @import("../../docstore.zig");
+const ordered_publication = @import("../artifact_publication.zig");
+const producer_input = @import("../artifact_producer_input.zig");
 const backend_scan = @import("../../backend_scan.zig");
 const mem_backend = @import("../../mem_backend.zig");
 const internal_keys = @import("../../internal_keys.zig");
@@ -110,6 +112,10 @@ pub const ChunkProvider = chunk_provider.Provider;
 
 pub const Config = struct {
     owner_id: []const u8 = "local",
+    /// Injected by the resident DB, never borrowed from restored producer
+    /// metadata or caller configuration. Ordered checkpoint-backed work fails
+    /// closed when the physical owner cannot supply a nonzero incarnation.
+    root_incarnation: u128 = 0,
     lease_ttl_ms: u64 = 30_000,
     dense_embedder: ?embedder_mod.DenseEmbedder = null,
     sparse_embedder: ?embedder_mod.SparseEmbedder = null,
@@ -241,6 +247,10 @@ pub const GeneratedRecordWriter = *const fn (
     source_guards: []const GeneratedSourceGuard,
     fence: ?GeneratedWriteFence,
 ) anyerror!GeneratedRecordCommit;
+pub const ArtifactUnitTurnCommit = struct {
+    ptr: *anyopaque,
+    commit: *const fn (*anyopaque, ?*const @import("../artifact_unit_jobs.zig").DocumentTurn, ?*const @import("../artifact_unit_jobs.zig").WorkTurn) anyerror!void,
+};
 pub const RequestFailure = struct {
     kind: enrichment_types.GeneratedEnrichmentKind,
     index_name: []const u8,
@@ -2455,6 +2465,9 @@ const WorkerRetryScope = enum {
 };
 
 fn workerLoopRetryScopeIfAllowed(runtime: *EnrichmentRuntime, err: anyerror) ?WorkerRetryScope {
+    // Queue admission is not a failed provider invocation. Keep the replay
+    // cursor durable and pending until the replicated receipt arrives.
+    if (err == error.ArtifactPublicationPending) return .request;
     const maybe_io = lockRuntime(runtime);
     defer unlockRuntime(runtime, maybe_io);
 
@@ -2552,7 +2565,7 @@ test "provider retry guidance extends bounded worker backoff" {
 }
 
 fn isEnrichmentControlError(err: anyerror) bool {
-    return err == error.EnrichmentRetryAborted;
+    return err == error.EnrichmentRetryAborted or err == error.ArtifactPublicationPending;
 }
 
 test "enrichment distinguishes transient capacity from permanent resource limits" {
@@ -3704,6 +3717,7 @@ const PlainDenseBatchItem = struct {
     source_hash: u64,
     artifact_key: []u8,
     source_record_digest: [32]u8 = undefined,
+    producer_input: ?producer_input.Token = null,
 };
 
 const AssetProducerBatchItem = struct {
@@ -3716,6 +3730,7 @@ const AssetProducerBatchItem = struct {
     artifact_key: []u8,
     state_key: []u8,
     state_value: []u8,
+    producer_context: ?@import("../artifact_producer_context.zig").Token = null,
 
     fn asRequest(self: *const @This()) asset_producer_mod.Request {
         return .{
@@ -3796,13 +3811,16 @@ test "enrichment batch retry identity covers every work item" {
 }
 
 fn freePlainDenseBatchItems(alloc: Allocator, items: []PlainDenseBatchItem) void {
-    for (items) |item| {
+    for (items) |*item| {
+        if (item.producer_input) |*token| token.deinit();
         alloc.free(@constCast(item.source_text));
         alloc.free(item.artifact_key);
     }
 }
 
 fn freeAssetProducerBatchItem(alloc: Allocator, item: AssetProducerBatchItem) void {
+    var context = item.producer_context;
+    if (context) |*value| value.deinit();
     if (item.config_json.len > 0) alloc.free(item.config_json);
     alloc.free(item.raw_doc);
     alloc.free(@constCast(item.source_text));
@@ -4159,6 +4177,10 @@ fn getOrCreateRequestChunks(
         try chunker_mod.chunkTextWithConfigJsonAndProvider(runtime.alloc, source_text, request.chunker_json, runtime.config.chunk_provider)
     else
         try chunker_mod.chunkText(runtime.alloc, source_text, request.chunk_size, request.chunk_overlap);
+    errdefer {
+        for (chunks) |*chunk| chunk.deinit(runtime.alloc);
+        runtime.alloc.free(chunks);
+    }
     chunks_created = chunks.len;
 
     try cache.append(runtime.alloc, .{
@@ -4206,6 +4228,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     store: backend_erased.Store,
     owns_store: bool,
     artifact_store: ?*docstore_mod.DocStore = null,
+    artifact_publication_dispatcher: ?ordered_publication.Dispatcher = null,
+    artifact_unit_turn_commit: ?ArtifactUnitTurnCommit = null,
     change_journal: *change_journal_mod.Journal,
     replay_source: replay_source_mod.Source,
     index_manager: *index_manager_mod.IndexManager,
@@ -4348,6 +4372,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .deadline_clock = config.clock orelse platform_clock.Clock.real(),
             .activity_epoch = newActivityEpoch(config, config.clock orelse platform_clock.Clock.real()),
             .config = .{
+                .root_incarnation = config.root_incarnation,
                 .lease_ttl_ms = config.lease_ttl_ms,
                 .dense_embedder = config.dense_embedder,
                 .sparse_embedder = config.sparse_embedder,
@@ -4702,6 +4727,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     store: backend_erased.Store,
     owns_store: bool,
     artifact_store: ?*docstore_mod.DocStore = null,
+    artifact_publication_dispatcher: ?ordered_publication.Dispatcher = null,
+    artifact_unit_turn_commit: ?ArtifactUnitTurnCommit = null,
     change_journal: *change_journal_mod.Journal,
     replay_source: replay_source_mod.Source,
     index_manager: *index_manager_mod.IndexManager,
@@ -4868,6 +4895,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .deadline_clock = config.clock orelse backend_runtime.monotonicClock(),
             .activity_epoch = newActivityEpoch(config, config.clock orelse backend_runtime.clock()),
             .config = .{
+                .root_incarnation = config.root_incarnation,
                 .lease_ttl_ms = config.lease_ttl_ms,
                 .dense_embedder = config.dense_embedder,
                 .sparse_embedder = config.sparse_embedder,
@@ -5494,22 +5522,28 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     fn recordRetryableError(self: *EnrichmentRuntime, io: Io, err: anyerror, scope: WorkerRetryScope) void {
-        std.log.warn("enrichment {s} transient failure, will retry: {s}", .{ @tagName(scope), @errorName(err) });
+        const awaiting_publication = err == error.ArtifactPublicationPending;
+        if (!awaiting_publication) std.log.warn("enrichment {s} transient failure, will retry: {s}", .{ @tagName(scope), @errorName(err) });
         var status: enrichment_state.RuntimeStatus = .{};
         self.mutex.lockUncancelable(io);
-        self.error_count += 1;
-        self.retryable_error_count += 1;
-        if (scope == .pipeline) self.consecutive_retry_count +|= 1;
+        if (!awaiting_publication) {
+            self.error_count += 1;
+            self.retryable_error_count += 1;
+            if (scope == .pipeline) self.consecutive_retry_count +|= 1;
+        }
         if (self.retry_failure_fingerprint != self.active_failure_fingerprint) {
             self.retry_failure_fingerprint = self.active_failure_fingerprint;
             self.retry_failure_count = 0;
         }
-        self.retry_failure_count +|= 1;
-        const retry_ordinal = if (scope == .request)
+        if (!awaiting_publication) self.retry_failure_count +|= 1;
+        // A normal ordered acknowledgement wait is not a provider failure.
+        // In particular, many census pages must not exponentially delay one
+        // another or inherit an earlier provider's backoff hint.
+        const retry_ordinal = if (awaiting_publication) 0 else if (scope == .request)
             self.retry_failure_count
         else
             self.consecutive_retry_count;
-        const delay_ms = workerRetryDelayWithHintMs(retry_ordinal, self.retry_after_hint_ms);
+        const delay_ms = workerRetryDelayWithHintMs(retry_ordinal, if (awaiting_publication) 0 else self.retry_after_hint_ms);
         self.retry_after_hint_ms = 0;
         self.next_retry_at_ms = self.clock.nowRealtimeMs() +| delay_ms;
         self.retrying = true;
@@ -11124,6 +11158,78 @@ test "prepared document cache prepares unrelated PDF keys concurrently" {
     try std.testing.expectEqual(@as(usize, 2), FakePreparation.peak.load(.acquire));
 }
 
+/// The durable replay wake carries only the document. Resolve one fair child
+/// and an owned bounded job page from the root-local directory, then release
+/// both the physical read and compiled plan before any provider invocation.
+pub fn servicePendingArtifactUnitJobs(runtime: *EnrichmentRuntime, document: []const u8, guard: ForegroundCatchUpGuard) !void {
+    const store = runtime.artifact_store orelse return;
+    if (runtime.config.root_incarnation == 0) return;
+    const unit_jobs = @import("../artifact_unit_jobs.zig");
+    var budget = if (runtime.config.resource_manager orelse runtime.index_manager.resource_manager) |manager|
+        resource_manager_mod.BudgetedAllocator.init(manager, .document_extraction_working_set, runtime.alloc, 1)
+    else
+        null;
+    defer if (budget) |*tracked| tracked.deinit();
+    const work_alloc = if (budget) |*tracked| tracked.allocator() else runtime.alloc;
+    var document_turn: ?unit_jobs.DocumentTurn = null;
+    var work: ?unit_jobs.WorkTurn = null;
+    defer if (work) |*turn| turn.deinit();
+    var parent_request: ?enrichment_types.GeneratedEnrichmentRequest = null;
+    defer if (parent_request) |request| enrichment_types.freeGeneratedRequest(runtime.alloc, request);
+    {
+        var read = try store.beginReadTxnWithBlockCacheAdmission(.transient);
+        defer read.abort();
+        document_turn = try unit_jobs.prepareDocumentTurn(&read, runtime.config.root_incarnation, document);
+        const selected = (document_turn orelse return).selected;
+        // Once a durable outbox exists, missing execution infrastructure must
+        // never let the ordinary generated replay advance past its wake.
+        if (runtime.artifact_publication_dispatcher == null or runtime.artifact_unit_turn_commit == null) return error.ArtifactPublicationPending;
+        if (selected) |scope| {
+            work = unit_jobs.prepareTurn(work_alloc, &read, runtime.config.root_incarnation, scope, .{ .visits = 4 }) catch |err| {
+                if (err == error.OutOfMemory) if (budget) |*tracked| if (tracked.denied()) return error.ResourceBudgetExceeded;
+                return err;
+            };
+            if (work.?.page.items.len != 0) {
+                const job = work.?.page.items[0].job;
+                if (!std.mem.eql(u8, job.document, document)) return error.ArtifactCatalogCorrupt;
+                var plan = try runtime.index_manager.acquireWritePlanSnapshot();
+                defer plan.release();
+                const completion = if (plan.plan().completion_plan) |*value| value else return error.ArtifactCatalogDrift;
+                const child = try completion.unitChild(job.child);
+                const ordinal = child.parent_template orelse return error.ArtifactPublicationPending;
+                if (ordinal >= plan.plan().generated_templates.len) return error.ArtifactCatalogDrift;
+                var parent = plan.plan().generated_templates[ordinal];
+                parent.doc_key = document;
+                parent_request = try enrichment_types.cloneGeneratedRequest(runtime.alloc, parent);
+            }
+        }
+    }
+    const commit = runtime.artifact_unit_turn_commit.?;
+    var first_error: ?anyerror = null;
+    if (work) |*turn| {
+        for (turn.page.items) |item| {
+            try guard.check();
+            if (!std.mem.eql(u8, item.job.document, document) or
+                !std.mem.eql(u8, item.job.child, turn.page.items[0].job.child)) return error.ArtifactCatalogCorrupt;
+            publishOrderedUnitJob(runtime, parent_request.?, item.job) catch |err| switch (err) {
+                // An admitted command is not an accepted result. Keep the job
+                // until receiver-verified retirement observes its receipt.
+                error.ArtifactPublicationPending, error.ArtifactCoverageBaselinePending, error.OnlineMergeArtifactTailsUnsupported => {},
+                error.EnrichmentSourceChanged => {},
+                else => if (first_error == null) {
+                    first_error = err;
+                },
+            };
+        }
+    }
+    const work_ptr: ?*const unit_jobs.WorkTurn = if (work) |*turn| turn else null;
+    try commit.commit(commit.ptr, &document_turn.?, work_ptr);
+    if (first_error) |err| return err;
+    // A wrapped or exhausted page still belongs to a nonempty durable outbox.
+    // Only receipt-checked retirement removes its last directory entry.
+    return error.ArtifactPublicationPending;
+}
+
 fn processPendingDocumentGroup(
     runtime: *EnrichmentRuntime,
     pending: enrichment_worker.PendingDocumentGroup,
@@ -11137,6 +11243,7 @@ fn processPendingDocumentGroup(
     guard: ForegroundCatchUpGuard,
 ) !void {
     try guard.check();
+    try servicePendingArtifactUnitJobs(runtime, pending.doc_key, guard);
     const planned = try getOrCreatePlannedRequests(runtime, pending.doc_key, request_plan_cache);
     var prepared_sources = PreparedDocumentSourceCache.init(runtime);
     defer prepared_sources.deinit();
@@ -11706,10 +11813,36 @@ fn processAsset(
 ) !void {
     const doc_store_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = (try storeGetOptionalDocumentAllocWithRetry(runtime, doc_store_key)) orelse return;
+    const observed = try storeGetOptionalDocumentAllocWithRetry(runtime, doc_store_key);
+    var context = captureAssetProducerContext(runtime, request, doc_store_key, observed) catch |err| {
+        if (observed) |value| runtime.alloc.free(value);
+        return err;
+    };
+    var context_owned = true;
+    defer if (context_owned) if (context) |*value| value.deinit();
     var raw_owned = true;
-    defer if (raw_owned) runtime.alloc.free(raw);
-
+    defer if (raw_owned) if (observed) |value| runtime.alloc.free(value);
+    const accepted = if (context) |*value| accepted: {
+        var read = try runtime.store.beginProbe();
+        defer read.abort();
+        break :accepted try value.accepted(runtime.alloc, &read);
+    } else false;
+    if (accepted) {
+        // Asset acceptance is not graph completion. Retry the ordered graph
+        // consumer without reinvoking the provider, including accepted absence
+        // after primary deletion. Pending publication holds the replay cursor.
+        try finishAcceptedAssetGraph(runtime, request);
+        return;
+    }
+    const raw = observed orelse {
+        if (context) |*value| {
+            const artifact = requestArtifactName(request);
+            const output_key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "asset", artifact);
+            defer runtime.alloc.free(output_key);
+            try enqueueAssetProducerOutput(runtime, request, value, output_key, null);
+        }
+        return;
+    };
     var producer_cfg = try asset_producer_mod.parseProducerConfig(runtime.alloc, request.producer_json);
     defer producer_cfg.deinit(runtime.alloc);
 
@@ -11718,7 +11851,7 @@ fn processAsset(
     var key_owned = true;
     defer if (key_owned) runtime.alloc.free(key);
 
-    const text_indexes = try runtime.index_manager.textIndexesForChunk(runtime.alloc, artifact_name, request.full_text_index);
+    const text_indexes: []const []const u8 = if (context != null) &.{} else try runtime.index_manager.textIndexesForChunk(runtime.alloc, artifact_name, request.full_text_index);
     defer {
         for (text_indexes) |name| runtime.alloc.free(name);
         runtime.alloc.free(text_indexes);
@@ -11739,8 +11872,14 @@ fn processAsset(
             request.upstream_artifact_name,
         );
         defer runtime.alloc.free(upstream_key);
+        if (context) |*value| {
+            var read = try runtime.store.beginProbe();
+            defer read.abort();
+            break :blk try @import("../artifact_asset_publication.zig").readUpstream(runtime.alloc, value, &read, upstream_key);
+        }
         break :blk try storeGetOptionalAllocWithRetry(runtime, upstream_key);
     } else try extractAssetSourceValue(runtime.alloc, runtime.config, raw, request)) orelse {
+        if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, null);
         const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
         defer runtime.alloc.free(state_key);
         if (producer_cfg.type == .document_extraction) {
@@ -11759,6 +11898,7 @@ fn processAsset(
     var source_text_owned = true;
     defer if (source_text_owned) runtime.alloc.free(@constCast(source_text));
     if (source_text.len == 0) {
+        if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, null);
         const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
         defer runtime.alloc.free(state_key);
         if (producer_cfg.type == .document_extraction) {
@@ -11788,6 +11928,7 @@ fn processAsset(
     };
 
     if (producer_cfg.type == .copy) {
+        if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, source_text);
         if (try shouldSkipAssetArtifact(runtime, key, source_text)) {
             try appendInlineFullTextDocumentToWindow(runtime, window, key, source_text, text_indexes);
             try materializeGraphAssetForRuntime(runtime, request, source_text, raw, window);
@@ -11836,7 +11977,7 @@ fn processAsset(
     const state_value = try assetStateValueAlloc(runtime.alloc, source_text, source_parts_json, request.producer_json);
     var state_value_owned = true;
     defer if (state_value_owned) runtime.alloc.free(state_value);
-    if (try shouldSkipAssetProducer(runtime, state_key, state_value)) {
+    if (context == null and try shouldSkipAssetProducer(runtime, state_key, state_value)) {
         const existing = try storeGetOptionalAllocWithRetry(runtime, key);
         if (existing) |value| {
             defer runtime.alloc.free(value);
@@ -11858,15 +11999,19 @@ fn processAsset(
         .request = request,
         .producer_type = producer_cfg.type,
         .config_json = @constCast(config_json),
-        .raw_doc = raw,
+        // Ordered publication derives graph/text consumers from its catalog;
+        // only the legacy local graph path needs the full primary document.
+        .raw_doc = if (context == null) raw else @constCast(""),
         .source_text = source_text,
         .source_parts_json = source_parts_json,
         .artifact_key = key,
         .state_key = state_key,
         .state_value = state_value,
+        .producer_context = context,
     }, scope);
+    context_owned = false;
     config_json_owned = false;
-    raw_owned = false;
+    raw_owned = context != null;
     source_text_owned = false;
     source_parts_json_owned = false;
     key_owned = false;
@@ -12079,6 +12224,7 @@ const PreparedAssetBatch = struct {
 
 fn assetProducerRetainedBytes(item: AssetProducerBatchItem) usize {
     var bytes = assetProducerBatchItemBytes(item);
+    if (item.producer_context) |value| bytes = addUsizeSaturating(bytes, value.arena.queryCapacity());
     for ([_][]const u8{ item.raw_doc, item.artifact_key, item.state_key, item.state_value }) |part|
         bytes = addUsizeSaturating(bytes, part.len);
     return bytes;
@@ -12288,7 +12434,11 @@ fn flushAssetProducerBatchItems(
                 } else try recordIsolatedRequestErrorFor(runtime, window, item.request, failure.cause, requestAttemptNumberFor(runtime, scope.fingerprint));
             },
             .value => |output| {
-                applyAssetProducerBatchOutput(runtime, item.*, output, window) catch |err| {
+                applyAssetProducerBatchOutput(runtime, item, output, window) catch |err| {
+                    if (err == error.ArtifactPublicationPending) {
+                        if (retry_error == null) retry_error = err;
+                        continue;
+                    }
                     if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
                     if (scope.shouldYield(runtime, err)) {
                         if (retry_error == null) {
@@ -12309,12 +12459,12 @@ fn flushAssetProducerBatchItems(
 fn flushAssetProducerBatchSequential(
     runtime: *EnrichmentRuntime,
     producer: asset_producer_mod.Producer,
-    items: []const AssetProducerBatchItem,
+    items: []AssetProducerBatchItem,
     window: *GeneratedReplayWindow,
     scope: *FailureScope,
 ) !void {
     var retry_error: ?anyerror = null;
-    for (items) |item| {
+    for (items) |*item| {
         if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
         scope.enter(requestFailureFingerprint(item.request));
         const request = item.asRequest();
@@ -12330,6 +12480,10 @@ fn flushAssetProducerBatchSequential(
         };
         defer runtime.alloc.free(produced);
         applyAssetProducerBatchOutput(runtime, item, produced, window) catch |err| {
+            if (err == error.ArtifactPublicationPending) {
+                if (retry_error == null) retry_error = err;
+                continue;
+            }
             if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
             if (scope.shouldYield(runtime, err)) {
                 if (retry_error == null) {
@@ -12344,10 +12498,11 @@ fn flushAssetProducerBatchSequential(
 
 fn applyAssetProducerBatchOutput(
     runtime: *EnrichmentRuntime,
-    item: AssetProducerBatchItem,
+    item: *AssetProducerBatchItem,
     produced: []const u8,
     window: *GeneratedReplayWindow,
 ) !void {
+    if (item.producer_context) |*value| return enqueueAssetProducerOutput(runtime, item.request, value, item.artifact_key, produced);
     const writes = [_]KVPair{
         .{ .key = item.artifact_key, .value = produced },
         .{ .key = item.state_key, .value = item.state_value },
@@ -19453,6 +19608,8 @@ fn storePutPrivateBatch(runtime: ?*EnrichmentRuntime, store: *backend_erased.Sto
     var batch = try store.beginBatch();
     errdefer batch.abort();
     if (runtime) |owner| try validateRuntimeStoreWriteFenceTxn(owner, &batch, fence);
+    for (writes) |write| try ordered_publication.requireLegacyMaterialization(&batch, write.key);
+    for (deletes) |delete_key| try ordered_publication.requireLegacyMaterialization(&batch, delete_key);
     for (writes) |write| try batch.put(write.key, write.value);
     for (deletes) |key| {
         batch.delete(key) catch |err| switch (err) {
@@ -20606,6 +20763,122 @@ const RuntimeDocumentExtractionMaterializeContext = struct {
     }
 };
 
+/// Publish one accepted extraction unit's complete child chunk set. The caller
+/// owns enumeration of the accepted upstream inventory; success closes only
+/// this unit, never the extraction/document stream. No provider runs while a
+/// storage snapshot or catalog/apply lease is retained.
+fn publishOrderedUnitChunks(runtime: *EnrichmentRuntime, parent_request: enrichment_types.GeneratedEnrichmentRequest, producer_name: []const u8, unit_key: []const u8) !void {
+    return publishOrderedUnitChunksGeneration(runtime, parent_request, producer_name, unit_key, null);
+}
+
+/// Scoped outbox callbacks cannot silently rebind stale work to a new parent.
+/// Retirement is separate and requires a current accepted-result receipt.
+fn publishOrderedUnitJob(runtime: *EnrichmentRuntime, parent_request: enrichment_types.GeneratedEnrichmentRequest, job: @import("../artifact_unit_jobs.zig").Job) !void {
+    if (!std.mem.eql(u8, parent_request.doc_key, job.document) or job.child.len == 0 or std.mem.allEqual(u8, &job.generation, 0)) return error.InvalidBatchRequest;
+    return publishOrderedUnitChunksGeneration(runtime, parent_request, job.child, job.unit, job.generation);
+}
+
+fn publishOrderedUnitChunksGeneration(runtime: *EnrichmentRuntime, parent_request: enrichment_types.GeneratedEnrichmentRequest, producer_name: []const u8, unit_key: []const u8, generation: ?ordered_publication.Digest) !void {
+    var budget = if (runtime.config.resource_manager orelse runtime.index_manager.resource_manager) |manager|
+        resource_manager_mod.BudgetedAllocator.init(manager, .document_extraction_working_set, runtime.alloc, 1)
+    else
+        null;
+    defer if (budget) |*tracked| tracked.deinit();
+    const alloc = if (budget) |*tracked| tracked.allocator() else runtime.alloc;
+    return publishOrderedUnitChunksGenerationWithAllocator(runtime, alloc, parent_request, producer_name, unit_key, generation) catch |err| {
+        if (err == error.OutOfMemory) if (budget) |*tracked| if (tracked.denied()) return error.ResourceBudgetExceeded;
+        if (err == error.ArtifactCoverageBaselinePending) {
+            var identity = (try @import("../artifact_ids.zig").decodeArtifactRefAlloc(alloc, unit_key)) orelse return error.InvalidBatchRequest;
+            defer identity.deinit(alloc);
+            const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .chunk_text, .index_name = "", .artifact_name = producer_name, .doc_key = parent_request.doc_key, .source_field = "", .upstream_artifact_name = parent_request.artifact_name };
+            try driveOrderedChunkInventoryScoped(runtime, request, identity.unit_id orelse return error.InvalidBatchRequest);
+            return error.ArtifactPublicationPending;
+        }
+        return err;
+    };
+}
+
+fn publishOrderedUnitChunksWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocator, parent_request: enrichment_types.GeneratedEnrichmentRequest, producer_name: []const u8, unit_key: []const u8) !void {
+    return publishOrderedUnitChunksGenerationWithAllocator(runtime, alloc, parent_request, producer_name, unit_key, null);
+}
+
+fn publishOrderedUnitChunksGenerationWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocator, parent_request: enrichment_types.GeneratedEnrichmentRequest, producer_name: []const u8, unit_key: []const u8, generation: ?ordered_publication.Digest) !void {
+    const publication = @import("../artifact_chunk_publication.zig");
+    const inventory = @import("../artifact_chunk_manifest.zig");
+    const enrichment_catalog = @import("../catalog/enrichment_catalog.zig");
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    var config: enrichment_catalog.EnrichmentConfig = undefined;
+    var input: publication.UnitInput = capture: {
+        if (runtime.coverage_apply_mutex) |mutex| mutex.lockShared();
+        defer if (runtime.coverage_apply_mutex) |mutex| mutex.unlockShared();
+        var read = try runtime.store.beginProbe();
+        defer read.abort();
+        var plan = try runtime.index_manager.acquireWritePlanSnapshot();
+        defer plan.release();
+        const session = (try publication.unitSession(alloc, &read, parent_request, producer_name, plan.plan())) orelse return error.ArtifactCatalogDrift;
+        var selected = if (generation) |expected| try session.captureGeneration(alloc, expected, unit_key) else try session.capture(alloc, unit_key);
+        errdefer selected.deinit();
+        if (try selected.token.accepted(alloc, &read)) {
+            selected.deinit();
+            return;
+        }
+        // Stale jobs and already accepted results need no chunker settings.
+        // Deserialize only once execution is actually required.
+        const catalogs = plan.plan().artifact_catalogs orelse return error.ArtifactCatalogDrift;
+        const configs = try enrichment_catalog.deserializeCatalog(owned, catalogs.enrichments);
+        config = for (configs) |candidate| {
+            if (candidate.kind == .chunk and std.mem.eql(u8, candidate.name, producer_name)) break candidate;
+        } else return error.ArtifactCatalogDrift;
+        break :capture selected;
+    };
+    defer input.deinit();
+    var desired: []chunker_mod.Chunk = &.{};
+    defer chunker_mod.freeChunks(alloc, desired);
+    var identity = (try @import("../artifact_ids.zig").decodeArtifactRefAlloc(alloc, unit_key)) orelse return error.InvalidDocumentExtractionManifest;
+    defer identity.deinit(alloc);
+    var unit: document_extraction_mod.Unit = undefined;
+    var fingerprint: []const u8 = "";
+    var parsed_unit: ?@import("document_unit_payload.zig").Owned = null;
+    defer if (parsed_unit) |*value| value.deinit();
+    if (input.value) |raw| {
+        parsed_unit = try @import("document_unit_payload.zig").decodeAlloc(alloc, raw, .{ .document = parent_request.doc_key, .producer = parent_request.artifact_name, .unit = identity.unit_id orelse return error.InvalidDocumentExtractionManifest });
+        // Chunk children inherit the accepted unit's range. This is stable
+        // across chunk-count changes and is authenticated by the parent head.
+        // Remote placement needs a routed publication transport before it may
+        // emit locally stamped child payloads.
+        if (parsed_unit.?.route.owner_group_id != 0 or !std.mem.eql(u8, parsed_unit.?.route.route_status, "local_committed")) return error.OnlineMergeArtifactTailsUnsupported;
+        unit = parsed_unit.?.unit;
+        fingerprint = parsed_unit.?.fingerprint;
+        desired = if (config.chunker_json.len != 0)
+            try chunker_mod.chunkTextWithConfigJsonAndProvider(alloc, unit.text, config.chunker_json, runtime.config.chunk_provider)
+        else
+            try chunker_mod.chunkText(alloc, unit.text, config.chunk_size, config.chunk_overlap);
+        document_extraction_mod.applyTranscriptTiming(unit, desired);
+    }
+    const count = @max(input.previous.count, desired.len);
+    if (count >= ordered_publication.max_mutations) return error.ResourceBudgetExceeded;
+    const effects = try owned.alloc(ordered_publication.Mutation, count + 1);
+    var builder = inventory.Builder.init();
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    for (effects[0..count], 0..) |*effect, ordinal| {
+        const key = try internal_keys.documentUnitChunkArtifactKeyAlloc(owned, parent_request.doc_key, producer_name, identity.unit_id.?, @intCast(ordinal));
+        const value = if (ordinal < desired.len) blk: {
+            if (desired[ordinal].chunk_id != ordinal) return error.InvalidBatchRequest;
+            if (!scratch.reset(.retain_capacity)) return error.OutOfMemory;
+            const raw = try buildDocumentUnitChunkPayloadAlloc(scratch.allocator(), parent_request.doc_key, unit_key, fingerprint, producer_name, parent_request.artifact_name, config.source_field, unit, desired[ordinal], true, parsed_unit.?.route);
+            try builder.append(@intCast(ordinal), raw);
+            break :blk try owned.dupe(u8, raw);
+        } else null;
+        effect.* = .{ .family = .document_artifact, .key = key, .value = value, .source_index = 0 };
+    }
+    const manifest = builder.finish().encode();
+    effects[count] = .{ .family = .document_artifact, .key = input.manifest_key, .value = &manifest, .source_index = 0 };
+    try enqueueProducerEffects(runtime, &input.token, effects);
+}
+
 fn appendRuntimeDocumentUnitChunkWrites(
     context: *RuntimeDocumentExtractionMaterializeContext,
     working_alloc: Allocator,
@@ -20726,21 +20999,120 @@ fn buildDocumentUnitChunkPayloadAlloc(
     return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = obj }, .{});
 }
 
+const GraphAssetExpectation = union(enum) {
+    current,
+    observed: ?[]const u8,
+};
+
+fn publishOrderedGraphForRuntime(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, expected_asset: GraphAssetExpectation) !bool {
+    var budget = if (runtime.config.resource_manager orelse runtime.index_manager.resource_manager) |manager|
+        resource_manager_mod.BudgetedAllocator.init(manager, .relational_preparation_working_set, runtime.alloc, 1)
+    else
+        null;
+    defer if (budget) |*tracked| tracked.deinit();
+    const alloc = if (budget) |*tracked| tracked.allocator() else runtime.alloc;
+    return publishOrderedGraphWithAllocator(runtime, alloc, request, expected_asset) catch |err| {
+        if (err == error.OutOfMemory) if (budget) |*tracked| if (tracked.denied()) return error.ResourceBudgetExceeded;
+        return err;
+    };
+}
+
+fn publishOrderedGraphWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, expected_asset: GraphAssetExpectation) !bool {
+    var read = try runtime.store.beginRead();
+    var read_open = true;
+    defer if (read_open) read.abort();
+    if (try ordered_publication.authority(&read) == null) return false;
+    const fence = try requiredRuntimeStoreWriteFence(runtime);
+    try validateRuntimeStoreWriteFenceTxn(runtime, &read, fence);
+    // Graph relations are derived from accepted asset output, not from a
+    // provider's uncommitted response or a legacy source-hash cache.
+    if (request.kind != .asset) return error.OnlineMergeArtifactTailsUnsupported;
+    const artifact_name = requestArtifactName(request);
+    const artifact_key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", artifact_name);
+    defer alloc.free(artifact_key);
+    const extraction = @import("../artifact_extraction_generation.zig");
+    const scope = try @import("../artifact_generation_scope.zig").extractionKeyAlloc(alloc, request.doc_key, artifact_name);
+    defer alloc.free(scope);
+    var borrowed: @import("../artifact_chunk_cursor.zig").BorrowedRead = .{ .read = &read };
+    var selected = try extraction.View(@TypeOf(borrowed)).open(alloc, &borrowed, scope);
+    defer if (selected) |*view| view.deinit();
+    const stored = if (selected) |*view|
+        try view.get(alloc, "root")
+    else
+        read.get(artifact_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+    const proof_key = if (selected) |*view| view.plan.core.head_key else artifact_key;
+    const selected_head = if (selected) |*view| view.plan.core.spec.encode() else undefined;
+    const proof_value: ?[]const u8 = if (selected != null) &selected_head else stored;
+    if (expected_asset == .observed) {
+        const observed = expected_asset.observed;
+        if ((stored == null) != (observed == null)) return error.EnrichmentSourceChanged;
+        if (stored) |value| if (!std.mem.eql(u8, value, observed.?)) return error.EnrichmentSourceChanged;
+    }
+    const context = try @import("../artifact_graph_planning.zig").Context.createWithProof(alloc, &read, request.doc_key, artifact_name, proof_key, proof_value);
+    defer context.destroy();
+    context.ttl_now_ns = runtime.clock.nowRealtimeNs();
+    var window: GeneratedReplayWindow = .{ .alloc = alloc };
+    defer window.deinit();
+    if (stored) |value| {
+        const row_key = try documentSourceStoreKeyWithAllocator(runtime, alloc, request.doc_key);
+        defer alloc.free(row_key);
+        const raw = try read.get(row_key);
+        const logical = try runtime.index_manager.materializeStoredValueAlloc(alloc, row_key, raw);
+        defer alloc.free(logical);
+        try materializeGraphAssetForRuntime(context, request, value, logical, &window);
+    } else try materializeGraphAssetDeleteForRuntime(context, request, &window);
+    // Serialization owns all bytes before the snapshot is released. Queue
+    // admission cannot itself credit replay or coverage; accepted retries use
+    // the same logical-input receipt and skip mutable-state planning.
+    var encoded: std.ArrayList([]u8) = .empty;
+    defer {
+        for (encoded.items) |bytes| alloc.free(bytes);
+        encoded.deinit(alloc);
+    }
+    for (context.commands.items) |command| {
+        const bytes = try @import("../artifact_publication_transport_codec.zig").encodeAlloc(alloc, command);
+        errdefer alloc.free(bytes);
+        try encoded.append(alloc, bytes);
+    }
+    read.abort();
+    read_open = false;
+    if (encoded.items.len == 0) return true;
+    const dispatcher = runtime.artifact_publication_dispatcher orelse return error.ArtifactCatalogDrift;
+    for (encoded.items) |bytes| try dispatcher.submit(context.base.namespace, bytes);
+    return error.ArtifactPublicationPending;
+}
+
 fn materializeGraphAssetForRuntime(
-    runtime: *EnrichmentRuntime,
+    runtime: anytype,
     request: enrichment_types.GeneratedEnrichmentRequest,
     value: []const u8,
     raw_doc: []const u8,
     window: *GeneratedReplayWindow,
 ) !void {
+    if (comptime @TypeOf(runtime) == *EnrichmentRuntime) {
+        if (try publishOrderedGraphForRuntime(runtime, request, .{ .observed = value })) return;
+    }
     if (!runtime.index_manager.hasGraphIndexes()) return;
-    if (runtime.coverage_apply_mutex) |lock| lock.lockExclusive();
-    defer if (runtime.coverage_apply_mutex) |lock| lock.unlockExclusive();
-    var graph_publication = runtime.index_manager.beginGraphPrimaryMutation();
-    defer graph_publication.release();
+    if (comptime @hasField(@typeInfo(@TypeOf(runtime)).pointer.child, "coverage_apply_mutex")) {
+        if (runtime.coverage_apply_mutex) |lock| lock.lockExclusive();
+    }
+    defer if (comptime @hasField(@typeInfo(@TypeOf(runtime)).pointer.child, "coverage_apply_mutex")) {
+        if (runtime.coverage_apply_mutex) |lock| lock.unlockExclusive();
+    };
+    var graph_publication = if (comptime @hasDecl(@typeInfo(@TypeOf(runtime.index_manager)).pointer.child, "beginGraphPrimaryMutation"))
+        runtime.index_manager.beginGraphPrimaryMutation()
+    else
+        .{};
+    defer if (comptime @hasDecl(@typeInfo(@TypeOf(runtime.index_manager)).pointer.child, "beginGraphPrimaryMutation")) graph_publication.release();
     const artifact_name = requestArtifactName(request);
 
     for (runtime.index_manager.graphIndexes()) |graph_entry| {
+        if (comptime @hasDecl(@typeInfo(@TypeOf(runtime)).pointer.child, "accepted")) {
+            if (try runtime.accepted(graph_entry)) continue;
+        }
         const source = runtime.index_manager.graphArtifactSourceForArtifact(graph_entry.config.name, artifact_name) orelse continue;
 
         const edge_limit = graph_asset_state.effectiveEdgeLimit(graph_entry.max_edges_per_document);
@@ -20764,7 +21136,7 @@ fn materializeGraphAssetForRuntime(
             // This is a source candidate, so the visible artifact's lifetime
             // may belong to another source. Reconciliation below restores this
             // exact source state's durable timestamp when it already exists.
-            const ttl_created_ns: u64 = if (graph_entry.ttl_duration_ns != 0) runtime.clock.nowRealtimeNs() else 0;
+            const ttl_created_ns: u64 = if (graph_entry.ttl_duration_ns != 0) (if (comptime @hasField(@typeInfo(@TypeOf(runtime)).pointer.child, "ttl_now_ns")) runtime.ttl_now_ns else runtime.clock.nowRealtimeNs()) else 0;
             const payload = try enrichment_artifact_codec.encodeGraphEdgeWithTtlAlloc(runtime.alloc, null, graph_entry.config.coverage_generation, write.weight, write.created_at, write.updated_at, ttl_created_ns, write.metadata_json);
             var payload_owned = true;
             errdefer if (payload_owned) runtime.alloc.free(payload);
@@ -20868,18 +21240,31 @@ fn materializeGraphAssetForRuntime(
 }
 
 fn materializeGraphAssetDeleteForRuntime(
-    runtime: *EnrichmentRuntime,
+    runtime: anytype,
     request: enrichment_types.GeneratedEnrichmentRequest,
     window: *GeneratedReplayWindow,
 ) !void {
+    if (comptime @TypeOf(runtime) == *EnrichmentRuntime) {
+        if (try publishOrderedGraphForRuntime(runtime, request, .{ .observed = null })) return;
+    }
     if (!runtime.index_manager.hasGraphIndexes()) return;
-    if (runtime.coverage_apply_mutex) |lock| lock.lockExclusive();
-    defer if (runtime.coverage_apply_mutex) |lock| lock.unlockExclusive();
-    var graph_publication = runtime.index_manager.beginGraphPrimaryMutation();
-    defer graph_publication.release();
+    if (comptime @hasField(@typeInfo(@TypeOf(runtime)).pointer.child, "coverage_apply_mutex")) {
+        if (runtime.coverage_apply_mutex) |lock| lock.lockExclusive();
+    }
+    defer if (comptime @hasField(@typeInfo(@TypeOf(runtime)).pointer.child, "coverage_apply_mutex")) {
+        if (runtime.coverage_apply_mutex) |lock| lock.unlockExclusive();
+    };
+    var graph_publication = if (comptime @hasDecl(@typeInfo(@TypeOf(runtime.index_manager)).pointer.child, "beginGraphPrimaryMutation"))
+        runtime.index_manager.beginGraphPrimaryMutation()
+    else
+        .{};
+    defer if (comptime @hasDecl(@typeInfo(@TypeOf(runtime.index_manager)).pointer.child, "beginGraphPrimaryMutation")) graph_publication.release();
     const artifact_name = requestArtifactName(request);
 
     for (runtime.index_manager.graphIndexes()) |graph_entry| {
+        if (comptime @hasDecl(@typeInfo(@TypeOf(runtime)).pointer.child, "accepted")) {
+            if (try runtime.accepted(graph_entry)) continue;
+        }
         const source = runtime.index_manager.graphArtifactSourceForArtifact(graph_entry.config.name, artifact_name) orelse continue;
 
         var deletes = std.ArrayListUnmanaged([]const u8).empty;
@@ -21033,7 +21418,7 @@ const RuntimeGraphEdgeWinners = struct {
 };
 
 fn runtimeGraphStateSourcePriorityAlloc(
-    runtime: *EnrichmentRuntime,
+    runtime: anytype,
     state_key: []const u8,
     state_prefix: []const u8,
     index_name: []const u8,
@@ -21125,8 +21510,20 @@ fn runtimeConsiderGraphEdgeWinner(
     try winners.map.put(alloc, owned_edge, .{ .owner_state_key = owner, .payload = owned_payload, .source_priority = source_priority });
 }
 
+/// Ordered publication plans against its pinned read view. The live worker
+/// reads TTL metadata from the durable artifact store.
+fn runtimeGetGraphTtlStateOptionalAlloc(runtime: anytype, key: []const u8) !?[]u8 {
+    if (comptime @hasField(@typeInfo(@TypeOf(runtime)).pointer.child, "artifact_store")) {
+        if (runtime.artifact_store) |store| return store.get(runtime.alloc, key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+    }
+    return storeGetOptionalAllocWithRetry(runtime, key);
+}
+
 fn runtimeReconcileGlobalGraphEdgeWinner(
-    runtime: *EnrichmentRuntime,
+    runtime: anytype,
     index_name: []const u8,
     expected_generation: u64,
     edge_key: []const u8,
@@ -21170,7 +21567,9 @@ fn runtimeReconcileGlobalGraphEdgeWinner(
         }
     };
     {
-        if (ttl_duration_ns != 0 and runtime.artifact_store == null) return error.InvalidIndexConfig;
+        if (comptime @hasField(@typeInfo(@TypeOf(runtime)).pointer.child, "artifact_store")) {
+            if (ttl_duration_ns != 0 and runtime.artifact_store == null) return error.InvalidIndexConfig;
+        }
         const direct_doc_key = (try internal_keys.decodeDocumentComponentAlloc(alloc, edge_key)) orelse return error.InvalidGraphEdgeArtifact;
         defer alloc.free(direct_doc_key);
         const direct_state_key = try internal_keys.graphDirectStateKeyAlloc(alloc, direct_doc_key, index_name);
@@ -21178,10 +21577,7 @@ fn runtimeReconcileGlobalGraphEdgeWinner(
         const direct_contender_key = try internal_keys.graphGlobalEdgeContenderKeyAlloc(alloc, index_name, expected_generation, edge_key, @intCast(graph_mod.direct_source_priority), direct_state_key);
         defer alloc.free(direct_contender_key);
         if (!runtimeGraphContenderStateChanged(edge_changes, direct_state_key)) {
-            const direct_raw = if (runtime.artifact_store) |artifact_store| artifact_store.get(alloc, direct_contender_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            } else try storeGetOptionalAllocWithRetry(runtime, direct_contender_key);
+            const direct_raw = try runtimeGetGraphTtlStateOptionalAlloc(runtime, direct_contender_key);
             defer if (direct_raw) |raw| alloc.free(raw);
             if (direct_raw) |raw| {
                 const direct = (try graph_edge_contender.decode(raw, expected_generation)) orelse return error.InvalidGraphEdgeContender;
@@ -21207,11 +21603,7 @@ fn runtimeReconcileGlobalGraphEdgeWinner(
     for (edge_changes) |change| {
         const contender_key = try internal_keys.graphGlobalEdgeContenderKeyAlloc(alloc, index_name, expected_generation, edge_key, change.source_priority, change.state_key);
         if (ttl_duration_ns != 0) {
-            const artifact_store = runtime.artifact_store orelse return error.InvalidIndexConfig;
-            const previous_raw = artifact_store.get(alloc, contender_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const previous_raw = try runtimeGetGraphTtlStateOptionalAlloc(runtime, contender_key);
             defer if (previous_raw) |raw| alloc.free(raw);
             if (previous_raw) |raw| {
                 const previous = (try graph_edge_contender.decode(raw, expected_generation)) orelse return error.InvalidGraphEdgeContender;
@@ -21231,13 +21623,9 @@ fn runtimeReconcileGlobalGraphEdgeWinner(
             var retimestamped: ?[]u8 = null;
             defer if (retimestamped) |value| alloc.free(value);
             if (incoming.ttl_created_ns != 0) {
-                const artifact_store = runtime.artifact_store orelse return error.InvalidIndexConfig;
                 const tombstone_key = try internal_keys.graphEdgeTtlTombstoneKeyAlloc(alloc, edge_key, index_name, expected_generation, change.state_key);
                 defer alloc.free(tombstone_key);
-                const tombstone_raw = artifact_store.get(alloc, tombstone_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const tombstone_raw = try runtimeGetGraphTtlStateOptionalAlloc(runtime, tombstone_key);
                 defer if (tombstone_raw) |value| alloc.free(value);
                 const changed_source_revision = if (tombstone_raw) |raw| blk: {
                     const tombstone = try graph_edge_ttl_tombstone.Tombstone.decode(raw);
@@ -21249,10 +21637,7 @@ fn runtimeReconcileGlobalGraphEdgeWinner(
                 const lifetime_key = try internal_keys.graphEdgeTtlLifetimeKeyAlloc(alloc, edge_key, index_name, expected_generation, change.state_key);
                 var lifetime_key_owned = true;
                 errdefer if (lifetime_key_owned) alloc.free(lifetime_key);
-                const lifetime_raw = artifact_store.get(alloc, lifetime_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const lifetime_raw = try runtimeGetGraphTtlStateOptionalAlloc(runtime, lifetime_key);
                 defer if (lifetime_raw) |value| alloc.free(value);
                 var source_timestamp = incoming.ttl_created_ns;
                 if (lifetime_raw != null and !changed_source_revision) {
@@ -21261,10 +21646,7 @@ fn runtimeReconcileGlobalGraphEdgeWinner(
                     source_timestamp = std.mem.readInt(u64, raw[0..8], .big);
                     if (source_timestamp == 0) return error.InvalidGraphEdgeTtlLifetime;
                 } else if (!changed_source_revision) {
-                    const previous_raw = artifact_store.get(alloc, contender_key) catch |err| switch (err) {
-                        error.NotFound => null,
-                        else => return err,
-                    };
+                    const previous_raw = try runtimeGetGraphTtlStateOptionalAlloc(runtime, contender_key);
                     defer if (previous_raw) |value| alloc.free(value);
                     if (previous_raw) |raw| {
                         const previous = (try graph_edge_contender.decode(raw, expected_generation)) orelse return error.InvalidGraphEdgeContender;
@@ -21326,7 +21708,7 @@ fn runtimeReconcileGlobalGraphEdgeWinner(
 }
 
 fn runtimeReconcileGraphEdgeContenders(
-    runtime: *EnrichmentRuntime,
+    runtime: anytype,
     doc_key: []const u8,
     index_name: []const u8,
     state_key: []const u8,
@@ -21352,13 +21734,7 @@ fn runtimeReconcileGraphEdgeContenders(
     for (graph_writes) |write| {
         const tombstone_key = try internal_keys.graphEdgeTtlTombstoneKeyAlloc(alloc, write.key, index_name, expected_generation, state_key);
         defer alloc.free(tombstone_key);
-        const tombstone_raw = if (runtime.artifact_store) |artifact_store|
-            artifact_store.get(alloc, tombstone_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            }
-        else
-            null;
+        const tombstone_raw = try runtimeGetGraphTtlStateOptionalAlloc(runtime, tombstone_key);
         defer if (tombstone_raw) |raw| alloc.free(raw);
         const suppressed = if (tombstone_raw) |raw| blk: {
             const tombstone = try graph_edge_ttl_tombstone.Tombstone.decode(raw);
@@ -22354,6 +22730,293 @@ fn processCachedChunkDenseItems(
     cached_items.clearRetainingCapacity();
 }
 
+/// Ordered producers never use local cache flags as acceptance and never
+/// publish directly to the legacy artifact store. Each bounded provider batch
+/// owns its causal inputs; no storage snapshot spans inference or dispatch.
+fn processOrderedChunkVectorRequest(
+    runtime: *EnrichmentRuntime,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    dense: ?embedder_mod.DenseEmbedder,
+    sparse: ?embedder_mod.SparseEmbedder,
+    consumers: []const []const u8,
+) !bool {
+    var budget = if (runtime.config.resource_manager orelse runtime.index_manager.resource_manager) |manager|
+        resource_manager_mod.BudgetedAllocator.init(manager, .relational_preparation_working_set, runtime.alloc, 1)
+    else
+        null;
+    defer if (budget) |*tracked| tracked.deinit();
+    const alloc = if (budget) |*tracked| tracked.allocator() else runtime.alloc;
+    return processOrderedChunkVectorWithAllocator(runtime, alloc, request, dense, sparse, consumers) catch |err| {
+        if (err == error.OutOfMemory) if (budget) |*tracked| if (tracked.denied()) return error.ResourceBudgetExceeded;
+        return err;
+    };
+}
+
+/// Accepted streams advance through the reserved publication control lane.
+/// No local write/queue acknowledgement can replace the ordered census page.
+/// False requests materialization; true still means replay must remain pending
+/// until upstream closure and obligation discharge have been certified.
+fn driveOrderedChunkVectorCensus(runtime: *EnrichmentRuntime, alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, limits: @import("../artifact_stream_census.zig").Limits) !bool {
+    const progress = @import("../artifact_stream_progress.zig");
+    var encoded: ?[]u8 = null;
+    defer if (encoded) |bytes| alloc.free(bytes);
+    var namespace: ordered_publication.Namespace = undefined;
+    {
+        if (runtime.coverage_apply_mutex) |mutex| mutex.lockShared();
+        defer if (runtime.coverage_apply_mutex) |mutex| mutex.unlockShared();
+        var read = try runtime.store.beginRead();
+        defer read.abort();
+        if (try ordered_publication.authority(&read) == null) return false;
+        if (runtime.config.root_incarnation == 0) return error.DurableRootIncarnationUnavailable;
+        const fence = try requiredRuntimeStoreWriteFence(runtime);
+        try validateRuntimeStoreWriteFenceTxn(runtime, &read, fence);
+        var plan = try runtime.index_manager.acquireWritePlanSnapshot();
+        defer plan.release();
+        var borrowed: @import("../artifact_chunk_cursor.zig").BorrowedRead = .{ .read = &read };
+        var prepared = (progress.prepare(alloc, &borrowed, runtime.config.root_incarnation, request, plan.plan(), limits, null) catch |err| switch (err) {
+            error.ArtifactPublicationPending => return false,
+            else => return err,
+        }) orelse return true;
+        defer prepared.deinit();
+        const command = try progress.commandFor(&prepared, request, plan.plan(), limits);
+        namespace = command.namespace;
+        encoded = try @import("../artifact_publication_transport_codec.zig").encodeAlloc(alloc, command);
+    }
+    // Release the pinned read, immutable plan and ownership/apply fence before
+    // touching the dispatcher. Queue refusal leaves durable progress unchanged.
+    const dispatcher = runtime.artifact_publication_dispatcher orelse return error.ArtifactCatalogDrift;
+    try dispatcher.submit(namespace, encoded.?);
+    return true;
+}
+
+fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, dense: ?embedder_mod.DenseEmbedder, sparse: ?embedder_mod.SparseEmbedder, consumers: []const []const u8) !bool {
+    if (try driveOrderedChunkVectorCensus(runtime, alloc, request, .{})) return error.ArtifactPublicationPending;
+    const publication = @import("../artifact_chunk_vector_publication.zig");
+    const logical = @import("../artifact_chunk_cursor.zig");
+    const Candidates = @import("../artifact_chunk_vector_cursor.zig").Cursor(logical.BorrowedRead);
+    const Item = struct { input: publication.Input, text: ?[]const u8 };
+    const Observation = @import("../artifact_stream_observation.zig").Observation;
+    const checkpoints = @import("../artifact_stream_checkpoint.zig");
+    var observation: ?Observation = null;
+    var checkpoint_key: ?checkpoints.Key = null;
+    var checkpoint_digest: ?ordered_publication.Digest = null;
+    var census: ?checkpoints.State = null;
+    var publishing = false;
+    var after: ?[]u8 = null;
+    defer if (after) |key| alloc.free(key);
+    var scan_after: ?[]u8 = null;
+    defer if (scan_after) |key| alloc.free(key);
+    var logical_after: ?[]u8 = null;
+    defer if (logical_after) |key| alloc.free(key);
+    const max_items = @min(@as(usize, 128), effectiveRequestEmbedBatchItems(runtime, request));
+    const max_bytes = requestEmbedBatchBytes(runtime.alloc, request);
+    while (true) {
+        var items: std.ArrayList(Item) = .empty;
+        defer {
+            for (items.items) |*item| item.input.deinit();
+            items.deinit(alloc);
+        }
+        var exhausted = false;
+        {
+            if (runtime.coverage_apply_mutex) |mutex| mutex.lockShared();
+            defer if (runtime.coverage_apply_mutex) |mutex| mutex.unlockShared();
+            var read = try runtime.store.beginRead();
+            defer read.abort();
+            if (try ordered_publication.authority(&read) == null) {
+                if (after != null) return error.ArtifactCatalogDrift;
+                return false;
+            }
+            const fence = try requiredRuntimeStoreWriteFence(runtime);
+            try validateRuntimeStoreWriteFenceTxn(runtime, &read, fence);
+            var plan = try runtime.index_manager.acquireWritePlanSnapshot();
+            defer plan.release();
+            if (checkpoint_key == null) {
+                if (runtime.config.root_incarnation == 0) return error.DurableRootIncarnationUnavailable;
+                const active = (try ordered_publication.authority(&read)).?;
+                const catalogs = try @import("../artifact_inventory.zig").catalogs(&read);
+                if (!plan.plan().matchesArtifactInventory(catalogs) or !std.mem.eql(u8, &catalogs.digest(), &active.catalog_digest)) return error.ArtifactCatalogDrift;
+                const defined = for (plan.plan().generated_templates) |candidate| {
+                    if (producer_input.sameDefinition(request, candidate)) break true;
+                } else false;
+                if (!defined) return error.EnrichmentSourceChanged;
+                const generation = plan.plan().coverageGeneration(request.index_name) orelse return error.ArtifactCatalogDrift;
+                checkpoint_key = checkpoints.key(active, request.doc_key, .{ .root_incarnation = runtime.config.root_incarnation, .kind = .index, .name = request.index_name, .generation = generation, .artifact = requestEmbeddingName(request) });
+                if (try checkpoints.load(&read, &checkpoint_key.?)) |loaded| {
+                    checkpoint_digest = loaded.digest;
+                    const current = blk: {
+                        loaded.state.observation.requireCurrent(&read, request.doc_key) catch |err| switch (err) {
+                            error.EnrichmentSourceChanged => break :blk false,
+                            else => return err,
+                        };
+                        break :blk true;
+                    };
+                    if (current) {
+                        if (loaded.state.enumerated) return error.ArtifactPublicationPending;
+                        census = loaded.state;
+                        if (loaded.state.cursor.len != 0) after = try alloc.dupe(u8, loaded.state.cursor);
+                        census.?.cursor = after orelse "";
+                        if (loaded.state.scan_cursor.len != 0) scan_after = try alloc.dupe(u8, loaded.state.scan_cursor);
+                        census.?.scan_cursor = scan_after orelse "";
+                        if (loaded.state.logical_scan_cursor.len != 0) logical_after = try alloc.dupe(u8, loaded.state.logical_scan_cursor);
+                        census.?.logical_scan_cursor = logical_after orelse "";
+                        observation = census.?.observation;
+                    }
+                }
+            }
+            if (!publishing) {
+                if (observation) |previous| try previous.requireCurrent(&read, request.doc_key) else observation = try Observation.capture(&read, request.doc_key);
+                if (census == null) census = .{ .root_incarnation = runtime.config.root_incarnation, .observation = observation.? };
+            }
+            var borrowed: logical.BorrowedRead = .{ .read = &read };
+            const captures = (try publication.captureSession(alloc, &read, request, plan.plan())) orelse return error.ArtifactCatalogDrift;
+            var cursor = try Candidates.open(alloc, &borrowed, request.doc_key, request.artifact_name, requestEmbeddingName(request));
+            defer cursor.close();
+            if (after) |key| try cursor.seekAfter(key);
+            if (scan_after) |key| try cursor.resumePhysical(key);
+            if (logical_after) |key| try cursor.resumeLogical(key);
+            var scan_budget: @import("../artifact_chunk_vector_cursor.zig").Budget = .{
+                .max_visits = max_items,
+                .deadline_ns = platform.time.monotonicNs() +| 2 * std.time.ns_per_ms,
+            };
+            var bytes: usize = 0;
+            var examined: usize = 0;
+            while (examined < max_items and (items.items.len == 0 or bytes < max_bytes)) : (examined += 1) {
+                if (examined != 0 and platform.time.monotonicNs() >= scan_budget.deadline_ns.?) break;
+                const key = switch (try cursor.poll(&scan_budget)) {
+                    .member => |key| key,
+                    .end => {
+                        if (!publishing) {
+                            var upstream = try @import("../artifact_chunk_publication.zig").readAcceptedRoot(alloc, &read, request.doc_key, request.artifact_name);
+                            defer upstream.deinit();
+                            try observation.?.observeProof(request.doc_key, upstream.proof);
+                        }
+                        exhausted = true;
+                        if (scan_after) |old| alloc.free(old);
+                        scan_after = null;
+                        if (!publishing) census.?.scan_cursor = "";
+                        if (logical_after) |old| alloc.free(old);
+                        logical_after = null;
+                        if (!publishing) census.?.logical_scan_cursor = "";
+                        break;
+                    },
+                    .logical_yielded => |position| {
+                        const next = try alloc.dupe(u8, position);
+                        if (logical_after) |old| alloc.free(old);
+                        logical_after = next;
+                        if (!publishing) census.?.logical_scan_cursor = next;
+                        break;
+                    },
+                    .yielded => |floor| {
+                        const next = try alloc.dupe(u8, floor);
+                        if (scan_after) |old| alloc.free(old);
+                        scan_after = next;
+                        if (!publishing) census.?.scan_cursor = next;
+                        break;
+                    },
+                };
+                if (scan_after) |old| alloc.free(old);
+                scan_after = null;
+                if (!publishing) census.?.scan_cursor = "";
+                const next_logical = try cursor.checkpointLogicalAlloc(alloc);
+                if (logical_after) |old| alloc.free(old);
+                logical_after = next_logical;
+                const next = try alloc.dupe(u8, key);
+                const previous_after = after;
+                defer if (previous_after) |old| alloc.free(old);
+                after = next;
+                var input = try captures.capture(alloc, key);
+                var input_owned = true;
+                defer if (input_owned) input.deinit();
+                if (try input.token.acceptedProof(alloc, &read)) |accepted| {
+                    var proof = accepted;
+                    defer proof.deinit();
+                    if (!publishing) {
+                        try observation.?.observeProof(request.doc_key, proof.owned.proof);
+                        try census.?.append(next, proof.owned.proof.publication_digest);
+                        census.?.logical_scan_cursor = logical_after.?;
+                    }
+                    continue;
+                }
+                // Publishing changes this document's census witness. Such a
+                // pass may drive work, but cannot also certify completion.
+                publishing = true;
+                const text = if (input.value) |value| try chunkPayloadTextAlloc(input.token.arena.allocator(), value, request.source_field) else null;
+                bytes +|= if (text) |value| value.len else 0;
+                try items.append(alloc, .{ .input = input, .text = text });
+                input_owned = false;
+            }
+            if (!publishing) try observation.?.requireCurrent(&read, request.doc_key);
+        }
+        if (!publishing) {
+            census.?.observation = observation.?;
+            census.?.enumerated = exhausted;
+            var prepared_checkpoint = try checkpoints.Prepared.init(alloc, census.?);
+            defer prepared_checkpoint.deinit();
+            if (runtime.coverage_apply_mutex) |mutex| mutex.lockShared();
+            defer if (runtime.coverage_apply_mutex) |mutex| mutex.unlockShared();
+            const fence = try requiredRuntimeStoreWriteFence(runtime);
+            var write = try runtime.store.beginWrite();
+            var open = true;
+            defer if (open) write.abort();
+            try validateRuntimeStoreWriteFenceTxn(runtime, &write, fence);
+            const staged = try checkpoints.stagePrepared(&write, &checkpoint_key.?, checkpoint_digest, &prepared_checkpoint, request.doc_key);
+            try write.commit();
+            open = false;
+            checkpoint_digest = staged.digest;
+            // Yield accepted-only passes after each durable page. Retry can
+            // resume from member OR ignored-tail progress without holding an
+            // LSM snapshot or monopolizing the replay worker for a full scan.
+            if (!exhausted) return error.ArtifactPublicationPending;
+        }
+        var texts: std.ArrayList([]const u8) = .empty;
+        defer texts.deinit(alloc);
+        for (items.items) |item| if (item.text) |value| try texts.append(alloc, value);
+        var dense_vectors: ?[]const []const f32 = null;
+        var sparse_vectors: ?[]embedder_mod.SparseEmbedding = null;
+        defer if (dense_vectors) |values| embedder_mod.freeDenseEmbeddingBatch(runtime.alloc, values);
+        defer if (sparse_vectors) |values| embedder_mod.freeSparseEmbeddingBatch(runtime.alloc, values);
+        if (texts.items.len != 0) {
+            yieldToInteractiveEmbeds(runtime);
+            const stats = textBatchByteStats(texts.items);
+            noteEmbedBatchStarted(runtime, consumers, texts.items.len, stats.total_bytes, stats.max_bytes);
+            const started = runtime.clock.nowRealtimeNs();
+            var succeeded = false;
+            defer noteEmbedBatchFinished(runtime, consumers, texts.items.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started), succeeded);
+            if (dense) |provider| {
+                dense_vectors = try embedDenseBatchWithRetry(provider, runtime, requestEmbeddingName(request), texts.items, request.expected_dims);
+                if (dense_vectors.?.len != texts.items.len) return error.InvalidEmbeddingResponse;
+            } else if (sparse) |provider| {
+                sparse_vectors = try embedSparseBatchWithRetry(provider, runtime, requestEmbeddingName(request), texts.items);
+                if (sparse_vectors.?.len != texts.items.len) return error.InvalidEmbeddingResponse;
+            } else return error.InvalidArgument;
+            succeeded = true;
+        }
+        defer if (texts.items.len != 0) finishActivePostprocess(runtime);
+        var vector_index: usize = 0;
+        for (items.items) |*item| {
+            const value = if (item.text) |text| blk: {
+                const hash = enrichment_artifact_codec.hashEmbeddingSource(text, request.producer_json);
+                const encoded = if (dense_vectors) |values|
+                    try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, hash, values[vector_index])
+                else
+                    try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(alloc, hash, sparse_vectors.?[vector_index].indices, sparse_vectors.?[vector_index].values);
+                vector_index += 1;
+                break :blk encoded;
+            } else null;
+            defer if (value) |bytes| alloc.free(bytes);
+            enqueueProducerEffects(runtime, &item.input.token, &.{.{ .family = .derived_vector, .key = item.input.output_key, .value = value, .source_index = 0 }}) catch |err| switch (err) {
+                error.ArtifactPublicationPending => {},
+                else => return err,
+            };
+        }
+        if (exhausted) break;
+    }
+    // Enumerating members is not an exact-input stream-completion certificate.
+    // Keep replay/obligations pending until the ordered reconciliation driver
+    // certifies this stream, including a stable empty generation.
+    return error.ArtifactPublicationPending;
+}
+
 fn processMaterializedChunkDenseRequest(
     runtime: *EnrichmentRuntime,
     request: enrichment_types.GeneratedEnrichmentRequest,
@@ -22364,6 +23027,7 @@ fn processMaterializedChunkDenseRequest(
     window: *GeneratedReplayWindow,
     scope: *FailureScope,
 ) !void {
+    if (try processOrderedChunkVectorRequest(runtime, request, dense_embedder, null, consumer_indexes)) return;
     const source_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
     defer runtime.alloc.free(source_key);
     const source_digest = try currentRecordDigest(runtime, source_key);
@@ -22607,6 +23271,7 @@ fn processMaterializedChunkSparseRequest(
     consumer_indexes: []const []const u8,
     window: *GeneratedReplayWindow,
 ) !void {
+    if (try processOrderedChunkVectorRequest(runtime, request, null, sparse_embedder, consumer_indexes)) return;
     const max_window_items = generatedReplayWindowItems();
     const max_batch_items = effectiveRequestEmbedBatchItems(runtime, request);
     const max_batch_bytes = requestEmbedBatchBytes(runtime.alloc, request);
@@ -22776,8 +23441,23 @@ fn collectPlainDenseBatchItem(
     defer runtime.alloc.free(doc_store_key);
     const raw = (try storeGetOptionalDocumentAllocWithRetry(runtime, doc_store_key)) orelse return null;
     defer runtime.alloc.free(raw);
+    var input = try captureProducerInput(runtime, request, doc_store_key, raw);
+    errdefer if (input) |*token| token.deinit();
+    if (input) |*token| {
+        if (try producerInputAccepted(runtime, token)) {
+            token.deinit();
+            return null;
+        }
+    }
 
     const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse {
+        if (input) |*token| {
+            const key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
+            defer runtime.alloc.free(key);
+            try enqueueProducerArtifact(runtime, token, key, null);
+            token.deinit();
+            return null;
+        }
         try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
         return null;
     };
@@ -22786,7 +23466,7 @@ fn collectPlainDenseBatchItem(
 
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
     errdefer runtime.alloc.free(artifact_key);
-    if (try shouldSkipEmbeddingArtifact(runtime, artifact_key, source_hash)) {
+    if (input == null and try shouldSkipEmbeddingArtifact(runtime, artifact_key, source_hash)) {
         if (try appendCachedDenseEmbeddingToWindow(runtime, window, request.doc_key, artifact_key, consumer_indexes)) {
             try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
         }
@@ -22801,6 +23481,7 @@ fn collectPlainDenseBatchItem(
         .source_hash = source_hash,
         .artifact_key = artifact_key,
         .source_record_digest = sourceRecordDigest(raw),
+        .producer_input = input,
     };
 }
 
@@ -22851,8 +23532,8 @@ fn flushPlainDenseItems(
         runtime.alloc.free(write.source_key);
         runtime.alloc.free(write.value);
     };
-    for (items, vectors, 0..) |item, vector, i| {
-        const source_key = try internal_keys.documentKeyAlloc(runtime.alloc, item.request.doc_key);
+    for (items, vectors, 0..) |*item, vector, i| {
+        const source_key = try documentSourceStoreKeyAlloc(runtime, item.request.doc_key);
         errdefer runtime.alloc.free(source_key);
         writes[i] = .{
             .key = item.artifact_key,
@@ -22861,6 +23542,7 @@ fn flushPlainDenseItems(
             .source_digest = item.source_record_digest,
             .doc_key = item.request.doc_key,
             .source_sequence = item.request.sequence,
+            .ordered_input = if (item.producer_input) |*token| token else null,
         };
         initialized += 1;
     }
@@ -22905,7 +23587,97 @@ const GuardedEmbeddingWrite = struct {
     parent_key: ?[]const u8 = null,
     doc_key: []const u8,
     source_sequence: u64,
+    ordered_input: ?*const producer_input.Token = null,
 };
+
+fn materializeProducerInput(ctx: *anyopaque, alloc: Allocator, key: []const u8, raw: []const u8) ![]u8 {
+    const manager: *index_manager_mod.IndexManager = @ptrCast(@alignCast(ctx));
+    return manager.materializeStoredValueAlloc(alloc, key, raw);
+}
+
+fn captureAssetProducerContext(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, source_key: []const u8, logical_input: ?[]const u8) !?@import("../artifact_producer_context.zig").Token {
+    if (runtime.coverage_apply_mutex) |mutex| mutex.lockShared();
+    defer if (runtime.coverage_apply_mutex) |mutex| mutex.unlockShared();
+    var read = try runtime.store.beginProbe();
+    defer read.abort();
+    if (try ordered_publication.authority(&read) == null) return null;
+    var plan = try runtime.index_manager.acquireWritePlanSnapshot();
+    defer plan.release();
+    return @import("../artifact_asset_publication.zig").capture(runtime.alloc, &read, request, plan.plan(), source_key, logical_input, .{ .ptr = runtime.index_manager, .materialize = materializeProducerInput });
+}
+
+fn finishAcceptedAssetGraph(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest) !void {
+    _ = try publishOrderedGraphForRuntime(runtime, request, .current);
+}
+
+fn enqueueAssetProducerOutput(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, token: *@import("../artifact_producer_context.zig").Token, key: []const u8, payload: ?[]const u8) !void {
+    try enqueueProducerEffects(runtime, token, &.{.{ .family = .document_artifact, .key = key, .value = payload, .source_index = 0 }});
+    // Acceptance can race enqueue, including a deferred provider callback.
+    // Consume the accepted bytes, never this callback's uncommitted response.
+    try finishAcceptedAssetGraph(runtime, request);
+}
+
+fn enqueueProducerEffects(runtime: *EnrichmentRuntime, token: *@import("../artifact_producer_context.zig").Token, effects: []const ordered_publication.Mutation) !void {
+    {
+        const fence = try requiredRuntimeStoreWriteFence(runtime);
+        var read = try runtime.store.beginProbe();
+        defer read.abort();
+        try validateRuntimeStoreWriteFenceTxn(runtime, &read, fence);
+        try token.validateInputs(runtime.alloc, &read);
+        if (try token.accepted(runtime.alloc, &read)) return;
+        try token.validate(runtime.alloc, &read);
+    }
+    const dispatcher = runtime.artifact_publication_dispatcher orelse return error.ArtifactCatalogDrift;
+    const command = try token.command(effects);
+    try command.validate(runtime.alloc);
+    const bytes = try @import("../artifact_publication_transport_codec.zig").encodeAlloc(runtime.alloc, command);
+    defer runtime.alloc.free(bytes);
+    try dispatcher.submit(token.namespace, bytes);
+    // Provider completion is not owner acceptance; hold replay progress until
+    // the next attempt observes the durable semantic receipt.
+    return error.ArtifactPublicationPending;
+}
+
+fn captureProducerInput(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, source_key: []const u8, logical_input: []const u8) !?producer_input.Token {
+    if (runtime.coverage_apply_mutex) |mutex| mutex.lockShared();
+    defer if (runtime.coverage_apply_mutex) |mutex| mutex.unlockShared();
+    var read = try runtime.store.beginProbe();
+    defer read.abort();
+    if (try ordered_publication.authority(&read) == null) return null;
+    var plan = try runtime.index_manager.acquireWritePlanSnapshot();
+    defer plan.release();
+    return producer_input.capture(runtime.alloc, &read, runtime.config.root_incarnation, request, plan.plan(), source_key, logical_input, .{
+        .ptr = runtime.index_manager,
+        .materialize = materializeProducerInput,
+    });
+}
+
+fn producerInputAccepted(runtime: *EnrichmentRuntime, token: *const producer_input.Token) !bool {
+    var read = try runtime.store.beginProbe();
+    defer read.abort();
+    return token.accepted(&read);
+}
+
+fn enqueueProducerArtifact(runtime: *EnrichmentRuntime, token: *const producer_input.Token, key: []const u8, payload: ?[]const u8) !void {
+    {
+        const fence = try requiredRuntimeStoreWriteFence(runtime);
+        var read = try runtime.store.beginProbe();
+        defer read.abort();
+        // Lease time is ingress-only authority. It is intentionally absent
+        // from the immutable command and from replicated apply validation.
+        try validateRuntimeStoreWriteFenceTxn(runtime, &read, fence);
+    }
+    if (try producerInputAccepted(runtime, token)) return;
+    const dispatcher = runtime.artifact_publication_dispatcher orelse return error.ArtifactCatalogDrift;
+    const command = token.command(&.{.{ .family = .base_vector, .key = key, .value = payload, .source_index = 0 }});
+    try command.validate(runtime.alloc);
+    const bytes = try @import("../artifact_publication_transport_codec.zig").encodeAlloc(runtime.alloc, command);
+    defer runtime.alloc.free(bytes);
+    // The callback owns a bounded clone. Never hold a store/catalog/apply lock
+    // across it, and never credit coverage merely because enqueue succeeded.
+    try dispatcher.submit(token.namespace, bytes);
+    return error.ArtifactPublicationPending;
+}
 
 fn embeddingSourceStillCurrent(alloc: Allocator, txn: anytype, write: GuardedEmbeddingWrite) !bool {
     // DB document identities use the same replay sequence as the request.
@@ -22936,6 +23708,7 @@ fn storeGuardedEmbeddingsTxn(runtime: *EnrichmentRuntime, txn: anytype, writes: 
     // Process counters with each put so duplicate keys do not inflate counts.
     @memset(accepted, false);
     for (writes, 0..) |write, i| {
+        try @import("../artifact_publication.zig").requireLegacyMaterialization(txn, write.key);
         if (!try embeddingSourceStillCurrent(runtime.alloc, txn, write)) continue;
         const pair = KVPair{ .key = write.key, .value = write.value };
         try updateDenseArtifactTargetCountersTxn(runtime, txn, &.{pair}, &.{});
@@ -22949,6 +23722,25 @@ fn storeGuardedEmbeddingsTxn(runtime: *EnrichmentRuntime, txn: anytype, writes: 
 }
 
 fn storeGuardedEmbeddings(runtime: *EnrichmentRuntime, writes: []const GuardedEmbeddingWrite, accepted: []bool) !void {
+    if (writes.len != 0) for (writes) |write| {
+        if ((write.ordered_input != null) != (writes[0].ordered_input != null)) return error.ArtifactCatalogDrift;
+    };
+    var ordered_pending = false;
+    for (writes, 0..) |write, i| if (write.ordered_input) |token| {
+        enqueueProducerArtifact(runtime, token, write.key, write.value) catch |err| switch (err) {
+            error.ArtifactPublicationPending => ordered_pending = true,
+            else => return err,
+        };
+        accepted[i] = false; // Native publication already owns projection/coverage.
+    };
+    // Batches are homogeneous under their pinned catalog generation. Reject
+    // a mixed caller rather than sending ordered effects through local writes.
+    if (writes.len != 0 and writes[0].ordered_input != null) {
+        for (writes) |write| if (write.ordered_input == null) return error.ArtifactCatalogDrift;
+        if (ordered_pending) return error.ArtifactPublicationPending;
+        return;
+    }
+    for (writes) |write| if (write.ordered_input != null) return error.ArtifactCatalogDrift;
     if (runtime.artifact_store) |store| {
         var txn = try store.beginWriteTxn();
         errdefer txn.abort();
@@ -23953,6 +24745,120 @@ const PdfEmbeddingWindowPrefetch = struct {
     }
 };
 
+/// Returns false only for the legacy authority. Ordered producers never fall
+/// back to owner-local artifact writes when inventory or admission is pending.
+fn processOrderedChunkText(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry)) !bool {
+    const inventory = @import("../artifact_chunk_manifest.zig");
+    const Captured = struct {
+        token: @import("../artifact_producer_context.zig").Token,
+        previous: inventory.Manifest,
+        source_digest: ?[32]u8,
+        persist: bool,
+        accepted: bool,
+    };
+    var captured: Captured = blk: {
+        if (runtime.coverage_apply_mutex) |mutex| mutex.lockShared();
+        defer if (runtime.coverage_apply_mutex) |mutex| mutex.unlockShared();
+        var read = try runtime.store.beginProbe();
+        defer read.abort();
+        if (try ordered_publication.authority(&read) == null) return false;
+        // Unit-derived streams have a separate scope/manifest lifecycle.
+        if (request.upstream_artifact_name.len != 0) return error.OnlineMergeArtifactTailsUnsupported;
+        var plan = try runtime.index_manager.acquireWritePlanSnapshot();
+        defer plan.release();
+        const source_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
+        defer runtime.alloc.free(source_key);
+        const stored = read.get(source_key) catch |err| if (err == error.NotFound) null else return err;
+        const logical = if (stored) |raw| try materializeProducerInput(runtime.index_manager, runtime.alloc, source_key, raw) else null;
+        defer if (logical) |raw| runtime.alloc.free(raw);
+        var token = (try @import("../artifact_asset_publication.zig").capture(runtime.alloc, &read, request, plan.plan(), source_key, logical, .{ .ptr = runtime.index_manager, .materialize = materializeProducerInput })) orelse return error.ArtifactCatalogDrift;
+        errdefer token.deinit();
+        const manifest_key = token.preconditions.items[0].key;
+        const previous = try inventory.Manifest.decode(try read.get(manifest_key));
+        const accepted = try token.accepted(runtime.alloc, &read);
+        // Resolve consumers from the same immutable catalog as the token,
+        // never from a live target lookup after provider execution.
+        var scratch = std.heap.ArenaAllocator.init(runtime.alloc);
+        defer scratch.deinit();
+        const catalogs = plan.plan().artifact_catalogs orelse return error.ArtifactCatalogDrift;
+        const indexes: []const types.IndexConfig = if (catalogs.indexes.len == 0) &.{} else try index_manager_mod.deserializeCatalog(scratch.allocator(), catalogs.indexes);
+        const include_default = request.full_text_index or try chunking_types_mod.parseHasFullTextIndexFromSlice(runtime.alloc, request.chunker_json);
+        const has_text = for (indexes) |index| {
+            if (index.kind != .full_text) continue;
+            const consumer = try index_manager_mod.TextArtifactConsumer.init(scratch.allocator(), index.config_json);
+            if (consumer.consumes(requestArtifactName(request), include_default)) break true;
+        } else false;
+        const persist = try shouldStoreChunkArtifacts(runtime.alloc, request, has_text);
+        break :blk .{ .token = token, .previous = previous, .source_digest = if (logical) |raw| sourceRecordDigest(raw) else null, .persist = persist, .accepted = accepted };
+    };
+    defer captured.token.deinit();
+    if (captured.accepted) return true;
+    // Provider calls hold no storage snapshot or apply lock. Reusing a cached
+    // chunk result still requires the exact logical primary sampled above.
+    const source = try getOrCreateRequestChunks(runtime, request, cache);
+    if (!std.meta.eql(source.source_record_digest, captured.source_digest)) return error.EnrichmentSourceChanged;
+    const desired = if (captured.persist) source.chunks else &.{};
+    const member_count = @max(captured.previous.count, desired.len);
+    // Larger sets require staged generations, not partial visible publication.
+    if (member_count >= ordered_publication.max_mutations) return error.ResourceBudgetExceeded;
+    var rows = try inventory.PreparedRows.init(runtime.alloc, request.doc_key, requestArtifactName(request), request.source_field, desired);
+    defer rows.deinit();
+    const effects = try runtime.alloc.alloc(ordered_publication.Mutation, member_count + 1);
+    defer runtime.alloc.free(effects);
+    @memcpy(effects[0..rows.mutations.len], rows.mutations);
+    const owned = captured.token.arena.allocator();
+    for (rows.mutations.len..member_count) |ordinal| effects[ordinal] = .{
+        .family = .document_artifact,
+        .key = try internal_keys.chunkArtifactKeyAlloc(owned, request.doc_key, requestArtifactName(request), @intCast(ordinal)),
+        .value = null,
+        .source_index = 0,
+    };
+    const manifest = rows.manifest.?.encode();
+    effects[member_count] = .{ .family = .document_artifact, .key = captured.token.preconditions.items[0].key, .value = &manifest, .source_index = 0 };
+    try enqueueProducerEffects(runtime, &captured.token, effects);
+    return true;
+}
+
+fn driveOrderedChunkInventory(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest) !void {
+    return driveOrderedChunkInventoryScoped(runtime, request, null);
+}
+
+fn driveOrderedChunkInventoryScoped(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, unit: ?[]const u8) !void {
+    // Reconstruction hashes the physical stream. Logical cursor wrappers may
+    // hydrate an unrelated vector on lookahead and pollute the query cache.
+    const store = runtime.artifact_store orelse return error.OnlineMergeArtifactTailsUnsupported;
+    var budget = if (runtime.config.resource_manager orelse runtime.index_manager.resource_manager) |manager|
+        resource_manager_mod.BudgetedAllocator.init(manager, .shard_transition_working_set, runtime.alloc, 1)
+    else
+        null;
+    defer if (budget) |*tracked| tracked.deinit();
+    const alloc = if (budget) |*tracked| tracked.allocator() else runtime.alloc;
+    var encoded: ?[]u8 = null;
+    defer if (encoded) |bytes| alloc.free(bytes);
+    var namespace: ordered_publication.Namespace = undefined;
+    {
+        if (runtime.coverage_apply_mutex) |mutex| mutex.lockShared();
+        defer if (runtime.coverage_apply_mutex) |mutex| mutex.unlockShared();
+        var read = try store.beginReadTxnWithBlockCacheAdmission(.transient);
+        defer read.abort();
+        var plan = try runtime.index_manager.acquireWritePlanSnapshot();
+        defer plan.release();
+        var prepared = (@import("../artifact_chunk_inventory_progress.zig").prepare(alloc, &read, runtime.config.root_incarnation, request, plan.plan(), unit, .{}, null) catch |err| {
+            if (err == error.OutOfMemory) if (budget) |*tracked| if (tracked.denied()) return error.ResourceBudgetExceeded;
+            return err;
+        }) orelse return;
+        defer prepared.deinit();
+        const command = prepared.command(requestArtifactName(request));
+        namespace = command.namespace;
+        encoded = @import("../artifact_publication_transport_codec.zig").encodeAlloc(alloc, command) catch |err| {
+            if (err == error.OutOfMemory) if (budget) |*tracked| if (tracked.denied()) return error.ResourceBudgetExceeded;
+            return err;
+        };
+    }
+    const dispatcher = runtime.artifact_publication_dispatcher orelse return error.ArtifactCatalogDrift;
+    try dispatcher.submit(namespace, encoded.?);
+}
+
 fn processChunkText(
     runtime: *EnrichmentRuntime,
     request: enrichment_types.GeneratedEnrichmentRequest,
@@ -23960,6 +24866,16 @@ fn processChunkText(
     window: *GeneratedReplayWindow,
 ) !void {
     if (request.chunk_size == 0 and request.chunker_json.len == 0) return;
+    const ordered = processOrderedChunkText(runtime, request, chunk_cache) catch |err| {
+        // Inventory reconstruction is control-plane progress, not a failed
+        // provider invocation or permission to advance the replay cursor.
+        if (err == error.ArtifactCoverageBaselinePending) {
+            try driveOrderedChunkInventory(runtime, request);
+            return error.ArtifactPublicationPending;
+        }
+        return err;
+    };
+    if (ordered) return;
 
     const chunks = (try getOrCreateRequestChunks(runtime, request, chunk_cache)).chunks;
 
@@ -23973,6 +24889,16 @@ fn processChunkText(
     }
 
     const persist_chunks = try shouldStoreChunkArtifacts(runtime.alloc, request, text_indexes.len != 0);
+    // Prepare before cleanup as well as upserts. No ephemeral payload is
+    // encoded when neither storage nor a text consumer needs one.
+    var prepared_chunks: ?@import("../artifact_chunk_manifest.zig").PreparedRows = if (chunks.len != 0 and (persist_chunks or text_indexes.len != 0))
+        if (persist_chunks)
+            try @import("../artifact_chunk_manifest.zig").PreparedRows.init(runtime.alloc, request.doc_key, artifact_name, request.source_field, chunks)
+        else
+            try @import("../artifact_chunk_manifest.zig").PreparedRows.initProjection(runtime.alloc, request.doc_key, artifact_name, request.source_field, chunks)
+    else
+        null;
+    defer if (prepared_chunks) |*prepared| prepared.deinit();
     // Stored chunk rows and derived embeddings have independent lifecycles.
     // An ephemeral chunker intentionally wants no chunk records, but its
     // deterministic virtual chunk identities still own the embedding
@@ -24007,46 +24933,9 @@ fn processChunkText(
     }
 
     if (persist_chunks) {
-        var writes = try runtime.alloc.alloc(KVPair, chunks.len);
-        defer {
-            for (writes) |write| runtime.alloc.free(@constCast(write.key));
-            runtime.alloc.free(writes);
-        }
-        var payloads = try runtime.alloc.alloc([]u8, chunks.len);
-        defer {
-            for (payloads) |payload| runtime.alloc.free(payload);
-            runtime.alloc.free(payloads);
-        }
-
-        for (chunks, 0..) |chunk, i| {
-            const key = try internal_keys.chunkArtifactKeyAlloc(runtime.alloc, request.doc_key, artifact_name, @intCast(chunk.chunk_id));
-            defer runtime.alloc.free(key);
-            writes[i] = .{
-                .key = try runtime.alloc.dupe(u8, key),
-                .value = undefined,
-            };
-            var obj = std.json.ObjectMap.empty;
-            errdefer {
-                var it = obj.iterator();
-                while (it.next()) |entry| {
-                    runtime.alloc.free(entry.key_ptr.*);
-                    freeJsonValue(runtime.alloc, entry.value_ptr);
-                }
-                obj.deinit(runtime.alloc);
-            }
-            try obj.put(runtime.alloc, try runtime.alloc.dupe(u8, "_parent_doc_key"), .{ .string = try runtime.alloc.dupe(u8, request.doc_key) });
-            try obj.put(runtime.alloc, try runtime.alloc.dupe(u8, "_artifact_name"), .{ .string = try runtime.alloc.dupe(u8, artifact_name) });
-            try obj.put(runtime.alloc, try runtime.alloc.dupe(u8, "_source_field"), .{ .string = try runtime.alloc.dupe(u8, request.source_field) });
-            try chunk_artifact_mod.appendArtifactFields(runtime.alloc, &obj, request.source_field, chunk, true);
-            payloads[i] = try std.json.Stringify.valueAlloc(runtime.alloc, std.json.Value{ .object = obj }, .{});
-            var it = obj.iterator();
-            while (it.next()) |entry| {
-                runtime.alloc.free(entry.key_ptr.*);
-                freeJsonValue(runtime.alloc, entry.value_ptr);
-            }
-            obj.deinit(runtime.alloc);
-            writes[i].value = payloads[i];
-        }
+        const writes = try runtime.alloc.alloc(KVPair, chunks.len);
+        defer runtime.alloc.free(writes);
+        for (prepared_chunks.?.mutations, writes) |row, *write| write.* = .{ .key = row.key, .value = row.value.? };
 
         try storePutBatchWithRetry(runtime, writes, &.{});
         for (writes) |write| {
@@ -24080,40 +24969,29 @@ fn processChunkText(
         if (docs.len > 0) runtime.alloc.free(docs);
     }
 
-    for (chunks) |chunk| {
+    for (chunks, 0..) |chunk, ordinal| {
         if (!chunk.isText()) continue;
-        const key = try internal_keys.chunkArtifactKeyAlloc(runtime.alloc, request.doc_key, artifact_name, @intCast(chunk.chunk_id));
-        defer runtime.alloc.free(key);
+        const row = prepared_chunks.?.takeRow(ordinal);
+        const key = row.key;
+        errdefer runtime.alloc.free(key);
+        const payload = row.value.?;
+        errdefer runtime.alloc.free(payload);
         var targets = try runtime.alloc.alloc(derived_types.DerivedTargetRef, text_indexes.len);
+        var initialized_targets: usize = 0;
+        errdefer {
+            for (targets[0..initialized_targets]) |target| runtime.alloc.free(@constCast(target.index_name));
+            runtime.alloc.free(targets);
+        }
         for (text_indexes, 0..) |index_name, j| {
             targets[j] = .{
                 .kind = .full_text,
                 .index_name = try runtime.alloc.dupe(u8, index_name),
             };
+            initialized_targets += 1;
         }
-        var obj = std.json.ObjectMap.empty;
-        errdefer {
-            var it = obj.iterator();
-            while (it.next()) |entry| {
-                runtime.alloc.free(entry.key_ptr.*);
-                freeJsonValue(runtime.alloc, entry.value_ptr);
-            }
-            obj.deinit(runtime.alloc);
-        }
-        try obj.put(runtime.alloc, try runtime.alloc.dupe(u8, "_parent_doc_key"), .{ .string = try runtime.alloc.dupe(u8, request.doc_key) });
-        try obj.put(runtime.alloc, try runtime.alloc.dupe(u8, "_artifact_name"), .{ .string = try runtime.alloc.dupe(u8, artifact_name) });
-        try obj.put(runtime.alloc, try runtime.alloc.dupe(u8, "_source_field"), .{ .string = try runtime.alloc.dupe(u8, request.source_field) });
-        try chunk_artifact_mod.appendArtifactFields(runtime.alloc, &obj, request.source_field, chunk, true);
-        const payload = try std.json.Stringify.valueAlloc(runtime.alloc, std.json.Value{ .object = obj }, .{});
-        var it = obj.iterator();
-        while (it.next()) |entry| {
-            runtime.alloc.free(entry.key_ptr.*);
-            freeJsonValue(runtime.alloc, entry.value_ptr);
-        }
-        obj.deinit(runtime.alloc);
 
         docs[initialized_docs] = .{
-            .key = try runtime.alloc.dupe(u8, key),
+            .key = key,
             .action = .upsert,
             .cleaned_value = payload,
             .targets = targets,
@@ -25354,6 +26232,9 @@ fn processDenseEmbedding(
     defer runtime.alloc.free(doc_store_key);
     const raw = (try storeGetOptionalDocumentAllocWithRetry(runtime, doc_store_key)) orelse return;
     defer runtime.alloc.free(raw);
+    var input = try captureProducerInput(runtime, request, doc_store_key, raw);
+    defer if (input) |*token| token.deinit();
+    if (input) |*token| if (try producerInputAccepted(runtime, token)) return;
 
     if (request.source_template.len > 0 and dense_embedder.supportsParts()) {
         const source_parts = try renderSourceParts(
@@ -25379,6 +26260,7 @@ fn processDenseEmbedding(
                 .source_record_digest = sourceRecordDigest(raw),
                 .source_sequence = request.sequence,
                 .vector = vector,
+                .ordered_input = if (input) |*token| token else null,
             })) return;
             try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
             const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
@@ -25392,11 +26274,21 @@ fn processDenseEmbedding(
             try appendOwnedDenseEmbeddingsToWindow(runtime, window, &embeddings);
             return;
         }
+        if (input) |*token| {
+            const key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
+            defer runtime.alloc.free(key);
+            return enqueueProducerArtifact(runtime, token, key, null);
+        }
         try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
         return;
     }
 
     const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse {
+        if (input) |*token| {
+            const key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
+            defer runtime.alloc.free(key);
+            return enqueueProducerArtifact(runtime, token, key, null);
+        }
         try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
         return;
     };
@@ -25405,7 +26297,7 @@ fn processDenseEmbedding(
 
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
     defer runtime.alloc.free(artifact_key);
-    if (try shouldSkipEmbeddingArtifact(runtime, artifact_key, source_hash)) {
+    if (input == null and try shouldSkipEmbeddingArtifact(runtime, artifact_key, source_hash)) {
         if (try appendCachedDenseEmbeddingToWindow(runtime, window, request.doc_key, artifact_key, consumer_indexes)) {
             try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
         }
@@ -25425,6 +26317,7 @@ fn processDenseEmbedding(
         .source_record_digest = sourceRecordDigest(raw),
         .source_sequence = request.sequence,
         .vector = vector,
+        .ordered_input = if (input) |*token| token else null,
     })) return;
     try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
 
@@ -25495,8 +26388,16 @@ fn processSparseEmbedding(
     defer runtime.alloc.free(doc_store_key);
     const raw = (try storeGetOptionalDocumentAllocWithRetry(runtime, doc_store_key)) orelse return;
     defer runtime.alloc.free(raw);
+    var input = try captureProducerInput(runtime, request, doc_store_key, raw);
+    defer if (input) |*token| token.deinit();
+    if (input) |*token| if (try producerInputAccepted(runtime, token)) return;
 
     const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse {
+        if (input) |*token| {
+            const key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
+            defer runtime.alloc.free(key);
+            return enqueueProducerArtifact(runtime, token, key, null);
+        }
         try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
         return;
     };
@@ -25505,7 +26406,7 @@ fn processSparseEmbedding(
 
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
     defer runtime.alloc.free(artifact_key);
-    if (try shouldSkipEmbeddingArtifact(runtime, artifact_key, source_hash)) {
+    if (input == null and try shouldSkipEmbeddingArtifact(runtime, artifact_key, source_hash)) {
         if (try appendCachedSparseEmbeddingToWindow(runtime, window, request.doc_key, artifact_key, consumer_indexes)) {
             try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
         }
@@ -25521,6 +26422,11 @@ fn processSparseEmbedding(
     noteEmbedBatchFinished(runtime, consumer_indexes, 1, source_text.len, source_text.len, elapsedNsSince(runtime, embed_started_ns), true);
     defer finishActivePostprocess(runtime);
     defer sparse.deinit(runtime.alloc);
+    if (input) |*token| {
+        const payload = try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(runtime.alloc, source_hash, sparse.indices, sparse.values);
+        defer runtime.alloc.free(payload);
+        return enqueueProducerArtifact(runtime, token, artifact_key, payload);
+    }
     try writeSparseEmbeddingArtifact(runtime, request.doc_key, embedding_artifact_name, source_hash, sparse.indices, sparse.values);
     try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
 
@@ -25880,6 +26786,7 @@ const EmbeddingArtifactWrite = struct {
     source_record_digest: [32]u8,
     source_sequence: u64,
     vector: []const f32,
+    ordered_input: ?*const producer_input.Token = null,
 };
 
 fn writeEmbeddingArtifact(runtime: *EnrichmentRuntime, write: EmbeddingArtifactWrite) !bool {
@@ -25892,8 +26799,12 @@ fn writeEmbeddingArtifact(runtime: *EnrichmentRuntime, write: EmbeddingArtifactW
     defer runtime.alloc.free(key);
     const payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(runtime.alloc, write.source_hash, write.vector);
     defer runtime.alloc.free(payload);
+    if (write.ordered_input) |token| {
+        try enqueueProducerArtifact(runtime, token, key, payload);
+        return false;
+    }
 
-    const source_key = try internal_keys.documentKeyAlloc(runtime.alloc, write.parent_doc_key);
+    const source_key = try documentSourceStoreKeyAlloc(runtime, write.parent_doc_key);
     defer runtime.alloc.free(source_key);
     var accepted: [1]bool = undefined;
     try storeGuardedEmbeddingsWithRetry(runtime, &.{.{
@@ -26127,11 +27038,7 @@ const DocumentExtractionUnitDescriptor = struct {
     fingerprint: []const u8,
 };
 
-const DocumentExtractionRangeRoute = struct {
-    range_id: []const u8,
-    route_status: []const u8 = "local_committed",
-    owner_group_id: u64 = 0,
-};
+const DocumentExtractionRangeRoute = @import("document_unit_payload.zig").Route;
 
 const RuntimeDocumentExtractionPreviousState = struct {
     unit_keys: []const []const u8 = &.{},
@@ -26198,20 +27105,11 @@ fn scanRuntimeDocumentExtractionPreviousStateFromStore(
     var out = RuntimeDocumentExtractionPreviousState{};
     errdefer out.deinit(runtime.alloc);
 
-    var unit_keys = std.ArrayListUnmanaged([]const u8).empty;
-    errdefer {
-        for (unit_keys.items) |key| runtime.alloc.free(@constCast(key));
-        unit_keys.deinit(runtime.alloc);
-    }
-    const unit_prefix = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, doc_key, "asset", artifact_name);
-    defer runtime.alloc.free(unit_prefix);
-    const unit_rows = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, unit_prefix);
-    defer backend_scan.freeResults(runtime.alloc, unit_rows);
-    for (unit_rows) |entry| {
-        if (std.mem.eql(u8, entry.key, unit_prefix)) continue;
-        if (internal_keys.isDerivedEmbeddingArtifactKey(entry.key)) continue;
-        try unit_keys.append(runtime.alloc, try runtime.alloc.dupe(u8, entry.key));
-    }
+    var read = try runtime.store.beginRead();
+    defer read.abort();
+    const logical_chunks = @import("../artifact_chunk_cursor.zig");
+    var borrowed: logical_chunks.BorrowedRead = .{ .read = &read };
+    out.unit_keys = try @import("../artifact_extraction_generation.zig").unitKeysAlloc(runtime.alloc, &borrowed, doc_key, artifact_name);
 
     var chunk_keys = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
@@ -26221,19 +27119,19 @@ fn scanRuntimeDocumentExtractionPreviousStateFromStore(
     for (runtime.index_manager.enrichments.items) |entry| {
         if (entry.kind != .chunk) continue;
         if (!std.mem.eql(u8, entry.source_artifact_name, artifact_name)) continue;
-        const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, doc_key, "chunk", entry.name);
-        defer runtime.alloc.free(chunk_prefix);
-        const chunk_rows = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, chunk_prefix);
-        defer backend_scan.freeResults(runtime.alloc, chunk_rows);
-        for (chunk_rows) |row| {
-            if (!internal_keys.isChunkArtifactRecordKey(row.key)) continue;
-            try chunk_keys.append(runtime.alloc, try runtime.alloc.dupe(u8, row.key));
+        var cursor = try logical_chunks.Cursor(logical_chunks.BorrowedRead).openNamed(runtime.alloc, &borrowed, doc_key, entry.name);
+        defer cursor.close();
+        while (try cursor.next()) |row| {
+            const key = try runtime.alloc.dupe(u8, row.key);
+            chunk_keys.append(runtime.alloc, key) catch |err| {
+                runtime.alloc.free(key);
+                return err;
+            };
         }
     }
 
-    out.unit_keys = try unit_keys.toOwnedSlice(runtime.alloc);
     out.chunk_keys = try chunk_keys.toOwnedSlice(runtime.alloc);
-    out.navigation_block_keys = try scanRuntimeDocumentExtractionNavigationBlockKeys(runtime, doc_key, artifact_name);
+    out.navigation_block_keys = try scanRuntimeDocumentExtractionNavigationBlockKeysFromRead(runtime.alloc, &borrowed, doc_key, artifact_name);
     out.navigation_block_count = std.math.cast(u32, out.navigation_block_keys.len) orelse
         return error.InvalidDocumentExtractionState;
     out.unit_descriptors = try runtime.alloc.alloc(DocumentExtractionUnitDescriptor, out.unit_keys.len);
@@ -26254,26 +27152,44 @@ fn scanRuntimeDocumentExtractionNavigationBlockKeys(
     doc_key: []const u8,
     artifact_name: []const u8,
 ) ![]const []const u8 {
+    var read = try runtime.store.beginRead();
+    defer read.abort();
+    var borrowed: @import("../artifact_chunk_cursor.zig").BorrowedRead = .{ .read = &read };
+    return scanRuntimeDocumentExtractionNavigationBlockKeysFromRead(runtime.alloc, &borrowed, doc_key, artifact_name);
+}
+
+fn scanRuntimeDocumentExtractionNavigationBlockKeysFromRead(
+    alloc: Allocator,
+    txn: anytype,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+) ![]const []const u8 {
     const prefix = try internal_keys.documentUnitNavigationBlockPrefixAlloc(
-        runtime.alloc,
+        alloc,
         doc_key,
         artifact_name,
     );
-    defer runtime.alloc.free(prefix);
-    const rows = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, prefix);
-    defer backend_scan.freeResults(runtime.alloc, rows);
+    defer alloc.free(prefix);
+    var cursor = try txn.openPhysicalCursorAdapter();
+    defer cursor.close();
     var keys = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
-        for (keys.items) |key| runtime.alloc.free(@constCast(key));
-        keys.deinit(runtime.alloc);
+        for (keys.items) |key| alloc.free(@constCast(key));
+        keys.deinit(alloc);
     }
-    for (rows) |row| {
+    var row = try cursor.seekAtOrAfter(prefix);
+    while (row) |entry| : (row = try cursor.next()) {
+        if (!std.mem.startsWith(u8, entry.key, prefix)) break;
         // The prefix ends immediately before the fixed-width block number.
         // Ignore malformed suffixes rather than broadening a repair deletion.
-        if (row.key.len != prefix.len + @sizeOf(u32)) continue;
-        try keys.append(runtime.alloc, try runtime.alloc.dupe(u8, row.key));
+        if (entry.key.len != prefix.len + @sizeOf(u32)) continue;
+        const key = try alloc.dupe(u8, entry.key);
+        keys.append(alloc, key) catch |err| {
+            alloc.free(key);
+            return err;
+        };
     }
-    return try keys.toOwnedSlice(runtime.alloc);
+    return try keys.toOwnedSlice(alloc);
 }
 
 fn cleanupRuntimeObsoleteNavigationBlocks(
@@ -26687,120 +27603,7 @@ fn documentExtractionUnitKeyStillPresent(
     return false;
 }
 
-fn documentUnitPayloadAlloc(
-    alloc: Allocator,
-    doc_key: []const u8,
-    artifact_name: []const u8,
-    unit: document_extraction_mod.Unit,
-    unit_fingerprint: []const u8,
-    source_url: []const u8,
-    content_type: []const u8,
-    route: DocumentExtractionRangeRoute,
-) ![]u8 {
-    const owner_group_id = std.math.cast(i64, route.owner_group_id) orelse return error.InvalidDocumentExtractionManifest;
-    return try std.json.Stringify.valueAlloc(alloc, .{
-        ._parent_doc_key = doc_key,
-        ._artifact_name = artifact_name,
-        ._artifact_range_id = route.range_id,
-        ._artifact_range_kind = "unit",
-        ._artifact_route_status = route.route_status,
-        ._artifact_owner_group_id = owner_group_id,
-        ._artifact_unit_fingerprint = unit_fingerprint,
-        .unit_id = unit.unit_id,
-        .unit_type = unit.unit_type,
-        .text = unit.text,
-        .content_type = "text/plain",
-        .language = "",
-        .source_path = unit.source_path,
-        .extraction_status = unit.extraction_status,
-        .source_sha256 = unit.source_sha256,
-        .byte_length = unit.byte_length,
-        .confidence = documentUnitConfidence(unit),
-        .ocr_attempted = unit.ocr_attempted,
-        .ocr_render_dpi = unit.ocr_render_dpi,
-        .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
-        .ocr_rendered_width = unit.ocr_rendered_width,
-        .ocr_rendered_height = unit.ocr_rendered_height,
-        .ocr_rendered_bytes = unit.ocr_rendered_bytes,
-        .ocr_failure_stage = unit.ocr_failure_stage,
-        .ocr_failure_retryable = unit.ocr_failure_retryable,
-        .ocr_trigger_reasons = unit.ocr_trigger_reasons,
-        .ocr_embedded_quality = unit.ocr_embedded_quality,
-        .ocr_output_quality = unit.ocr_output_quality,
-        .ocr_confidence = unit.ocr_confidence,
-        .ocr_bbox = unit.ocr_bbox,
-        .transcript_confidence = unit.transcript_confidence,
-        .extraction_warning = unit.extraction_warning,
-        .provenance = .{
-            .source_url = source_url,
-            .source_path = unit.source_path,
-            .method = unit.method,
-            .extraction_status = unit.extraction_status,
-            .source_sha256 = unit.source_sha256,
-            .byte_length = unit.byte_length,
-            .confidence = documentUnitConfidence(unit),
-            .ocr_used = unit.ocr_used,
-            .ocr_attempted = unit.ocr_attempted,
-            .ocr_render_dpi = unit.ocr_render_dpi,
-            .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
-            .ocr_rendered_width = unit.ocr_rendered_width,
-            .ocr_rendered_height = unit.ocr_rendered_height,
-            .ocr_rendered_bytes = unit.ocr_rendered_bytes,
-            .ocr_failure_stage = unit.ocr_failure_stage,
-            .ocr_failure_retryable = unit.ocr_failure_retryable,
-            .ocr_trigger_reasons = unit.ocr_trigger_reasons,
-            .ocr_embedded_quality = unit.ocr_embedded_quality,
-            .ocr_output_quality = unit.ocr_output_quality,
-            .ocr_confidence = unit.ocr_confidence,
-            .ocr_bbox = unit.ocr_bbox,
-            .transcript_used = unit.transcript_used,
-            .transcript_confidence = unit.transcript_confidence,
-            .transcript_spans = if (unit.transcript_spans.len > 0) unit.transcript_spans else null,
-            .extraction_warning = unit.extraction_warning,
-            .page_number = unit.page_number,
-            .page_label = unit.page_label,
-            .page_bbox = unit.page_bbox,
-            .page_rotation = unit.page_rotation,
-            .text_regions = unit.text_regions,
-            .char_start = unit.char_start,
-            .char_end = unit.char_end,
-            .source_content_type = content_type,
-            .format_provenance = .{
-                .schema = "antfly.document_format_provenance.v1",
-                .source_content_type = content_type,
-                .source_path = unit.source_path,
-                .coordinate_system = "source_page_points",
-                .extraction_method = unit.method,
-                .extraction_status = unit.extraction_status,
-                .source_sha256 = unit.source_sha256,
-                .byte_length = unit.byte_length,
-                .confidence = documentUnitConfidence(unit),
-                .ocr_used = unit.ocr_used,
-                .ocr_attempted = unit.ocr_attempted,
-                .ocr_render_dpi = unit.ocr_render_dpi,
-                .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
-                .ocr_rendered_width = unit.ocr_rendered_width,
-                .ocr_rendered_height = unit.ocr_rendered_height,
-                .ocr_rendered_bytes = unit.ocr_rendered_bytes,
-                .ocr_failure_stage = unit.ocr_failure_stage,
-                .ocr_failure_retryable = unit.ocr_failure_retryable,
-                .ocr_trigger_reasons = unit.ocr_trigger_reasons,
-                .ocr_embedded_quality = unit.ocr_embedded_quality,
-                .ocr_output_quality = unit.ocr_output_quality,
-                .ocr_confidence = unit.ocr_confidence,
-                .ocr_bbox = unit.ocr_bbox,
-                .transcript_used = unit.transcript_used,
-                .transcript_confidence = unit.transcript_confidence,
-                .extraction_warning = unit.extraction_warning,
-                .page_number = unit.page_number,
-                .page_label = unit.page_label,
-                .page_bbox = unit.page_bbox,
-                .page_rotation = unit.page_rotation,
-                .text_regions = unit.text_regions,
-            },
-        },
-    }, .{});
-}
+const documentUnitPayloadAlloc = @import("document_unit_payload.zig").encodeAlloc;
 
 fn documentUnitConfidence(unit: document_extraction_mod.Unit) ?f64 {
     return unit.ocr_confidence orelse unit.transcript_confidence;
@@ -27539,7 +28342,7 @@ fn runtimeMentionGraphStateNameAlloc(alloc: Allocator, source_artifact: []const 
 }
 
 fn runtimeResolutionMentionStateKeysForGraphSourceAlloc(
-    runtime: *EnrichmentRuntime,
+    runtime: anytype,
     doc_key: []const u8,
     index_name: []const u8,
     source: index_manager_mod.GraphArtifactSource,
@@ -27576,7 +28379,7 @@ fn encodeGraphAssetStateKeysAlloc(alloc: Allocator, generation: u64, writes: []c
 }
 
 fn appendRuntimeGraphAssetStateSegmentDeletes(
-    runtime: *EnrichmentRuntime,
+    runtime: anytype,
     state_key: []const u8,
     deletes: *std.ArrayListUnmanaged([]const u8),
 ) !void {
@@ -27594,7 +28397,7 @@ fn appendRuntimeGraphAssetStateSegmentDeletes(
     }
 }
 
-fn loadGraphAssetStateKeysAlloc(runtime: *EnrichmentRuntime, state_key: []const u8, expected_generation: u64) !?[][]u8 {
+fn loadGraphAssetStateKeysAlloc(runtime: anytype, state_key: []const u8, expected_generation: u64) !?[][]u8 {
     const alloc = runtime.alloc;
     const raw = (try storeGetOptionalAllocWithRetry(runtime, state_key)) orelse return null;
     defer alloc.free(raw);
@@ -27819,8 +28622,9 @@ fn deleteStaleChunkArtifacts(
 }
 
 fn chunkArtifactSourceHash(runtime: *EnrichmentRuntime, chunk_key: []const u8, source_field: []const u8, producer_json: []const u8) !?u64 {
-    const raw = (try storeGetOptionalAllocWithRetry(runtime, chunk_key)) orelse return null;
-    defer runtime.alloc.free(raw);
+    var read = try runtime.store.beginRead();
+    defer read.abort();
+    const raw = (try @import("../artifact_chunk_generation.zig").readMember(runtime.alloc, &read, chunk_key)) orelse return null;
 
     const source = try chunk_artifact_mod.artifactTextAlloc(runtime.alloc, raw, source_field) orelse return null;
     defer runtime.alloc.free(source);
@@ -27842,10 +28646,12 @@ fn storedChunkEmbeddingSourcesForRequest(
     request: enrichment_types.GeneratedEnrichmentRequest,
     artifact_name: []const u8,
 ) ![]ChunkEmbeddingSource {
-    const prefix = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "chunk", artifact_name);
-    defer runtime.alloc.free(prefix);
-    const existing = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, prefix);
-    defer backend_scan.freeResults(runtime.alloc, existing);
+    const logical = @import("../artifact_chunk_cursor.zig");
+    var read = try runtime.store.beginRead();
+    defer read.abort();
+    var borrowed: logical.BorrowedRead = .{ .read = &read };
+    var cursor = try logical.Cursor(logical.BorrowedRead).openNamed(runtime.alloc, &borrowed, request.doc_key, artifact_name);
+    defer cursor.close();
 
     var sources = std.ArrayListUnmanaged(ChunkEmbeddingSource).empty;
     errdefer {
@@ -27856,17 +28662,93 @@ fn storedChunkEmbeddingSourcesForRequest(
         sources.deinit(runtime.alloc);
     }
 
-    for (existing) |entry| {
-        if (!internal_keys.isChunkArtifactRecordKey(entry.key)) continue;
+    while (try cursor.next()) |entry| {
         const text = (try chunkPayloadTextAlloc(runtime.alloc, entry.value, request.source_field)) orelse continue;
         errdefer runtime.alloc.free(text);
+        const key = try runtime.alloc.dupe(u8, entry.key);
+        errdefer runtime.alloc.free(key);
         try sources.append(runtime.alloc, .{
-            .key = try runtime.alloc.dupe(u8, entry.key),
+            .key = key,
             .text = text,
             .source_record_digest = sourceRecordDigest(entry.value),
         });
     }
     return try sources.toOwnedSlice(runtime.alloc);
+}
+
+test "ordered artifact inventory embedding fallback reads selected chunk generations including empty output" {
+    const alloc = std.testing.allocator;
+    const db_mod = @import("../db.zig");
+    const chunks = @import("../artifact_chunk_manifest.zig");
+    const generations = @import("../artifact_chunk_generation.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/chunk-consumer", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchemaJson(alloc, "{}");
+    try db.addEnrichment(.{ .name = "anchor", .kind = .asset, .field = "body", .content_type = "text/plain" });
+    const member = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc", "chunks", 0);
+    defer alloc.free(member);
+    const tail = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc", "chunks", 1);
+    defer alloc.free(tail);
+    try db.core.store.putBatch(&.{ .{ .key = member, .value = "{\"body\":\"old\"}" }, .{ .key = tail, .value = "{\"body\":\"old tail\"}" } }, &.{});
+    try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
+    const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .dense_embedding, .index_name = "embedding", .doc_key = "doc", .source_field = "body" };
+    try std.testing.expectEqual(enrichment_artifact_codec.hashEmbeddingSource("old", ""), (try chunkArtifactSourceHash(runtime, member, "body", "")).?);
+    var namespace: ordered_publication.Namespace = undefined;
+    @import("../doc_identity.zig").encodeNamespace(&namespace, db.core.identity_namespace);
+    const authority: ordered_publication.Authority = .{ .namespace = namespace, .epoch = 1, .catalog_digest = @splat(2) };
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try @import("../../source_authority.zig").bind(&txn, .native, namespace);
+        try ordered_publication.stageAuthority(&txn, .{ .mode = .activate, .namespace = namespace, .authority_epoch = 1, .catalog_digest = authority.catalog_digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
+        try txn.commit();
+    }
+    const scope = try chunks.keyAlloc(alloc, "doc", "chunks");
+    defer alloc.free(scope);
+    var previous: ?ordered_publication.Digest = null;
+    for (0..2) |pass| {
+        const payloads: []const []const u8 = if (pass == 0) &.{"{\"body\":\"new\"}"} else &.{};
+        var output = chunks.Builder.init();
+        for (payloads, 0..) |payload, ordinal| try output.append(@intCast(ordinal), payload);
+        const spec = try generations.Spec.init(authority, scope, @splat(3), output.finish(), pass + 1);
+        var plan = try generations.Plan.init(alloc, scope, spec);
+        defer plan.deinit();
+        const Guard = struct {
+            pub fn validate(_: @This(), _: anytype) !void {}
+        };
+        {
+            var txn = try db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            _ = try plan.begin(&txn);
+            if (payloads.len != 0) {
+                var append = try generations.PreparedAppend.init(alloc, &plan, try plan.load(&txn), payloads);
+                defer append.deinit();
+                _ = try append.stage(&plan, &txn);
+            }
+            _ = try plan.publish(&txn, previous, Guard{});
+            try txn.commit();
+        }
+        previous = spec.id();
+        const sources = try storedChunkEmbeddingSourcesForRequest(runtime, request, "chunks");
+        defer {
+            for (sources) |source| {
+                runtime.alloc.free(source.key);
+                runtime.alloc.free(source.text);
+            }
+            runtime.alloc.free(sources);
+        }
+        try std.testing.expectEqual(payloads.len, sources.len);
+        if (pass == 0) {
+            try std.testing.expectEqualStrings("new", sources[0].text);
+            try std.testing.expectEqual(enrichment_artifact_codec.hashEmbeddingSource("new", ""), (try chunkArtifactSourceHash(runtime, member, "body", "")).?);
+        } else try std.testing.expect((try chunkArtifactSourceHash(runtime, member, "body", "")) == null);
+        try std.testing.expect((try chunkArtifactSourceHash(runtime, tail, "body", "")) == null);
+    }
 }
 
 fn chunkEmbeddingSourceSetForRequest(
@@ -28294,7 +29176,8 @@ fn storePutWithRetry(runtime: *EnrichmentRuntime, key: []const u8, value: []cons
     }
 }
 
-fn storePutBatchWithRetry(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: []const []const u8) !void {
+fn storePutBatchWithRetry(runtime: anytype, writes: []const KVPair, deletes: []const []const u8) !void {
+    if (comptime @hasDecl(@typeInfo(@TypeOf(runtime)).pointer.child, "publishGraphEffects")) return runtime.publishGraphEffects(writes, deletes);
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
         try heartbeatEnrichmentLease(runtime);
@@ -29486,7 +30369,8 @@ const AllocatedStoreReader = struct {
     }
 };
 
-fn storeGetAlloc(runtime: *EnrichmentRuntime, key: []const u8) ![]u8 {
+fn storeGetAlloc(runtime: anytype, key: []const u8) ![]u8 {
+    if (comptime @hasDecl(@typeInfo(@TypeOf(runtime)).pointer.child, "getAlloc")) return runtime.getAlloc(key);
     var reader = AllocatedStoreReader{ .runtime = runtime, .alloc = runtime.alloc };
     return reader.read(key);
 }
@@ -29526,7 +30410,7 @@ fn readAllocWithRetry(context: anytype, key: []const u8, comptime read_fn: anyty
     }
 }
 
-fn storeGetAllocWithRetry(runtime: *EnrichmentRuntime, key: []const u8) ![]u8 {
+fn storeGetAllocWithRetry(runtime: anytype, key: []const u8) ![]u8 {
     return readAllocWithRetry(runtime, key, storeGetAlloc);
 }
 
@@ -29543,7 +30427,7 @@ fn storeGetOptionalDocumentAllocWithRetry(runtime: *EnrichmentRuntime, key: []co
 /// state, so laundering `WriterLocked` into null can destructively publish an
 /// empty replacement. Retry bounded contention and propagate every remaining
 /// operational failure to the supervised worker boundary.
-fn storeGetOptionalAllocWithRetry(runtime: *EnrichmentRuntime, key: []const u8) !?[]u8 {
+fn storeGetOptionalAllocWithRetry(runtime: anytype, key: []const u8) !?[]u8 {
     return storeGetAllocWithRetry(runtime, key) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
@@ -29591,6 +30475,7 @@ fn storePut(runtime: *EnrichmentRuntime, key: []const u8, value: []const u8) !vo
     var txn = try runtime.store.beginWrite();
     errdefer txn.abort();
     try validateRuntimeStoreWriteFenceTxn(runtime, &txn, fence);
+    try @import("../artifact_publication.zig").requireLegacyMaterialization(&txn, key);
     const write = KVPair{ .key = key, .value = value };
     try updateDenseArtifactTargetCountersTxn(runtime, &txn, &.{write}, &.{});
     try txn.put(key, value);
@@ -29607,6 +30492,8 @@ fn storePutBatch(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: [
     var batch = try runtime.store.beginBatch();
     errdefer batch.abort();
     try validateRuntimeStoreWriteFenceTxn(runtime, &batch, fence);
+    for (writes) |write| try @import("../artifact_publication.zig").requireLegacyMaterialization(&batch, write.key);
+    for (deletes) |key| try @import("../artifact_publication.zig").requireLegacyMaterialization(&batch, key);
     try updateDenseArtifactTargetCountersTxn(runtime, &batch, writes, deletes);
     var marker_keys = std.ArrayListUnmanaged([]u8).empty;
     defer {
@@ -30765,6 +31652,1168 @@ test "asset batch fallback isolates malformed envelope and preserves typed mixed
     try std.testing.expectEqual(@as(usize, 0), mixed.single_count);
 }
 
+test "ordered artifact inventory unit chunk callback reconstructs publishes and retires accepted inputs" {
+    const alloc = std.testing.allocator;
+    const db_mod = @import("../db.zig");
+    const publication = ordered_publication;
+    const manifest = @import("../artifact_chunk_manifest.zig");
+    const Harness = struct {
+        encoded: ?[]u8 = null,
+        calls: usize = 0,
+        fn enqueue(ptr: *anyopaque, _: publication.Namespace, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const copy = try std.testing.allocator.dupe(u8, bytes);
+            if (self.encoded) |old| std.testing.allocator.free(old);
+            self.encoded = copy;
+            self.calls += 1;
+        }
+        // The extraction writer is still gated. Supply its accepted upstream
+        // output explicitly to exercise the real downstream callback/receiver.
+        fn parent(db: *db_mod.DB, key: []const u8, value: ?[]const u8, index: u64) !void {
+            var arena = std.heap.ArenaAllocator.init(db.alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            var txn = try db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            const authority = (try publication.authority(&txn)).?;
+            const source = try publication.capturePrimarySource(a, &txn, authority.namespace, "doc");
+            var command: publication.Command = .{ .namespace = authority.namespace, .authority_epoch = authority.epoch, .catalog_digest = authority.catalog_digest, .producer_kind = .enrichment, .producer_name = "units", .producer_generation = authority.epoch, .producer_artifact_name = "units", .sources = (&source)[0..1], .mutations = &.{.{ .family = .document_artifact, .key = key, .value = value, .source_index = 0 }}, .publication_digest = @splat(0) };
+            command.publication_digest = command.digest();
+            var proof = try @import("../artifact_producer_provenance.zig").fromCommand(a, command);
+            defer proof.deinit();
+            const encoded = try @import("../artifact_producer_provenance.zig").encodeAlloc(a, proof.proof);
+            const position: publication.Position = .{ .raft = .{ .term = 1, .index = index } };
+            if (value) |raw| try txn.put(key, raw) else try txn.delete(key);
+            try publication.stageArtifactRevisions(&txn, command, position);
+            try @import("../artifact_producer_provenance.zig").stage(&txn, command, encoded, position);
+            var marker: [16]u8 = undefined;
+            std.mem.writeInt(u64, marker[0..8], 1, .little);
+            std.mem.writeInt(u64, marker[8..16], index, .little);
+            try txn.put(&internal_keys.raft_document_applied_entry_key, &marker);
+            try txn.commit();
+        }
+        fn apply(self: *@This(), db: *db_mod.DB, index: u64) !void {
+            var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(db.alloc, self.encoded.?);
+            defer decoded.deinit();
+            try db.batchRaftReplicatedApply(.{ .artifact_publication = decoded.command }, .{ .term = 1, .index = index });
+        }
+    };
+    var harness: Harness = .{};
+    defer if (harness.encoded) |bytes| alloc.free(bytes);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/unit-chunk-callback", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false, .artifact_publication_dispatcher = .{ .ptr = &harness, .enqueue = Harness.enqueue } });
+    defer db.close();
+    try db.setSchemaJson(alloc, "{}");
+    try db.addEnrichment(.{ .name = "units", .kind = .asset, .field = "url", .producer_json = "{\"type\":\"document_extraction\"}" });
+    try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .source_artifact_name = "units", .chunk_size = 4 });
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"chunks\"}]}" });
+    try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{\"url\":\"input\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
+    var catalog = try db.artifactInventoryCommand(alloc);
+    defer catalog.catalogs.deinit(alloc);
+    catalog.binding.effect_protocol = 15;
+    try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
+    var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
+    activation.publication_digest = activation.digest();
+    try db.batchRaftReplicatedApply(.{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc", "units", "page-1");
+    defer alloc.free(unit_key);
+    const unit: document_extraction_mod.Unit = .{ .unit_id = @constCast("page-1"), .unit_type = @constCast("page"), .text = @constCast("hello world"), .method = @constCast("text"), .page_number = 7, .char_start = 30, .char_end = 41 };
+    const unit_fingerprint = try document_unit_fingerprint.fingerprintAlloc(alloc, unit);
+    defer alloc.free(unit_fingerprint);
+    const payload = try documentUnitPayloadAlloc(alloc, "doc", "units", unit, unit_fingerprint, "input", "text/plain", .{ .range_id = "units-0" });
+    defer alloc.free(payload);
+    try Harness.parent(&db, unit_key, payload, 4);
+    try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
+    const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
+    var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer plan.release();
+    var request = for (plan.plan().generated_templates) |candidate| {
+        if (candidate.kind == .asset and std.mem.eql(u8, candidate.artifact_name, "units")) break candidate;
+    } else return error.TestUnexpectedResult;
+    request.doc_key = "doc";
+    // A durable generation-bound job must not fall back to a legacy unit row
+    // after its selected parent disappeared. No provider/publication runs.
+    const stale_job: @import("../artifact_unit_jobs.zig").Job = .{ .generation = @splat(42), .document = "doc", .child = "chunks", .unit = unit_key };
+    try std.testing.expectError(error.EnrichmentSourceChanged, publishOrderedUnitJob(runtime, request, stale_job));
+    try std.testing.expectEqual(@as(usize, 0), harness.calls);
+    var foreign_job = stale_job;
+    foreign_job.document = "foreign";
+    try std.testing.expectError(error.InvalidBatchRequest, publishOrderedUnitJob(runtime, request, foreign_job));
+    // First pass reconstructs inventory without invoking the chunker.
+    try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedUnitChunks(runtime, request, "chunks", unit_key));
+    try harness.apply(&db, 5);
+    const AllocationCheck = struct {
+        fn run(a: Allocator, worker: *EnrichmentRuntime, parent_request: enrichment_types.GeneratedEnrichmentRequest, key: []const u8) !void {
+            publishOrderedUnitChunksWithAllocator(worker, a, parent_request, "chunks", key) catch |err| {
+                if (err == error.ArtifactPublicationPending) return;
+                return err;
+            };
+            return error.TestUnexpectedResult;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ runtime, request, unit_key });
+    harness.calls = 1;
+    try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedUnitChunks(runtime, request, "chunks", unit_key));
+    try harness.apply(&db, 6);
+    const manifest_key = try manifest.scopedKeyAlloc(alloc, "doc", "chunks", "page-1");
+    defer alloc.free(manifest_key);
+    var count: u32 = 0;
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        count = (try manifest.Manifest.decode(try read.get(manifest_key))).count;
+        try std.testing.expect(count > 1);
+        const key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc", "chunks", "page-1", 0);
+        defer alloc.free(key);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, try read.get(key), .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(unit_key, parsed.value.object.get("_parent_unit_key").?.string);
+        try std.testing.expectEqualStrings("units-0", parsed.value.object.get("_artifact_range_id").?.string);
+        try std.testing.expectEqualStrings("local_committed", parsed.value.object.get("_artifact_route_status").?.string);
+        try std.testing.expectEqual(@as(i64, 7), parsed.value.object.get("provenance").?.object.get("page_number").?.integer);
+    }
+    try publishOrderedUnitChunks(runtime, request, "chunks", unit_key);
+    try std.testing.expectEqual(@as(usize, 2), harness.calls);
+    const remote_unit = try documentUnitPayloadAlloc(alloc, "doc", "units", unit, unit_fingerprint, "input", "text/plain", .{ .range_id = "units-0", .route_status = "remote_committed", .owner_group_id = 7002 });
+    defer alloc.free(remote_unit);
+    try Harness.parent(&db, unit_key, remote_unit, 7);
+    try std.testing.expectError(error.OnlineMergeArtifactTailsUnsupported, publishOrderedUnitChunks(runtime, request, "chunks", unit_key));
+    try std.testing.expectEqual(@as(usize, 2), harness.calls);
+    // Even an accepted fixture cannot bypass the typed unit contract. The
+    // receiver will share this decoder; consumers must not propagate a stale
+    // fingerprint or overwrite a previously accepted child set meanwhile.
+    const corrupt_unit = try documentUnitPayloadAlloc(alloc, "doc", "units", unit, "wrong-fingerprint", "input", "text/plain", .{ .range_id = "units-0" });
+    defer alloc.free(corrupt_unit);
+    try Harness.parent(&db, unit_key, corrupt_unit, 8);
+    try std.testing.expectError(error.InvalidDocumentExtractionManifest, publishOrderedUnitChunks(runtime, request, "chunks", unit_key));
+    try std.testing.expectEqual(@as(usize, 2), harness.calls);
+    try Harness.parent(&db, unit_key, null, 9);
+    try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedUnitChunks(runtime, request, "chunks", unit_key));
+    try harness.apply(&db, 10);
+    try publishOrderedUnitChunks(runtime, request, "chunks", unit_key);
+    try std.testing.expectEqual(@as(usize, 3), harness.calls);
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqual(@as(u32, 0), (try manifest.Manifest.decode(try read.get(manifest_key))).count);
+    for (0..count) |ordinal| {
+        const key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc", "chunks", "page-1", @intCast(ordinal));
+        defer alloc.free(key);
+        try std.testing.expectError(error.NotFound, read.get(key));
+    }
+}
+
+test "ordered artifact inventory chunk callback waits for acceptance and atomically publishes empty streams" {
+    const db_mod = @import("../db.zig");
+    const inventory = @import("../artifact_chunk_manifest.zig");
+    const alloc = std.testing.allocator;
+    const Harness = struct {
+        encoded: ?[]u8 = null,
+        calls: usize = 0,
+        fn enqueue(ptr: *anyopaque, _: ordered_publication.Namespace, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const copy = try std.testing.allocator.dupe(u8, bytes);
+            if (self.encoded) |old| std.testing.allocator.free(old);
+            self.encoded = copy;
+            self.calls += 1;
+        }
+    };
+    var harness: Harness = .{};
+    defer if (harness.encoded) |bytes| alloc.free(bytes);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/chunk-callback", .{tmp.sub_path});
+    defer alloc.free(path);
+    const options: db_mod.OpenOptions = .{
+        .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 },
+        .online_source_authority = .raft,
+        .primary_backend = .{ .lsm = .{} },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .artifact_publication_dispatcher = .{ .ptr = &harness, .enqueue = Harness.enqueue },
+    };
+    var db = try db_mod.DB.open(alloc, path, options);
+    defer db.close();
+    try db.setSchemaJson(alloc, "{}");
+    try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 4 });
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"chunks\"}]}" });
+    try db.batchRaftReplicatedApply(.{ .writes = &.{ .{ .key = "doc", .value = "{\"body\":\"hello world\"}" }, .{ .key = "unreconciled", .value = "{\"body\":\"pending\"}" } }, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
+    const manifest_key = try inventory.keyAlloc(alloc, "doc", "chunks");
+    defer alloc.free(manifest_key);
+    // An inventory reconstructed before activation. The second document has
+    // none, and must remain pending rather than infer an empty old stream.
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(manifest_key, &inventory.Builder.init().finish().encode());
+        try txn.commit();
+    }
+    var catalog = try db.artifactInventoryCommand(alloc);
+    defer catalog.catalogs.deinit(alloc);
+    catalog.binding.effect_protocol = 15;
+    try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
+    var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
+    activation.publication_digest = activation.digest();
+    try db.batchRaftReplicatedApply(.{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
+    const progress = @import("../artifact_stream_progress.zig");
+    var previous: ?progress.DocumentClosure = null;
+    defer if (previous) |*value| value.deinit();
+    {
+        try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
+        const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+        try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
+        var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+        defer plan.release();
+        var request = for (plan.plan().generated_templates) |candidate| {
+            if (candidate.kind == .chunk_text and std.mem.eql(u8, candidate.artifact_name, "chunks")) break candidate;
+        } else return error.TestUnexpectedResult;
+        request.doc_key = "doc";
+        var cache: std.ArrayListUnmanaged(WorkerChunkCacheEntry) = .empty;
+        defer freeWorkerChunkCache(runtime.alloc, &cache);
+        var window: GeneratedReplayWindow = .{ .alloc = runtime.alloc };
+        defer window.deinit();
+        var unreconciled = request;
+        unreconciled.doc_key = "unreconciled";
+        try std.testing.expectError(error.ArtifactPublicationPending, processChunkText(runtime, unreconciled, &cache, &window));
+        try std.testing.expectEqual(@as(usize, 1), harness.calls);
+        try std.testing.expectEqual(@as(usize, 0), cache.items.len);
+        {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectError(error.ArtifactPublicationPending, progress.prepareEnrichmentClosure(alloc, &read, db.root_incarnation, request, plan.plan()));
+            try std.testing.expectError(error.ArtifactPublicationPending, progress.prepareEnrichmentClosure(alloc, &read, db.root_incarnation, unreconciled, plan.plan()));
+        }
+        {
+            var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
+            defer decoded.deinit();
+            try std.testing.expectEqual(.census, decoded.command.mode);
+            try std.testing.expectEqual(.enrichment, decoded.command.producer_kind);
+            try db.batchRaftReplicatedApply(.{ .artifact_publication = decoded.command }, .{ .term = 1, .index = 4 });
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            // Inventory alone is never proof that a provider finished.
+            try std.testing.expectError(error.ArtifactPublicationPending, progress.prepareEnrichmentClosure(alloc, &read, db.root_incarnation, unreconciled, plan.plan()));
+        }
+        try std.testing.expectError(error.ArtifactPublicationPending, processChunkText(runtime, unreconciled, &cache, &window));
+        try std.testing.expectEqual(@as(usize, 2), harness.calls);
+        {
+            var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
+            defer decoded.deinit();
+            try db.batchRaftReplicatedApply(.{ .artifact_publication = decoded.command }, .{ .term = 1, .index = 5 });
+        }
+        try processChunkText(runtime, unreconciled, &cache, &window);
+        try std.testing.expectEqual(@as(usize, 2), harness.calls);
+        for (0..3) |pass| {
+            if (pass == 1) try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .timestamp_ns = 101 }, .{ .term = 1, .index = 7 });
+            if (pass == 2) try db.batchRaftReplicatedApply(.{ .deletes = &.{"doc"}, .timestamp_ns = 102 }, .{ .term = 1, .index = 9 });
+            try std.testing.expectError(error.ArtifactPublicationPending, processChunkText(runtime, request, &cache, &window));
+            try std.testing.expectEqual(pass + 3, harness.calls);
+            if (previous) |*value| {
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                try std.testing.expectError(error.EnrichmentSourceChanged, value.requireCurrent(&read, db.root_incarnation));
+            }
+            var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
+            defer decoded.deinit();
+            const manifest = decoded.command.mutations[decoded.command.mutations.len - 1];
+            const next = try inventory.Manifest.decode(manifest.value.?);
+            try std.testing.expect(if (pass == 0) next.count > 1 else next.count == 0);
+            try db.batchRaftReplicatedApply(.{ .artifact_publication = decoded.command }, .{ .term = 1, .index = pass * 2 + 6 });
+            const cache_count = cache.items.len;
+            try processChunkText(runtime, request, &cache, &window);
+            try std.testing.expectEqual(pass + 3, harness.calls);
+            try std.testing.expectEqual(cache_count, cache.items.len);
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqualDeep(next, try inventory.Manifest.decode(try read.get(manifest_key)));
+            for (decoded.command.mutations[0 .. decoded.command.mutations.len - 1]) |effect| {
+                if (effect.value) |value| try std.testing.expectEqualStrings(value, try read.get(effect.key)) else try std.testing.expectError(error.NotFound, read.get(effect.key));
+            }
+            if (previous) |*value| value.deinit();
+            previous = null;
+            previous = try progress.prepareEnrichmentClosure(alloc, &read, db.root_incarnation, request, plan.plan());
+            try previous.?.requireCurrent(&read, db.root_incarnation);
+            try std.testing.expectError(error.DurableRootIncarnationUnavailable, previous.?.requireCurrent(&read, db.root_incarnation + 1));
+            var verifier: @import("../artifact_completion_progress.zig").StreamVerifier = .{ .plan = plan.plan() };
+            var witness = (try verifier.verify(alloc, &read, db.root_incarnation, "doc", try plan.plan().completion_plan.?.providerFor(request))).?;
+            defer witness.deinit();
+            try witness.requireCurrent(&read, db.root_incarnation);
+            if (pass == 0) {
+                const Check = struct {
+                    fn run(a: Allocator, txn: *@TypeOf(read), root: u128, selected: enrichment_types.GeneratedEnrichmentRequest, snapshot: *const index_manager_mod.IndexManager.WritePlanSnapshot) !void {
+                        var closure = try @import("../artifact_stream_progress.zig").prepareEnrichmentClosure(a, txn, root, selected, snapshot);
+                        defer closure.deinit();
+                    }
+                };
+                try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ &read, db.root_incarnation, request, plan.plan() });
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 0), window.documents.items.len);
+    }
+    db.close();
+    db = try db_mod.DB.open(alloc, path, options);
+    var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer plan.release();
+    var request = for (plan.plan().generated_templates) |candidate| {
+        if (candidate.kind == .chunk_text and std.mem.eql(u8, candidate.artifact_name, "chunks")) break candidate;
+    } else return error.TestUnexpectedResult;
+    request.doc_key = "doc";
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try previous.?.requireCurrent(&read, db.root_incarnation);
+        var recovered = try progress.prepareEnrichmentClosure(alloc, &read, db.root_incarnation, request, plan.plan());
+        defer recovered.deinit();
+        try std.testing.expectEqualDeep(previous.?.record_digest, recovered.record_digest);
+        try std.testing.expectEqualDeep(previous.?.requirement, recovered.requirement);
+    }
+    // Reimporting the same empty manifest cannot retain its old acceptance.
+    const empty = inventory.Builder.init().finish().encode();
+    var marker: [16]u8 = undefined;
+    std.mem.writeInt(u64, marker[0..8], 1, .little);
+    std.mem.writeInt(u64, marker[8..16], 11, .little);
+    try db.core.store.putBatch(&.{ .{ .key = manifest_key, .value = &empty }, .{ .key = &internal_keys.raft_document_applied_entry_key, .value = &marker } }, &.{});
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectError(error.EnrichmentSourceChanged, previous.?.requireCurrent(&read, db.root_incarnation));
+    try std.testing.expectError(error.EnrichmentSourceChanged, progress.prepareEnrichmentClosure(alloc, &read, db.root_incarnation, request, plan.plan()));
+}
+
+test "ordered artifact inventory authored document callbacks bypass providers and publication" {
+    const alloc = std.testing.allocator;
+    const db_mod = @import("../db.zig");
+    const publication = ordered_publication;
+    const Harness = struct {
+        calls: usize = 0,
+        fn dense(ptr: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.UnexpectedProviderInvocation;
+        }
+        fn sparse(ptr: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !embedder_mod.SparseEmbedding {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.UnexpectedProviderInvocation;
+        }
+        fn enqueue(ptr: *anyopaque, _: publication.Namespace, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.UnexpectedPublication;
+        }
+    };
+    for ([_]bool{ true, false }) |dense| {
+        var harness: Harness = .{};
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/authored-document-callback", .{tmp.sub_path});
+        defer alloc.free(path);
+        var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 }, .online_source_authority = .native, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false, .artifact_publication_dispatcher = .{ .ptr = &harness, .enqueue = Harness.enqueue } });
+        defer db.close();
+        try db.setSchemaJson(alloc, "{}");
+        try db.addEnrichment(.{ .name = "model", .kind = .embedding, .field = "body", .expected_dims = if (dense) 2 else 0 });
+        try db.addIndex(.{ .name = "vector", .kind = if (dense) .dense_vector else .sparse_vector, .config_json = if (dense) "{\"field\":\"dense\",\"dims\":2,\"embedding_name\":\"model\"}" else "{\"field\":\"sparse\",\"embedding_name\":\"model\"}" });
+        var catalog = try db.artifactInventoryCommand(alloc);
+        defer catalog.catalogs.deinit(alloc);
+        catalog.binding.effect_protocol = 15;
+        const authority: publication.Authority = .{ .namespace = catalog.namespace, .epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest };
+        {
+            var txn = try db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            try @import("../artifact_inventory.zig").stageOrdered(alloc, &txn, catalog, 1);
+            try publication.stageAuthority(&txn, .{ .mode = .activate, .namespace = authority.namespace, .authority_epoch = authority.epoch, .catalog_digest = authority.catalog_digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
+            try @import("../artifact_producer_obligations.zig").begin(alloc, &txn, authority);
+            try @import("../artifact_producer_validation.zig").begin(alloc, &txn, authority);
+            try txn.commit();
+        }
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const owned = arena.allocator();
+        const primary = try internal_keys.documentKeyAlloc(owned, "doc");
+        const ttl = try internal_keys.ttlKeyAlloc(owned, "doc");
+        const output = try internal_keys.embeddingArtifactKeyForDocumentAlloc(owned, "doc", "model");
+        const value = if (dense) try enrichment_artifact_codec.encodeAuthoredDenseEmbeddingAlloc(owned, &.{ 1, 2 }) else try enrichment_artifact_codec.encodeAuthoredSparseEmbeddingAlloc(owned, &.{1}, &.{2});
+        const writes = [_]@import("../../docstore.zig").KVPair{ .{ .key = primary, .value = "{\"body\":\"hello\"}" }, .{ .key = ttl, .value = &.{ 1, 0, 0, 0, 0, 0, 0, 0 } }, .{ .key = output, .value = value } };
+        var ingress = try @import("../artifact_authored_acceptance.zig").Prepared.init(alloc, db.root_incarnation, writes[2..], &writes);
+        defer ingress.deinit();
+        try db.core.store.putBatchWithReplayAndParticipant(null, &writes, &.{}, null, .{}, ingress.participant());
+        try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true, .dense_embedder = .{ .ptr = &harness, .dense_embed_fn = Harness.dense }, .sparse_embedder = .{ .ptr = &harness, .sparse_embed_fn = Harness.sparse } });
+        const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+        var pin = try db.core.index_manager.acquireWritePlanSnapshot();
+        defer pin.release();
+        var request = pin.plan().generated_templates[0];
+        request.doc_key = "doc";
+        var cache: std.ArrayListUnmanaged(WorkerChunkCacheEntry) = .empty;
+        defer freeWorkerChunkCache(alloc, &cache);
+        var sources = PreparedDocumentSourceCache.init(runtime);
+        defer sources.deinit();
+        var window: GeneratedReplayWindow = .{ .alloc = alloc };
+        defer window.deinit();
+        if (dense) {
+            try processDenseEmbedding(runtime, request, &cache, &sources, &window);
+            try std.testing.expect(try collectPlainDenseBatchItem(runtime, request, &.{"vector"}, &window) == null);
+        } else try processSparseEmbedding(runtime, request, &cache, &window);
+        try std.testing.expectEqual(@as(usize, 0), harness.calls);
+    }
+}
+
+test "ordered artifact inventory chunk vector callback publishes and retires without reinference after acceptance" {
+    try testOrderedChunkVectorCallback(false);
+    try testOrderedChunkVectorCallback(true);
+}
+
+fn testOrderedChunkVectorCallback(dense: bool) !void {
+    const db_mod = @import("../db.zig");
+    const inventory = @import("../artifact_chunk_manifest.zig");
+    const alloc = std.testing.allocator;
+    const Harness = struct {
+        encoded: ?[]u8 = null,
+        calls: usize = 0,
+        provider_calls: usize = 0,
+        refuse_next: bool = false,
+        fn enqueue(ptr: *anyopaque, _: ordered_publication.Namespace, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.refuse_next) {
+                self.refuse_next = false;
+                return error.QueueFull;
+            }
+            const copy = try std.testing.allocator.dupe(u8, bytes);
+            if (self.encoded) |old| std.testing.allocator.free(old);
+            self.encoded = copy;
+            self.calls += 1;
+        }
+        fn embed(ptr: *anyopaque, a: Allocator, _: []const u8, text: []const u8) !embedder_mod.SparseEmbedding {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("hello world", text);
+            self.provider_calls += 1;
+            const indices = try a.dupe(u32, &.{1});
+            errdefer a.free(indices);
+            return .{ .indices = indices, .values = try a.dupe(f32, &.{2}) };
+        }
+        fn embedDense(ptr: *anyopaque, a: Allocator, _: []const u8, text: []const u8, dims: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("hello world", text);
+            try std.testing.expectEqual(@as(u32, 2), dims);
+            self.provider_calls += 1;
+            return a.dupe(f32, &.{ 1, 2 });
+        }
+        fn process(self: *@This(), runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, window: *GeneratedReplayWindow, use_dense: bool) !void {
+            if (use_dense) {
+                var scope: FailureScope = .{};
+                return processMaterializedChunkDenseRequest(runtime, request, "chunks", "model", .{ .ptr = self, .dense_embed_fn = embedDense }, &.{"sparse"}, window, &scope);
+            }
+            return processMaterializedChunkSparseRequest(runtime, request, "chunks", "model", .{ .ptr = self, .sparse_embed_fn = embed }, &.{"sparse"}, window);
+        }
+        fn apply(self: *@This(), db: *db_mod.DB, index: u64) !void {
+            var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(std.testing.allocator, self.encoded.?);
+            defer decoded.deinit();
+            try db.batchRaftReplicatedApply(.{ .artifact_publication = decoded.command }, .{ .term = 1, .index = index });
+        }
+    };
+    var harness: Harness = .{};
+    defer if (harness.encoded) |bytes| alloc.free(bytes);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/chunk-vector-callback", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try db_mod.DB.open(alloc, path, .{
+        .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 },
+        .online_source_authority = .raft,
+        .primary_backend = .{ .lsm = .{} },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .artifact_publication_dispatcher = .{ .ptr = &harness, .enqueue = Harness.enqueue },
+    });
+    defer db.close();
+    try db.setSchemaJson(alloc, "{}");
+    try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 100 });
+    try db.addEnrichment(.{ .name = "model", .kind = .embedding, .field = "body", .source_artifact_name = "chunks", .expected_dims = if (dense) 2 else 0 });
+    try db.addIndex(.{ .name = "sparse", .kind = if (dense) .dense_vector else .sparse_vector, .config_json = if (dense) "{\"field\":\"dense\",\"dims\":2,\"embedding_name\":\"model\"}" else "{\"field\":\"sparse\",\"embedding_name\":\"model\"}" });
+    try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"hello world\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
+    const manifest_key = try inventory.keyAlloc(alloc, "doc", "chunks");
+    defer alloc.free(manifest_key);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(manifest_key, &inventory.Builder.init().finish().encode());
+        try txn.commit();
+    }
+    var catalog = try db.artifactInventoryCommand(alloc);
+    defer catalog.catalogs.deinit(alloc);
+    catalog.binding.effect_protocol = 15;
+    try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
+    var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
+    activation.publication_digest = activation.digest();
+    try db.batchRaftReplicatedApply(.{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
+    try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
+    const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
+    var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer plan.release();
+    var chunk_request = for (plan.plan().generated_templates) |candidate| {
+        if (candidate.kind == .chunk_text) break candidate;
+    } else return error.TestUnexpectedResult;
+    chunk_request.doc_key = "doc";
+    var vector_request = for (plan.plan().generated_templates) |candidate| {
+        if (candidate.kind == (if (dense) enrichment_types.GeneratedEnrichmentKind.dense_embedding else enrichment_types.GeneratedEnrichmentKind.sparse_embedding)) break candidate;
+    } else return error.TestUnexpectedResult;
+    vector_request.doc_key = "doc";
+    const stream_progress = @import("../artifact_stream_progress.zig");
+    {
+        // Baseline inventory contains an empty manifest, but no producer has
+        // accepted an empty result. Neither raw bytes nor EOF are evidence.
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const census = @import("../artifact_stream_census.zig");
+        const start: census.Progress = .{ .observation = try @import("../artifact_stream_observation.zig").Observation.capture(&read, "doc") };
+        try std.testing.expectError(error.ArtifactPublicationPending, census.scan(alloc, &read, vector_request, plan.plan(), start, .{}));
+    }
+    var last_verified: ?stream_progress.Prepared = null;
+    defer if (last_verified) |*prepared| prepared.deinit();
+    var last_closure: ?stream_progress.Closure = null;
+    defer if (last_closure) |*closure| closure.deinit();
+    var cache: std.ArrayListUnmanaged(WorkerChunkCacheEntry) = .empty;
+    defer freeWorkerChunkCache(runtime.alloc, &cache);
+    var window: GeneratedReplayWindow = .{ .alloc = runtime.alloc };
+    defer window.deinit();
+    const member = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc", "chunks", 0);
+    defer alloc.free(member);
+    const output = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, member, "model");
+    defer alloc.free(output);
+    {
+        const incarnation = runtime.config.root_incarnation;
+        try std.testing.expectEqual(db.root_incarnation, incarnation);
+        try std.testing.expect(incarnation != 0);
+        runtime.config.root_incarnation = 0;
+        defer runtime.config.root_incarnation = incarnation;
+        try std.testing.expectError(error.DurableRootIncarnationUnavailable, harness.process(runtime, vector_request, &window, dense));
+        try std.testing.expectEqual(@as(usize, 0), harness.provider_calls);
+        try std.testing.expectEqual(@as(usize, 0), harness.calls);
+    }
+    for (0..2) |pass| {
+        if (pass == 1) try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .timestamp_ns = 101 }, .{ .term = 1, .index = 7 });
+        try std.testing.expectError(error.ArtifactPublicationPending, processChunkText(runtime, chunk_request, &cache, &window));
+        try harness.apply(&db, if (pass == 0) 4 else 8);
+        const census = @import("../artifact_stream_census.zig");
+        if (pass == 0) {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            const start: census.Progress = .{ .observation = try @import("../artifact_stream_observation.zig").Observation.capture(&read, "doc") };
+            try std.testing.expectError(error.ArtifactPublicationPending, census.scan(alloc, &read, vector_request, plan.plan(), start, .{}));
+        }
+        const before = harness.calls;
+        try std.testing.expectError(error.ArtifactPublicationPending, harness.process(runtime, vector_request, &window, dense));
+        try std.testing.expectEqual(before + 1, harness.calls);
+        try harness.apply(&db, if (pass == 0) 5 else 9);
+        {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            const Counted = struct {
+                snapshot: *@TypeOf(read),
+                catalog_reads: usize = 0,
+                pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+                    if (std.mem.eql(u8, key, @import("../artifact_inventory.zig").ordered_key)) self.catalog_reads += 1;
+                    return self.snapshot.get(key);
+                }
+            };
+            var counted: Counted = .{ .snapshot = &read };
+            const bound = (try @import("../artifact_chunk_vector_publication.zig").captureSession(alloc, &counted, vector_request, plan.plan())).?;
+            for (0..16) |_| {
+                var input = try bound.capture(alloc, member);
+                defer input.deinit();
+                try std.testing.expectEqualStrings(output, input.output_key);
+                var accepted_member = (try input.token.acceptedProof(alloc, &counted)).?;
+                defer accepted_member.deinit();
+            }
+            // The catalog decode cost is per snapshot, not per member. Both
+            // live and absent outputs still perform their own causal checks.
+            try std.testing.expectEqual(@as(usize, 1), counted.catalog_reads);
+        }
+        if (pass == 1) {
+            // An empty physical scan is not accepted empty production. These
+            // aborted changes model a missing manifest and a same-revision
+            // corrupted replacement without modifying the serving fixture.
+            const manifests = @import("../artifact_chunk_manifest.zig");
+            var writer = try db.core.store.beginWriteTxn();
+            defer writer.abort();
+            const original = try alloc.dupe(u8, try writer.get(manifest_key));
+            defer alloc.free(original);
+            const start: census.Progress = .{ .observation = try @import("../artifact_stream_observation.zig").Observation.capture(&writer, "doc") };
+            try writer.delete(manifest_key);
+            try std.testing.expectError(error.ArtifactPublicationPending, census.scan(alloc, &writer, vector_request, plan.plan(), start, .{}));
+            var changed = try manifests.Manifest.decode(original);
+            changed.count += 1;
+            try writer.put(manifest_key, &changed.encode());
+            try std.testing.expectError(error.EnrichmentSourceChanged, census.scan(alloc, &writer, vector_request, plan.plan(), start, .{}));
+            try writer.put(manifest_key, original);
+            var empty = try census.scan(alloc, &writer, vector_request, plan.plan(), start, .{});
+            defer empty.deinit();
+            try std.testing.expect(empty.progress.enumerated);
+            // A selected empty generation cannot borrow the older accepted
+            // manifest's proof. Staged/head bytes alone are not acceptance.
+            const generations = @import("../artifact_chunk_generation.zig");
+            const spec = try generations.Spec.init(start.observation.authority, manifest_key, @splat(1), manifests.Builder.init().finish(), 1);
+            var selected = try generations.Plan.init(alloc, manifest_key, spec);
+            defer selected.deinit();
+            _ = try selected.begin(&writer);
+            try writer.put(selected.head_key, &spec.encode());
+            try std.testing.expectError(error.ArtifactPublicationPending, census.scan(alloc, &writer, vector_request, plan.plan(), start, .{}));
+        }
+        const accepted = harness.calls;
+        harness.refuse_next = true;
+        try std.testing.expectError(error.QueueFull, harness.process(runtime, vector_request, &window, dense));
+        try std.testing.expectEqual(accepted, harness.calls);
+        try std.testing.expectError(error.ArtifactPublicationPending, harness.process(runtime, vector_request, &window, dense));
+        try std.testing.expectEqual(accepted + 1, harness.calls);
+        {
+            var queued = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
+            defer queued.deinit();
+            try std.testing.expectEqual(.census, queued.command.mode);
+        }
+        try std.testing.expectEqual(@as(usize, 1), harness.provider_calls);
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        if (pass == 0) _ = try read.get(output) else try std.testing.expectError(error.NotFound, read.get(output));
+        var progress: census.Progress = .{ .observation = try @import("../artifact_stream_observation.zig").Observation.capture(&read, "doc") };
+        var wrong_kind = vector_request;
+        wrong_kind.input_kind = .document;
+        try std.testing.expectError(error.OnlineMergeArtifactTailsUnsupported, census.scan(alloc, &read, wrong_kind, plan.plan(), progress, .{}));
+        if (pass == 0) {
+            {
+                // Simulate an uncertified obsolete output after an accepted
+                // member without committing this synthetic fixture artifact.
+                const pending_member = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc", "chunks", "pending", 0);
+                defer alloc.free(pending_member);
+                const pending_output = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, pending_member, "model");
+                defer alloc.free(pending_output);
+                var writer = try db.core.store.beginWriteTxn();
+                defer writer.abort();
+                try writer.put(pending_output, "uncertified output");
+                const start: census.Progress = .{ .observation = try @import("../artifact_stream_observation.zig").Observation.capture(&writer, "doc") };
+                var prefix = try census.scan(alloc, &writer, vector_request, plan.plan(), start, .{});
+                defer prefix.deinit();
+                try std.testing.expect(!prefix.progress.enumerated);
+                try std.testing.expectEqual(@as(u64, 1), prefix.progress.members);
+                try std.testing.expectEqualStrings(member, prefix.progress.cursor);
+                var verified = try census.verify(alloc, &writer, vector_request, plan.plan(), start, .{}, prefix.claim);
+                defer verified.deinit();
+                try std.testing.expectEqualDeep(prefix.progress, verified.progress);
+                try std.testing.expectError(error.ArtifactPublicationPending, census.scan(alloc, &writer, vector_request, plan.plan(), prefix.progress, .{}));
+            }
+            const AllocationCheck = struct {
+                fn run(a: Allocator, txn: *@TypeOf(read), root: u128, request: enrichment_types.GeneratedEnrichmentRequest, snapshot: *const index_manager_mod.IndexManager.WritePlanSnapshot, start: census.Progress) !void {
+                    var page = try census.scan(a, txn, request, snapshot, start, .{});
+                    defer page.deinit();
+                    try std.testing.expect(page.progress.enumerated);
+                    try std.testing.expectEqual(@as(u64, 1), page.progress.members);
+                    var prepared = (try stream_progress.prepare(a, txn, root, request, snapshot, .{}, page.claim)).?;
+                    defer prepared.deinit();
+                    try std.testing.expectEqualDeep(page.claim, prepared.record.claim);
+                }
+            };
+            try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &read, db.root_incarnation, vector_request, plan.plan(), progress });
+        }
+        var previous_page: ?census.Page = null;
+        defer if (previous_page) |*page| page.deinit();
+        var pages: usize = 0;
+        while (!progress.enumerated) {
+            var page = try census.scan(alloc, &read, vector_request, plan.plan(), progress, .{ .visits = 1 });
+            errdefer page.deinit();
+            // Independent read/cursor, with no access to the sender's local
+            // root identity or persisted checkpoint, reproduces the page.
+            var receiver = try db.core.store.beginReadTxn();
+            defer receiver.abort();
+            var verified = try census.verify(alloc, &receiver, vector_request, plan.plan(), progress, .{ .visits = 1 }, page.claim);
+            defer verified.deinit();
+            try std.testing.expectEqualDeep(page.progress, verified.progress);
+            var tampered = page.claim;
+            tampered.after[0] ^= 1;
+            try std.testing.expectError(error.InvalidBatchRequest, census.verify(alloc, &receiver, vector_request, plan.plan(), progress, .{ .visits = 1 }, tampered));
+            tampered = page.claim;
+            tampered.before[0] ^= 1;
+            try std.testing.expectError(error.EnrichmentSourceChanged, census.verify(alloc, &receiver, vector_request, plan.plan(), progress, .{ .visits = 1 }, tampered));
+            if (previous_page) |*old_page| old_page.deinit();
+            progress = page.progress;
+            previous_page = page;
+            pages += 1;
+            try std.testing.expect(pages < 16);
+        }
+        try std.testing.expectEqual(@as(u64, if (pass == 0) 1 else 0), progress.members);
+        {
+            var progress_harness: Harness = .{};
+            defer if (progress_harness.encoded) |bytes| alloc.free(bytes);
+            const dispatcher = runtime.artifact_publication_dispatcher;
+            runtime.artifact_publication_dispatcher = .{ .ptr = &progress_harness, .enqueue = Harness.enqueue };
+            defer runtime.artifact_publication_dispatcher = dispatcher;
+            var committed_pages: usize = 0;
+            while (true) {
+                var prepared = blk: {
+                    var snapshot = try db.core.store.beginReadTxn();
+                    defer snapshot.abort();
+                    break :blk (try stream_progress.prepare(alloc, &snapshot, db.root_incarnation, vector_request, plan.plan(), .{ .visits = 1 }, null)) orelse break;
+                };
+                defer prepared.deinit();
+                try std.testing.expect(try driveOrderedChunkVectorCensus(runtime, alloc, vector_request, .{ .visits = 1 }));
+                {
+                    var queued = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, progress_harness.encoded.?);
+                    defer queued.deinit();
+                    try std.testing.expectEqualDeep(try stream_progress.commandFor(&prepared, vector_request, plan.plan(), .{ .visits = 1 }), queued.command);
+                }
+                var competing: ?stream_progress.Prepared = null;
+                defer if (competing) |*value| value.deinit();
+                if (pass == 0 and committed_pages == 0) {
+                    var snapshot = try db.core.store.beginReadTxn();
+                    defer snapshot.abort();
+                    competing = try stream_progress.prepare(alloc, &snapshot, db.root_incarnation, vector_request, plan.plan(), .{}, null);
+                    try std.testing.expect(!std.mem.eql(u8, &prepared.record.claim.after, &competing.?.record.claim.after));
+                }
+                // An abort must not advance durable progress. Preparation has
+                // already released its read and owns all cursor/input bytes.
+                {
+                    var writer = try db.core.store.beginWriteTxn();
+                    defer writer.abort();
+                    try std.testing.expectError(error.DurableRootIncarnationUnavailable, stream_progress.stage(&writer, 0, &prepared));
+                    try std.testing.expect(try stream_progress.stage(&writer, db.root_incarnation, &prepared));
+                }
+                const replay = db.core.store.lastReplaySequence(0);
+                {
+                    var writer = try db.core.store.beginWriteTxn();
+                    errdefer writer.abort();
+                    const pending = (try @import("../artifact_producer_obligations.zig").load(&writer)).?.pending_documents;
+                    try std.testing.expect(try stream_progress.stage(&writer, db.root_incarnation, &prepared));
+                    try std.testing.expect(!try stream_progress.stage(&writer, db.root_incarnation, &prepared));
+                    if (competing) |*value| try std.testing.expectError(error.EnrichmentSourceChanged, stream_progress.stage(&writer, db.root_incarnation, value));
+                    try std.testing.expectEqual(pending, (try @import("../artifact_producer_obligations.zig").load(&writer)).?.pending_documents);
+                    try writer.commit();
+                }
+                try std.testing.expectEqual(replay, db.core.store.lastReplaySequence(0));
+                {
+                    var snapshot = try db.core.store.beginReadTxn();
+                    defer snapshot.abort();
+                    const stored = (try stream_progress.load(&snapshot, db.root_incarnation, vector_request, plan.plan())).?;
+                    try std.testing.expectEqualDeep(prepared.record.claim, stored.claim);
+                    try std.testing.expectEqual(stored.progress.enumerated, stored.closed);
+                    if (!stored.progress.enumerated) try std.testing.expectError(error.ArtifactPublicationPending, stream_progress.prepareClosure(alloc, &snapshot, db.root_incarnation, vector_request, plan.plan()));
+                    // Lost-reply duplicate reuses only the receiver's verified
+                    // record, not the requester's private scan checkpoint.
+                    var duplicate = (try stream_progress.prepare(alloc, &snapshot, db.root_incarnation, vector_request, plan.plan(), .{ .visits = 1 }, prepared.record.claim)).?;
+                    errdefer duplicate.deinit();
+                    try std.testing.expectEqualSlices(u8, prepared.encoded, duplicate.encoded);
+                    if (last_verified) |*value| value.deinit();
+                    last_verified = duplicate;
+                }
+                committed_pages += 1;
+                try std.testing.expect(committed_pages < 16);
+            }
+            try std.testing.expect(committed_pages != 0);
+            try std.testing.expectEqual(committed_pages, progress_harness.calls);
+            try std.testing.expect(try driveOrderedChunkVectorCensus(runtime, alloc, vector_request, .{ .visits = 1 }));
+            try std.testing.expectEqual(committed_pages, progress_harness.calls);
+        }
+        {
+            var snapshot = try db.core.store.beginReadTxn();
+            defer snapshot.abort();
+            if (last_closure) |*closure| closure.deinit();
+            last_closure = null;
+            last_closure = try stream_progress.prepareClosure(alloc, &snapshot, db.root_incarnation, vector_request, plan.plan());
+            const requirement_bound = for (plan.plan().generated_templates, 0..) |candidate, ordinal| {
+                if (!producer_input.sameDefinition(vector_request, candidate)) continue;
+                try std.testing.expectEqualDeep((try plan.plan().completion_plan.?.provider(ordinal)).id, last_closure.?.requirement);
+                break true;
+            } else false;
+            try std.testing.expect(requirement_bound);
+            try last_closure.?.requireCurrent(&snapshot, db.root_incarnation);
+            try std.testing.expectError(error.DurableRootIncarnationUnavailable, last_closure.?.requireCurrent(&snapshot, db.root_incarnation + 1));
+            const ClosureAllocations = struct {
+                fn run(a: Allocator, txn: *@TypeOf(snapshot), root: u128, request: enrichment_types.GeneratedEnrichmentRequest, pinned: *const index_manager_mod.IndexManager.WritePlanSnapshot) !void {
+                    var closure = try stream_progress.prepareClosure(a, txn, root, request, pinned);
+                    defer closure.deinit();
+                    try closure.requireCurrent(txn, root);
+                }
+            };
+            if (pass == 0) try std.testing.checkAllAllocationFailures(alloc, ClosureAllocations.run, .{ &snapshot, db.root_incarnation, vector_request, plan.plan() });
+        }
+        {
+            var writer = try db.core.store.beginWriteTxn();
+            defer writer.abort();
+            const pending = (try @import("../artifact_producer_obligations.zig").load(&writer)).?.pending_documents;
+            try last_closure.?.requireCurrent(&writer, db.root_incarnation);
+            // A per-stream certificate neither clears document work nor
+            // survives loss/replacement of the verified progress it binds.
+            try std.testing.expectEqual(pending, (try @import("../artifact_producer_obligations.zig").load(&writer)).?.pending_documents);
+            try writer.delete(&last_closure.?.selected);
+            try std.testing.expectError(error.EnrichmentSourceChanged, last_closure.?.requireCurrent(&writer, db.root_incarnation));
+            try std.testing.expectError(error.ArtifactPublicationPending, stream_progress.prepareClosure(alloc, &writer, db.root_incarnation, vector_request, plan.plan()));
+        }
+        if (pass == 0) {
+            {
+                var writer = try db.core.store.beginWriteTxn();
+                errdefer writer.abort();
+                try writer.delete(&last_verified.?.selected);
+                try writer.commit();
+            }
+            var live = blk: {
+                var snapshot = try db.core.store.beginReadTxn();
+                defer snapshot.abort();
+                break :blk (try stream_progress.prepare(alloc, &snapshot, db.root_incarnation, vector_request, plan.plan(), .{}, null)).?;
+            };
+            defer live.deinit();
+            try std.testing.expectEqual(@as(u64, 1), live.record.progress.members);
+            const live_command = try stream_progress.commandFor(&live, vector_request, plan.plan(), .{});
+            var queued = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
+            defer queued.deinit();
+            try std.testing.expectEqualDeep(live_command, queued.command);
+            try harness.apply(&db, 6);
+            var snapshot = try db.core.store.beginReadTxn();
+            defer snapshot.abort();
+            try std.testing.expectEqualDeep(live.record.claim, (try stream_progress.load(&snapshot, db.root_incarnation, vector_request, plan.plan())).?.claim);
+            try std.testing.expect((try stream_progress.load(&snapshot, db.root_incarnation, vector_request, plan.plan())).?.closed);
+            try std.testing.expect((try ordered_publication.rejected(&snapshot, live_command)) == null);
+            const calls = harness.calls;
+            try std.testing.expectError(error.ArtifactPublicationPending, harness.process(runtime, vector_request, &window, dense));
+            try std.testing.expectEqual(calls, harness.calls);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), window.sparse_embeddings.items.len);
+    try std.testing.expectEqual(@as(usize, 0), window.dense_embeddings.items.len);
+    const census_command = try stream_progress.commandFor(&last_verified.?, vector_request, plan.plan(), .{});
+    // Remove only the test's manually staged registry record so actual Raft
+    // apply must independently verify and install a previously unseen page.
+    {
+        var writer = try db.core.store.beginWriteTxn();
+        errdefer writer.abort();
+        try writer.delete(&last_verified.?.selected);
+        try writer.commit();
+    }
+    const census_bytes = try @import("../artifact_publication_transport_codec.zig").encodeAlloc(alloc, census_command);
+    defer alloc.free(census_bytes);
+    var decoded_census = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, census_bytes);
+    defer decoded_census.deinit();
+    {
+        var queued = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
+        defer queued.deinit();
+        try std.testing.expectEqualDeep(census_command, queued.command);
+    }
+    try db.batchRaftReplicatedApply(.{ .artifact_publication = decoded_census.command }, .{ .term = 1, .index = 10 });
+    try db.batchRaftReplicatedApply(.{ .artifact_publication = decoded_census.command }, .{ .term = 1, .index = 10 });
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const stored = (try stream_progress.load(&read, db.root_incarnation, vector_request, plan.plan())).?;
+        try std.testing.expectEqualDeep(last_verified.?.record.claim, stored.claim);
+        try std.testing.expect(stored.progress.enumerated);
+        try std.testing.expect(stored.closed);
+        try std.testing.expect((try ordered_publication.rejected(&read, census_command)) == null);
+    }
+    var wrong_generation = census_command;
+    wrong_generation.producer_generation += 1;
+    wrong_generation.publication_digest = wrong_generation.digest();
+    try db.batchRaftReplicatedApply(.{ .artifact_publication = wrong_generation }, .{ .term = 1, .index = 11 });
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(ordered_publication.Rejection.stale_catalog, (try ordered_publication.rejected(&read, wrong_generation)).?.reason);
+    }
+    const Observation = @import("../artifact_stream_observation.zig").Observation;
+    var local: Observation = undefined;
+    var foreign: Observation = undefined;
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        var input = (try @import("../artifact_chunk_vector_publication.zig").capture(alloc, &read, vector_request, plan.plan(), member)).?;
+        defer input.deinit();
+        var proof = (try input.token.acceptedProof(alloc, &read)).?;
+        defer proof.deinit();
+        local = try Observation.capture(&read, "doc");
+        try local.observeProof("doc", proof.owned.proof);
+        try std.testing.expect(!local.foreign_inputs);
+        try local.requireCurrent(&read, "doc");
+        try std.testing.expectError(error.InvalidBatchRequest, local.requireCurrent(&read, "other"));
+        // Scope classification uses the complete causal set, including inputs
+        // that own no output. The accepted-proof reader separately validates
+        // those inputs before a production census can observe this structure.
+        foreign = local;
+        var cross_document = proof.owned.proof;
+        var neighbor = proof.owned.proof.sources[0];
+        neighbor.document_key = "other";
+        const sources = [_]ordered_publication.Source{ proof.owned.proof.sources[0], neighbor };
+        cross_document.sources = &sources;
+        try foreign.observeProof("doc", cross_document);
+        try std.testing.expect(foreign.foreign_inputs);
+        try foreign.requireCurrent(&read, "doc");
+        cross_document.authority_epoch += 1;
+        try std.testing.expectError(error.ArtifactCatalogDrift, local.observeProof("doc", cross_document));
+    }
+    try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "other", .value = "{}" }}, .timestamp_ns = 103 }, .{ .term = 1, .index = 12 });
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try local.requireCurrent(&read, "doc");
+        try std.testing.expectError(error.EnrichmentSourceChanged, foreign.requireCurrent(&read, "doc"));
+        try last_closure.?.requireCurrent(&read, db.root_incarnation);
+    }
+    try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"changed\"}" }}, .timestamp_ns = 104 }, .{ .term = 1, .index = 13 });
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectError(error.EnrichmentSourceChanged, local.requireCurrent(&read, "doc"));
+        try std.testing.expectError(error.EnrichmentSourceChanged, last_closure.?.requireCurrent(&read, db.root_incarnation));
+        try std.testing.expectError(error.EnrichmentSourceChanged, @import("../artifact_stream_census.zig").scan(alloc, &read, vector_request, plan.plan(), .{ .observation = local }, .{}));
+    }
+    {
+        var writer = try db.core.store.beginWriteTxn();
+        defer writer.abort();
+        try std.testing.expectError(error.EnrichmentSourceChanged, stream_progress.stage(&writer, db.root_incarnation, &last_verified.?));
+    }
+    try db.batchRaftReplicatedApply(.{ .artifact_publication = census_command }, .{ .term = 1, .index = 14 });
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const rejected = (try ordered_publication.rejected(&read, census_command)).?;
+        try std.testing.expectEqual(ordered_publication.Rejection.stale_source, rejected.reason);
+        try std.testing.expectEqual(@as(u64, 14), rejected.applied_index);
+    }
+    // Publication progress is a normal control-plane wait. It must neither
+    // inflate error metrics nor inherit exponential provider/pipeline delay.
+    const original_clock = runtime.clock;
+    defer runtime.clock = original_clock;
+    var clock: platform_clock.ManualClock = .{};
+    clock.setRealtimeNs(original_clock.nowRealtimeNs());
+    runtime.clock = clock.clock();
+    const io = (runtime.io_impl orelse return error.TestUnexpectedResult).io();
+    const errors = runtime.error_count;
+    const retryable_errors = runtime.retryable_error_count;
+    runtime.consecutive_retry_count = 6;
+    runtime.retry_failure_count = 5;
+    runtime.retry_failure_fingerprint = runtime.active_failure_fingerprint;
+    const applied_sequence = runtime.applied_sequence;
+    for ([_]WorkerRetryScope{ .request, .pipeline, .request, .pipeline }) |scope| {
+        runtime.retry_after_hint_ms = transient_worker_retry_max_sleep_ms;
+        runtime.recordRetryableError(io, error.ArtifactPublicationPending, scope);
+        try std.testing.expectEqual(errors, runtime.error_count);
+        try std.testing.expectEqual(retryable_errors, runtime.retryable_error_count);
+        try std.testing.expectEqual(@as(u32, 6), runtime.consecutive_retry_count);
+        try std.testing.expectEqual(@as(u32, 5), runtime.retry_failure_count);
+        try std.testing.expectEqual(applied_sequence, runtime.applied_sequence);
+        try std.testing.expectEqual(clock.clock().nowRealtimeMs() + workerRetryDelayMs(0), runtime.next_retry_at_ms);
+    }
+}
+
+test "ordered artifact inventory asset callback waits for receipt and publishes absence" {
+    try testOrderedAssetCallback(false, false);
+}
+
+test "ordered artifact inventory deferred asset callback retains causal context without reinference" {
+    try testOrderedAssetCallback(true, false);
+}
+
+test "ordered artifact inventory accepted asset callback waits for graph publication including absence" {
+    try testOrderedAssetCallback(false, true);
+}
+
+test "ordered artifact inventory deferred asset callback completes graph without reinference" {
+    try testOrderedAssetCallback(true, true);
+}
+
+fn testOrderedAssetCallback(generated: bool, graph: bool) !void {
+    try testOrderedAssetLifecycle(generated, graph, false);
+    try testOrderedAssetLifecycle(generated, graph, true);
+}
+
+fn testOrderedAssetLifecycle(generated: bool, graph: bool, delete_live: bool) !void {
+    const db_mod = @import("../db.zig");
+    const alloc = std.testing.allocator;
+    const Harness = struct {
+        encoded: ?[]u8 = null,
+        calls: usize = 0,
+        provider_calls: usize = 0,
+        refuse_next: bool = false,
+        fn produce(ptr: *anyopaque, a: Allocator, request: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.provider_calls += 1;
+            return a.dupe(u8, request.source_text);
+        }
+        fn canBatch(_: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) !bool {
+            return false;
+        }
+        fn enqueue(ptr: *anyopaque, _: ordered_publication.Namespace, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.refuse_next) {
+                self.refuse_next = false;
+                return error.QueueFull;
+            }
+            const copy = try std.testing.allocator.dupe(u8, bytes);
+            if (self.encoded) |old| std.testing.allocator.free(old);
+            self.encoded = copy;
+            self.calls += 1;
+        }
+    };
+    var harness: Harness = .{};
+    defer if (harness.encoded) |bytes| alloc.free(bytes);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/asset-callback", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try db_mod.DB.open(alloc, path, .{
+        .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 },
+        .online_source_authority = .raft,
+        .primary_backend = .{ .lsm = .{} },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .artifact_publication_dispatcher = .{ .ptr = &harness, .enqueue = Harness.enqueue },
+    });
+    defer db.close();
+    try db.setSchemaJson(alloc, "{}");
+    try db.addEnrichment(.{ .name = "copy", .kind = .asset, .field = "body", .content_type = if (graph) "application/json" else "text/plain", .producer_json = if (generated) "{\"type\":\"generator\",\"config\":{}}" else "" });
+    try db.addEnrichment(.{ .name = "downstream", .kind = .asset, .source_artifact_name = "copy", .content_type = "text/plain" });
+    if (graph) try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"sources\":[{\"artifact\":\"copy\"}]}" });
+    const asset_body = if (graph) "{\"type\":\"mentions\",\"target\":\"other\"}" else "hello";
+    const document = try std.json.Stringify.valueAlloc(alloc, .{ .body = asset_body }, .{});
+    defer alloc.free(document);
+    try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = document }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
+    var catalog = try db.artifactInventoryCommand(alloc);
+    defer catalog.catalogs.deinit(alloc);
+    catalog.binding.effect_protocol = 15;
+    try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
+    var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
+    activation.publication_digest = activation.digest();
+    try db.batchRaftReplicatedApply(.{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
+    try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true, .asset_producer = if (generated) .{ .ptr = &harness, .vtable = &.{
+        .produce = Harness.produce,
+        .can_produce_batch = Harness.canBatch,
+        .invocation_memory_for_requests = testInvocationMemoryForRequests,
+    } } else null });
+    const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
+    var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer plan.release();
+    var request = for (plan.plan().generated_templates) |candidate| {
+        if (std.mem.eql(u8, candidate.artifact_name, "copy")) break candidate;
+    } else return error.TestUnexpectedResult;
+    request.doc_key = "doc";
+    var downstream = for (plan.plan().generated_templates) |candidate| {
+        if (std.mem.eql(u8, candidate.artifact_name, "downstream")) break candidate;
+    } else return error.TestUnexpectedResult;
+    downstream.doc_key = "doc";
+    var window: GeneratedReplayWindow = .{ .alloc = runtime.alloc };
+    defer window.deinit();
+    var batch: PreparedAssetBatch = .{};
+    defer batch.deinit(runtime.alloc);
+    var prepared_sources = PreparedDocumentSourceCache.init(runtime);
+    defer prepared_sources.deinit();
+    var scope: FailureScope = .{};
+    const key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "copy");
+    defer alloc.free(key);
+    const calls_per_pass: usize = if (graph) 3 else 2;
+    const entries_per_pass: usize = if (graph) 4 else 3;
+    const streams = @import("../artifact_stream_progress.zig");
+    var previous_closure: ?streams.DocumentClosure = null;
+    defer if (previous_closure) |*value| value.deinit();
+    for (0..@as(usize, if (delete_live) 2 else 3)) |pass| {
+        const deleted = pass == 2 or (delete_live and pass == 1);
+        if (pass != 0) {
+            if (!deleted) {
+                try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .timestamp_ns = 101 }, .{ .term = 1, .index = pass * entries_per_pass + 3 });
+            } else try db.batchRaftReplicatedApply(.{ .deletes = &.{"doc"}, .timestamp_ns = 102 }, .{ .term = 1, .index = pass * entries_per_pass + 3 });
+            // The old upstream bytes still exist, but their proof refers to
+            // the old primary. No downstream provider may consume them.
+            if (!deleted) try std.testing.expectError(error.EnrichmentSourceChanged, processAsset(runtime, downstream, &batch, &prepared_sources, &window, &scope));
+            try std.testing.expectEqual(pass * calls_per_pass, harness.calls);
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectError(error.EnrichmentSourceChanged, previous_closure.?.requireCurrent(&read, db.root_incarnation));
+            try std.testing.expectError(error.EnrichmentSourceChanged, streams.prepareEnrichmentClosure(alloc, &read, db.root_incarnation, downstream, plan.plan()));
+        }
+        if (generated and pass == 0) {
+            try processAsset(runtime, request, &batch, &prepared_sources, &window, &scope);
+            try std.testing.expectEqual(@as(usize, 1), batch.items.items.len);
+            try std.testing.expectError(error.ArtifactPublicationPending, batch.flush(runtime, &window, &scope));
+        } else try std.testing.expectError(error.ArtifactPublicationPending, processAsset(runtime, request, &batch, &prepared_sources, &window, &scope));
+        try std.testing.expectEqual(pass * calls_per_pass + 1, harness.calls);
+        var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
+        defer decoded.deinit();
+        try std.testing.expectEqual(@as(usize, 1), decoded.command.mutations.len);
+        if (pass == 0) {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectError(error.NotFound, read.get(key));
+            try std.testing.expectEqualStrings(asset_body, decoded.command.mutations[0].value.?);
+        } else try std.testing.expect(decoded.command.mutations[0].value == null);
+        try db.batchRaftReplicatedApply(.{ .artifact_publication = decoded.command }, .{ .term = 1, .index = pass * entries_per_pass + 4 });
+        if (graph) {
+            harness.refuse_next = true;
+            try std.testing.expectError(error.QueueFull, processAsset(runtime, request, &batch, &prepared_sources, &window, &scope));
+            try std.testing.expectEqual(pass * calls_per_pass + 1, harness.calls);
+            try std.testing.expectError(error.ArtifactPublicationPending, processAsset(runtime, request, &batch, &prepared_sources, &window, &scope));
+            var graph_command = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
+            defer graph_command.deinit();
+            try std.testing.expect(graph_command.command.producer_kind == .graph);
+            try db.batchRaftReplicatedApply(.{ .artifact_publication = graph_command.command }, .{ .term = 1, .index = pass * entries_per_pass + 5 });
+            const edge_key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, "doc", "g", "mentions", "other", "doc");
+            defer alloc.free(edge_key);
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            if (pass == 0) {
+                _ = try read.get(edge_key);
+            } else try std.testing.expectError(error.NotFound, read.get(edge_key));
+        }
+        try processAsset(runtime, request, &batch, &prepared_sources, &window, &scope);
+        try std.testing.expectEqual((pass + 1) * calls_per_pass - 1, harness.calls);
+        try std.testing.expectError(error.ArtifactPublicationPending, processAsset(runtime, downstream, &batch, &prepared_sources, &window, &scope));
+        try std.testing.expectEqual((pass + 1) * calls_per_pass, harness.calls);
+        var child = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
+        defer child.deinit();
+        try std.testing.expectEqual(@as(usize, if (deleted) 0 else 2), child.command.artifact_sources.len);
+        if (!deleted) {
+            const head = try @import("../artifact_extraction_generation.zig").headKeyAlloc(alloc, "doc", "copy");
+            defer alloc.free(head);
+            try std.testing.expectEqualStrings(key, child.command.artifact_sources[0].key);
+            try std.testing.expectEqualStrings(head, child.command.artifact_sources[1].key);
+            try std.testing.expect(child.command.artifact_sources[1].content_digest == null);
+        }
+        try db.batchRaftReplicatedApply(.{ .artifact_publication = child.command }, .{ .term = 1, .index = pass * entries_per_pass + entries_per_pass + 2 });
+        try processAsset(runtime, downstream, &batch, &prepared_sources, &window, &scope);
+        try std.testing.expectEqual((pass + 1) * calls_per_pass, harness.calls);
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        var verifier: @import("../artifact_completion_progress.zig").StreamVerifier = .{ .plan = plan.plan() };
+        for ([_]enrichment_types.GeneratedEnrichmentRequest{ request, downstream }) |selected| {
+            var closure = try streams.prepareEnrichmentClosure(alloc, &read, db.root_incarnation, selected, plan.plan());
+            defer closure.deinit();
+            const Metadata = struct {
+                txn: *@TypeOf(read),
+                reads: usize = 0,
+                pub fn get(self: *@This(), key_name: []const u8) ![]const u8 {
+                    try std.testing.expect(std.mem.startsWith(u8, key_name, "\x00\x00"));
+                    self.reads += 1;
+                    return self.txn.get(key_name);
+                }
+            };
+            var probe: Metadata = .{ .txn = &read };
+            try closure.requireCurrent(&probe, db.root_incarnation);
+            try std.testing.expectEqual(@as(usize, 3), probe.reads);
+            var witness = (try verifier.verify(alloc, &read, db.root_incarnation, "doc", try plan.plan().completion_plan.?.providerFor(selected))).?;
+            defer witness.deinit();
+            try witness.requireCurrent(&read, db.root_incarnation);
+            const Check = struct {
+                fn run(a: Allocator, txn: *@TypeOf(read), root: u128, chosen: enrichment_types.GeneratedEnrichmentRequest, snapshot: *const index_manager_mod.IndexManager.WritePlanSnapshot) !void {
+                    var value = try @import("../artifact_stream_progress.zig").prepareEnrichmentClosure(a, txn, root, chosen, snapshot);
+                    defer value.deinit();
+                }
+            };
+            if (pass == 0 and !delete_live and !graph and !generated) try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ &read, db.root_incarnation, selected, plan.plan() });
+        }
+        if (previous_closure) |*value| value.deinit();
+        previous_closure = null;
+        previous_closure = try streams.prepareEnrichmentClosure(alloc, &read, db.root_incarnation, downstream, plan.plan());
+    }
+    try std.testing.expectEqual(@as(usize, 0), window.documents.items.len);
+    try std.testing.expectEqual(@as(usize, 0), batch.items.items.len);
+    try std.testing.expectEqual(@as(usize, if (generated) 1 else 0), harness.provider_calls);
+}
+
 test "asset preparation is lazy and byte bounded across retryable provider batches" {
     const alloc = std.testing.allocator;
     const Harness = struct {
@@ -30908,7 +32957,8 @@ test "asset preparation is lazy and byte bounded across retryable provider batch
     const healthy = try Harness.item(alloc, healthy_request, "healthy");
     defer freeAssetProducerBatchItem(alloc, healthy);
     var sequential_scope = FailureScope{};
-    try std.testing.expectError(error.EmbedRateLimited, flushAssetProducerBatchSequential(&runtime, runtime.config.asset_producer.?, &.{ blocked, healthy }, &window, &sequential_scope));
+    var sequential_items = [_]AssetProducerBatchItem{ blocked, healthy };
+    try std.testing.expectError(error.EmbedRateLimited, flushAssetProducerBatchSequential(&runtime, runtime.config.asset_producer.?, &sequential_items, &window, &sequential_scope));
     try std.testing.expectEqual(@as(usize, 7), harness.calls);
     // The deferred retry's identity travels in the scope, not in the
     // runtime-global active identity (which a concurrent lane could have

@@ -24,6 +24,7 @@ pub const raft = @import("raft.zig");
 pub const raw_node = @import("raw_node.zig");
 
 pub const Config = raft.Config;
+pub const ProposalAdmission = raft.ProposalAdmission;
 pub const Message = message.Message;
 pub const Entry = types.Entry;
 pub const ConfChange = types.ConfChange;

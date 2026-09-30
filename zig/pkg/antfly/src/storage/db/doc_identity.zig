@@ -473,6 +473,11 @@ pub fn reassignNamespaceWithMetadataAlloc(
     namespace: Namespace,
     metadata: []const NamespaceMetadataUpdate,
 ) !void {
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try @import("artifact_reconcile_intent.zig").requireAbsent(&read);
+    }
     try validateStoreAlloc(alloc, store);
 
     var ordinal_rows = OrdinalDocRows{};
@@ -481,6 +486,10 @@ pub fn reassignNamespaceWithMetadataAlloc(
 
     var txn = try store.beginWriteTxn();
     errdefer txn.abort();
+    try @import("artifact_reconcile_intent.zig").requireAbsent(&txn);
+    if (try loadNamespaceTxn(&txn)) |previous| {
+        if (!previous.eql(namespace)) try @import("artifact_inventory.zig").invalidateOrdered(&txn);
+    } else try @import("artifact_inventory.zig").invalidateOrdered(&txn);
     var namespace_value: [24]u8 = undefined;
     encodeNamespace(namespace_value[0..], namespace);
     try txn.put(internal_keys.identity_namespace_key[0..], &namespace_value);

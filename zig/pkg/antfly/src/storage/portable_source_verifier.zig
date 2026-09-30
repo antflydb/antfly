@@ -242,7 +242,7 @@ fn initialize(alloc: Allocator, io: std.Io, file: std.Io.File, index: std.Io.Fil
         used[blob_index] = true;
         const kind = std.meta.stringToEnum(codec.BlockType, object.role) orelse return error.InvalidBackupManifest;
         switch (kind) {
-            .cluster_manifest, .table_manifest, .shard_header, .document_batch, .embedding_batch, .sparse_batch, .summary_batch, .chunk_batch, .edge_batch, .transaction_batch, .doc_identity_batch, .metadata_batch, .artifact_batch, .resolution_batch, .integrity_batch, .shard_footer, .file_footer => {},
+            .cluster_manifest, .table_manifest, .shard_header, .document_batch, .embedding_batch, .sparse_batch, .summary_batch, .chunk_batch, .edge_batch, .transaction_batch, .doc_identity_batch, .metadata_batch, .artifact_batch, .resolution_batch, .integrity_batch, .source_artifact_batch, .source_proof_batch, .shard_footer, .file_footer => {},
             else => return error.InvalidBackupManifest,
         }
         var bytes: [object_record_size]u8 = @splat(0);
@@ -445,6 +445,7 @@ fn objectsStep(alloc: Allocator, io: std.Io, file: std.Io.File, index: std.Io.Fi
             if (state.kind == 0x18) {
                 if (state.metadata.phase != .done) return error.InvalidSourceSnapshot;
             } else {
+                if (state.kind == 0x1d) state.content.provenance_required = true;
                 state.content.ordered_content_digest = try state.object_hash.finish();
                 state.content.objects = std.math.add(u64, state.content.objects, 1) catch return error.SourceSnapshotTooLarge;
                 state.content.content_bytes = std.math.add(u64, state.content.content_bytes, if (state.kind == 0xff) 16 else state.blob_size) catch return error.SourceSnapshotTooLarge;

@@ -210,6 +210,11 @@ pub const ManagedProgressDriver = struct {
         self.* = undefined;
     }
 
+    /// Request a progress-only turn without accelerating Raft ticks.
+    pub fn requestWake(self: *ManagedProgressDriver) void {
+        requestProgress(self);
+    }
+
     fn releaseSourceOwnership(self: *ManagedProgressDriver) void {
         if (!self.source_owned) return;
         self.source.release_owner.?(self.source.ptr);
@@ -553,6 +558,35 @@ test "managed raft progress driver advances independently and joins on stop" {
     try io_impl.io().sleep(.fromMilliseconds(5), .awake);
     try std.testing.expectEqual(stopped_count, counter.count.load(.acquire));
     try std.testing.expectError(error.AlreadyStarted, driver.start());
+}
+
+test "managed raft progress driver wakes immediately when deferred apply owner opens" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const Counter = struct {
+        count: std.atomic.Value(u64) = .init(0),
+        fn runOnce(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.count.fetchAdd(1, .release);
+        }
+    };
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var counter = Counter{};
+    var driver = ManagedProgressDriver.init(io, .{ .ptr = &counter, .run_once = Counter.runOnce, .run_progress_once = Counter.runOnce }, std.time.ns_per_hour);
+    defer driver.deinit();
+    try driver.start();
+    const deadline = platform_time.monotonicNs() + std.time.ns_per_s;
+    while (counter.count.load(.acquire) == 0) {
+        if (platform_time.monotonicNs() >= deadline) return error.TestProgressDidNotStart;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    driver.requestWake();
+    while (counter.count.load(.acquire) < 2) {
+        if (platform_time.monotonicNs() >= deadline) return error.TestOwnerWakeDidNotAdvanceProgress;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try driver.checkFailure();
 }
 
 test "managed raft progress driver publishes source failure" {

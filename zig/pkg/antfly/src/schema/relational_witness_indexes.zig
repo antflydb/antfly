@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! MATCH PARTIAL uses linear-size ordered support, never mask enumeration or
 //! an unbounded primary-row scan. Shared by DDL dependency admission and the
@@ -111,6 +111,27 @@ pub fn requireCoverage(parent: anytype, columns: []const []const u8) !void {
             if (eligible(index) and std.mem.eql(u8, index.keys[0].column.?, column)) break;
         } else return error.ForeignKeyPartialSupportIndexRequired;
     }
+}
+
+/// The exact selectable index identities for an FK parent. A child-generation
+/// owner receipt may only be staged after each selected index is ready in the
+/// same pinned parent schema. Repeated columns share one proof.
+pub fn supportNames(alloc: std.mem.Allocator, parent: anytype, columns: []const []const u8) ![]const []const u8 {
+    const indexes = parent.relational_indexes orelse return error.ForeignKeyPartialSupportIndexRequired;
+    var names: std.ArrayList([]const u8) = .empty;
+    errdefer names.deinit(alloc);
+    for (columns) |column| {
+        const selected = for (indexes.value) |index| {
+            if (eligible(index) and std.mem.eql(u8, index.keys[0].column.?, column)) break index.name;
+        } else return error.ForeignKeyPartialSupportIndexRequired;
+        var seen = false;
+        for (names.items) |existing| if (std.mem.eql(u8, existing, selected)) {
+            seen = true;
+            break;
+        };
+        if (!seen) try names.append(alloc, selected);
+    }
+    return names.toOwnedSlice(alloc);
 }
 
 pub const Selection = struct { name: []const u8, values: []const std.json.Value };

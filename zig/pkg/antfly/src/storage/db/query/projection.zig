@@ -110,76 +110,11 @@ pub fn projectOwnedStoredBytesForSearch(
     return try projectLookupStoredBytes(alloc, doc_key, raw, search_exec.searchLookupOptions(req), loader);
 }
 
-pub fn freeJsonValue(alloc: Allocator, value: *std.json.Value) void {
-    switch (value.*) {
-        .string => |s| alloc.free(s),
-        .array => |*arr| {
-            for (arr.items) |*item| freeJsonValue(alloc, item);
-            arr.deinit();
-        },
-        .object => |*obj| {
-            var it = obj.iterator();
-            while (it.next()) |entry| {
-                alloc.free(entry.key_ptr.*);
-                freeJsonValue(alloc, entry.value_ptr);
-            }
-            obj.deinit(alloc);
-        },
-        .number_string => |s| alloc.free(s),
-        else => {},
-    }
-    value.* = undefined;
-}
-
-pub fn cloneJsonValue(alloc: Allocator, value: std.json.Value) !std.json.Value {
-    return switch (value) {
-        .null => .null,
-        .bool => |b| .{ .bool = b },
-        .integer => |i| .{ .integer = i },
-        .float => |f| .{ .float = f },
-        .number_string => |s| .{ .number_string = try alloc.dupe(u8, s) },
-        .string => |s| .{ .string = try alloc.dupe(u8, s) },
-        .array => |arr| blk: {
-            var cloned = std.json.Array.init(alloc);
-            errdefer {
-                for (cloned.items) |*item| freeJsonValue(alloc, item);
-                cloned.deinit();
-            }
-            for (arr.items) |item| try cloned.append(try cloneJsonValue(alloc, item));
-            break :blk .{ .array = cloned };
-        },
-        .object => |obj| blk: {
-            var cloned = std.json.ObjectMap.empty;
-            errdefer {
-                var it = cloned.iterator();
-                while (it.next()) |entry| {
-                    alloc.free(entry.key_ptr.*);
-                    freeJsonValue(alloc, entry.value_ptr);
-                }
-                cloned.deinit(alloc);
-            }
-            var it = obj.iterator();
-            while (it.next()) |entry| {
-                try cloned.put(alloc, try alloc.dupe(u8, entry.key_ptr.*), try cloneJsonValue(alloc, entry.value_ptr.*));
-            }
-            break :blk .{ .object = cloned };
-        },
-    };
-}
-
-pub fn putOwnedValue(
-    alloc: Allocator,
-    obj: *std.json.ObjectMap,
-    key: []const u8,
-    value: std.json.Value,
-) !void {
-    if (obj.getPtr(key)) |existing| {
-        freeJsonValue(alloc, existing);
-        existing.* = value;
-        return;
-    }
-    try obj.put(alloc, try alloc.dupe(u8, key), value);
-}
+const owned_json = @import("../../../common/owned_json.zig");
+pub const freeJsonValue = owned_json.deinit;
+pub const cloneJsonValue = owned_json.clone;
+pub const putOwnedValue = owned_json.put;
+const putClonedValue = owned_json.putClone;
 
 pub fn normalizeChunkArtifactForQuery(alloc: Allocator, value: *std.json.Value) !void {
     if (value.* != .object) return;
@@ -192,22 +127,22 @@ pub fn normalizeChunkArtifactForQuery(alloc: Allocator, value: *std.json.Value) 
 
     if (obj.get("_id") == null) {
         if (obj.get("_chunk_id")) |chunk_id| {
-            try putOwnedValue(alloc, obj, "_id", try cloneJsonValue(alloc, chunk_id));
+            try putClonedValue(alloc, obj, "_id", chunk_id);
         }
     }
     if (obj.get("_start_char") == null) {
         if (obj.get("_start_offset")) |start_offset| {
-            try putOwnedValue(alloc, obj, "_start_char", try cloneJsonValue(alloc, start_offset));
+            try putClonedValue(alloc, obj, "_start_char", start_offset);
         }
     }
     if (obj.get("_end_char") == null) {
         if (obj.get("_end_offset")) |end_offset| {
-            try putOwnedValue(alloc, obj, "_end_char", try cloneJsonValue(alloc, end_offset));
+            try putClonedValue(alloc, obj, "_end_char", end_offset);
         }
     }
     if (obj.get("_content") == null) {
         if (findChunkContentField(obj)) |content_value| {
-            try putOwnedValue(alloc, obj, "_content", try cloneJsonValue(alloc, content_value));
+            try putClonedValue(alloc, obj, "_content", content_value);
         }
     }
 }
@@ -261,17 +196,17 @@ fn mergeStoredDocumentWithSpecialFields(
     special: SpecialFieldSelection,
     loader: SpecialFieldLoader,
 ) ![]u8 {
-    const artifact_value = if (special.all_artifacts) try loader.load_artifacts(loader.ctx, alloc, doc_key) else null;
+    var artifact_value = if (special.all_artifacts) try loader.load_artifacts(loader.ctx, alloc, doc_key) else null;
     errdefer if (artifact_value) |value| {
         var mutable = value;
         freeJsonValue(alloc, &mutable);
     };
-    const chunk_value = if (special.all_chunks) try loader.load_chunks(loader.ctx, alloc, doc_key) else null;
+    var chunk_value = if (special.all_chunks) try loader.load_chunks(loader.ctx, alloc, doc_key) else null;
     errdefer if (chunk_value) |value| {
         var mutable = value;
         freeJsonValue(alloc, &mutable);
     };
-    const embedding_value = if (special.all_embeddings) try loader.load_embeddings(loader.ctx, alloc, doc_key) else null;
+    var embedding_value = if (special.all_embeddings) try loader.load_embeddings(loader.ctx, alloc, doc_key) else null;
     errdefer if (embedding_value) |value| {
         var mutable = value;
         freeJsonValue(alloc, &mutable);
@@ -290,17 +225,46 @@ fn mergeStoredDocumentWithSpecialFields(
     if (root != .object) unreachable;
     if (artifact_value) |value| {
         try putOwnedValue(alloc, &root.object, "_artifacts", value);
+        artifact_value = null;
     }
     if (chunk_value) |value| {
         try putOwnedValue(alloc, &root.object, "_chunks", value);
+        chunk_value = null;
     }
     if (embedding_value) |value| {
         try putOwnedValue(alloc, &root.object, "_embeddings", value);
+        embedding_value = null;
     }
 
     const json = try std.json.Stringify.valueAlloc(alloc, root, .{});
     freeJsonValue(alloc, &root);
     return json;
+}
+
+test "ordered artifact inventory public projections transfer nested ownership across allocation faults" {
+    const Harness = struct {
+        fn load(_: ?*anyopaque, alloc: Allocator, _: []const u8) !?std.json.Value {
+            const parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"group\":[{\"value\":\"text\",\"nested\":[1,2,3]}]}", .{});
+            defer parsed.deinit();
+            return try cloneJsonValue(alloc, parsed.value);
+        }
+        fn project(alloc: Allocator) !void {
+            const json = try projectLookupStoredBytes(alloc, "doc", "{\"title\":\"retained\"}", .{ .fields = &.{ "_artifacts", "_chunks", "_embeddings", "title", "-secret.nested" }, .include_all_fields = false }, .{
+                .ctx = null,
+                .load_chunks = load,
+                .load_embeddings = load,
+                .load_artifacts = load,
+            });
+            defer alloc.free(json);
+            const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+            defer parsed.deinit();
+            for ([_][]const u8{ "_artifacts", "_chunks", "_embeddings" }) |name| {
+                try std.testing.expectEqualStrings("text", parsed.value.object.get(name).?.object.get("group").?.array.items[0].object.get("value").?.string);
+            }
+            try std.testing.expectEqualStrings("retained", parsed.value.object.get("title").?.string);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.project, .{});
 }
 
 test "normalizeChunkArtifactForQuery strips private unit revision metadata" {

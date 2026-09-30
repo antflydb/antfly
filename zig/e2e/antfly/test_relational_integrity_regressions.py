@@ -53,6 +53,7 @@ def test_equivalent_cascades(auth_api, mixed_spelling):
                 == "enforced"
             ),
             timeout_s=30,
+            retry_not_found=True,
         )
         api.post("/tables/" + table + "/batch", {"inserts": {"row": {"id": 0}}})
     tx = api.post("/transactions/begin", {"sync_level": "write"})["transaction_id"]
@@ -218,6 +219,7 @@ def test_equivalent_datetime_cascades(auth_api, mixed_spelling):
                 == "enforced"
             ),
             timeout_s=30,
+            retry_not_found=True,
         )
         api.post(
             "/tables/" + table + "/batch",
@@ -284,6 +286,7 @@ def test_conflicting_cascade_has_client_conflict_status(auth_api, explicit_child
                 == "enforced"
             ),
             timeout_s=30,
+            retry_not_found=True,
         )
         api.post("/tables/" + table + "/batch", {"inserts": {"row": {"id": 0}}})
     tx = api.post("/transactions/begin", {"sync_level": "write"})["transaction_id"]
@@ -313,6 +316,7 @@ def _enforced(api, table):
             api.get(f"/tables/{table}/constraints/status").get("state") == "enforced"
         ),
         timeout_s=30,
+        retry_not_found=True,
     )
 
 

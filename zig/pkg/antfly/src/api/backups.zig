@@ -61,20 +61,19 @@ pub const ClusterRestoreRequest = struct {
 };
 
 pub const format_version = @import("local_backups.zig").format_version;
-
 pub const cluster_format_version: u32 = 2;
 pub const table_backup_id = "table";
 pub const antfly_version = "zig-dev";
 pub const max_portable_backup_file_bytes: usize = 1024 * 1024 * 1024;
 pub const max_backup_manifest_bytes = @import("local_backups.zig").max_backup_manifest_bytes;
-
 pub const max_backup_attempt_marker_bytes: usize = 2 * 1024 * 1024;
 pub const max_backup_attempt_cursor_bytes: usize = 8 * 1024;
 const max_backup_attempt_quarantine_bytes: usize = max_backup_attempt_marker_bytes + 2048;
 const max_backup_attempt_lease_bytes = @import("local_backups.zig").max_backup_attempt_lease_bytes;
-
+// `:` is intentionally outside validateBackupId's public alphabet. Cleanup
+// owners therefore cannot be confused with a caller-supplied attempt ID, while
+// the suffix can still carry the full 128-byte public identity losslessly.
 const backup_cleanup_lease_owner_prefix = @import("local_backups.zig").backup_cleanup_lease_owner_prefix;
-
 const legacy_backup_cleanup_lease_owner_prefix = "antfly-cleanup-";
 const backup_attempt_quarantine_prefix = ".antfly-quarantine";
 const cluster_backup_attempt_quarantine_suffix = ".quarantine";
@@ -112,20 +111,18 @@ const backup_cleanup_local_traversal_budget: usize = 512;
 pub const backup_attempt_cleanup_object_budget: usize = 1_000_000;
 pub const backup_attempt_lease_duration_ns: u64 = 5 * std.time.ns_per_min;
 pub const backup_attempt_lease_renew_interval_ns = @import("local_backups.zig").backup_attempt_lease_renew_interval_ns;
-
+/// Current storage owners renew this lease for as long as artifact production
+/// remains live. The initial 24-hour term preserves the pre-lease grace window
+/// when forwarding to a rolling-upgrade peer that does not yet renew it.
 pub const table_backup_writer_lease_duration_ns: u64 = backup_attempt_reclaim_age_ns;
 /// Lease timestamps are produced by the backup coordinator but may be examined
 /// by a different node. Reclamation therefore waits beyond the advertised
 /// expiry by this bounded skew envelope. Deployments must keep host clocks
 /// within this two-renewal-period tolerance.
 pub const backup_attempt_lease_clock_skew_allowance_ns = @import("local_backups.zig").backup_attempt_lease_clock_skew_allowance_ns;
-
 pub const backup_integrity_read_chunk_bytes = @import("local_backups.zig").backup_integrity_read_chunk_bytes;
-
 pub const backup_integrity_max_native_files = @import("local_backups.zig").backup_integrity_max_native_files;
-
 pub const backup_integrity_max_native_list_pages = @import("local_backups.zig").backup_integrity_max_native_list_pages;
-
 const artifact_verification_cache_max_entries: usize = 65_536;
 const incomplete_backup_prefix = ".antfly-incomplete";
 const backup_attempt_head_name = ".antfly-backup-attempt-head.json";
@@ -239,20 +236,15 @@ pub const BackupListPage = struct {
 };
 
 pub const BackupFormat = @import("local_backups.zig").BackupFormat;
-
 pub const ArtifactIntegrityMode = @import("local_backups.zig").ArtifactIntegrityMode;
-
 pub const TableBackupManifest = @import("local_backups.zig").TableBackupManifest;
-
 pub const ShardSnapshot = @import("local_backups.zig").ShardSnapshot;
 
 pub const ArtifactIntegrity = @import("local_backups.zig").ArtifactIntegrity;
 
 pub const TableBackupPlan = @import("local_backups.zig").TableBackupPlan;
-
 pub const TableBackupFence = backup_contract.TableBackupFence;
 pub const BackupOperationControl = @import("local_backups.zig").BackupOperationControl;
-
 pub const TableRestorePlan = backup_contract.TableRestorePlan;
 
 pub const backup_fence_metadata_group_id_header = backup_contract.backup_fence_metadata_group_id_header;
@@ -432,6 +424,10 @@ pub fn tableBackupFenceMatches(
 
 pub const max_restore_source_identity_bytes = @import("local_backups.zig").max_restore_source_identity_bytes;
 
+/// Produces the bounded, canonical identity persisted with a restored
+/// generation. Canonicalization makes equivalent accepted spellings (such as
+/// gcs:// and gs://, redundant file path components, or trailing object-store
+/// separators) share one idempotency key.
 pub const canonicalRestoreSourceIdentityAlloc = @import("local_backups.zig").canonicalRestoreSourceIdentityAlloc;
 
 const canonicalObjectStoreLocationAlloc = @import("local_backups.zig").canonicalObjectStoreLocationAlloc;
@@ -446,6 +442,9 @@ pub const validateSingleRangeRestoreManifestLayout = @import("local_backups.zig"
 
 pub const BackupLocation = @import("local_backups.zig").BackupLocation;
 
+/// Production adapter from the configured backup location to the canonical
+/// refs/manifests/blobs repository. The adapter borrows `location`; callers
+/// must keep both values alive for the complete repository operation.
 const repository_epoch_path = "control/repository.epoch";
 const repository_coordinator_path = "control/repository.coordinator";
 const repository_epoch_max_bytes: usize = 32;
@@ -2151,7 +2150,24 @@ test "filesystem backup location returns the canonical authorized identity" {
     opened.close(io);
 }
 
+pub const cloneAcceptedGenerationSummary = @import("local_backups.zig").cloneAcceptedGenerationSummary;
+
+pub const shardAdmissionNamespace = @import("local_backups.zig").shardAdmissionNamespace;
+
 pub const createManifest = @import("local_backups.zig").createManifest;
+
+test "portable backup manifest rejects partial per-shard accepted generation proof" {
+    const alloc = std.testing.allocator;
+    const table: metadata_table_manager.TableRecord = .{ .table_id = 11, .name = "parents", .schema_json = "{}" };
+    const empty_digest = try @import("../storage/portable_backup.zig").sourceGenerationAdmissionSummaryDigest(.{ .table_id = 11, .shard_id = 101, .range_id = 101 }, &.{});
+    const shards = [_]ShardSnapshot{
+        .{ .group_id = 101, .range_id = 101, .doc_identity_shard_id = 101, .doc_identity_range_id = 101, .start_key = "", .end_key = "m", .snapshot_path = "first.afb", .accepted_generation_summary_digest = empty_digest },
+        .{ .group_id = 102, .range_id = 102, .doc_identity_shard_id = 102, .doc_identity_range_id = 102, .start_key = "m", .snapshot_path = "second.afb" },
+    };
+    try std.testing.expectError(error.BackupIntegrityFailure, createManifest(alloc, "daily", .portable, &table, &shards));
+    const manifest: TableBackupManifest = .{ .format = .portable, .backup_id = "daily", .table_name = "parents", .table_id = 11, .description = "", .schema_json = "{}", .read_schema_json = "", .indexes_json = "{}", .replication_sources_json = "[]", .shards = &shards };
+    try std.testing.expectError(error.BackupIntegrityFailure, validateTableManifest(alloc, &manifest, "daily"));
+}
 
 pub const writeManifest = @import("local_backups.zig").writeManifest;
 
@@ -11409,8 +11425,17 @@ pub fn copyFileFromLocation(
 
 pub const copyFileFromLocationUsingIo = @import("local_backups.zig").copyFileFromLocationUsingIo;
 
+/// Reads one authenticated control file without enumerating or buffering the
+/// artifact generation that contains it. Restore uses this for the native
+/// generation manifest before admitting any corpus-sized bytes.
 pub const readFileFromLocationUsingIoLimited = @import("local_backups.zig").readFileFromLocationUsingIoLimited;
 
+/// Copies exactly one manifest-declared artifact directly into an unpublished
+/// generation. Size and digest are checked against the bytes written, and a
+/// remote object's immutable identity is pinned across bounded range reads.
+/// A bounded transfer primitive shared by restartable materializers. The
+/// caller owns the returned bytes and pins the final file digest from the
+/// authenticated manifest; provider ETags additionally fence each range read.
 pub fn readFileRangeFromLocationUsingIo(alloc: std.mem.Allocator, io: std.Io, location: *BackupLocation, relative_path: []const u8, expected_size: u64, offset: u64, maximum: usize, cancellation: CancellationToken) ![]u8 {
     try cancellation.check();
     try validateArtifactRelativePath(relative_path);
@@ -11570,6 +11595,10 @@ pub const verifyShardArtifactIntegrity = @import("local_backups.zig").verifyShar
 
 pub const verifyShardArtifactIntegrityWithCancellation = @import("local_backups.zig").verifyShardArtifactIntegrityWithCancellation;
 
+/// Restore-only verification for native generations. A whole-tree mismatch
+/// may represent a missing/corrupt generated projection. It is safe to defer
+/// that classification to the native validator only when the separately
+/// authenticated per-file generation manifest is still exact.
 pub const verifyRestorableShardArtifactIntegrityWithCancellation = @import("local_backups.zig").verifyRestorableShardArtifactIntegrityWithCancellation;
 
 pub const nativeGenerationManifestIntegrityAllocWithCancellation = @import("local_backups.zig").nativeGenerationManifestIntegrityAllocWithCancellation;
@@ -11612,6 +11641,11 @@ pub const writeFileToLocation = @import("local_backups.zig").writeFileToLocation
 
 const cloneTableBackupManifest = @import("local_backups.zig").cloneTableBackupManifest;
 
+/// Derive the mutable restore envelope for a destination table without
+/// changing the immutable source manifest that authenticated the backup.
+/// Native bundle extraction uses this after verifying the sealed AFB2 source;
+/// the resulting table manifest is the target-scoped intent consumed by the
+/// ordinary restore API.
 pub const deriveRestoreManifestForTargetTable = @import("local_backups.zig").deriveRestoreManifestForTargetTable;
 
 fn cloneClusterBackupManifest(alloc: std.mem.Allocator, manifest: ClusterBackupManifest) !ClusterBackupManifest {
@@ -11786,6 +11820,9 @@ pub const copyDirectoryRecursiveUsingIo = @import("local_backups.zig").copyDirec
 
 pub const copyDirectoryRecursiveUsingIoWithCancellation = @import("local_backups.zig").copyDirectoryRecursiveUsingIoWithCancellation;
 
+/// Copies a native artifact and computes the canonical tree digest from the
+/// exact bytes written. This avoids a second corpus-sized read after local
+/// materialization and binds the advertised integrity to the destination.
 pub const copyNativeDirectoryWithIntegrityUsingIo = @import("local_backups.zig").copyNativeDirectoryWithIntegrityUsingIo;
 
 const copyFileAndHashCancellable = @import("local_backups.zig").copyFileAndHashCancellable;

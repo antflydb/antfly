@@ -15,6 +15,12 @@
     "size_bytes": 515100,
     "source": "https://raw.githubusercontent.com/googlefonts/roboto-2/38062f4b4a0be4346d07a928408da21602545e9e/src/hinted/Roboto-Regular.ttf"
   },
+  "zig/pkg/antfly/src/sql/fixtures/sql_parity_inventory.json": {
+    "license": "Apache-2.0",
+    "sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
+    "size_bytes": 716374,
+    "source": "First-party SQL compiler/runtime parity inventory"
+  },
   "zig/pkg/antfly/src/storage/testdata/cross_backend_v1.afb": {
     "kind": "first-party test fixture",
     "license": "Apache-2.0",

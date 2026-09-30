@@ -74,11 +74,11 @@ Classify these files by responsibility, not by their current `raft/` or
   with embedded metadata and backup code only when an embedded entry point
   actually consumes them. `metadata/provision_contract.zig` remains with server
   provisioning because its current consumers are server-only.
-- Topology wire versions, reallocation requests, incarnation IDs, and mutation
-  stamps are currently consumed by server coordination, not the Lite or
-  inference import graph. Keep them in `pkg/antfly` unless an actual embedded
-  consumer appears. `topology_records.zig` is distinct: its durable table and
-  range records are read by local restore code.
+- Keep metadata authority, reallocation, and routing coordination in the server.
+  The embedded SQL and transaction records now consume the pure
+  `metadata/catalog_route_contract.zig` identity/fence contract, including its
+  incarnation stamp; `metadata/api.zig` re-exports that contract. Durable
+  `topology_records.zig` table and range records remain shared with local restore.
 - Split `backup_cohort.zig` at its pure plan/checkpoint transition and driver
   interface: the reusable state machine remains Apache, while admission,
   metadata locks, Raft persistence, and scheduling are server-owned.
@@ -120,3 +120,21 @@ import, so the server and embedded code use the same schema declarations.
 The neutral `zig/build_support/openapi.zig` orchestrates one deterministic
 generation/check step across all outputs. The boundary check must keep Lite,
 C API, and inference free of server-only imports.
+
+## SQL runtime integration
+
+The embedded C API consumes the same SQL compiler, executor, scalar/binding
+helpers, and integrity mutation planner as the server. These implementations
+are explicit Apache exceptions until the engine source migration completes.
+Keep the SQL HTTP and pgwire adapters, metadata decisions, owner routing, and
+publication workers in the server. The embedded C API adapter remains a
+single-handle adapter and does not acquire a server coordinator dependency.
+
+The shared read callback contract uses local graph wire types and a route
+budget from `api/routing_budget.zig`. Its graph route-cache binding is an
+opaque borrowed server capability; the engine does not import or dereference
+the server cache implementation. A pinned read view similarly borrows an
+opaque routing-session handle: the server adapter owns and releases its actual
+catalog lease, while embedded integrity planning only uses the bound source. Portable seed validation consumes
+`system_catalog/portable_policy_contract.zig`, while server catalog projections
+and their Raft/metadata dependencies stay in `system_catalog/projection.zig`.

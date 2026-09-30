@@ -169,6 +169,11 @@ os.environ.setdefault(
     "antfly-e2e-dedicated-internal-service-secret-v1",
 )
 os.environ.setdefault("ANTFLY_INTERNAL_SERVICE_ISSUER", "antfly-e2e")
+os.environ.setdefault(
+    "ANTFLY_SETTING_AUTHORITY_SECRET",
+    "antfly-e2e-setting-authority-secret-v1",
+)
+os.environ.setdefault("ANTFLY_SETTING_AUTHORITY_ISSUER", "antfly-e2e")
 
 
 def internal_service_headers() -> dict[str, str]:
