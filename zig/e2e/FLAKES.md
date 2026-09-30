@@ -38,6 +38,13 @@ byte and scan limits. The graph suite also exposed split/merge imports casting
 expanded mutation records to smaller storage records; both paths now explicitly
 project key/value fields. The complete graph suite passed 73/73 after these fixes.
 
+Live rewrite recovery seals the source accepted-generation summary and installs
+only fresh surviving FK mappings on hidden targets. Initial provisioning and cold
+RPC recovery share one descriptor builder; receipt reads accept validated live
+handoffs under the same strict ReadIndex gate as empty-generation handoffs.
+Public restore-job listings independently own response strings before releasing
+their parsed records. The final Debug smoke passed all three #919 selectors.
+
 Qualification of the final merged executable remains pending; earlier frozen
 600/600 recovery runs do not qualify these subsequent architectural changes.
 

@@ -88,6 +88,22 @@ decoders: export excludes physical accepted-generation keys, and plan validation
 uses their fenced pin/certificate proof rather than repository-cohort admission
 proofs. Ordinary portable backups still require those admission proofs.
 
+Live rewrites also carry the namespace-bound accepted-generation and retirement
+summary for every source owner, including owners with empty summaries. Source
+fencing seals that immutable authority; hidden targets install only mappings for
+surviving FK declarations under fresh target IDs and generations. Removed or
+retargeted declarations retain their source proof without granting target
+acceptance. These live handoffs use the same validated descriptor projection for
+initial provisioning, cold job recovery and receipt reads. Regression coverage
+rejects missing handoffs, checks descriptor/install-receipt equality, and covers
+lost replies and native reopen. The distributed publication-reply-loss smoke
+previously stalled on an empty-only receipt guard and now completes successfully.
+
+Public restore-job views own their idempotency keys and nested result strings
+before parsed records are released. A regression overwrites the source buffers
+before inspecting the response, and the focused backup/restore target includes
+the job listing tests. Response ownership does not depend on allocator reuse.
+
 The retained-transfer fixtures use canonical artifact keys owned by their
 logical source document, including multi-fragment proofs across crash/reopen.
 The restore benchmark uses a checked allocator without per-allocation stack

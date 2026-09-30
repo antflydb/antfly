@@ -2296,6 +2296,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "db explicit restore runtime repair repairs managed chunked dense embeddings once for restored shard",
             "db incomplete deferred restore import recovers before runtime repair",
             "db restore state uses strict structured content identity markers",
+            "restore job list paginates after authorization filtering",
+            "restore job list bounds authorization scans with an empty continuation page",
             "restore job ownership failures remain retryable",
             "restore retry wakeup admission failure cannot escape as execution failure",
             "staged restore published metadata wins cancellation only after every owner opens",
