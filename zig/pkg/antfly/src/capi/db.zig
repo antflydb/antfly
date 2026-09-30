@@ -6883,7 +6883,7 @@ pub fn storageOwnerWaitForSync(
     return .ok;
 }
 
-pub fn storageOwnerApplyHAReplicationRecord(
+pub fn storageOwnerApplyHotStandbyReplicationRecord(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.HAReplicationRecordRequest,
 ) callconv(.c) kernel_owner_abi.Status {

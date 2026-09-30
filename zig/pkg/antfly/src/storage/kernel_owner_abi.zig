@@ -1941,7 +1941,7 @@ pub extern fn antfly_storage_owner_wait_for_sync(
     request: *const SyncRequest,
 ) callconv(.c) Status;
 
-pub extern fn antfly_storage_owner_apply_ha_replication_record(
+pub extern fn antfly_storage_owner_apply_hot_standby_replication_record(
     owner: ?*anyopaque,
     request: *const HAReplicationRecordRequest,
 ) callconv(.c) Status;

@@ -583,7 +583,7 @@ pub const Owner = struct {
         table_name: []const u8,
         record: HotStandbyReplicationRecord,
     ) !void {
-        try statusToError(abi.antfly_storage_owner_apply_ha_replication_record(
+        try statusToError(abi.antfly_storage_owner_apply_hot_standby_replication_record(
             self.handle,
             &.{
                 .flags = record.flags,
