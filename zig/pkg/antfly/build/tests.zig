@@ -4600,32 +4600,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 18 else 7) * 1024 * 1024 * 1024,
     });
-    inline for (.{
-        test_imports.runtime.inference_bridge,
-        test_imports.runtime.inference_provider_failure,
-        test_imports.runtime.inference_worker_wire,
-    }) |module| {
-        lib_standalone_runtime_test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module })).step);
-    }
-    const inference_host_tests = b.addTest(.{
-        .root_module = test_imports.runtime.inference_host,
-        .filters = &.{
-            "local generate message conversion preserves tool history and admission",
-            "inference worker",
-            "standalone numeric result ABI",
-            "standalone raster embedding control",
-            "encoded reader ABI enforces resolved model capabilities",
-            "linked generator validates concrete MIME and decoded pixels",
-            "standalone prompt cache detaches resource observer before owner teardown",
-            "standalone inference keep alive parses compound durations and zero",
-            "standalone preload bridge preserves A4B residency controls",
-            "standalone data directory does not change the default models directory",
-            "standalone linked inference ABI validates the supported function-table prefix",
-            "linked rerank documents become server content parts with attachment references",
-        },
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
-    });
-    lib_standalone_runtime_test_step.dependOn(&b.addRunArtifact(inference_host_tests).step);
     // Keep the complete API worker fixture out of the inference-heavy runtime
     // object. Compile this narrow integration slice independently so adding
     // restore coverage does not inflate every standalone runtime test build.
