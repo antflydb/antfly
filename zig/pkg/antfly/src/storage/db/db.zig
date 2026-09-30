@@ -51969,7 +51969,15 @@ fn encodeThinReplayRecordPayload(
             try appendUniqueReplayRecordHint(alloc, &target_hints, .sparse_vector);
         }
         if (extracted_write.mentioned_graph_indexes.len > 0 or extracted_write.graph_writes.len > 0) {
-            try appendUniqueReplayRecordKeyWithSet(alloc, &changed_doc_keys, &changed_doc_key_set, write.key);
+            // Graph-only content (an `_edges`-only document, for example) has
+            // no full-text/dense/sparse/algebraic payload. changed_doc_keys
+            // feeds those replay workers, which reconstruct a synthetic
+            // upsert for every key it contains and expect to find a primary
+            // row. A document whose only content is edges never has one, so
+            // recording its key here would make full-text replay retry
+            // ReplayDocumentNotVisible forever (issue #938). The graph
+            // worker replays this change through changed_artifact_keys
+            // instead, so only the hint belongs here.
             try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
         }
         if (overwritten_flags[i] and extracted_write.hasDocument()) {
@@ -120487,6 +120495,128 @@ test "db encodeThinReplayRecordPayload treats embedding-only writes as artifact 
     try std.testing.expectEqualStrings("artifact:dense:doc:a", decoded.record.changed_artifact_keys[0]);
     try std.testing.expect(!journalRecordHasHint(decoded.record, .full_text));
     try std.testing.expect(journalRecordHasHint(decoded.record, .dense_vector));
+}
+
+test "db encodeThinReplayRecordPayload omits an edges-only document from full-text replay" {
+    const alloc = std.testing.allocator;
+
+    const req = types.BatchRequest{
+        .writes = &.{
+            .{ .key = "node:a", .value = "{\"_edges\":{\"graph\":{\"KNOWS\":[{\"target\":\"node:b\"}]}}}" },
+        },
+    };
+
+    var extracted = try mapper.extractWrite(alloc, req.writes[0].key, req.writes[0].value);
+    defer extracted.deinit(alloc);
+    try std.testing.expect(!extracted.hasDocument());
+    try std.testing.expect(extracted.mentioned_graph_indexes.len > 0);
+
+    const payload = try encodeThinReplayRecordPayload(
+        alloc,
+        req,
+        &.{extracted},
+        &.{},
+        &.{},
+        &.{false},
+        &.{true},
+        50,
+        false,
+        null,
+        null,
+    );
+    defer alloc.free(payload);
+
+    var decoded = try change_journal_mod.decodeRecord(alloc, payload);
+    defer decoded.deinit();
+
+    // A document whose only content is `_edges` never gets a primary row.
+    // Recording its key in changed_doc_keys would make full-text/dense/
+    // sparse replay treat it as a document they must find content for --
+    // one that never has any, forever (issue #938). Only the graph hint
+    // belongs here.
+    try std.testing.expectEqual(@as(usize, 0), decoded.record.changed_doc_keys.len);
+    try std.testing.expect(journalRecordHasHint(decoded.record, .graph));
+    try std.testing.expect(!journalRecordHasHint(decoded.record, .full_text));
+}
+
+test "db encodeThinReplayRecordPayload keeps an edges-only sibling out of a full-text-hinted record" {
+    const alloc = std.testing.allocator;
+
+    const req = types.BatchRequest{
+        .writes = &.{
+            .{ .key = "node:a", .value = "{\"_edges\":{\"graph\":{\"KNOWS\":[{\"target\":\"node:b\"}]}}}" },
+            .{ .key = "node:b", .value = "{\"name\":\"b\"}" },
+        },
+    };
+
+    var extracted_a = try mapper.extractWrite(alloc, req.writes[0].key, req.writes[0].value);
+    defer extracted_a.deinit(alloc);
+    var extracted_b = try mapper.extractWrite(alloc, req.writes[1].key, req.writes[1].value);
+    defer extracted_b.deinit(alloc);
+
+    const payload = try encodeThinReplayRecordPayload(
+        alloc,
+        req,
+        &.{ extracted_a, extracted_b },
+        &.{},
+        &.{},
+        &.{ false, false },
+        &.{ true, true },
+        51,
+        false,
+        null,
+        null,
+    );
+    defer alloc.free(payload);
+
+    var decoded = try change_journal_mod.decodeRecord(alloc, payload);
+    defer decoded.deinit();
+
+    // node:b's content gives the record a full_text hint; node:a's edges
+    // give it a graph hint. The full-text/algebraic replay worker treats
+    // every key in changed_doc_keys as a synthetic upsert once it sees that
+    // hint, so node:a (which never gets a primary row) must not be one of
+    // them, or replay retries ReplayDocumentNotVisible forever (issue #938).
+    try std.testing.expect(journalRecordHasHint(decoded.record, .full_text));
+    try std.testing.expect(journalRecordHasHint(decoded.record, .graph));
+    try std.testing.expectEqual(@as(usize, 1), decoded.record.changed_doc_keys.len);
+    try std.testing.expectEqualStrings("node:b", decoded.record.changed_doc_keys[0]);
+}
+
+test "db run_until_idle does not hang on a document whose only content is graph edges" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{ .name = "graph", .kind = .graph, .config_json = "{}" });
+    try db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
+
+    // node:b's ordinary write gives this batch's thin replay record a
+    // full_text hint; node:a's `_edges`-only write gives it a graph hint.
+    // Before the fix, the full-text worker treated every key in the
+    // record's changed_doc_keys as a candidate once it saw that hint,
+    // including node:a -- which never gets a primary row -- so it retried
+    // error.ReplayDocumentNotVisible forever and run_until_idle() never
+    // returned (issue #938).
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "node:b", .value = "{\"name\":\"b\"}" },
+            .{ .key = "node:a", .value = "{\"_edges\":{\"graph\":{\"KNOWS\":[{\"target\":\"node:b\"}]}}}" },
+        },
+    });
+
+    try db.runUntilIdle();
+
+    try std.testing.expectEqual(@as(?[]u8, null), try db.get(alloc, "node:a"));
+    const b_value = (try db.get(alloc, "node:b")).?;
+    defer alloc.free(b_value);
+    try std.testing.expect(std.mem.indexOf(u8, b_value, "\"b\"") != null);
 }
 
 test "db thin replay marks artifact-derived target hints" {
