@@ -284,17 +284,19 @@ learning rate 1e-4, batch 1, resident Metal:
 | released Laya (ModernBERT-large, not fine-tuned) | 0.387 | 0.34 | 0.35 | 0.48 |
 | step-0 split, 2,000 decisions, 3 epochs (15 min) | 0.434 | 0.39 | 0.34 | 0.61 |
 | plus Open-Jev (64,450 decisions), 1 epoch (4 h) | 0.404 | 0.41 | 0.25 | 0.61 |
+| that head, then the step-0 split for 3 epochs | 0.476 | 0.49 | 0.39 | 0.59 |
 
 A head on the frozen base-size trunk beats released Laya-large, but trails
-Laya's full step-0 fine-tune (about 0.62, encoder trained). Open-Jev hurts
-score questions here, as it left Laya's own eval unchanged (LAYA.md,
-"Scaling packed training on Open-Jev").
+Laya's full step-0 fine-tune (about 0.62, encoder trained). Mixed in for one
+epoch, Open-Jev hurts score questions, as it left Laya's own eval unchanged
+(LAYA.md, "Scaling packed training on Open-Jev"); as a first stage followed
+by three epochs on the step-0 split it helps (0.476 against 0.434, soft
+cross-entropy 1.094 against 1.135), mostly on choice and score questions.
 
 ## Next
 
 - Evaluate run19 and its stage 3 against run18.
-- Decision head: Open-Jev first, then the in-domain split for several
-  epochs; a decision head on run19's trunk.
+- Decision head on run19's trunk, with the same curriculum.
 - Classification markers are the remaining gap. The mixed pool has 216 real
   class names and fills the rest of each label list from entity types; add
   many real label sets (intents, topics, sentiment and stance scales,
