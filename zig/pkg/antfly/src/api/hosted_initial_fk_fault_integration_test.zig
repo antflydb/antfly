@@ -162,7 +162,7 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
     defer if (data_control_alive) data_control.deinit();
     try data_control.start();
 
-    const peers_api = @import("hosted_self_fk_e2e.zig");
+    const peers_api = @import("hosted_self_fk_integration_test.zig");
     var peers: [2]?*peers_api.DataPeer = .{ null, null };
     defer {
         if (meta_control_alive) {

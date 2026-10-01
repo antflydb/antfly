@@ -112,7 +112,11 @@ RSS budget of 80% of the detected cgroup or host memory. Set
 `ANTFLY_ZIG_MAX_RSS` to an explicit byte count when a smaller local budget is
 needed. From the repository root, use `make zig-test` or `make zig-unit-test`.
 
-The Python e2e suites are split by product:
+Native API and model fixtures use `integration_test.zig` or
+`*_integration_test.zig`: they exercise mounted services or model pipelines
+in-process through Zig test targets. Model benchmark programs use `_bench.zig`,
+and codec corpus programs use `_runner.zig`. The Python E2E suites exercise the
+built executables and are split by product:
 
 ```sh
 scripts/ci/zig-antfly-e2e-pytest.sh e2e/antfly

@@ -713,7 +713,7 @@ const FakeAntflyProvider = struct {
     }
 };
 
-test "public api smoke e2e creates table inserts and queries documents" {
+test "public api smoke integration creates table inserts and queries documents" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1569,7 +1569,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     try std.testing.expect(saw_customers and saw_addresses);
 }
 
-test "public api e2e rebuilds schema-migration full-text index on exact backfill boundary" {
+test "public api integration rebuilds schema-migration full-text index on exact backfill boundary" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1858,7 +1858,7 @@ test "public api e2e rebuilds schema-migration full-text index on exact backfill
     try std.testing.expectEqualStrings("Document 500", parsed_lookup.value.title);
 }
 
-test "public api e2e rejects table backup during active schema migration" {
+test "public api integration rejects table backup during active schema migration" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1966,7 +1966,7 @@ test "public api e2e rejects table backup during active schema migration" {
     );
 }
 
-test "public api e2e rejects table restore for migration-state backup manifests" {
+test "public api integration rejects table restore for migration-state backup manifests" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2083,7 +2083,7 @@ test "public api e2e rejects table restore for migration-state backup manifests"
     try std.testing.expect(std.mem.indexOf(u8, restore_resp.body, "restore does not support active schema migration") != null);
 }
 
-test "public api e2e rejects table restore when target already exists" {
+test "public api integration rejects table restore when target already exists" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2190,7 +2190,7 @@ test "public api e2e rejects table restore when target already exists" {
     try std.testing.expect(std.mem.indexOf(u8, restore_resp.body, "restore target already exists") != null);
 }
 
-test "public api e2e rejects table restore for mismatched backup manifests" {
+test "public api integration rejects table restore for mismatched backup manifests" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2307,7 +2307,7 @@ test "public api e2e rejects table restore for mismatched backup manifests" {
     try std.testing.expect(std.mem.indexOf(u8, restore_resp.body, "invalid restore request") != null);
 }
 
-test "public api e2e validates backup and restore request shapes and locations" {
+test "public api integration validates backup and restore request shapes and locations" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2496,7 +2496,7 @@ test "public api e2e validates backup and restore request shapes and locations" 
     try std.testing.expect(std.mem.indexOf(u8, cluster_restore_bad_mode.body, "invalid restore mode") != null);
 }
 
-test "public api e2e backs up drops and restores a table" {
+test "public api integration backs up drops and restores a table" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2632,7 +2632,7 @@ test "public api e2e backs up drops and restores a table" {
     try std.testing.expectEqualStrings("alpha", parsed_lookup.value.title);
 }
 
-test "public api split e2e backs up drops and restores a table" {
+test "public api split integration backs up drops and restores a table" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2764,7 +2764,7 @@ test "public api split e2e backs up drops and restores a table" {
     try std.testing.expectEqualStrings("alpha", parsed_lookup.value.title);
 }
 
-test "public api standalone-like e2e backs up drops and restores a table" {
+test "public api standalone-like integration backs up drops and restores a table" {
     const internal_service_secret = "standalone-e2e-internal-service-secret-v1";
     const internal_service_issuer = "standalone-e2e";
     const process_alloc = platform.allocator.processAllocator(std.testing.allocator);
@@ -3583,7 +3583,7 @@ test "split data runtime serves retrieval agent pipeline queries" {
     try std.testing.expectEqualStrings("doc:a", parsed.value.hits[0]._id);
 }
 
-test "public api e2e supports managed semantic search and sparse embeddings" {
+test "public api integration supports managed semantic search and sparse embeddings" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -3713,7 +3713,7 @@ test "public api e2e supports managed semantic search and sparse embeddings" {
     try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchQuery(base_uri, "docs", unknown_sparse_query_body));
 }
 
-test "public api e2e adds managed embeddings indexes to existing tables" {
+test "public api integration adds managed embeddings indexes to existing tables" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -3845,7 +3845,7 @@ test "public api e2e adds managed embeddings indexes to existing tables" {
     }
 }
 
-test "public api e2e recreates managed embeddings index after corrupt artifact" {
+test "public api integration recreates managed embeddings index after corrupt artifact" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -4029,7 +4029,7 @@ test "public api e2e recreates managed embeddings index after corrupt artifact" 
     try std.testing.expect(semantic_ready);
 }
 
-test "public api e2e restores managed embeddings from table backup" {
+test "public api integration restores managed embeddings from table backup" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -4213,7 +4213,7 @@ test "public api e2e restores managed embeddings from table backup" {
     try std.testing.expectEqualStrings("doc:a", parsed_semantic_after.value.responses.?[0].hits.?.hits.?[0]._id);
 }
 
-test "public api e2e supports managed sparse embeddings generation" {
+test "public api integration supports managed sparse embeddings generation" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -4328,7 +4328,7 @@ test "public api e2e supports managed sparse embeddings generation" {
     try std.testing.expectEqualStrings("doc:a", parsed_sparse.value.responses.?[0].hits.?.hits.?[0]._id);
 }
 
-test "public api e2e supports hybrid query pruner and reranker" {
+test "public api integration supports hybrid query pruner and reranker" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -4473,7 +4473,7 @@ test "public api e2e supports hybrid query pruner and reranker" {
     for (hits) |hit| try std.testing.expect(!std.mem.eql(u8, hit._id, "doc:c"));
 }
 
-test "public api e2e supports retrieval agent pipeline queries" {
+test "public api integration supports retrieval agent pipeline queries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -4569,7 +4569,7 @@ test "public api e2e supports retrieval agent pipeline queries" {
     try std.testing.expectEqualStrings("doc:a", parsed.value.hits[0]._id);
 }
 
-test "public api e2e supports retrieval agent generation step" {
+test "public api integration supports retrieval agent generation step" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -4674,7 +4674,7 @@ test "public api e2e supports retrieval agent generation step" {
     try std.testing.expectEqual(@as(usize, 2), parsed.value.steps.?.len);
 }
 
-test "public api e2e supports retrieval agent semantic and hybrid strategies" {
+test "public api integration supports retrieval agent semantic and hybrid strategies" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -4799,7 +4799,7 @@ test "public api e2e supports retrieval agent semantic and hybrid strategies" {
     try std.testing.expectEqual(@as(usize, 2), parsed_metadata.value.hits.len);
 }
 
-test "public api e2e supports retrieval agent tree search pipeline" {
+test "public api integration supports retrieval agent tree search pipeline" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -4905,7 +4905,7 @@ test "public api e2e supports retrieval agent tree search pipeline" {
     try std.testing.expectEqualStrings("doc:child", parsed.value.hits[1]._id);
 }
 
-test "public api e2e supports retrieval agent tree search from roots" {
+test "public api integration supports retrieval agent tree search from roots" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5009,7 +5009,7 @@ test "public api e2e supports retrieval agent tree search from roots" {
     try std.testing.expectEqualStrings("doc:child", parsed.value.hits[0]._id);
 }
 
-test "public api e2e supports retrieval agent classification confidence and followup" {
+test "public api integration supports retrieval agent classification confidence and followup" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5120,7 +5120,7 @@ test "public api e2e supports retrieval agent classification confidence and foll
     try std.testing.expectEqual(@as(usize, 3), parsed.value.followup_questions.?.len);
 }
 
-test "public api e2e supports retrieval agent fixed-body sse streaming" {
+test "public api integration supports retrieval agent fixed-body sse streaming" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5255,7 +5255,7 @@ test "public api e2e supports retrieval agent fixed-body sse streaming" {
     try std.testing.expect(saw_done);
 }
 
-test "public api e2e retrieval streaming emits clarification events" {
+test "public api integration retrieval streaming emits clarification events" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5375,7 +5375,7 @@ test "public api e2e retrieval streaming emits clarification events" {
     try std.testing.expect(saw_done);
 }
 
-test "public api e2e supports bounded agentic retrieval mode" {
+test "public api integration supports bounded agentic retrieval mode" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5470,7 +5470,7 @@ test "public api e2e supports bounded agentic retrieval mode" {
     try std.testing.expectEqual(@as(usize, 1), parsed.value.hits.len);
 }
 
-test "public api e2e agentic retrieval selects the best declared query" {
+test "public api integration agentic retrieval selects the best declared query" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5563,7 +5563,7 @@ test "public api e2e agentic retrieval selects the best declared query" {
     try std.testing.expectEqualStrings("doc:a", parsed.value.hits[0]._id);
 }
 
-test "public api e2e agentic retrieval evaluates misses and falls back to the next query" {
+test "public api integration agentic retrieval evaluates misses and falls back to the next query" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5672,7 +5672,7 @@ test "public api e2e agentic retrieval evaluates misses and falls back to the ne
     try std.testing.expect(saw_evaluation_select);
 }
 
-test "public api e2e agentic retrieval can require clarification and continue from a decision" {
+test "public api integration agentic retrieval can require clarification and continue from a decision" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5778,7 +5778,7 @@ test "public api e2e agentic retrieval can require clarification and continue fr
     try std.testing.expectEqualStrings("doc:a", parsed_continued.value.hits[0]._id);
 }
 
-test "public api e2e restores managed sparse embeddings from table backup" {
+test "public api integration restores managed sparse embeddings from table backup" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5955,7 +5955,7 @@ test "public api e2e restores managed sparse embeddings from table backup" {
     try std.testing.expectEqualStrings("doc:a", parsed_sparse_after.value.responses.?[0].hits.?.hits.?[0]._id);
 }
 
-test "public api e2e supports embedding_template remote media helper" {
+test "public api integration supports embedding_template remote media helper" {
     const FakeRemoteMedia = struct {
         fn executor() http_common.RequestExecutor {
             return .{
@@ -6112,7 +6112,7 @@ test "public api e2e supports embedding_template remote media helper" {
     try std.testing.expectEqualStrings("doc:a", parsed.value.responses.?[0].hits.?.hits.?[0]._id);
 }
 
-test "public api e2e supports template chunked remote text enrichment and query helper failures" {
+test "public api integration supports template chunked remote text enrichment and query helper failures" {
     const FakeRemoteAssets = struct {
         fn executor() http_common.RequestExecutor {
             return .{
@@ -6398,7 +6398,7 @@ test "public api e2e supports template chunked remote text enrichment and query 
     );
 }
 
-test "public api e2e restores chunked managed embeddings from table backup" {
+test "public api integration restores chunked managed embeddings from table backup" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -6604,7 +6604,7 @@ test "public api e2e restores chunked managed embeddings from table backup" {
     try std.testing.expectEqualStrings("doc:a", parsed_fixed_after.value.responses.?[0].hits.?.hits.?[0]._id);
 }
 
-test "public api e2e supports graph queries" {
+test "public api integration supports graph queries" {
     const expectSingleGraphResult = struct {
         fn get(parsed: metadata_openapi.QueryResponses, name: []const u8) !indexes_openapi.GraphNodesResult {
             const responses = parsed.responses orelse return error.TestUnexpectedResult;
@@ -6825,7 +6825,7 @@ test "public api e2e supports graph queries" {
     );
 }
 
-test "public api e2e graph queries respect full_index sync level" {
+test "public api integration graph queries respect full_index sync level" {
     const expectSingleGraphResult = struct {
         fn get(parsed: metadata_openapi.QueryResponses, name: []const u8) !indexes_openapi.GraphNodesResult {
             const responses = parsed.responses orelse return error.TestUnexpectedResult;
@@ -6960,7 +6960,7 @@ test "public api e2e graph queries respect full_index sync level" {
     try std.testing.expectEqualStrings("doc-c", neighbors_after.nodes[0].key);
 }
 
-test "public api e2e restores graph indexes from table backup" {
+test "public api integration restores graph indexes from table backup" {
     const expectSingleGraphResult = struct {
         fn get(parsed: metadata_openapi.QueryResponses, name: []const u8) !indexes_openapi.GraphNodesResult {
             const responses = parsed.responses orelse return error.TestUnexpectedResult;
@@ -7254,7 +7254,7 @@ test "public api e2e restores graph indexes from table backup" {
     try std.testing.expect(restored_graph_ready);
 }
 
-test "public api smoke e2e queries across split ranges" {
+test "public api smoke integration queries across split ranges" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -7447,7 +7447,7 @@ test "public api smoke e2e queries across split ranges" {
     try std.testing.expectEqual(@as(u64, 0), deleted_query_result.hits.?.total.?.value);
 }
 
-test "public api split e2e uses distributed global text stats for bm25 and significant_terms" {
+test "public api split integration uses distributed global text stats for bm25 and significant_terms" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -7786,7 +7786,7 @@ test "public api split e2e uses distributed global text stats for bm25 and signi
     try std.testing.expect(saw_rareright);
 }
 
-test "public api e2e serves cluster backup list and restore routes" {
+test "public api integration serves cluster backup list and restore routes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
@@ -8041,7 +8041,7 @@ test "public api e2e serves cluster backup list and restore routes" {
     try std.testing.expectEqualStrings("overwrite-log", parsed_logs_lookup_after_overwrite.value.title);
 }
 
-test "public api e2e does not publish or restore a partial cluster backup" {
+test "public api integration does not publish or restore a partial cluster backup" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
@@ -8168,7 +8168,7 @@ test "public api e2e does not publish or restore a partial cluster backup" {
     );
 }
 
-test "public api e2e reports unsupported multi-range tables in cluster backup" {
+test "public api integration reports unsupported multi-range tables in cluster backup" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
@@ -8372,7 +8372,7 @@ test "public api e2e reports unsupported multi-range tables in cluster backup" {
     );
 }
 
-test "public api smoke e2e commits transaction across split ranges" {
+test "public api smoke integration commits transaction across split ranges" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -8552,7 +8552,7 @@ test "public api smoke e2e commits transaction across split ranges" {
     try std.testing.expect(parsed_abort.value.conflict != null);
 }
 
-test "public api smoke e2e commits transactions across two tables atomically" {
+test "public api smoke integration commits transactions across two tables atomically" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -8746,7 +8746,7 @@ test "public api smoke e2e commits transactions across two tables atomically" {
     try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchLookup(base_uri, "users", "user:phantom", null));
 }
 
-test "public api smoke e2e queries after merge finalization" {
+test "public api smoke integration queries after merge finalization" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 

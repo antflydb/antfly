@@ -458,7 +458,7 @@ jobs:
           echo "ANTFLY_E2E_REGRESSION_REPORT_DIR=$RUNNER_TEMP/production-e2e-soak/reports" >> "$GITHUB_ENV"
       - name: Install native debugger
         run: sudo apt-get update && sudo apt-get install -y gdb
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: production-soak-binary
@@ -602,7 +602,7 @@ jobs:
           echo "ANTFLY_E2E_REGRESSION_REPORT_DIR=$RUNNER_TEMP/production-e2e-soak/reports" >> "$GITHUB_ENV"
       - name: Install native debugger
         run: sudo apt-get update && sudo apt-get install -y gdb
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: production-soak-binary
