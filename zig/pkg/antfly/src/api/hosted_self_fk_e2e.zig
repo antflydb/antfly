@@ -731,18 +731,33 @@ fn printBuilderRouteState(alloc: std.mem.Allocator, transport: http.RequestExecu
 
 fn awaitBuilderOwnerReadiness(alloc: std.mem.Allocator, io: std.Io, transport: http.RequestExecutor, metadata: *metadata_runtime.Server, first: *data_runtime.DataServer, peers: [2]*DataPeer, table_name: []const u8, group_id: u64) !void {
     _ = try awaitThreeVoters(io, first, peers, group_id);
+    awaitBuilderCatalogReadiness(alloc, io, metadata, table_name) catch |err| {
+        printBuilderRouteState(alloc, transport, metadata, first, peers, table_name, group_id);
+        return err;
+    };
+}
+
+fn awaitBuilderCatalogReadiness(alloc: std.mem.Allocator, io: std.Io, metadata: *metadata_runtime.Server, table_name: []const u8) !void {
     const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
     var last_error: ?anyerror = null;
     while (platform.time.monotonicNs() < deadline) {
         if (builderOwnerReadReady(alloc, metadata, table_name)) |_| return else |err| {
+            switch (err) {
+                error.StorageReadTemporarilyUnavailable,
+                error.IntegrityCatalogUnavailable,
+                error.IntegrityTopologyBusy,
+                error.OwnerIdentityNotReady,
+                error.OwnerCatalogNotReady,
+                => {},
+                else => return err,
+            }
             if (last_error == null or last_error.? != err) {
-                std.debug.print("self-FK three-voter builder owner probe err={s}\n", .{@errorName(err)});
+                std.debug.print("self-FK builder owner probe err={s}\n", .{@errorName(err)});
                 last_error = err;
             }
         }
         try io.sleep(.fromMilliseconds(10), .awake);
     }
-    printBuilderRouteState(alloc, transport, metadata, first, peers, table_name, group_id);
     return error.BuilderOwnerReadinessTimeout;
 }
 
@@ -1378,10 +1393,16 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
         }
         return;
     }
-    if (leader_transfer) {
+    {
         const physical = try tableGroup(alloc, &metadata, table_id);
         defer alloc.free(physical.name);
-        try awaitBuilderOwnerReadiness(alloc, io, transport, &metadata, &data, .{ peers[0].?, peers[1].? }, physical.name, physical.group_id);
+        // Public catalog readiness does not establish the metadata frontend's
+        // routed owner ReadIndex/catalog view. Prove that prerequisite before
+        // the first DDL proposal, including the single-voter recovery cases.
+        if (leader_transfer)
+            try awaitBuilderOwnerReadiness(alloc, io, transport, &metadata, &data, .{ peers[0].?, peers[1].? }, physical.name, physical.group_id)
+        else
+            try awaitBuilderCatalogReadiness(alloc, io, &metadata, physical.name);
     }
     var paused_metadata_fk_server: ?*http_server.ApiHttpServer = null;
     defer if (paused_metadata_fk_server) |server| http_server.ApiHttpServer.FkGenerationPublicationTestDriver.resumeBackground(server);

@@ -452,8 +452,10 @@ fn mountedHostedExternalParent(mode: MountedMode) !void {
     }) |statement| {
         var response = try sql(alloc, transport, &headers, base, statement);
         defer response.deinit(alloc);
-        if (response.status != 200) std.debug.print("hosted FK create status={d}\n", .{response.status});
-        try std.testing.expectEqual(@as(u16, 200), response.status);
+        // CREATE may acknowledge catalog admission before owner readiness.
+        // The authoritative table barriers below must still complete.
+        if (response.status != 200 and response.status != 202) std.debug.print("hosted FK create status={d}\n", .{response.status});
+        try std.testing.expect(response.status == 200 or response.status == 202);
     }
     const parent_id = try awaitTable(alloc, io, transport, &headers, base, "parents");
     const child_id = try awaitTable(alloc, io, transport, &headers, base, "children");

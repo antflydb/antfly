@@ -123,6 +123,9 @@ pub const AdmissionFacts = struct {
     /// Rewrite-only immutable public mappings for every durable native epoch.
     /// The caller owns the decoded response, not a borrowed native DB view.
     source_schemas: []const []const u8 = &.{},
+    /// Rewrite-only bounded live admissions and constant-work retirement root
+    /// from the same immutable observation as the historical schema manifest.
+    generation_handoff: ?@import("empty_generation_handoff.zig").Summary = null,
     namespace: @import("doc_identity_namespace.zig").Namespace,
     eligible: bool,
     catalog_digest: [32]u8,

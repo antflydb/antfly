@@ -18022,7 +18022,7 @@ test "capi fact relationships preserve identities and filter before ranking" {
         .sync_level = .full_index,
     });
     var edge_output: capi.Buffer = .{};
-    defer antfly_db_buffer_free(edge_output.ptr, edge_output.len);
+    defer freeRawBuffer(edge_output.ptr, edge_output.len);
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_edges_json(handle_ptr, .{ .ptr = "facts", .len = 5 }, .{ .ptr = "a", .len = 1 }, .{ .ptr = "R", .len = 1 }, 0, &edge_output));
     const edge_bytes = edge_output.ptr.?[0..edge_output.len];
     try std.testing.expect(std.mem.indexOf(u8, edge_bytes, "\"edge_id_b64\":\"b25l\"") != null);
@@ -18039,7 +18039,7 @@ test "capi fact relationships preserve identities and filter before ranking" {
     };
     for (requests, 0..) |request, i| {
         var output: capi.Buffer = .{};
-        defer antfly_db_buffer_free(output.ptr, output.len);
+        defer freeRawBuffer(output.ptr, output.len);
         const slice = capi.Slice{ .ptr = request.ptr, .len = request.len };
         const status = switch (i) {
             0 => antfly_db_traverse_edges_json(handle_ptr, slice, &output),
@@ -18066,7 +18066,7 @@ test "capi fact relationships preserve identities and filter before ranking" {
     };
     for (decimal_requests, 0..) |request, i| {
         var output: capi.Buffer = .{};
-        defer antfly_db_buffer_free(output.ptr, output.len);
+        defer freeRawBuffer(output.ptr, output.len);
         const slice = capi.Slice{ .ptr = request.ptr, .len = request.len };
         const status = switch (i) {
             0 => antfly_db_traverse_edges_json(handle_ptr, slice, &output),
@@ -18156,7 +18156,7 @@ test "capi fact algebraic paths retain provenance and respect frontier limits" {
     };
     for (queries) |query| {
         var output: capi.Buffer = .{};
-        defer antfly_db_buffer_free(output.ptr, output.len);
+        defer freeRawBuffer(output.ptr, output.len);
         try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_execute_graph_queries_json(handle_ptr, .{ .ptr = query.ptr, .len = query.len }, &output));
         const bytes = output.ptr.?[0..output.len];
         try std.testing.expect(std.mem.indexOf(u8, bytes, "fact:one") != null or std.mem.indexOf(u8, bytes, "ZmFjdDpvbmU=") != null);

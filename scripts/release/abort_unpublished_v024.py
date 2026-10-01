@@ -25,7 +25,9 @@ RUN_ID = 36062063327
 TAG = "v0.2.4"
 COMMIT = "2690946d6570a23ec208f789b5408977995febf3"
 LEDGER_SHA256 = "dc91489efd51d67bd22e9a88c7f7aef42a7138c5d786ad27cb6ac16472a9480b"
-CONTAINER_DIGEST = "sha256:19940271c38cf84ba18039a5c4dfd95ad59e873a7e21f6d0390a37e6294c2531"
+CONTAINER_DIGEST = (
+    "sha256:19940271c38cf84ba18039a5c4dfd95ad59e873a7e21f6d0390a37e6294c2531"
+)
 PUBLICATION_JOBS = {
     "Publish antfly-cli to PyPI",
     "Publish @antfly/cli to npm",
@@ -50,7 +52,10 @@ def verify_cancelled_run(token: str) -> None:
     page = 1
     while True:
         response = github_api(
-            "GET", REPOSITORY, f"/actions/runs/{RUN_ID}/jobs?per_page=100&page={page}", token
+            "GET",
+            REPOSITORY,
+            f"/actions/runs/{RUN_ID}/jobs?per_page=100&page={page}",
+            token,
         )
         if not isinstance(response, dict) or not isinstance(response.get("jobs"), list):
             raise SystemExit("v0.2.4 promotion returned malformed jobs")

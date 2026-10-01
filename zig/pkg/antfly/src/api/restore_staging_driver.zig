@@ -302,6 +302,11 @@ test "restore staging cohort proof binds every source identity and durable seal"
     manifest.format = .portable;
     try std.testing.expectError(error.BackupIntegrityFailure, cohortSource(a, proof, &manifest));
     proof.artifact_format = .portable;
+    const missing_admissions = try cohortSource(a, proof, &manifest);
+    try std.testing.expectError(error.RestoreSourceProofMissing, buildPlan(a, try staging.idForAttempt(11, 1), @splat(9), &.{missing_admissions}, &.{}, &.{}, "fail_if_exists"));
+    const portable_shards = try a.dupe(@typeInfo(@TypeOf(manifest.shards)).pointer.child, manifest.shards);
+    portable_shards[0].accepted_generation_summary_digest = try @import("../storage/portable_backup.zig").sourceGenerationAdmissionSummaryDigest(fence.namespace, &.{});
+    manifest.shards = portable_shards;
     const portable_source = try cohortSource(a, proof, &manifest);
     const portable_selected = try buildPlan(a, try staging.idForAttempt(11, 1), @splat(9), &.{portable_source}, &.{}, &.{}, "fail_if_exists");
     try std.testing.expectEqual(.portable, portable_selected.plan.?.targets[0].source_artifacts[0].format);

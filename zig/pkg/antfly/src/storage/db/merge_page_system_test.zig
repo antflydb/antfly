@@ -149,7 +149,9 @@ test "relational index system merge tail source proofs stage inertly with exact 
     var namespace: publication.Namespace = undefined;
     @import("doc_identity.zig").encodeNamespace(&namespace, source.namespace);
     const logical_source = publication.Source{ .document_key = "b", .content_digest = @splat(3), .timestamp = 1, .input_position = null };
-    const logical_effect = provenance.Effect{ .family = .document_artifact, .key = "effect", .source_index = 0, .value_digest = null, .value_bytes = 0 };
+    const effect_key = try @import("../internal_keys.zig").chunkArtifactKeyAlloc(alloc, "b", "asset", 0);
+    defer alloc.free(effect_key);
+    const logical_effect = provenance.Effect{ .family = .document_artifact, .key = effect_key, .source_index = 0, .value_digest = null, .value_bytes = 0 };
     var logical_proof: provenance.Proof = .{ .namespace = namespace, .authority_epoch = 1, .catalog_digest = @splat(2), .producer_kind = .index, .producer_name = "index", .producer_generation = 1, .producer_artifact_name = "asset", .publication_digest = @splat(4), .input_digest = undefined, .sources = (&logical_source)[0..1], .artifact_sources = &.{}, .effects = (&logical_effect)[0..1] };
     logical_proof.input_digest = logical_proof.inputCommand().inputDigest();
     const raw = try provenance.encodeAlloc(alloc, logical_proof);
@@ -182,6 +184,11 @@ test "relational index system merge tail source proofs stage inertly with exact 
     var large_proof = logical_proof;
     large_proof.publication_digest = @splat(6);
     large_proof.sources = (&large_source)[0..1];
+    const large_effect_key = try @import("../internal_keys.zig").chunkArtifactKeyAlloc(alloc, large_document, "asset", 0);
+    defer alloc.free(large_effect_key);
+    var large_effect = logical_effect;
+    large_effect.key = large_effect_key;
+    large_proof.effects = (&large_effect)[0..1];
     large_proof.input_digest = large_proof.inputCommand().inputDigest();
     const large_raw = try provenance.encodeAlloc(alloc, large_proof);
     defer alloc.free(large_raw);
@@ -196,7 +203,8 @@ test "relational index system merge tail source proofs stage inertly with exact 
     const transfer = try pages.RowChunks(types.BatchRequest).init(seal(.{ .merge_replication = context, .merge_page = page }));
     const first = try transfer.requestAt(0);
     const middle = try transfer.requestAt(pages.chunk_bytes);
-    const final = try transfer.requestAt(2 * pages.chunk_bytes);
+    const final_offset = ((large_value.len - 1) / pages.chunk_bytes) * pages.chunk_bytes;
+    const final = try transfer.requestAt(final_offset);
     try apply(&db, &index, first);
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, &large_key));
     db.close();
@@ -204,6 +212,11 @@ test "relational index system merge tail source proofs stage inertly with exact 
     try apply(&db, &index, first);
     try apply(&db, &index, middle);
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, &large_key));
+    var remaining_offset: usize = 2 * pages.chunk_bytes;
+    while (remaining_offset < final_offset) : (remaining_offset += pages.chunk_bytes) {
+        try apply(&db, &index, try transfer.requestAt(remaining_offset));
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, &large_key));
+    }
     try apply(&db, &index, final);
     const stored_large = try db.core.store.get(alloc, &large_key);
     defer alloc.free(stored_large);

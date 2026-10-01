@@ -317,6 +317,7 @@ pub const MetadataServer = struct {
             owned_public_write_source = public_write_source;
 
             var api_server_cfg = cfg.api_server_cfg;
+            api_server_cfg.restore_owner_progress_generation = &svc.restore_owner_progress_generation;
             api_server_cfg.configureRemoteCatalogPublicationAuthority();
             // Restore-owner and durable-session RPCs share the same owned
             // data-bearing routes and transport as ordinary hosted reads and
@@ -520,6 +521,7 @@ pub const MetadataServer = struct {
         const io = (try self.svc.ensureBackendRuntime()).io() orelse return error.AsyncRestoreUnavailable;
         var last_unexpected_error: ?anyerror = null;
         while (!self.restore_supervisor_stop.load(.acquire)) {
+            const observed_progress = self.svc.restore_owner_progress_generation.load(.acquire);
             if (self.owned_admin_mux) |mux| {
                 if (mux.ensureRestoreLeadershipIfLocalLeader()) |local_leader| {
                     if (local_leader) {
@@ -543,7 +545,15 @@ pub const MetadataServer = struct {
                     }
                 }
             }
-            io.sleep(std.Io.Duration.fromMilliseconds(250), .awake) catch return;
+            // Register before checking the generation, so a receipt racing
+            // reset cannot be lost. Periodic reconciliation covers restarts
+            // and notifications that never reached this metadata replica.
+            self.svc.restore_owner_progress_event.reset();
+            if (self.svc.restore_owner_progress_generation.load(.acquire) != observed_progress) continue;
+            self.svc.restore_owner_progress_event.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(250), .clock = .awake } }) catch |err| switch (err) {
+                error.Timeout => {},
+                error.Canceled => return,
+            };
         }
     }
 

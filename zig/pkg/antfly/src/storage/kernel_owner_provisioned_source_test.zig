@@ -554,10 +554,16 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
                     .free_admin_snapshot = freeAdminSnapshot,
                     .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
                     .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .table_routing_snapshot = descriptorSnapshot,
+                    .linearizable_table_routing_snapshot = descriptorSnapshot,
                     .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                     .validate_publication = validatePublication,
                 },
             };
+        }
+
+        fn descriptorSnapshot(ptr: *anyopaque, _: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            return table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot(ptr, deadline_ns);
         }
 
         fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
@@ -733,6 +739,10 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
             .execution_deadline_ns = started + 20 * std.time.ns_per_ms,
         }, .stale));
         try std.testing.expect(time.monotonicNs() - started < 4 * std.time.ns_per_s);
+        try std.testing.expect(entry.exclusive_active);
+        try std.testing.expectError(error.Timeout, owner_source.readSource().lookupGroupLocal(alloc, 7001, "articles", "doc:1", .{
+            .execution_deadline_ns = time.monotonicNs() + 20 * std.time.ns_per_ms,
+        }, .stale));
         try std.testing.expect(entry.exclusive_active);
         const CancelAfter = struct {
             at: u64,

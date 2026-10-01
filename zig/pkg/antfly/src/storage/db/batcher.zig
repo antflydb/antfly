@@ -756,9 +756,9 @@ const GraphReplayAccumulator = struct {
     fn recordGraphDelete(self: *GraphReplayAccumulator, delete: types.GraphEdgeDelete) !void {
         // A node clear retires incident source-owned edges, but leaves facts
         // owned by other documents intact. It cannot subsume their deletions.
-        const separately_owned = delete.owner_document.len > 0 and !std.mem.eql(u8, delete.owner_document, delete.source);
+        const separately_owned = !std.mem.eql(u8, delete.producingDocument(), delete.source);
         if (if (separately_owned)
-            self.deleted_keys.contains(delete.owner_document) or self.doc_clears.contains(delete.owner_document)
+            self.deleted_keys.contains(delete.producingDocument()) or self.doc_clears.contains(delete.producingDocument())
         else
             self.deleted_keys.contains(delete.source) or self.deleted_keys.contains(delete.target) or
                 self.doc_clears.contains(delete.source) or self.doc_clears.contains(delete.target)) return;
@@ -963,7 +963,9 @@ fn lessThanGraphWrite(_: void, lhs: types.GraphEdgeWrite, rhs: types.GraphEdgeWr
     if (type_cmp != .eq) return type_cmp == .lt;
     const id_cmp = std.mem.order(u8, lhs.edge_id, rhs.edge_id);
     if (id_cmp != .eq) return id_cmp == .lt;
-    return std.mem.order(u8, lhs.owner_document, rhs.owner_document) == .lt;
+    const owner_cmp = std.mem.order(u8, lhs.owner_document, rhs.owner_document);
+    if (owner_cmp != .eq) return owner_cmp == .lt;
+    return std.mem.order(u8, lhs.owner, rhs.owner) == .lt;
 }
 
 fn lessThanGraphDelete(_: void, lhs: types.GraphEdgeDelete, rhs: types.GraphEdgeDelete) bool {
@@ -975,7 +977,9 @@ fn lessThanGraphDelete(_: void, lhs: types.GraphEdgeDelete, rhs: types.GraphEdge
     if (type_cmp != .eq) return type_cmp == .lt;
     const id_cmp = std.mem.order(u8, lhs.edge_id, rhs.edge_id);
     if (id_cmp != .eq) return id_cmp == .lt;
-    return std.mem.order(u8, lhs.owner_document, rhs.owner_document) == .lt;
+    const owner_cmp = std.mem.order(u8, lhs.owner_document, rhs.owner_document);
+    if (owner_cmp != .eq) return owner_cmp == .lt;
+    return std.mem.order(u8, lhs.owner, rhs.owner) == .lt;
 }
 
 fn cloneDerivedDocument(alloc: Allocator, doc: derived_types.DerivedDocument) !derived_types.DerivedDocument {
@@ -1173,15 +1177,17 @@ fn deinitGraphDelete(alloc: Allocator, delete: *types.GraphEdgeDelete) void {
 
 test "graph replay node clears do not subsume independently owned fact deletions" {
     const alloc = std.testing.allocator;
-    for ([_]bool{ false, true }) |clear_first| {
+    for ([_]types.GraphEdgeDelete{
+        .{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R", .edge_id = "one", .owner_document = "fact:one" },
+        .{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R", .owner = "fact:one" },
+    }) |deletion| for ([_]bool{ false, true }) |clear_first| {
         var accumulator = GraphReplayAccumulator{ .alloc = alloc, .index_name = "facts" };
         defer accumulator.deinit();
-        const deletion = types.GraphEdgeDelete{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R", .edge_id = "one", .owner_document = "fact:one" };
         if (clear_first) try accumulator.recordDocClear("a");
         try accumulator.recordGraphDelete(deletion);
         if (!clear_first) try accumulator.recordDocDelete("b");
         try std.testing.expectEqual(@as(usize, 1), accumulator.graph_deletes.count());
         try accumulator.recordDocDelete("fact:one");
         try std.testing.expectEqual(@as(usize, 0), accumulator.graph_deletes.count());
-    }
+    };
 }

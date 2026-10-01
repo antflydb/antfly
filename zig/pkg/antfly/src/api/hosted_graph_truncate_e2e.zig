@@ -552,7 +552,8 @@ fn mountedGraphTruncate(faults: bool) !void {
 
     var created = try sql(alloc, transport, &headers, base, "CREATE TABLE docs (id BIGINT PRIMARY KEY, graph_target TEXT)");
     defer created.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), created.status);
+    // An accepted CREATE still has to pass the owner-readiness barrier below.
+    try std.testing.expect(created.status == 200 or created.status == 202);
     const old_id = try awaitTableId(alloc, io, transport, &headers, base, null, null);
     var index = try request(alloc, transport, &headers, base, "/db/v1/tables/docs/indexes/links", .POST, "{\"name\":\"links\",\"type\":\"graph\",\"edge_types\":[{\"name\":\"cites\",\"field\":\"graph_target\"}]}");
     defer index.deinit(alloc);
@@ -637,7 +638,7 @@ fn mountedGraphTruncate(faults: bool) !void {
     // not bypass any separate initial-child authority gate.
     var created_child = try sql(alloc, transport, &headers, restarted_base, "CREATE TABLE children (id BIGINT PRIMARY KEY, parent_id BIGINT)");
     defer created_child.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), created_child.status);
+    try std.testing.expect(created_child.status == 200 or created_child.status == 202);
     const old_child_id = try awaitNamedTableId(alloc, io, transport, &headers, restarted_base, "children", null, null);
     var parent_insert = try request(alloc, transport, &headers, restarted_base, "/db/v1/tables/docs/batch", .POST, "{\"inserts\":{\"doc-b\":{\"id\":2}},\"sync_level\":\"full_text\"}");
     defer parent_insert.deinit(alloc);
