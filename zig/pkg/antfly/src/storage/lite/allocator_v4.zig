@@ -11,6 +11,44 @@ pub const free: u32 = 0x80000000;
 pub const max_references: u32 = free - 1;
 pub const max_pending_objects = 1024 * 1024;
 pub const collector_reserve = 4096; // 64 levels × 63 siblings, plus publication metadata.
+
+fn ceil(n: u64, divisor: usize) u64 {
+    return n / divisor + @intFromBool(n % divisor != 0);
+}
+
+pub fn snapshotPages(payload: usize, covered: u64, pending: usize) u64 {
+    return 1 +| @max(@as(u64, 1), ceil(covered -| 1, (payload - 24) / 4)) +| ceil(pending, (payload - 16) / 48);
+}
+
+/// Capacity for a full metadata checkpoint, bounded DFS expansion, and two
+/// recovery-slot advances. Uses scalar ledger sizes, never a graph/page scan.
+/// Include counters for reserve pages themselves to reach the small fixed point.
+pub fn retirementReservePages(payload: usize, covered: u64, pending: usize) u64 {
+    const counters = (payload - 24) / 4;
+    const events = (payload - 16) / 48;
+    const advance = serviceJournalPages(payload, 1);
+    const queue_pages = ceil(@as(u64, pending) +| collector_reserve, events);
+    var reserve: u64 = 0;
+    while (true) {
+        const next = 1 +| ceil((covered -| 1) +| reserve, counters) +| queue_pages +| (2 *| advance);
+        if (next == reserve) return reserve;
+        reserve = next;
+    }
+}
+
+/// Upper bound for a service journal: one index may release every key, a value
+/// may discover 64 children, and housekeeping promotes the preceding batch's
+/// completed pages. Allocation of journal pages also changes free counters.
+pub fn serviceJournalPages(payload: usize, work: usize) u64 {
+    const per_page = (payload - 16) / 56;
+    const entries = @as(u64, work) *| (4 * (payload / 18 + 2) + 64 + 16) +| 32;
+    var pages: u64 = 1;
+    while (true) {
+        const next = 1 +| ceil(entries +| pages, per_page);
+        if (next == pages) return pages;
+        pages = next;
+    }
+}
 pub const Kind = enum(u8) { record, index, value, metadata, page, allocator_chain };
 pub const Retirement = struct {
     id: u64 = 0,
@@ -140,6 +178,15 @@ pub const State = struct {
         const current = self.count(page);
         if (current == 0 or current >= free) return error.InvalidNativeAllocator;
         try self.set(page, if (current == 1) free else current - 1, true);
+        return current == 1;
+    }
+    /// A retired object's bytes can still be required by the rollback/fallback
+    /// allocator queue. Removing ownership does not make that object reusable
+    /// until its completion has crossed both recovery slots.
+    pub fn releaseDeferred(self: *State, page: u64) !bool {
+        const current = self.count(page);
+        if (current == 0 or current >= free) return error.InvalidNativeAllocator;
+        try self.set(page, current - 1, true);
         return current == 1;
     }
     pub fn releaseMetadata(self: *State, page: u64) !void {
@@ -602,4 +649,17 @@ test "lite allocator v4 sparse journal pages count toward checkpoint threshold" 
     try state.retain(2);
     try state.preparePersist(1, 4080);
     try std.testing.expect(state.checkpointing);
+}
+
+test "lite allocator v4 capacity reserve scales with snapshots and queue width" {
+    const payload = 4080;
+    const small = retirementReservePages(payload, 3, 0);
+    const million = retirementReservePages(payload, 1_000_000, 0);
+    const wide = retirementReservePages(payload, 1_000_000, max_pending_objects);
+    try std.testing.expect(small < 128);
+    try std.testing.expect(million < 1200);
+    try std.testing.expect(wide < 15000);
+    // The reserve covers a checkpoint even after the entire DFS reserve is
+    // occupied and allocating its own pages grows the counter table.
+    try std.testing.expect(wide >= snapshotPages(payload, 1_000_000 + wide, max_pending_objects + collector_reserve) + 2 * serviceJournalPages(payload, 1));
 }

@@ -2353,6 +2353,10 @@ pub const NativeFile = struct {
     /// Owner admission budget. Reuse remains permitted at the file-size cap.
     /// Null means unlimited; the owner subtracts retired/workspace capacity.
     max_file_bytes: ?u64 = null,
+    /// Foreground owners preserve allocator workspace inside the hard limit.
+    /// Private rewrite images use their separately admitted workspace instead.
+    reserve_retirement_capacity: bool = false,
+    maintenance_publication: bool = false,
     vacuum_workspace_limit: ?u64 = null,
     vacuum_target_indexed: bool = false,
     ledger: ?*allocator_v4.State = null,
@@ -2954,9 +2958,11 @@ pub const NativeFile = struct {
         if (budget == 0) return 0;
         const frontier = self.reuseFrontier();
         const metadata_frontier = self.metadataReuseFrontier();
-        // Each publication creates one root retirement. Two housekeeping
-        // slots drain that debt without starving data when the work budget is 1.
-        for (0..2) |_| {
+        // Completed data/chain pages use the metadata fence too: recovery can
+        // replay an older retirement queue that still needs their bytes. Scale
+        // physical reuse promotion with the maximum key fanout of data work.
+        const promotions = @max(@as(usize, 8), budget *| (self.maxPagePayloadBytes() / 18 + 2));
+        for (0..promotions) |_| {
             const root = state.metadata_heap.peek() orelse break;
             if (root.epoch > metadata_frontier) break;
             if (root.page == 0 or root.page >= checkpoint.page_count) return error.InvalidNativeAllocator;
@@ -2969,22 +2975,32 @@ pub const NativeFile = struct {
         for (0..@max(@as(usize, 8), budget)) |_| {
             const item = state.chains_heap.peek() orelse break;
             if (item.epoch > metadata_frontier) break;
+            if (state.pending.count() + 8 >= state.pending_limit + allocator_v4.collector_reserve) break;
             const next_page = try self.retiredAllocatorNext(item.page, checkpoint);
             try state.complete(item);
-            try state.releaseMetadata(item.page);
+            try state.retireCollected(.{ .epoch = self.publicationEpoch(), .page = item.page, .kind = .metadata });
             if (next_page != 0) try state.retireCollected(.{ .epoch = item.epoch, .page = next_page, .kind = .allocator_chain });
         }
         var done: usize = 0;
         while (done < budget) : (done += 1) {
             const item = state.heap.peek() orelse break;
             if (item.epoch > frontier) break;
+            // A single node can discover value children or release many typed
+            // keys. Keep publication space when collector admission is full;
+            // advancing slots then promotes older completed pages first.
+            const expansion: usize = switch (item.kind) {
+                .value => 64 + 8,
+                .index => self.maxPagePayloadBytes() / 18 + 8,
+                else => 8,
+            };
+            if (state.pending.count() + expansion >= state.pending_limit + allocator_v4.collector_reserve) break;
             if (physicalPage(item.page) == 0 or physicalPage(item.page) >= checkpoint.page_count) return error.InvalidNativeAllocator;
             try state.complete(item);
             switch (item.kind) {
                 .metadata => try state.releaseMetadata(item.page),
                 .allocator_chain => return error.InvalidNativeAllocator,
                 .page => {
-                    _ = try state.release(item.page);
+                    _ = try self.releaseRetiredPage(state, item.page);
                 },
                 .record => {
                     const raw = try self.readPageAllocForCheckpoint(self.allocator, item.page, checkpoint);
@@ -3001,7 +3017,7 @@ pub const NativeFile = struct {
                         else => return error.InvalidNativeAllocator,
                     };
                     if (root != 0) try state.retireCollected(.{ .epoch = item.epoch, .page = root, .length = length, .kind = .value });
-                    _ = try state.release(physicalPage(item.page));
+                    _ = try self.releaseRetiredPage(state, physicalPage(item.page));
                 },
                 .index => {
                     const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, item.page, .document_index, checkpoint);
@@ -3012,14 +3028,14 @@ pub const NativeFile = struct {
                     for (0..frame.offsets.items.len) |i| {
                         const key = frame.keyReference(i);
                         if (key == 0) continue;
-                        _ = try state.release(physicalPage(key));
+                        _ = try self.releaseRetiredPage(state, physicalPage(key));
                     }
-                    _ = try state.release(item.page);
+                    _ = try self.releaseRetiredPage(state, item.page);
                 },
                 .value => {
                     // Children belong to a shared immutable node, rather than
                     // separately to every document that points at its root.
-                    if (try state.release(item.page)) {
+                    if (try self.releaseRetiredPage(state, item.page)) {
                         const raw = try self.readPageAllocForCheckpoint(self.allocator, item.page, checkpoint);
                         defer self.allocator.free(raw);
                         switch (raw[4]) {
@@ -3039,6 +3055,12 @@ pub const NativeFile = struct {
             }
         }
         return done;
+    }
+
+    fn releaseRetiredPage(self: *NativeFile, state: *allocator_v4.State, page: u64) !bool {
+        const last = try state.releaseDeferred(page);
+        if (last) try state.retireCollected(.{ .epoch = self.publicationEpoch(), .page = page, .kind = .metadata });
+        return last;
     }
 
     fn initializeIndexedAllocator(self: *NativeFile) !void {
@@ -3077,6 +3099,25 @@ pub const NativeFile = struct {
         if (pages.metadata_cursor != pages.metadata_reserve.items.len) return error.InvalidNativeAllocator;
         checkpoint.page_count = pages.next_page_id;
         pages.ledger_persisted = true;
+        if (self.reserve_retirement_capacity and !self.maintenance_publication) {
+            if (self.max_file_bytes) |limit| {
+                const available = (limit / self.header.page_size -| pages.next_page_id) +|
+                    (if (pages.can_reuse) state.free_pages else 0);
+                if (available < allocator_v4.retirementReservePages(self.maxPagePayloadBytes(), state.counts.items.len, state.pending.count())) return error.LiteStorageBudgetExceeded;
+            }
+        }
+    }
+
+    pub fn retirementReserveBytes(self: *NativeFile) !u64 {
+        if (!self.header.indexed_reclamation) return 0;
+        const state = try self.loadLedger(self.activeCheckpoint());
+        return allocator_v4.retirementReservePages(self.maxPagePayloadBytes(), state.counts.items.len, state.pending.count()) *| self.header.page_size;
+    }
+
+    /// Creation is admitted before opening/truncating/renaming any artifact.
+    pub fn minimumOwnerStorageBytes(indexed: bool) u64 {
+        if (!indexed) return default_page_size;
+        return (3 + allocator_v4.retirementReservePages(default_page_size - page_header_size, 3, 0)) * default_page_size;
     }
 
     pub const AllocatorStats = struct {
@@ -3096,9 +3137,10 @@ pub const NativeFile = struct {
     pub fn retirementNeedsService(self: *NativeFile) !bool {
         if (!self.header.indexed_reclamation or self.read_only) return false;
         const state = try self.loadLedger(self.activeCheckpoint());
-        const excess_roots = state.metadata_heap.count() > 2;
-        if (state.data_pending == 0 and state.chains_heap.count() == 0 and !excess_roots) return false;
-        if (excess_roots) {
+        if (self.retirementCheckpointUnderPressure(state)) return true;
+        const excess_promotions = state.metadata_heap.count() > 2;
+        if (state.data_pending == 0 and state.chains_heap.count() == 0 and !excess_promotions) return false;
+        if (excess_promotions) {
             const root = state.metadata_heap.peek().?;
             if (root.epoch <= self.metadataReuseFrontier() or self.durable_header == null) return true;
         }
@@ -3112,6 +3154,20 @@ pub const NativeFile = struct {
         return item.epoch <= self.reuseFrontier() or (self.minimum_reader_sequence == null and self.durable_header == null);
     }
 
+    fn retirementCheckpointUnderPressure(self: *NativeFile, state: *allocator_v4.State) bool {
+        if (!self.reserve_retirement_capacity) return false;
+        const limit = self.max_file_bytes orelse return false;
+        const available = (limit / self.header.page_size -| self.activeCheckpoint().page_count) +| state.free_pages;
+        const reserve = allocator_v4.retirementReservePages(self.maxPagePayloadBytes(), state.counts.items.len, state.pending.count());
+        // Sparse journals must also checkpoint below the byte budget, rather
+        // than requiring the ordinary 256 KiB threshold to fit in a small file.
+        // Demand a net saving so pressure cannot cause a checkpoint-per-batch
+        // loop that creates metadata faster than retirement can release it.
+        const snapshot_bytes = allocator_v4.snapshotPages(self.maxPagePayloadBytes(), state.counts.items.len, state.pending.count()) *| self.maxPagePayloadBytes();
+        return available < reserve +| allocator_v4.serviceJournalPages(self.maxPagePayloadBytes(), 1) and
+            state.root.delta_bytes >= 2 *| snapshot_bytes;
+    }
+
     /// Services idle retirement and advances recovery slots independently of
     /// file shrinking. The owner serializes this with mutations and snapshots.
     pub fn reclaimPages(self: *NativeFile, budget: usize) !usize {
@@ -3122,7 +3178,20 @@ pub const NativeFile = struct {
         defer self.retirement_work_pages = previous_budget;
         var pages = try self.pageAllocatorFromFreeMap(before);
         defer pages.deinit();
-        const count = try self.drainRetirement(pages.ledger.?, before, budget);
+        if (self.retirementCheckpointUnderPressure(pages.ledger.?)) pages.ledger.?.force_checkpoint = true;
+        var work = budget;
+        if (self.max_file_bytes) |limit| {
+            const available = (limit / self.header.page_size -| pages.next_page_id) +|
+                (if (pages.can_reuse) pages.ledger.?.free_pages else 0);
+            // Keep normal-sized batches when capacity permits. Under pressure
+            // bound journal allocation before traversing/mutating the ledger.
+            const advances = 2 *| allocator_v4.serviceJournalPages(self.maxPagePayloadBytes(), 1);
+            while (work > 1 and allocator_v4.serviceJournalPages(self.maxPagePayloadBytes(), work) +| advances > available) work = work / 2 + work % 2;
+        }
+        const count = try self.drainRetirement(pages.ledger.?, before, work);
+        const previous_maintenance = self.maintenance_publication;
+        self.maintenance_publication = true;
+        defer self.maintenance_publication = previous_maintenance;
         var next = before;
         next.commit_sequence += 1;
         next.free_map_root_page = try pages.allocate();
@@ -14861,9 +14930,59 @@ test "lite allocator v4 idle metadata advances recovery behind a pinned reader" 
     try std.testing.expect(try file.retirementNeedsService());
     _ = try file.reclaimPages(1);
     _ = try file.reclaimPages(1);
+    // Chain completion itself must cross the allocator recovery frontier
+    // before its physical pages can enter the free bitmap.
+    var rounds: usize = 0;
+    while (try file.retirementNeedsService()) : (rounds += 1) {
+        try std.testing.expect(rounds < 16);
+        _ = try file.reclaimPages(1);
+    }
     try std.testing.expect(!try file.retirementNeedsService());
     try std.testing.expectEqual(@as(?[]u8, null), try file.getDocumentAtCheckpointAlloc(a, pinned, "live"));
     try std.testing.expect((try file.check()).valid);
+}
+
+test "lite allocator v4 completed retirement preserves rollback and fallback bytes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "retirement-completion-recovery.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer file.close();
+    file.retirement_work_pages = 0;
+    const value: [8192]u8 = @splat('v');
+    try file.putCatalogRecord("key", &value);
+    const checkpoint = file.activeCheckpoint();
+    const reference = (try file.lookupCatalogPage(checkpoint, .metadata, "key")).?;
+    const payload = try file.readPagePayloadByKindAllocForCheckpoint(a, reference, .catalog, checkpoint);
+    defer a.free(payload);
+    const root = (try decodeCatalogEntry(payload)).external_value_root_page;
+    try file.putCatalogRecord("key", "replacement");
+    try file.putDocument("advance", "frontier");
+    var rounds: usize = 0;
+    while ((try file.loadLedger(file.activeCheckpoint())).count(root) != 0) : (rounds += 1) {
+        try std.testing.expect(rounds < 16);
+        _ = try file.reclaimPages(1);
+    }
+    // The completion is committed, but the previous allocator still owns a
+    // queue entry that must read this value node. It cannot be reused yet.
+    const state = try file.loadLedger(file.activeCheckpoint());
+    var found = false;
+    var pending = state.pending.valueIterator();
+    while (pending.next()) |item| if (item.kind == .metadata and item.page == root) {
+        found = true;
+    };
+    try std.testing.expect(found);
+    try file.beginTransaction();
+    try file.putDocument("private", &value);
+    _ = try file.materializeTransactionCheckpoint();
+    file.abortTransaction();
+    try std.testing.expect((try file.check()).valid);
+    var fallback = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true });
+    defer fallback.close();
+    fallback.header.active_checkpoint = 1 - fallback.header.active_checkpoint;
+    try std.testing.expect((try fallback.check()).valid);
 }
 
 test "lite allocator v4 external reader waits for in place reclamation lock" {

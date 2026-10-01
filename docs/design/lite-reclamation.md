@@ -62,7 +62,11 @@ Busy publication, resource deferral, and failed service retry
 after the configured interval. An active online capture or assessment parks the
 worker until completion signals it; eligible debt never causes a no-progress spin.
 Construction suppresses worker startup until the returned owner has a stable
-address. Read-only handles perform no maintenance. Writable reopen assesses outstanding debt synchronously, preventing repeated short CLI
+address. The native backend activates its fully initialized heap owner before
+returning, so remaining reopen debt runs without another operation. Direct
+value-based `Store` users call `startMaintenance` after placing the store at its
+final address, or use cooperative `maintainOnce`. Read-only handles perform no
+maintenance. Writable reopen assesses outstanding debt synchronously, preventing repeated short CLI
 sessions from discarding a newly launched background task forever. Close requests
 cancellation, wakes and joins the task, then closes the storage runtime. The
 publication boundary retains the existing atomic adoption and directory-sync
@@ -80,6 +84,17 @@ freshness. An explicit integrity audit remains independent of routine assessment
 
 The allocator rejects appended pages before they exceed an optional aggregate
 storage budget. Admission subtracts rewrite workspace and retained generations.
+Revision-4 foreground publication also preserves capacity for one counter/queue
+snapshot, the bounded DFS queue expansion, and two recovery-slot advances. The
+reserve includes its own counter pages at a fixed point. It uses scalar ledger
+sizes without scanning free pages or value graphs, and scales with physical page
+count and pending queue size. Maintenance may use the reserve. Near the hard
+limit, service reduces its data batch geometrically before touching the ledger;
+normal batches remain available when capacity permits. Sparse journals checkpoint
+early under capacity pressure only when the old journal is at least twice the
+new snapshot size, ensuring a net metadata reduction. Creation checks the format
+footprint and reserve against the budget and disk headroom before touching an
+existing artifact; an undersized limit fails with `LiteStorageBudgetExceeded`.
 The rewrite reserves the larger of twice estimated compact size and an assessment
 interval. When capacity or an aggregate budget is available, it constrains allocation in
 the initial copy and residual change replay. Exhausting the reservation safely
@@ -167,14 +182,19 @@ reads and retires one chain page per work unit, rather than enqueueing an entire
 snapshot. Metadata roots and chains have separate queues. Their visibility fence
 is the recovery/durability slots: internal data transactions never read allocator
 metadata. External snapshot and audit handles still prevent physical overwrite
-through the inode lock. Each service batch additionally cleans at most two eligible
-old allocator roots and at most `max(8, retirement_work_pages)` allocator-chain
-pages. Scaling cleanup with data work avoids accumulating snapshot overhead under
-sustained service; the eight-page minimum lets a one-object data budget drain its
-publication overhead. Data never waits behind an entire metadata chain. Root-only
-debt beyond two retained roots also drains at a net reduction per publication; the
-last two roots never start an idle service loop. Existing single-page metadata
-retirements remain readable. Metadata checkpoints preserve live document/value
+through the inode lock. Each service batch retires at most
+`max(8, retirement_work_pages)` allocator-chain pages. Completed data and
+chain objects retain zero-count physical pages as single-page metadata events
+until the completion epoch crosses both recovery/durability slots. This preserves
+the bytes needed by an aborted transaction's queue and by fallback-ledger replay.
+Promotion to the free bitmap is separately bounded by
+`max(8, retirement_work_pages * (payload_bytes / 18 + 2))`, covering the preceding
+batch's maximum typed-key fanout and publication overhead. Collector queue
+pressure limits expansion before consuming publication slots. Data never waits
+behind an entire metadata chain. Single-page debt beyond two retained promotions
+drains at a net reduction per publication; the last two promotions never start an
+idle service loop. Existing single-page metadata retirements remain readable.
+Metadata checkpoints preserve live document/value
 pages. Metadata reservations consume free bits before
 serialization, preventing the allocator from advertising its own pages as free.
 
@@ -257,10 +277,20 @@ exercise existing backup/import/encryption/replay/resource contracts. Numerical
 throughput, latency-percentile, and I/O promises require workload benchmarks;
 correctness tests and structural page-growth bounds do not establish those claims.
 
+`zig build lite-native-benchmark -Doptimize=ReleaseFast` includes a capacity
+reclamation workload with 1,024 overwrites of four 8 KiB documents under three
+fixed budgets. It reports peak physical bytes, retry/service counts, page I/O,
+and p50/p99 elapsed write times including cooperative retirement. This workload
+uses `no_sync` and a C allocator to isolate allocator/publication overhead from
+sync latency and the test allocator. It asserts the capacity envelope and audits
+the final ledger; timing values are observations, not pass/fail thresholds.
+
 ## Failure and estimation guarantees
 
 Replacement creation initializes and syncs the complete selected format on the
 staged inode before rename; initialization failure preserves the original artifact.
+Vacuum reports and hysteresis use the final image size after allocator publication,
+including the recovery-slot rebase and its metadata checkpoint.
 Compact-size estimation models the destination format, including migration, typed
 long-key pages, and the fixed point of allocator root and counter snapshot pages.
 Revision 4 omits the legacy namespace directory. Graph audits and vacuum ownership

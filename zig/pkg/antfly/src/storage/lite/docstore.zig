@@ -30,6 +30,136 @@ const maintenance = @import("../maintenance.zig");
 const Allocator = std.mem.Allocator;
 const bounded_cursor_test_documents: usize = 512;
 
+test "lite reclamation capacity reserve sustains bounded overwrites" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "retirement-capacity.aflite");
+    defer a.free(path);
+    const limit = 128 * 4096;
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false, .max_storage_bytes = limit } });
+    defer store.close();
+    // Exercise cooperative service deterministically, including pressure that
+    // arrives before the normal sparse-journal checkpoint threshold.
+    store.maintenance_cancel.request();
+    var value: [8192]u8 = @splat('v');
+    const key: [700]u8 = @splat('k');
+    var rejected: usize = 0;
+    for (0..128) |version| {
+        value[0] = @intCast(version);
+        var accepted = false;
+        for (0..256) |_| {
+            var write = try store.beginWrite();
+            errdefer write.abort();
+            try write.put(&key, &value);
+            if (write.commit()) |_| {
+                accepted = true;
+                break;
+            } else |err| {
+                write.abort();
+                if (err != error.LiteStorageBudgetExceeded) return err;
+                rejected += 1;
+            }
+            try std.testing.expect(try store.file.retirementNeedsService());
+            try store.maintainOnce(false);
+        }
+        try std.testing.expect(accepted);
+        try std.testing.expect((try store.file.file.stat(std.testing.io)).size <= limit);
+    }
+    try std.testing.expect(rejected > 0);
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqual(@as(u8, 127), (try read.get(&key))[0]);
+    try std.testing.expect((try store.checkWithCancel(null)).valid);
+}
+
+test "lite reclamation creation checks budget before replacement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "creation-capacity.aflite");
+    defer a.free(path);
+    {
+        var file = try native.NativeFile.createWithIo(a, std.testing.io, path, .{});
+        defer file.close();
+        try file.putCatalogRecord("stable", "original");
+    }
+    try std.testing.expectError(error.LiteStorageBudgetExceeded, Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .max_storage_bytes = 4096 } }));
+    var file = try native.NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true });
+    defer file.close();
+    const value = (try file.getCatalogRecordAlloc(a, "stable")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("original", value);
+}
+
+test "lite reclamation capacity reserve drains wide value graphs" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "wide-retirement-capacity.aflite");
+    defer a.free(path);
+    const limit = 256 * 4096;
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false, .max_storage_bytes = limit } });
+    defer store.close();
+    store.maintenance_cancel.request();
+    const value = try a.alloc(u8, 256 * 1024);
+    defer a.free(value);
+    @memset(value, 'v');
+    for (0..12) |version| {
+        value[0] = @intCast(version);
+        var accepted = false;
+        for (0..256) |_| {
+            if (store.putCatalogRecord("meta", value)) |_| {
+                accepted = true;
+                break;
+            } else |err| {
+                if (err != error.LiteStorageBudgetExceeded) return err;
+            }
+            try std.testing.expect(try store.file.retirementNeedsService());
+            try store.maintainOnce(false);
+        }
+        try std.testing.expect(accepted);
+        try std.testing.expect((try store.file.file.stat(std.testing.io)).size <= limit);
+    }
+    const stored = (try store.getCatalogRecordAlloc(a, "meta")).?;
+    defer a.free(stored);
+    try std.testing.expectEqualSlices(u8, value, stored);
+    try std.testing.expect((try store.checkWithCancel(null)).valid);
+}
+
+test "lite reclamation owner vacuum reports final publication size" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "vacuum-final-size.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_cancel.request();
+    for (0..32) |_| try store.putCatalogRecord("meta", "value");
+    const report = try store.vacuum();
+    const size = (try store.file.file.stat(std.testing.io)).size;
+    try std.testing.expectEqual(size, report.after_size);
+    try std.testing.expectEqual(report.before_size -| size, report.reclaimed_bytes);
+    try std.testing.expectEqual(report.reclaimed_bytes, (try store.reclamationStatus()).last_reclaimed_bytes);
+}
+
+test "lite reclamation creation checks disk before replacing an artifact" {
+    const Probe = struct {
+        fn available(_: *anyopaque, _: []const u8) !u64 {
+            return native.NativeFile.minimumOwnerStorageBytes(true) - 1;
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "creation-disk.aflite");
+    defer a.free(path);
+    var context: u8 = 0;
+    try std.testing.expectError(error.LiteInsufficientDiskSpace, Store.createWithOptions(a, path, .{ .io = std.testing.io, .reclamation = .{ .disk_headroom_bytes = 0, .capacity_probe = .{ .context = &context, .available = Probe.available } } }));
+    try std.testing.expectError(error.FileNotFound, native.NativeFile.openWithIo(a, std.testing.io, path, .{}));
+}
+
 test "lite reclamation counts retired inodes until pinned readers release" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -55,7 +185,7 @@ test "lite reclamation counts retired inodes until pinned readers release" {
     try std.testing.expectEqualStrings("old", try old.get("doc"));
     // The old inode consumes the aggregate budget even though the visible
     // pathname is compact. Releasing its reader restores mutation capacity.
-    store.maintenance_policy.options.max_storage_bytes = status.totalBytes() + 4096;
+    store.maintenance_policy.options.max_storage_bytes = status.totalBytes() + (try store.file.retirementReserveBytes()) + 4096;
     const large: [4 * 4096]u8 = @splat('x');
     write = try store.beginWrite();
     try write.put("capacity", &large);
@@ -473,6 +603,7 @@ pub const Store = struct {
         // An owner may live for only one CLI invocation. Reopen services debt
         // synchronously so repeated short sessions cannot starve reclamation.
         result.file.retirement_work_pages = opts.reclamation.retirement_work_pages;
+        result.file.reserve_retirement_capacity = true;
         result.file.vacuum_target_indexed = opts.reclamation.page_reuse;
         if (!opts.read_only and opts.reclamation.page_reuse and !result.file.header.indexed_reclamation) {
             _ = try result.vacuumWithCancel(null);
@@ -488,6 +619,15 @@ pub const Store = struct {
 
     pub fn createWithOptions(allocator: Allocator, path: []const u8, opts: CreateOptions) !Store {
         const policy = try reclamation.Policy.init(opts.reclamation);
+        const minimum = native.NativeFile.minimumOwnerStorageBytes(opts.reclamation.page_reuse);
+        if (opts.reclamation.max_storage_bytes != 0 and minimum > opts.reclamation.max_storage_bytes) return error.LiteStorageBudgetExceeded;
+        const available = if (opts.reclamation.capacity_probe) |probe|
+            try probe.available(probe.context, path)
+        else if (opts.io == null and antfly_platform.filesystem.capacity_supported)
+            (try antfly_platform.filesystem.capacity(std.fs.path.dirname(path) orelse ".")).available_bytes
+        else
+            null;
+        if (available) |bytes| if (bytes < minimum +| opts.reclamation.disk_headroom_bytes) return error.LiteInsufficientDiskSpace;
         const native_opts = native.CreateOptions{
             .exclusive = opts.exclusive,
             .no_sync = opts.no_sync,
@@ -500,6 +640,8 @@ pub const Store = struct {
         else
             try native.NativeFile.createWithOptions(allocator, path, native_opts);
         file.retirement_work_pages = opts.reclamation.retirement_work_pages;
+        file.reserve_retirement_capacity = true;
+        if (opts.reclamation.max_storage_bytes != 0) file.max_file_bytes = opts.reclamation.max_storage_bytes;
         file.vacuum_target_indexed = opts.reclamation.page_reuse;
         return .{
             .allocator = allocator,
@@ -697,6 +839,9 @@ pub const Store = struct {
             if (try self.file.retirementNeedsService()) {
                 try self.refreshAdmissionAssumeLocked();
                 _ = try self.file.reclaimPages(self.maintenance_policy.options.retirement_work_pages);
+                self.maintenance_policy.status.state = if (self.maintenance_policy.options.enabled) .idle else .disabled;
+                self.maintenance_policy.status.reason = if (self.maintenance_policy.options.enabled) .none else .disabled;
+                self.maintenance_policy.status.last_error = null;
             }
         }
         if (!self.maintenance_policy.options.enabled) return;
@@ -1002,6 +1147,8 @@ pub const Store = struct {
                     image.report.reclaimed_bytes = image.report.before_size -| image.report.after_size;
                     image.prepared.no_sync = self.file.no_sync;
                     try image.prepared.preparePublicationSequence(self.file.activeCheckpoint().commit_sequence + 1);
+                    image.report.after_size = (try image.prepared.file.stat(io)).size;
+                    image.report.reclaimed_bytes = image.report.before_size -| image.report.after_size;
                     const old_handle = self.file.file.handle;
                     defer if (self.file.file.handle != old_handle) self.retireReadGeneration(image.report.before_size);
                     try self.file.publishVacuum(&image);

@@ -1461,6 +1461,8 @@ test "lite index read limits reject from pinned metadata before payload allocati
     defer a.free(path);
     var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
     defer docs.close();
+    // Isolate query I/O accounting from background reclamation; foreground reuse remains enabled.
+    docs.maintenance_cancel.request();
     docs.file.page_cache_enabled.store(false, .monotonic);
     const large = try a.alloc(u8, 4 * 1024 * 1024);
     defer a.free(large);
@@ -1478,7 +1480,9 @@ test "lite index read limits reject from pinned metadata before payload allocati
     budget.allocator().free(empty);
     try std.testing.expectEqual(@as(usize, 0), budget.peak);
     try std.testing.expect(docs.file.test_page_reads.load(.monotonic) - before <= 16);
-    const checkpoint = docs.file.activeCheckpoint();
+    var snapshot = try docs.beginRead();
+    defer snapshot.abort();
+    const checkpoint = snapshot.checkpoint;
     try docs.file.putIndexCatalogRecord("/scope/large", "short");
     try std.testing.expectError(error.FileTooBig, docs.file.getIndexCatalogRecordLimitedAtCheckpointAlloc(budget.allocator(), "/scope/large", 1024, checkpoint));
     budget.limit = std.math.maxInt(usize);

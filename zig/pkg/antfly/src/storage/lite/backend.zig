@@ -750,6 +750,9 @@ fn initNativeSingleFile(
     if (root_namespace_alias) |alias| {
         if (!isStableGroupNamespace(alias)) return error.InvalidLiteRootNamespaceAlias;
     }
+    // Construction returns/moves a value. Only this heap owner has a stable
+    // address that a maintenance task may retain, including on idle reopen.
+    store.startMaintenance();
     return .{
         .allocator = allocator,
         .engine = .native_single_file,
@@ -841,6 +844,33 @@ fn hasMode(modes: []const []const u8, expected: []const u8) bool {
         if (std.mem.eql(u8, mode, expected)) return true;
     }
     return false;
+}
+
+test "lite reclamation backend reopen activates idle retirement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "reopen-retirement.aflite");
+    defer a.free(path);
+    {
+        var handle = try Handle.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+        defer handle.deinit();
+        const owner = handle.native_docstore.?;
+        owner.maintenance_cancel.request();
+        try owner.putCatalogRecord("meta", "old");
+        try owner.putCatalogRecord("meta", "new");
+    }
+    var handle = try Handle.open(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer handle.deinit();
+    const owner = handle.native_docstore.?;
+    try std.testing.expect(owner.maintenance_future != null);
+    const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(5));
+    // No mutations, transactions, or explicit maintainOnce calls after open.
+    while ((try owner.reclamationStatus()).pending_data_retirement_objects != 0) {
+        if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= deadline.nanoseconds) return error.TestUnexpectedResult;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect((try owner.checkWithCancel(null)).valid);
 }
 
 test "lite backend capabilities distinguish native and hosted profiles" {
@@ -1074,6 +1104,8 @@ test "lite backend native engine creates and checks aflite file" {
     var handle = try Handle.create(allocator, path, true);
     defer handle.deinit();
 
+    // Keep this format/maintenance test deterministic while using NativeFile directly.
+    handle.native_docstore.?.maintenance_cancel.request();
     try handle.native_docstore.?.file.putDocument("doc:1", "value");
     try std.testing.expect(handle.maintenanceSource().status().maintenance.online);
     var cancel = maintenance.CancelToken{};
@@ -1110,8 +1142,10 @@ test "lite backend native engine creates and checks aflite file" {
     const configured_report = try handle.check();
     const vacuumed = try handle.vacuum();
     try std.testing.expectEqual(configured_report.file_size, vacuumed.before_size);
-    try std.testing.expectEqual(configured_report.compact_size, vacuumed.after_size);
-    try std.testing.expectEqual(vacuumed.before_size - vacuumed.after_size, vacuumed.reclaimed_bytes);
+    // Publishing the replacement adds allocator metadata beyond the image estimate.
+    try std.testing.expectEqual((try handle.native_docstore.?.file.file.stat(std.testing.io)).size, vacuumed.after_size);
+    try std.testing.expect(vacuumed.after_size >= configured_report.compact_size);
+    try std.testing.expectEqual(vacuumed.before_size -| vacuumed.after_size, vacuumed.reclaimed_bytes);
 }
 
 test "lite backend propagates no_sync to native engine" {
