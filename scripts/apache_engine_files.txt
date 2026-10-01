@@ -615,7 +615,6 @@ zig/pkg/antfly/src/storage/db/test_support.zig
 zig/pkg/antfly/src/storage/db/text_analysis_config.zig
 zig/pkg/antfly/src/storage/db/text_memory_stats.zig
 zig/pkg/antfly/src/storage/db/transaction_recovery_contract.zig
-zig/pkg/antfly/src/storage/db/transaction_resolution.zig
 zig/pkg/antfly/src/storage/db/transform.zig
 zig/pkg/antfly/src/storage/db/typed_doc_values_coverage.zig
 zig/pkg/antfly/src/storage/db/types.zig

@@ -15,8 +15,9 @@
 
 const std = @import("std");
 const platform_clock = @import("antfly_platform").clock;
-const resolution_mod = @import("db/transaction_resolution.zig");
 const transactions_mod = @import("transactions.zig");
+
+pub const ResolveParticipantFn = *const fn (*anyopaque, transactions_mod.TxnId, []const u8, transactions_mod.TxnStatus, u64) anyerror!void;
 
 pub const Config = struct {
     enabled: bool = false,
@@ -34,7 +35,7 @@ pub const Config = struct {
     max_records_per_run: usize = 16_384,
     clock: platform_clock.Clock = platform_clock.Clock.real(),
     resolver_ctx: ?*anyopaque = null,
-    resolve_participant_fn: ?resolution_mod.ResolveParticipantFn = null,
+    resolve_participant_fn: ?ResolveParticipantFn = null,
     /// Replicated DBs route all transaction metadata changes through their
     /// coordinator Raft group. Standalone stores keep the direct local path.
     replicated_metadata: bool = false,
