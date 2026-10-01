@@ -119,17 +119,30 @@ pub const default_max_tokens: i64 = 256;
 
 pub const OpenAIReasoningEffort = openapi.OpenAIReasoningEffort;
 
+pub const openai_default_url = "https://api.openai.com/v1";
+pub const ollama_default_url = "http://127.0.0.1:11434/v1";
+
 pub const OpenAIConfig = struct {
     model: []const u8,
-    url: []const u8 = "https://api.openai.com/v1",
+    url: []const u8 = openai_default_url,
     api_key: ?[]const u8 = null,
 };
+
+pub fn defaultUrl(provider: Provider) []const u8 {
+    return switch (provider) {
+        .openai => openai_default_url,
+        .openrouter => openrouter_default_url,
+        .ollama => ollama_default_url,
+        // Antfly's empty URL selects embedded inference when available.
+        .antfly, .mock, .gemini, .vertex => "",
+    };
+}
 
 pub const openrouter_default_url = "https://openrouter.ai/api/v1";
 
 pub const OllamaConfig = struct {
     model: []const u8,
-    url: []const u8 = "http://127.0.0.1:11434/v1",
+    url: []const u8 = ollama_default_url,
 };
 
 pub const AntflyConfig = struct {
@@ -337,10 +350,8 @@ pub fn configFromOpenApi(alloc: std.mem.Allocator, generated: openapi.GeneratorC
             try alloc.dupe(u8, url)
         else if (generated.api_url) |api_url|
             try alloc.dupe(u8, api_url)
-        else if (provider == .openrouter)
-            try alloc.dupe(u8, openrouter_default_url)
         else
-            "",
+            try alloc.dupe(u8, defaultUrl(provider)),
         .api_key = if (generated.api_key) |api_key| try alloc.dupe(u8, api_key) else null,
         .project_id = if (generated.project_id) |project_id| try alloc.dupe(u8, project_id) else null,
         .location = if (generated.location) |location| try alloc.dupe(u8, location) else null,
@@ -988,4 +999,39 @@ test "generator config rejects ambiguous and invalid OpenAI completion options" 
     try std.testing.expectError(error.UnexpectedToken, parseConfigFromSlice(alloc,
         \\{"provider":"openai","model":"m","url":"http://localhost","reasoning_effort":"bogus"}
     ));
+}
+
+test "generator provider URL defaults survive parsing and round trip" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { provider: Provider, url: []const u8 }{
+        .{ .provider = .openai, .url = "https://api.openai.com/v1" },
+        .{ .provider = .openrouter, .url = "https://openrouter.ai/api/v1" },
+        .{ .provider = .ollama, .url = "http://127.0.0.1:11434/v1" },
+        .{ .provider = .antfly, .url = "" },
+        .{ .provider = .gemini, .url = "" },
+        .{ .provider = .vertex, .url = "" },
+    };
+    for (cases) |case| {
+        const raw = try std.fmt.allocPrint(alloc, "{{\"provider\":\"{s}\",\"model\":\"test-model\"}}", .{@tagName(case.provider)});
+        defer alloc.free(raw);
+        var cfg = try parseConfigFromSlice(alloc, raw);
+        defer cfg.deinit(alloc);
+        try std.testing.expectEqualStrings(case.url, cfg.url);
+        const encoded = try stringifyConfigAlloc(alloc, cfg);
+        defer alloc.free(encoded);
+        var round_trip = try parseConfigFromSlice(alloc, encoded);
+        defer round_trip.deinit(alloc);
+        try std.testing.expectEqualStrings(cfg.url, round_trip.url);
+    }
+}
+
+test "generator explicit URL and api_url take precedence over defaults" {
+    const alloc = std.testing.allocator;
+    inline for (.{ "url", "api_url" }) |field| {
+        const raw = try std.fmt.allocPrint(alloc, "{{\"provider\":\"openai\",\"model\":\"test\",\"{s}\":\"http://custom/v1\"}}", .{field});
+        defer alloc.free(raw);
+        var cfg = try parseConfigFromSlice(alloc, raw);
+        defer cfg.deinit(alloc);
+        try std.testing.expectEqualStrings("http://custom/v1", cfg.url);
+    }
 }
