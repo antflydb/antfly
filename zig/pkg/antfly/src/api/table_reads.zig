@@ -29374,7 +29374,7 @@ fn implementationTests() type {
             try std.testing.expectEqualStrings("snapshot_idx", statuses.items[0].stats.indexes[0].name);
         }
 
-        test "provisioned table read source falls back from read_index to stale on not leader" {
+        test "provisioned table read source rejects uncertified point reads and permits explicit stale reads" {
             const alloc = std.testing.allocator;
             var tmp = std.testing.tmpDir(.{});
             defer tmp.cleanup();
@@ -29487,7 +29487,9 @@ fn implementationTests() type {
             var source = ProvisionedTableReadSource.init(path, FakeCatalog.iface(), barrier.barrier());
             source.prepare_for_read = reads.iface();
 
-            var lookup = (try source.source().lookup(alloc, "docs", "doc:a", .{}, .read_index)).?;
+            try std.testing.expectError(error.NotLeader, source.source().lookup(alloc, "docs", "doc:a", .{}, .read_index));
+            try std.testing.expectEqual(@as(usize, 0), reads.begins);
+            var lookup = (try source.source().lookup(alloc, "docs", "doc:a", .{}, .stale)).?;
             defer lookup.deinit(alloc);
             try std.testing.expectEqual(@as(u64, 4321), lookup.version);
             const LookupDocument = struct {

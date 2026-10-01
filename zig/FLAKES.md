@@ -9,7 +9,8 @@ consumer fixtures explicitly. Missing and duplicate identities still fail;
 unrelated owner fixtures remain covered by their normal targets. Real build
 graph regressions prove that an unrelated, deliberately uncompilable owner
 fixture is excluded and that omitting either a required owner or consumer fails.
-The storage shard manifest also now imports `hot_standby/primary_effect.zig`.
+The storage shard manifest also now imports `hot_standby/primary_effect.zig`
+and the Lite allocator/reclamation test sources added on main.
 
 The cancelled Zig job had already reported two deterministic API fixture
 failures. The authority fixture now exercises a partially configured dedicated
@@ -63,7 +64,10 @@ consumer tests; the two reported API fixtures passed; all 461 hot-standby tests
 and the storage ownership audit passed; 19 build-discovery/shard tests and both
 memory-admission tests passed. The reproduced merge stack regression passed
 200/200 fresh-process repetitions using `scripts/ci/zig_vopr_soak.py`'s bounded
-process runner. The mocked compilation rollover test now fixes its disk-free
+process runner. The UNIQUE/FK merge/split/restart history also completed 200
+passing repetitions; one interrupted process-runner invocation was rerun before
+continuing the loop. Both soaks used the pre-merge revision; the full data-runtime
+target also passed after merging main. The mocked compilation rollover test now fixes its disk-free
 observation so a nearly full developer disk cannot alter its expected build
 sequence.
 
