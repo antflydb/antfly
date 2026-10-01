@@ -354,11 +354,48 @@ pub const ValidationSession = struct {
         self.port.timingRecord("step_progress_ns", started_ns);
         if (current.state != .importing and current.state != .validating) return error.RestoreStagingScopeChanged;
         started_ns = self.port.timingStart();
-        const done = try validateSlice(alloc, &self.catalog, self.bound.reader, self.bound.writer, cursor);
+        const done = try validateWindow(alloc, &self.catalog, self.bound.reader, self.bound.writer, cursor, request);
         self.port.timingRecord("step_validate_ns", started_ns);
         return done;
     }
 };
+
+/// Owner-local activation receipts are authoritative. Advance a bounded
+/// window within one phase; the cohort-wide UNIQUE/FK barrier stays intact.
+fn validateWindow(alloc: std.mem.Allocator, catalog: *Catalog, reader: reads.TableReadSource, writer: writes.TableWriteSource, cursor: *ValidationCursor, request: @import("operation.zig").RequestContext) !bool {
+    const capability = request.fanout_io orelse request.deadline_io;
+    if (capability == null or cursor.phase == .complete or cursor.owner_index >= catalog.snapshot.ranges.len)
+        return validateSlice(alloc, catalog, reader, writer, cursor);
+    const Slot = struct {
+        arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
+        cursor: ValidationCursor,
+        failure: ?anyerror = null,
+        fn run(slot: *@This(), c: *Catalog, r: reads.TableReadSource, w: writes.TableWriteSource) void {
+            _ = validateSlice(slot.arena.allocator(), c, r, w, &slot.cursor) catch |err| {
+                slot.failure = err;
+                return;
+            };
+        }
+    };
+    var slots: [4]Slot = undefined;
+    const count = @min(slots.len, catalog.snapshot.ranges.len - cursor.owner_index);
+    for (slots[0..count], 0..) |*slot, offset| slot.* = .{ .cursor = .{ .phase = cursor.phase, .owner_index = cursor.owner_index + @as(u32, @intCast(offset)) } };
+    defer for (slots[0..count]) |*slot| slot.arena.deinit();
+    var receiver = try capability.?.receive();
+    const io = receiver.io();
+    var tasks: std.Io.Group = .init;
+    for (slots[0..count]) |*slot| tasks.async(io, Slot.run, .{ slot, catalog, reader, writer });
+    tasks.await(io) catch return error.Cancelled;
+    try request.ensureActive();
+    for (slots[0..count]) |slot| if (slot.failure) |err| return err;
+    // A pending owner blocks the scheduling prefix, but not its independent
+    // siblings. A retry observes their existing durable receipts.
+    for (slots[0..count]) |slot| {
+        if (slot.cursor.owner_index != cursor.owner_index + 1) break;
+        cursor.owner_index += 1;
+    }
+    return false;
+}
 
 /// One bounded native activation page, through the same typed planner and 2PC
 /// used for ordinary writes. The caller persists this small scheduling cursor
@@ -421,7 +458,9 @@ test "distributed txn staged mixed restore rebuilds fresh FK claims with durable
     const child_schema =
         \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"parent_fk","child_columns":["id"],"parent_table":"parent","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
     ;
-    for ([_]bool{ false, true }, 0..) |invalid, trial| {
+    for (0..4) |trial| {
+        const invalid = trial % 2 != 0;
+        const concurrent = trial >= 2;
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const owned = arena.allocator();
@@ -481,7 +520,7 @@ test "distributed txn staged mixed restore rebuilds fresh FK claims with durable
         const Fixture = struct {
             dbs: [3]*db_mod.DB,
             catalog: *Catalog,
-            sequence: u8 = 0,
+            sequence: std.atomic.Value(u8) = .init(0),
             active: bool = true,
             fn verify(ptr: *anyopaque, _: [16]u8, _: [32]u8) !bool {
                 return @as(*@This(), @ptrCast(@alignCast(ptr))).active;
@@ -530,8 +569,8 @@ test "distributed txn staged mixed restore rebuilds fresh FK claims with durable
             fn commit(ptr: *anyopaque, allocator: std.mem.Allocator, requests: []const contract.TableCommitRequest, sync: types.SyncLevel, cancellation: types.CancellationToken) !?contract.CommitOutcome {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 try cancellation.check();
-                self.sequence += 1;
-                return try distributed.executeMultiTableCommit(allocator, self.catalog.source(), .{ .ptr = self, .vtable = &.{ .begin_group = begin, .prepare_group = prepare, .resolve_group = resolve, .status_group = status } }, @splat(self.sequence), @as(u64, self.sequence) * 1000, @as(u64, self.sequence) * 1000 + 1, requests, sync, null);
+                const sequence = self.sequence.fetchAdd(1, .monotonic) + 1;
+                return try distributed.executeMultiTableCommit(allocator, self.catalog.source(), .{ .ptr = self, .vtable = &.{ .begin_group = begin, .prepare_group = prepare, .resolve_group = resolve, .status_group = status } }, @splat(sequence), @as(u64, sequence) * 1000, @as(u64, sequence) * 1000 + 1, requests, sync, null);
             }
         };
         var private_catalog: Catalog = undefined;
@@ -539,9 +578,13 @@ test "distributed txn staged mixed restore rebuilds fresh FK claims with durable
         private_catalog = try Catalog.init(alloc, .{ .status = .{ .metadata_group_id = 1, .metadata_incarnation = @splat(1), .metrics = .{} }, .tables = &table_records, .ranges = &range_records, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} }, &scopes, .{ .ptr = &fixture, .verify = Fixture.verify });
         const reader: reads.TableReadSource = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = Fixture.scan, .query = Fixture.query } };
         const writer: writes.TableWriteSource = .{ .ptr = &fixture, .vtable = &.{ .batch = Fixture.batch, .commit_batch_with_cancellation = Fixture.commit } };
+        var threaded: std.Io.Threaded = .init(alloc, .{ .async_limit = .limited(4) });
+        defer threaded.deinit();
+        const io = threaded.io();
+        const control: @import("operation.zig").RequestContext = if (concurrent) .{ .fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io) } else .{};
         var validation: ValidationCursor = .{};
         for (0..80) |_| {
-            const complete = validateSlice(alloc, &private_catalog, reader, writer, &validation) catch |err| {
+            const complete = validateWindow(alloc, &private_catalog, reader, writer, &validation, control) catch |err| {
                 if (invalid and err == error.ConstraintActivationFailed) break;
                 return err;
             };

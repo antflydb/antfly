@@ -211,16 +211,19 @@ fn admissionFactsJson(db: *DB, alloc: Allocator, request: wire.Request, cancella
     try cancellation.check();
     var manifest_arena = std.heap.ArenaAllocator.init(alloc);
     defer manifest_arena.deinit();
+    var generation_handoff: ?@import("empty_generation_handoff.zig").Summary = null;
     const source_schemas = if (request.scope.fence.role == .rewrite_source and request.operation.admission == .donor) manifest: {
         // Probe transactions deliberately lack cursors. A bounded read snapshot
         // under the same apply lease observes immutable historical mappings.
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
+        generation_handoff = try @import("empty_generation_handoff.zig").summaryAlloc(manifest_arena.allocator(), &read, db.core.identity_namespace);
         break :manifest try @import("relational_rewrite_manifest.zig").read(manifest_arena.allocator(), &read, cancellation);
     } else &.{};
     return std.json.Stringify.valueAlloc(alloc, wire.AdmissionFacts{
         .authority = request.scope.authority,
         .source_schemas = source_schemas,
+        .generation_handoff = generation_handoff,
         .namespace = db.core.identity_namespace,
         .eligible = eligible,
         .catalog_digest = digest,

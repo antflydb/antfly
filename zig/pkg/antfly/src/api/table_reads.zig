@@ -3209,6 +3209,13 @@ fn queryRoutingDeadline(catalog: table_catalog.CatalogSource, req: db_mod.types.
     return catalog.deadlineFrom(.{ .deadline_ns = req.execution_deadline_ns });
 }
 
+// A missing route is a metadata observation, not an owner absence proof.
+// Public catalog binding resolves truly unknown tables before this boundary.
+fn lookupWithoutRoute(consistency: raft_mod.ReadConsistency) !?LookupResponse {
+    if (consistency == .read_index) return error.StorageReadTemporarilyUnavailable;
+    return null;
+}
+
 fn lookupRoutingDeadline(catalog: table_catalog.CatalogSource, opts: db_mod.types.LookupOptions) ?u64 {
     return catalog.deadlineFrom(.{ .deadline_ns = opts.execution_deadline_ns, .io = opts.execution_io });
 }
@@ -4601,7 +4608,7 @@ pub const ProvisionedTableReadSource = struct {
             // catalog as the distributed adapter. Admit only its exact owner
             // scope, never an ordinary named-table open.
             const routed = try table_catalog.routedGroupSnapshotUntil(alloc, self.catalog, table_name, key, lookupRoutingDeadline(self.catalog, opts));
-            const fence = routed.fence() orelse return null;
+            const fence = routed.fence() orelse return lookupWithoutRoute(consistency);
             // Routing views forward this optional capability even for normal
             // published tables. Only a returned scope authorizes staging;
             // restore catalogs reject unknown owners instead of returning null.
@@ -4622,7 +4629,7 @@ pub const ProvisionedTableReadSource = struct {
             var prepared = try self.prepareRoutedKeyRead(alloc, table_name, key, .{ .lookup = .{ .key = key, .opts = opts } }, consistency, .general);
             defer prepared.deinit();
             try checkLookupOptionsActive(opts);
-            const route = prepared.route orelse return null;
+            const route = prepared.route orelse return lookupWithoutRoute(consistency);
             const group_id = route.group_id;
             const result = if (comptime control_only_storage_sources)
                 self.groupLocalSourceWithFence(prepared.fence(.{ .deadline_ns = opts.execution_deadline_ns, .io = opts.execution_io }, opts.cancellation).?).lookupGroupLocal(alloc, group_id, table_name, key, opts, .stale)
@@ -6918,7 +6925,7 @@ pub const HostedProvisionedTableReadSource = struct {
             key,
             lookupRoutingDeadline(hosted.catalog, opts),
         );
-        const fence = routed.fence() orelse return null;
+        const fence = routed.fence() orelse return lookupWithoutRoute(consistency);
         var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
         var pinned = routePinnedCatalogForFence(hosted.catalog, table_name, fence, &route_storage);
         var routed_source = hosted.*;
@@ -7101,6 +7108,11 @@ pub const HostedProvisionedTableReadSource = struct {
                 else => return err,
             }
         }
+        // Exhausting replicas is not a ReadIndex absence proof. An unmarked
+        // HTTP miss or a failed endpoint can occur while a published owner is
+        // still converging. Keep that uncertainty on the availability path so
+        // callers re-resolve their fenced route within the existing budget.
+        if (consistency == .read_index) return error.StorageReadTemporarilyUnavailable;
         return null;
     }
 
@@ -17216,6 +17228,7 @@ fn consumerTests() type {
                 barrier_calls: usize = 0,
                 activity_active: usize = 0,
                 route_unavailable: bool = false,
+                catalog_route_missing: bool = false,
                 fn readIndexBeforeAdmission(ptr: *anyopaque, _: u64, _: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     // Raft apply needs exclusive admission. A second barrier
@@ -17259,6 +17272,9 @@ fn consumerTests() type {
                     if (!self.remote) return error.UnexpectedReplicaRead;
                     return try alloc.dupe(u8, "http://worker");
                 }
+                fn groupNodeIds(_: *anyopaque, alloc: std.mem.Allocator, _: u64, _: table_router.RouteBudget) ![]u64 {
+                    return try alloc.dupe(u64, &.{ 2, 3 });
+                }
                 fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
                     return error.UnexpectedPlacementRefresh;
                 }
@@ -17277,7 +17293,9 @@ fn consumerTests() type {
                     headers[1] = .{ .name = try alloc.dupe(u8, metadata_api.read_index_absence_header), .value = try alloc.dupe(u8, self.absence) };
                     return .{ .status = self.status, .headers = headers, .body = try alloc.dupe(u8, "not found") };
                 }
-                fn resolve(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: table_catalog.RouteQuery, _: ?u64) !table_catalog.RouteResult {
+                fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: table_catalog.RouteQuery, _: ?u64) !table_catalog.RouteResult {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (self.catalog_route_missing) return .not_found;
                     const groups = try alloc.alloc(table_catalog.CatalogGroupRoute, 1);
                     groups[0] = .{ .group_id = 7, .range_id = 7, .identity_namespace = .{ .table_id = 1, .shard_id = 7, .range_id = 7 } };
                     return .{ .found = .{ .metadata_group_id = 1, .metadata_incarnation = null, .catalog_revision = 1, .table_id = 1, .topology_epoch = 1, .groups = groups } };
@@ -17304,6 +17322,12 @@ fn consumerTests() type {
             _ = hosted.withLocalReadSource(.{ .ptr = &fixture, .strict_read_index_absence = true, .vtable = &.{ .lookup = unsupportedPhysicalTopLevelLookup, .scan = unsupportedPhysicalTopLevelScan, .query = unsupportedPhysicalTopLevelQuery, .lookup_group_local_routed = Fixture.lookup } });
             for (0..36) |_| try std.testing.expect((try hosted.source().lookup(std.testing.allocator, "rows", "absent", .{}, .read_index)) == null);
             try std.testing.expectEqual(@as(usize, 36), fixture.reads);
+            // A catalog miss does not certify absence of a row in an owner.
+            fixture.catalog_route_missing = true;
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, hosted.source().lookup(std.testing.allocator, "rows", "absent", .{}, .read_index));
+            try std.testing.expect((try hosted.source().lookup(std.testing.allocator, "rows", "absent", .{}, .stale)) == null);
+            try std.testing.expectEqual(@as(usize, 36), fixture.reads);
+            fixture.catalog_route_missing = false;
             var unavailable_router = router;
             var unavailable_vtable = router.vtable.*;
             unavailable_vtable.resolve_group_routes = Fixture.resolveRoutes;
@@ -17319,6 +17343,9 @@ fn consumerTests() type {
             provisioned_view.distributed_router = router;
             provisioned_view.distributed_executor = hosted.executor;
             provisioned_view.local_read_source = hosted.local_read_source;
+            fixture.catalog_route_missing = true;
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, provisioned_view.source().lookup(std.testing.allocator, "rows", "absent", .{}, .read_index));
+            fixture.catalog_route_missing = false;
             try std.testing.expect((try provisioned_view.source().lookup(std.testing.allocator, "rows", "absent", .{}, .read_index)) == null);
             // No absence is inferred from failed barriers; stale reads retain
             // the existing fallback behavior instead of claiming authority.
@@ -17342,6 +17369,28 @@ fn consumerTests() type {
             fixture.absence = "1";
             fixture.status = 500;
             try std.testing.expectError(error.UnexpectedPlacementRefresh, hosted.source().lookup(std.testing.allocator, "rows", "absent", .{}, .read_index));
+
+            // A bounded placement list can be exhausted successfully while
+            // every endpoint returns an unproved miss or server failure. That
+            // must not turn into a public 404 after publication.
+            var bounded_vtable = router.vtable.*;
+            bounded_vtable.group_node_ids = Fixture.groupNodeIds;
+            var bounded_router = router;
+            bounded_router.vtable = &bounded_vtable;
+            hosted.router = bounded_router;
+            fixture.absence = "";
+            inline for (.{ @as(u16, 404), @as(u16, 500) }) |status| {
+                fixture.status = status;
+                fixture.reads = 0;
+                try std.testing.expectError(error.StorageReadTemporarilyUnavailable, hosted.source().lookup(std.testing.allocator, "rows", "absent", .{}, .read_index));
+                try std.testing.expectEqual(@as(usize, 2), fixture.reads);
+            }
+            fixture.status = 404;
+            fixture.absence = "1";
+            fixture.reads = 0;
+            try std.testing.expect((try hosted.source().lookup(std.testing.allocator, "rows", "absent", .{}, .read_index)) == null);
+            try std.testing.expectEqual(@as(usize, 1), fixture.reads);
+            hosted.router = router;
 
             // A raw client must not accept even valid headers for a stale
             // request, or an absence marker without its route ACK.

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// End-to-end DeBERTa-v3 LoRA training integration test (level-3 pipeline).
+// DeBERTa-v3 LoRA training pipeline integration test (level-3 pipeline).
 //
 // Validates the full pipeline:
 //   graph construction -> LoRA injection -> autodiff -> execution -> loss -> optimizer step
@@ -303,7 +303,7 @@ fn populateDebertaWeights(allocator: std.mem.Allocator, store: *WeightStore, rng
 
 // ── The test ───────────────────────────────────────────────────────────
 
-test "DeBERTa e2e: loss decreases over training steps" {
+test "DeBERTa integration: loss decreases over training steps" {
     const allocator = std.testing.allocator;
 
     // 1. Populate weight store with random DeBERTa parameters.

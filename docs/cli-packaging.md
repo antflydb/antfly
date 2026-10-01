@@ -152,6 +152,17 @@ a journaled pending identity and only that exact tag, source commit,
 release-ledger digest, and container digest may resume it. A published GitHub
 release is never changed back to draft.
 
+The cancelled v0.2.4 stable promotion is a one-time exception because its
+reservation succeeded before any publication job ran. The manually dispatched
+`Abort unpublished v0.2.4 promotion` workflow checks the cancelled run, draft
+GitHub release, absent npm and PyPI versions, and unchanged stable projections.
+It also requires every other release-promotion run to be complete.
+Its apply job repeats those checks under the release storage lock after
+`release-promotion` environment approval, then conditionally clears only the
+exact v0.2.4 reservation. The journal retains an abort record that prevents
+v0.2.4 from being reserved again. Never use this workflow for a partially
+published release.
+
 Nightly recovery uses the general channel event because nightlies deliberately
 have no GitHub Release. Supply its exact source commit and ledger digest; the
 controller restores the immutable versioned payload from R2 before running the

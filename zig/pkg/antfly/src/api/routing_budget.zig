@@ -23,6 +23,7 @@ pub const runtime_io_abi = @import("antfly_runtime_abi").io_abi;
 pub const RoutingBudget = struct {
     deadline_ns: ?u64 = null,
     io: ?runtime_io_abi.Borrow = null,
+    cancellation: @import("antfly_cancellation").CancellationToken = .none,
 
     const checkpoint_stride: usize = 64;
 
@@ -66,6 +67,7 @@ pub const RoutingBudget = struct {
     }
 
     pub fn checkpoint(self: RoutingBudget) !void {
+        try self.cancellation.check();
         if (self.deadline_ns) |deadline| {
             if (self.nowNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
         }

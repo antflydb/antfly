@@ -30,4 +30,5 @@ test {
 
 pub const antfly_sources = struct {
     pub const physical_db = @import("storage/db/db.zig");
+    pub const selected_db = @import("storage/db/mod.zig");
 };

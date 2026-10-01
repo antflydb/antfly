@@ -1658,12 +1658,12 @@ Each validates the full level-3 pipeline: graph → LoRA injection → autodiff 
 
 | Test | Architecture | Params | Head |
 |------|-------------|--------|------|
-| `test_bert_e2e.zig` | BERT (2L, 4H, H=64) | 37 | MSE |
-| `test_qwen2_e2e.zig` | Qwen2 (2L, 4H/2KV, H=32) | 26 | pooled MSE |
-| `test_deberta_e2e.zig` | DeBERTa-v3 (2L, 4H, H=64) | 38 | MSE |
-| `test_gliner2_e2e.zig` | DeBERTa + NER head (5 classes) | 40 | token CE |
-| `test_fused_chunker_e2e.zig` | ModernBERT + boundary MLP | 39 | 2-class CE |
-| `test_layoutlmv3_e2e.zig` | LayoutLMv3 + token cls (5 classes) | 43 | token CE |
+| `bert_integration_test.zig` | BERT (2L, 4H, H=64) | 37 | MSE |
+| `qwen2_integration_test.zig` | Qwen2 (2L, 4H/2KV, H=32) | 26 | pooled MSE |
+| `deberta_integration_test.zig` | DeBERTa-v3 (2L, 4H, H=64) | 38 | MSE |
+| `gliner2_integration_test.zig` | DeBERTa + NER head (5 classes) | 40 | token CE |
+| `fused_chunker_integration_test.zig` | ModernBERT + boundary MLP | 39 | 2-class CE |
+| `layoutlmv3_integration_test.zig` | LayoutLMv3 + token cls (5 classes) | 43 | token CE |
 
 ### Real-World Validation Plan
 

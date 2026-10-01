@@ -1455,7 +1455,7 @@ fn startMetadataAdminServers(
     for (0..N) |i| base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
 }
 
-test "public api multi-node e2e routes CRUD from a non-host node" {
+test "public api multi-node integration routes CRUD from a non-host node" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1709,7 +1709,7 @@ test "public api multi-node e2e routes CRUD from a non-host node" {
     try std.testing.expect(parsed_stable_table_detail.value.indexes.map.get("embed_idx") == null);
 }
 
-test "public api multi-node e2e routes transaction commit from a non-host node" {
+test "public api multi-node integration routes transaction commit from a non-host node" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1910,7 +1910,7 @@ test "public api multi-node e2e routes transaction commit from a non-host node" 
     try std.testing.expectEqual(@as(u64, group_id), participant.group_id.?);
 }
 
-test "public api multi-node e2e commits cross-table transactions atomically" {
+test "public api multi-node integration commits cross-table transactions atomically" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2165,7 +2165,7 @@ test "public api multi-node e2e commits cross-table transactions atomically" {
     try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchLookup(client_base, "users", "user:phantom", null));
 }
 
-test "public api multi-node e2e supports long-lived transaction sessions from a non-host node" {
+test "public api multi-node integration supports long-lived transaction sessions from a non-host node" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2499,7 +2499,7 @@ test "public api multi-node e2e supports long-lived transaction sessions from a 
     try std.testing.expectEqual(@as(u16, 404), commit_after_abort.status);
 }
 
-test "public api multi-node e2e supports cross-table transaction sessions" {
+test "public api multi-node integration supports cross-table transaction sessions" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2735,7 +2735,7 @@ test "public api multi-node e2e supports cross-table transaction sessions" {
     try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchLookup(followup_base, "orders", "order:old", null));
 }
 
-test "public api multi-node e2e reloads durable cross-table transaction sessions after coordinator restart" {
+test "public api multi-node integration reloads durable cross-table transaction sessions after coordinator restart" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -3004,7 +3004,7 @@ test "public api multi-node e2e reloads durable cross-table transaction sessions
     try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchLookup(followup_base, "orders", "order:old", null));
 }
 
-test "public api multi-node e2e adopts durable cross-table transaction sessions after coordinator loss" {
+test "public api multi-node integration adopts durable cross-table transaction sessions after coordinator loss" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -3274,7 +3274,7 @@ test "public api multi-node e2e adopts durable cross-table transaction sessions 
     try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchLookup(followup_base, "orders", "order:old", null));
 }
 
-test "public api multi-node e2e reloads durable transaction sessions after coordinator restart" {
+test "public api multi-node integration reloads durable transaction sessions after coordinator restart" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -3501,7 +3501,7 @@ test "public api multi-node e2e reloads durable transaction sessions after coord
     try std.testing.expectEqualStrings("alpha durable session committed", parsed_updated.value.title);
 }
 
-test "public api multi-node e2e adopts durable transaction sessions after coordinator loss" {
+test "public api multi-node integration adopts durable transaction sessions after coordinator loss" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -3703,7 +3703,7 @@ test "public api multi-node e2e adopts durable transaction sessions after coordi
     try std.testing.expectEqualStrings("alpha adopted", parsed_updated.value.title);
 }
 
-test "public api multi-node e2e retries transaction commit once after topology churn" {
+test "public api multi-node integration retries transaction commit once after topology churn" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -3948,7 +3948,7 @@ test "public api multi-node e2e retries transaction commit once after topology c
     try std.testing.expectEqualStrings("zeta retried", parsed_updated_right.value.title);
 }
 
-test "public api multi-node e2e fails transaction commit after repeated topology churn beyond retry limit" {
+test "public api multi-node integration fails transaction commit after repeated topology churn beyond retry limit" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -4184,7 +4184,7 @@ test "public api multi-node e2e fails transaction commit after repeated topology
     try std.testing.expectEqual(@as(u32, 2), churn_executor.trigger_count);
 }
 
-test "public api multi-node e2e retries transaction session commit once after topology churn" {
+test "public api multi-node integration retries transaction session commit once after topology churn" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -4470,7 +4470,7 @@ test "public api multi-node e2e retries transaction session commit once after to
     try std.testing.expectEqualStrings("zeta session retried", parsed_updated_right.value.title);
 }
 
-test "public api multi-node e2e retries cross-table transaction session commit once after topology churn" {
+test "public api multi-node integration retries cross-table transaction session commit once after topology churn" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -4805,7 +4805,7 @@ test "public api multi-node e2e retries cross-table transaction session commit o
     try std.testing.expectEqualStrings("retried", parsed_updated_order.value.item);
 }
 
-test "public api multi-node e2e fails transaction session commit after repeated topology churn beyond retry limit" {
+test "public api multi-node integration fails transaction session commit after repeated topology churn beyond retry limit" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5095,7 +5095,7 @@ test "public api multi-node e2e fails transaction session commit after repeated 
     try std.testing.expectEqual(@as(u16, 404), session_info_after_abort.status);
 }
 
-test "public api multi-node e2e recovers unresolved distributed transaction after participant leader restart" {
+test "public api multi-node integration recovers unresolved distributed transaction after participant leader restart" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5354,7 +5354,7 @@ test "public api multi-node e2e recovers unresolved distributed transaction afte
     try expectTxnCleanedOnGroup(std.testing.allocator, roots[right_restart_index], right_group, recovery_txn_id);
 }
 
-test "public api multi-node e2e routes semantic and sparse queries from a non-host node" {
+test "public api multi-node integration routes semantic and sparse queries from a non-host node" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5713,7 +5713,7 @@ test "public api multi-node e2e routes semantic and sparse queries from a non-ho
     try std.testing.expectEqualStrings("doc:a", parsed_template_chunked.value.responses.?[0].hits.?.hits.?[0]._id);
 }
 
-test "public api multi-node e2e routes graph queries from a non-host node" {
+test "public api multi-node integration routes graph queries from a non-host node" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5908,7 +5908,7 @@ test "public api multi-node e2e routes graph queries from a non-host node" {
     try std.testing.expectEqualStrings("doc:b", neighbors.nodes[0].key);
 }
 
-test "public api multi-node e2e routes split flow from a non-host node" {
+test "public api multi-node integration routes split flow from a non-host node" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -6347,7 +6347,7 @@ test "public api multi-node e2e routes split flow from a non-host node" {
     try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchLookup(client_base, "docs", "doc:z", null));
 }
 
-test "public api multi-node e2e routes merge flow from a non-host node" {
+test "public api multi-node integration routes merge flow from a non-host node" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -6660,7 +6660,7 @@ test "public api multi-node e2e routes merge flow from a non-host node" {
     try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchLookup(client_base, "docs", "doc:z", null));
 }
 
-test "public api multi-node e2e retries distributed graph after merge churn" {
+test "public api multi-node integration retries distributed graph after merge churn" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -6938,7 +6938,7 @@ test "public api multi-node e2e retries distributed graph after merge churn" {
     try std.testing.expectEqual(@as(u32, 1), churn_executor.trigger_count);
 }
 
-test "public api multi-node e2e fails distributed graph after repeated churn beyond retry limit" {
+test "public api multi-node integration fails distributed graph after repeated churn beyond retry limit" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -7205,7 +7205,7 @@ test "public api multi-node e2e fails distributed graph after repeated churn bey
     try std.testing.expectEqual(@as(u32, 2), churn_executor.trigger_count);
 }
 
-test "public api multi-node e2e routes semantic and sparse queries across split ranges from a non-host node" {
+test "public api multi-node integration routes semantic and sparse queries across split ranges from a non-host node" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -7544,7 +7544,7 @@ test "public api multi-node e2e routes semantic and sparse queries across split 
     try expectQueryProfileSummary(std.heap.page_allocator, template_result.profile, 2, true);
 }
 
-test "public api multi-node e2e routes semantic and sparse queries after merge from a non-host node" {
+test "public api multi-node integration routes semantic and sparse queries after merge from a non-host node" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 

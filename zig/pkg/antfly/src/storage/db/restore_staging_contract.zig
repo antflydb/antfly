@@ -85,7 +85,7 @@ pub const OwnerBootstrap = struct {
         // Empty-generation targets cannot be opened without the immutable
         // source authority they must install before publication. Catch a
         // missing cold-descriptor projection before it reaches Raft apply.
-        if (self.scope.empty_generation != (self.empty_generation_handoff != null))
+        if ((self.scope.empty_generation or self.scope.rewrite != null) and self.empty_generation_handoff == null)
             return error.InvalidRestoreStagingCommand;
         if (self.table_name.len == 0 or (self.table_name.len > 255 and !(try @import("../../system_catalog/domain.zig").isRestoreTarget(self.table_name))) or std.mem.indexOfAny(u8, self.table_name, "/\\\x00") != null or std.mem.eql(u8, self.table_name, ".") or std.mem.eql(u8, self.table_name, "..") or
             self.schema_json.len +| self.read_schema_json.len > 4 * 1024 * 1024 or self.indexes_json.len == 0 or self.indexes_json.len > 4 * 1024 * 1024 or
@@ -104,7 +104,7 @@ pub const OwnerBootstrap = struct {
                 return error.InvalidRestoreStagingCommand;
         }
         if (self.empty_generation_handoff) |binding| {
-            if (!self.scope.empty_generation or self.source_generation_proof_digest != null or
+            if (!(self.scope.empty_generation or self.scope.rewrite != null) or self.source_generation_proof_digest != null or
                 self.generation_admission != null or std.mem.allEqual(u8, &binding.source_summary_digest, 0) or
                 std.mem.allEqual(u8, &binding.retired_digest, 0) or
                 std.mem.allEqual(u8, &binding.expected_install_receipt_digest, 0))

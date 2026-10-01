@@ -14,7 +14,7 @@
 
 //! Helper for fetching the openjpeg-data conformance fixtures used by the
 //! JPEG 2000 decode validation harness. Mirrors the fetch pattern in
-//! `lib/image/src/image_jpeg_seed_corpora_e2e.zig` but targeted at the
+//! `lib/image/src/image_jpeg_seed_corpora_runner.zig` but targeted at the
 //! Part 1 conformance vectors (`input/conformance/`).
 //!
 //! The repository is cached under `/tmp/openjpeg-data` and is NOT committed

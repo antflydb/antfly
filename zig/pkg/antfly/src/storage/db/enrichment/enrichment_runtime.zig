@@ -7020,6 +7020,15 @@ fn runForegroundCatchUpPassOwned(
         return;
     }
 
+    // A replay pass can exceed the lease TTL even when each provider call is
+    // short: text embeddings, rate-limit waits and publication across many
+    // documents all share this tenure. Keep the exact admitted epoch alive
+    // for the entire pass, including draining already-dispatched lanes.
+    // Per-write durable fences still reject results after a real takeover.
+    var replay_lease_guard = RuntimeLeaseHeartbeatGuard.init(runtime);
+    try replay_lease_guard.start();
+    defer replay_lease_guard.stop();
+
     try scavengeSharedPdfConsumerAttempts(runtime);
     const pending = try enrichment_worker.collectPendingDocumentGroups(runtime.alloc, runtime.replay_source, runtime.applied_sequence);
     defer enrichment_worker.freePendingDocumentGroups(runtime.alloc, pending);
@@ -7044,6 +7053,7 @@ fn runForegroundCatchUpPassOwned(
         return err;
     };
     try drain_result;
+    try replay_lease_guard.check();
     if (pending.len == 0) {
         max_seen = target_sequence;
     }
@@ -30209,9 +30219,10 @@ const RuntimeLeaseHeartbeatGuard = struct {
     fn run(self: *@This()) void {
         const io = self.runtime.io_impl.?.io();
         const interval_ms = @max(@as(u64, 1), self.ttl_ms / 4);
+        var wait_ms = interval_ms;
         while (!self.done.isSet()) {
             self.done.waitTimeout(io, .{ .duration = .{
-                .raw = Io.Duration.fromMilliseconds(@intCast(interval_ms)),
+                .raw = Io.Duration.fromMilliseconds(@intCast(wait_ms)),
                 .clock = .awake,
             } }) catch |err| switch (err) {
                 error.Timeout => {},
@@ -30228,7 +30239,12 @@ const RuntimeLeaseHeartbeatGuard = struct {
                 now_ms,
                 self.ttl_ms,
             ) catch |err| switch (err) {
-                error.WriterLocked => continue,
+                error.WriterLocked => {
+                    // Contention consumes renewal slack. Retry promptly
+                    // rather than sleeping another quarter of the lease TTL.
+                    wait_ms = @min(interval_ms, 100);
+                    continue;
+                },
                 else => {
                     self.renewal_failed.store(true, .release);
                     return;
@@ -30241,15 +30257,13 @@ const RuntimeLeaseHeartbeatGuard = struct {
             // Publish only the cheap scalar expiry update under the runtime
             // mutex. Parsing/stringification happened on the guard allocator.
             self.runtime.mutex.lockUncancelable(io);
-            if (!self.runtime.ownership.has_lease or
-                self.runtime.ownership.lease_epoch != self.epoch)
-            {
+            if (!self.runtime.ownership.noteFencedRenewal(self.epoch, now_ms)) {
                 self.runtime.mutex.unlock(io);
                 self.renewal_failed.store(true, .release);
                 return;
             }
-            self.runtime.ownership.lease_expires_at_ms = std.math.add(u64, now_ms, self.ttl_ms) catch std.math.maxInt(u64);
             self.runtime.mutex.unlock(io);
+            wait_ms = interval_ms;
         }
     }
 };

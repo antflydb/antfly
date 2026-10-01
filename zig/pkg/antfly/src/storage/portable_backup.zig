@@ -890,7 +890,11 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
     }
     const admitted_prefix = @import("db/relational_integrity_generation_admission.zig").prefix;
     if (try retired_cursor.seekAtOrAfter(admitted_prefix)) |entry| {
-        if (std.mem.startsWith(u8, entry.key, admitted_prefix) and cohort == null)
+        // A certified source-copy stream is a private logical decoder, not
+        // an independently restorable database. It carries the pinned row
+        // cut and excludes physical acceptance authority; the destination
+        // cohort reconstructs that authority at its activation barrier.
+        if (std.mem.startsWith(u8, entry.key, admitted_prefix) and cohort == null and source_copy == null)
             return error.CoordinatedConstraintPortableBackupUnsupported;
     }
     const topology_fence = scan.get(@import("db/relational_integrity_topology.zig").fence_key) catch |err| switch (err) {

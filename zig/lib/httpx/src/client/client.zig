@@ -4737,6 +4737,7 @@ const python_redirect_writer_server_script =
     "    allow_reuse_address = True\n" ++
     "\n" ++
     "with ReuseTCPServer(('127.0.0.1', port), Handler) as httpd:\n" ++
+    "    print(httpd.server_address[1], flush=True)\n" ++
     "    httpd.serve_forever()\n";
 
 const python_tls_fixed_keepalive_server_script =
@@ -5552,24 +5553,19 @@ test "requestToWriter follows redirects without streaming intermediate redirect 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    const port = try reserveEphemeralPort(io);
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_redirect_writer_server_script });
-
-    var port_buf: [16]u8 = undefined;
-    const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
 
     var child = std.process.spawn(io, .{
         .argv = &.{
             "python3",
             "server.py",
-            port_arg,
+            "0",
         },
         .cwd = .{ .dir = tmp.dir },
         .stdin = .ignore,
-        .stdout = .inherit,
+        .stdout = .pipe,
         .stderr = .inherit,
     }) catch |err| switch (err) {
         error.FileNotFound => return,
@@ -5577,7 +5573,12 @@ test "requestToWriter follows redirects without streaming intermediate redirect 
     };
     defer child.kill(io);
 
-    io.sleep(Io.Duration.fromMilliseconds(500), .awake) catch {};
+    // The child owns the listening port and signals readiness after bind.
+    // Reserving/releasing a port and sleeping cannot establish either fact.
+    var stdout_buffer: [64]u8 = undefined;
+    var stdout_reader = child.stdout.?.readerStreaming(io, &stdout_buffer);
+    const port_line = (try stdout_reader.interface.takeDelimiter('\n')) orelse return error.TestServerExited;
+    const port = try std.fmt.parseUnsigned(u16, port_line, 10);
 
     const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/redirect", .{port});
     defer allocator.free(url);

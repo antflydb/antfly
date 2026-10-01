@@ -134,36 +134,14 @@ pub fn validate(alloc: std.mem.Allocator, public_tables: []const tables.TableRec
                 if (!tables.rangeRecordsEqual(expected_range, actual_range)) return error.InvalidRestoreStaging;
                 const inserted = try seen_groups.getOrPut(alloc, range.group_id);
                 if (inserted.found_existing) return error.InvalidRestoreStaging;
-                const scope = try staging.ownerScope(alloc, parsed.value.plan, parsed.value.plan_digest, target, range);
-                try scope.validate();
-                // The validated plan aligns each old/new range and its
-                // handoff by ordinal. Avoid rescanning every target for each
-                // projected owner on the hot metadata snapshot path.
-                const handoff = if (scope.empty_generation) handoff: {
-                    if (range_index >= target.generation_handoffs.len) return error.InvalidRestoreStaging;
-                    const pinned = target.generation_handoffs[range_index];
-                    if (pinned.target_group_id != range.group_id) return error.InvalidRestoreStaging;
-                    const command: @import("../storage/db/relational_integrity_topology_contract.zig").GenerationHandoffInstall = .{
-                        .scope = scope.digest(),
-                        .source_summary_digest = pinned.admissions_digest,
-                        .retired_digest = pinned.retired_digest,
-                        .retired_count = pinned.retired_count,
-                        .mappings = pinned.mappings,
-                    };
-                    break :handoff @import("../storage/db/restore_staging_contract.zig").EmptyGenerationHandoffExpectation{
-                        .source_summary_digest = command.source_summary_digest,
-                        .retired_digest = command.retired_digest,
-                        .retired_count = command.retired_count,
-                        .expected_install_receipt_digest = try @import("../storage/db/empty_generation_handoff.zig").installReceiptDigest(command),
-                    };
-                } else null;
+                const bootstrap = try staging.ownerBootstrapForRangeIndex(alloc, parsed.value.plan, parsed.value.plan_digest, target, range_index);
                 try owners.append(alloc, .{
                     .plan_id = parsed.value.plan.id,
                     .plan_digest = parsed.value.plan_digest,
                     .table = actual,
                     .range = actual_range,
-                    .scope = scope,
-                    .empty_generation_handoff = handoff,
+                    .scope = bootstrap.scope,
+                    .empty_generation_handoff = bootstrap.empty_generation_handoff,
                     .cancel_recovery = parsed.value.state == .canceling,
                 });
             }

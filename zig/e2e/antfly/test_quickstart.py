@@ -1201,7 +1201,12 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
             break
         __import__("time").sleep(0.05)
     assert partial_status is not None, __import__("json").dumps(
-        observed_states, indent=2, sort_keys=True
+        {
+            "index_observations": observed_states,
+            "provider": progressive_openai_embedder.stats(),
+        },
+        indent=2,
+        sort_keys=True,
     )
     time_to_first_artifact_s = __import__("time").monotonic() - started
     assert time_to_first_artifact_s < 30.0
@@ -1909,7 +1914,8 @@ def test_progressive_publication_remains_queryable_across_process_restart(
                 )
             ):
                 return None
-            if int(status.get("searchable_vectors", 0)) <= 0:
+            searchable = int(status.get("searchable_vectors", 0))
+            if searchable <= 0:
                 return None
             # Restart from a genuinely observed partial checkpoint, not the
             # intentionally conservative handoff snapshot where last-known
@@ -1935,7 +1941,12 @@ def test_progressive_publication_remains_queryable_across_process_restart(
         )
         incarnation = before["incarnation"]
         searchable_vectors = before["searchable_vectors"]
-        covered_sources = before["source_coverage"]["covered"]
+        # Each source produces two chunks. Source outcomes for the next
+        # window can be observed before its native posting WAL commits; only
+        # the immutable serving vectors are the restart baseline.
+        covered_sources = min(
+            before["source_coverage"]["covered"], searchable_vectors // 2
+        )
         assert 0 < covered_sources < len(documents)
         assert searchable_vectors > covered_sources
         assert before["source_coverage"]["pending"] > 0
@@ -1986,6 +1997,7 @@ def test_progressive_publication_remains_queryable_across_process_restart(
         )
         assert after is not None, __import__("json").dumps(
             {
+                "before_restart": before,
                 "index": stateful_api.get_index(table_name, index_name),
                 "logs": stateful_api.debug_logs(),
             },
@@ -1994,9 +2006,7 @@ def test_progressive_publication_remains_queryable_across_process_restart(
         )
         assert __import__("time").monotonic() - restarted_at < 8.0
         assert after["milestones"]["queryable"]["blockers"] == []
-        assert (
-            after["source_coverage"]["covered"] >= before["source_coverage"]["covered"]
-        )
+        assert after["source_coverage"]["covered"] >= covered_sources
 
         # Startup may first expose the durable serving checkpoint while its
         # owner is still re-establishing convergence authority. That must not

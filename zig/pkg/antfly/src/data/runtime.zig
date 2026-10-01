@@ -4820,6 +4820,11 @@ fn isRetryableMetadataBootstrapError(err: anyerror) bool {
         // published. The fenced read is intentionally rejected; retrying the
         // next control round obtains a snapshot from the new cache generation.
         error.MetadataSnapshotHeadMismatch,
+        // A tagged hidden placement can outlive its private descriptor while
+        // initial publication is canceled or its retirement is reconciled.
+        // No new owner is admitted without the descriptor; keep established
+        // groups serving and let the existing control/retirement paths retry.
+        error.InitialFkOwnerAuthorityUnavailable,
         // Metadata listeners can accept connections before their first
         // authoritative incarnation has been established. Data nodes that
         // start in that window must retry; an actual incarnation mismatch or
@@ -10325,6 +10330,19 @@ pub const DataServer = struct {
         const registration = try apply_sm.read_barriers.register(group_id, &context_buffer);
         var waiter_live = true;
         defer if (waiter_live) apply_sm.read_barriers.cancel(registration.token);
+        errdefer |err| if (err == error.ReadIndexTimeout or (err == error.Cancelled and self.dataRaftMonotonicNs() +| (500 * std.time.ns_per_ms) >= deadline_ns)) {
+            const needs_quorum = apply_sm.read_barriers.needsReadIndex(registration.token);
+            const installed = apply_sm.read_barriers.appliedIndex(group_id);
+            if (self.data_raft_mutex.tryLock()) {
+                defer self.data_raft_mutex.unlock();
+                if (raft.host.http_host.host.runtime_host.group(group_id)) |group| {
+                    const status = group.status();
+                    std.log.warn("data read-index wait failed error={s} group_id={d} needs_quorum={} installed={d} leader={?} term={d} commit={d} applied={d}", .{
+                        @errorName(err), group_id, needs_quorum, installed, status.soft.leader_id, status.hard.current_term, status.hard.commit_index, status.applied_index,
+                    });
+                }
+            } else std.log.warn("data read-index wait failed error={s} group_id={d} needs_quorum={} installed={d} raft_lock_busy=true", .{ @errorName(err), group_id, needs_quorum, installed });
+        };
 
         // Admission is part of the same read budget as quorum/apply. A
         // resolution callback can arrive while the Raft owner is waiting for
@@ -11534,35 +11552,15 @@ pub const DataServer = struct {
         if (!std.mem.eql(u8, &job.plan_digest, &(try job.plan.digest(alloc)))) return error.RestoreStagingScopeChanged;
         for (job.plan.targets) |target| {
             if (!std.mem.eql(u8, target.table.name, table_name)) continue;
-            for (target.ranges) |range| {
+            for (target.ranges, 0..) |range, range_index| {
                 if (range.group_id != group_id) continue;
-                const scope = try stages.ownerScope(alloc, job.plan, job.plan_digest, target, range);
+                const bootstrap = try stages.ownerBootstrapForRangeIndex(alloc, job.plan, job.plan_digest, target, range_index);
+                const scope = bootstrap.scope;
                 if (!std.mem.eql(u8, &scope.digest(), &digest)) return error.RestoreStagingScopeChanged;
                 const schema_json = try alloc.dupe(u8, target.table.schema_json);
                 errdefer alloc.free(schema_json);
                 const indexes_json = try alloc.dupe(u8, target.table.indexes_json);
                 errdefer alloc.free(indexes_json);
-                const handoff = if (scope.empty_generation)
-                    (try stages.mappedEmptyGenerationHandoffForGroup(alloc, job.plan, job.plan_digest, range.group_id)) orelse return error.RestoreStagingScopeChanged
-                else
-                    null;
-                const bootstrap: @import("../storage/db/restore_staging_contract.zig").OwnerBootstrap = .{
-                    .scope = scope,
-                    .table_name = table_name,
-                    .schema_json = target.table.schema_json,
-                    .read_schema_json = target.table.read_schema_json,
-                    .indexes_json = target.table.indexes_json,
-                    .byte_range = .{ .start = range.start_key, .end = range.end_key orelse "" },
-                    .source_generation_proof_digest = try stages.sourceGenerationProofDigestForGroup(job.plan, range.group_id),
-                    .generation_admission = try stages.expectedGenerationAdmissionReceiptForGroup(alloc, job.plan, job.plan_digest, range.group_id),
-                    .empty_generation_handoff = if (handoff) |mapped| .{
-                        .source_summary_digest = mapped.command.source_summary_digest,
-                        .retired_digest = mapped.command.retired_digest,
-                        .retired_count = mapped.command.retired_count,
-                        .expected_install_receipt_digest = mapped.expected_receipt_digest,
-                    } else null,
-                };
-                try bootstrap.validate();
                 const encoded = try std.json.Stringify.valueAlloc(alloc, bootstrap, .{});
                 return .{ .descriptor = .{ .lsm_root_generation = self.provisioned_storage.groupVisibleRootGenerationSource().visibleRootGenerationForGroup(group_id), .identity = .{ .table_id = scope.target_namespace.table_id, .shard_id = scope.target_namespace.shard_id, .range_id = scope.target_namespace.range_id }, .schema_json = schema_json, .indexes_json = indexes_json, .table_storage = target.table.storage, .restore_bootstrap_json = encoded } };
             }
@@ -13323,7 +13321,11 @@ pub const DataServer = struct {
         const budget: antfly.metadata_http_client.RequestBudget = .{ .deadline_ns = deadline_ns, .io = self.dataRaftIo(), .cancellation = route.cancellation };
         try remote.lockWithBudget(&remote.cache_mutex, budget);
         defer remote.cache_mutex.unlock();
-        return if (remote.control_read_generation) |peers| peers.retain() else error.MetadataSnapshotUnavailable;
+        // Catalog invalidation revokes read/planning authority, not endpoint
+        // discovery. A cache-only admitted write may still contact a previous
+        // endpoint: the receiver must validate its group, leadership and the
+        // unchanged write-route fence. Never refresh or infer authority here.
+        return if (remote.control_read_generation orelse remote.forwarding_hint_generation) |peers| peers.retain() else error.GroupLeaderUnavailable;
     }
 
     fn dataApiUriForNode(
@@ -18528,11 +18530,24 @@ pub const DataServer = struct {
         // Claim the work before collecting the report. A mutation racing with
         // collection sets the bit again and is therefore published by a later
         // round; clearing at the end would lose that notification.
-        _ = self.store_status_dirty.swap(false, .acq_rel);
+        const claimed_dirty = self.store_status_dirty.swap(false, .acq_rel);
         errdefer if (!handed_off) self.store_status_dirty.store(true, .release);
         const claimed_activity = self.embedding_activity_status_dirty.swap(false, .acq_rel);
         errdefer if (!handed_off and claimed_activity) self.embedding_activity_status_dirty.store(true, .release);
-        var snapshot = try remote_metadata.fetchSnapshot();
+        // A dirty local topology report is an observation, not a write
+        // authorization. Reuse the immutable control view recently reconciled
+        // by this process; per-group generation and reporter incarnation still
+        // fence publication. Baseline/recovery and periodic full refreshes keep
+        // their fresh metadata barrier, and an expired view falls back to it.
+        const has_baseline = baseline: {
+            if (!self.store_report_publish_mutex.tryLock()) break :baseline false;
+            defer self.store_report_publish_mutex.unlock(remote_metadata.io);
+            break :baseline self.store_report_publisher.cursor != null;
+        };
+        var snapshot = if (claimed_dirty and has_baseline)
+            (try remote_metadata.cachedSnapshotWithin(metadata_snapshot_cache_ttl_ms)) orelse try remote_metadata.fetchSnapshot()
+        else
+            try remote_metadata.fetchSnapshot();
         defer if (!handed_off) freeAdminSnapshotOwned(self.alloc, &snapshot);
         self.provisioned_storage.setDenseNativeAuthorityPermitted(
             snapshot.status.dense_native_storage_protocol_activated_version >=
@@ -18850,6 +18865,24 @@ pub const DataServer = struct {
                 snapshotTableNameForGroup(snapshot, intent.record.group_id) == null) return true;
         }
         return false;
+    }
+
+    fn requireInitialOwnerAuthority(
+        snapshot: *const antfly.metadata_api.AdminSnapshot,
+        intents: []const antfly.raft.PlacementIntent,
+        owners: []const @import("private_provisioning.zig").InitialOwner,
+        retained: []const u64,
+    ) !void {
+        for (intents) |intent| {
+            if (groupIdInSlice(retained, intent.record.group_id)) continue;
+            if (intent.record.initial_fk_root_generation == 0 or
+                snapshotTableNameForGroup(snapshot, intent.record.group_id) != null) continue;
+            const found = for (owners) |owner| {
+                if (owner.range.group_id == intent.record.group_id and
+                    owner.descriptor.child_table_id == owner.table.table_id) break true;
+            } else false;
+            if (!found) return error.InitialFkOwnerAuthorityUnavailable;
+        }
     }
 
     fn replicaRetirementTableName(
@@ -19308,16 +19341,7 @@ pub const DataServer = struct {
             // range merely because its private descriptor is absent or was
             // canceled between the two reads. Split/restore destinations have
             // their own admission protocols and carry no initial-FK generation.
-            for (next_cached_local_intents) |intent| {
-                if (groupIdInSlice(retained_hidden.items, intent.record.group_id)) continue;
-                if (intent.record.initial_fk_root_generation == 0 or
-                    snapshotTableNameForGroup(snapshot, intent.record.group_id) != null) continue;
-                const found = for (private_initial_owners) |owner| {
-                    if (owner.range.group_id == intent.record.group_id and
-                        owner.descriptor.child_table_id == owner.table.table_id) break true;
-                } else false;
-                if (!found) return error.InvalidGenerationPublication;
-            }
+            try requireInitialOwnerAuthority(snapshot, next_cached_local_intents, private_initial_owners, retained_hidden.items);
         }
         var next_group_table_names = try self.buildLocalDataRaftGroupTableNames(snapshot, next_cached_local_intents, private_initial_owners, retained_hidden.items);
         defer {
@@ -23932,6 +23956,10 @@ const activation_admission_tests = if (@import("builtin").is_test and implementa
         try std.testing.expect(!DataServer.needsPrivateInitialOwnerSnapshot(&snapshot, &.{ordinary}));
         const hidden = antfly.raft.PlacementIntent{ .record = .{ .group_id = 8, .replica_id = 1, .local_node_id = 9, .initial_fk_root_generation = 4 } };
         try std.testing.expect(DataServer.needsPrivateInitialOwnerSnapshot(&snapshot, &.{hidden}));
+        try DataServer.requireInitialOwnerAuthority(&snapshot, &.{ordinary}, &.{}, &.{});
+        try std.testing.expectError(error.InitialFkOwnerAuthorityUnavailable, DataServer.requireInitialOwnerAuthority(&snapshot, &.{hidden}, &.{}, &.{}));
+        try std.testing.expect(isRetryableMetadataBootstrapError(error.InitialFkOwnerAuthorityUnavailable));
+        try std.testing.expect(!isRetryableMetadataBootstrapError(error.InvalidGenerationPublication));
     }
 
     test "distributed online merge admission declines both owners and direct source proposals" {
@@ -24818,6 +24846,9 @@ const RemoteMetadataSource = struct {
     cached_peer_snapshot: ?antfly.metadata_api.AdminSnapshot = null,
     cached_peer_snapshot_owner: ?*ControlSnapshotOwner = null,
     control_read_generation: ?*ControlReadGeneration = null,
+    /// One immutable retired endpoint view for cache-only write forwarding.
+    /// This is never usable as catalog, placement or read authority.
+    forwarding_hint_generation: ?*ControlReadGeneration = null,
     control_read_generation_at_ms: u64 = 0,
     control_read_refresh_mutex: std.atomic.Mutex = .unlocked,
     // Bounded across peer-view replacement; routing changes bypass cooldown.
@@ -24964,6 +24995,7 @@ const RemoteMetadataSource = struct {
         lockAtomic(&self.cache_mutex);
         if (self.join_planning_generation) |planning| planning.release();
         if (self.control_read_generation) |routing| routing.release();
+        if (self.forwarding_hint_generation) |routing| routing.release();
         if (self.diagnostic_snapshot) |*snapshot| freeAdminSnapshotOwned(self.alloc, snapshot);
         releaseSnapshot(self.alloc, self.cached_snapshot_owner, self.cached_snapshot);
         releaseSnapshot(self.alloc, self.cached_peer_snapshot_owner, self.cached_peer_snapshot);
@@ -25321,7 +25353,8 @@ const RemoteMetadataSource = struct {
         retired_snapshot = self.cached_snapshot;
         retired_routing_snapshot = self.cached_routing_snapshot;
         self.cached_snapshot = null;
-        const retired_peers = self.control_read_generation;
+        const retired_hint = if (self.control_read_generation != null) self.forwarding_hint_generation else null;
+        if (self.control_read_generation) |peers| self.forwarding_hint_generation = peers;
         self.control_read_generation = null;
         self.cached_routing_snapshot = null;
         self.cached_head = null;
@@ -25332,7 +25365,7 @@ const RemoteMetadataSource = struct {
         self.snapshot_invalidation_generation +%= 1;
         self.cache_mutex.unlock();
         if (retired_planning) |planning| planning.release();
-        if (retired_peers) |peers| peers.release();
+        if (retired_hint) |peers| peers.release();
         releaseSnapshot(self.alloc, retired_owner, retired_snapshot);
         releaseSnapshot(self.alloc, retired_peer_owner, retired_peer_snapshot);
         if (retired_routing_snapshot) |snapshot| snapshot.release(self.alloc);
@@ -25526,9 +25559,21 @@ const RemoteMetadataSource = struct {
     }
 
     fn cachedSnapshotView(self: *RemoteMetadataSource, comptime peers: bool) !?antfly.metadata_api.AdminSnapshot {
+        return self.cachedSnapshotViewWithin(peers, null);
+    }
+
+    fn cachedSnapshotWithin(self: *RemoteMetadataSource, max_age_ms: u64) !?antfly.metadata_api.AdminSnapshot {
+        return self.cachedSnapshotViewWithin(false, max_age_ms);
+    }
+
+    fn cachedSnapshotViewWithin(self: *RemoteMetadataSource, comptime peers: bool, max_age_ms: ?u64) !?antfly.metadata_api.AdminSnapshot {
         lockAtomic(&self.cache_mutex);
         const compact = peers and self.cached_peer_snapshot != null;
         const snapshot = if (compact) self.cached_peer_snapshot else self.cached_snapshot;
+        if (max_age_ms) |age| if (self.awakeMs() -| self.cached_snapshot_at_ms > age) {
+            self.cache_mutex.unlock();
+            return null;
+        };
         if (snapshot == null or (!peers and (snapshot.?.peer_view or snapshot.?.planning_view))) {
             self.cache_mutex.unlock();
             return null;
@@ -29792,6 +29837,7 @@ fn dataRaftLocalStatusFingerprint(
         };
         hashU64(&hasher, 1);
         hashU64(&hasher, status.id);
+        hashU64(&hasher, status.hard.current_term);
         hashU64(&hasher, @intFromEnum(status.soft.role));
         if (status.soft.leader_id) |leader_id| {
             hashU64(&hasher, 1);
@@ -29803,6 +29849,10 @@ fn dataRaftLocalStatusFingerprint(
         for (status.conf_state.voters) |node_id| hashU64(&hasher, node_id);
         hashU64(&hasher, status.conf_state.voters_outgoing.len);
         for (status.conf_state.voters_outgoing) |node_id| hashU64(&hasher, node_id);
+        hashU64(&hasher, status.conf_state.learners.len);
+        for (status.conf_state.learners) |node_id| hashU64(&hasher, node_id);
+        hashU64(&hasher, status.conf_state.learners_next.len);
+        for (status.conf_state.learners_next) |node_id| hashU64(&hasher, node_id);
     }
     return hasher.final();
 }
@@ -34121,7 +34171,7 @@ fn consumerTests() type {
             const alloc = std.testing.allocator;
             const Http = antfly.common.http;
             const VoprIo = @import("vopr").vopr_io.VoprIo;
-            const Mode = enum { recover, short_deadline, exhausted, late_response, canceled_response };
+            const Mode = enum { recover, truncated_response, short_deadline, exhausted, late_response, canceled_response };
             const Fake = struct {
                 clock: *VoprIo,
                 mode: Mode,
@@ -34137,7 +34187,7 @@ fn consumerTests() type {
                     try std.testing.expectEqual(expected_ms, request.timeout_ms.?);
                     if (self.calls == 1 or self.mode == .exhausted) {
                         try self.clock.advance(@as(u64, expected_ms) * std.time.ns_per_ms);
-                        return error.Timeout;
+                        return if (self.mode == .truncated_response) error.InvalidResponse else error.Timeout;
                     }
                     try std.testing.expectEqual(@as(usize, 2), self.calls);
                     try self.clock.advance(if (self.mode == .late_response) 8 * std.time.ns_per_s else 1_400 * std.time.ns_per_ms);
@@ -34163,7 +34213,7 @@ fn consumerTests() type {
                 };
                 const result = source.readSystemCatalog(alloc, context, .{ .write_validation = "docs" });
                 switch (mode) {
-                    .recover => {
+                    .recover, .truncated_response => {
                         const body = try result;
                         defer alloc.free(body);
                         try std.testing.expectEqualStrings("null", body);
@@ -44106,7 +44156,7 @@ fn consumerTests() type {
             second_reader.release();
             var server: DataServer = undefined;
             server.data_raft = null;
-            server.backend_runtime = null;
+            server.backend_runtime = backend_runtime.ptr();
             server.remote_metadata = &source;
             const forwarding_clone_count = source.test_faults.snapshot_result_clones;
             // The production preflight only needs peer freshness and a control
@@ -44159,6 +44209,19 @@ fn consumerTests() type {
 
             try std.testing.expect(source.control_read_generation == null);
             try std.testing.expectEqualStrings("http://restarted", latest.nodes.get(2).?);
+            // Cache-only write forwarding can retain endpoint hints after a
+            // catalog mutation without reviving the invalidated read view.
+            const forwarding_deadline = server.dataRaftMonotonicNs() + std.time.ns_per_s;
+            const hint = (try server.acquireDataForwardingPeers(.{ .discovery = .cached }, forwarding_deadline)).?;
+            defer hint.release();
+            try std.testing.expect(hint == latest);
+            try std.testing.expectError(error.Timeout, server.acquireDataForwardingPeers(.{ .discovery = .cached }, 0));
+            var canceled_forwarding: antfly.raft.transport.http_common.RequestCancellation = .{};
+            canceled_forwarding.cancel();
+            try std.testing.expectError(error.Cancelled, server.acquireDataForwardingPeers(.{ .discovery = .cached, .cancellation = &canceled_forwarding }, forwarding_deadline));
+            source.invalidateCache();
+            try std.testing.expect(source.control_read_generation == null);
+            try std.testing.expect(source.forwarding_hint_generation == hint);
             const clone_count = source.test_faults.snapshot_result_clones;
             const observed = try cloneAdminSnapshotOwned(alloc, snapshot);
             const head = RemoteMetadataSource.snapshotHead(&observed);
@@ -44214,6 +44277,12 @@ fn consumerTests() type {
             try std.testing.expectEqual(catalog_at, source.cached_snapshot_at_ms);
             var retained_catalog = (try source.cachedSnapshot()).?;
             defer freeAdminSnapshotOwned(alloc, &retained_catalog);
+            var report_view = (try source.cachedSnapshotWithin(metadata_snapshot_cache_ttl_ms)).?;
+            defer freeAdminSnapshotOwned(alloc, &report_view);
+            try std.testing.expectEqualStrings("catalog", report_view.tables[0].name);
+            source.cached_snapshot_at_ms = 0;
+            try std.testing.expect((try source.cachedSnapshotWithin(0)) == null);
+            source.cached_snapshot_at_ms = catalog_at;
             var latest_compact = (try source.cachedPeerSnapshot()).?;
             defer freeAdminSnapshotOwned(alloc, &latest_compact);
             try std.testing.expectEqualStrings("{}", retained_catalog.tables[0].schema_json);

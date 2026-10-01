@@ -1779,7 +1779,13 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = optimize,
         .version = "test",
     });
+    // Filtered executables can share a root module. Link inputs belong to the
+    // module, so attach them once even when several compile steps consume it.
+    var linked_consumer_modules: std.AutoHashMapUnmanaged(*std.Build.Module, void) = .empty;
+    defer linked_consumer_modules.deinit(b.allocator);
     for (owner_tests.linked_consumer_tests) |tests| {
+        const entry = linked_consumer_modules.getOrPut(b.allocator, tests.root_module) catch @panic("OOM");
+        if (entry.found_existing) continue;
         tests.root_module.addObject(consumer_test_metadata.object);
         inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
             tests.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(@as(@import("pkg/antfly/build/runtime.zig").RuntimeLibraryUnit, unit))].?);
@@ -1979,7 +1985,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     for ([_][]const u8{
         "antfly-raft-transport-test",  "standby-vopr-test",                "vopr-runtime-test",
         "restore-admission-vopr-test", "vopr-determinism-audit",           "vopr-build",
-        "antfly",                      "antfly-storage-owner-source-test",
+        "antfly",                      "antfly-storage-owner-source-test", "antfly-api-hosted-recovery-test",
     }) |name| {
         assignDefaultAggregateMaxRss(
             b,

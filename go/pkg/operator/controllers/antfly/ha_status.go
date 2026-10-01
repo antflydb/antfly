@@ -2488,7 +2488,13 @@ func haPreservePlannedActionExecution(action antflyv1.HAPlannedActionStatus, sta
 		if haActionRequiresSeedArtifactReceipt(haActionKind(previous.Kind)) &&
 			previous.AdminJobPhase == haAdminJobPhaseSucceeded &&
 			!haSeedArtifactReceiptMatches(previous) {
-			return action
+			// Preserve a completed Job with missing evidence so reconciliation can
+			// reread its original logs. It remains dependency-ineligible until a
+			// matching receipt is checkpointed; observation drift must not rerun it.
+			if previous.SeedArtifactReceipt != nil || strings.TrimSpace(previous.AdminJobName) == "" ||
+				previous.AdminJobName == haAdminDirectAPIName {
+				return action
+			}
 		}
 		if haPlannedActionExecutionStarted(previous) {
 			// Once an external execution is possible, the entire request payload is

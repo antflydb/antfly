@@ -28,7 +28,7 @@ pub fn addConformance(b: *std.Build, options: AddConformanceOptions) [2]*std.Bui
     const lib_audio_xiph_conformance = b.addExecutable(.{
         .name = "lib-audio-xiph-conformance",
         .root_module = b.createModule(.{
-            .root_source_file = options.root.path(b, "audio_xiph_corpora_e2e.zig"),
+            .root_source_file = options.root.path(b, "audio_xiph_corpora_runner.zig"),
             .target = target,
             .optimize = .ReleaseFast,
         }),
@@ -38,7 +38,7 @@ pub fn addConformance(b: *std.Build, options: AddConformanceOptions) [2]*std.Bui
     const lib_audio_misc_conformance = b.addExecutable(.{
         .name = "lib-audio-misc-conformance",
         .root_module = b.createModule(.{
-            .root_source_file = options.root.path(b, "audio_misc_corpora_e2e.zig"),
+            .root_source_file = options.root.path(b, "audio_misc_corpora_runner.zig"),
             .target = target,
             .optimize = .ReleaseFast,
         }),

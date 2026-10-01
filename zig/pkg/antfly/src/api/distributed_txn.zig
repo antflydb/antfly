@@ -5056,6 +5056,7 @@ fn consumerTests() type {
                     durable_coordinator: bool = false,
                     active: usize = 0,
                     peak: usize = 0,
+                    overlap: std.Io.Event = .unset,
                     invoked: [5]bool = @splat(false),
                     resolved: [5]bool = @splat(false),
                     acknowledged: [5]bool = @splat(false),
@@ -5082,6 +5083,15 @@ fn consumerTests() type {
                         self.active += 1;
                         defer self.active -= 1;
                         self.peak = @max(self.peak, self.active);
+                        // Prove overlap through a handshake, not the scheduler's
+                        // choice between a new task and an advancing timer.
+                        // Sequential fanout now deadlocks this test explicitly.
+                        // The first wave may contain a single contacted owner
+                        // in contact-mask mode; the final wave always has two.
+                        if (i >= 3) {
+                            if (self.active == 2) self.overlap.set(self.io);
+                            try self.overlap.wait(self.io);
+                        }
                         try self.io.sleep(.fromMilliseconds(2), .awake);
                         if (i == 2) {
                             if (self.mode == .contact_mask) {
