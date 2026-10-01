@@ -697,6 +697,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_preload_model_spec_test_step = b.step("antfly-common-preload-model-spec-test", "Run preload model CLI parser tests");
     lib_preload_model_spec_test_step.dependOn(&run_lib_preload_model_spec_tests.step);
 
+    const provider_default_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "audio runtime", "bearer auth header cache provider defaults" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_provider_default_tests = addFilteredTestRunArtifact(b, provider_default_tests);
+    b.step("antfly-provider-defaults-test", "Verify provider endpoint and credential defaults").dependOn(&run_provider_default_tests.step);
+
     const lib_common_secrets_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "file secret store", "bearer auth header cache", "remote content runtime", "secret contract", "secret record" },
@@ -4706,6 +4714,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_test_step.dependOn(&run_public_api_parity_aggregate_tests.step);
     unit_test_step.dependOn(&run_lib_template_tests.step);
     unit_test_step.dependOn(&run_lib_audio_tests.step);
+    unit_test_step.dependOn(&run_provider_default_tests.step);
     unit_test_step.dependOn(lib_standalone_runtime_test_step);
     // The aggregate's storage HA shard owns the library tests. Keep only the
     // command-root coverage that the shard cannot discover; `antfly-storage-hot-standby-test` remains
@@ -6684,9 +6693,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .chaos_test_step = chaos_test_step,
         .compiled_recall_tests = compiled_recall_tests,
         .storage_test_step = lib_storage_test_step,
-        // Runtime and restore slices share this root and retain storage-owner
-        // ABI callbacks, so both require the production provider libraries.
-        .linked_consumer_tests = std.mem.concat(b.allocator, *std.Build.Step.Compile, &.{ api_tests_addTests_result.linked_consumer_tests, data_tests_addTests_result.linked_consumer_tests, &.{ provisioned_query_visibility_tests.consumer.executable, graph_metric_remote_wire_tests.consumer.executable, lib_standalone_runtime_tests } }) catch @panic("OOM"),
+        // Runtime/restore and VOPR CLI/meta/registry slices each share a root.
+        // Register both roots once to link their production ABI providers.
+        .linked_consumer_tests = std.mem.concat(b.allocator, *std.Build.Step.Compile, &.{ api_tests_addTests_result.linked_consumer_tests, data_tests_addTests_result.linked_consumer_tests, &.{ provisioned_query_visibility_tests.consumer.executable, graph_metric_remote_wire_tests.consumer.executable, lib_standalone_runtime_tests, vopr_cli } }) catch @panic("OOM"),
     };
 }
 

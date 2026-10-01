@@ -4620,11 +4620,11 @@ fn buildManagedEmbeddingEntry(
         @constCast("");
     errdefer if (source_table.len > 0) alloc.free(source_table);
     const api_key = switch (provider) {
-        .openai => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "OPENAI_API_KEY"),
-        .openrouter => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "OPENROUTER_API_KEY"),
-        .cohere => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "COHERE_API_KEY"),
-        .gemini => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "GEMINI_API_KEY"),
-        .antfly => try common_secrets.SecretValue.initConfigOrEnv(
+        .openai => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "OPENAI_API_KEY"),
+        .openrouter => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "OPENROUTER_API_KEY"),
+        .cohere => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "COHERE_API_KEY"),
+        .gemini => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "GEMINI_API_KEY"),
+        .antfly => try common_secrets.SecretValue.initConfigOrProviderDefault(
             alloc,
             embedder_cfg.api_key orelse options.inference_api_key,
             "ANTFLY_INFERENCE_API_KEY",
@@ -7008,7 +7008,7 @@ fn optionalBearerAuthHeaderOwned(
 ) !?[]u8 {
     return entry.auth_header_cache.getOwned(entry.alloc, alloc, api_key_ref, entry.secret_store) catch |err| switch (err) {
         error.SecretNotFound => switch (api_key_ref.*) {
-            .env_var => return null,
+            .env_var, .provider_default => return null,
             else => return err,
         },
         else => return err,
@@ -8459,7 +8459,7 @@ test "managed embedder openrouter defaults and credential identity stay separate
     const router = managed.findQueryEntry("router") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(ProviderKind.openrouter, router.provider);
     try std.testing.expectEqualStrings("https://openrouter.ai/api/v1", router.base_url);
-    try std.testing.expectEqualStrings("OPENROUTER_API_KEY", router.api_key.?.env_var);
+    try std.testing.expectEqualStrings("openrouter.api_key", router.api_key.?.provider_default);
     const custom = managed.findQueryEntry("custom") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("https://gateway.example/api/v1", custom.base_url);
     try std.testing.expectEqualStrings("team.router", custom.api_key.?.secret_ref);
