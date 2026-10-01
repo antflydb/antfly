@@ -120,6 +120,7 @@ pub const default_max_tokens: i64 = 256;
 pub const OpenAIReasoningEffort = openapi.OpenAIReasoningEffort;
 
 pub const openai_default_url = "https://api.openai.com/v1";
+pub const gemini_default_url = "https://generativelanguage.googleapis.com/v1beta";
 pub const ollama_default_url = "http://127.0.0.1:11434/v1";
 
 pub const OpenAIConfig = struct {
@@ -133,8 +134,9 @@ pub fn defaultUrl(provider: Provider) []const u8 {
         .openai => openai_default_url,
         .openrouter => openrouter_default_url,
         .ollama => ollama_default_url,
+        .gemini => gemini_default_url,
         // Antfly's empty URL selects embedded inference when available.
-        .antfly, .mock, .gemini, .vertex => "",
+        .antfly, .mock, .vertex => "",
     };
 }
 
@@ -973,7 +975,7 @@ test "generator provider URL defaults survive parsing and round trip" {
         .{ .provider = .openrouter, .url = "https://openrouter.ai/api/v1" },
         .{ .provider = .ollama, .url = "http://127.0.0.1:11434/v1" },
         .{ .provider = .antfly, .url = "" },
-        .{ .provider = .gemini, .url = "" },
+        .{ .provider = .gemini, .url = "https://generativelanguage.googleapis.com/v1beta" },
         .{ .provider = .vertex, .url = "" },
     };
     for (cases) |case| {
