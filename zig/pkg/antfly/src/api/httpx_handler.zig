@@ -14969,6 +14969,17 @@ test "httpx schema rewrite accepted job atomically stores draft and preserves id
                 .donor_term = 1,
                 .next_copy_sequence = 1,
                 .source_schemas = &.{self.schema},
+                .generation_handoff = .{
+                    .namespace = request.scope.fence.namespace,
+                    .admissions = &.{},
+                    .admissions_digest = try @import("../storage/portable_backup.zig").sourceGenerationAdmissionSummaryDigest(request.scope.fence.namespace, &.{}),
+                    // Owner-authenticated empty retirement set; zero is the
+                    // missing-proof sentinel and must never be admitted.
+                    .retired_digest = @splat(7),
+                    .retired_count = 0,
+                    .intent = null,
+                    .seal = null,
+                },
             }, .{});
         }
         fn create(ptr: *anyopaque, a: std.mem.Allocator, key: []const u8, value: []const u8, plan: []const u8, _: u64) ![]u8 {
@@ -15056,6 +15067,7 @@ test "httpx schema rewrite accepted job atomically stores draft and preserves id
     const headers = [_][2][]const u8{ .{ "content-type", "application/merge-patch+json" }, .{ "if-match", "\"schema-1\"" }, .{ "idempotency-key", "rewrite-accepted" } };
     var accepted = try requestWithRetry(&client, io.io(), .PATCH, url, patch, &headers, 20);
     defer accepted.deinit();
+    if (accepted.status.code != 202) std.debug.print("schema rewrite admission response: {s}\n", .{accepted.body orelse ""});
     try std.testing.expectEqual(@as(u16, 202), accepted.status.code);
     try std.testing.expect(std.mem.startsWith(u8, accepted.headers.get("location").?, "/db/v1/restore/jobs/"));
     try std.testing.expectEqualStrings("rewrite-accepted", accepted.headers.get("idempotency-key").?);

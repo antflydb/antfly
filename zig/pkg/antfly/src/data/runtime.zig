@@ -9287,6 +9287,8 @@ pub const DataServer = struct {
         self.provisioned_index_repair_shutdown.store(true, .release);
         self.lsm_maintenance_stop.store(true, .release);
         self.lsm_maintenance_wake.store(true, .release);
+        if (self.distributed_read_http_executor) |executor| executor.beginShutdown();
+        if (self.kernel_owner_source) |source| source.beginApplyControlShutdown();
         self.write_source.beginTeardown();
         if (self.data_raft_apply) |apply_sm| apply_sm.write_source.beginTeardown();
         if (self.listener) |listener| listener.requestStop();
@@ -32103,11 +32105,37 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         .vtable = &.{ .execute = Metadata.execute },
     };
 
+    var raft_uris: [3][]u8 = undefined;
+    var raft_uri_count: usize = 0;
+    defer for (raft_uris[0..raft_uri_count]) |uri| alloc.free(uri);
+    var api_uris: [3][]u8 = undefined;
+    var api_uri_count: usize = 0;
+    defer for (api_uris[0..api_uri_count]) |uri| alloc.free(uri);
+    var hosted_http_executor: ?antfly.common.http.IoHttpExecutor = null;
     var servers: [3]DataServer = undefined;
     var initialized = [_]bool{false} ** 3;
-    defer for (&servers, &initialized) |*server, is_initialized| {
-        if (is_initialized) server.deinit();
-    };
+    defer {
+        // Publish every node's stop before driving cancellation. HTTP request
+        // leases are released by scheduler-owned tasks; joining a client from
+        // this outer frame before those tasks unwind cannot make progress.
+        for (&servers, &initialized) |*server, is_initialized| {
+            if (is_initialized) server.beginTeardown();
+        }
+        if (hosted_http_executor) |*executor| executor.beginShutdown();
+        _ = vopr_io.cancelAndDrainTasksForTeardown(alloc, 10_000) catch
+            @panic("multi-owner DataServer teardown failed to drain scheduler tasks");
+        if (hosted_http_executor) |*executor| {
+            std.debug.assert(executor.activeRequestCount() == 0);
+            executor.deinit();
+        }
+        for (&servers, &initialized) |*server, is_initialized| {
+            if (is_initialized) {
+                if (server.distributed_read_http_executor) |executor|
+                    std.debug.assert(executor.activeRequestCount() == 0);
+                server.deinit();
+            }
+        }
+    }
     for (&servers, 0..) |*server, i| {
         server.* = try DataServer.initFromMetadataApiUrls(alloc, .{
             .bind_port = public_port_base + @as(u16, @intCast(i)),
@@ -32132,12 +32160,6 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         initialized[i] = true;
     }
 
-    var raft_uris: [3][]u8 = undefined;
-    var raft_uri_count: usize = 0;
-    defer for (raft_uris[0..raft_uri_count]) |uri| alloc.free(uri);
-    var api_uris: [3][]u8 = undefined;
-    var api_uri_count: usize = 0;
-    defer for (api_uris[0..api_uri_count]) |uri| alloc.free(uri);
     for (&servers, 0..) |*server, i| {
         const raft = server.data_raft orelse return error.MissingDataRaft;
         try raft.start();
@@ -32425,8 +32447,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         // first command necessarily crosses the production public transport.
         .local_node_id = 3,
     };
-    var hosted_http_executor = antfly.common.http.IoHttpExecutor.init(alloc, io, .{});
-    defer hosted_http_executor.deinit();
+    hosted_http_executor = antfly.common.http.IoHttpExecutor.init(alloc, io, .{});
     const Readiness = struct {
         fn get(_: *anyopaque, _: u64) !antfly.metadata.transition_state.StablePlacementReadiness {
             return .ready;
@@ -32436,7 +32457,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         alloc,
         antfly.public_api.table_catalog.emptyCatalogSource(),
         router.iface(),
-        hosted_http_executor.executor(),
+        hosted_http_executor.?.executor(),
         .{ .ptr = undefined, .readiness = Readiness.get },
         servers[2].localShardOperationAdapter(),
     );
@@ -47581,24 +47602,33 @@ fn implementationTests() type {
                     const vopr = @import("vopr");
                     const allocator = server.alloc;
                     const io = runtime.io();
-                    var future = io.async(DataServer.runStoreStatusRoundOnly, .{server});
-                    defer {
+                    const Round = struct {
+                        server: *DataServer,
+                        done: bool = false,
+                        fn execute(round: *@This()) !void {
+                            defer round.done = true;
+                            try round.server.runStoreStatusRoundOnly();
+                        }
+                    };
+                    var round: Round = .{ .server = server };
+                    var future = io.async(Round.execute, .{&round});
+                    defer if (!round.done) {
                         _ = runtime.cancelAndDrainTasksForTeardown(allocator, 10_000) catch @panic("store report test cleanup failed");
                         _ = future.cancel(io) catch {};
-                    }
+                    };
                     var enabled: vopr.transition.List = .{};
                     defer enabled.deinit(allocator);
                     var events: vopr.event.Sink = .{};
                     defer events.deinit(allocator);
                     for (0..1_000) |_| {
-                        if (runtime.scheduler().quiescent()) break;
+                        if (round.done) break;
                         enabled.items.clearRetainingCapacity();
                         try runtime.scheduler().enumerateReady(&enabled, allocator);
                         try enabled.canonicalize();
                         if (enabled.items.items.len == 0) return error.VoprStoreReportDeadlock;
                         try runtime.scheduler().executeReady(enabled.items.items[0].id, &events, allocator);
                     }
-                    try std.testing.expect(runtime.scheduler().quiescent());
+                    try std.testing.expect(round.done);
                     try future.await(io);
                 }
             };
@@ -47793,16 +47823,19 @@ fn implementationTests() type {
 
             // Registration uses the same backoff before the status collector runs.
             server.store_registration_confirmed = false;
-            server.setRemoteMetadataFetchErrorForTest(error.NotLeader);
+            // Registration uses transport discovery, not the snapshot fetch
+            // seam. Inject the failure at that actual boundary.
+            metadata_transport.delayed_error = error.NotLeader;
             try RuntimeRound.run(&server, &vopr_io);
             try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
-            server.setRemoteMetadataFetchErrorForTest(error.MetadataIncarnationMismatch);
+            metadata_transport.delayed_error = error.MetadataIncarnationMismatch;
             try RuntimeRound.run(&server, &vopr_io);
             vopr_io.monotonic_ns = @as(i96, server.nextMetadataBootstrapRetryAtMsForTest()) * std.time.ns_per_ms;
             try std.testing.expectError(error.MetadataIncarnationMismatch, RuntimeRound.run(&server, &vopr_io));
             try std.testing.expectEqual(@as(usize, 2), metadata_transport.reports);
             // Cover actual transport failures that complete after the old deadline
             // would already have elapsed, for both publication and registration.
+            metadata_transport.delayed_error = null;
             server.setRemoteMetadataFetchErrorForTest(null);
             for ([_]bool{ true, false }) |registered| {
                 for ([_]anyerror{ error.NotLeader, error.ConnectionResetByPeer, error.SocketUnconnected }) |transport_error| {
