@@ -9678,24 +9678,24 @@ pub const DB = struct {
     }
 
     fn drainStandaloneGraphEndpointCleanup(self: *DB) !bool {
-        return self.drainStandaloneGraphEndpointCleanupWithOptions(.{});
+        return self.drainStandaloneGraphEndpointCleanupWithOptions(.{}, std.math.maxInt(usize));
     }
 
-    fn drainStandaloneGraphEndpointCleanupWithOptions(self: *DB, opts: BatchExecutionOptions) !bool {
+    fn drainStandaloneGraphEndpointCleanupWithOptions(self: *DB, opts: BatchExecutionOptions, max_pages: usize) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
         // Most batches create no endpoint jobs. Avoid authority probes and
         // maintenance admission altogether on their completion path.
         if (!try self.core.store.hasGraphEndpointCleanup()) return false;
         if (try self.graphCleanupRequiresRaft()) return false;
-        var drained = false;
-        while (try self.core.store.hasGraphEndpointCleanup()) {
+        var pages: usize = 0;
+        while (pages < max_pages and try self.core.store.hasGraphEndpointCleanup()) {
             try self.batchInternal(.{ .graph_endpoint_cleanup = true, .sync_level = .write }, null, .{
                 .document_child_range_dispatcher = opts.document_child_range_dispatcher,
                 .committed_batch_effects_observer = opts.committed_batch_effects_observer,
             });
-            drained = true;
+            pages += 1;
         }
-        return drained;
+        return pages != 0;
     }
 
     /// Shared completion for ordinary, profiled, callback and transaction
@@ -9707,7 +9707,11 @@ pub const DB = struct {
             opts.raft_applied_entry_marker != null or opts.ha_applied_lsn_marker != null or
             opts.native_initial_child_entry != null or opts.restore_staging != null or
             req.restore_staging_scope != null or req.restore_staging != null) return;
-        const drained = try self.drainStandaloneGraphEndpointCleanupWithOptions(opts);
+        // Weak sync levels pay for at most one bounded maintenance page.
+        // Durable jobs continue through the resident scheduler; full_index
+        // and explicit maintenance retain complete cleanup guarantees.
+        const max_pages: usize = if (req.sync_level == .full_index) std.math.maxInt(usize) else 1;
+        const drained = try self.drainStandaloneGraphEndpointCleanupWithOptions(opts, max_pages);
         // A resident worker can finish before the foreground queue probe.
         // Deletes/transforms must still include its newly committed replay cut.
         if (req.sync_level == .full_index and (drained or req.deletes.len != 0 or req.transforms.len != 0))
@@ -11301,7 +11305,11 @@ pub const DB = struct {
         defer if (verified_principal) |*principal| principal.deinit();
         var row_policy_lease: ?row_policy_gate_mod.Gate.Lease = null;
         const trusted_replay = opts.raft_applied_entry_marker != null or opts.native_initial_child_entry != null or opts.ha_applied_lsn_marker != null;
-        if (!trusted_replay) try self.maybeFinalizePendingRowPolicyPublication();
+        // Strict private-command validation above confines this exemption to
+        // derived inline-edge/job maintenance. It cannot mutate user rows,
+        // and must progress while a policy publication is preparing or active.
+        const graph_cleanup_maintenance = req.graph_endpoint_cleanup;
+        if (!trusted_replay and !graph_cleanup_maintenance) try self.maybeFinalizePendingRowPolicyPublication();
         if (req.row_policy_principal_proof.len != 0) {
             if (req.row_policy_admitted_at_seconds <= 0 or req.row_policy_database.len == 0 or
                 req.row_policy_publication != null or req.relational_generation_gc != null or
@@ -11315,12 +11323,12 @@ pub const DB = struct {
                 try self.row_policy_gate.enterVerifiedPrincipal(&verified_principal.?.value, now_seconds);
         } else if (req.row_policy_database.len != 0 or req.row_policy_admitted_at_seconds != 0) {
             return error.RowPolicyAuthenticationRequired;
-        } else if (!trusted_replay and req.relational_generation_gc == null and opts.transaction_resolution == null) {
+        } else if (!trusted_replay and !graph_cleanup_maintenance and req.relational_generation_gc == null and opts.transaction_resolution == null) {
             row_policy_lease = try self.row_policy_gate.enterRaw();
         } else if (self.row_policy_gate.currentPhase() != .disabled and
             (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
                 req.graph_writes.len != 0 or req.graph_deletes.len != 0) and
-            opts.transaction_resolution == null and req.relational_generation_gc == null)
+            opts.transaction_resolution == null and req.relational_generation_gc == null and !graph_cleanup_maintenance)
         {
             return error.RowPolicyAuthenticationRequired;
         }
@@ -158799,4 +158807,90 @@ test "db graph endpoint cleanup pages incomplete directory preserves owner retir
     try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"v\":2}" }}, .sync_level = .write });
     try std.testing.expect(!try db.core.store.graphRelationshipRetired(artifact));
     try std.testing.expect(!try db.core.store.graphIncomingDirectoryReady());
+}
+
+test "db graph endpoint cleanup pages progress through row policy phases without user admission" {
+    const alloc = std.testing.allocator;
+    for ([_]table_catalog_mod.RowPolicyPhase{ .preparing, .active }) |phase| {
+        for (0..3) |mode| {
+            var directory = try TestDirectory.init("policy-cleanup-admission");
+            defer directory.cleanup();
+            var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+            defer db.close();
+            try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+            const edge: types.GraphEdgeWrite = .{ .index_name = "g", .source = "a", .target = "hub", .edge_type = "R" };
+            if (mode == 1)
+                try db.batchRaftReplicatedApply(.{ .graph_writes = &.{edge} }, .{ .term = 1, .index = 1 })
+            else
+                try db.batch(.{ .graph_writes = &.{edge}, .sync_level = .full_index });
+            const job = try internal_keys.graphEndpointCleanupKeyAlloc(alloc, "hub");
+            defer alloc.free(job);
+            try db.core.store.put(job, "hub");
+            db.row_policy_gate.phase.store(@intFromEnum(phase), .release);
+            defer db.row_policy_gate.phase.store(@intFromEnum(table_catalog_mod.RowPolicyPhase.disabled), .release);
+            // Maintenance must not acquire a user admission lease, including
+            // during preparing. Invalid mixed commands never gain exemption.
+            try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{ .graph_endpoint_cleanup = true, .writes = &.{.{ .key = "user", .value = "{}" }} }));
+            try std.testing.expectError(error.RowPolicyAuthenticationRequired, db.batch(.{ .writes = &.{.{ .key = "user", .value = "{}" }} }));
+            try std.testing.expectError(error.RowPolicyAuthenticationRequired, db.batchRaftReplicatedApply(.{ .graph_writes = &.{edge} }, .{ .term = 1, .index = 2 }));
+            switch (mode) {
+                0 => try std.testing.expect(try db.runStandaloneGraphEndpointCleanupStep()),
+                1 => {
+                    var page = (try db.prepareGraphEndpointCleanupBatch(alloc)).?;
+                    defer page.deinit();
+                    try db.batchRaftReplicatedApply(page.request(), .{ .term = 1, .index = 2 });
+                },
+                2 => try db.batchInternal(.{ .graph_endpoint_cleanup = true, .sync_level = .write }, null, .{ .ha_applied_lsn_marker = 1, .bypass_ha_write_gate = true }),
+                else => unreachable,
+            }
+            try std.testing.expect(!try db.core.store.hasGraphEndpointCleanup());
+            // Authentication failures and cleanup cannot create a user row.
+            try std.testing.expectError(error.NotFound, db.core.store.get(alloc, "user"));
+        }
+    }
+}
+
+test "db graph endpoint cleanup pages weak sync has one page budget and full index drains" {
+    const alloc = std.testing.allocator;
+    const Capture = struct {
+        calls: usize = 0,
+        fn observe(ptr: *anyopaque, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+        }
+        fn dispatch(_: *anyopaque, _: Allocator, _: DocumentArtifactChildRangeDispatch) !void {}
+    };
+    for ([_]types.SyncLevel{ .propose, .write, .full_text, .enrichments, .full_index }) |level| {
+        var directory = try TestDirectory.init("cleanup-foreground-budget");
+        defer directory.cleanup();
+        var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+        try db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{}" }}, .sync_level = .write });
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const jobs = try scratch.alloc(docstore_mod.KVPair, 600);
+        for (jobs, 0..) |*job, i| {
+            const endpoint = try std.fmt.allocPrint(scratch, "isolated:{d}", .{i});
+            job.* = .{ .key = try internal_keys.graphEndpointCleanupKeyAlloc(scratch, endpoint), .value = endpoint };
+        }
+        try db.core.store.putBatch(jobs, &.{});
+        var capture = Capture{};
+        try db.batchWithDocumentArtifactChildRangeDispatcherAndCommittedEffectsObserver(.{ .writes = &.{.{ .key = "unrelated", .value = "{}" }}, .sync_level = level }, .{ .ptr = &capture, .apply = Capture.dispatch }, .{ .ptr = &capture, .apply = Capture.observe });
+        const pending = try db.core.store.scanPrefix(alloc, internal_keys.graph_endpoint_cleanup_prefix);
+        defer docstore_mod.DocStore.freeResults(alloc, pending);
+        if (level == .full_index) {
+            try std.testing.expectEqual(@as(usize, 0), pending.len);
+            try std.testing.expectEqual(@as(usize, 4), capture.calls);
+        } else {
+            try std.testing.expectEqual(@as(usize, 344), pending.len);
+            try std.testing.expectEqual(@as(usize, 2), capture.calls);
+            // Each scheduler turn remains bounded and eventually clears jobs.
+            try std.testing.expect(try db.runStandaloneGraphEndpointCleanupStep());
+            try std.testing.expect(try db.core.store.hasGraphEndpointCleanup());
+            try std.testing.expect(try db.runStandaloneGraphEndpointCleanupStep());
+            try std.testing.expect(!try db.core.store.hasGraphEndpointCleanup());
+        }
+    }
 }

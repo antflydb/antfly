@@ -61,9 +61,11 @@ relationship identities; followers never replan from local directory progress.
 Planned commands are private and isolated: their only effects are inline
 relationship deletions and cleanup-job removals. They cannot delete documents or
 change constraint metadata, so completion also works on tables with unique or
-foreign-key constraints.
+foreign-key constraints. Strictly validated private cleanup commands also use
+maintenance admission during row-policy preparation and activation; user
+mutations retain principal authentication.
 
-Standalone DB writes and recovery drain the same commands locally. Resident
+Standalone DB writes and recovery execute the same commands locally. Resident
 standalone owners also register with the shared maintenance scheduler, processing
 one bounded page per turn independently of foreground writes, including after
 TTL expiry. Idle maintenance also backfills the incoming directory in bounded
@@ -74,9 +76,11 @@ after installing the DB at its final address to enable resident maintenance.
 Explicit worker suppression leaves cleanup to writes, recovery, and maintenance
 calls. Local batch completion is shared by ordinary writes, profiled writes,
 transaction writes/resolution, and storage callback entry points. Completion
-drains endpoint jobs after the primary apply lock is released; `full_index`
-also waits for the resulting cleanup replay cut, including cleanup completed
-concurrently by a resident worker. Foreground cleanup retains the callback
+runs at most one bounded cleanup page for weak sync levels after the primary
+apply lock is released. Remaining durable jobs continue through resident
+maintenance. Recovery, explicit maintenance, and `full_index` drain endpoint
+jobs completely; `full_index` also waits for the resulting cleanup replay cut,
+including cleanup completed concurrently by a resident worker. Foreground cleanup retains the callback
 dispatcher and committed-effects observer. Replicated apply executes only its
 ordered command and leaves subsequent cleanup to the owner leader. Raft ownership is
 checked before local planning, including before the first applied-entry marker
