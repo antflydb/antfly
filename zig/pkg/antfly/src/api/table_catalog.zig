@@ -33,6 +33,7 @@ const runtime_io_abi = @import("../runtime_io_abi.zig");
 pub const RoutingBudget = struct {
     deadline_ns: ?u64 = null,
     io: ?runtime_io_abi.Borrow = null,
+    cancellation: @import("../common/cancellation.zig").CancellationToken = .none,
 
     const checkpoint_stride: usize = 64;
 
@@ -76,6 +77,7 @@ pub const RoutingBudget = struct {
     }
 
     pub fn checkpoint(self: RoutingBudget) !void {
+        try self.cancellation.check();
         if (self.deadline_ns) |deadline| {
             if (self.nowNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
         }
@@ -2021,6 +2023,20 @@ pub fn tableGroupDescriptorProjection(
     group_id: u64,
     deadline_ns: ?u64,
 ) !?TableGroupDescriptorProjection {
+    return tableGroupDescriptorProjectionControlled(alloc, catalog, table_name, group_id, catalog.budget(deadline_ns));
+}
+
+/// One catalog-clock budget covers eventual capture, authoritative miss
+/// confirmation, and projection. Cancellation prevents admission after a
+/// completed capture; the original deadline bounds capture I/O itself.
+pub fn tableGroupDescriptorProjectionControlled(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    group_id: u64,
+    budget: RoutingBudget,
+) !?TableGroupDescriptorProjection {
+    try budget.checkpoint();
     // Catalog-wide routing intentionally strips schema and index payloads.
     // A first-party point projection is bounded to one table and therefore
     // carries the complete physical definition needed by the storage owner.
@@ -2030,8 +2046,10 @@ pub fn tableGroupDescriptorProjection(
     if (catalog.vtable.table_routing_snapshot) |capture| {
         if (catalog.vtable.free_routing_snapshot == unsupportedFreeRoutingSnapshot)
             return error.CatalogRoutingUnavailable;
-        var snapshot = try capture(catalog.ptr, table_name, deadline_ns);
+        try budget.checkpoint();
+        var snapshot = try capture(catalog.ptr, table_name, budget.deadline_ns);
         defer catalog.vtable.free_routing_snapshot(catalog.ptr, &snapshot);
+        try budget.checkpoint();
         if (try descriptorProjectionFromRoutingSnapshot(alloc, snapshot, table_name, group_id)) |projection|
             return projection;
     }
@@ -2042,8 +2060,10 @@ pub fn tableGroupDescriptorProjection(
     if (catalog.vtable.linearizable_table_routing_snapshot) |capture| {
         if (catalog.vtable.free_routing_snapshot == unsupportedFreeRoutingSnapshot)
             return error.CatalogRoutingUnavailable;
-        var snapshot = try capture(catalog.ptr, table_name, deadline_ns);
+        try budget.checkpoint();
+        var snapshot = try capture(catalog.ptr, table_name, budget.deadline_ns);
         defer catalog.vtable.free_routing_snapshot(catalog.ptr, &snapshot);
+        try budget.checkpoint();
         if (try descriptorProjectionFromRoutingSnapshot(alloc, snapshot, table_name, group_id)) |projection|
             return projection;
     }
@@ -2052,15 +2072,17 @@ pub fn tableGroupDescriptorProjection(
     // diagnostic read. Its scheduler keeps the debt until the point projection
     // is ready. Explicit split/restore structural admission retains the full
     // lifecycle fallback below.
-    if (deadline_ns != null) return error.CatalogRoutingUnavailable;
+    if (budget.deadline_ns != null) return error.CatalogRoutingUnavailable;
 
     // A split destination does not become an active routing range until
     // cutover, but its immutable descriptor is already captured in the
     // replicated transition contract. Consult the full lifecycle projection
     // only on this compact-routing miss; ordinary owner opens stay independent
     // of the much larger administrative/runtime status snapshot.
+    try budget.checkpoint();
     var admin = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&admin);
+    try budget.checkpoint();
     if (findTableByName(admin.tables, table_name)) |table| {
         for (admin.ranges) |range| {
             if (range.table_id != table.table_id or range.group_id != group_id) continue;

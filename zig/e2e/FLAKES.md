@@ -60,6 +60,28 @@ unproved miss, so final qualification must include the publication path.
 Qualification of the final merged executable remains pending; earlier frozen
 600/600 recovery runs do not qualify these subsequent architectural changes.
 
+The v22 mixed soak passed Autograph and FK recovery 200/200 each, but schema
+publication passed 198/200: two successful jobs were followed by a frontend
+404 for a retained row. Reopening copies of all three target replicas found
+the expected durable row. That does not establish the live read's failing
+stage. Two additional false-absence paths are now guarded: a missing route
+under ReadIndex returns availability, and descriptor disappearance after an
+authenticated route cannot certify a row miss. Focused regressions preserve
+stale semantics and native certified absence. The v23 frozen-binary mixed
+soak is still running; its results do not qualify later source changes.
+The v23 run has also reproduced a schema publication failure and progressive
+quickstart first-result failures. Those signatures remain open; the deadline
+fix below does not establish their causes or qualify the publication path.
+
+Owner admission now preserves the request's deadline, executor clock and
+cancellation through ordinary lookup and lease acquisition. Descriptor reads
+translate the remaining budget into the catalog clock once, share that absolute
+deadline across eventual and authoritative captures, and check cancellation
+between captures and before owner admission. Budgeted misses cannot fall back
+to an unbounded administrative snapshot. Deterministic regressions use distinct
+clock epochs and consume time or cancel during the first capture, proving that
+confirmation neither renews the budget nor runs after expiry/cancellation.
+
 The post-main smoke also exposed a shared metadata availability defect: initial
 FK creation wrote its physical table before publishing the logical binding,
 leaving a bound table in the legacy-only listing. Listing then failed with

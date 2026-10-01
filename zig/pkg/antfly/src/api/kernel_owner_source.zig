@@ -176,6 +176,89 @@ test "source owner routed admission preserves the fence clock" {
     try std.testing.expectEqual(@as(usize, 2), catalog.calls);
 }
 
+test "source owner lookup and descriptor admission preserve one cancellable catalog budget" {
+    const Fixture = struct {
+        request_now: u64 = 10,
+        catalog_now: u64 = 1000 * std.time.ns_per_s,
+        canceled: std.atomic.Value(bool) = .init(false),
+        mode: enum { confirm, cancel, expire } = .confirm,
+        captures: usize = 0,
+        confirmations: usize = 0,
+        fn now(ptr: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            const value: *const u64 = @ptrCast(@alignCast(ptr.?));
+            return .{ .nanoseconds = value.* };
+        }
+        fn capture(ptr: *anyopaque, _: []const u8, deadline: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(?u64, 1001 * std.time.ns_per_s), deadline);
+            self.captures += 1;
+            const elapsed: u64 = if (self.mode == .expire) std.time.ns_per_s else 250 * std.time.ns_per_ms;
+            self.request_now += elapsed;
+            self.catalog_now += elapsed;
+            if (self.mode == .cancel) self.canceled.store(true, .release);
+            return .{ .metadata_group_id = 1, .catalog_revision = 1, .tables = &.{}, .ranges = &.{} };
+        }
+        fn confirm(ptr: *anyopaque, _: []const u8, deadline: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            // The eventual miss used 250 ms. Confirmation keeps the original
+            // absolute deadline, rather than receiving a fresh second.
+            try std.testing.expectEqual(@as(?u64, 1001 * std.time.ns_per_s), deadline);
+            self.confirmations += 1;
+            return error.DescriptorProbeComplete;
+        }
+        fn freeRouting(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
+        fn admin(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnbudgetedDescriptorFallback;
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    var vtable = std.testing.io.vtable.*;
+    vtable.now = Fixture.now;
+    for ([_]@FieldType(Fixture, "mode"){ .confirm, .cancel, .expire }) |mode| {
+        for ([_]bool{ false, true }) |lookup| {
+            var fixture: Fixture = .{ .mode = mode };
+            const request_io: std.Io = .{ .userdata = &fixture.request_now, .vtable = &vtable };
+            const catalog_io: std.Io = .{ .userdata = &fixture.catalog_now, .vtable = &vtable };
+            var source = ProvisionedKernelOwnerSource.init(std.testing.allocator, "unused", .{ .ptr = &fixture, .io = @import("../runtime_io_abi.zig").Borrow.init(&catalog_io), .vtable = &.{ .admin_snapshot = Fixture.admin, .free_admin_snapshot = Fixture.free, .table_routing_snapshot = Fixture.capture, .linearizable_table_routing_snapshot = Fixture.confirm, .free_routing_snapshot = Fixture.freeRouting } }, read_gate.alreadyReadSafeBarrier());
+            const opts: db_types.LookupOptions = .{ .execution_deadline_ns = fixture.request_now + std.time.ns_per_s, .execution_io = @import("../runtime_io_abi.zig").Borrow.init(&request_io), .cancellation = .fromAtomic(&fixture.canceled) };
+            const expected: anyerror = switch (mode) {
+                .confirm => error.DescriptorProbeComplete,
+                .cancel => error.Canceled,
+                .expire => error.CatalogRoutingSnapshotTimeout,
+            };
+            if (lookup) {
+                try std.testing.expectError(expected, ProvisionedKernelOwnerSource.lookupGroupLocal(&source, std.testing.allocator, 7, "rows", "a", opts, .stale));
+            } else {
+                try std.testing.expectError(expected, source.acquireWithControls(7, "rows", .from(opts)));
+            }
+            try std.testing.expectEqual(@as(usize, 1), fixture.captures);
+            try std.testing.expectEqual(@as(usize, if (mode == .confirm) 1 else 0), fixture.confirmations);
+        }
+    }
+}
+
+test "source owner fenced descriptor disappearance is availability not absence" {
+    const Fixture = struct {
+        fn resolve(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: table_catalog.RouteQuery, _: ?u64) !table_catalog.RouteResult {
+            const groups = try alloc.alloc(table_catalog.CatalogGroupRoute, 1);
+            groups[0] = .{ .group_id = 7, .range_id = 7, .identity_namespace = .{ .table_id = 1, .shard_id = 7, .range_id = 7 } };
+            return .{ .found = .{ .metadata_group_id = 1, .metadata_incarnation = null, .catalog_revision = 1, .table_id = 1, .topology_epoch = 1, .groups = groups } };
+        }
+        fn admin(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{ .status = .{ .metadata_group_id = 1, .metrics = .{} }, .tables = &.{}, .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    var fixture: u8 = 0;
+    var source = ProvisionedKernelOwnerSource.init(std.testing.allocator, "unused", .{ .ptr = &fixture, .vtable = &.{ .admin_snapshot = Fixture.admin, .free_admin_snapshot = Fixture.free, .validate_route = Fixture.resolve } }, read_gate.alreadyReadSafeBarrier());
+    const fence: metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 1, .topology_epoch = 1, .route = .{ .group_id = 7, .range_id = 7, .identity_namespace = .{ .table_id = 1, .shard_id = 7, .range_id = 7 } } };
+    // The authenticated public route exists. A later descriptor projection
+    // cannot certify that its row is absent without admitting an owner.
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, ProvisionedKernelOwnerSource.lookupGroupLocalRouted(&source, std.testing.allocator, fence, 7, "rows", "a", .{}, .read_index));
+    // An unfenced physical lookup still identifies a genuinely missing table.
+    try std.testing.expectError(error.TableNotFound, ProvisionedKernelOwnerSource.lookupGroupLocal(&source, std.testing.allocator, 7, "rows", "a", .{}, .read_index));
+}
+
 pub const ProvisionedKernelOwnerSource = struct {
     alloc: std.mem.Allocator,
     replica_root_dir: []const u8,
@@ -2864,12 +2947,22 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
         deadline_ns: ?u64,
     ) !LoadedDescriptor {
-        var projection = (try table_catalog.tableGroupDescriptorProjection(
+        return self.loadDescriptorWithBudget(alloc, group_id, table_name, self.catalog.budget(deadline_ns));
+    }
+
+    fn loadDescriptorWithBudget(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        budget: table_catalog.RoutingBudget,
+    ) !LoadedDescriptor {
+        var projection = (try table_catalog.tableGroupDescriptorProjectionControlled(
             alloc,
             self.catalog,
             table_name,
             group_id,
-            deadline_ns,
+            budget,
         )) orelse return error.TableNotFound;
         errdefer projection.deinit(alloc);
         const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
@@ -2898,6 +2991,12 @@ pub const ProvisionedKernelOwnerSource = struct {
 
         fn from(req: anytype) ReadControls {
             return .{ .execution_deadline_ns = req.execution_deadline_ns, .execution_io = if (@hasField(@TypeOf(req), "execution_io")) req.execution_io else null, .cancellation = req.cancellation };
+        }
+
+        fn catalogBudget(self: ReadControls, catalog: table_catalog.CatalogSource) table_catalog.RoutingBudget {
+            var budget = catalog.budget(catalog.deadlineFrom(.{ .deadline_ns = self.execution_deadline_ns, .io = self.execution_io }));
+            budget.cancellation = self.cancellation orelse .none;
+            return budget;
         }
 
         fn check(self: ReadControls) !void {
@@ -2929,8 +3028,9 @@ pub const ProvisionedKernelOwnerSource = struct {
         controls: ReadControls,
     ) !Lease {
         try controls.check();
-        var descriptor = try self.loadDescriptor(self.alloc, group_id, table_name);
+        var descriptor = try self.loadDescriptorWithBudget(self.alloc, group_id, table_name, controls.catalogBudget(self.catalog));
         defer descriptor.deinit(self.alloc);
+        try controls.check();
         return self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, descriptor.view(), false, .resident, controls);
     }
 
@@ -4221,7 +4321,12 @@ pub const ProvisionedKernelOwnerSource = struct {
             defer response.deinit();
             return .{ .json = try alloc.dupe(u8, response.bytes()), .version = response.version(), .expected_content_digest = response.expectedContentDigest() };
         }
-        return try lookupGroupLocal(ptr, alloc, group_id, table_name, key, opts, consistency);
+        // The route was authenticated above. A missing descriptor during
+        // owner admission is a topology/availability race, never a row miss.
+        return lookupGroupLocal(ptr, alloc, group_id, table_name, key, opts, consistency) catch |err| switch (err) {
+            error.TableNotFound => error.StorageReadTemporarilyUnavailable,
+            else => err,
+        };
     }
 
     fn publishedHandoffReceiptReadCertified(key: []const u8, opts: db_types.LookupOptions, consistency: read_gate.ReadConsistency) bool {
@@ -4656,14 +4761,18 @@ pub const ProvisionedKernelOwnerSource = struct {
         try self.prepareLookupRead(group_id, key, opts, consistency);
         const request_json = try table_reads.encodeStorageKernelLookupRequest(alloc, key, opts);
         defer alloc.free(request_json);
+        var controls = ReadControls.from(opts);
+        controls.allow_deferred_catalog = std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"identity\"}") or
+            std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_publication\"}") or
+            fkGenerationSourceDeferredLookupAllowed(key, opts, consistency);
+        try controls.check();
         var lease = if (std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"initial_child_preflight\"}") or
             std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"initial_child_publication\"}"))
             try self.acquirePreparedOwner(group_id, table_name)
         else
-            try self.acquireWithControls(group_id, table_name, .{ .allow_deferred_catalog = std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"identity\"}") or
-                std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_publication\"}") or
-                fkGenerationSourceDeferredLookupAllowed(key, opts, consistency) });
+            try self.acquireWithControls(group_id, table_name, controls);
         defer lease.deinit();
+        try controls.check();
         var response = lease.owner().lookupJson(table_name, request_json) catch |err| switch (err) {
             error.NotFound => return null,
             else => return err,
