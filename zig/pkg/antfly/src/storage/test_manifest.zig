@@ -185,7 +185,6 @@ comptime {
     _ = @import("db/merge_contract.zig");
     _ = @import("db/merge_page_system_test.zig");
     _ = @import("db/merge_page_wire.zig");
-    _ = @import("db/native_raft_snapshot.zig");
     _ = @import("db/online_merge_io.zig");
     _ = @import("db/online_integrity_shadow.zig");
     _ = @import("db/online_merge_io_contract.zig");

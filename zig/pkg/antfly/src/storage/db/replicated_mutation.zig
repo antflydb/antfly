@@ -20,7 +20,7 @@ pub const Batch = struct {
     receipt: Receipt = .none,
     pub const Receipt = union(enum) {
         none,
-        ordered: types.RaftAppliedEntryIdentity,
+        ordered: types.OrderedApplyReceipt,
         native: @import("receipt_position.zig").Native,
         online_source: u64,
     };

@@ -7,8 +7,10 @@
 //     https://www.antfly.io/licensing/ELv2-license
 
 const std = @import("std");
+const native_snapshot = @import("raft/storage/native_snapshot.zig");
 const file_snapshot_store = @import("raft/storage/file_snapshot_store.zig");
 
 test "raft snapshot storage tests are reachable" {
     std.testing.refAllDecls(file_snapshot_store);
+    std.testing.refAllDecls(native_snapshot);
 }

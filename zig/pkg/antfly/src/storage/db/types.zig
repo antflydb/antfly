@@ -3992,11 +3992,14 @@ pub const IndexRepairWake = union(enum) {
     }
 };
 
-/// Exact data-Raft entry persisted atomically with one document mutation.
-pub const RaftAppliedEntryIdentity = struct {
+/// Exact ordered mutation receipt persisted atomically with primary effects.
+pub const OrderedApplyReceipt = struct {
     term: u64,
     index: u64,
 };
+
+/// Server source compatibility; the durable term/index encoding is unchanged.
+pub const RaftAppliedEntryIdentity = OrderedApplyReceipt;
 
 pub const ArtifactRepairResult = struct {
     scanned: u64 = 0,

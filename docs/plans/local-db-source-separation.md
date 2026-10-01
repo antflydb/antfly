@@ -41,6 +41,13 @@ translation live in `storage/server_db_adapter.zig`. Local receipt writes,
 source-pin recovery, snapshot pins, repair proofs, and range finalization retain
 their existing store transactions and apply fences.
 
+Native Raft snapshot wire transport lives in `raft/storage/native_snapshot.zig`
+and runs in the server Raft storage test suite. The physical DB exposes
+`OrderedApplyReceipt`, ordered mutation admission, and local snapshot document
+replacement, staging, and repair primitives. Existing server names remain
+source aliases; durable term/index bytes, persisted keys, and error identities
+remain unchanged.
+
 `storage/db/replication_ingress.zig`
 owns envelope decoding and temporary payload allocation. Apply receipts remain
 atomic with primary mutations and derived effects. The engine also owns record
@@ -83,6 +90,13 @@ resolve named imports against each target's actual `Build.Module` import tables.
 They retain unknown conditional branches and select only conditions proven by
 the target or its generated build options. Native public C API object compilation
 is independently available through `zig build embedded-capi-check`.
+
+Feature-disabled early returns exclude later statements only when the return
+is unconditional within its enclosing block. An unbraced runtime condition or
+loop cannot hide reachable imports. Generated Antfly modules are audited even
+when the compiler writes them outside the checkout. The build explicitly marks
+dependency-owned modules using their owning builder, and the audit retains
+their declared imports back into Antfly sources.
 
 `python3 zig/tools/check_embedded_isolated_build.py` stages the working source
 inputs with server coordination and private C API implementations replaced

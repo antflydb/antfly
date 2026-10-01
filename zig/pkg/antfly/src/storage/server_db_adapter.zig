@@ -17,7 +17,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("db/types.zig");
-const snapshots = @import("db/native_raft_snapshot.zig");
+const snapshots = @import("../raft/storage/native_snapshot.zig");
 
 fn physicalOwner(owner: anytype) if (@typeInfo(@TypeOf(owner.*)) == .pointer) @TypeOf(owner.*) else @TypeOf(owner) {
     return if (@typeInfo(@TypeOf(owner.*)) == .pointer) owner.* else owner;
@@ -39,7 +39,7 @@ pub fn applyOrdered(
     // admission, transform expansion, and derived-payload construction.
     // batchInternal repeats this check under the mutation lock, which is
     // the correctness fence if another caller advances the marker here.
-    if (try db.raftEntryAlreadyApplied(identity)) {
+    if (try db.orderedMutationAlreadyApplied(identity)) {
         // Admission commits its write fence before sealing the immutable
         // pin. A crash in that window must repair the exact pending cut
         // before this outer replay fast path acknowledges the entry.
@@ -53,7 +53,7 @@ pub fn applyOrdered(
         if (req.restore_staging) |command| if (command == .finish and
             (command.finish.phase == .validated or command.finish.phase == .published))
         {
-            const current = try db.raftAppliedEntry();
+            const current = try db.orderedApplyReceipt();
             if (current != null and current.?.index == identity.index and current.?.term == identity.term)
                 try db.recoverReplicatedRestoreFinish(command.finish);
         };

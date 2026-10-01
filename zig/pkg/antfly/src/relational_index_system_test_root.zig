@@ -10,7 +10,7 @@ test {
     _ = @import("storage/db/relational_row_transform_test.zig");
     _ = @import("storage/db/relational_rewrite_staging_test.zig");
     _ = @import("storage/db/merge_page_system_test.zig");
-    _ = @import("storage/db/native_raft_snapshot.zig");
+    _ = @import("raft/storage/native_snapshot.zig");
     _ = @import("storage/db/online_merge_receiver.zig");
     _ = @import("storage/db/online_merge_io.zig");
     _ = @import("storage/db/source_publication_job.zig");

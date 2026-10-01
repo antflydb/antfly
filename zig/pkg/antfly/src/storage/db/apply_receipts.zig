@@ -19,13 +19,13 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const docstore_mod = @import("../docstore.zig");
 const internal_keys = @import("../internal_keys.zig");
-pub const RaftAppliedEntryIdentity = @import("types.zig").RaftAppliedEntryIdentity;
+pub const OrderedApplyReceipt = @import("types.zig").OrderedApplyReceipt;
 
-pub const raft_applied_entry_value_len = 2 * @sizeOf(u64);
+pub const ordered_apply_receipt_value_len = 2 * @sizeOf(u64);
 
-pub fn raftAppliedEntryWrite(
-    identity: RaftAppliedEntryIdentity,
-    value_buf: *[raft_applied_entry_value_len]u8,
+pub fn orderedApplyReceiptWrite(
+    identity: OrderedApplyReceipt,
+    value_buf: *[ordered_apply_receipt_value_len]u8,
 ) docstore_mod.KVPair {
     std.mem.writeInt(u64, value_buf[0..8], identity.term, .little);
     std.mem.writeInt(u64, value_buf[8..16], identity.index, .little);
@@ -35,17 +35,17 @@ pub fn raftAppliedEntryWrite(
     };
 }
 
-pub fn readRaftAppliedEntry(
+pub fn readOrderedApplyReceipt(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
-) !?RaftAppliedEntryIdentity {
+) !?OrderedApplyReceipt {
     const raw = store.get(alloc, internal_keys.raft_document_applied_entry_key[0..]) catch |err| switch (err) {
         error.NotFound => return null,
         else => return err,
     };
     defer alloc.free(raw);
-    if (raw.len != raft_applied_entry_value_len) return error.CorruptRaftAppliedEntry;
-    const identity: RaftAppliedEntryIdentity = .{
+    if (raw.len != ordered_apply_receipt_value_len) return error.CorruptRaftAppliedEntry;
+    const identity: OrderedApplyReceipt = .{
         .term = std.mem.readInt(u64, raw[0..8], .little),
         .index = std.mem.readInt(u64, raw[8..16], .little),
     };
@@ -53,12 +53,12 @@ pub fn readRaftAppliedEntry(
     return identity;
 }
 
-pub const RaftAppliedEntryDisposition = enum { apply, already_applied };
+pub const OrderedApplyDisposition = enum { apply, already_applied };
 
-pub fn raftAppliedEntryDisposition(
-    persisted: ?RaftAppliedEntryIdentity,
-    incoming: RaftAppliedEntryIdentity,
-) !RaftAppliedEntryDisposition {
+pub fn orderedApplyDisposition(
+    persisted: ?OrderedApplyReceipt,
+    incoming: OrderedApplyReceipt,
+) !OrderedApplyDisposition {
     if (incoming.term == 0 or incoming.index == 0) return error.InvalidRaftAppliedEntry;
     const current = persisted orelse return .apply;
     if (current.index > incoming.index) return .already_applied;
@@ -88,9 +88,9 @@ pub fn readReplicationAppliedSequence(alloc: Allocator, store: *docstore_mod.Doc
 }
 
 test "storage.hot_standby apply receipts preserve independent Raft and HA encodings" {
-    var raft_buf: [raft_applied_entry_value_len]u8 = undefined;
+    var raft_buf: [ordered_apply_receipt_value_len]u8 = undefined;
     var replication_buf: [replication_applied_lsn_value_len]u8 = undefined;
-    const raft = raftAppliedEntryWrite(.{ .term = 0x0102030405060708, .index = 9 }, &raft_buf);
+    const raft = orderedApplyReceiptWrite(.{ .term = 0x0102030405060708, .index = 9 }, &raft_buf);
     const ha = replicationAppliedSequenceWrite(11, &replication_buf);
     try std.testing.expectEqualSlices(u8, &.{ 8, 7, 6, 5, 4, 3, 2, 1, 9, 0, 0, 0, 0, 0, 0, 0 }, raft.value);
     try std.testing.expectEqualSlices(u8, &.{ 11, 0, 0, 0, 0, 0, 0, 0 }, ha.value);
@@ -98,12 +98,20 @@ test "storage.hot_standby apply receipts preserve independent Raft and HA encodi
 }
 
 test "storage.hot_standby apply receipts reject conflicting identities without advancing progress" {
-    const current: RaftAppliedEntryIdentity = .{ .term = 3, .index = 11 };
-    try std.testing.expectEqual(RaftAppliedEntryDisposition.apply, try raftAppliedEntryDisposition(null, current));
-    try std.testing.expectEqual(RaftAppliedEntryDisposition.already_applied, try raftAppliedEntryDisposition(current, current));
-    try std.testing.expectEqual(RaftAppliedEntryDisposition.already_applied, try raftAppliedEntryDisposition(current, .{ .term = 2, .index = 10 }));
-    try std.testing.expectEqual(RaftAppliedEntryDisposition.apply, try raftAppliedEntryDisposition(current, .{ .term = 4, .index = 12 }));
-    try std.testing.expectError(error.ConflictingRaftAppliedEntry, raftAppliedEntryDisposition(current, .{ .term = 4, .index = 11 }));
-    try std.testing.expectError(error.InvalidRaftAppliedEntry, raftAppliedEntryDisposition(current, .{ .term = 0, .index = 12 }));
-    try std.testing.expectError(error.InvalidRaftAppliedEntry, raftAppliedEntryDisposition(null, .{ .term = 3, .index = 0 }));
+    const current: OrderedApplyReceipt = .{ .term = 3, .index = 11 };
+    try std.testing.expectEqual(OrderedApplyDisposition.apply, try orderedApplyDisposition(null, current));
+    try std.testing.expectEqual(OrderedApplyDisposition.already_applied, try orderedApplyDisposition(current, current));
+    try std.testing.expectEqual(OrderedApplyDisposition.already_applied, try orderedApplyDisposition(current, .{ .term = 2, .index = 10 }));
+    try std.testing.expectEqual(OrderedApplyDisposition.apply, try orderedApplyDisposition(current, .{ .term = 4, .index = 12 }));
+    try std.testing.expectError(error.ConflictingRaftAppliedEntry, orderedApplyDisposition(current, .{ .term = 4, .index = 11 }));
+    try std.testing.expectError(error.InvalidRaftAppliedEntry, orderedApplyDisposition(current, .{ .term = 0, .index = 12 }));
+    try std.testing.expectError(error.InvalidRaftAppliedEntry, orderedApplyDisposition(null, .{ .term = 3, .index = 0 }));
 }
+
+// Server source compatibility; storage keys, bytes and errors stay unchanged.
+pub const RaftAppliedEntryIdentity = OrderedApplyReceipt;
+pub const raft_applied_entry_value_len = ordered_apply_receipt_value_len;
+pub const raftAppliedEntryWrite = orderedApplyReceiptWrite;
+pub const readRaftAppliedEntry = readOrderedApplyReceipt;
+pub const RaftAppliedEntryDisposition = OrderedApplyDisposition;
+pub const raftAppliedEntryDisposition = orderedApplyDisposition;
