@@ -11281,6 +11281,7 @@ fn sortAndPageTextDocValueDocNumsAlloc(
         const source_profile = try loadMissingProjectedTextHitDocuments(alloc, effective_req, executor, out.hits);
         applyProjectedSourceLoadProfileToSortProfile(&out, source_profile);
         logBenchProjectedSourceLoadProfile(effective_req, plan, "text", source_profile);
+        try dropMissingStoredSearchHits(alloc, &out, "text");
     }
     return out;
 }
@@ -11574,6 +11575,7 @@ pub fn searchTextQuery(
                 const source_profile = try loadMissingProjectedTextHitDocuments(alloc, effective_req, executor, out.hits);
                 applyProjectedSourceLoadProfileToSortProfile(&out, source_profile);
                 logBenchProjectedSourceLoadProfile(effective_req, sorted_plan, "text", source_profile);
+                try dropMissingStoredSearchHits(alloc, &out, "text");
             }
             return out;
         }
@@ -11854,6 +11856,7 @@ pub fn searchTextQuery(
             const source_profile = try loadMissingProjectedTextHitDocuments(alloc, effective_req, executor, out.hits);
             applyProjectedSourceLoadProfileToSortProfile(&out, source_profile);
             logBenchProjectedSourceLoadProfile(effective_req, if (requires_field_sort) field_sort_plan else .{ .kind = .score_top_k }, "text", source_profile);
+            try dropMissingStoredSearchHits(alloc, &out, "text");
         }
         if (bench_query_profile) {
             std.log.info(
@@ -13323,8 +13326,18 @@ fn searchDenseInternal(
                 !unresolved_stored_filters;
             if (load_stored_before_postprocess) {
                 const load_profile_total_before = projected_source_profile.total_ns;
-                stored_data = try loadProjectedDenseDocumentWithProfile(alloc, postprocess_req, executor, doc_key, &projected_source_profile);
-                stored_data_owned = true;
+                // Orphaned posting (issue #929): the dense index still
+                // points at this doc key but its stored row is gone. Leave
+                // stored_data null; the hit is appended anyway and dropped
+                // later (once it is part of a types.SearchResult) by the
+                // shared loadMissingProjectedDenseHitDocuments +
+                // dropMissingStoredSearchHits pass instead of failing the
+                // whole query.
+                stored_data = loadProjectedDenseDocumentWithProfile(alloc, postprocess_req, executor, doc_key, &projected_source_profile) catch |err| switch (err) {
+                    error.StoredDocMissing => null,
+                    else => return err,
+                };
+                stored_data_owned = stored_data != null;
                 profile.load_projected_document_ns += projected_source_profile.total_ns - load_profile_total_before;
             }
             try hit_vector_ids.append(alloc, hit.vector_id);
@@ -13407,6 +13420,7 @@ fn searchDenseInternal(
             projected_source_profile.loaded_count += source_profile.loaded_count;
             projected_source_profile.batch_count += source_profile.batch_count;
             projected_source_profile.total_ns +|= source_profile.total_ns;
+            try dropMissingStoredSearchHits(alloc, &result, "dense");
         }
         profile.returned_hit_count = result.total_hits;
         profile.total_ns = platform_time.monotonicNs() - total_start;
@@ -14625,7 +14639,15 @@ fn loadMissingProjectedDenseHitDocuments(
     for (hits, 0..) |*hit, i| {
         if (hit.stored_data != null) continue;
         if (i % 1024 == 0) try checkSearchRequestDeadline(req);
-        hit.stored_data = try loadProjectedDenseDocumentWithProfile(alloc, req, executor, hit.id, &profile);
+        hit.stored_data = loadProjectedDenseDocumentWithProfile(alloc, req, executor, hit.id, &profile) catch |err| switch (err) {
+            // Orphaned posting (issue #929): leave stored_data null and let
+            // the caller drop this hit instead of failing the whole query.
+            error.StoredDocMissing => {
+                profile.missing_count += 1;
+                continue;
+            },
+            else => return err,
+        };
     }
     profile.total_ns = platform_time.monotonicNs() - start_ns;
     return profile;
@@ -15193,6 +15215,7 @@ pub fn searchSparse(
         if (postprocess_req.include_stored and !(chunk_backed and group_chunk_parents)) {
             projected_source_profile = try loadMissingProjectedSparseHitDocuments(alloc, postprocess_req, executor, result.hits);
             if (bench_query_profile) hit_build_ns += projected_source_profile.total_ns;
+            try dropMissingStoredSearchHits(alloc, &result, "sparse");
         }
         if (collect_sort_profile) {
             result.sort_profile = vectorScoreTopKSortProfile(req, collect_sort_profile, .exact, raw_hits.len, result.hits.len, platform_time.monotonicNs() - total_start_ns);
@@ -15259,10 +15282,17 @@ fn loadMissingProjectedSparseHitDocuments(
         for (hits, 0..) |*hit, i| {
             if (hit.stored_data != null) continue;
             if (i % 1024 == 0) try checkSearchRequestDeadline(req);
-            const stored = loaded[loaded_index] orelse return error.StoredDocMissing;
-            hit.stored_data = stored;
-            loaded[loaded_index] = null;
-            profile.loaded_count += 1;
+            if (loaded[loaded_index]) |stored| {
+                hit.stored_data = stored;
+                loaded[loaded_index] = null;
+                profile.loaded_count += 1;
+            } else {
+                // Orphaned posting: the sparse index still points at this
+                // doc key but its stored row is gone (issue #929). Leave
+                // stored_data null; the caller drops the hit instead of
+                // failing the whole query.
+                profile.missing_count += 1;
+            }
             loaded_index += 1;
         }
         profile.total_ns = platform_time.monotonicNs() - start_ns;
@@ -15272,7 +15302,15 @@ fn loadMissingProjectedSparseHitDocuments(
     for (hits, 0..) |*hit, i| {
         if (hit.stored_data != null) continue;
         if (i % 1024 == 0) try checkSearchRequestDeadline(req);
-        hit.stored_data = try executor.load_projected_document(executor.ctx, alloc, req, hit.id);
+        // Orphaned posting (issue #929): leave stored_data null and let the
+        // caller drop this hit instead of failing the whole query.
+        hit.stored_data = executor.load_projected_document(executor.ctx, alloc, req, hit.id) catch |err| switch (err) {
+            error.StoredDocMissing => {
+                profile.missing_count += 1;
+                continue;
+            },
+            else => return err,
+        };
         profile.loaded_count += 1;
         profile.batch_count += 1;
     }
@@ -15292,7 +15330,32 @@ const ProjectedSourceLoadProfile = struct {
     loaded_count: usize = 0,
     batch_count: usize = 0,
     total_ns: u64 = 0,
+    /// Count of requested hits whose stored document could not be loaded
+    /// (issue #929: an orphaned posting with no backing stored row). These
+    /// hits are left with `stored_data == null` and are dropped from the
+    /// result by `dropMissingStoredSearchHits`/
+    /// `result_shape.dropSearchHitsWithMissingStoredData` rather than
+    /// failing the whole query.
+    missing_count: usize = 0,
 };
+
+/// Drops hits left with `stored_data == null` after a projected-source
+/// hydration pass and logs once (at warn level) if anything was dropped.
+/// This is the single call-site-facing entry point for issue #929's
+/// query-side defense: every `loadMissingProjected*` loader now leaves an
+/// orphaned posting's hit with `stored_data == null` instead of failing the
+/// whole query, and every caller that hydrates a `types.SearchResult` in
+/// place calls this immediately afterward so `result.hits`/`total_hits`
+/// stay consistent with what was actually returned.
+fn dropMissingStoredSearchHits(alloc: Allocator, result: *types.SearchResult, source: []const u8) !void {
+    const dropped = try result_shape.dropSearchHitsWithMissingStoredData(alloc, result);
+    if (dropped > 0) {
+        std.log.warn(
+            "antfly_search_dropped_missing_stored_hits source={s} dropped={d} remaining={d}",
+            .{ source, dropped, result.hits.len },
+        );
+    }
+}
 
 fn logBenchProjectedSourceLoadProfile(
     req: types.SearchRequest,
@@ -15363,9 +15426,16 @@ fn loadMissingProjectedHitBatches(
         try checkSearchRequestDeadline(req);
         if (loaded.len != count) return error.InvalidSearchResult;
         for (loaded, positions[0..count]) |*value, position| {
-            hits[position].stored_data = value.* orelse return error.StoredDocMissing;
-            value.* = null;
-            profile.loaded_count += 1;
+            if (value.*) |stored| {
+                hits[position].stored_data = stored;
+                value.* = null;
+                profile.loaded_count += 1;
+            } else {
+                // Orphaned posting: no backing stored row for this key
+                // (issue #929). Leave stored_data null; the caller drops
+                // the hit instead of failing the whole query.
+                profile.missing_count += 1;
+            }
         }
     }
     profile.total_ns = platform_time.monotonicNs() - start_ns;
@@ -15417,13 +15487,26 @@ fn loadMissingProjectedHitDocuments(
     for (hits, 0..) |*hit, i| {
         if (hit.stored_data != null) continue;
         if (i % 1024 == 0) try checkSearchRequestDeadline(req);
-        hit.stored_data = if (comptime @hasField(@TypeOf(executor), "load_projected_document"))
-            try executor.load_projected_document(executor.ctx, alloc, req, hit.id)
-        else blk: {
-            const stored = (try executor.load_stored(executor.ctx, alloc, hit.id)) orelse return error.StoredDocMissing;
+        // Orphaned posting (issue #929): the index still points at this
+        // key but its stored row is gone. Leave stored_data null and count
+        // it as missing instead of failing the whole query; the caller
+        // drops these hits.
+        if (comptime @hasField(@TypeOf(executor), "load_projected_document")) {
+            hit.stored_data = executor.load_projected_document(executor.ctx, alloc, req, hit.id) catch |err| switch (err) {
+                error.StoredDocMissing => {
+                    profile.missing_count += 1;
+                    continue;
+                },
+                else => return err,
+            };
+        } else {
+            const stored = (try executor.load_stored(executor.ctx, alloc, hit.id)) orelse {
+                profile.missing_count += 1;
+                continue;
+            };
             defer alloc.free(stored);
-            break :blk try executor.project_stored_search(executor.ctx, alloc, req, hit.id, stored);
-        };
+            hit.stored_data = try executor.project_stored_search(executor.ctx, alloc, req, hit.id, stored);
+        }
         profile.loaded_count += 1;
         profile.batch_count += 1;
     }
@@ -16540,6 +16623,7 @@ fn sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
         const source_profile = try loadMissingProjectedMatchAllHitDocuments(alloc, effective_req, executor, out.hits);
         applyProjectedSourceLoadProfileToSortProfile(&out, source_profile);
         logBenchProjectedSourceLoadProfile(effective_req, plan, "match_all", source_profile);
+        try dropMissingStoredSearchHits(alloc, &out, "match_all");
     }
     return out;
 }
@@ -16919,6 +17003,7 @@ pub fn searchMatchAll(
                 const source_profile = try loadMissingProjectedMatchAllHitDocuments(alloc, postprocess_req, executor, out.hits);
                 applyProjectedSourceLoadProfileToSortProfile(&out, source_profile);
                 logBenchProjectedSourceLoadProfile(postprocess_req, planned_sort, "match_all", source_profile);
+                try dropMissingStoredSearchHits(alloc, &out, "match_all");
             }
             return out;
         }
@@ -16931,6 +17016,7 @@ pub fn searchMatchAll(
             const source_profile = try loadMissingProjectedMatchAllHitDocuments(alloc, postprocess_req, executor, out.hits);
             applyProjectedSourceLoadProfileToSortProfile(&out, source_profile);
             logBenchProjectedSourceLoadProfile(postprocess_req, planned_sort, "match_all", source_profile);
+            try dropMissingStoredSearchHits(alloc, &out, "match_all");
         }
         return out;
     }
@@ -16991,6 +17077,7 @@ pub fn searchMatchAll(
             const source_profile = try loadMissingProjectedMatchAllHitDocuments(alloc, postprocess_req, executor, out.hits);
             applyProjectedSourceLoadProfileToSortProfile(&out, source_profile);
             logBenchProjectedSourceLoadProfile(postprocess_req, planned_sort, "match_all", source_profile);
+            try dropMissingStoredSearchHits(alloc, &out, "match_all");
         }
         return out;
     }
@@ -17094,6 +17181,7 @@ pub fn searchMatchAll(
                 const source_profile = try loadMissingProjectedMatchAllHitDocuments(alloc, postprocess_req, executor, filtered.hits);
                 applyProjectedSourceLoadProfileToSortProfile(&filtered, source_profile);
                 logBenchProjectedSourceLoadProfile(postprocess_req, sort_plan, "match_all", source_profile);
+                try dropMissingStoredSearchHits(alloc, &filtered, "match_all");
             }
             return filtered;
         }
@@ -17103,6 +17191,7 @@ pub fn searchMatchAll(
         errdefer paged.deinit();
         if (postprocess_req.include_stored) {
             _ = try loadMissingProjectedMatchAllHitDocuments(alloc, postprocess_req, executor, paged.hits);
+            try dropMissingStoredSearchHits(alloc, &paged, "match_all");
         }
         return paged;
     }
@@ -17125,6 +17214,7 @@ pub fn searchMatchAll(
             const source_profile = try loadMissingProjectedMatchAllHitDocuments(alloc, postprocess_req, executor, out.hits);
             applyProjectedSourceLoadProfileToSortProfile(&out, source_profile);
             logBenchProjectedSourceLoadProfile(postprocess_req, sort_plan, "match_all", source_profile);
+            try dropMissingStoredSearchHits(alloc, &out, "match_all");
         }
         return out;
     }
@@ -17165,6 +17255,7 @@ pub fn searchMatchAll(
     errdefer out.deinit();
     if (postprocess_req.include_stored) {
         _ = try loadMissingProjectedMatchAllHitDocuments(alloc, postprocess_req, executor, out.hits);
+        try dropMissingStoredSearchHits(alloc, &out, "match_all");
     }
     return out;
 }
@@ -19837,7 +19928,18 @@ const TestMatchAllCtx = struct {
     projected_load_count: ?*usize = null,
     projected_batch_count: ?*usize = null,
     projected_batch_doc_count: ?*usize = null,
+    /// Issue #929: ids in this set simulate an orphaned posting whose
+    /// stored document row is gone; the projected-document loaders return
+    /// it as missing (null) instead of a value.
+    missing_ids: []const []const u8 = &.{},
 };
+
+fn testMatchAllCtxIdIsMissing(test_ctx: *const TestMatchAllCtx, id: []const u8) bool {
+    for (test_ctx.missing_ids) |missing_id| {
+        if (std.mem.eql(u8, missing_id, id)) return true;
+    }
+    return false;
+}
 
 fn testCollectMatchAllCandidatesCallback(
     ctx: ?*anyopaque,
@@ -19975,6 +20077,7 @@ fn testMatchAllLoadProjectedCallback(
     const test_ctx: *const TestMatchAllCtx = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
     const counter = test_ctx.projected_load_count orelse return error.UnexpectedTestCall;
     counter.* += 1;
+    if (testMatchAllCtxIdIsMissing(test_ctx, key)) return error.StoredDocMissing;
     return try std.fmt.allocPrint(alloc, "{{\"id\":\"{s}\"}}", .{key});
 }
 
@@ -19998,7 +20101,10 @@ fn testMatchAllLoadProjectedManyCallback(
     }
     _ = req;
     for (keys, 0..) |key, i| {
-        out[i] = try std.fmt.allocPrint(alloc, "{{\"id\":\"{s}\"}}", .{key});
+        out[i] = if (testMatchAllCtxIdIsMissing(test_ctx, key))
+            null
+        else
+            try std.fmt.allocPrint(alloc, "{{\"id\":\"{s}\"}}", .{key});
         initialized += 1;
     }
     return out;
@@ -25434,6 +25540,141 @@ test "text score query exposes score top k sort profile" {
     try std.testing.expectEqualStrings("{\"body\":\"primary:doc:a\"}", source_result.hits[0].stored_data.?);
 }
 
+test "text query drops hits with missing stored documents and lowers total_hits" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/text-missing-stored-drop", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+
+    // Both docs match the "alpha" term so the query produces two hits
+    // before hydration; doc:b's stored row is then reported missing below
+    // to simulate the issue #929 orphaned-posting scenario (a chunk
+    // enrichment delete/reprocess removed the KV row but not the posting).
+    const text_fields_alpha = [_]introducer_mod.TextField{.{ .field_name = "body", .text = "alpha" }};
+    const docs = [_]introducer_mod.TextDocument{
+        .{
+            .id = "doc:a",
+            .stored_data = "{\"body\":\"alpha\"}",
+            .text_fields = &text_fields_alpha,
+            .doc_ordinal = 101,
+        },
+        .{
+            .id = "doc:b",
+            .stored_data = "{\"body\":\"alpha\"}",
+            .text_fields = &text_fields_alpha,
+            .doc_ordinal = 102,
+        },
+    };
+    const segment = try introducer_mod.buildSegmentFromTextWithAnalysisOptions(alloc, &docs, &analysis_mod.default_analyzer, .{}, .{});
+    defer alloc.free(segment);
+    try persistent.writer.addSegment(segment);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = .{},
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    const Harness = struct {
+        text_entry: *index_manager_mod.IndexManager.TextIndex,
+
+        fn textIndexEntry(
+            ctx: ?*anyopaque,
+            _: ?[]const u8,
+        ) anyerror!?*index_manager_mod.IndexManager.TextIndex {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return self.text_entry;
+        }
+
+        fn textIndexIsChunkBacked(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: ?[]const u8,
+        ) anyerror!bool {
+            return false;
+        }
+
+        fn searchMatchAll(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+        ) anyerror!types.SearchResult {
+            return error.UnexpectedTestCall;
+        }
+
+        fn projectStoredSearch(
+            _: ?*anyopaque,
+            project_alloc: Allocator,
+            _: types.SearchRequest,
+            _: []const u8,
+            raw: []const u8,
+        ) anyerror![]u8 {
+            return try project_alloc.dupe(u8, raw);
+        }
+
+        fn loadStored(
+            _: ?*anyopaque,
+            load_alloc: Allocator,
+            key: []const u8,
+        ) anyerror!?[]u8 {
+            // doc:b's stored row is gone (orphaned posting); everything
+            // else loads normally.
+            if (std.mem.eql(u8, key, "doc:b")) return null;
+            return try std.fmt.allocPrint(load_alloc, "{{\"body\":\"primary:{s}\"}}", .{key});
+        }
+
+        fn postprocess(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            result: types.SearchResult,
+            _: bool,
+        ) anyerror!types.SearchResult {
+            return result;
+        }
+    };
+
+    var harness = Harness{ .text_entry = &text_entry };
+    var result = try searchTextQuery(alloc, .{
+        .index_name = "ft",
+        .include_stored = true,
+        .limit = 10,
+    }, .{ .term = .{ .field = "body", .term = "alpha" } }, .{
+        .ctx = &harness,
+        .text_index_entry = Harness.textIndexEntry,
+        .text_index_is_chunk_backed = Harness.textIndexIsChunkBacked,
+        .search_match_all = Harness.searchMatchAll,
+        .project_stored_search = Harness.projectStoredSearch,
+        .load_stored = Harness.loadStored,
+        .postprocess = Harness.postprocess,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+    try std.testing.expectEqualStrings("{\"body\":\"primary:doc:a\"}", result.hits[0].stored_data.?);
+}
+
 test "text ordered query rejects unresolved stored pattern filters" {
     const alloc = std.testing.allocator;
 
@@ -27141,7 +27382,17 @@ test "text projected source batch preserves selection and cleans up failed hydra
                     _ = try loadMissingProjectedTextHitDocuments(alloc, .{}, executor, &hits);
                     try std.testing.expectEqual(@as(usize, 1), harness.calls);
                 },
-                .missing => try std.testing.expectError(error.StoredDocMissing, result),
+                .missing => {
+                    // Issue #929: an orphaned posting (no backing stored
+                    // row) leaves that hit's stored_data null instead of
+                    // failing the whole batch; the rest load normally.
+                    const profile = try result;
+                    try std.testing.expectEqual(@as(usize, 1), profile.loaded_count);
+                    try std.testing.expectEqual(@as(usize, 1), profile.missing_count);
+                    try std.testing.expectEqualStrings("already projected", hits[0].stored_data.?);
+                    try std.testing.expectEqualStrings("projected:doc:c", hits[1].stored_data.?);
+                    try std.testing.expect(hits[2].stored_data == null);
+                },
                 .invalid_count => try std.testing.expectError(error.InvalidSearchResult, result),
                 .expired => {
                     try std.testing.expectError(error.Timeout, result);
@@ -27277,13 +27528,26 @@ test "projected source batches clean up malformed missing and failed loads" {
         var harness = mode;
         var hits = [_]types.SearchHit{ .{ .id = @constCast("a") }, .{ .id = @constCast("b") } };
         defer for (hits) |hit| if (hit.stored_data) |value| alloc.free(value);
-        const expected = switch (mode.mode) {
-            .short => error.InvalidSearchResult,
-            .missing => error.StoredDocMissing,
-            .failure => error.InjectedFailure,
-        };
-        try std.testing.expectError(expected, loadMissingProjectedHitBatches(alloc, .{}, &harness, Harness.load, &hits));
-        try std.testing.expect(hits[1].stored_data == null);
+        switch (mode.mode) {
+            .short => {
+                try std.testing.expectError(error.InvalidSearchResult, loadMissingProjectedHitBatches(alloc, .{}, &harness, Harness.load, &hits));
+                try std.testing.expect(hits[1].stored_data == null);
+            },
+            .failure => {
+                try std.testing.expectError(error.InjectedFailure, loadMissingProjectedHitBatches(alloc, .{}, &harness, Harness.load, &hits));
+                try std.testing.expect(hits[1].stored_data == null);
+            },
+            .missing => {
+                // Issue #929: an orphaned posting (no backing stored row)
+                // leaves that hit's stored_data null instead of failing
+                // the whole batch.
+                const profile = try loadMissingProjectedHitBatches(alloc, .{}, &harness, Harness.load, &hits);
+                try std.testing.expectEqual(@as(usize, 1), profile.loaded_count);
+                try std.testing.expectEqual(@as(usize, 1), profile.missing_count);
+                try std.testing.expectEqualStrings("a", hits[0].stored_data.?);
+                try std.testing.expect(hits[1].stored_data == null);
+            },
+        }
     }
 }
 
@@ -29315,6 +29579,39 @@ test "match_all unordered source loads selected hits through projected batch" {
     try std.testing.expectEqual(@as(usize, 0), projected_load_count);
     try std.testing.expectEqual(@as(usize, 1), projected_batch_count);
     try std.testing.expectEqual(@as(usize, 1), projected_batch_doc_count);
+}
+
+test "match_all drops hits with missing stored documents and lowers total_hits" {
+    const alloc = std.testing.allocator;
+    var projected_batch_count: usize = 0;
+    var projected_batch_doc_count: usize = 0;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c" },
+        .ordinals = &.{ 1, 2, 3 },
+        .projected_batch_count = &projected_batch_count,
+        .projected_batch_doc_count = &projected_batch_doc_count,
+        // Issue #929: doc:b's full-text posting survived an orphaned chunk
+        // delete, but its stored row is gone.
+        .missing_ids = &.{"doc:b"},
+    };
+
+    var executor = testMatchAllExecutor(&ctx);
+    executor.live_filter_doc_set = null;
+    var result = try searchMatchAll(alloc, .{
+        .include_stored = true,
+        .limit = 10,
+    }, executor);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+    try std.testing.expect(result.hits[0].stored_data != null);
+    try std.testing.expectEqualStrings("doc:c", result.hits[1].id);
+    try std.testing.expect(result.hits[1].stored_data != null);
+    try std.testing.expectEqual(@as(usize, 1), projected_batch_count);
+    try std.testing.expectEqual(@as(usize, 3), projected_batch_doc_count);
 }
 
 test "match_all rejects invalid sort cursor contract" {

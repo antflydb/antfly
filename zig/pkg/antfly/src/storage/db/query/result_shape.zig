@@ -236,6 +236,45 @@ fn rewriteLocalTotalAfterObservedDrop(result: *types.SearchResult, source: types
     rewriteLocalTotal(result, source, original_hits_len, local_total);
 }
 
+/// Drops hits whose `stored_data` is still `null` after a projected-source
+/// hydration pass (issue #929: an orphaned full-text/sparse/dense posting
+/// pointing at a stored document row that no longer exists). Callers must
+/// only invoke this immediately after a hydration pass that is expected to
+/// have populated every hit's `stored_data` when present; any hit still
+/// carrying a `null` at that point is treated as a permanently missing
+/// stored document rather than a transient/uninitialized state, and is
+/// dropped from the result (with `total_hits` adjusted the same way
+/// `filterVisibleSearchResult` and the dedupe helpers already do). Returns
+/// the number of hits dropped so callers can log it once per query.
+pub fn dropSearchHitsWithMissingStoredData(alloc: Allocator, result: *types.SearchResult) !usize {
+    var dropped: usize = 0;
+    for (result.hits) |hit| {
+        if (hit.stored_data == null) dropped += 1;
+    }
+    if (dropped == 0) return 0;
+
+    const source = result.*;
+    const original_hits_len = result.hits.len;
+    var kept = try std.ArrayListUnmanaged(types.SearchHit).initCapacity(alloc, original_hits_len - dropped);
+    errdefer {
+        for (kept.items) |*hit| hit.deinit(alloc);
+        kept.deinit(alloc);
+    }
+
+    for (result.hits) |*hit| {
+        if (hit.stored_data == null) {
+            hit.deinit(alloc);
+        } else {
+            kept.appendAssumeCapacity(hit.*);
+        }
+    }
+
+    alloc.free(result.hits);
+    result.hits = try kept.toOwnedSlice(alloc);
+    rewriteLocalTotalAfterObservedDrop(result, source, original_hits_len, result.hits.len);
+    return dropped;
+}
+
 pub fn dedupeSearchHitsById(alloc: Allocator, result: *types.SearchResult) !void {
     if (allHitsHaveDocOrdinals(result.hits)) return try dedupeSearchHitsByOrdinal(alloc, result);
 
@@ -2016,6 +2055,74 @@ test "dedupeSearchHitsById uses ordinals when hit page is complete" {
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 1), result.hits[0].doc_ordinal);
     try std.testing.expectEqualStrings("doc:b", result.hits[1].id);
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 2), result.hits[1].doc_ordinal);
+}
+
+test "dropSearchHitsWithMissingStoredData drops orphaned postings and rewrites total_hits" {
+    const alloc = std.testing.allocator;
+
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = try alloc.alloc(types.SearchHit, 3),
+        .total_hits = 3,
+    };
+    defer result.deinit();
+    result.hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .stored_data = try alloc.dupe(u8, "{}") };
+    // Issue #929: the posting for doc:b survived an orphaned chunk delete
+    // but its stored row is gone, so the hydration pass leaves stored_data
+    // null for it.
+    result.hits[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .stored_data = null };
+    result.hits[2] = .{ .id = try alloc.dupe(u8, "doc:c"), .stored_data = try alloc.dupe(u8, "{}") };
+
+    const dropped = try dropSearchHitsWithMissingStoredData(alloc, &result);
+
+    try std.testing.expectEqual(@as(usize, 1), dropped);
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:c", result.hits[1].id);
+}
+
+test "dropSearchHitsWithMissingStoredData is a no-op when nothing is missing" {
+    const alloc = std.testing.allocator;
+
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = try alloc.alloc(types.SearchHit, 2),
+        .total_hits = 2,
+    };
+    defer result.deinit();
+    result.hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .stored_data = try alloc.dupe(u8, "{}") };
+    result.hits[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .stored_data = try alloc.dupe(u8, "{}") };
+    const hits_ptr = result.hits.ptr;
+
+    const dropped = try dropSearchHitsWithMissingStoredData(alloc, &result);
+
+    try std.testing.expectEqual(@as(usize, 0), dropped);
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(hits_ptr, result.hits.ptr);
+}
+
+test "dropSearchHitsWithMissingStoredData keeps an approximate total approximate" {
+    const alloc = std.testing.allocator;
+
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = try alloc.alloc(types.SearchHit, 2),
+        .total_hits = 100,
+        .total_hits_relation = .gte,
+    };
+    defer result.deinit();
+    result.hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .stored_data = null };
+    result.hits[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .stored_data = try alloc.dupe(u8, "{}") };
+
+    const dropped = try dropSearchHitsWithMissingStoredData(alloc, &result);
+
+    try std.testing.expectEqual(@as(usize, 1), dropped);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.gte, result.total_hits_relation);
 }
 
 test "exact-id dedupe preserves distinct chunks sharing a parent ordinal" {

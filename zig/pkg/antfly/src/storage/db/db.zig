@@ -80481,7 +80481,6 @@ test "db vector indexes combine direct document and chunk-backed artifact source
         .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 3 } },
         .limit = 3,
         .search_effort = 1.0,
-        .return_mode = .member,
     });
     defer dense_members.deinit();
     try std.testing.expectEqual(@as(usize, 3), dense_members.hits.len);
@@ -80543,7 +80542,6 @@ test "db vector indexes combine direct document and chunk-backed artifact source
         .query = .{ .sparse_knn = .{ .indices = &.{1}, .values = &.{1.0}, .k = 3 } },
         .limit = 3,
         .search_effort = 1.0,
-        .return_mode = .member,
     });
     defer sparse_members.deinit();
     try std.testing.expectEqual(@as(usize, 3), sparse_members.hits.len);
@@ -96092,7 +96090,6 @@ test "db direct generated chunks feed multi-source text and graph indexes" {
     var text_result = try db.search(alloc, .{
         .index_name = "selected_text",
         .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
-        .return_mode = .member,
     });
     defer text_result.deinit();
     try std.testing.expectEqual(@as(u32, 1), text_result.total_hits);
@@ -96166,7 +96163,6 @@ test "db member-mode chunk hits filter through the parent row on the full-text a
     var unfiltered = try db.search(alloc, .{
         .index_name = "selected_text",
         .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
-        .return_mode = .member,
     });
     defer unfiltered.deinit();
     try std.testing.expectEqual(@as(u32, 2), unfiltered.total_hits);
@@ -96174,7 +96170,6 @@ test "db member-mode chunk hits filter through the parent row on the full-text a
     var included = try db.search(alloc, .{
         .index_name = "selected_text",
         .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
-        .return_mode = .member,
         .filter_query_json = "{\"term\":{\"category\":\"keep\"}}",
     });
     defer included.deinit();
@@ -96185,7 +96180,6 @@ test "db member-mode chunk hits filter through the parent row on the full-text a
     var excluded = try db.search(alloc, .{
         .index_name = "selected_text",
         .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
-        .return_mode = .member,
         .exclusion_query_json = "{\"term\":{\"category\":\"keep\"}}",
     });
     defer excluded.deinit();
@@ -96238,7 +96232,6 @@ test "db member-mode chunk hits apply query.bool.filter/must_not against the par
     var included = try db.search(alloc, .{
         .index_name = "selected_text",
         .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
-        .return_mode = .member,
         .filter_text = .{ .term = .{ .field = "category", .term = "keep" } },
     });
     defer included.deinit();
@@ -96249,7 +96242,6 @@ test "db member-mode chunk hits apply query.bool.filter/must_not against the par
     var excluded = try db.search(alloc, .{
         .index_name = "selected_text",
         .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
-        .return_mode = .member,
         .exclusion_text = .{ .term = .{ .field = "category", .term = "keep" } },
     });
     defer excluded.deinit();
@@ -96263,7 +96255,6 @@ test "db member-mode chunk hits apply query.bool.filter/must_not against the par
     try std.testing.expectError(error.UnsupportedQueryRequest, db.search(alloc, .{
         .index_name = "selected_text",
         .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
-        .return_mode = .member,
         .filter_text = .{ .match = .{ .field = "category", .text = "keep" } },
     }));
 }
@@ -96311,7 +96302,6 @@ test "db member-mode chunk hits apply query.bool.filter/must_not against the par
     var unfiltered = try db.search(alloc, .{
         .index_name = "dv_v1",
         .dense = .{ .vector = query_vec, .k = 10 },
-        .return_mode = .member,
     });
     defer unfiltered.deinit();
     try std.testing.expectEqual(@as(u32, 6), unfiltered.total_hits);
@@ -96319,7 +96309,6 @@ test "db member-mode chunk hits apply query.bool.filter/must_not against the par
     var included = try db.search(alloc, .{
         .index_name = "dv_v1",
         .dense = .{ .vector = query_vec, .k = 10 },
-        .return_mode = .member,
         .filter_text = .{ .term = .{ .field = "category", .term = "keep" } },
     });
     defer included.deinit();
@@ -96329,7 +96318,6 @@ test "db member-mode chunk hits apply query.bool.filter/must_not against the par
     var excluded = try db.search(alloc, .{
         .index_name = "dv_v1",
         .dense = .{ .vector = query_vec, .k = 10 },
-        .return_mode = .member,
         .exclusion_text = .{ .term = .{ .field = "category", .term = "keep" } },
     });
     defer excluded.deinit();
@@ -96721,7 +96709,6 @@ test "db multi-source full text unions chunk and textual asset streams across de
         var chunk_match = try waitForSearchResult(alloc, &db, .{
             .index_name = "document_text",
             .full_text = .{ .match = .{ .field = "body", .text = "chunkonlytoken" } },
-            .return_mode = .member,
         }, 1);
         defer chunk_match.deinit();
         try std.testing.expectEqual(@as(usize, 1), chunk_match.hits.len);
@@ -96731,7 +96718,6 @@ test "db multi-source full text unions chunk and textual asset streams across de
         var asset_match = try waitForSearchResult(alloc, &db, .{
             .index_name = "document_text",
             .full_text = .{ .match = .{ .field = "summary", .text = "assetonlytoken" } },
-            .return_mode = .member,
         }, 1);
         defer asset_match.deinit();
         try std.testing.expectEqual(@as(usize, 1), asset_match.hits.len);
@@ -96741,7 +96727,6 @@ test "db multi-source full text unions chunk and textual asset streams across de
         var members = try waitForSearchResult(alloc, &db, .{
             .index_name = "document_text",
             .full_text = .{ .match_all = {} },
-            .return_mode = .member,
             .limit = 10,
         }, 2);
         defer members.deinit();
@@ -96787,7 +96772,6 @@ test "db multi-source full text unions chunk and textual asset streams across de
             .index_name = "document_text",
             .full_text = .{ .match = .{ .field = "body", .text = "chunkonlytoken" } },
             .filter_prefix = "doc:a",
-            .return_mode = .member,
             .limit = 10,
         }, 1);
         defer prefixed_text.deinit();
@@ -96801,7 +96785,6 @@ test "db multi-source full text unions chunk and textual asset streams across de
                 .query = .{ .match = .{ .field = "body", .text = "chunkonlytoken" } },
             }},
             .filter_prefix = "doc:a",
-            .return_mode = .member,
             .limit = 10,
         }, 1);
         defer prefixed_composed_text.deinit();
@@ -96829,7 +96812,6 @@ test "db multi-source full text unions chunk and textual asset streams across de
         var removed_match = try db.search(alloc, .{
             .index_name = "document_text",
             .full_text = .{ .match = .{ .field = "summary", .text = "assetonlytoken" } },
-            .return_mode = .member,
         });
         defer removed_match.deinit();
         try std.testing.expectEqual(@as(u32, 0), removed_match.total_hits);
@@ -96837,7 +96819,6 @@ test "db multi-source full text unions chunk and textual asset streams across de
         var after_delete = try waitForSearchResult(alloc, &db, .{
             .index_name = "document_text",
             .full_text = .{ .match_all = {} },
-            .return_mode = .member,
             .limit = 10,
         }, 1);
         defer after_delete.deinit();
@@ -96852,7 +96833,6 @@ test "db multi-source full text unions chunk and textual asset streams across de
     var recovered = try waitForSearchResult(alloc, &reopened, .{
         .index_name = "document_text",
         .full_text = .{ .match_all = {} },
-        .return_mode = .member,
         .limit = 10,
     }, 1);
     defer recovered.deinit();
@@ -105830,6 +105810,109 @@ test "db document extraction skips stable unit local rewrites while replaying fu
     try std.testing.expectEqualStrings("doc:a", chunk_unit_result.hits[0].artifact_ref.?.document_id);
     try std.testing.expectEqualStrings("document_units_v1", chunk_unit_result.hits[0].artifact_ref.?.name);
     try std.testing.expectEqualStrings("document:000001", chunk_unit_result.hits[0].artifact_ref.?.unit_id.?);
+}
+
+test "db query drops full text hits whose stored document row was deleted directly from the store" {
+    // Issue #929: deleting a chunk enrichment and reprocessing (or a crash
+    // mid-purge) can leave a full-text posting pointing at a stored-document
+    // key whose row is gone -- the write-side fix in this checkout stops
+    // *new* orphans from the enrichment-delete-then-reprocess path, but the
+    // query side must still tolerate any orphaned posting that already
+    // exists (e.g. from a crash, or a store mutated out of band) by
+    // dropping the affected hit instead of failing the whole query with
+    // StoredDocMissing/500, exactly as the issue's own repro observed for
+    // plain row-level queries and match_all. Simulate that end state
+    // directly on a plain (non-chunk) table: delete a row's stored KV entry
+    // out from under its own full-text posting, then assert queries that
+    // would have hit it still succeed with reduced, correct results.
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_rows",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha beta gamma\"}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"alpha delta epsilon\"}" },
+        },
+        .sync_level = .full_index,
+    });
+    try db.runUntilIdle();
+
+    // Sanity check: both rows are searchable before one goes missing.
+    var before_term = try db.search(alloc, .{
+        .index_name = "ft_rows",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .include_stored = true,
+        .limit = 10,
+    });
+    defer before_term.deinit();
+    try std.testing.expectEqual(@as(u32, 2), before_term.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), before_term.hits.len);
+
+    const orphaned_doc_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+    defer alloc.free(orphaned_doc_key);
+    // Confirm the row exists before deleting it, so a failure to delete
+    // doesn't silently make this test pass for the wrong reason.
+    {
+        var probe = try db.core.store.beginProbeTxn();
+        defer probe.abort();
+        _ = try probe.get(orphaned_doc_key);
+    }
+    // Delete the KV row directly, bypassing db.batch's normal delete path
+    // entirely -- the posting for "doc:a" in ft_rows now has no backing
+    // stored row, the same end state left by #929's enrichment-delete +
+    // reprocess sequence (or a crash mid-purge).
+    try db.core.store.delete(orphaned_doc_key);
+
+    // A term unique to the now-orphaned row must come back empty, not fail
+    // the query (matches the issue's `query {"query": "harbor"} -> 500`).
+    var unique_term = try db.search(alloc, .{
+        .index_name = "ft_rows",
+        .full_text = .{ .match = .{ .field = "body", .text = "beta" } },
+        .include_stored = true,
+        .limit = 10,
+    });
+    defer unique_term.deinit();
+    try std.testing.expectEqual(@as(u32, 0), unique_term.total_hits);
+    try std.testing.expectEqual(@as(usize, 0), unique_term.hits.len);
+
+    // A term shared by both rows must drop only the orphaned hit and adjust
+    // total_hits, not fail the whole query.
+    var shared_term = try db.search(alloc, .{
+        .index_name = "ft_rows",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .include_stored = true,
+        .limit = 10,
+    });
+    defer shared_term.deinit();
+    try std.testing.expectEqual(@as(u32, 1), shared_term.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), shared_term.hits.len);
+    try std.testing.expectEqualStrings("doc:b", shared_term.hits[0].id);
+
+    // match_all must also drop the orphaned hit rather than 500 (the
+    // issue's own repro: `match_all` failed too, not just term queries).
+    var all_result = try db.search(alloc, .{
+        .index_name = "ft_rows",
+        .full_text = .{ .match_all = {} },
+        .include_stored = true,
+        .limit = 10,
+    });
+    defer all_result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), all_result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), all_result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", all_result.hits[0].id);
 }
 
 test "db materialized dense enrichment survives artifact write list growth" {
