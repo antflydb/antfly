@@ -950,7 +950,12 @@ pub const Scenario = struct {
                 // has a deeper synchronous frame chain than focused suites.
                 // Match a conventional native main-thread stack so VOPR does
                 // not turn ordinary production stack use into a fiber fault.
-                .tasks = .{ .stack_size = 8 * 1024 * 1024 },
+                // 8 MiB overflowed under Debug codegen on the equivalent
+                // single-DataServer Raft-merge campaign; this composition is
+                // deeper still (metadata quorum, three API nodes, a
+                // serverless worker), so use the same 32 MiB headroom as the
+                // other production-shaped VOPR configs.
+                .tasks = .{ .stack_size = 32 * 1024 * 1024 },
                 .network = .{ .max_sockets = 96, .stream_capacity = 256 * 1024 },
                 .files = .{ .capacity_bytes = 64 * 1024 * 1024 },
                 .instrumentation = .{ .enabled = false, .map_digest = 0x4655_4c4c },

@@ -31875,7 +31875,10 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
 
     var vopr_io = try vopr.vopr_io.VoprIo.init(.{
         .seed = 0x4d55_4c54_4944_4154,
-        .tasks = .{ .stack_size = 8 * 1024 * 1024 },
+        // Three full DataServers replicating a Raft merge/split is a
+        // strictly larger version of the single-server campaign below; see
+        // the matching comment there for why 8 MiB overflowed under Debug.
+        .tasks = .{ .stack_size = 32 * 1024 * 1024 },
         .network = .{ .max_sockets = 16_384 },
         .required = .of(&.{
             .clock_read,
