@@ -54469,7 +54469,16 @@ fn implementationTests() type {
             // host-backed differential boundary; no native thread drives consensus.
             var vopr_io = try vopr.vopr_io.VoprIo.init(.{
                 .seed = 0x4441_5441_4d45_5247,
-                .tasks = .{ .stack_size = 8 * 1024 * 1024 },
+                // Debug builds keep every frame in this call chain
+                // unoptimized (DataServer -> Raft apply -> merge replication
+                // -> local batch wait), and the old 8 MiB fiber stack
+                // overflowed into an adjacent task's heap allocation,
+                // corrupting its `kernel`/`current` state and crashing (with
+                // an unwalkable fiber stack) deep in the scheduler on
+                // resume. 32 MiB reproduces clean across 40+ runs with
+                // headroom; see the VoprIo task kernel for the stack
+                // allocation itself.
+                .tasks = .{ .stack_size = 32 * 1024 * 1024 },
                 .required = .of(&.{
                     .clock_read,
                     .sleep,
