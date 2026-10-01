@@ -5814,6 +5814,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.durable_outbox_store.",
             "storage.db.primary_effect.",
             "storage.db.replication_contract.",
+            "storage.db.replication_ingress.",
             "storage.db.replication_effects.",
             "storage.db.commit_integration.",
             "storage.db.replication_record.",

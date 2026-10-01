@@ -26,6 +26,7 @@ comptime {
     _ = @import("db/durable_outbox_store.zig");
     _ = @import("db/primary_effect.zig");
     _ = @import("db/replication_contract.zig");
+    _ = @import("db/replication_ingress.zig");
     _ = @import("db/replication_effects.zig");
 
     _ = @import("backup_restore.zig");
