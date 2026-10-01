@@ -1,7 +1,7 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
 //! Opt-in linked mounted self-FK publication and public guard proof.
-const fixture = @import("api/hosted_self_fk_e2e.zig");
+const fixture = @import("api/hosted_self_fk_integration_test.zig");
 
 pub const antfly_sources = @import("source_owner_control.zig");
 pub const consumer_tests_only = true;

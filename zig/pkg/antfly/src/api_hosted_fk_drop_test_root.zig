@@ -1,8 +1,8 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
 //! Linked metadata/data composition for mounted external-parent FK DROP.
-const fixture = @import("api/hosted_fk_drop_e2e.zig");
-const graph_fixture = @import("api/hosted_graph_truncate_e2e.zig");
+const fixture = @import("api/hosted_fk_drop_integration_test.zig");
+const graph_fixture = @import("api/hosted_graph_truncate_integration_test.zig");
 
 pub const antfly_sources = @import("source_owner_control.zig");
 pub const consumer_tests_only = true;

@@ -296,11 +296,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api http invalid filter query response names the offending node",
         "api http unsupported filter query response names the offending node",
         "api http server drop table observes metadata absence before local cleanup",
-        "public api smoke e2e creates table inserts and queries documents",
+        "public api smoke integration creates table inserts and queries documents",
         "provisioned table write source routes batch writes across ranges",
-        "public api e2e recreates managed embeddings index after corrupt artifact",
-        "public api split e2e uses distributed global text stats for bm25 and significant_terms",
-        "public api multi-node e2e routes CRUD from a non-host node",
+        "public api integration recreates managed embeddings index after corrupt artifact",
+        "public api split integration uses distributed global text stats for bm25 and significant_terms",
+        "public api multi-node integration routes CRUD from a non-host node",
     };
     const public_api_parity_runtime_filters = selectTestFilters(b, &public_api_parity_default_filters);
     const public_api_parity_tests = b.addTest(.{
@@ -2276,7 +2276,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_api_standalone_backup_restore_tests = b.addTest(.{
         .root_module = api_backup_restore_test_mod,
         .filters = &.{
-            "public api standalone-like e2e backs up drops and restores a table",
+            "public api standalone-like integration backs up drops and restores a table",
             "public table backup handler exposes non-retryable fenced outcomes",
             "api restore rollback preserves a concurrently replaced table definition",
             "api http server cluster overwrite restores from read-only repository without dropping live table",
