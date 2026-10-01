@@ -21219,6 +21219,11 @@ fn materializeGraphAssetForRuntime(
             try deletes.append(runtime.alloc, try internal_keys.graphEdgeTtlLifetimeKeyAlloc(runtime.alloc, edge_key, graph_entry.config.name, graph_entry.config.coverage_generation, state_key));
             try deletes.append(runtime.alloc, try internal_keys.graphEdgeTtlTombstoneKeyAlloc(runtime.alloc, edge_key, graph_entry.config.name, graph_entry.config.coverage_generation, state_key));
         };
+        var raw_scanned_contender_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (raw_scanned_contender_keys.items) |key| runtime.alloc.free(@constCast(key));
+            raw_scanned_contender_keys.deinit(runtime.alloc);
+        }
         if (previous_keys == null and runtime.index_manager.graphArtifactSources(graph_entry.config.name).len <= 1) {
             const protected_keys = try runtimeResolutionMentionStateKeysForGraphSourceAlloc(runtime, request.doc_key, graph_entry.config.name, source);
             defer freeOwnedConstKeySlice(runtime.alloc, protected_keys);
@@ -21231,6 +21236,13 @@ fn materializeGraphAssetForRuntime(
                 if (runtimeContainsConstKey(protected_keys, entry.key)) continue;
                 try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, entry.key));
                 try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, entry.key);
+                // This edge has no tracked per-document state (previous_keys
+                // is null), so it is only found by the raw scan above. Feed
+                // it into the contender reconciliation below as a departing
+                // previous key; otherwise its per-(edge,state) contender row
+                // and the per-document visible-count witness never get
+                // updated, and they go stale once the edge is deleted here.
+                try appendUniqueDupeConstKey(runtime.alloc, &raw_scanned_contender_keys, entry.key);
             }
         }
 
@@ -21244,9 +21256,10 @@ fn materializeGraphAssetForRuntime(
             request.doc_key,
             graph_entry.config.name,
             state_key,
-            previous_keys orelse &.{},
+            if (previous_keys) |keys| keys else raw_scanned_contender_keys.items,
             writes.items[0..graph_write_count],
             graph_entry.config.coverage_generation,
+            previous_keys == null,
         );
         defer reconciled.deinit(runtime.alloc);
         if (reconciled.visible_count > edge_limit) return error.ResourceLimitExceeded;
@@ -21255,7 +21268,11 @@ fn materializeGraphAssetForRuntime(
             for (affected.items) |key| runtime.alloc.free(key);
             affected.deinit(runtime.alloc);
         }
-        if (previous_keys) |keys| for (keys) |key| try appendUniqueDupeKey(runtime.alloc, &affected, key);
+        if (previous_keys) |keys| {
+            for (keys) |key| try appendUniqueDupeKey(runtime.alloc, &affected, key);
+        } else {
+            for (raw_scanned_contender_keys.items) |key| try appendUniqueDupeKey(runtime.alloc, &affected, key);
+        }
         for (writes.items[0..graph_write_count]) |write| try appendUniqueDupeKey(runtime.alloc, &affected, write.key);
         for (affected.items) |edge_key| {
             if (reconciled.winners.map.get(edge_key)) |winner| {
@@ -21339,6 +21356,11 @@ fn materializeGraphAssetDeleteForRuntime(
             try deletes.append(runtime.alloc, try internal_keys.graphEdgeTtlLifetimeKeyAlloc(runtime.alloc, edge_key, graph_entry.config.name, graph_entry.config.coverage_generation, state_key));
             try deletes.append(runtime.alloc, try internal_keys.graphEdgeTtlTombstoneKeyAlloc(runtime.alloc, edge_key, graph_entry.config.name, graph_entry.config.coverage_generation, state_key));
         };
+        var raw_scanned_contender_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (raw_scanned_contender_keys.items) |key| runtime.alloc.free(@constCast(key));
+            raw_scanned_contender_keys.deinit(runtime.alloc);
+        }
         if (previous_keys == null and runtime.index_manager.graphArtifactSources(graph_entry.config.name).len <= 1) {
             const protected_keys = try runtimeResolutionMentionStateKeysForGraphSourceAlloc(runtime, request.doc_key, graph_entry.config.name, source);
             defer freeOwnedConstKeySlice(runtime.alloc, protected_keys);
@@ -21350,6 +21372,11 @@ fn materializeGraphAssetDeleteForRuntime(
                 if (runtimeContainsConstKey(protected_keys, entry.key)) continue;
                 try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, entry.key));
                 try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, entry.key);
+                // See the matching comment in materializeGraphAssetForRuntime:
+                // this edge is only visible via the raw scan above, so it
+                // must be reconciled as a departing contender or the
+                // per-document visible-count witness goes stale.
+                try appendUniqueDupeConstKey(runtime.alloc, &raw_scanned_contender_keys, entry.key);
             }
         }
 
@@ -21368,15 +21395,20 @@ fn materializeGraphAssetDeleteForRuntime(
             for (affected.items) |key| runtime.alloc.free(key);
             affected.deinit(runtime.alloc);
         }
-        if (previous_keys) |keys| for (keys) |edge_key| try appendUniqueDupeKey(runtime.alloc, &affected, edge_key);
+        if (previous_keys) |keys| {
+            for (keys) |edge_key| try appendUniqueDupeKey(runtime.alloc, &affected, edge_key);
+        } else {
+            for (raw_scanned_contender_keys.items) |edge_key| try appendUniqueDupeKey(runtime.alloc, &affected, edge_key);
+        }
         var reconciled = try runtimeReconcileGraphEdgeContenders(
             runtime,
             request.doc_key,
             graph_entry.config.name,
             state_key,
-            previous_keys orelse &.{},
+            if (previous_keys) |keys| keys else raw_scanned_contender_keys.items,
             &.{},
             graph_entry.config.coverage_generation,
+            previous_keys == null,
         );
         defer reconciled.deinit(runtime.alloc);
         for (affected.items) |edge_key| {
@@ -21770,6 +21802,7 @@ fn runtimeReconcileGraphEdgeContenders(
     previous_keys: []const []const u8,
     graph_writes: []const KVPair,
     expected_generation: u64,
+    force_witness_verify: bool,
 ) !RuntimeGraphContenderResult {
     const alloc = runtime.alloc;
     var result = RuntimeGraphContenderResult{};
@@ -21873,6 +21906,31 @@ fn runtimeReconcileGraphEdgeContenders(
         }
     }
     if (saw_current_contender and !count_present) return error.InvalidGraphEdgeContenderCount;
+    if (force_witness_verify and changes.count() == 0 and count_present) {
+        // Callers set `force_witness_verify` when they have no local
+        // previous-keys tracking for this state (the asset-state root was
+        // null or raw-scanned, not loaded). With nothing in `changes` to
+        // reconcile, the branches above leave `result.visible_count` as a
+        // verbatim echo of the stored witness. That witness goes stale
+        // whenever something clears this document's graph-asset-state root
+        // and contender rows directly (for example, deleting the primary
+        // document) without updating the per-document visible-count
+        // witness. Recompute it from the actual contender rows instead of
+        // trusting a witness that may no longer describe reality.
+        const contender_prefix = try internal_keys.graphEdgeContenderIndexPrefixAlloc(alloc, doc_key, index_name);
+        defer alloc.free(contender_prefix);
+        const existing_contenders = try backend_scan.scanPrefix(alloc, &runtime.store, contender_prefix);
+        defer backend_scan.freeResults(alloc, existing_contenders);
+        var distinct_edges = std.StringHashMapUnmanaged(void).empty;
+        defer distinct_edges.deinit(alloc);
+        for (existing_contenders) |contender| {
+            if (std.mem.eql(u8, contender.key, count_key)) continue;
+            if (internal_keys.isGraphEdgeTtlLifetimeKey(contender.key) or internal_keys.isGraphEdgeTtlTombstoneKey(contender.key)) continue;
+            const view = (try graph_edge_contender.decode(contender.value, expected_generation)) orelse continue;
+            try distinct_edges.put(alloc, view.edge_key, {});
+        }
+        result.visible_count = distinct_edges.count();
+    }
     const encoded_count = try graph_edge_contender.encodeVisibleCount(expected_generation, result.visible_count);
     try result.writes.append(alloc, .{ .key = try alloc.dupe(u8, count_key), .value = try alloc.dupe(u8, &encoded_count) });
 
