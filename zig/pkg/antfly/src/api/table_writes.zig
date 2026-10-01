@@ -17423,7 +17423,7 @@ pub const ProvisionedTableWriteSource = struct {
                 // A restored generation contains document state, not the
                 // destination replica's Raft history. Reset the group-local
                 // replay fence before this isolated generation is sealed.
-                try db.clearRaftAppliedEntry();
+                try db.clearOrderedApplyReceipt();
                 raft_apply_marker_reset = true;
             }
 
@@ -22726,7 +22726,7 @@ pub const ProvisionedTableWriteSource = struct {
                 ) catch |err| return mapReplicatedApplyWriterAcquireError(metadata_source, err);
             defer cached.deinit(alloc);
             const already_applied = if (raft_entry) |entry|
-                try cached.db.raftEntryAlreadyApplied(entry)
+                try cached.db.orderedMutationAlreadyApplied(entry)
             else
                 false;
             if (!already_applied) {
@@ -22783,7 +22783,7 @@ pub const ProvisionedTableWriteSource = struct {
             if (!local_prepared)
                 try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             const already_applied = if (raft_entry) |entry|
-                try db.raftEntryAlreadyApplied(entry)
+                try db.orderedMutationAlreadyApplied(entry)
             else
                 false;
             if (!already_applied) {
@@ -22943,9 +22943,9 @@ pub const ProvisionedTableWriteSource = struct {
                 if (chunk_len == 0) break;
                 const writes = writes_buffer[0..chunk_len];
                 if (parsed_schema) |schema| try tables_api.validateWritesAgainstTableSchema(alloc, schema, writes);
-                try staged_db.appendRaftDocumentSnapshotChunk(&staged, state.byte_range, writes);
+                try staged_db.appendStagedSnapshotDocuments(&staged, state.byte_range, writes);
             }
-            try staged_db.finishRaftDocumentSnapshot(&staged, state.byte_range);
+            try staged_db.finishStagedSnapshotRange(&staged, state.byte_range);
             try staged_db.sync(true);
             try staged_db.syncIndexes(true);
         }
@@ -40355,12 +40355,12 @@ fn implementationTests() type {
             try std.testing.expectError(error.RaftApplyWriterUnavailable, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", merge, .{ .term = 1, .index = 2 }));
             try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
             try std.testing.expectEqual(@as(usize, 0), cache.retired_entries.items.len);
-            try std.testing.expectEqual(@as(u64, 1), (try writer.db.raftAppliedEntry()).?.index);
+            try std.testing.expectEqual(@as(u64, 1), (try writer.db.orderedApplyReceipt()).?.index);
             // Unit tests explicitly drive the same maintenance pass; the borrowed-I/O
             // regression separately proves its production scheduler advances it.
             try writer.db.runArtifactRepairMetadataMaintenanceUntilIdle();
             _ = try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", merge, .{ .term = 1, .index = 2 });
-            try std.testing.expectEqual(@as(u64, 2), (try writer.db.raftAppliedEntry()).?.index);
+            try std.testing.expectEqual(@as(u64, 2), (try writer.db.orderedApplyReceipt()).?.index);
             try std.testing.expectEqualStrings("", writer.db.getRange().end);
         }
 

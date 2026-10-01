@@ -16,6 +16,20 @@
 //! Audit the real named module graph for each embedded target/profile.
 const std = @import("std");
 
+fn dependencyOwned(b: *std.Build, source: std.Build.LazyPath) bool {
+    const owner = switch (source) {
+        .src_path => |path| path.owner,
+        .generated => |path| path.file.step.owner,
+        .dependency => |path| path.dependency.builder,
+        // Host paths have no dependency provenance; audit them conservatively.
+        .cwd_relative => return false,
+    };
+    const project_root = b.build_root.path orelse return false;
+    const owner_root = owner.build_root.path orelse return false;
+    const relative = std.fs.path.relative(b.allocator, project_root, null, project_root, owner_root) catch @panic("OOM");
+    return std.fs.path.isAbsolute(relative) or std.mem.eql(u8, relative, "..") or std.mem.startsWith(u8, relative, "../") or std.mem.startsWith(u8, relative, "..\\");
+}
+
 pub fn add(b: *std.Build, module: *std.Build.Module) *std.Build.Step.Run {
     const run = b.addSystemCommand(&.{"python3"});
     run.addFileArg(b.path("tools/audit_embedded_source_boundary.py"));
@@ -31,6 +45,8 @@ pub fn add(b: *std.Build, module: *std.Build.Module) *std.Build.Step.Run {
         const current = modules.items[cursor];
         const source = current.root_source_file orelse @panic("embedded module must have a source owner");
         run.addArgs(&.{ "--module", b.fmt("M{d}", .{cursor}) });
+        if (dependencyOwned(b, source))
+            run.addArgs(&.{ "--external-module", b.fmt("M{d}", .{cursor}) });
         // Authored roots can be absent in a staged tree when their declared
         // module is unused. Resolve them only if the source audit reaches them.
         switch (source) {

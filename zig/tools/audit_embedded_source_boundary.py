@@ -137,6 +137,12 @@ def production_exclusions(source: str, *, target_os: str | None = None, options:
                 excluded.append((second, second_end) if value else (first, first_end))
     if options is not None:
         for guard in re.finditer(r'\bif\s*\(\s*(?:comptime\s+)?(!?)build_options\.(\w+)\s*\)\s*return(?:\s+[^;]*)?;', masked):
+            # Only a standalone statement proves the rest of this block dead.
+            # An unbraced runtime if/loop, else arm, or expression can decide
+            # whether the guard runs at all. Unknown syntax stays visible.
+            preceding = masked[:guard.start()].rstrip()
+            if not preceding or preceding[-1] not in "{;}":
+                continue
             value = options.get(guard[2])
             if value is None or (not value if guard[1] else value) is not True:
                 continue
@@ -182,7 +188,7 @@ def server_source(relative: str) -> bool:
                 or relative.startswith("metadata/storage/")
             )
         )
-        or relative in {"system_catalog/server_call.zig", "storage/server_db_adapter.zig", "storage/metadata_hot_standby_port.zig", "tracing/server_raft_writer.zig", "tracing/raft_trace_logger.zig", "tracing/mod.zig", "storage/db/native_raft_snapshot.zig", "capi/server_owner.zig", "capi_root.zig", "capi_dependencies.zig"}
+        or relative in {"system_catalog/server_call.zig", "storage/server_db_adapter.zig", "storage/metadata_hot_standby_port.zig", "tracing/server_raft_writer.zig", "tracing/raft_trace_logger.zig", "tracing/mod.zig", "capi/server_owner.zig", "capi_root.zig", "capi_dependencies.zig"}
     )
 
 
@@ -220,10 +226,16 @@ def audit(root: Path, entries: list[str]) -> dict[str, list[str]]:
     return graph
 
 
-def audit_modules(project: Path, modules: dict[str, Path], edges: dict[tuple[str, str], str], entry: str, target_os: str | None = None) -> int:
+def audit_modules(project: Path, modules: dict[str, Path], edges: dict[tuple[str, str], str], entry: str, target_os: str | None = None, external_modules: set[str] | None = None) -> int:
     """Resolve source imports against the actual target's Build.Module table."""
     project = project.resolve()
     source_root = project / "pkg/antfly/src"
+    external_modules = external_modules or set()
+    unknown = external_modules.difference(modules)
+    if unknown:
+        raise ValueError(f"unknown external module owners: {sorted(unknown)}")
+    if entry not in modules or any(owner not in modules or target not in modules for (owner, _), target in edges.items()):
+        raise ValueError("module graph references an unknown source owner")
     pending = collections.deque([(entry, modules[entry].resolve(), [])])
     visited: set[tuple[str, Path]] = set()
     while pending:
@@ -233,9 +245,14 @@ def audit_modules(project: Path, modules: dict[str, Path], edges: dict[tuple[str
         visited.add((module, path))
         if path.is_relative_to(source_root) and server_source(path.relative_to(source_root).as_posix()):
             raise ValueError("embedded module imports server coordination: " + " -> ".join(chain + [str(path)]))
-        # Third-party modules have their own source/license owners. The build
-        # table makes these explicit; this audit checks Antfly-owned sources.
-        if not path.is_relative_to(project):
+        # Exempt only dependency-owned modules declared by the build, never
+        # Antfly-generated sources merely because their cache is external.
+        if module in external_modules and not path.is_relative_to(project):
+            # A dependency may be configured with Antfly-owned named imports.
+            # Preserve those ownership edges even while excluding its sources.
+            for (owner, _), target in edges.items():
+                if owner == module and (target not in external_modules or modules[target].resolve().is_relative_to(project)):
+                    pending.append((target, modules[target].resolve(), chain + [str(path)]))
             continue
         if not path.is_file():
             raise ValueError(f"missing module source: {path}")
@@ -251,7 +268,9 @@ def audit_modules(project: Path, modules: dict[str, Path], edges: dict[tuple[str
             next_chain = chain + [str(path)]
             if imported.endswith(".zig"):
                 dependency = (path.parent / imported).resolve()
-                if not dependency.is_relative_to(project):
+                # Generated sibling files belong to their declared module's
+                # source directory. Other external imports need a named owner.
+                if not dependency.is_relative_to(project) and not dependency.is_relative_to(modules[module].resolve().parent):
                     raise ValueError(f"{path} imports outside Antfly's source owner: {imported}")
                 pending.append((module, dependency, next_chain))
             else:
@@ -273,6 +292,7 @@ def main() -> None:
     parser.add_argument("--project", type=Path)
     parser.add_argument("--module", nargs=2, action="append", default=[])
     parser.add_argument("--module-import", nargs=3, action="append", default=[])
+    parser.add_argument("--external-module", action="append", default=[])
     parser.add_argument("--entry-module")
     parser.add_argument("--target-os")
     args = parser.parse_args()
@@ -282,7 +302,7 @@ def main() -> None:
                 args.project or Path(__file__).resolve().parents[1],
                 {name: Path(path) for name, path in args.module},
                 {(owner, name): target for owner, name, target in args.module_import},
-                args.entry_module, args.target_os,
+                args.entry_module, args.target_os, set(args.external_module),
             )
             print(f"Embedded module boundary: {count} resolved sources, no server coordination imports.")
             return

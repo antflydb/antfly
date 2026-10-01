@@ -2911,11 +2911,11 @@ const BatchExecutionOptions = struct {
     bypass_replication_write_gate: bool = false,
     replication_applied_lsn_marker: ?u64 = null,
     online_source_applied_index: ?u64 = null,
-    raft_applied_entry_marker: ?RaftAppliedEntryIdentity = null,
+    raft_applied_entry_marker: ?OrderedApplyReceipt = null,
     /// Metadata-authorized native hidden-child receipt identity. Never
     /// writes the data-Raft watermark into a native source-authority root.
-    native_initial_child_entry: ?RaftAppliedEntryIdentity = null,
-    native_fk_generation_entry: ?RaftAppliedEntryIdentity = null,
+    native_initial_child_entry: ?OrderedApplyReceipt = null,
+    native_fk_generation_entry: ?OrderedApplyReceipt = null,
     native_topology_position: ?@import("receipt_position.zig").Native = null,
     suppress_derived_replay_append: bool = false,
     extra_store_writes: []const docstore_mod.KVPair = &.{},
@@ -2928,17 +2928,18 @@ const BatchExecutionOptions = struct {
     visibility_cancellation: types.CancellationToken = .none,
 };
 
-pub const RaftAppliedEntryIdentity = types.RaftAppliedEntryIdentity;
+pub const OrderedApplyReceipt = types.OrderedApplyReceipt;
+pub const RaftAppliedEntryIdentity = OrderedApplyReceipt;
 
-const raft_applied_entry_value_len = apply_receipts.raft_applied_entry_value_len;
+const ordered_apply_receipt_value_len = apply_receipts.ordered_apply_receipt_value_len;
 
-const raftAppliedEntryWrite = apply_receipts.raftAppliedEntryWrite;
+const orderedApplyReceiptWrite = apply_receipts.orderedApplyReceiptWrite;
 
-const readRaftAppliedEntry = apply_receipts.readRaftAppliedEntry;
+const readOrderedApplyReceipt = apply_receipts.readOrderedApplyReceipt;
 
-const RaftAppliedEntryDisposition = apply_receipts.RaftAppliedEntryDisposition;
+const OrderedApplyDisposition = apply_receipts.OrderedApplyDisposition;
 
-const raftAppliedEntryDisposition = apply_receipts.raftAppliedEntryDisposition;
+const orderedApplyDisposition = apply_receipts.orderedApplyDisposition;
 
 const TransactionResolution = struct {
     txn_id: transactions_mod.TxnId,
@@ -5007,6 +5008,16 @@ const GraphRestoreParseCache = struct {
 };
 
 pub const DB = struct {
+    // Server source compatibility; local execution uses the generic owners below.
+    pub const raftAppliedEntry = orderedApplyReceipt;
+    pub const raftEntryAlreadyApplied = orderedMutationAlreadyApplied;
+    pub const markRaftEntryApplied = recordOrderedApplyReceipt;
+    pub const clearRaftAppliedEntry = clearOrderedApplyReceipt;
+    pub const replaceRaftDocumentSnapshot = replacePrimaryDocumentsAndRange;
+    pub const appendRaftDocumentSnapshotChunk = appendStagedSnapshotDocuments;
+    pub const finishRaftDocumentSnapshot = finishStagedSnapshotRange;
+    pub const repairReplicaPrimarySnapshot = repairVerifiedPrimarySnapshot;
+
     row_policy_gate: row_policy_gate_mod.Gate = .{},
     row_policy_bundle: ?row_policy_bundle_mod.Installed = null,
     /// Borrowed from the opaque owner handle; Lite leaves these unset and
@@ -9607,7 +9618,7 @@ pub const DB = struct {
     /// allocation-light no-op before transforms or derived work execute.
     /// Execute a committed ordered mutation. The receipt and primary effects
     /// share a store transaction; server replay policy is supplied by the caller.
-    pub fn applyOrderedCommittedMutation(self: *DB, request: types.BatchRequest, identity: RaftAppliedEntryIdentity, bypass_write_gate: bool) anyerror!void {
+    pub fn applyOrderedCommittedMutation(self: *DB, request: types.BatchRequest, identity: OrderedApplyReceipt, bypass_write_gate: bool) anyerror!void {
         try self.batchInternal(request, null, .{
             .validate_range_ownership = false,
             .wait_for_sync_level = false,
@@ -9616,7 +9627,7 @@ pub const DB = struct {
         });
     }
 
-    pub fn recoverOrderedSourceAdmission(self: *DB, request: types.BatchRequest, identity: RaftAppliedEntryIdentity, bypass_write_gate: bool) !void {
+    pub fn recoverOrderedSourceAdmission(self: *DB, request: types.BatchRequest, identity: OrderedApplyReceipt, bypass_write_gate: bool) !void {
         try self.applyOnlineSourceBatch(request, .{
             .validate_range_ownership = false,
             .wait_for_sync_level = false,
@@ -9630,7 +9641,7 @@ pub const DB = struct {
     /// hidden Record commits the operation receipt with the schema/phase.
     /// Keep this distinct from the generic Raft path: native source roots
     /// must never acquire a fabricated Raft applied-entry watermark.
-    pub fn batchNativeInitialChildApply(self: *DB, req: types.BatchRequest, receipt: RaftAppliedEntryIdentity) !void {
+    pub fn batchNativeInitialChildApply(self: *DB, req: types.BatchRequest, receipt: OrderedApplyReceipt) !void {
         const command = req.relational_topology orelse return error.InvalidInitialChildPublication;
         if (command.action != .provision_initial_child and command.action != .release_initial_child and command.action != .cancel_initial_child)
             return error.InvalidInitialChildPublication;
@@ -9755,7 +9766,7 @@ pub const DB = struct {
     fn applyRangeFinalization(
         self: *DB,
         transition: types.SplitTransitionMutation,
-        identity: ?RaftAppliedEntryIdentity,
+        identity: ?OrderedApplyReceipt,
         replication_lsn: ?u64,
         replication_payload: ?[]const u8,
     ) !void {
@@ -9766,7 +9777,7 @@ pub const DB = struct {
         var transaction_manager = try self.core.initTxnManager();
         defer transaction_manager.deinit();
         if (try transaction_manager.hasSchemaLeases()) return error.SchemaInUse;
-        if (identity) |entry| switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), entry)) {
+        if (identity) |entry| switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry)) {
             .already_applied => return,
             .apply => {},
         };
@@ -9794,7 +9805,7 @@ pub const DB = struct {
             else => return err,
         };
         if (builtin.is_test and graph_mod.test_abort_ownership_before_range_commit) return error.TestInjectedBackfillFailure;
-        var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
+        var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
         var replication_marker_buf: [replication_applied_lsn_value_len]u8 = undefined;
         var outbox_value: ?[]u8 = null;
         defer if (outbox_value) |bytes| self.alloc.free(bytes);
@@ -9806,7 +9817,7 @@ pub const DB = struct {
         var metadata_writes: std.ArrayList(docstore_mod.KVPair) = .empty;
         defer metadata_writes.deinit(self.alloc);
         try metadata_writes.append(self.alloc, .{ .key = range_state_mod.range_key, .value = range_value });
-        if (identity) |entry| try metadata_writes.append(self.alloc, raftAppliedEntryWrite(entry, &marker_buf));
+        if (identity) |entry| try metadata_writes.append(self.alloc, orderedApplyReceiptWrite(entry, &marker_buf));
         if (replication_lsn) |lsn| try metadata_writes.append(self.alloc, replicationAppliedSequenceWrite(lsn, &replication_marker_buf));
         if (replication_payload) |payload| {
             const mirror = self.replication_async_batch_mirror orelse return error.HAMirrorUnavailable;
@@ -9843,8 +9854,8 @@ pub const DB = struct {
         self.core.adoptRangeInMemoryOwned(start, end);
     }
 
-    /// Called only under the Raft owner's completion fence. Protocol-only
-    /// entries may advance that fence without changing the native marker.
+    /// Pin primary data and its ordered receipt under the local apply lock.
+    /// A server adapter supplies any surrounding protocol completion fence.
     pub fn pinTransferablePrimarySnapshot(self: *DB) !TransferablePrimarySnapshot {
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
@@ -9856,7 +9867,7 @@ pub const DB = struct {
             try @import("../source_pin_state.zig").requireNoPrepared(&read, namespace);
             try @import("online_source.zig").requireTransferableSnapshots(&read, namespace);
         }
-        const marker = try readRaftAppliedEntry(self.alloc, self.core.store);
+        const marker = try readOrderedApplyReceipt(self.alloc, self.core.store);
         var primary = try self.core.pinNativeSnapshot();
         errdefer primary.deinit();
         switch (primary) {
@@ -9870,15 +9881,15 @@ pub const DB = struct {
         alloc: Allocator,
         io: std.Io,
         namespace: [24]u8,
-        receipt: ?RaftAppliedEntryIdentity,
+        receipt: ?OrderedApplyReceipt,
         primary: db_core.PinnedStoreSnapshot,
     };
 
-    pub fn verifyTransferablePrimarySnapshot(self: *DB, namespace: [24]u8, receipt: ?RaftAppliedEntryIdentity) !void {
+    pub fn verifyTransferablePrimarySnapshot(self: *DB, namespace: [24]u8, receipt: ?OrderedApplyReceipt) !void {
         var actual_namespace: [24]u8 = undefined;
         doc_identity.encodeNamespace(&actual_namespace, self.core.identity_namespace);
         if (!std.mem.eql(u8, &actual_namespace, &namespace)) return error.InvalidSnapshot;
-        const marker = try self.raftAppliedEntry();
+        const marker = try self.orderedApplyReceipt();
         if ((if (marker) |value| value.index else 0) != (if (receipt) |value| value.index else 0) or
             (if (marker) |value| value.term else 0) != (if (receipt) |value| value.term else 0)) return error.InvalidSnapshot;
         var read = try self.core.store.beginProbeTxn();
@@ -9887,17 +9898,17 @@ pub const DB = struct {
         try @import("online_source.zig").requireTransferableSnapshots(&read, namespace);
     }
 
-    pub fn raftAppliedEntry(self: *DB) !?RaftAppliedEntryIdentity {
+    pub fn orderedApplyReceipt(self: *DB) !?OrderedApplyReceipt {
         lockApply(self);
         defer self.core.unlockApply();
-        return try readRaftAppliedEntry(self.alloc, self.core.store);
+        return try readOrderedApplyReceipt(self.alloc, self.core.store);
     }
 
-    pub fn raftEntryAlreadyApplied(self: *DB, identity: RaftAppliedEntryIdentity) !bool {
+    pub fn orderedMutationAlreadyApplied(self: *DB, identity: OrderedApplyReceipt) !bool {
         lockApply(self);
         defer self.core.unlockApply();
-        return switch (try raftAppliedEntryDisposition(
-            try readRaftAppliedEntry(self.alloc, self.core.store),
+        return switch (try orderedApplyDisposition(
+            try readOrderedApplyReceipt(self.alloc, self.core.store),
             identity,
         )) {
             .apply => false,
@@ -9905,18 +9916,18 @@ pub const DB = struct {
         };
     }
 
-    pub fn markRaftEntryApplied(self: *DB, identity: RaftAppliedEntryIdentity) !void {
+    pub fn recordOrderedApplyReceipt(self: *DB, identity: OrderedApplyReceipt) !void {
         lockApply(self);
         defer self.core.unlockApply();
-        switch (try raftAppliedEntryDisposition(
-            try readRaftAppliedEntry(self.alloc, self.core.store),
+        switch (try orderedApplyDisposition(
+            try readOrderedApplyReceipt(self.alloc, self.core.store),
             identity,
         )) {
             .already_applied => return,
             .apply => {},
         }
-        var value_buf: [raft_applied_entry_value_len]u8 = undefined;
-        const marker = raftAppliedEntryWrite(identity, &value_buf);
+        var value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+        const marker = orderedApplyReceiptWrite(identity, &value_buf);
         try self.core.store.putBatch(&.{marker}, &.{});
     }
 
@@ -10067,7 +10078,7 @@ pub const DB = struct {
         return self.finalizePendingRowPolicyReceiptLocked(pending);
     }
 
-    pub fn applyReplicatedRowPolicyPublication(self: *DB, bundle_bytes: []const u8, request: @import("../../system_catalog/policies.zig").InstallRequest, identity: RaftAppliedEntryIdentity) !?row_policy_bundle_mod.Receipt {
+    pub fn applyReplicatedRowPolicyPublication(self: *DB, bundle_bytes: []const u8, request: @import("../../system_catalog/policies.zig").InstallRequest, identity: OrderedApplyReceipt) !?row_policy_bundle_mod.Receipt {
         return self.applyRowPolicyPublicationInternal(bundle_bytes, request, identity, null);
     }
 
@@ -10094,7 +10105,7 @@ pub const DB = struct {
         );
     }
 
-    fn applyRowPolicyPublicationInternal(self: *DB, bundle_bytes: []const u8, request: @import("../../system_catalog/policies.zig").InstallRequest, identity: RaftAppliedEntryIdentity, replication_lsn: ?u64) !?row_policy_bundle_mod.Receipt {
+    fn applyRowPolicyPublicationInternal(self: *DB, bundle_bytes: []const u8, request: @import("../../system_catalog/policies.zig").InstallRequest, identity: OrderedApplyReceipt, replication_lsn: ?u64) !?row_policy_bundle_mod.Receipt {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         if (identity.term == 0 or identity.index == 0 or (replication_lsn != null and replication_lsn.? == 0)) return error.InvalidRowPolicyPublication;
         if (replication_lsn == null and self.replication_async_metadata_mirror == null and
@@ -10154,7 +10165,7 @@ pub const DB = struct {
             .bundle_digest = bundle_digest,
             .descriptor_digest = request.expected_descriptor_digest,
         };
-        if (try self.raftEntryAlreadyApplied(identity)) {
+        if (try self.orderedMutationAlreadyApplied(identity)) {
             lockApply(self);
             const already = self.readRowPolicyApplyResultLocked(expected_receipt) catch |err| {
                 self.core.unlockApply();
@@ -10169,7 +10180,7 @@ pub const DB = struct {
         try self.lockApplyForPortableRuntime();
         var apply_held = true;
         defer if (apply_held) self.core.unlockApply();
-        if (switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), identity)) {
+        if (switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity)) {
             .already_applied => true,
             .apply => false,
         }) {
@@ -10238,8 +10249,8 @@ pub const DB = struct {
             publication.policy_generation < previous.row_policy_generation or
             (publication.policy_generation == previous.row_policy_generation and !stage_with_serving and
                 previous.row_policy_phase != .preparing)) return error.RowPolicyCatalogChanged;
-        var receipt_bytes: [raft_applied_entry_value_len]u8 = undefined;
-        const receipt = raftAppliedEntryWrite(identity, &receipt_bytes);
+        var receipt_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+        const receipt = orderedApplyReceiptWrite(identity, &receipt_bytes);
         if (stage_with_serving) {
             if (self.row_policy_gate.currentPhase() != .active or previous.row_policy_phase != .active or
                 publication.policy_generation <= previous.row_policy_generation or
@@ -10337,7 +10348,7 @@ pub const DB = struct {
     /// materialized for a different Raft history (for example restore or the
     /// destination side of a split). The caller must hold structural ownership
     /// of the generation; ordinary Raft apply must never clear this fence.
-    pub fn clearRaftAppliedEntry(self: *DB) !void {
+    pub fn clearOrderedApplyReceipt(self: *DB) !void {
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.store.putBatch(&.{}, &.{internal_keys.raft_document_applied_entry_key[0..]});
@@ -10555,7 +10566,7 @@ pub const DB = struct {
 
     /// Reconcile an ordered source inventory before applying its mutation.
     /// The store owns the admission fence; callers supply an exact receipt.
-    pub fn reconcileReplicatedArtifactAdmission(self: *DB, request: types.BatchRequest, entry: RaftAppliedEntryIdentity) !void {
+    pub fn reconcileReplicatedArtifactAdmission(self: *DB, request: types.BatchRequest, entry: OrderedApplyReceipt) !void {
         const command = request.artifact_catalog orelse return;
         const context = try self.preflightArtifactAdmission(request, entry);
         if (!try self.reconcileOrderedArtifactCatalogWithContext(command, entry.index, context)) return error.ArtifactCatalogDrift;
@@ -11575,8 +11586,8 @@ pub const DB = struct {
         }
 
         if (opts.raft_applied_entry_marker) |identity| {
-            switch (try raftAppliedEntryDisposition(
-                try readRaftAppliedEntry(self.alloc, self.core.store),
+            switch (try orderedApplyDisposition(
+                try readOrderedApplyReceipt(self.alloc, self.core.store),
                 identity,
             )) {
                 .apply => {},
@@ -11607,8 +11618,8 @@ pub const DB = struct {
                 // A delayed committed command must advance the receipt without
                 // touching documents, artifacts, indexes or visibility state.
                 if (opts.raft_applied_entry_marker) |identity| {
-                    var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
-                    try self.core.store.putBatch(&.{raftAppliedEntryWrite(identity, &marker_buf)}, &.{});
+                    var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+                    try self.core.store.putBatch(&.{orderedApplyReceiptWrite(identity, &marker_buf)}, &.{});
                 }
                 if (opts.replication_applied_lsn_marker) |lsn| {
                     var marker_buf: [replication_applied_lsn_value_len]u8 = undefined;
@@ -11632,10 +11643,10 @@ pub const DB = struct {
                         .replay => {
                             var marker_writes: [2]docstore_mod.KVPair = undefined;
                             var count: usize = 0;
-                            var raft_buffer: [raft_applied_entry_value_len]u8 = undefined;
+                            var raft_buffer: [ordered_apply_receipt_value_len]u8 = undefined;
                             var standby_buffer: [replication_applied_lsn_value_len]u8 = undefined;
                             if (opts.raft_applied_entry_marker) |identity| {
-                                marker_writes[count] = raftAppliedEntryWrite(identity, &raft_buffer);
+                                marker_writes[count] = orderedApplyReceiptWrite(identity, &raft_buffer);
                                 count += 1;
                             }
                             if (opts.replication_applied_lsn_marker) |lsn| {
@@ -11743,9 +11754,9 @@ pub const DB = struct {
                 // optimistic collection and this apply fence. The replicated
                 // receipt and coordinator acknowledgement must still commit in
                 // the same terminal batch before Raft advances this entry.
-                var raft_marker_value_buf: [raft_applied_entry_value_len]u8 = undefined;
+                var raft_marker_value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
                 const completion_writes: []const docstore_mod.KVPair = if (opts.raft_applied_entry_marker) |identity|
-                    &.{raftAppliedEntryWrite(identity, &raft_marker_value_buf)}
+                    &.{orderedApplyReceiptWrite(identity, &raft_marker_value_buf)}
                 else
                     &.{};
                 const outcome = try self.core.resolveTransactionIntentsWithExtraBatch(
@@ -12961,9 +12972,9 @@ pub const DB = struct {
                 try store_writes.append(self.alloc, replicationAppliedSequenceWrite(lsn, &replication_applied_lsn_value_buf));
             }
         }
-        var raft_applied_entry_value_buf: [raft_applied_entry_value_len]u8 = undefined;
+        var raft_applied_entry_value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
         const raft_applied_entry_write: ?docstore_mod.KVPair = if (opts.raft_applied_entry_marker) |identity|
-            raftAppliedEntryWrite(identity, &raft_applied_entry_value_buf)
+            orderedApplyReceiptWrite(identity, &raft_applied_entry_value_buf)
         else
             null;
         // A transaction resolution owns a second idempotency boundary: normal
@@ -24861,10 +24872,10 @@ pub const DB = struct {
         try self.core.saveSplitBootstrapMarker(marker);
     }
 
-    /// Replaces all primary documents and the range for a Raft snapshot in a
+    /// Replaces all primary documents and their range in a
     /// single durable commit. Derived indexes consume the same replacement
     /// batch, so stale documents are removed instead of surviving restore.
-    pub fn replaceRaftDocumentSnapshot(
+    pub fn replacePrimaryDocumentsAndRange(
         self: *DB,
         alloc: Allocator,
         byte_range: types.ByteRange,
@@ -24929,10 +24940,10 @@ pub const DB = struct {
         try self.refreshSplitBootstrapRangeInMemory(byte_range);
     }
 
-    /// Appends a bounded chunk into an isolated Raft snapshot generation.
+    /// Appends a bounded document chunk into an isolated snapshot generation.
     /// The caller owns generation publication and must never call this against
     /// a live generation because chunks are independently durable.
-    pub fn appendRaftDocumentSnapshotChunk(
+    pub fn appendStagedSnapshotDocuments(
         self: *DB,
         staged_generation: *const generation_lifecycle.StagedGeneration,
         byte_range: types.ByteRange,
@@ -24956,7 +24967,7 @@ pub const DB = struct {
     }
 
     /// Finalizes the range metadata after all chunks have been imported.
-    pub fn finishRaftDocumentSnapshot(
+    pub fn finishStagedSnapshotRange(
         self: *DB,
         staged_generation: *const generation_lifecycle.StagedGeneration,
         byte_range: types.ByteRange,
@@ -26833,14 +26844,14 @@ pub const DB = struct {
         try restored.core.index_manager.syncAll(true);
     }
 
-    /// An NRSP primary is already verified and complete. Reconstruct only
+    /// A verified primary is complete. Reconstruct only
     /// derived projections in its unpublished generation; never run optional
     /// transaction recovery or advance the replicated mutation watermark.
-    pub fn repairReplicaPrimarySnapshot(
+    pub fn repairVerifiedPrimarySnapshot(
         alloc: Allocator,
         staged: *const generation_lifecycle.StagedGeneration,
         namespace: [24]u8,
-        receipt: ?RaftAppliedEntryIdentity,
+        receipt: ?OrderedApplyReceipt,
         root_generation: u64,
     ) !void {
         try staged.validatePath(staged.path());
@@ -28524,7 +28535,7 @@ pub const DB = struct {
         schema_json_digest: [32]u8,
         before_catalog_digest: [32]u8,
         after_catalog_digest: [32]u8,
-        raft_entry: RaftAppliedEntryIdentity,
+        raft_entry: OrderedApplyReceipt,
         native: bool = false,
     };
 
@@ -28536,7 +28547,7 @@ pub const DB = struct {
         schema_digest: [32]u8,
         public_schema_json_digest: [32]u8,
         catalog_digest: [32]u8,
-        raft_entry: RaftAppliedEntryIdentity,
+        raft_entry: OrderedApplyReceipt,
         native: bool = false,
     };
 
@@ -28563,7 +28574,7 @@ pub const DB = struct {
             return error.InvalidInitialChildPublication;
         const replay = if (input.native)
             try self.core.getStoreValue(self.alloc, hidden.key)
-        else if (try self.raftEntryAlreadyApplied(input.raft_entry))
+        else if (try self.orderedMutationAlreadyApplied(input.raft_entry))
             (try self.core.getStoreValue(self.alloc, hidden.key)) orelse return error.InitialChildPublicationChanged
         else
             null;
@@ -28616,8 +28627,8 @@ pub const DB = struct {
             .provision_index = input.raft_entry.index,
         };
         const encoded_record = try record.encode();
-        var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
-        const marker = raftAppliedEntryWrite(input.raft_entry, &marker_buf);
+        var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+        const marker = orderedApplyReceiptWrite(input.raft_entry, &marker_buf);
         // Self-referential parents share these hidden child owners. Install
         // their accepted generation scopes in the same durable transaction as
         // the initial schema and hidden gate, before any release can route a
@@ -28685,7 +28696,7 @@ pub const DB = struct {
         try self.lockApplyForPortableRuntime();
         var apply_held = true;
         errdefer if (apply_held) self.core.unlockApply();
-        if (!input.native) switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), input.raft_entry)) {
+        if (!input.native) switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), input.raft_entry)) {
             .already_applied => {
                 self.core.unlockApply();
                 apply_held = false;
@@ -28748,7 +28759,7 @@ pub const DB = struct {
         self.reconcilePublishedSchemaIndexes(runtime_schema.version);
     }
 
-    fn applyInitialChildPhase(self: *DB, fence: @import("relational_integrity_topology_contract.zig").Fence, control: @import("relational_integrity_topology_contract.zig").InitialChildControl, phase: @import("relational_initial_child_publication.zig").Phase, entry: RaftAppliedEntryIdentity, native: bool, replication_lsn: ?u64, replication_payload: ?[]const u8) !void {
+    fn applyInitialChildPhase(self: *DB, fence: @import("relational_integrity_topology_contract.zig").Fence, control: @import("relational_integrity_topology_contract.zig").InitialChildControl, phase: @import("relational_initial_child_publication.zig").Phase, entry: OrderedApplyReceipt, native: bool, replication_lsn: ?u64, replication_payload: ?[]const u8) !void {
         const hidden = @import("relational_initial_child_publication.zig");
         if (fence.role != .child_generation_source or !fence.namespace.eql(self.core.identity_namespace) or
             std.mem.allEqual(u8, &control.plan_id, 0) or std.mem.allEqual(u8, &control.plan_digest, 0) or
@@ -28756,7 +28767,7 @@ pub const DB = struct {
             phase == .hidden or (replication_lsn != null and replication_payload != null)) return error.InvalidInitialChildPublication;
         const replay = if (native)
             try self.core.getStoreValue(self.alloc, hidden.key)
-        else if (try self.raftEntryAlreadyApplied(entry))
+        else if (try self.orderedMutationAlreadyApplied(entry))
             (try self.core.getStoreValue(self.alloc, hidden.key)) orelse return error.InitialChildPublicationChanged
         else
             null;
@@ -28781,7 +28792,7 @@ pub const DB = struct {
         defer mutation.release();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
-        if (!native) switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), entry)) {
+        if (!native) switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry)) {
             .already_applied => return,
             .apply => {},
         };
@@ -28806,8 +28817,8 @@ pub const DB = struct {
             };
             _ = try hidden.stageUnprovisionedCancel(&txn, canceled);
             if (!native) {
-                var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
-                const marker = raftAppliedEntryWrite(entry, &marker_buf);
+                var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+                const marker = orderedApplyReceiptWrite(entry, &marker_buf);
                 try txn.put(marker.key, marker.value);
             }
             if (replication_lsn) |lsn| {
@@ -28836,8 +28847,8 @@ pub const DB = struct {
         if (current.provision_term == 0) {
             if (phase != .canceled) return error.InitialChildPublicationChanged;
             if (!native) {
-                var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
-                const marker = raftAppliedEntryWrite(entry, &marker_buf);
+                var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+                const marker = orderedApplyReceiptWrite(entry, &marker_buf);
                 try txn.put(marker.key, marker.value);
             }
             if (replication_lsn) |lsn| {
@@ -28884,8 +28895,8 @@ pub const DB = struct {
         if ((try @import("table_catalog.zig").Catalog.decode(table_raw)).row_count != 0) return error.InitialChildPublicationChanged;
         _ = try hidden.stagePhase(&txn, current, phase, entry.term, entry.index);
         if (!native) {
-            var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
-            const marker = raftAppliedEntryWrite(entry, &marker_buf);
+            var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+            const marker = orderedApplyReceiptWrite(entry, &marker_buf);
             try txn.put(marker.key, marker.value);
         }
         if (replication_lsn) |lsn| {
@@ -28937,7 +28948,7 @@ pub const DB = struct {
         // already advanced. Check its durable marker before re-preparing the
         // old→new catalog comparison; the apply-locked check below still
         // closes the race with another entry.
-        if (!publication.native and try self.raftEntryAlreadyApplied(publication.raft_entry)) return;
+        if (!publication.native and try self.orderedMutationAlreadyApplied(publication.raft_entry)) return;
         return self.setSchemaJsonMode(alloc, schema_json, publication);
     }
 
@@ -29013,11 +29024,11 @@ pub const DB = struct {
             schema_metadata_writes[2] = .{ .key = durable_replication_schema_outbox_key.?, .value = outbox };
             schema_metadata_write_count = 3;
         }
-        var raft_marker_buffer: [raft_applied_entry_value_len]u8 = undefined;
+        var raft_marker_buffer: [ordered_apply_receipt_value_len]u8 = undefined;
         var source_receipt_buffer: [48]u8 = undefined;
         if (publication) |published| {
             if (!published.native) {
-                const marker = raftAppliedEntryWrite(published.raft_entry, &raft_marker_buffer);
+                const marker = orderedApplyReceiptWrite(published.raft_entry, &raft_marker_buffer);
                 schema_metadata_writes[schema_metadata_write_count] = marker;
                 schema_metadata_write_count += 1;
             }
@@ -29045,7 +29056,7 @@ pub const DB = struct {
         try self.lockApplyForPortableRuntime();
         var apply_held = true;
         errdefer if (apply_held) self.core.unlockApply();
-        if (publication) |published| if (!published.native) switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), published.raft_entry)) {
+        if (publication) |published| if (!published.native) switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), published.raft_entry)) {
             .already_applied => {
                 self.core.unlockApply();
                 apply_held = false;
@@ -29243,16 +29254,16 @@ pub const DB = struct {
         participants: []const []const u8,
         coordinator: bool,
         retain_terminal: bool,
-        identity: RaftAppliedEntryIdentity,
+        identity: OrderedApplyReceipt,
     ) !transactions_mod.TxnId {
         return self.beginReplicatedTransactionScoped(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, null);
     }
 
-    pub fn beginReplicatedTransactionScoped(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: RaftAppliedEntryIdentity, scope: ?[32]u8) !transactions_mod.TxnId {
+    pub fn beginReplicatedTransactionScoped(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: OrderedApplyReceipt, scope: ?[32]u8) !transactions_mod.TxnId {
         lockApply(self);
         defer self.core.unlockApply();
         if (self.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
-        switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), identity)) {
+        switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity)) {
             .already_applied => return txn_id,
             .apply => {},
         }
@@ -29261,8 +29272,8 @@ pub const DB = struct {
             defer read.abort();
             try @import("restore_staging.zig").requireMutableScope(self.alloc, &read, scope);
         }
-        var value_buf: [raft_applied_entry_value_len]u8 = undefined;
-        const marker = raftAppliedEntryWrite(identity, &value_buf);
+        var value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+        const marker = orderedApplyReceiptWrite(identity, &value_buf);
         return try self.core.beginTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(
             txn_id,
             timestamp_ns,
@@ -29366,7 +29377,7 @@ pub const DB = struct {
         self: *DB,
         txn_id: types.TxnId,
         req: types.TransactionIntentRequest,
-        identity: RaftAppliedEntryIdentity,
+        identity: OrderedApplyReceipt,
     ) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         try self.writeTransactionInternal(txn_id, req, identity);
@@ -29376,7 +29387,7 @@ pub const DB = struct {
         self: *DB,
         txn_id: types.TxnId,
         req: types.TransactionIntentRequest,
-        raft_entry: ?RaftAppliedEntryIdentity,
+        raft_entry: ?OrderedApplyReceipt,
     ) !void {
         if (raft_entry == null) try self.maybeFinalizePendingRowPolicyPublication();
         var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
@@ -29423,7 +29434,7 @@ pub const DB = struct {
         self: *DB,
         txn_id: types.TxnId,
         req: types.TransactionIntentRequest,
-        raft_entry: ?RaftAppliedEntryIdentity,
+        raft_entry: ?OrderedApplyReceipt,
         preparation_alloc: Allocator,
         row_policy_principal: ?*const row_policy_authority_mod.Payload,
         row_policy_lease: ?*const row_policy_gate_mod.Gate.Lease,
@@ -29747,12 +29758,12 @@ pub const DB = struct {
         try self.prepareOnlineVectorIntentBoundsLocked(preparation_alloc, intents.items, prepared_schema_view);
         if (row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         if (raft_entry) |identity| {
-            switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(preparation_alloc, self.core.store), identity)) {
+            switch (try orderedApplyDisposition(try readOrderedApplyReceipt(preparation_alloc, self.core.store), identity)) {
                 .already_applied => return,
                 .apply => {},
             }
-            var value_buf: [raft_applied_entry_value_len]u8 = undefined;
-            const marker = raftAppliedEntryWrite(identity, &value_buf);
+            var value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+            const marker = orderedApplyReceiptWrite(identity, &value_buf);
             try self.core.writeIntentsExtraBatch(
                 txn_id,
                 intents.items,
@@ -30096,7 +30107,7 @@ pub const DB = struct {
         commit_version: u64,
         sync_level: types.SyncLevel,
         visibility_cancellation: types.CancellationToken,
-        identity: RaftAppliedEntryIdentity,
+        identity: OrderedApplyReceipt,
         resolved_participant: ?[]const u8,
     ) !void {
         try self.resolveTransactionIntentsInternal(
@@ -30117,7 +30128,7 @@ pub const DB = struct {
         commit_version: u64,
         sync_level: types.SyncLevel,
         visibility_cancellation: types.CancellationToken,
-        raft_entry: ?RaftAppliedEntryIdentity,
+        raft_entry: ?OrderedApplyReceipt,
         resolved_participant: ?[]const u8,
     ) !void {
         var preparation: RequestPreparationContext = undefined;
@@ -30142,7 +30153,7 @@ pub const DB = struct {
         commit_version: u64,
         sync_level: types.SyncLevel,
         visibility_cancellation: types.CancellationToken,
-        raft_entry: ?RaftAppliedEntryIdentity,
+        raft_entry: ?OrderedApplyReceipt,
         resolved_participant: ?[]const u8,
         preparation: *PreparedRowAllocator,
     ) !void {
@@ -30159,13 +30170,13 @@ pub const DB = struct {
         if (status != .committed) {
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
-            var marker_value_buf: [raft_applied_entry_value_len]u8 = undefined;
+            var marker_value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
             const marker_writes: []const docstore_mod.KVPair = if (raft_entry) |identity| blk: {
-                switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), identity)) {
+                switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity)) {
                     .already_applied => return,
                     .apply => {},
                 }
-                break :blk &.{raftAppliedEntryWrite(identity, &marker_value_buf)};
+                break :blk &.{orderedApplyReceiptWrite(identity, &marker_value_buf)};
             } else &.{};
             _ = self.core.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{
                 .completion_writes = marker_writes,
@@ -30198,16 +30209,16 @@ pub const DB = struct {
                     self.core.unlockApply();
                     return error.PreparedGenerationChanged;
                 }
-                var marker_value_buf: [raft_applied_entry_value_len]u8 = undefined;
+                var marker_value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
                 const marker_writes: []const docstore_mod.KVPair = if (raft_entry) |identity| blk: {
-                    switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), identity)) {
+                    switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity)) {
                         .already_applied => {
                             self.core.unlockApply();
                             return;
                         },
                         .apply => {},
                     }
-                    break :blk &.{raftAppliedEntryWrite(identity, &marker_value_buf)};
+                    break :blk &.{orderedApplyReceiptWrite(identity, &marker_value_buf)};
                 } else &.{};
                 const outcome = self.core.resolveTransactionIntentsWithExtraBatch(
                     txn_id,
@@ -30671,7 +30682,7 @@ pub const DB = struct {
     pub fn applyRelationalTopologyControl(
         self: *DB,
         command: @import("relational_integrity_topology.zig").Command,
-        raft_entry: ?RaftAppliedEntryIdentity,
+        raft_entry: ?OrderedApplyReceipt,
     ) !void {
         return self.applyRelationalTopologyControlWithReplication(command, raft_entry, null, null, null, null);
     }
@@ -30715,7 +30726,7 @@ pub const DB = struct {
             defer if (catalog_admission) self.index_structural_mutation_mutex.unlock();
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
-            if (opts.raft_applied_entry_marker) |entry| switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), entry)) {
+            if (opts.raft_applied_entry_marker) |entry| switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry)) {
                 .already_applied => {
                     if (command == .admit) {
                         const repair = blk: {
@@ -30825,8 +30836,8 @@ pub const DB = struct {
                 payload = if (req.artifact_catalog != null) try replication_effects_mod.encodeArtifactCatalogMutationRequestAlloc(self.alloc, req, opts.raft_applied_entry_marker orelse return error.InvalidArtifactCatalogCommand) else try replication_effects_mod.encodeOnlineSourceMutationRequestAlloc(self.alloc, req, applied_index);
             for (opts.extra_store_writes) |write| try txn.put(write.key, write.value);
             if (opts.raft_applied_entry_marker) |entry| {
-                var bytes: [raft_applied_entry_value_len]u8 = undefined;
-                const marker = raftAppliedEntryWrite(entry, &bytes);
+                var bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+                const marker = orderedApplyReceiptWrite(entry, &bytes);
                 try txn.put(marker.key, marker.value);
             }
             if (opts.replication_applied_lsn_marker) |lsn| {
@@ -31047,7 +31058,7 @@ pub const DB = struct {
         return .{ .namespace = namespace, .previous = observed.ordered, .binding = .{ .epoch = try std.math.add(u64, if (observed.ordered) |value| value.epoch else 0, 1), .digest = catalogs.digest(), .semantic_digest = try catalogs.semanticDigest(alloc) }, .catalogs = catalogs };
     }
 
-    fn completeArtifactUpload(txn: anytype, finalization: ?@import("artifact_publication_transport.zig").Finalization, entry: RaftAppliedEntryIdentity) !void {
+    fn completeArtifactUpload(txn: anytype, finalization: ?@import("artifact_publication_transport.zig").Finalization, entry: OrderedApplyReceipt) !void {
         if (finalization) |prepared| {
             const upload = prepared.control;
             if (upload.action != .finalize) return error.InvalidBatchRequest;
@@ -31129,7 +31140,7 @@ pub const DB = struct {
         try self.lockApplyForPortableRuntime();
         var apply_held = true;
         defer if (apply_held) self.core.unlockApply();
-        if (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), entry) == .already_applied) return;
+        if (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry) == .already_applied) return;
         var txn = try self.core.store.beginWriteTxn();
         errdefer txn.abort();
         if (fence) |*current| if (prepared) |*candidate| {
@@ -31144,8 +31155,8 @@ pub const DB = struct {
                 try provenance.stageAdoptedIndexed(&txn, candidate.adopted.proof, candidate.adopted.encoded, candidate.positions, .{ .raft = .{ .term = entry.term, .index = entry.index } }, &candidate.references, entry.index);
             }
         };
-        var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
-        const marker = raftAppliedEntryWrite(entry, &marker_buf);
+        var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+        const marker = orderedApplyReceiptWrite(entry, &marker_buf);
         try txn.put(marker.key, marker.value);
         var standby_buf: [replication_applied_lsn_value_len]u8 = undefined;
         if (opts.replication_applied_lsn_marker) |lsn| {
@@ -31233,7 +31244,7 @@ pub const DB = struct {
         try self.lockApplyForPortableRuntime();
         var apply_held = true;
         defer if (apply_held) self.core.unlockApply();
-        if (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), entry) == .already_applied) return;
+        if (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry) == .already_applied) return;
         var txn = try self.core.store.beginWriteTxn();
         errdefer txn.abort();
         _ = try @import("../source_authority.zig").require(&txn, .raft, namespace);
@@ -31263,8 +31274,8 @@ pub const DB = struct {
             .prune => _ = try transport.pruneOneExpired(&txn, entry.index),
             .abandon => _ = try transport.stageAbandon(&txn, control),
         }
-        var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
-        const marker = raftAppliedEntryWrite(entry, &marker_buf);
+        var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+        const marker = orderedApplyReceiptWrite(entry, &marker_buf);
         try txn.put(marker.key, marker.value);
         var standby_buf: [replication_applied_lsn_value_len]u8 = undefined;
         if (opts.replication_applied_lsn_marker) |lsn| {
@@ -31292,8 +31303,8 @@ pub const DB = struct {
         // same logical publication can finalize after reconciliation. A
         // terminal upload record here would strand its retry forever.
         if (reason != .baseline_pending) try completeArtifactUpload(&txn, opts.artifact_upload_finalize, entry);
-        var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
-        const marker = raftAppliedEntryWrite(entry, &marker_buf);
+        var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+        const marker = orderedApplyReceiptWrite(entry, &marker_buf);
         try txn.put(marker.key, marker.value);
         var standby_buf: [replication_applied_lsn_value_len]u8 = undefined;
         if (opts.replication_applied_lsn_marker) |lsn| {
@@ -31509,7 +31520,7 @@ pub const DB = struct {
         try self.lockApplyForPortableRuntime();
         var apply_held = true;
         defer if (apply_held) self.core.unlockApply();
-        if (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), entry) == .already_applied) return;
+        if (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry) == .already_applied) return;
         var namespace: [24]u8 = undefined;
         doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
         if (!std.mem.eql(u8, &namespace, &command.namespace)) return error.IdentityNamespaceMismatch;
@@ -31591,8 +31602,8 @@ pub const DB = struct {
                     }
                 }
             }
-            var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
-            const marker = raftAppliedEntryWrite(entry, &marker_buf);
+            var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+            const marker = orderedApplyReceiptWrite(entry, &marker_buf);
             try txn.put(marker.key, marker.value);
             var standby_buf: [replication_applied_lsn_value_len]u8 = undefined;
             if (opts.replication_applied_lsn_marker) |lsn| {
@@ -31642,11 +31653,11 @@ pub const DB = struct {
                 if (!std.mem.eql(u8, &receipt.publication_digest, &command.publication_digest)) return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .stale_source, &apply_held);
             }
             if (duplicate) {
-                var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
+                var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
                 var txn = try self.core.store.beginWriteTxn();
                 errdefer txn.abort();
                 try completeArtifactUpload(&txn, opts.artifact_upload_finalize, entry);
-                const marker = raftAppliedEntryWrite(entry, &marker_buf);
+                const marker = orderedApplyReceiptWrite(entry, &marker_buf);
                 try txn.put(marker.key, marker.value);
                 var standby_buf: [replication_applied_lsn_value_len]u8 = undefined;
                 if (opts.replication_applied_lsn_marker) |lsn| {
@@ -31703,8 +31714,8 @@ pub const DB = struct {
             if (effect.value) |value| try writes.append(self.alloc, .{ .key = effect.key, .value = value }) else try deletes.append(self.alloc, effect.key);
         }
         try appendDenseArtifactCounterMutations(self.alloc, self.core.store, self.core.index_manager, &writes, deletes.items, &owned_keys, &owned_values);
-        var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
-        try writes.append(self.alloc, raftAppliedEntryWrite(entry, &marker_buf));
+        var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+        try writes.append(self.alloc, orderedApplyReceiptWrite(entry, &marker_buf));
         var standby_buf: [replication_applied_lsn_value_len]u8 = undefined;
         if (opts.replication_applied_lsn_marker) |lsn| try writes.append(self.alloc, replicationAppliedSequenceWrite(lsn, &standby_buf));
         try writes.appendSlice(self.alloc, opts.extra_store_writes);
@@ -31779,7 +31790,7 @@ pub const DB = struct {
             defer admission.release();
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
-            if (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), entry) == .already_applied) return;
+            if (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry) == .already_applied) return;
             var namespace: [24]u8 = undefined;
             doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
             if (!std.mem.eql(u8, &namespace, &command.namespace)) return error.IdentityNamespaceMismatch;
@@ -31790,8 +31801,8 @@ pub const DB = struct {
             try @import("relational_integrity_topology.zig").requireUnfenced(&txn);
             try inventory.stageOrdered(self.alloc, &txn, command, entry.index);
             for (opts.extra_store_writes) |write| try txn.put(write.key, write.value);
-            var marker_bytes: [raft_applied_entry_value_len]u8 = undefined;
-            const marker = raftAppliedEntryWrite(entry, &marker_bytes);
+            var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+            const marker = orderedApplyReceiptWrite(entry, &marker_bytes);
             try txn.put(marker.key, marker.value);
             if (opts.replication_applied_lsn_marker) |lsn| {
                 var bytes: [replication_applied_lsn_value_len]u8 = undefined;
@@ -31889,7 +31900,7 @@ pub const DB = struct {
         defer admission.release();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
-        if (opts.raft_applied_entry_marker) |entry| switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), entry)) {
+        if (opts.raft_applied_entry_marker) |entry| switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry)) {
             .already_applied => return,
             .apply => {},
         };
@@ -31907,8 +31918,8 @@ pub const DB = struct {
             };
         }
         if (opts.raft_applied_entry_marker) |entry| {
-            var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
-            const marker = raftAppliedEntryWrite(entry, &marker_buf);
+            var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+            const marker = orderedApplyReceiptWrite(entry, &marker_buf);
             try txn.put(marker.key, marker.value);
         }
         if (opts.replication_applied_lsn_marker) |lsn| {
@@ -32060,10 +32071,10 @@ pub const DB = struct {
     fn applyRelationalTopologyControlWithReplication(
         self: *DB,
         command: @import("relational_integrity_topology.zig").Command,
-        raft_entry: ?RaftAppliedEntryIdentity,
+        raft_entry: ?OrderedApplyReceipt,
         replication_lsn: ?u64,
         replication_payload: ?[]const u8,
-        native_receipt: ?RaftAppliedEntryIdentity,
+        native_receipt: ?OrderedApplyReceipt,
         native_control: ?NativeTopologyContext,
     ) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
@@ -32075,7 +32086,7 @@ pub const DB = struct {
         defer if (structural_held) self.index_structural_mutation_mutex.unlock();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
-        if (raft_entry) |entry| switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), entry)) {
+        if (raft_entry) |entry| switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry)) {
             .already_applied => return,
             .apply => {},
         };
@@ -32408,8 +32419,8 @@ pub const DB = struct {
             .prune => try @import("relational_integrity_handoff.zig").prune(self.alloc, &txn, command.fence, self.core.byteRange()),
         };
         if (raft_entry) |entry| {
-            var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
-            const marker = raftAppliedEntryWrite(entry, &marker_buf);
+            var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+            const marker = orderedApplyReceiptWrite(entry, &marker_buf);
             try txn.put(marker.key, marker.value);
         }
         if (replication_lsn) |lsn| {
@@ -32445,16 +32456,16 @@ pub const DB = struct {
         self: *DB,
         txn_id: transactions_mod.TxnId,
         participant: []const u8,
-        identity: RaftAppliedEntryIdentity,
+        identity: OrderedApplyReceipt,
     ) !void {
         lockApply(self);
         defer self.core.unlockApply();
-        switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), identity)) {
+        switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity)) {
             .already_applied => return,
             .apply => {},
         }
-        var value_buf: [raft_applied_entry_value_len]u8 = undefined;
-        const marker = raftAppliedEntryWrite(identity, &value_buf);
+        var value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+        const marker = orderedApplyReceiptWrite(identity, &value_buf);
         self.core.markTransactionParticipantResolvedExtraBatch(
             txn_id,
             participant,
@@ -32465,15 +32476,15 @@ pub const DB = struct {
         };
     }
 
-    pub fn markReplicatedTransactionParticipantsResolvedAtRaftEntry(self: *DB, txn_id: transactions_mod.TxnId, participants: []const []const u8, identity: RaftAppliedEntryIdentity) !void {
+    pub fn markReplicatedTransactionParticipantsResolvedAtRaftEntry(self: *DB, txn_id: transactions_mod.TxnId, participants: []const []const u8, identity: OrderedApplyReceipt) !void {
         lockApply(self);
         defer self.core.unlockApply();
-        switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), identity)) {
+        switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity)) {
             .already_applied => return,
             .apply => {},
         }
-        var value_buf: [raft_applied_entry_value_len]u8 = undefined;
-        const marker = raftAppliedEntryWrite(identity, &value_buf);
+        var value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+        const marker = orderedApplyReceiptWrite(identity, &value_buf);
         self.core.markTransactionParticipantsResolvedExtraBatch(
             txn_id,
             participants,
@@ -32500,16 +32511,16 @@ pub const DB = struct {
         txn_id: transactions_mod.TxnId,
         cutoff_timestamp: u64,
         retained_cutoff_timestamp: u64,
-        identity: RaftAppliedEntryIdentity,
+        identity: OrderedApplyReceipt,
     ) !bool {
         lockApply(self);
         defer self.core.unlockApply();
-        switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), identity)) {
+        switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity)) {
             .already_applied => return false,
             .apply => {},
         }
-        var value_buf: [raft_applied_entry_value_len]u8 = undefined;
-        const marker = raftAppliedEntryWrite(identity, &value_buf);
+        var value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+        const marker = orderedApplyReceiptWrite(identity, &value_buf);
         return try self.core.cleanupTransactionMetadataIfEligibleExtraBatch(
             txn_id,
             cutoff_timestamp,
@@ -42339,7 +42350,7 @@ pub const DB = struct {
         try txn.commit();
     }
 
-    fn encodeRestoreStagingReplicationPayload(self: *DB, req: types.BatchRequest, raft_entry: ?RaftAppliedEntryIdentity) ![]u8 {
+    fn encodeRestoreStagingReplicationPayload(self: *DB, req: types.BatchRequest, raft_entry: ?OrderedApplyReceipt) ![]u8 {
         const staging = @import("restore_staging.zig");
         if (req.restore_staging.? == .install_generation_admissions)
             return replication_effects_mod.encodeRestoreGenerationAdmissionMutationRequestAlloc(self.alloc, req, raft_entry orelse return error.InvalidRestoreStagingCommand);
@@ -42378,7 +42389,7 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         command: @import("restore_staging_contract.zig").InstallGenerationAdmissions,
-        marker: ?RaftAppliedEntryIdentity,
+        marker: ?OrderedApplyReceipt,
         replication_lsn: ?u64,
         replication_payload: ?[]const u8,
     ) !@import("restore_staging_contract.zig").GenerationAdmissionReceipt {
@@ -42403,7 +42414,7 @@ pub const DB = struct {
             !std.mem.eql(u8, &binding.source_summary_digest, &command.source_summary_digest) or
             !std.mem.eql(u8, &binding.expected_receipt_digest, &expected))
             return error.RestoreStagingScopeChanged;
-        switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(alloc, self.core.store), entry)) {
+        switch (try orderedApplyDisposition(try readOrderedApplyReceipt(alloc, self.core.store), entry)) {
             .already_applied => {
                 const receipt = (try @import("restore_generation_admissions.zig").loadReceipt(&txn)) orelse
                     return error.RestoreSourceProofMissing;
@@ -42414,8 +42425,8 @@ pub const DB = struct {
             .apply => {},
         }
         const receipt = try @import("restore_generation_admissions.zig").stageInstall(alloc, &txn, command, entry.term, entry.index);
-        var marker_bytes: [raft_applied_entry_value_len]u8 = undefined;
-        const applied = raftAppliedEntryWrite(entry, &marker_bytes);
+        var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+        const applied = orderedApplyReceiptWrite(entry, &marker_bytes);
         try txn.put(applied.key, applied.value);
         if (replication_lsn) |lsn| {
             var lsn_bytes: [replication_applied_lsn_value_len]u8 = undefined;
@@ -42582,13 +42593,13 @@ pub const DB = struct {
         self.durable_replication_outbox_maybe.store(true, .release);
     }
 
-    fn beginRestoreStagingWithMarker(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Scope, marker: ?RaftAppliedEntryIdentity, replication_lsn: ?u64, replication_payload: ?[]const u8) !void {
+    fn beginRestoreStagingWithMarker(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Scope, marker: ?OrderedApplyReceipt, replication_lsn: ?u64, replication_payload: ?[]const u8) !void {
         const staging = @import("restore_staging.zig");
         try scope.validate();
         if (!scope.target_namespace.eql(self.core.identity_namespace)) return error.RestoreStagingScopeChanged;
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
-        if (marker) |entry| switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), entry)) {
+        if (marker) |entry| switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry)) {
             .already_applied => return,
             .apply => {},
         };
@@ -42609,8 +42620,8 @@ pub const DB = struct {
                 if (existing.value.phase == .canceled) return error.RestoreStagingCanceled;
                 if (marker != null or replication_lsn != null or replication_payload != null) {
                     if (marker) |entry| {
-                        var buffer: [raft_applied_entry_value_len]u8 = undefined;
-                        const write = raftAppliedEntryWrite(entry, &buffer);
+                        var buffer: [ordered_apply_receipt_value_len]u8 = undefined;
+                        const write = orderedApplyReceiptWrite(entry, &buffer);
                         try txn.put(write.key, write.value);
                     }
                     if (replication_lsn) |lsn| {
@@ -42710,8 +42721,8 @@ pub const DB = struct {
             try txn.put(write.key, write.value);
         }
         if (marker) |entry| {
-            var buffer: [raft_applied_entry_value_len]u8 = undefined;
-            const write = raftAppliedEntryWrite(entry, &buffer);
+            var buffer: [ordered_apply_receipt_value_len]u8 = undefined;
+            const write = orderedApplyReceiptWrite(entry, &buffer);
             try txn.put(write.key, write.value);
         }
         try txn.commit();
@@ -43035,7 +43046,7 @@ pub const DB = struct {
         return self.finishRestoreStagingWithMarker(alloc, scope, phase, null, null, null);
     }
 
-    fn finishRestoreStagingWithMarker(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Digest, phase: @import("restore_staging.zig").Phase, marker: ?RaftAppliedEntryIdentity, replication_lsn: ?u64, replication_payload: ?[]const u8) !@import("restore_staging.zig").Digest {
+    fn finishRestoreStagingWithMarker(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Digest, phase: @import("restore_staging.zig").Phase, marker: ?OrderedApplyReceipt, replication_lsn: ?u64, replication_payload: ?[]const u8) !@import("restore_staging.zig").Digest {
         const staging = @import("restore_staging.zig");
         if (phase != .validated and phase != .published and phase != .canceled) return error.InvalidRestoreStagingCommand;
         try self.lockApplyForPortableRuntime();
@@ -43051,7 +43062,7 @@ pub const DB = struct {
         defer parsed.deinit();
         var next = parsed.value;
         if (!std.mem.eql(u8, &next.scope.digest(), &scope)) return error.RestoreStagingScopeChanged;
-        if (marker) |entry| switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), entry)) {
+        if (marker) |entry| switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry)) {
             .already_applied => return next.receipt(),
             .apply => {},
         };
@@ -43067,8 +43078,8 @@ pub const DB = struct {
         if (next.phase == phase) {
             if (marker != null or replication_lsn != null or replication_payload != null) {
                 if (marker) |entry| {
-                    var buffer: [raft_applied_entry_value_len]u8 = undefined;
-                    const write = raftAppliedEntryWrite(entry, &buffer);
+                    var buffer: [ordered_apply_receipt_value_len]u8 = undefined;
+                    const write = orderedApplyReceiptWrite(entry, &buffer);
                     try txn.put(write.key, write.value);
                 }
                 if (replication_lsn) |lsn| {
@@ -43131,8 +43142,8 @@ pub const DB = struct {
             try txn.put(write.key, write.value);
         }
         if (marker) |entry| {
-            var buffer: [raft_applied_entry_value_len]u8 = undefined;
-            const write = raftAppliedEntryWrite(entry, &buffer);
+            var buffer: [ordered_apply_receipt_value_len]u8 = undefined;
+            const write = orderedApplyReceiptWrite(entry, &buffer);
             try txn.put(write.key, write.value);
         }
         try txn.commit();
@@ -81351,7 +81362,7 @@ test "graph ownership cleanup runs on borrowed VoprIo before replicated merge" {
                 .merged_end = "",
             } };
             try std.testing.expectError(error.RaftApplyWriterUnavailable, server_test_adapter.applyOrdered(&database, merge, .{ .term = 1, .index = 2 }));
-            try std.testing.expectEqual(@as(u64, 1), (try database.raftAppliedEntry()).?.index);
+            try std.testing.expectEqual(@as(u64, 1), (try database.orderedApplyReceipt()).?.index);
             database.startResidentBackgroundWorkersIfNeeded();
             if (database.artifact_repair_metadata_future == null) return error.GraphMaintenanceWorkerMissing;
             const graph = &database.core.index_manager.graphIndex("g").?.index;
@@ -81361,7 +81372,7 @@ test "graph ownership cleanup runs on borrowed VoprIo before replicated merge" {
             }
             if (graph.ownershipTransitionPending()) return error.GraphOwnershipCleanupTimedOut;
             try server_test_adapter.applyOrdered(&database, merge, .{ .term = 1, .index = 2 });
-            try std.testing.expectEqual(@as(u64, 2), (try database.raftAppliedEntry()).?.index);
+            try std.testing.expectEqual(@as(u64, 2), (try database.orderedApplyReceipt()).?.index);
             try std.testing.expectEqualStrings("", database.getRange().end);
             const retired = try database.getEdges(database.alloc, "g", "a", "link", .in);
             defer graph_mod.GraphIndex.freeEdges(database.alloc, retired);
@@ -83127,7 +83138,7 @@ test "relational replicated admission is identical across local memory envelopes
         const txn = try db.beginTransaction(100);
         try db.writeReplicatedTransactionAtRaftEntry(txn, .{ .writes = &.{.{ .key = "a", .value = "{\"n\":1}" }} }, .{ .term = 1, .index = 1 });
         try std.testing.expectError(error.TransactionTooLarge, db.writeReplicatedTransactionAtRaftEntry(txn, .{ .writes = &.{.{ .key = "b", .value = "{\"n\":2}" }} }, .{ .term = 1, .index = 2 }));
-        try std.testing.expectEqual(@as(u64, 1), (try db.raftAppliedEntry()).?.index);
+        try std.testing.expectEqual(@as(u64, 1), (try db.orderedApplyReceipt()).?.index);
         var intents = try db.core.collectTransactionIntentBatch(alloc, txn);
         defer intents.deinit(alloc);
         try std.testing.expectEqual(@as(usize, 1), intents.writes.len);
@@ -117244,7 +117255,7 @@ test "db replicated merge artifacts preserve graph ttl dense sparse projections 
                 .merge_replication = .{ .transition_id = 1, .donor_group_id = 2, .receiver_group_id = 3, .identity_namespace = receiver.core.identity_namespace },
                 .merge_artifacts = rows,
             };
-            const identity: RaftAppliedEntryIdentity = .{ .term = 1, .index = 10 };
+            const identity: OrderedApplyReceipt = .{ .term = 1, .index = 10 };
             try server_test_adapter.applyOrdered(&receiver, req, identity);
             try server_test_adapter.applyOrdered(&receiver, req, identity);
             if (start_workers) {
@@ -133926,7 +133937,7 @@ fn testChildGenerationInstall(native: bool) !void {
     const receipt = try @import("relational_integrity_generation_admission.zig").AppliedReceipt.decode(receipt_bytes);
     try std.testing.expectEqual(@as(u64, 1), receipt.term);
     try std.testing.expectEqual(@as(u64, if (native) 5 else 1), receipt.index);
-    if (native) try std.testing.expect((try readRaftAppliedEntry(alloc, installed.core.store)) == null);
+    if (native) try std.testing.expect((try readOrderedApplyReceipt(alloc, installed.core.store)) == null);
     // A later DROP publication fences the already-installed v1 layout. The
     // schema pin is intentionally false for an equal version, but cold owner
     // index reconciliation must still wait for this dual-role fence.
@@ -139230,9 +139241,9 @@ test "db replicated transaction commits each raft receipt atomically" {
 
     const txn_id: transactions_mod.TxnId = .{0x5a} ** 16;
     const participant = "table:receipts:group:7";
-    const begin_entry: RaftAppliedEntryIdentity = .{ .term = 3, .index = 11 };
-    const prepare_entry: RaftAppliedEntryIdentity = .{ .term = 3, .index = 12 };
-    const resolve_entry: RaftAppliedEntryIdentity = .{ .term = 3, .index = 13 };
+    const begin_entry: OrderedApplyReceipt = .{ .term = 3, .index = 11 };
+    const prepare_entry: OrderedApplyReceipt = .{ .term = 3, .index = 12 };
+    const resolve_entry: OrderedApplyReceipt = .{ .term = 3, .index = 13 };
 
     _ = try db.beginReplicatedTransactionAtRaftEntry(
         txn_id,
@@ -139243,7 +139254,7 @@ test "db replicated transaction commits each raft receipt atomically" {
         false,
         begin_entry,
     );
-    try std.testing.expectEqualDeep(begin_entry, (try db.raftAppliedEntry()).?);
+    try std.testing.expectEqualDeep(begin_entry, (try db.orderedApplyReceipt()).?);
 
     // An exact begin replay is fenced before it can alter the existing record.
     _ = try db.beginReplicatedTransactionAtRaftEntry(
@@ -139260,7 +139271,7 @@ test "db replicated transaction commits each raft receipt atomically" {
     try db.writeReplicatedTransactionAtRaftEntry(txn_id, .{
         .writes = &.{.{ .key = "doc:receipt", .value = "{\"title\":\"transaction\"}" }},
     }, prepare_entry);
-    try std.testing.expectEqualDeep(prepare_entry, (try db.raftAppliedEntry()).?);
+    try std.testing.expectEqualDeep(prepare_entry, (try db.orderedApplyReceipt()).?);
 
     try db.resolveReplicatedTransactionAtRaftEntry(
         txn_id,
@@ -139271,7 +139282,7 @@ test "db replicated transaction commits each raft receipt atomically" {
         resolve_entry,
         participant,
     );
-    try std.testing.expectEqualDeep(resolve_entry, (try db.raftAppliedEntry()).?);
+    try std.testing.expectEqualDeep(resolve_entry, (try db.orderedApplyReceipt()).?);
     const unresolved = try db.getUnresolvedTransactionParticipants(alloc, txn_id);
     defer transactions_mod.freeParticipantList(alloc, unresolved);
     try std.testing.expectEqual(@as(usize, 0), unresolved.len);
@@ -139394,14 +139405,14 @@ test "storage.hot_standby merge proof adoption certifies receiver-local absent o
         defer read.abort();
         try std.testing.expectEqualDeep(publication.Position{ .raft = .{ .term = 4, .index = 7 } }, (try publication.artifactRevision(&read, receiver_bytes, output_key)).?);
     }
-    try std.testing.expectEqual(@as(u64, 7), (try db.raftAppliedEntry()).?.index);
+    try std.testing.expectEqual(@as(u64, 7), (try db.orderedApplyReceipt()).?.index);
     var wrong = command;
     wrong.record_digest = @splat(8);
     try server_test_adapter.applyOrdered(&db, .{ .merge_proof_adoption = wrong }, .{ .term = 4, .index = 8 });
     var read = try db.core.store.beginReadTxn();
     defer read.abort();
     try std.testing.expectEqualDeep(publication.Position{ .raft = .{ .term = 4, .index = 7 } }, (try publication.artifactRevision(&read, receiver_bytes, output_key)).?);
-    try std.testing.expectEqual(@as(u64, 8), (try db.raftAppliedEntry()).?.index);
+    try std.testing.expectEqual(@as(u64, 8), (try db.orderedApplyReceipt()).?.index);
 }
 
 test "storage.hot_standby stale merge proof adoption advances only its ordered watermark" {
@@ -139422,13 +139433,13 @@ test "storage.hot_standby stale merge proof adoption advances only its ordered w
         defer db.close();
         const before = db.core.nextDerivedSequence();
         try server_test_adapter.applyOrdered(&db, .{ .merge_proof_adoption = command }, .{ .term = 2, .index = 7 });
-        try std.testing.expectEqual(@as(u64, 7), (try db.raftAppliedEntry()).?.index);
+        try std.testing.expectEqual(@as(u64, 7), (try db.orderedApplyReceipt()).?.index);
         try std.testing.expectEqual(before, db.core.nextDerivedSequence());
     }
     var reopened = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer reopened.close();
     try server_test_adapter.applyOrdered(&reopened, .{ .merge_proof_adoption = command }, .{ .term = 2, .index = 7 });
-    try std.testing.expectEqual(@as(u64, 7), (try reopened.raftAppliedEntry()).?.index);
+    try std.testing.expectEqual(@as(u64, 7), (try reopened.orderedApplyReceipt()).?.index);
 }
 
 test "db raced replicated transaction completion persists receipt and participant acknowledgement" {
@@ -139468,7 +139479,7 @@ test "db raced replicated transaction completion persists receipt and participan
     defer transactions_mod.freeParticipantList(alloc, unresolved_before);
     try std.testing.expectEqual(@as(usize, 1), unresolved_before.len);
 
-    const resolve_entry: RaftAppliedEntryIdentity = .{ .term = 4, .index = 23 };
+    const resolve_entry: OrderedApplyReceipt = .{ .term = 4, .index = 23 };
     try db.batchInternal(.{
         .writes = &.{.{ .key = "doc:raced-receipt", .value = "{\"title\":\"transaction\"}" }},
         .timestamp_ns = 25_000,
@@ -139486,7 +139497,7 @@ test "db raced replicated transaction completion persists receipt and participan
         },
     });
 
-    try std.testing.expectEqualDeep(resolve_entry, (try db.raftAppliedEntry()).?);
+    try std.testing.expectEqualDeep(resolve_entry, (try db.orderedApplyReceipt()).?);
     const unresolved_after = try db.getUnresolvedTransactionParticipants(alloc, txn_id);
     defer transactions_mod.freeParticipantList(alloc, unresolved_after);
     try std.testing.expectEqual(@as(usize, 0), unresolved_after.len);
@@ -139530,7 +139541,7 @@ test "online direct vector uncertified source cannot authorize unknown effects o
     chunked.merge_page.?.source.artifact_catalog = null;
     chunked.merge_page.?.digest = pages.commandDigest(chunked);
     try std.testing.expectError(error.InvalidMergePage, server_test_adapter.applyOrdered(&db, chunked, .{ .term = 1, .index = 2 }));
-    try std.testing.expectEqual(@as(u64, 1), (try db.raftAppliedEntry()).?.index);
+    try std.testing.expectEqual(@as(u64, 1), (try db.orderedApplyReceipt()).?.index);
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, key));
 }
 
@@ -141495,7 +141506,7 @@ test "db raft snapshot replacement preserves overlapping incoming documents" {
         .{ .key = "doc:stale", .value = "{\"stale\":true}" },
     } });
 
-    try db.replaceRaftDocumentSnapshot(alloc, .{ .start = "", .end = "" }, &.{
+    try db.replacePrimaryDocumentsAndRange(alloc, .{ .start = "", .end = "" }, &.{
         .{ .key = "doc:keep", .value = "{\"version\":2}" },
         .{ .key = "doc:new", .value = "{\"new\":true}" },
     });
@@ -141534,15 +141545,15 @@ test "db staged raft snapshot chunks atomically replace the live generation" {
         });
         defer candidate.close();
         const byte_range: types.ByteRange = .{ .start = "doc:a", .end = "doc:z" };
-        try candidate.appendRaftDocumentSnapshotChunk(&staged, byte_range, &.{.{
+        try candidate.appendStagedSnapshotDocuments(&staged, byte_range, &.{.{
             .key = "doc:keep",
             .value = "{\"version\":2}",
         }});
-        try candidate.appendRaftDocumentSnapshotChunk(&staged, byte_range, &.{.{
+        try candidate.appendStagedSnapshotDocuments(&staged, byte_range, &.{.{
             .key = "doc:new",
             .value = "{\"new\":true}",
         }});
-        try candidate.finishRaftDocumentSnapshot(&staged, byte_range);
+        try candidate.finishStagedSnapshotRange(&staged, byte_range);
         try candidate.sync(true);
     }
     try staged.seal();
@@ -141804,7 +141815,7 @@ test "db merge receiver fences stale copies and retains retired transitions acro
         try server_test_adapter.applyOrdered(&db, .{ .merge_replication = copy, .merge_artifacts = &.{.{ .key = artifact_key, .value = "invalid stale artifact" }} }, .{ .term = 2, .index = 8 });
         try std.testing.expect((try db.core.getStoreValue(alloc, artifact_key)) == null);
         try std.testing.expectEqual(before, db.core.nextDerivedSequence());
-        try std.testing.expectEqual(@as(u64, 8), (try db.raftAppliedEntry()).?.index);
+        try std.testing.expectEqual(@as(u64, 8), (try db.orderedApplyReceipt()).?.index);
         const value = (try db.get(alloc, "b")).?;
         defer alloc.free(value);
         try std.testing.expectEqualStrings("{\"public\":true}", value);
@@ -141931,7 +141942,7 @@ test "db merge copy attempts fence delayed leaders before finalize across reopen
     completed_copy.copy_attempt = checkpoint.copy_attempt;
     try Apply.command(&db, &index, .{ .merge_replication = completed_copy, .deletes = &.{"b"} });
     try std.testing.expectEqual(before, db.core.nextDerivedSequence());
-    try std.testing.expectEqual(index, (try db.raftAppliedEntry()).?.index);
+    try std.testing.expectEqual(index, (try db.orderedApplyReceipt()).?.index);
     try std.testing.expect((try db.core.getStoreValue(alloc, artifact_key)) == null);
     checkpoint.kind = .finalize;
     try Apply.command(&db, &index, .{ .merge_checkpoint = checkpoint });
@@ -142101,7 +142112,7 @@ test "db replicated merge checkpoints keep rolled back receivers live across del
     try std.testing.expectEqual(merge_state_mod.Phase.rolled_back, state.phase);
     try std.testing.expect(!state.bootstrap_complete);
     try std.testing.expectEqual(@as(u64, 0), state.bootstrap_applied_index);
-    try std.testing.expectEqual(@as(u64, 8), (try db.raftAppliedEntry()).?.index);
+    try std.testing.expectEqual(@as(u64, 8), (try db.orderedApplyReceipt()).?.index);
     const value = (try db.get(alloc, "n")).?;
     defer alloc.free(value);
     try std.testing.expectEqualStrings("{\"live\":true}", value);
@@ -142180,7 +142191,7 @@ test "db terminal merge controls preserve a subsequent split across reopen" {
             try std.testing.expectEqual(@as(u64, if (terminal == .finalize) 1 else 0), state.bootstrap_applied_index);
             try std.testing.expectEqualStrings("z", state.receiver_base_range.end);
             try std.testing.expectEqualStrings("z", state.merged_range.?.end);
-            try std.testing.expectEqual(@as(u64, 10), (try db.raftAppliedEntry()).?.index);
+            try std.testing.expectEqual(@as(u64, 10), (try db.orderedApplyReceipt()).?.index);
             try std.testing.expectEqual(shard_mod.SplitPhase.splitting, db.core.splitState().?.phase);
         }
         var reopened = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
@@ -142190,7 +142201,7 @@ test "db terminal merge controls preserve a subsequent split across reopen" {
         const value = (try reopened.get(alloc, "n")).?;
         defer alloc.free(value);
         try std.testing.expectEqualStrings("{\"live\":true}", value);
-        try std.testing.expectEqual(@as(u64, 10), (try reopened.raftAppliedEntry()).?.index);
+        try std.testing.expectEqual(@as(u64, 10), (try reopened.orderedApplyReceipt()).?.index);
     }
 }
 
@@ -142296,7 +142307,7 @@ test "db physical lsm split retains parent merge receipts and clears child recei
                 try std.testing.expectEqualSlices(u64, &.{70}, receipt.retired_transition_ids);
                 try std.testing.expectEqual(std.math.Order.eq, receipt.copy_attempt.order(.{ .donor_term = 1, .sequence = 1 }));
                 try std.testing.expectEqual(@as(u64, if (terminal == .finalize) 4 else 0), receipt.bootstrap_applied_index);
-                try std.testing.expectEqual(@as(u64, 14), (try parent.raftAppliedEntry()).?.index);
+                try std.testing.expectEqual(@as(u64, 14), (try parent.orderedApplyReceipt()).?.index);
             }
             {
                 var child = try DB.open(alloc, std.mem.span(child_path), options);
@@ -142318,7 +142329,7 @@ test "db physical lsm split retains parent merge receipts and clears child recei
                 fresh.bootstrap_applied_index = 0;
                 fresh.copy_attempt = .{};
                 try server_test_adapter.applyOrdered(&child, .{ .merge_checkpoint = fresh }, .{ .term = 1, .index = 1 });
-                try std.testing.expectEqual(@as(u64, 1), (try child.raftAppliedEntry()).?.index);
+                try std.testing.expectEqual(@as(u64, 1), (try child.orderedApplyReceipt()).?.index);
             }
             var reopened = try DB.open(alloc, std.mem.span(parent_path), options);
             defer reopened.close();
@@ -150923,7 +150934,7 @@ test "db ordered artifact inventory producer baseline resumes and includes behin
     const follower_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/producer-baseline-follower", .{tmp.sub_path});
     defer alloc.free(follower_path);
     const Replicate = struct {
-        fn apply(owners: [2]*DB, request: types.BatchRequest, position: RaftAppliedEntryIdentity) !void {
+        fn apply(owners: [2]*DB, request: types.BatchRequest, position: OrderedApplyReceipt) !void {
             for (owners) |owner| try server_test_adapter.applyOrdered(&owner, request, position);
         }
     };
@@ -151153,7 +151164,7 @@ test "db ordered artifact inventory upload backpressure advances apply without f
     try server_test_adapter.applyOrdered(&db, .{ .artifact_publication_transport = begin }, .{ .term = 1, .index = 10 });
     try server_test_adapter.applyOrdered(&db, .{ .artifact_publication_transport = .{ .action = .chunk, .namespace = namespace, .publication_digest = begin.publication_digest, .manifest_root = root, .chunk_base64 = "eA==" } }, .{ .term = 1, .index = 11 });
     try server_test_adapter.applyOrdered(&db, .{ .artifact_publication_transport = .{ .action = .finalize, .namespace = namespace, .publication_digest = begin.publication_digest, .manifest_root = root } }, .{ .term = 1, .index = 12 });
-    try std.testing.expectEqual(@as(u64, 12), (try db.raftAppliedEntry()).?.index);
+    try std.testing.expectEqual(@as(u64, 12), (try db.orderedApplyReceipt()).?.index);
     try std.testing.expectEqual(cut, db.core.store.lastReplaySequence(0));
     {
         var read = try db.core.store.beginReadTxn();
@@ -151276,8 +151287,8 @@ fn testGraphGenerationHeadFence(accepted_before_switch: bool) !void {
         errdefer txn.abort();
         _ = try plan.begin(&txn);
         _ = try plan.publish(&txn, null, Guard{});
-        var marker_bytes: [raft_applied_entry_value_len]u8 = undefined;
-        const marker = raftAppliedEntryWrite(.{ .term = 1, .index = if (accepted_before_switch) 6 else 5 }, &marker_bytes);
+        var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+        const marker = orderedApplyReceiptWrite(.{ .term = 1, .index = if (accepted_before_switch) 6 else 5 }, &marker_bytes);
         try txn.put(marker.key, marker.value);
         try txn.commit();
     }
@@ -151369,8 +151380,8 @@ test "db ordered artifact inventory graph planning inherits selected extraction 
         const position: publication.Position = .{ .raft = .{ .term = 1, .index = 4 } };
         try publication.stageArtifactRevisions(&txn, header, position);
         try provenance.stage(&txn, header, encoded_proof, position);
-        var marker_bytes: [raft_applied_entry_value_len]u8 = undefined;
-        const marker = raftAppliedEntryWrite(.{ .term = 1, .index = 4 }, &marker_bytes);
+        var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+        const marker = orderedApplyReceiptWrite(.{ .term = 1, .index = 4 }, &marker_bytes);
         try txn.put(marker.key, marker.value);
         try txn.commit();
     }
@@ -151427,8 +151438,8 @@ test "db ordered artifact inventory graph planning inherits selected extraction 
         errdefer txn.abort();
         _ = try empty.begin(&txn);
         _ = try empty.publish(&txn, plan.core.spec.id(), Guard{});
-        var marker_bytes: [raft_applied_entry_value_len]u8 = undefined;
-        const marker = raftAppliedEntryWrite(.{ .term = 1, .index = 7 }, &marker_bytes);
+        var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+        const marker = orderedApplyReceiptWrite(.{ .term = 1, .index = 7 }, &marker_bytes);
         try txn.put(marker.key, marker.value);
         try txn.commit();
     }
@@ -151761,7 +151772,7 @@ test "db ordered artifact inventory upload resumes across restart and atomically
     // deletion; it never needs to resurrect the large original command.
     try server_test_adapter.applyOrdered(&reopened, finalize, .{ .term = 2, .index = 8 });
     try std.testing.expectEqual(before, reopened.core.store.lastReplaySequence(0));
-    try std.testing.expectEqual(@as(u64, 8), (try reopened.raftAppliedEntry()).?.index);
+    try std.testing.expectEqual(@as(u64, 8), (try reopened.orderedApplyReceipt()).?.index);
     var read = try reopened.core.store.beginReadTxn();
     defer read.abort();
     try std.testing.expectEqual(publication.Rejection.stale_catalog, (try publication.rejected(&read, command)).?.reason);
@@ -152572,7 +152583,7 @@ test "db ordered artifact inventory stale publications commit rejection without 
         stale_catalog.publication_digest = stale_catalog.digest();
         try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = stale_catalog }, .{ .term = 1, .index = 6 });
         try std.testing.expectEqual(committed_replay, db.core.store.lastReplaySequence(0));
-        try std.testing.expectEqual(@as(u64, 6), (try db.raftAppliedEntry()).?.index);
+        try std.testing.expectEqual(@as(u64, 6), (try db.orderedApplyReceipt()).?.index);
     }
     var reopened = try DB.open(alloc, path, options);
     defer reopened.close();
@@ -152666,7 +152677,7 @@ test "relational index system online admission defers during index structural mu
     try std.testing.expectError(error.StorageBusy, server_test_adapter.applyOrdered(&db, command, .{ .term = 2, .index = 1 }));
     db.index_structural_mutation_mutex.unlock();
     held = false;
-    try std.testing.expect((try db.raftAppliedEntry()) == null);
+    try std.testing.expect((try db.orderedApplyReceipt()) == null);
     {
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
@@ -152674,7 +152685,7 @@ test "relational index system online admission defers during index structural mu
         try std.testing.expect((try @import("../source_pin_state.zig").load(&read)) == null);
     }
     try server_test_adapter.applyOrdered(&db, command, .{ .term = 2, .index = 1 });
-    try std.testing.expectEqual(@as(u64, 1), (try db.raftAppliedEntry()).?.index);
+    try std.testing.expectEqual(@as(u64, 1), (try db.orderedApplyReceipt()).?.index);
     {
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
@@ -152704,7 +152715,7 @@ test "db transaction batched acknowledgement migration preserves legacy replay a
         try std.testing.expectError(error.NotFound, read.get(&index_key));
     }
     try std.testing.expectError(error.InvalidParticipant, db.markReplicatedTransactionParticipantsResolvedAtRaftEntry(txn, &.{ "b", "absent" }, .{ .term = 3, .index = 3 }));
-    try std.testing.expectEqual(@as(u64, 2), (try db.raftAppliedEntry()).?.index);
+    try std.testing.expectEqual(@as(u64, 2), (try db.orderedApplyReceipt()).?.index);
     try db.markReplicatedTransactionParticipantsResolvedAtRaftEntry(txn, &.{"b"}, .{ .term = 3, .index = 3 });
     // Exact replay is fenced before payload admission, preserving the durable
     // marker together with the indexed membership and migrated resolution.
@@ -152713,7 +152724,7 @@ test "db transaction batched acknowledgement migration preserves legacy replay a
     opened = false;
     db = try DB.open(alloc, path, .{ .start_index_workers = false });
     opened = true;
-    try std.testing.expectEqual(@as(u64, 3), (try db.raftAppliedEntry()).?.index);
+    try std.testing.expectEqual(@as(u64, 3), (try db.orderedApplyReceipt()).?.index);
     const pending = try db.getUnresolvedTransactionParticipants(alloc, txn);
     defer transactions_mod.freeParticipantList(alloc, pending);
     try std.testing.expectEqual(@as(usize, 1), pending.len);

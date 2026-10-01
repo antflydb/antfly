@@ -50,22 +50,22 @@ pub const AppendMetadataMutationOptions = struct {
 pub const BatchMutationPayload = struct {
     /// Original authority for ordinary rows and coordinated resolutions. Input
     /// provenance cannot substitute a standby-local replay sequence.
-    ordinary_raft_entry: ?db_types.RaftAppliedEntryIdentity = null,
-    artifact_publication_raft_entry: ?db_types.RaftAppliedEntryIdentity = null,
-    artifact_publication_transport_raft_entry: ?db_types.RaftAppliedEntryIdentity = null,
-    merge_proof_adoption_raft_entry: ?db_types.RaftAppliedEntryIdentity = null,
+    ordinary_raft_entry: ?db_types.OrderedApplyReceipt = null,
+    artifact_publication_raft_entry: ?db_types.OrderedApplyReceipt = null,
+    artifact_publication_transport_raft_entry: ?db_types.OrderedApplyReceipt = null,
+    merge_proof_adoption_raft_entry: ?db_types.OrderedApplyReceipt = null,
     native_topology_position: ?@import("receipt_position.zig").Native = null,
-    artifact_catalog_raft_entry: ?db_types.RaftAppliedEntryIdentity = null,
+    artifact_catalog_raft_entry: ?db_types.OrderedApplyReceipt = null,
     /// Initial hidden FK owner controls are Raft decisions. Standby replay
     /// must preserve that exact entry identity for owner receipts and reject
     /// an ordinary batch carrying the same private command.
-    initial_child_raft_entry: ?db_types.RaftAppliedEntryIdentity = null,
+    initial_child_raft_entry: ?db_types.OrderedApplyReceipt = null,
     /// Graph owner seals bind a durable receipt to the primary's exact Raft
     /// apply entry; a standby must replay the same term/index.
-    graph_retirement_raft_entry: ?db_types.RaftAppliedEntryIdentity = null,
+    graph_retirement_raft_entry: ?db_types.OrderedApplyReceipt = null,
     /// Imported FK proof becomes target admission only at this exact primary
     /// Raft entry. A standby may not invent a local term/index for its receipt.
-    restore_generation_admission_raft_entry: ?db_types.RaftAppliedEntryIdentity = null,
+    restore_generation_admission_raft_entry: ?db_types.OrderedApplyReceipt = null,
     /// Original source cut identity, assigned by native apply, never by a caller.
     online_source_applied_index: ?u64 = null,
     restore_staging_bootstrap: ?@import("restore_staging_contract.zig").OwnerBootstrap = null,
@@ -195,7 +195,7 @@ test "storage.hot_standby source generation proof page requires versioned standb
     try std.testing.expectError(error.UnsupportedBatchMutationPayloadVersion, decodeBatchMutationRequest(alloc, record));
 }
 
-pub fn encodeInitialChildMutationRequestAlloc(alloc: Allocator, request: db_types.BatchRequest, entry: db_types.RaftAppliedEntryIdentity) ![]u8 {
+pub fn encodeInitialChildMutationRequestAlloc(alloc: Allocator, request: db_types.BatchRequest, entry: db_types.OrderedApplyReceipt) ![]u8 {
     if (batchMutationVersion(request) != 8 or entry.term == 0 or entry.index == 0) return error.InvalidInitialChildPublication;
     try validatePageFields(request);
     return std.json.Stringify.valueAlloc(alloc, BatchMutationPayload{
@@ -483,7 +483,7 @@ pub const MetadataMutationPayload = struct {
     published_child: ?PublishedChildSchema = null,
     row_policy_bundle: ?[]const u8 = null,
     row_policy_request: ?@import("../../system_catalog/policies.zig").InstallRequest = null,
-    row_policy_raft_entry: ?db_types.RaftAppliedEntryIdentity = null,
+    row_policy_raft_entry: ?db_types.OrderedApplyReceipt = null,
 };
 
 /// Policy installation is an owner Raft decision, not a schema update. The
@@ -492,7 +492,7 @@ pub fn encodeRowPolicyMetadataMutationAlloc(
     alloc: Allocator,
     bundle: []const u8,
     request: @import("../../system_catalog/policies.zig").InstallRequest,
-    entry: db_types.RaftAppliedEntryIdentity,
+    entry: db_types.OrderedApplyReceipt,
 ) ![]u8 {
     if (bundle.len == 0 or entry.term == 0 or entry.index == 0) return error.InvalidMetadataMutationPayload;
     return std.json.Stringify.valueAlloc(alloc, MetadataMutationPayload{
@@ -536,7 +536,7 @@ pub fn encodeBatchMutationRequestAlloc(
 pub fn encodeGraphRetirementSealMutationRequestAlloc(
     alloc: Allocator,
     request: db_types.BatchRequest,
-    entry: db_types.RaftAppliedEntryIdentity,
+    entry: db_types.OrderedApplyReceipt,
 ) ![]u8 {
     const command = request.relational_topology orelse return error.InvalidGraphRetirementSeal;
     if (command.action != .seal_graph_retirement or command.graph_retirement == null or
@@ -552,7 +552,7 @@ pub fn encodeGraphRetirementSealMutationRequestAlloc(
 pub fn encodeRestoreGenerationAdmissionMutationRequestAlloc(
     alloc: Allocator,
     request: db_types.BatchRequest,
-    entry: db_types.RaftAppliedEntryIdentity,
+    entry: db_types.OrderedApplyReceipt,
 ) ![]u8 {
     const command = request.restore_staging orelse return error.InvalidRestoreStagingCommand;
     if (command != .install_generation_admissions or entry.term == 0 or entry.index == 0)
@@ -576,25 +576,25 @@ pub fn encodeOnlineSourceMutationRequestAlloc(alloc: Allocator, request: db_type
     }, .{});
 }
 
-pub fn encodeArtifactCatalogMutationRequestAlloc(alloc: Allocator, request: db_types.BatchRequest, entry: db_types.RaftAppliedEntryIdentity) ![]u8 {
+pub fn encodeArtifactCatalogMutationRequestAlloc(alloc: Allocator, request: db_types.BatchRequest, entry: db_types.OrderedApplyReceipt) ![]u8 {
     if (request.artifact_catalog == null or entry.term == 0 or entry.index == 0) return error.InvalidArtifactCatalogCommand;
     try validatePageFields(request);
     return std.json.Stringify.valueAlloc(alloc, BatchMutationPayload{ .schema_version = 12, .request = request, .artifact_catalog_raft_entry = entry, .online_source_applied_index = if (request.online_source != null) entry.index else null }, .{});
 }
 
-pub fn encodeArtifactPublicationMutationRequestAlloc(alloc: Allocator, request: db_types.BatchRequest, entry: db_types.RaftAppliedEntryIdentity) ![]u8 {
+pub fn encodeArtifactPublicationMutationRequestAlloc(alloc: Allocator, request: db_types.BatchRequest, entry: db_types.OrderedApplyReceipt) ![]u8 {
     if (request.artifact_publication == null or entry.term == 0 or entry.index == 0) return error.InvalidBatchRequest;
     try @import("artifact_publication.zig").validateRequest(alloc, request);
     return std.json.Stringify.valueAlloc(alloc, BatchMutationPayload{ .schema_version = 14, .request = request, .artifact_publication_raft_entry = entry }, .{});
 }
 
-pub fn encodeArtifactPublicationTransportMutationRequestAlloc(alloc: Allocator, request: db_types.BatchRequest, entry: db_types.RaftAppliedEntryIdentity) ![]u8 {
+pub fn encodeArtifactPublicationTransportMutationRequestAlloc(alloc: Allocator, request: db_types.BatchRequest, entry: db_types.OrderedApplyReceipt) ![]u8 {
     if (request.artifact_publication_transport == null or entry.term == 0 or entry.index == 0) return error.InvalidBatchRequest;
     try @import("artifact_publication_transport.zig").validateBatchRequest(request);
     return std.json.Stringify.valueAlloc(alloc, BatchMutationPayload{ .schema_version = 16, .request = request, .artifact_publication_transport_raft_entry = entry }, .{});
 }
 
-pub fn encodeMergeProofAdoptionMutationRequestAlloc(alloc: Allocator, request: db_types.BatchRequest, entry: db_types.RaftAppliedEntryIdentity) ![]u8 {
+pub fn encodeMergeProofAdoptionMutationRequestAlloc(alloc: Allocator, request: db_types.BatchRequest, entry: db_types.OrderedApplyReceipt) ![]u8 {
     if (request.merge_proof_adoption == null or entry.term == 0 or entry.index == 0) return error.InvalidBatchRequest;
     try @import("merge_proof_adoption.zig").validateRequest(request);
     return std.json.Stringify.valueAlloc(alloc, BatchMutationPayload{ .schema_version = 17, .request = request, .merge_proof_adoption_raft_entry = entry }, .{});
@@ -626,7 +626,7 @@ test "storage.hot_standby ordered artifact inventory merge adoption requires a v
     try std.testing.expectError(error.UnsupportedBatchMutationPayloadVersion, decodeBatchMutationRequest(alloc, bad));
 }
 
-pub fn encodeRaftBatchMutationRequestAlloc(alloc: Allocator, request: db_types.BatchRequest, entry: db_types.RaftAppliedEntryIdentity) ![]u8 {
+pub fn encodeRaftBatchMutationRequestAlloc(alloc: Allocator, request: db_types.BatchRequest, entry: db_types.OrderedApplyReceipt) ![]u8 {
     const payload: BatchMutationPayload = .{ .schema_version = 15, .request = request, .ordinary_raft_entry = entry };
     try validateOrdinaryRaftPayload(payload);
     return std.json.Stringify.valueAlloc(alloc, payload, .{});
@@ -668,7 +668,7 @@ test "storage.hot_standby ordered artifact inventory standby baseline keeps disc
     };
     command.publication_digest = command.digest();
     const request: db_types.BatchRequest = .{ .artifact_publication = command };
-    const applied: db_types.RaftAppliedEntryIdentity = .{ .term = 6, .index = 9 };
+    const applied: db_types.OrderedApplyReceipt = .{ .term = 6, .index = 9 };
     try std.testing.expectError(error.InvalidBatchRequest, encodeBatchMutationRequestAlloc(alloc, request));
     try std.testing.expectError(error.InvalidBatchRequest, encodeRaftBatchMutationRequestAlloc(alloc, request, applied));
     const bytes = try encodeArtifactPublicationMutationRequestAlloc(alloc, request, applied);
@@ -698,7 +698,7 @@ test "storage.hot_standby ordered artifact inventory standby validation retains 
     };
     command.publication_digest = command.digest();
     const request: db_types.BatchRequest = .{ .artifact_publication = command };
-    const applied: db_types.RaftAppliedEntryIdentity = .{ .term = 6, .index = 9 };
+    const applied: db_types.OrderedApplyReceipt = .{ .term = 6, .index = 9 };
     try std.testing.expectError(error.InvalidBatchRequest, encodeBatchMutationRequestAlloc(alloc, request));
     try std.testing.expectError(error.InvalidBatchRequest, encodeRaftBatchMutationRequestAlloc(alloc, request, applied));
     const bytes = try encodeArtifactPublicationMutationRequestAlloc(alloc, request, applied);
@@ -728,7 +728,7 @@ test "storage.hot_standby ordered artifact inventory standby census preserves pa
     };
     command.publication_digest = command.digest();
     const request: db_types.BatchRequest = .{ .artifact_publication = command };
-    const applied: db_types.RaftAppliedEntryIdentity = .{ .term = 6, .index = 9 };
+    const applied: db_types.OrderedApplyReceipt = .{ .term = 6, .index = 9 };
     try std.testing.expectError(error.InvalidBatchRequest, encodeBatchMutationRequestAlloc(alloc, request));
     try std.testing.expectError(error.InvalidBatchRequest, encodeRaftBatchMutationRequestAlloc(alloc, request, applied));
     const bytes = try encodeArtifactPublicationMutationRequestAlloc(alloc, request, applied);
@@ -856,10 +856,10 @@ pub fn decodeRestoreFinishForReplay(
     const Finish = @FieldType(@import("restore_staging_contract.zig").Control, "finish");
     const Projection = struct {
         schema_version: u32 = 1,
-        ordinary_raft_entry: ?db_types.RaftAppliedEntryIdentity = null,
-        artifact_publication_raft_entry: ?db_types.RaftAppliedEntryIdentity = null,
-        artifact_publication_transport_raft_entry: ?db_types.RaftAppliedEntryIdentity = null,
-        merge_proof_adoption_raft_entry: ?db_types.RaftAppliedEntryIdentity = null,
+        ordinary_raft_entry: ?db_types.OrderedApplyReceipt = null,
+        artifact_publication_raft_entry: ?db_types.OrderedApplyReceipt = null,
+        artifact_publication_transport_raft_entry: ?db_types.OrderedApplyReceipt = null,
+        merge_proof_adoption_raft_entry: ?db_types.OrderedApplyReceipt = null,
         online_source_applied_index: ?u64 = null,
         request: struct {
             artifact_publication: ?struct {} = null,
@@ -1005,7 +1005,7 @@ pub const SchemaMutation = struct {
 pub const RowPolicyMutation = struct {
     bundle: []const u8,
     request: @import("../../system_catalog/policies.zig").InstallRequest,
-    entry: db_types.RaftAppliedEntryIdentity,
+    entry: db_types.OrderedApplyReceipt,
 };
 
 pub const DecodedSchemaMetadataMutation = struct {

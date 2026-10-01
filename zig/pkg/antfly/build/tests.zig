@@ -5856,7 +5856,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.merge_contract.",
             "storage.db.merge_page_system_test.",
             "storage.db.merge_page_wire.",
-            "storage.db.native_raft_snapshot.",
             "storage.db.online_merge_io.",
             "storage.db.online_integrity_shadow.",
             "storage.db.online_merge_io_contract.",

@@ -4478,9 +4478,9 @@ pub fn prepareStorageSnapshot(request: *const kernel_owner_abi.SnapshotPrepareRe
         if (chunk_len == 0) break;
         const writes = writes_buffer[0..chunk_len];
         if (parsed_schema) |schema| try tables_api.validateWritesAgainstTableSchema(alloc, schema, writes);
-        try db.appendRaftDocumentSnapshotChunk(&staged, state.byte_range, writes);
+        try db.appendStagedSnapshotDocuments(&staged, state.byte_range, writes);
     }
-    try db.finishRaftDocumentSnapshot(&staged, state.byte_range);
+    try db.finishStagedSnapshotRange(&staged, state.byte_range);
     try db.sync(true);
     try db.syncIndexes(true);
     db.close();
@@ -4523,7 +4523,7 @@ pub fn prepareNativeStorageSnapshot(request: *const kernel_owner_abi.SnapshotPre
         defer primary.close();
         try @import("../storage/server_db_adapter.zig").verifySnapshot(&primary, expected);
     }
-    try db_mod.DB.repairReplicaPrimarySnapshot(alloc, &staged, expected.namespace, if (expected.native_index == 0 and expected.native_term == 0) null else .{ .term = expected.native_term, .index = expected.native_index }, request.lsm_root_generation);
+    try db_mod.DB.repairVerifiedPrimarySnapshot(alloc, &staged, expected.namespace, if (expected.native_index == 0 and expected.native_term == 0) null else .{ .term = expected.native_term, .index = expected.native_index }, request.lsm_root_generation);
     // Read-only verification preserves source intents and retention records.
     {
         var db = try db_mod.DB.open(alloc, staged.path(), .{

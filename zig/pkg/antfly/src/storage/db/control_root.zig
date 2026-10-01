@@ -25,7 +25,8 @@ const document_artifact_child_range = @import("document_artifact_child_range.zig
 
 pub const types = @import("types.zig");
 pub const coordinated_ttl = @import("../coordinated_ttl.zig");
-pub const RaftAppliedEntryIdentity = types.RaftAppliedEntryIdentity;
+pub const OrderedApplyReceipt = types.OrderedApplyReceipt;
+pub const RaftAppliedEntryIdentity = OrderedApplyReceipt;
 pub const aggregations = @import("aggregations_contract.zig");
 pub const algebraic = @import("algebraic/control_root.zig");
 pub const doc_filter_wire = @import("doc_filter_wire.zig");

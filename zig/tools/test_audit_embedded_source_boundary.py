@@ -120,6 +120,45 @@ fn lazy() void { _ = @import("local.zig"); }
         self.assertEqual(production_imports(source, include_named=True, options={"enable_pjrt": True}), ["pjrt", "local.zig"])
         self.assertEqual(production_imports(source, include_named=True, options={}), ["pjrt", "local.zig"])
 
+    def test_runtime_control_flow_cannot_make_a_feature_guard_unconditional(self):
+        for control in ("if (dynamic)", "while (dynamic)", "for (items) |_|", "if (dynamic) {} else"):
+            with self.subTest(control=control):
+                source = ('fn execute() void { ' + control +
+                          ' if (!build_options.enable_pjrt) return; '
+                          '_ = @import("storage/server_db_adapter.zig"); }')
+                self.assertEqual(production_imports(source, options={"enable_pjrt": False}),
+                                 ["storage/server_db_adapter.zig"])
+        source = ('fn execute() void { if (dynamic) { if (!build_options.enable_pjrt) return; '
+                  '_ = @import("disabled.zig"); } _ = @import("outside.zig"); }')
+        self.assertEqual(production_imports(source, options={"enable_pjrt": False}), ["outside.zig"])
+
+    def test_external_cache_does_not_exempt_antfly_generated_owners(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "project"
+            cache = Path(directory) / "cache"
+            project.mkdir()
+            cache.mkdir()
+            entry = project / "entry.zig"
+            entry.write_text('const generated = @import("generated");')
+            generated = cache / "generated.zig"
+            generated.write_text('const sibling = @import("sibling.zig");')
+            sibling = cache / "sibling.zig"
+            sibling.write_text('const server = @import("server");')
+            server = project / "pkg/antfly/src/storage/server_db_adapter.zig"
+            server.parent.mkdir(parents=True)
+            server.write_text("")
+            modules = {"entry": entry, "generated": generated, "server": server}
+            edges = {("entry", "generated"): "generated", ("generated", "server"): "server"}
+            with self.assertRaisesRegex(ValueError, "server coordination"):
+                audit_modules(project, modules, edges, "entry")
+            sibling.write_text("")
+            self.assertEqual(audit_modules(project, modules, edges, "entry"), 3)
+            self.assertEqual(audit_modules(project, modules, {("entry", "generated"): "generated"},
+                                          "entry", external_modules={"generated"}), 2)
+            # Explicit dependencies cannot hide a declared Antfly import.
+            with self.assertRaisesRegex(ValueError, "server coordination"):
+                audit_modules(project, modules, edges, "entry", external_modules={"generated"})
+
     def test_target_struct_branch_preserves_local_imports(self):
         source = ('const backend = if (@import("builtin").os.tag == .freestanding) '
                   'struct { const local = @import("portable.zig"); } else @import("native");')
