@@ -1293,6 +1293,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "distributed graph edge reader finds fact owners outside the source endpoint shard",
             "distributed graph edges response round trips owned edges",
             "internal batch parser owns and round trips graph mutations",
+            "internal batch graph endpoint cleanup command",
             "Yen scratch reservations fail before allocation and release exactly",
             "graph workers report retired ranges as topology unavailability",
             "distributed graph incoming probe expands only positive source shards",

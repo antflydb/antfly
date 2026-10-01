@@ -837,6 +837,16 @@ fn exportSourceProofs(alloc: Allocator, scan: *DocStore.Txn, out: *PortableOutpu
 }
 
 fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableOutput, cohort: ?CohortProof, source_copy: ?SourceCopyProof) !void {
+    // Pending jobs are local control state, not portable primary records.
+    // Refuse the immutable cut rather than silently omitting their authority.
+    {
+        var cursor = try scan.openPhysicalCursorAdapter();
+        defer cursor.close();
+        if (try cursor.seekAtOrAfter(internal_keys.graph_endpoint_cleanup_prefix)) |row| {
+            if (std.mem.startsWith(u8, row.key, internal_keys.graph_endpoint_cleanup_prefix)) return error.StorageBusy;
+        }
+    }
+
     const ranges = @import("db/range_state.zig");
     const source_range: ?@import("db/types.zig").ByteRange = if (source_copy != null) range: {
         const raw = scan.get(ranges.range_key) catch |err| switch (err) {

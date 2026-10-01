@@ -41,8 +41,24 @@ artifact writes and deletes. New stores mark the directory ready on their first
 user-record write. Older stores backfill at most 256 keys or 256 KiB of temporary
 key data per transaction (one oversized key may form its own page). A durable
 cursor resumes migration after interruption; readers use the directory only
-when the final ready marker commits. The first deletion on an old store waits
-for this one-time migration. Subsequent deletion work follows affected targets.
+when the final ready marker commits. Endpoint deletion records a durable cleanup
+job instead of enumerating all incoming relationships in the foreground. Each
+cleanup command advances at most one migration page, then retires at most 256
+incoming relationships or 256 KiB of directory data (one oversized record may
+form its own page). Each committed retirement removes its directory entry, so
+restarting at the target prefix resumes without retaining the full adjacency.
+
+In data-Raft deployments the owner leader proposes cleanup through the ordinary
+replicated writer, one page per control round. Commands carry the leader-selected
+relationship identities; followers never replan from local directory progress.
+Standalone DB writes and recovery drain the same commands locally. Pending jobs survive restart and leader changes.
+Graph reads return `StorageBusy` until cleanup completes. New inline
+relationships targeting a pending endpoint receive the deterministic rejection
+`IntegrityTopologyBusy`, allowing Raft to advance to subsequent cleanup entries.
+Independent fact documents keep their own lifecycle. Portable export returns
+`StorageBusy` and range-source admission returns `IntegrityTopologyBusy` rather
+than capture a cut that would omit pending cleanup. Native whole-store recovery
+retains the durable jobs.
 
 Deleting an endpoint also records retirement of each affected relationship whose
 owner survives. Retirement records belong to that owner and retain the complete
@@ -73,8 +89,12 @@ that write retirement records themselves use ordinary transactional writes.
 
 Merge artifact pages include primary retirement records. Receiver replay applies
 exact relationship deletions to existing projections as well as suppressing
-future materialization; retirement-bearing batches require data-Raft protocol
-version 18. Ordinary artifact batches retain their existing protocol requirements.
+future materialization. Commands that can generate retirements during apply
+require data-Raft protocol version 18, including ordinary document deletion,
+legacy relationship deletion, cleanup, transforms, committed transaction
+decisions, and merge pages. Classification occurs before proposal even when retirement records
+are absent from the input. Ordinary artifact-only batches retain their existing
+protocol requirements.
 Physical splits rebuild the incoming directory and retirement accounting on both
 the child and retained parent before graph work resumes. Clearing and rebuilding
 use bounded, durable pages; incomplete directories conservatively check primary

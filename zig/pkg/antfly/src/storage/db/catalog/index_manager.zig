@@ -9853,7 +9853,7 @@ pub const IndexManager = struct {
     fn graphMetricWorkerSnapshotAlloc(self: *IndexManager) !GraphMetricWorkerSnapshot {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
-        if (self.graph_retirement_closed.load(.acquire)) return error.IntegrityTopologyBusy;
+        if (!self.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         if (self.graph_artifact_rebuild_pending) {
             const entries = try self.alloc.alloc(GraphMetricWorkerSnapshotEntry, 0);
             errdefer self.alloc.free(entries);
@@ -10305,7 +10305,7 @@ pub const IndexManager = struct {
     ) !GraphMetricPlannedSchedulerSweepResult {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
-        if (self.graph_retirement_closed.load(.acquire)) return error.IntegrityTopologyBusy;
+        if (!self.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         if (self.graph_artifact_rebuild_pending) return .{};
         return try self.runGraphMetricPlannedCoordinatorSweepUnlocked(options);
     }
@@ -17342,7 +17342,9 @@ pub const IndexManager = struct {
     }
 
     pub fn graphRetirementAdmissionOpen(self: *const IndexManager) bool {
-        return !self.graph_retirement_closed.load(.acquire);
+        if (self.graph_retirement_closed.load(.acquire)) return false;
+        if (self.primary_store) |store| if (store.hasGraphEndpointCleanup() catch true) return false;
+        return true;
     }
 
     /// Call only while holding catalog_mutex exclusively. The Raft apply

@@ -1472,6 +1472,7 @@ fn parseBatchRequestWithOptions(
             .writes = writes,
             .deletes = deletes,
             .transforms = transforms,
+            .graph_endpoint_cleanup = if (root.get("_graph_endpoint_cleanup")) |value| if (allow_internal and value == .bool) value.bool else return error.InvalidBatchRequest else false,
             .graph_writes = graph_writes,
             .graph_deletes = graph_deletes,
             .predicates = predicates,
@@ -1490,6 +1491,13 @@ fn parseBatchRequestWithOptions(
         },
     };
     try @import("../storage/range_protection.zig").validateRequest(result_value.req);
+    if (!allow_internal) {
+        const prefix = @import("../storage/internal_keys.zig").graph_endpoint_cleanup_prefix;
+        for (result_value.req.writes) |write| if (std.mem.startsWith(u8, write.key, prefix)) return error.InvalidBatchRequest;
+        for (result_value.req.deletes) |key| if (std.mem.startsWith(u8, key, prefix)) return error.InvalidBatchRequest;
+        for (result_value.req.transforms) |transform| if (std.mem.startsWith(u8, transform.key, prefix)) return error.InvalidBatchRequest;
+    }
+    try db_mod.types.validateGraphEndpointCleanupCommand(result_value.req);
     try merge_pages.validateRequest(result_value.req);
     try @import("../storage/db/merge_proof_adoption.zig").validateRequest(result_value.req);
     try @import("../storage/db/online_source_contract.zig").validateRequest(result_value.req);
@@ -1534,6 +1542,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
     }
     if (req.relational_topology != null and (req.transaction != null or req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or req.predicates.len != 0 or req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or req.relational_retirement != null or req.relational_index_maintenance != null or req.split_checkpoint != null or req.split_replication != null or req.split_transition != null or req.merge_checkpoint != null or req.merge_replication != null or req.merge_source_transition != null)) return error.InvalidBatchRequest;
     if (req.relational_generation_gc != null and (req.transaction != null or req.relational_topology != null or req.row_policy_publication != null or req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or req.predicates.len != 0 or req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or req.relational_retirement != null or req.relational_index_maintenance != null or req.split_checkpoint != null or req.split_replication != null or req.split_transition != null or req.merge_checkpoint != null or req.merge_replication != null or req.merge_source_transition != null)) return error.InvalidBatchRequest;
+    try db_mod.types.validateGraphEndpointCleanupCommand(req);
     if (req.relational_generation_gc) |gc| try gc.validate();
     if (req.relational_topology != null and (req.relational_schema_version != null or req.relational_integrity_generation_set != null or req.relational_repair)) return error.InvalidBatchRequest;
     if (req.integrity.len != 0 and (req.transaction == null or req.transaction.? != .prepare)) return error.InvalidBatchRequest;
@@ -1769,6 +1778,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
         try writer.writeAll(",\"_integrity\":");
         try writer.writeAll(encoded_integrity.items);
     }
+    if (req.graph_endpoint_cleanup) try writer.writeAll(",\"_graph_endpoint_cleanup\":true");
     if (req.graph_writes.len > 0) {
         try writer.writeAll(",\"_graph_writes\":[");
         for (req.graph_writes, 0..) |write, i| {
@@ -1800,6 +1810,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
                 std.json.fmt(delete.edge_type, .{}),
             });
             if (delete.edge_id.len > 0) try writer.print(",\"edge_id\":{f}", .{std.json.fmt(delete.edge_id, .{})});
+            if (delete.owner.len > 0) try writer.print(",\"owner\":{f}", .{std.json.fmt(delete.owner, .{})});
             if (delete.owner_document.len > 0) try writer.print(",\"owner_document\":{f}", .{std.json.fmt(delete.owner_document, .{})});
             try writer.writeByte('}');
         }
@@ -2146,7 +2157,11 @@ fn parseGraphDeletes(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.
         const owner_document = try optionalGraphIdentityString(alloc, item.object, "owner_document");
         errdefer if (owner_document.len > 0) alloc.free(owner_document);
         if (owner_document.len > 0 and edge_id.len == 0) return error.InvalidBatchRequest;
+        const owner = try optionalGraphIdentityString(alloc, item.object, "owner");
+        errdefer if (owner.len > 0) alloc.free(owner);
+        if (owner.len > 0 and owner_document.len > 0) return error.InvalidBatchRequest;
         deletes[i] = .{
+            .owner = owner,
             .edge_id = edge_id,
             .owner_document = owner_document,
             .index_name = index_name,
@@ -2411,6 +2426,31 @@ fn consumerTests() type {
             var internal = try parseInternalBatchRequest(alloc, body);
             defer internal.deinit(alloc);
             try std.testing.expectEqual(@as(?[32]u8, [_]u8{7} ** 32), internal.req.relational_integrity_generation_set);
+        }
+
+        test "internal batch graph endpoint cleanup command cannot enter public or mixed batches" {
+            const alloc = std.testing.allocator;
+            const encoded = try encodeBatchRequest(alloc, .{ .graph_endpoint_cleanup = true });
+            defer alloc.free(encoded);
+            var parsed = try parseInternalBatchRequest(alloc, encoded);
+            defer parsed.deinit(alloc);
+            try std.testing.expect(parsed.req.graph_endpoint_cleanup);
+            try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
+            try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, .{ .graph_endpoint_cleanup = true, .deletes = &.{"doc"} }));
+            try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(alloc, "{\"_graph_endpoint_cleanup\":true,\"deletes\":[\"doc\"]}"));
+            const legacy = try encodeBatchRequest(alloc, .{ .graph_deletes = &.{.{ .index_name = "g", .source = "entity", .target = "hub", .edge_type = "R", .owner = "producer" }} });
+            defer alloc.free(legacy);
+            var legacy_parsed = try parseInternalBatchRequest(alloc, legacy);
+            defer legacy_parsed.deinit(alloc);
+            try std.testing.expectEqualStrings("producer", legacy_parsed.req.graph_deletes[0].owner);
+            const job = try @import("../storage/internal_keys.zig").graphEndpointCleanupKeyAlloc(alloc, "hub");
+            defer alloc.free(job);
+            const control_delete = try encodeBatchRequest(alloc, .{ .deletes = &.{job} });
+            defer alloc.free(control_delete);
+            try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, control_delete));
+            var internal_delete = try parseInternalBatchRequest(alloc, control_delete);
+            defer internal_delete.deinit(alloc);
+            try std.testing.expectEqualStrings(job, internal_delete.req.deletes[0]);
         }
 
         test "internal batch parser owns binary staged restore controls and rejects public injection" {

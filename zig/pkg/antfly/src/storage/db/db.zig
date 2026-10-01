@@ -6891,6 +6891,7 @@ pub const DB = struct {
                 // completed initialization, so open remains single-threaded.
                 db.scheduleGeneratedArtifactCleanup();
             }
+            if (!openModeRequiresReadOnlyBackends(opts.open_mode)) _ = try db.drainStandaloneGraphEndpointCleanup();
             profile.total_ns = monotonicTimeNs() - open_started_ns;
             if (openProfileEnabled()) {
                 logOpenProfile(path, opts.open_mode, db.start_index_workers, profile);
@@ -9671,6 +9672,51 @@ pub const DB = struct {
         alloc.free(dense_bytes);
     }
 
+    fn drainStandaloneGraphEndpointCleanup(self: *DB) !bool {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
+        const native = blk: {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            break :blk if (read.get(&internal_keys.raft_document_applied_entry_key)) |_| true else |err| if (err == error.NotFound) false else return err;
+        };
+        if (native) return false;
+        var drained = false;
+        while (try self.core.store.hasGraphEndpointCleanup()) {
+            try self.batch(.{ .graph_endpoint_cleanup = true, .sync_level = .write });
+            drained = true;
+        }
+        return drained;
+    }
+
+    pub const GraphEndpointCleanupBatch = struct {
+        page: docstore_mod.DocStore.GraphEndpointCleanupPage,
+        graph_deletes: []types.GraphEdgeDelete,
+        pub fn request(self: *const @This()) types.BatchRequest {
+            return .{ .graph_deletes = self.graph_deletes, .deletes = self.page.deletes, .sync_level = .write };
+        }
+        pub fn deinit(self: *@This()) void {
+            for (self.graph_deletes) |*item| item.deinit(self.page.alloc);
+            self.page.alloc.free(self.graph_deletes);
+            self.page.deinit();
+        }
+    };
+
+    /// The leader selects exact identities before proposal. Followers apply
+    /// these afterimages rather than consulting their local directory progress.
+    pub fn prepareGraphEndpointCleanupBatch(self: *DB, alloc: Allocator) !?GraphEndpointCleanupBatch {
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        if (!try self.core.store.hasGraphEndpointCleanup()) return null;
+        var page = (try self.core.store.prepareGraphEndpointCleanupPage(alloc)) orelse return null;
+        errdefer page.deinit();
+        return .{ .page = page, .graph_deletes = try graphEndpointCleanupDeletesAlloc(alloc, page) };
+    }
+
+    fn requireGraphEndpointCleanupReady(self: *DB) !void {
+        if (!try self.core.store.hasGraphEndpointCleanup()) return;
+        return error.StorageBusy;
+    }
+
     pub fn batch(self: *DB, req: types.BatchRequest) anyerror!void {
         if (benchMetricsEnabled()) {
             var profile = BatchProfile{};
@@ -9678,6 +9724,10 @@ pub const DB = struct {
             logBatchProfile(req, profile);
         } else {
             try self.batchInternal(req, null, .{});
+        }
+        if (!req.graph_endpoint_cleanup) {
+            const drained = try self.drainStandaloneGraphEndpointCleanup();
+            if (drained and req.sync_level == .full_index) try self.waitForCurrentSyncLevel(.full_index);
         }
     }
 
@@ -9688,6 +9738,10 @@ pub const DB = struct {
             logBatchProfile(req, profile);
         } else {
             try self.batchInternal(req, null, .{ .visibility_cancellation = cancellation });
+        }
+        if (!req.graph_endpoint_cleanup) {
+            const drained = try self.drainStandaloneGraphEndpointCleanup();
+            if (drained and req.sync_level == .full_index) try self.waitForCurrentSyncLevelWithCancellation(.full_index, cancellation);
         }
     }
 
@@ -9893,6 +9947,7 @@ pub const DB = struct {
         req: types.BatchRequest,
         identity: RaftAppliedEntryIdentity,
     ) anyerror!void {
+        if (req.graph_endpoint_cleanup) return error.InvalidBatchRequest;
         const mirror_scoped_restore = requiresDurableLifecycleHA(req) and self.ha_async_batch_mirror != null;
         // HA is process-local and includes this node's Raft follower roots.
         // Recover the local committed obligation before a Raft receipt can
@@ -11143,6 +11198,7 @@ pub const DB = struct {
     /// the global serialization fence. The bound prevents catalog churn from
     /// turning one request into unbounded CPU/provider work.
     fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
+        try types.validateGraphEndpointCleanupCommand(req);
         if (self.initial_child_hidden.load(.acquire) and
             (req.relational_topology == null or
                 (req.relational_topology.?.action != .provision_initial_child and
@@ -11535,7 +11591,7 @@ pub const DB = struct {
             break :blk combined;
         };
 
-        const effective_req: types.BatchRequest = .{
+        var effective_req: types.BatchRequest = .{
             .artifact_catalog = req.artifact_catalog,
             .row_policy_principal_proof = req.row_policy_principal_proof,
             .row_policy_database = req.row_policy_database,
@@ -11555,6 +11611,7 @@ pub const DB = struct {
             .relational_index_maintenance = req.relational_index_maintenance,
             .writes = effective_ops.writes,
             .deletes = effective_ops.deletes,
+            .graph_endpoint_cleanup = req.graph_endpoint_cleanup,
             .graph_writes = effective_graph_writes,
             .graph_deletes = effective_graph_deletes,
             .transforms = &.{},
@@ -11894,6 +11951,14 @@ pub const DB = struct {
         try self.lockApplyForPortableRuntime();
         if (profile) |active_profile| active_profile.apply_lock_wait_ns += monotonicTimeNs() - apply_lock_wait_start_ns;
         if (self.source_vectors.load(.acquire)) |source| source.recordBatchLockWait(monotonicTimeNs() -| apply_lock_wait_start_ns);
+        var graph_cleanup_page: ?docstore_mod.DocStore.GraphEndpointCleanupPage = null;
+        defer if (graph_cleanup_page) |*page| page.deinit();
+        var cleanup_graph_deletes: ?[]types.GraphEdgeDelete = null;
+        var initialized_cleanup_deletes: usize = 0;
+        defer if (cleanup_graph_deletes) |items| {
+            for (items[0..initialized_cleanup_deletes]) |*item| item.deinit(preparation_alloc);
+            preparation_alloc.free(items);
+        };
         var apply_mutex_held = true;
         var apply_lock_acquired_ns = monotonicTimeNs();
         errdefer if (apply_mutex_held) unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
@@ -12407,6 +12472,18 @@ pub const DB = struct {
         defer {
             for (identity_visibility_deletes.items) |key| self.alloc.free(key);
             identity_visibility_deletes.deinit(self.alloc);
+        }
+
+        if (req.graph_endpoint_cleanup) {
+            effective_req.graph_endpoint_cleanup = false;
+            graph_cleanup_page = try self.core.store.prepareGraphEndpointCleanupPage(self.alloc);
+            if (graph_cleanup_page) |page| {
+                const graph_deletes = try graphEndpointCleanupDeletesAlloc(preparation_alloc, page);
+                cleanup_graph_deletes = graph_deletes;
+                initialized_cleanup_deletes = graph_deletes.len;
+                effective_req.graph_deletes = graph_deletes;
+                effective_req.deletes = page.deletes;
+            }
         }
 
         for (effective_req.writes, 0..) |write, i| {
@@ -12968,7 +13045,7 @@ pub const DB = struct {
             &owned_delete_keys,
         );
         defer self.alloc.free(deleted_artifact_keys);
-        try appendGraphEndpointRetirements(self.alloc, effective_req.deletes, deleted_artifact_keys, &store_writes, &owned_store_keys);
+        try appendGraphEndpointRetirements(self.alloc, effective_req.deletes, self.core.index_manager.hasGraphIndexes(), deleted_artifact_keys, &store_writes, &owned_store_keys);
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.delete_artifacts_ns, delete_artifacts_start_ns);
 
         const use_thin_replay_fast_path =
@@ -30864,7 +30941,7 @@ pub const DB = struct {
 
     fn lookupRelationalTopology(self: *DB, alloc: Allocator, request_json: []const u8, opts: types.LookupOptions) !?types.LookupResult {
         var request = try std.json.parseFromSlice(struct {
-            mode: enum { identity, status, completed, parent_activation, generation_publication, generation_handoff_summary, generation_handoff_seal, generation_handoff_install, generation_handoff_identity, graph_retirement, initial_child_preflight, initial_child_publication, public_schema, generation_gc, handoff_progress, handoff_manifest, prune_progress, online_source_status, merge_copy_receipt },
+            mode: enum { identity, status, completed, parent_activation, generation_publication, generation_handoff_summary, generation_handoff_seal, generation_handoff_install, generation_handoff_identity, graph_retirement, graph_endpoint_cleanup, initial_child_preflight, initial_child_publication, public_schema, generation_gc, handoff_progress, handoff_manifest, prune_progress, online_source_status, merge_copy_receipt },
             scope: ?@import("online_source_contract.zig").Scope = null,
         }, alloc, request_json, .{});
         defer request.deinit();
@@ -30983,6 +31060,13 @@ pub const DB = struct {
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
                 try @import("relational_integrity_json.zig").write(try @import("empty_generation_handoff.zig").loadInstallReceipt(&read), &stream);
+            },
+            .graph_endpoint_cleanup => {
+                if (try self.prepareGraphEndpointCleanupBatch(alloc)) |owned| {
+                    var cleanup = owned;
+                    defer cleanup.deinit();
+                    try @import("relational_integrity_json.zig").write(.{ .pending = true, .graph_deletes = cleanup.graph_deletes, .deletes = cleanup.page.deletes }, &stream);
+                } else try @import("relational_integrity_json.zig").write(.{ .pending = false, .graph_deletes = @as([]const types.GraphEdgeDelete, &.{}), .deletes = @as([]const []const u8, &.{}) }, &stream);
             },
             .graph_retirement => {
                 self.core.lockApplyShared();
@@ -31306,6 +31390,7 @@ pub const DB = struct {
             // Reject unsupported backends before publishing a durable write
             // fence which they could never turn into an immutable pin.
             if (command == .admit) {
+                if (try self.core.store.hasGraphEndpointCleanup()) return error.IntegrityTopologyBusy;
                 const lsm = self.core.primary_store_owner.lsmBackend() orelse return error.BackupSealBackendUnsupported;
                 if (lsm.storage) |storage| {
                     if (!storage.supportsHostPathGenerationPublication()) return error.NativeBackupStorageBackendUnsupported;
@@ -33130,6 +33215,7 @@ pub const DB = struct {
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
+        try self.requireGraphEndpointCleanupReady();
         if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         _ = try self.currentIdentityReadGenerationForRequest(identity_read_generation);
         const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
@@ -33152,6 +33238,7 @@ pub const DB = struct {
         if (key.len == 0) return try alloc.alloc(graph_mod.Edge, 0);
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
+        try self.requireGraphEndpointCleanupReady();
         if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         const edges = try self.core.graphGetEdges(alloc, index_name, key, edge_type, direction);
         errdefer graph_mod.GraphIndex.freeEdges(alloc, edges);
@@ -33171,6 +33258,7 @@ pub const DB = struct {
         if (start_key.len == 0) return try alloc.alloc(traversal_mod.TraversalResult, 0);
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
+        try self.requireGraphEndpointCleanupReady();
         if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         const results = try self.core.graphTraverseEdges(alloc, index_name, start_key, rules);
         errdefer traversal_mod.freeOwnedResults(alloc, results);
@@ -33231,6 +33319,7 @@ pub const DB = struct {
         if (source.len == 0 or target.len == 0) return null;
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
+        try self.requireGraphEndpointCleanupReady();
         if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         // The algebraic shortcut cannot represent a custom frontier limit.
         if (!options.edge_filter.active() and options.node_admission == null and options.work_budget == null and options.max_intermediate_states == (paths_mod.PathFindOptions{}).max_intermediate_states) {
@@ -33284,6 +33373,7 @@ pub const DB = struct {
         }
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
+        try self.requireGraphEndpointCleanupReady();
         if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         const entry = self.core.index_manager.graphIndex(index_name) orelse {
             try self.failIfIndexQuarantined(index_name);
@@ -33390,6 +33480,7 @@ pub const DB = struct {
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
+        try self.requireGraphEndpointCleanupReady();
         if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         var work_budget = graph_pattern_mod.WorkBudget.init(
             graph_pattern_mod.default_max_explored_nodes,
@@ -33598,6 +33689,7 @@ pub const DB = struct {
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
+        try self.requireGraphEndpointCleanupReady();
         if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         if (req.identity_read_generation == null) {
             for (input_sets) |input_set| {
@@ -36154,7 +36246,8 @@ pub const DB = struct {
     }
 
     fn runMaintenanceUntilWithOptions(self: *DB, sequence: u64, sync_targets: ManagedSyncTargets, options: ReplayDrainOptions) !void {
-        var stable_target = sequence;
+        _ = try self.drainStandaloneGraphEndpointCleanup();
+        var stable_target = @max(sequence, self.currentMaintenanceTargetSequence());
         while (true) {
             // Enrichment is a producer for the managed derived indexes: it can
             // append embedding/chunk artifacts at the same source revision as
@@ -37657,6 +37750,7 @@ pub const DB = struct {
         }
         lockApply(self);
         defer self.core.unlockApply();
+        try self.requireGraphEndpointCleanupReady();
         if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         return switch (self.graph_metric_idle_maintenance) {
             .legacy => try self.core.index_manager.runGraphMetricMaintenance(),
@@ -37706,6 +37800,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        try self.requireGraphEndpointCleanupReady();
         if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         return try self.core.index_manager.runGraphMetricPlannedMaintenance(options);
     }
@@ -37795,6 +37890,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        try self.requireGraphEndpointCleanupReady();
         if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
         try entry.index.enableGraphMetric(metric_name);
@@ -37809,6 +37905,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        try self.requireGraphEndpointCleanupReady();
         if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
         try entry.index.enableGraphMetric(metric_name);
@@ -37833,6 +37930,7 @@ pub const DB = struct {
         const owned_status = blk: {
             lockApply(self);
             defer self.core.unlockApply();
+            try self.requireGraphEndpointCleanupReady();
             if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
             const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
             var current = try entry.index.graphMetricStatus(metric_name);
@@ -37869,6 +37967,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        try self.requireGraphEndpointCleanupReady();
         if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
         try entry.index.deleteGraphMetricMaterialization(metric_name);
@@ -37883,6 +37982,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        try self.requireGraphEndpointCleanupReady();
         if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
         var status = try entry.index.pauseGraphMetricMaintenance(metric_name);
@@ -37894,6 +37994,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        try self.requireGraphEndpointCleanupReady();
         if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
         var status = try entry.index.resumeGraphMetricMaintenance(metric_name);
@@ -37911,6 +38012,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        try self.requireGraphEndpointCleanupReady();
         if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         var status = try self.core.index_manager.ensureGraphMetricPlannedBuild(index_name, metric_name, target_generation);
         defer status.deinit(self.core.index_manager.alloc);
@@ -37921,6 +38023,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        try self.requireGraphEndpointCleanupReady();
         if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         return try self.core.index_manager.runGraphMetricPlannedWorkerPageStep(index_name, metric_name, worker_id);
     }
@@ -37929,6 +38032,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        try self.requireGraphEndpointCleanupReady();
         if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         return try self.core.index_manager.runGraphMetricPlannedWorkerPageStepAt(index_name, metric_name, worker_id, now_ms);
     }
@@ -37937,6 +38041,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        try self.requireGraphEndpointCleanupReady();
         if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         return try self.core.index_manager.runGraphMetricPlannedCoordinatorStep(index_name, metric_name);
     }
@@ -37945,6 +38050,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        try self.requireGraphEndpointCleanupReady();
         if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         return try self.core.index_manager.runGraphMetricPlannedCoordinatorStepAt(index_name, metric_name, now_ms);
     }
@@ -37953,6 +38059,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        try self.requireGraphEndpointCleanupReady();
         if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         var status = try self.core.index_manager.failGraphMetricPlannedBuild(index_name, metric_name, err);
         defer status.deinit(self.core.index_manager.alloc);
@@ -37963,6 +38070,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        try self.requireGraphEndpointCleanupReady();
         if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         var status = try self.core.index_manager.runGraphMetricPlannedDrain(index_name, metric_name, target_generation, options);
         defer status.deinit(self.core.index_manager.alloc);
@@ -46598,6 +46706,7 @@ pub const DB = struct {
         named: types.NamedGraphMetricQuery,
         cancellation: ?types.CancellationToken,
     ) !types.GraphMetricResult {
+        try self.requireGraphEndpointCleanupReady();
         const entry = self.core.graphIndex(named.query.index_name) orelse return error.IndexNotFound;
         if (named.query.damping != null and named.query.seed_nodes.len == 0) return error.InvalidQueryRequest;
         var metric_snapshot = if (named.query.seed_nodes.len != 0) blk: {
@@ -49407,6 +49516,7 @@ pub const DB = struct {
     ) ![]types.SearchHit {
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
+        try self.requireGraphEndpointCleanupReady();
         if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
 
         const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
@@ -49471,6 +49581,7 @@ pub const DB = struct {
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
+        try self.requireGraphEndpointCleanupReady();
         if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         // Validate under the same apply lease as the reverse snapshot. A
         // out-of-lease check can race index replacement and certify an
@@ -49588,6 +49699,7 @@ pub const DB = struct {
         named_sets: []const NamedResultSet,
         budgets: db_query_graph.RequestGraphBudgets,
     ) !types.GraphSearchResult {
+        try self.requireGraphEndpointCleanupReady();
         const predicate_aware = graphRequestRequiresAdmission(req, named.query.params.node_filter);
         var admission = GraphNodeAdmissionCache.init(self, alloc, req, named.query.index_name, named.query.params.node_filter);
         defer admission.deinit();
@@ -50609,6 +50721,7 @@ pub const DB = struct {
         work_budget: ?*graph_pattern_mod.WorkBudget,
         scope: graph_query_mod.ExecutionScope,
     ) !graph_query_mod.GraphQueryResult {
+        try self.requireGraphEndpointCleanupReady();
         const entry = self.core.graphIndex(graph_query.index_name) orelse {
             try self.failIfIndexQuarantined(graph_query.index_name);
             return error.IndexNotFound;
@@ -62377,7 +62490,6 @@ fn collectEnrichmentArtifactDeletesForBatch(
     const vector_effects = artifact_effects;
     if (!self.core.hasArtifactCleanupMaybe() and vector_effects.len == 0) return try self.alloc.alloc([]u8, 0);
 
-    if (req.deletes.len != 0) try self.core.store.ensureGraphIncomingDirectory();
     var deleted = std.ArrayListUnmanaged([]u8).empty;
     errdefer deleted.deinit(self.alloc);
     var seen_docs = std.StringHashMapUnmanaged(void).empty;
@@ -62497,24 +62609,9 @@ fn collectEnrichmentArtifactDeleteKeysForDocContext(
     defer alloc.free(retired_prefix);
     try collectDeleteKeysForPrefix(alloc, store, retired_prefix, delete_keys, owned_delete_keys, null);
 
-    // Retire authoritative inline relationship artifacts, not just adjacency.
-    // Exact primary tombstones flow through the ordinary graph replay journal.
-    const incoming_prefix = try internal_keys.graphIncomingPrefixAlloc(alloc, doc_key);
-    defer alloc.free(incoming_prefix);
-    const incoming = try store.scanPrefix(alloc, incoming_prefix);
-    defer docstore_mod.DocStore.freeResults(alloc, incoming);
-    for (incoming) |entry| {
-        // Self loops and jointly deleted endpoints may already be selected.
-        if (selected_artifacts.contains(entry.value)) continue;
-        const owned = try alloc.dupe(u8, entry.value);
-        errdefer alloc.free(owned);
-        try owned_delete_keys.append(alloc, owned);
-        errdefer _ = owned_delete_keys.pop();
-        try delete_keys.append(alloc, owned);
-        errdefer _ = delete_keys.pop();
-        try deleted_artifact_keys.append(alloc, owned);
-        try selected_artifacts.put(alloc, owned, {});
-    }
+    // Incoming artifacts can span an arbitrarily large number of owners.
+    // The primary delete records a durable job instead of retaining them here.
+
 }
 
 fn collectDeleteKeysForPrefix(
@@ -62555,6 +62652,7 @@ fn collectGraphArtifactsForDocIndex(
 fn appendGraphEndpointRetirements(
     alloc: Allocator,
     deleted_docs: []const []const u8,
+    enqueue_endpoints: bool,
     deleted_artifacts: []const []const u8,
     writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
     owned_keys: *std.ArrayListUnmanaged([]u8),
@@ -62562,6 +62660,15 @@ fn appendGraphEndpointRetirements(
     var deleted_owners = std.StringHashMapUnmanaged(void).empty;
     defer deleted_owners.deinit(alloc);
     for (deleted_docs) |doc| try deleted_owners.put(alloc, doc, {});
+    for (deleted_docs) |doc| {
+        if (!enqueue_endpoints or isMetadataKey(doc)) continue;
+        const job = try internal_keys.graphEndpointCleanupKeyAlloc(alloc, doc);
+        owned_keys.append(alloc, job) catch |err| {
+            alloc.free(job);
+            return err;
+        };
+        try writes.append(alloc, .{ .key = job, .value = doc });
+    }
     for (deleted_artifacts) |artifact| {
         if (internal_keys.graphInlineTargetComponent(artifact) == null) continue;
         const owner_end = internal_keys.findComponentTerminator(artifact, 1).?;
@@ -62922,7 +63029,6 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
     else
         true;
     if (should_scan_artifacts) {
-        try ctx.store.ensureGraphIncomingDirectory();
         var selected_artifacts = std.StringHashMapUnmanaged(void).empty;
         defer selected_artifacts.deinit(ctx.alloc);
         var seen_docs = std.StringHashMapUnmanaged(void).empty;
@@ -62941,7 +63047,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
             );
         }
     }
-    try appendGraphEndpointRetirements(ctx.alloc, keys, deleted_artifact_keys.items, &store_writes, &owned_store_keys);
+    try appendGraphEndpointRetirements(ctx.alloc, keys, ctx.index_manager.hasGraphIndexes(), deleted_artifact_keys.items, &store_writes, &owned_store_keys);
     const req = types.BatchRequest{
         .deletes = keys,
         .sync_level = sync_level,
@@ -158285,4 +158391,115 @@ test "db graph ttl HA retirement preserves different replay progress" {
             try std.testing.expectEqual(@as(usize, 1), renewed.len);
         }
     }
+}
+
+test "db graph endpoint cleanup pages are replicated bounded and restartable" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("endpoint-cleanup-pages");
+    defer directory.cleanup();
+    var follower_directory = try TestDirectory.init("endpoint-cleanup-follower");
+    defer follower_directory.cleanup();
+    var follower = try DB.open(alloc, std.mem.span(follower_directory.path().ptr), .{});
+    defer follower.close();
+    try follower.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+    {
+        var db = try DB.open(alloc, std.mem.span(directory.path().ptr), .{});
+        defer db.close();
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const writes = try scratch.alloc(types.GraphEdgeWrite, 600);
+        for (writes, 0..) |*write, i| write.* = .{ .index_name = "g", .source = try std.fmt.allocPrint(scratch, "source:{d:0>4}", .{i}), .target = "hub", .edge_type = "R" };
+        try db.batchRaftReplicatedApply(.{ .graph_writes = writes, .sync_level = .full_index }, .{ .term = 1, .index = 1 });
+        try follower.batchRaftReplicatedApply(.{ .graph_writes = writes, .sync_level = .write }, .{ .term = 1, .index = 1 });
+        try follower.batchRaftReplicatedApply(.{ .deletes = &.{"hub"}, .sync_level = .write }, .{ .term = 1, .index = 2 });
+        // Local directory readiness differs across replicas. The follower must
+        // still apply the leader-selected identities, without replanning.
+        try follower.core.store.invalidateGraphDirectories();
+        try db.batchRaftReplicatedApply(.{ .deletes = &.{"hub"}, .sync_level = .write }, .{ .term = 1, .index = 2 });
+        try std.testing.expect(try db.core.store.hasGraphEndpointCleanup());
+        var archive = std.ArrayListUnmanaged(u8).empty;
+        defer archive.deinit(alloc);
+        try std.testing.expectError(error.StorageBusy, portable_backup.exportPortable(alloc, db.core.store, &archive));
+        var reply = (try db.lookup(alloc, "", .{ .relational_topology_json = "{\"mode\":\"graph_endpoint_cleanup\"}" })).?;
+        defer reply.deinit(alloc);
+        var plan = try std.json.parseFromSlice(struct { pending: bool, graph_deletes: []const types.GraphEdgeDelete, deletes: []const []const u8 }, alloc, reply.json, .{});
+        defer plan.deinit();
+        try std.testing.expect(plan.value.pending);
+        try std.testing.expectEqual(@as(usize, 256), plan.value.graph_deletes.len);
+        try std.testing.expectEqual(@as(usize, 0), plan.value.deletes.len);
+        try std.testing.expectError(error.StorageBusy, db.getEdges(alloc, "g", "source:0000", "", .out));
+        try std.testing.expectError(error.IntegrityTopologyBusy, db.batchRaftReplicatedApply(.{ .graph_writes = &.{.{ .index_name = "g", .source = "new", .target = "hub", .edge_type = "R" }}, .sync_level = .write }, .{ .term = 1, .index = 3 }));
+        var first_page = (try db.prepareGraphEndpointCleanupBatch(alloc)).?;
+        defer first_page.deinit();
+        try db.batchRaftReplicatedApply(first_page.request(), .{ .term = 1, .index = 3 });
+        try follower.batchRaftReplicatedApply(first_page.request(), .{ .term = 1, .index = 3 });
+        const remaining = try db.core.store.scanPrefix(alloc, internal_keys.graph_incoming_prefix);
+        defer docstore_mod.DocStore.freeResults(alloc, remaining);
+        try std.testing.expectEqual(@as(usize, 344), remaining.len);
+        // An already-applied Raft entry cannot consume a second page.
+        try db.batchRaftReplicatedApply(first_page.request(), .{ .term = 1, .index = 3 });
+        const unchanged = try db.core.store.scanPrefix(alloc, internal_keys.graph_incoming_prefix);
+        defer docstore_mod.DocStore.freeResults(alloc, unchanged);
+        try std.testing.expectEqual(remaining.len, unchanged.len);
+    }
+    {
+        var db = try DB.open(alloc, std.mem.span(directory.path().ptr), .{});
+        defer db.close();
+        try std.testing.expect(try db.core.store.hasGraphEndpointCleanup());
+        var second_page = (try db.prepareGraphEndpointCleanupBatch(alloc)).?;
+        defer second_page.deinit();
+        try db.batchRaftReplicatedApply(second_page.request(), .{ .term = 2, .index = 4 });
+        try follower.batchRaftReplicatedApply(second_page.request(), .{ .term = 2, .index = 4 });
+        try std.testing.expect(try db.core.store.hasGraphEndpointCleanup());
+        var final_page = (try db.prepareGraphEndpointCleanupBatch(alloc)).?;
+        defer final_page.deinit();
+        try db.batchRaftReplicatedApply(final_page.request(), .{ .term = 2, .index = 5 });
+        try follower.batchRaftReplicatedApply(final_page.request(), .{ .term = 2, .index = 5 });
+        try std.testing.expect(!try follower.core.store.hasGraphEndpointCleanup());
+        try follower.runUntilIdle();
+        _ = try follower.rebuildGraphDerivedState();
+        const follower_edges = try follower.getEdges(alloc, "g", "hub", "", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, follower_edges);
+        try std.testing.expectEqual(@as(usize, 0), follower_edges.len);
+        try std.testing.expect(!try db.core.store.hasGraphEndpointCleanup());
+        try db.runUntilIdle();
+        _ = try db.rebuildGraphDerivedState();
+        const edges = try db.getEdges(alloc, "g", "hub", "", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 0), edges.len);
+        try db.batchRaftReplicatedApply(.{ .graph_writes = &.{.{ .index_name = "g", .source = "new", .target = "hub", .edge_type = "R" }}, .sync_level = .full_index }, .{ .term = 2, .index = 6 });
+        // Raft apply deliberately returns before derived visibility; the
+        // public writer waits for its requested sync level separately.
+        try db.runUntilIdle();
+        const revived = try db.getEdges(alloc, "g", "hub", "", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, revived);
+        try std.testing.expectEqual(@as(usize, 1), revived.len);
+    }
+}
+
+fn graphEndpointCleanupDeletesAlloc(alloc: Allocator, page: docstore_mod.DocStore.GraphEndpointCleanupPage) ![]types.GraphEdgeDelete {
+    const items = try alloc.alloc(types.GraphEdgeDelete, page.writes.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (items[0..initialized]) |*item| item.deinit(alloc);
+        alloc.free(items);
+    }
+    for (page.writes, items) |row, *item| {
+        const artifact = try internal_keys.graphRetirementArtifactKeyAlloc(alloc, row.key);
+        defer alloc.free(artifact);
+        const parsed = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(alloc, artifact)).?;
+        item.* = .{
+            .index_name = parsed.index_name,
+            .source = if (parsed.logical_source.len > 0) parsed.logical_source else parsed.doc_key,
+            .target = parsed.target_doc_key,
+            .edge_type = parsed.edge_type,
+            .edge_id = parsed.edge_id,
+            .owner_document = if (parsed.edge_id.len > 0 and parsed.logical_source.len > 0) parsed.doc_key else "",
+            .owner = if (parsed.edge_id.len == 0 and parsed.logical_source.len > 0) parsed.doc_key else "",
+        };
+        initialized += 1;
+    }
+    return items;
 }

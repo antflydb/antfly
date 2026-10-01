@@ -3457,7 +3457,11 @@ test "graph relationship artifact identity is versioned and owner scoped" {
     const corrupt = try std.mem.concat(alloc, u8, &.{ explicit, "x" });
     defer alloc.free(corrupt);
     try std.testing.expect(!isGraphEdgeArtifactKey(corrupt));
-    try std.testing.expectError(error.InvalidGraphEdges, graphRelationshipArtifactKeyAlloc(alloc, "fact", "facts", "RELATES_TO", "b", "a", ""));
+    const owned_legacy = try graphRelationshipArtifactKeyAlloc(alloc, "fact", "facts", "RELATES_TO", "b", "a", "");
+    defer alloc.free(owned_legacy);
+    const old_owned = try graphEdgeArtifactKeyWithSourceAlloc(alloc, "fact", "facts", "RELATES_TO", "b", "a");
+    defer alloc.free(old_owned);
+    try std.testing.expectEqualSlices(u8, old_owned, owned_legacy);
 }
 
 /// Allocation-free format admission for primary artifact transfers.
@@ -3469,4 +3473,14 @@ pub fn graphArtifactHasRelationshipId(key: []const u8) bool {
     pos = findComponentTerminator(key, pos).? + 2;
     pos = findComponentTerminator(key, pos).? + 2;
     return parseGraphRelationshipSuffix(key, pos).?.edge_id.len != 0;
+}
+
+/// Durable endpoint cleanup is owner-local control state. Source snapshots
+/// must drain it before copying a range; native whole-store recovery retains it.
+pub const graph_endpoint_cleanup_prefix = "\x00\x00__metadata__:graph_endpoint_cleanup:v1:";
+pub fn graphEndpointCleanupKeyAlloc(alloc: Allocator, endpoint: []const u8) ![]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(endpoint, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return std.mem.concat(alloc, u8, &.{ graph_endpoint_cleanup_prefix, &hex });
 }

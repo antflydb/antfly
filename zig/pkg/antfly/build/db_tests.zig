@@ -30,7 +30,10 @@ pub const AddTestsResult = struct {
 pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
     const relationship_identity_filters = [_][]const u8{
+        "db graph endpoint cleanup pages",
+        "graph endpoint cleanup byte admission",
         "graph relationship integration",
+        "graph relationship artifact identity",
         "derived log record",
         "derived log relationship identities",
         "k shortest paths preserve",

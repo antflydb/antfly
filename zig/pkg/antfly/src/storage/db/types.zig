@@ -378,6 +378,8 @@ pub const BatchRequest = struct {
     writes: []const BatchWrite = &.{},
     deletes: []const []const u8 = &.{},
     transforms: []const DocumentTransform = &.{},
+    /// Private owner-leader maintenance: one bounded durable endpoint page.
+    graph_endpoint_cleanup: bool = false,
     graph_writes: []const GraphEdgeWrite = &.{},
     graph_deletes: []const GraphEdgeDelete = &.{},
     predicates: []const TransactionVersionPredicate = &.{},
@@ -5029,9 +5031,29 @@ pub const IndexTargetVisibility = struct {
 /// understand their complete identities before any primary rows are applied.
 pub fn requiresGraphRelationshipProtocol(req: BatchRequest) bool {
     const keys = @import("../internal_keys.zig");
+    // Deletes generate exact retirements during apply even when the input
+    // contains only legacy tuples or document keys. Classify those effects
+    // before proposal; inspecting only already-materialized rows is too late.
+    if (req.graph_endpoint_cleanup or req.deletes.len != 0 or req.graph_deletes.len != 0 or req.transforms.len != 0 or req.merge_page != null) return true;
+    if (req.transaction) |control| if (control == .resolve and control.resolve.status == .committed) return true;
     for (req.graph_writes) |write| if (write.edge_id.len != 0 or write.owner_document.len != 0) return true;
     for (req.graph_deletes) |delete| if (delete.edge_id.len != 0 or delete.owner_document.len != 0) return true;
     for (req.merge_artifacts) |row| if (keys.isGraphRetirementKey(row.key) or keys.graphArtifactHasRelationshipId(row.key)) return true;
     for (req.writes) |row| if (keys.isGraphRetirementKey(row.key) or keys.graphArtifactHasRelationshipId(row.key)) return true;
     return false;
+}
+
+/// Cleanup is a private, effect-bearing command, never a flag that can be
+/// attached to a public mutation or a lifecycle control.
+pub fn validateGraphEndpointCleanupCommand(req: BatchRequest) !void {
+    if (!req.graph_endpoint_cleanup) return;
+    const defaults = BatchRequest{};
+    inline for (std.meta.fields(BatchRequest)) |field| {
+        if (comptime !std.mem.eql(u8, field.name, "graph_endpoint_cleanup") and !std.mem.eql(u8, field.name, "timestamp_ns") and !std.mem.eql(u8, field.name, "sync_level")) {
+            const value = @field(req, field.name);
+            if (comptime @typeInfo(field.type) == .pointer and @typeInfo(field.type).pointer.size == .slice) {
+                if (value.len != 0) return error.InvalidBatchRequest;
+            } else if (!std.meta.eql(value, @field(defaults, field.name))) return error.InvalidBatchRequest;
+        }
+    }
 }
