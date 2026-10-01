@@ -6613,7 +6613,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .chaos_test_step = chaos_test_step,
         .compiled_recall_tests = compiled_recall_tests,
         .storage_test_step = lib_storage_test_step,
-        .linked_consumer_tests = std.mem.concat(b.allocator, *std.Build.Step.Compile, &.{ api_tests_addTests_result.linked_consumer_tests, data_tests_addTests_result.linked_consumer_tests, &.{ provisioned_query_visibility_tests.consumer.executable, graph_metric_remote_wire_tests.consumer.executable } }) catch @panic("OOM"),
+        // The CLI and its meta/registry tests share a root module. Register
+        // that consumer once so all three link the production ABI providers.
+        .linked_consumer_tests = std.mem.concat(b.allocator, *std.Build.Step.Compile, &.{ api_tests_addTests_result.linked_consumer_tests, data_tests_addTests_result.linked_consumer_tests, &.{ provisioned_query_visibility_tests.consumer.executable, graph_metric_remote_wire_tests.consumer.executable, vopr_cli } }) catch @panic("OOM"),
     };
 }
 
