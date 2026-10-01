@@ -312,7 +312,7 @@ SERVER_ENTRYPOINTS = (
     "capi/server_owner.zig",
     "capi/db_test.zig",
     "storage/server_db_adapter.zig",
-    "storage/db/native_raft_snapshot.zig",
+    "raft/storage/native_snapshot.zig",
     "storage/metadata_hot_standby_port.zig",
 )
 
