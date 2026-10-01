@@ -11,6 +11,9 @@ pub const Options = struct {
     enabled: bool = true,
     page_reuse: bool = true,
     retirement_work_pages: usize = 128,
+    /// Minimum growth interval; exact scans also require proportional change
+    /// as the store grows. Retirement uses the smaller of this minimum and
+    /// minimum_reclaim_bytes, subject to the same proportional floor.
     assessment_bytes: u64 = 64 * 1024 * 1024,
     minimum_reclaim_bytes: u64 = 256 * 1024 * 1024,
     amplification: u32 = 2,
@@ -73,6 +76,7 @@ pub const Policy = struct {
     options: Options = .{},
     status: Status = .{},
     next_assessment_size: u64 = 0,
+    assessment_activity_bytes: u64 = 0,
     retirement_bytes: u64 = 0,
     assessed_retirement_bytes: u64 = 0,
 
@@ -86,25 +90,38 @@ pub const Policy = struct {
 
     pub fn due(self: Policy, size: u64) bool {
         const activity_due = self.retirement_bytes -| self.assessed_retirement_bytes >=
-            @min(self.options.assessment_bytes, self.options.minimum_reclaim_bytes);
+            self.assessment_activity_bytes;
         return self.options.enabled and size >= self.options.minimum_reclaim_bytes and
             (size >= self.next_assessment_size or activity_due);
     }
 
-    pub fn assessed(self: *Policy, physical: u64, compact: u64, live: u64, sequence: u64) bool {
-        self.next_assessment_size = physical +| self.options.assessment_bytes;
+    // An exact assessment traverses all live records. Charge at least a
+    // quarter of the assessed physical size in growth or committed retirement
+    // before another scan, so routine scan work is amortized to changed data.
+    // Retirement includes inline deletions, which need not release whole pages.
+    fn resetAssessmentBudget(self: *Policy, physical: u64) void {
+        const proportional = physical / 4;
+        self.next_assessment_size = physical +| @max(self.options.assessment_bytes, proportional);
+        self.assessment_activity_bytes = @max(@min(self.options.assessment_bytes, self.options.minimum_reclaim_bytes), proportional);
         self.assessed_retirement_bytes = self.retirement_bytes;
+    }
+
+    pub fn assessed(self: *Policy, physical: u64, compact: u64, live: u64, sequence: u64) bool {
+        self.resetAssessmentBudget(physical);
         self.status.assessment_count +|= 1;
         self.status.compact_size_estimate = compact;
         self.status.live_bytes_estimate = live;
         self.status.estimated_at_sequence = sequence;
+        return self.worthwhile(physical, compact);
+    }
+
+    pub fn worthwhile(self: Policy, physical: u64, compact: u64) bool {
         return physical -| compact >= self.options.minimum_reclaim_bytes and
             physical > compact *| self.options.amplification;
     }
 
     pub fn completed(self: *Policy, physical: u64, reclaimed: u64) void {
-        self.next_assessment_size = physical +| self.options.assessment_bytes;
-        self.assessed_retirement_bytes = self.retirement_bytes;
+        self.resetAssessmentBudget(physical);
         self.status.rewrite_count +|= 1;
         self.status.last_reclaimed_bytes = reclaimed;
         self.status.state = if (self.options.enabled) .idle else .disabled;
@@ -122,11 +139,51 @@ test "lite reclamation policy uses hysteresis and saturating size arithmetic" {
     try std.testing.expect(policy.assessed(1024, 300, 200, 7));
     try std.testing.expect(!policy.due(1025));
     policy.completed(300, 724);
-    try std.testing.expect(!policy.due(363));
-    try std.testing.expect(policy.due(364));
+    try std.testing.expect(!policy.due(374));
+    try std.testing.expect(policy.due(375));
     try std.testing.expect(!policy.assessed(600, 300, 200, 8));
     try std.testing.expect(!policy.assessed(std.math.maxInt(u64), std.math.maxInt(u64) / 2 + 1, 0, 9));
     try std.testing.expectEqual(std.math.maxInt(u64), policy.next_assessment_size);
     try std.testing.expectError(error.InvalidLiteMaintenanceOptions, Policy.init(.{ .assessment_bytes = 0 }));
     try std.testing.expectError(error.InvalidLiteMaintenanceOptions, Policy.init(.{ .max_storage_bytes = 4095 }));
+}
+
+test "lite reclamation assessments amortize steady reuse and growth to store size" {
+    const mib = 1024 * 1024;
+    for ([_]u64{ 1024 * mib, 16 * 1024 * mib, 64 * 1024 * mib }) |physical| {
+        var policy = try Policy.init(.{});
+        try std.testing.expect(!policy.assessed(physical, physical - 4096, physical - 8192, 1));
+        // Identical 2 GiB of updates causes fewer scans as the store grows.
+        // Each scan requires proportional retirement, even with no file growth.
+        var scanned_bytes: u64 = 0;
+        for (0..32) |i| {
+            policy.retirement_bytes += 64 * mib;
+            if (policy.due(physical)) {
+                scanned_bytes += physical;
+                try std.testing.expect(!policy.assessed(physical, physical - 4096, physical - 8192, i + 2));
+            }
+        }
+        try std.testing.expect(scanned_bytes <= policy.retirement_bytes * 4);
+        const activity = policy.retirement_bytes;
+        // File growth obeys the same proportional budget independently.
+        try std.testing.expect(!policy.due(policy.next_assessment_size - 1));
+        try std.testing.expect(policy.due(policy.next_assessment_size));
+        try std.testing.expectEqual(activity, policy.retirement_bytes);
+    }
+}
+
+test "lite reclamation proportional assessments still observe deletion without growth" {
+    const physical = 16 * 1024 * 1024 * 1024;
+    var policy = try Policy.init(.{});
+    try std.testing.expect(!policy.assessed(physical, physical, physical, 1));
+    var compact: u64 = physical;
+    // Includes inline retirement: a shrinking trigger must not require free
+    // whole pages or increasing file size. At most a quarter-file of activity
+    // separates the exact assessments as amplification crosses the threshold.
+    for (0..3) |i| {
+        policy.retirement_bytes += physical / 4;
+        compact -= physical / 4;
+        try std.testing.expect(policy.due(physical));
+        try std.testing.expectEqual(i == 2, policy.assessed(physical, compact, compact, i + 2));
+    }
 }

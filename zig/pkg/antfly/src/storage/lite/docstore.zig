@@ -30,6 +30,325 @@ const maintenance = @import("../maintenance.zig");
 const Allocator = std.mem.Allocator;
 const bounded_cursor_test_documents: usize = 512;
 
+test "lite reclamation stale quota estimates expire after roots shrink" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "review-stale-quota.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    const value = try a.alloc(u8, 128 * 1024);
+    defer a.free(value);
+    @memset(value, 'v');
+    for (0..64) |_| try store.file.putDocument("large", value);
+    try store.file.putDocument("keep", value);
+    const physical = (try store.file.file.stat(std.testing.io)).size;
+    const old_compact = (try store.file.liveStats(null)).compact_size;
+    const cap = physical + old_compact * 2 - 64 * 1024;
+    store.maintenance_policy = try reclamation.Policy.init(.{ .page_reuse = false, .assessment_bytes = 4096, .minimum_reclaim_bytes = 128 * 1024, .max_storage_bytes = cap });
+    try store.maintainOnce(false);
+    try std.testing.expectEqual(reclamation.Reason.storage_budget, store.maintenance_policy.status.reason);
+    var write = try store.beginWrite();
+    try write.delete("large");
+    try write.commit();
+    const after = (try store.file.file.stat(std.testing.io)).size;
+    const compact = (try store.file.liveStats(null)).compact_size;
+    try std.testing.expect(after + compact * 2 < cap);
+    try std.testing.expect(store.maintenance_policy.worthwhile(after, compact));
+    for (0..5) |_| try store.maintainOnce(true);
+    try std.testing.expectEqual(@as(u64, 1), store.maintenance_policy.status.assessment_count);
+    try std.testing.expectEqual(@as(u64, 0), store.maintenance_policy.status.rewrite_count);
+    try std.testing.expectEqual(reclamation.Reason.storage_budget, store.maintenance_policy.status.reason);
+    // Advance the private monotonic deadline rather than sleeping in a test.
+    store.assessment_cache.?.revalidate_at = .zero;
+    try store.maintainOnce(true);
+    try std.testing.expectEqual(@as(u64, 2), store.maintenance_policy.status.assessment_count);
+    try std.testing.expectEqual(@as(u64, 1), store.maintenance_policy.status.rewrite_count);
+    try std.testing.expect(store.assessment_cache == null);
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectError(error.NotFound, read.get("large"));
+    try std.testing.expectEqualSlices(u8, value, try read.get("keep"));
+    try std.testing.expect((try store.checkWithCancel(null)).valid);
+}
+
+test "lite reclamation writer busy retries gate image copies until publication is available" {
+    const Hook = struct {
+        var owner: ?*Store = null;
+        var writes: u64 = 0;
+        fn write(userdata: ?*anyopaque, file: std.Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) std.Io.File.WritePositionalError!usize {
+            const n = try std.testing.io.vtable.fileWritePositional(userdata, file, header, data, splat, offset);
+            if (owner) |store| if (file.handle != store.file.file.handle) {
+                writes += 1;
+            };
+            return n;
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "review-busy-copy.aflite");
+    defer a.free(path);
+    var vtable = std.testing.io.vtable.*;
+    vtable.fileWritePositional = Hook.write;
+    const io = std.Io{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    var store = try Store.createWithOptions(a, path, .{ .io = io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    for (0..64) |_| try store.file.putDocument("doc", "value");
+    store.maintenance_policy = try reclamation.Policy.init(.{ .page_reuse = false, .assessment_bytes = 4096, .minimum_reclaim_bytes = 128 * 1024 });
+    var pending = try store.beginWrite();
+    var pending_open = true;
+    defer if (pending_open) pending.abort();
+    Hook.owner = &store;
+    defer Hook.owner = null;
+    const checkpoint = store.file.activeCheckpoint();
+    for (0..4) |_| {
+        const before = Hook.writes;
+        const retry = store.maintenance_policy.status.state == .deferred;
+        store.maintainOnceWithCancel(retry, &store.maintenance_cancel) catch |err| {
+            try std.testing.expectEqual(error.FileBusy, err);
+            store.recordMaintenanceError(err);
+        };
+        if (before == 0) try std.testing.expect(Hook.writes > before + 2) else try std.testing.expectEqual(before, Hook.writes);
+        try std.testing.expectEqualDeep(checkpoint, store.file.activeCheckpoint());
+        try std.testing.expectEqual(reclamation.Reason.writer_busy, store.maintenance_policy.status.reason);
+    }
+    try std.testing.expectEqual(@as(u64, 1), store.maintenance_policy.status.assessment_count);
+    const before = Hook.writes;
+    pending.abort();
+    pending_open = false;
+    // A queued yielding writer also owns the next publication opportunity.
+    store.next_writer_ticket +%= 1;
+    try store.maintainOnce(true);
+    try std.testing.expectEqual(before, Hook.writes);
+    try std.testing.expectEqual(reclamation.Reason.writer_busy, store.maintenance_policy.status.reason);
+    store.serving_writer_ticket +%= 1;
+    try store.maintainOnce(true);
+    try std.testing.expect(Hook.writes > before);
+    try std.testing.expectEqual(@as(u64, 1), store.maintenance_policy.status.rewrite_count);
+    try std.testing.expect(!store.shrink_waiting_for_writer);
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("value", try read.get("doc"));
+    try std.testing.expect((try store.checkWithCancel(null)).valid);
+}
+
+test "lite reclamation prepared admission cancels cold reserve replay before publication" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "admission-live.aflite");
+    defer a.free(path);
+    const staged_path = try testPath(a, tmp, "admission-prepared.aflite");
+    defer a.free(staged_path);
+    const options: CreateOptions = .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } };
+    var live = try Store.createWithOptions(a, path, options);
+    defer live.close();
+    live.maintenance_start_suppressed = true;
+    var staged = try Store.createWithOptions(a, staged_path, options);
+    defer staged.close();
+    staged.maintenance_start_suppressed = true;
+    const value = try a.alloc(u8, 4 * 1024 * 1024);
+    defer a.free(value);
+    @memset(value, 'v');
+    var write = try staged.beginWrite();
+    try write.put("large", value);
+    try write.commit();
+    try staged.file.beginTransaction();
+    staged.file.abortTransaction();
+    const live_checkpoint = live.file.activeCheckpoint();
+    const staged_checkpoint = staged.file.activeCheckpoint();
+    const reads = staged.file.test_page_reads.load(.monotonic);
+    var cancel = maintenance.CancelToken{};
+    staged.file.test_cancel_on_read = &cancel;
+    defer staged.file.test_cancel_on_read = null;
+    const old_bytes = (try live.file.file.stat(std.testing.io)).size;
+    try std.testing.expectError(error.MaintenanceCanceled, live.admitPreparedGenerationAssumeLockedWithCancel(&staged.file, old_bytes, &cancel));
+    try std.testing.expect(staged.file.test_page_reads.load(.monotonic) - reads <= 2);
+    try std.testing.expectEqualDeep(live_checkpoint, live.file.activeCheckpoint());
+    try std.testing.expectEqualDeep(staged_checkpoint, staged.file.activeCheckpoint());
+    try std.testing.expect(staged.file.ledger == null);
+    staged.file.test_cancel_on_read = null;
+    cancel.requested.store(false, .release);
+    try live.admitPreparedGenerationAssumeLockedWithCancel(&staged.file, old_bytes, &cancel);
+    try std.testing.expectEqualDeep(live_checkpoint, live.file.activeCheckpoint());
+    try std.testing.expectEqualDeep(staged_checkpoint, staged.file.activeCheckpoint());
+}
+
+test "lite reclamation retries reuse estimates and reassess changed roots when admitted" {
+    const Probe = struct {
+        bytes: u64 = 0,
+        fn available(ptr: *anyopaque, _: []const u8) !u64 {
+            return @as(*@This(), @ptrCast(@alignCast(ptr))).bytes;
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "review-retry-scan.aflite");
+    defer a.free(path);
+    var probe = Probe{};
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .page_reuse = false, .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    for (0..64) |_| try store.file.putDocument("doc", "value");
+    store.maintenance_policy = try reclamation.Policy.init(.{ .page_reuse = false, .assessment_bytes = 4096, .minimum_reclaim_bytes = 32 * 4096, .disk_headroom_bytes = 4096, .capacity_probe = .{ .context = &probe, .available = Probe.available } });
+    try store.maintainOnce(false);
+    const checkpoint = store.file.activeCheckpoint();
+    for (0..5) |_| {
+        try std.testing.expectEqual(reclamation.State.deferred, store.maintenance_policy.status.state);
+        const retry = store.maintenance_policy.status.state == .deferred or store.maintenance_policy.status.state == .failed;
+        try store.maintainOnceWithCancel(retry, &store.maintenance_cancel);
+        try std.testing.expectEqualDeep(checkpoint, store.file.activeCheckpoint());
+    }
+    try std.testing.expectEqual(@as(u64, 1), store.maintenance_policy.status.assessment_count);
+    store.assessment_cache.?.revalidate_at = .zero;
+    try store.maintainOnce(true);
+    try std.testing.expectEqual(@as(u64, 1), store.maintenance_policy.status.assessment_count);
+    const baseline = store.maintenance_policy.assessed_retirement_bytes;
+    store.maintenance_policy.options.max_storage_bytes = (try store.reclamationStatus()).totalBytes() + 4096;
+    for (0..5) |_| try store.maintainOnce(true);
+    try std.testing.expectEqual(reclamation.Reason.storage_budget, store.maintenance_policy.status.reason);
+    try std.testing.expectEqual(@as(u64, 1), store.maintenance_policy.status.assessment_count);
+    try std.testing.expectEqual(baseline, store.maintenance_policy.assessed_retirement_bytes);
+    store.maintenance_policy.options.max_storage_bytes = 0;
+    store.assessment_cache.?.revalidate_at = std.Io.Clock.awake.now(std.testing.io).addDuration(std.Io.Duration.fromSeconds(30));
+    // Changed checkpoints must not force repeated scans while resources remain
+    // blocked and proportional activity has not exhausted the scan budget.
+    for (0..5) |_| {
+        try store.file.putDocument("doc", "changed");
+        try store.maintainOnce(true);
+    }
+    try std.testing.expectEqual(@as(u64, 1), store.maintenance_policy.status.assessment_count);
+    try std.testing.expect(!std.meta.eql(checkpoint, store.file.activeCheckpoint()));
+    store.assessment_cache.?.revalidate_at = .zero;
+    try store.maintainOnce(true);
+    try std.testing.expectEqual(@as(u64, 2), store.maintenance_policy.status.assessment_count);
+    try std.testing.expectEqual(reclamation.Reason.low_disk, store.maintenance_policy.status.reason);
+    try std.testing.expect(store.assessment_cache.?.revalidate_at.nanoseconds >= std.Io.Clock.awake.now(std.testing.io).addDuration(std.Io.Duration.fromSeconds(29)).nanoseconds);
+    for (0..5) |_| {
+        try store.file.putDocument("doc", "changed");
+        try store.maintainOnce(true);
+    }
+    try std.testing.expectEqual(@as(u64, 2), store.maintenance_policy.status.assessment_count);
+    probe.bytes = 16 * 1024 * 1024;
+    try store.maintainOnce(true);
+    try std.testing.expectEqual(@as(u64, 3), store.maintenance_policy.status.assessment_count);
+    try std.testing.expectEqual(@as(u64, 1), store.maintenance_policy.status.rewrite_count);
+    try std.testing.expect(store.assessment_cache == null);
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("changed", try read.get("doc"));
+    try std.testing.expect((try store.checkWithCancel(null)).valid);
+}
+
+test "lite reclamation worker cancels post assessment status replay after foreground abort" {
+    const Hook = struct {
+        var owner: ?*Store = null;
+        var owner_reads: u64 = 0;
+        var checkpoint: native.CheckpointSlot = undefined;
+        fn read(userdata: ?*anyopaque, file: std.Io.File, data: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
+            const n = try std.testing.io.vtable.fileReadPositional(userdata, file, data, offset);
+            if (owner) |store| {
+                if (file.handle == store.file.file.handle and store.maintenance_cancel.requested.load(.acquire)) owner_reads += 1;
+                if (file.handle != store.file.file.handle and store.maintenance_running and offset >= 4096 and store.file.test_cancel_on_read == null) {
+                    lockStore(store);
+                    defer store.mutex.unlock();
+                    store.file.beginTransaction() catch unreachable;
+                    store.file.abortTransaction();
+                    checkpoint = store.file.activeCheckpoint();
+                    store.file.page_cache_enabled.store(false, .monotonic);
+                    store.file.test_cancel_on_read = &store.maintenance_cancel;
+                }
+            }
+            return n;
+        }
+        fn available(_: *anyopaque, _: []const u8) !u64 {
+            return 0;
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "review-status-cancel.aflite");
+    defer a.free(path);
+    var vtable = std.testing.io.vtable.*;
+    vtable.fileReadPositional = Hook.read;
+    const io = std.Io{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = io, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    const value = try a.alloc(u8, 256 * 1024);
+    defer a.free(value);
+    @memset(value, 'v');
+    for (0..20) |_| {
+        var write = try store.beginWrite();
+        try write.put("large", value);
+        try write.commit();
+    }
+    var dummy: u8 = 0;
+    store.maintenance_policy = try reclamation.Policy.init(.{ .minimum_reclaim_bytes = 4096, .assessment_bytes = 4096, .retirement_work_pages = 1, .capacity_probe = .{ .context = &dummy, .available = Hook.available } });
+    Hook.owner = &store;
+    defer Hook.owner = null;
+    defer store.file.test_cancel_on_read = null;
+    try std.testing.expectError(error.MaintenanceCanceled, store.maintainOnceWithCancel(false, &store.maintenance_cancel));
+    try std.testing.expect(store.maintenance_cancel.requested.load(.acquire));
+    try std.testing.expect(Hook.owner_reads <= 2);
+    try std.testing.expectEqualDeep(Hook.checkpoint, store.file.activeCheckpoint());
+    try std.testing.expect(store.file.ledger == null);
+    try std.testing.expect(store.file.allocator_cancel_token == null);
+    Hook.owner = null;
+    store.file.test_cancel_on_read = null;
+    // The worker token stays requested; independent foreground mutations must
+    // still publish normally, without inheriting maintenance cancellation.
+    var write = try store.beginWrite();
+    try write.put("foreground", "accepted");
+    try write.commit();
+    store.maintenance_cancel.requested.store(false, .release);
+    try store.maintainOnce(true);
+    try std.testing.expectEqual(reclamation.Reason.low_disk, store.maintenance_policy.status.reason);
+}
+
+test "lite reclamation worker cancels cold debt replay after vacuum adoption" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "worker-cold-debt.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    const value = try a.alloc(u8, 4 * 1024 * 1024);
+    defer a.free(value);
+    @memset(value, 'v');
+    var write = try store.beginWrite();
+    try write.put("large", value);
+    try write.commit();
+    _ = try store.vacuumWithCancel(null);
+    try std.testing.expect(store.file.ledger == null);
+    const checkpoint = store.file.activeCheckpoint();
+    const reads = store.file.test_page_reads.load(.monotonic);
+    store.file.test_cancel_on_read = &store.maintenance_cancel;
+    defer store.file.test_cancel_on_read = null;
+    try std.testing.expectError(error.MaintenanceCanceled, store.maintenanceNeedsService());
+    try std.testing.expect(store.file.test_page_reads.load(.monotonic) - reads <= 2);
+    try std.testing.expectEqualDeep(checkpoint, store.file.activeCheckpoint());
+    try std.testing.expect(store.file.ledger == null);
+    // Cancellation already pending on mutex acquisition must do no I/O.
+    const canceled_reads = store.file.test_page_reads.load(.monotonic);
+    try std.testing.expectError(error.MaintenanceCanceled, store.maintenanceNeedsService());
+    try std.testing.expectEqual(canceled_reads, store.file.test_page_reads.load(.monotonic));
+    store.file.test_cancel_on_read = null;
+    store.maintenance_cancel.requested.store(false, .release);
+    _ = try store.maintenanceNeedsService();
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualSlices(u8, value, try read.get("large"));
+}
+
 test "lite reclamation vacuum preserves collector capacity with retained readers" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -787,6 +1106,19 @@ pub const Store = struct {
     /// of retained generations. Status may walk them for reader diagnostics.
     retired_file_bytes: u64 = 0,
     maintenance_policy: reclamation.Policy = .{},
+    // Valid only for this inode, exact checkpoint, and destination format.
+    // Resource retries do not consume or reset the proportional scan budget.
+    assessment_cache: ?struct {
+        generation: u64,
+        checkpoint: native.CheckpointSlot,
+        indexed: bool,
+        stats: native.NativeFile.LiveStats,
+        revalidate_at: std.Io.Timestamp,
+    } = null,
+    assessment_generation: u64 = 0,
+    // Independent of retirement status, which can return to idle while a
+    // prepared generation is still waiting for a publication opportunity.
+    shrink_waiting_for_writer: bool = false,
     maintenance_future: ?std.Io.Future(void) = null,
     maintenance_started: std.atomic.Value(bool) = .init(false),
     maintenance_wake: std.Io.Event = .unset,
@@ -930,8 +1262,11 @@ pub const Store = struct {
     }
 
     fn retireReadGeneration(self: *Store, old_bytes: u64) void {
-        self.admission_refresh_size = 0;
+        self.assessment_generation +%= 1;
+        self.assessment_cache = null;
+        self.shrink_waiting_for_writer = false;
         self.maintenance_policy.status.estimated_at_sequence = null;
+        self.admission_refresh_size = 0;
         const generation = self.read_generation orelse return;
         self.read_generation = null;
         self.file.minimum_reader_sequence = null;
@@ -1010,7 +1345,7 @@ pub const Store = struct {
         defer self.mutex.unlock();
         if (self.read_only or self.maintenance_start_suppressed or self.maintenance_cancel.requested.load(.acquire) or
             self.maintenance_future != null) return;
-        const retirement = self.file.retirementNeedsService() catch false;
+        const retirement = self.file.retirementNeedsServiceWithCancel(&self.maintenance_cancel) catch false;
         if (!retirement and (!self.maintenance_policy.options.enabled or self.file.activeCheckpoint().page_count *| self.file.header.page_size < self.maintenance_policy.options.minimum_reclaim_bytes)) return;
         self.maintenance_future = self.file.runtime().concurrent(maintenanceLoop, .{self}) catch |err| {
             self.maintenance_policy.status.state = .deferred;
@@ -1048,7 +1383,6 @@ pub const Store = struct {
             if (self.maintenance_cancel.requested.load(.acquire)) break;
             lockStore(self);
             const deferred = failed or self.maintenance_policy.status.state == .deferred;
-            const blocked = self.maintenance_running or self.generation_workspace_active or self.file.change_capture != null;
             self.mutex.unlock();
             if (deferred) {
                 retry_at = std.Io.Clock.awake.now(io).addDuration(std.Io.Duration.fromMilliseconds(self.maintenance_policy.options.retry_ms));
@@ -1058,12 +1392,22 @@ pub const Store = struct {
                 } }) catch {};
             } else {
                 retry_at = .zero;
-                lockStore(self);
-                const more = !blocked and (self.file.retirementNeedsService() catch false);
-                self.mutex.unlock();
+                const more = self.maintenanceNeedsService() catch false;
+                if (self.maintenance_cancel.requested.load(.acquire)) break;
                 if (!more) self.maintenance_wake.waitUncancelable(io);
             }
         }
+    }
+
+    // Adoption discards the cached ledger. This probe can therefore replay a
+    // whole allocator snapshot; it must share the worker's cancellation fence
+    // even though the preceding maintenance cycle has restored its token.
+    fn maintenanceNeedsService(self: *Store) !bool {
+        lockStore(self);
+        defer self.mutex.unlock();
+        try self.maintenance_cancel.check();
+        if (self.maintenance_running or self.generation_workspace_active or self.file.change_capture != null) return false;
+        return self.file.retirementNeedsServiceWithCancel(&self.maintenance_cancel);
     }
 
     /// One owner-controlled assessment/cycle. Public for cooperative runtimes
@@ -1093,63 +1437,86 @@ pub const Store = struct {
             }
         }
         if (!self.maintenance_policy.options.enabled) return;
-        var snapshot = blk: {
+        var snapshot: ?native.NativeFile = null;
+        defer if (snapshot) |*source| source.close();
+        var cached_stats: ?native.NativeFile.LiveStats = null;
+        var assessed_checkpoint: native.CheckpointSlot = undefined;
+        var assessed_size: u64 = undefined;
+        var assessed_indexed: bool = undefined;
+        var assessed_generation: u64 = undefined;
+        {
             lockStore(self);
             defer self.mutex.unlock();
             if (self.maintenance_running or self.generation_workspace_active or self.file.change_capture != null) return;
             if (cancel) |token| try token.check();
+            if (self.shrink_waiting_for_writer) {
+                if (!self.writerSlotAvailable()) {
+                    self.maintenance_policy.status.state = .deferred;
+                    self.maintenance_policy.status.reason = .writer_busy;
+                    return;
+                }
+                self.shrink_waiting_for_writer = false;
+            }
             const size = (try self.file.file.stat(self.file.runtime())).size;
             self.maintenance_policy.retirement_bytes = self.file.retirement_activity_bytes;
             if (!force and !self.maintenance_policy.due(size)) return;
             if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeUnknown;
-            var source = try native.NativeFile.openWithIo(self.allocator, self.file.runtime(), self.file.path, .{ .read_only = true, .resource_manager = self.resource_manager });
-            source.header = self.file.header;
-            source.page_cache_policy = .metadata_only;
+            assessed_checkpoint = self.file.activeCheckpoint();
+            assessed_size = size;
+            assessed_indexed = self.file.header.indexed_reclamation or self.file.vacuum_target_indexed;
+            assessed_generation = self.assessment_generation;
+            if (force) {
+                if (self.assessment_cache) |cache| {
+                    if (cache.generation == assessed_generation and cache.indexed == assessed_indexed and std.meta.eql(cache.checkpoint, assessed_checkpoint)) {
+                        cached_stats = cache.stats;
+                    } else if (cache.generation == assessed_generation and cache.indexed == assessed_indexed and !self.maintenance_policy.due(size)) {
+                        // A stale workspace is only a temporary admission hint:
+                        // deletions can make a rewrite fit without exhausting
+                        // the growth/activity budget. Bound revalidation by
+                        // time and scan cost instead of scanning every retry.
+                        if (std.Io.Clock.awake.now(self.file.runtime()).nanoseconds < cache.revalidate_at.nanoseconds and
+                            try self.admitShrinkWorkspaceAssumeLocked(cache.stats.compact_size, cancel) == null) return;
+                    }
+                }
+            }
+            if (cached_stats == null) {
+                snapshot = try native.NativeFile.openWithIo(self.allocator, self.file.runtime(), self.file.path, .{ .read_only = true, .resource_manager = self.resource_manager });
+                snapshot.?.header = self.file.header;
+                snapshot.?.page_cache_policy = .metadata_only;
+            }
             self.maintenance_running = true;
             self.maintenance_policy.status.state = .assessing;
-            break :blk source;
-        };
+        }
         defer {
             lockStore(self);
             self.maintenance_running = false;
             self.maintenance_wake.set(self.file.runtime());
             self.mutex.unlock();
         }
-        var snapshot_open = true;
-        defer if (snapshot_open) snapshot.close();
-        const stats = try snapshot.liveStats(cancel);
-        const size = (try snapshot.file.stat(snapshot.runtime())).size;
+        const scan_started = std.Io.Clock.awake.now(self.file.runtime());
+        const stats = cached_stats orelse try snapshot.?.liveStats(cancel);
+        const scan_finished = std.Io.Clock.awake.now(self.file.runtime());
         const rewrite = blk: {
             lockStore(self);
             defer self.mutex.unlock();
-            const due = self.maintenance_policy.assessed(size, stats.compact_size, stats.bytes, snapshot.activeCheckpoint().commit_sequence);
+            if (cancel) |token| try token.check();
+            if (self.assessment_generation != assessed_generation) return error.FileBusy;
+            const due = if (cached_stats != null)
+                self.maintenance_policy.worthwhile(assessed_size, stats.compact_size)
+            else
+                self.maintenance_policy.assessed(assessed_size, stats.compact_size, stats.bytes, assessed_checkpoint.commit_sequence);
+            if (cached_stats == null) {
+                // Spend at most ~1/64 of elapsed time rescanning changed roots
+                // under sustained pressure, with a 30-second minimum interval.
+                // Exact unchanged checkpoints never need time-based rescans.
+                const interval_ns = @max(@as(i96, 30 * std.time.ns_per_s), scan_started.durationTo(scan_finished).nanoseconds *| 64);
+                self.assessment_cache = .{ .generation = assessed_generation, .checkpoint = assessed_checkpoint, .indexed = assessed_indexed, .stats = stats, .revalidate_at = scan_finished.addDuration(.{ .nanoseconds = interval_ns }) };
+            }
             self.maintenance_policy.status.state = .idle;
             self.maintenance_policy.status.reason = .none;
             self.maintenance_policy.status.last_error = null;
             if (!due) break :blk false;
-            // Reserve conservatively for the compact image and catch-up. The
-            // old inode remains allocated until all retained readers release.
-            const accounting = try self.reclamationStatusAssumeLocked();
-            const workspace = @max(stats.compact_size *| 2, self.maintenance_policy.options.assessment_bytes);
-            const budget = self.maintenance_policy.options.max_storage_bytes;
-            if (budget != 0 and accounting.totalBytes() +| workspace > budget) {
-                self.maintenance_policy.status.state = .deferred;
-                self.maintenance_policy.status.reason = .storage_budget;
-                break :blk false;
-            }
-            self.admitEstimatedGenerationAssumeLocked(stats.compact_size, accounting.current_file_bytes) catch {
-                self.maintenance_policy.status.state = .deferred;
-                self.maintenance_policy.status.reason = .storage_budget;
-                break :blk false;
-            };
-            if (try self.availableDiskBytes()) |available| {
-                self.maintenance_policy.status.available_disk_bytes = available;
-                if (available < workspace +| self.maintenance_policy.options.disk_headroom_bytes) {
-                    self.maintenance_policy.status.state = .deferred;
-                    self.maintenance_policy.status.reason = .low_disk;
-                    break :blk false;
-                }
-            }
+            const workspace = (try self.admitShrinkWorkspaceAssumeLocked(stats.compact_size, cancel)) orelse break :blk false;
             self.maintenance_policy.status.state = .rewriting;
             self.maintenance_policy.status.temporary_bytes = workspace;
             break :blk true;
@@ -1162,13 +1529,47 @@ pub const Store = struct {
         }
         // The assessment descriptor names the old inode. Release its shared
         // lock before vacuum; the owner takes its own capture snapshot.
-        snapshot.close();
-        snapshot_open = false;
-        const report = try self.performVacuum(cancel, true);
+        if (snapshot) |*source| source.close();
+        snapshot = null;
+        const report = self.performVacuum(cancel, true) catch |err| {
+            if (err == error.FileBusy or err == error.WouldBlock) {
+                lockStore(self);
+                self.shrink_waiting_for_writer = true;
+                self.mutex.unlock();
+            }
+            return err;
+        };
         lockStore(self);
         defer self.mutex.unlock();
         self.maintenance_policy.retirement_bytes = self.file.retirement_activity_bytes;
         self.maintenance_policy.completed(report.after_size, report.reclaimed_bytes);
+    }
+
+    fn admitShrinkWorkspaceAssumeLocked(self: *Store, compact: u64, cancel: ?*const maintenance.CancelToken) !?u64 {
+        const accounting = try self.reclamationStatusAssumeLockedWithCancel(cancel);
+        const workspace = @max(compact *| 2, self.maintenance_policy.options.assessment_bytes);
+        const budget = self.maintenance_policy.options.max_storage_bytes;
+        if (budget != 0 and accounting.totalBytes() +| workspace > budget) {
+            self.maintenance_policy.status.state = .deferred;
+            self.maintenance_policy.status.reason = .storage_budget;
+            return null;
+        }
+        self.admitEstimatedGenerationAssumeLocked(compact, accounting.current_file_bytes) catch |err| {
+            if (err != error.LiteStorageBudgetExceeded) return err;
+            self.maintenance_policy.status.state = .deferred;
+            self.maintenance_policy.status.reason = .storage_budget;
+            return null;
+        };
+        if (try self.availableDiskBytes()) |available| {
+            if (cancel) |token| try token.check();
+            self.maintenance_policy.status.available_disk_bytes = available;
+            if (available < workspace +| self.maintenance_policy.options.disk_headroom_bytes) {
+                self.maintenance_policy.status.state = .deferred;
+                self.maintenance_policy.status.reason = .low_disk;
+                return null;
+            }
+        }
+        return workspace;
     }
 
     fn recordMaintenanceError(self: *Store, err: anyerror) void {
@@ -1218,6 +1619,11 @@ pub const Store = struct {
     }
 
     pub fn reclamationStatusAssumeLocked(self: *Store) !reclamation.Status {
+        return self.reclamationStatusAssumeLockedWithCancel(null);
+    }
+
+    fn reclamationStatusAssumeLockedWithCancel(self: *Store, cancel: ?*const maintenance.CancelToken) !reclamation.Status {
+        if (cancel) |token| try token.check();
         var status = self.maintenance_policy.status;
         status.allocator_enabled = self.file.header.indexed_reclamation;
         status.shrinking_enabled = self.maintenance_policy.options.enabled;
@@ -1231,11 +1637,12 @@ pub const Store = struct {
         }
         var next = self.retired_generations;
         while (next) |generation| : (next = generation.next_retired) {
+            if (cancel) |token| try token.check();
             status.retired_generations += 1;
             status.retained_readers += generation.references;
             status.oldest_reader_age_ms = @max(status.oldest_reader_age_ms, @as(u64, @intCast(@max(0, generation.pinned_at.durationTo(now).toMilliseconds()))));
         }
-        if (try self.file.allocatorStats()) |stats| {
+        if (try self.file.allocatorStatsWithCancel(cancel)) |stats| {
             status.reusable_pages = stats.reusable_pages;
             status.pending_retirement_objects = stats.pending_objects;
             status.pending_data_retirement_objects = stats.pending_data_objects;
@@ -1295,6 +1702,7 @@ pub const Store = struct {
         var source = blk: {
             lockStore(self);
             defer self.mutex.unlock();
+            if (cancel) |token| try token.check();
             if (self.generation_workspace_active or self.file.change_capture != null or (self.maintenance_running and !automatic)) {
                 std.log.warn("lite vacuum refused: another maintenance cycle owns the workspace", .{});
                 return error.FileBusy;
@@ -1327,7 +1735,7 @@ pub const Store = struct {
         {
             lockStore(self);
             defer self.mutex.unlock();
-            const status = try self.reclamationStatusAssumeLocked();
+            const status = try self.reclamationStatusAssumeLockedWithCancel(cancel);
             const workspace = if (status.temporary_bytes != 0) status.temporary_bytes else @max(compact *| 2, self.maintenance_policy.options.assessment_bytes);
             const budget = self.maintenance_policy.options.max_storage_bytes;
             if (budget != 0 and status.current_file_bytes +| status.retired_file_bytes +| workspace > budget) return error.LiteStorageBudgetExceeded;
@@ -1405,6 +1813,7 @@ pub const Store = struct {
                 defer self.generation_lock.unlock(io);
                 lockStore(self);
                 defer self.mutex.unlock();
+                if (cancel) |token| try token.check();
                 if (capture.overflow) {
                     std.log.warn("lite vacuum gave up: change capture overflowed while holding the writer slot round={d} captured={d}", .{ round, capture.count });
                     return error.FileBusy;
@@ -1421,7 +1830,7 @@ pub const Store = struct {
                     try image.prepared.finishPublicationSequence(self.file.activeCheckpoint().commit_sequence + 1, image.prepared.activeCheckpoint());
                     image.report.after_size = (try image.prepared.file.stat(io)).size;
                     image.report.reclaimed_bytes = image.report.before_size -| image.report.after_size;
-                    try self.admitPreparedGenerationAssumeLocked(&image.prepared, image.report.before_size);
+                    try self.admitPreparedGenerationAssumeLockedWithCancel(&image.prepared, image.report.before_size, cancel);
                     const old_handle = self.file.file.handle;
                     const retained_old = if (self.read_generation) |generation| generation.references != 0 else false;
                     defer if (self.file.file.handle != old_handle) {
@@ -1592,10 +2001,15 @@ pub const Store = struct {
     /// Shared final adoption admission. Prepared bytes replace the workspace
     /// reservation; the old inode remains charged while its readers are pinned.
     fn admitPreparedGenerationAssumeLocked(self: *Store, prepared: *native.NativeFile, old_bytes: u64) !void {
+        return self.admitPreparedGenerationAssumeLockedWithCancel(prepared, old_bytes, null);
+    }
+
+    fn admitPreparedGenerationAssumeLockedWithCancel(self: *Store, prepared: *native.NativeFile, old_bytes: u64, cancel: ?*const maintenance.CancelToken) !void {
+        if (cancel) |token| try token.check();
         const prepared_bytes = (try prepared.file.stat(prepared.runtime())).size;
         const options = self.maintenance_policy.options;
-        const reserve = try prepared.retirementReserveBytes();
-        const reusable = if (try prepared.allocatorStats()) |stats| stats.reusable_pages *| prepared.header.page_size else 0;
+        const reserve = try prepared.retirementReserveBytesWithCancel(cancel);
+        const reusable = if (try prepared.allocatorStatsWithCancel(cancel)) |stats| stats.reusable_pages *| prepared.header.page_size else 0;
         const total = old_bytes +| self.retired_file_bytes +| prepared_bytes;
         const retained_old = if (self.read_generation) |generation| (if (generation.references != 0) old_bytes else 0) else 0;
         const adopted_total = retained_old +| self.retired_file_bytes +| prepared_bytes;
@@ -1603,6 +2017,7 @@ pub const Store = struct {
             if (total > options.max_storage_bytes or options.max_storage_bytes -| adopted_total +| reusable < reserve) return error.LiteStorageBudgetExceeded;
         }
         if (try self.availableDiskBytes()) |available| {
+            if (cancel) |token| try token.check();
             if (available < options.disk_headroom_bytes +| (reserve -| reusable)) return error.LiteInsufficientDiskSpace;
         }
     }
@@ -1677,6 +2092,15 @@ pub const Store = struct {
             current = item.next;
         }
         try self.file.commitTransactionWithDurability(durable);
+    }
+
+    fn writerSlotAvailable(self: *Store) bool {
+        const io = self.file.runtime();
+        self.writer_mutex.lockUncancelable(io);
+        defer self.writer_mutex.unlock(io);
+        // This is an admission hint, not a reservation. Online capture still
+        // permits foreground writers throughout the subsequent image copy.
+        return !self.writer_active and self.next_writer_ticket == self.serving_writer_ticket;
     }
 
     pub fn reserveWriterSlot(self: *Store) !void {

@@ -49,15 +49,22 @@ var db = try embedded.DB.openLite(allocator, path, .{
 defer db.close();
 ```
 
-Default assessment occurs after 64 MiB of file growth or committed data
-retirement once the file reaches 256 MiB. Retirement activity includes released
+Assessment starts once the file reaches 256 MiB by default. After each exact
+assessment, the next scan requires file growth of at least the larger of 64 MiB
+and one quarter of the assessed physical size, or proportional committed data
+retirement. Charging scan work to proportional change prevents repeated full
+live-record traversals every 64 MiB on a large, densely live store. Retirement activity includes released
 physical data pages and retired inline record bytes, so partially live packed
 pages can also trigger compaction. Shared external value lengths are excluded;
 retiring an append's old record never counts its entire shared value. Activity is counted at
 publication from scalar allocator state; aborted transactions and allocator
-housekeeping do not contribute. Activity assessments use the smaller of the
-growth interval and minimum reclamation threshold, so deleting data can trigger
-shrinking while physical size remains stable. Successful rewrites reset both
+housekeeping do not contribute. The retirement interval is the larger of one
+quarter of the assessed physical size and the smaller of the configured growth
+interval and minimum reclamation threshold, so deleting data can trigger
+shrinking while physical size remains stable, including within partially live
+packed pages. Both growth and retirement accounting are constant-time scalar
+checks; neither requires a fragmentation walk to decide whether a scan is due.
+Successful rewrites reset both
 assessment baselines; reopen assesses afresh. An assessment walks live ordered-index metadata, not historical chains
 or external value payloads. A rewrite is eligible only when both physical size
 exceeds twice estimated compact size and estimated savings reach 256 MiB. These
@@ -69,6 +76,25 @@ consume a concurrency lane. Mutations signal one owner task and requests coalesc
 Busy publication, resource deferral, and failed service retry
 after the configured interval. An active online capture or assessment parks the
 worker until completion signals it; eligible debt never causes a no-progress spin.
+Resource retries reuse an exact estimate keyed by owner generation, complete
+checkpoint, and destination format, without consuming the proportional scan
+budget. If roots change below that budget while resources remain blocked, the
+retry checks the known workspace before opening another assessment snapshot.
+A stale hint expires after the greater of 30 seconds and 64 times the previous
+scan duration. Changed roots are then reassessed even under continued pressure,
+so deletions or smaller replacements can make shrinking fit a fixed quota
+without further writes. This bounds repeated scan cost under sustained mutation;
+unchanged checkpoints keep their exact estimate regardless of elapsed time.
+After a writer-busy publication attempt, retries check both the active writer and
+queued writer tickets before scanning or copying another image. This admission
+check does not reserve the slot across copying: online capture continues to allow
+foreground writes, and writer release wakes maintenance. Retirement service runs
+independently even while image preparation is gated by a busy writer.
+Proportional activity still permits a fresh assessment under pressure; when
+resources return, changed roots are reassessed before reserving or copying an
+image. Adoption invalidates the estimate, including when page IDs are reused
+in the new inode. Assessment counts report actual live-record walks, rather
+than resource-admission attempts.
 Construction suppresses worker startup until the returned owner has a stable
 address. The native backend activates its fully initialized heap owner before
 returning, so remaining reopen debt runs without another operation. Direct
@@ -357,7 +383,13 @@ normalized before catch-up, outside the owner mutex; catch-up retires at epoch
 zero and final sequence publication writes only the header slots.
 
 Worker cancellation reaches allocator reservation, counter/queue construction,
-and journal emission. Each check occurs before checkpoint publication begins.
+journal emission, and every worker debt probe. Generation adoption invalidates
+the cached ledger; the following probe checks cancellation after acquiring the
+owner mutex and throughout cold counter/queue replay. Each check occurs before checkpoint publication begins.
+Worker status accounting and both estimated and prepared-image admission pass
+the same operation token through allocator statistics and reserve replay. These
+tokens remain local to the worker operation; foreground mutations and independent
+cooperative calls do not inherit a worker's shutdown request.
 Canceled batches abort their private native transaction and discard its tail;
 previously published partial roots remain durable and resumable. Cancellation
 is not injected into the final durability boundary, whose existing uncertainty

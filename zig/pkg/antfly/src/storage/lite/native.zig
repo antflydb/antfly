@@ -3261,8 +3261,13 @@ pub const NativeFile = struct {
     }
 
     pub fn retirementReserveBytes(self: *NativeFile) !u64 {
+        return self.retirementReserveBytesWithCancel(self.allocator_cancel_token);
+    }
+
+    pub fn retirementReserveBytesWithCancel(self: *NativeFile, cancel: ?*const maintenance.CancelToken) !u64 {
+        if (cancel) |token| try token.check();
         if (!self.header.indexed_reclamation) return 0;
-        const state = try self.loadLedger(self.activeCheckpoint());
+        const state = try self.loadLedgerWithCancel(self.activeCheckpoint(), cancel);
         return allocator_v4.retirementReservePages(self.maxPagePayloadBytes(), state.counts.items.len, state.pending.count()) *| self.header.page_size;
     }
 
@@ -3287,14 +3292,24 @@ pub const NativeFile = struct {
     };
 
     pub fn allocatorStats(self: *NativeFile) !?AllocatorStats {
+        return self.allocatorStatsWithCancel(self.allocator_cancel_token);
+    }
+
+    pub fn allocatorStatsWithCancel(self: *NativeFile, cancel: ?*const maintenance.CancelToken) !?AllocatorStats {
+        if (cancel) |token| try token.check();
         if (!self.header.indexed_reclamation) return null;
-        const state = try self.loadLedger(self.activeCheckpoint());
+        const state = try self.loadLedgerWithCancel(self.activeCheckpoint(), cancel);
         return .{ .reusable_pages = state.free_pages, .pending_objects = state.pending.count(), .pending_data_objects = state.data_pending, .reused_pages = state.allocations, .serviced_objects = state.collected };
     }
 
     pub fn retirementNeedsService(self: *NativeFile) !bool {
+        return self.retirementNeedsServiceWithCancel(self.allocator_cancel_token);
+    }
+
+    pub fn retirementNeedsServiceWithCancel(self: *NativeFile, cancel: ?*const maintenance.CancelToken) !bool {
+        if (cancel) |token| try token.check();
         if (!self.header.indexed_reclamation or self.read_only) return false;
-        const state = try self.loadLedger(self.activeCheckpoint());
+        const state = try self.loadLedgerWithCancel(self.activeCheckpoint(), cancel);
         if (state.checkpointDue() or self.budgetedCheckpointDue(state)) return true;
         const excess_promotions = state.metadata_heap.count() > 2;
         if (state.data_pending == 0 and state.chains_heap.count() == 0 and !excess_promotions) return false;
