@@ -262,6 +262,7 @@ comptime {
     _ = @import("hot_standby/replication_record.zig");
     _ = @import("hot_standby/seed_activation.zig");
     _ = @import("hot_standby/seed_artifact.zig");
+    _ = @import("hot_standby/primary_effect.zig");
     _ = @import("hot_standby/seed_capture.zig");
     _ = @import("hot_standby/seed_namespace_control.zig");
     _ = @import("hot_standby/seed_prefix_cleanup_test.zig");
@@ -280,6 +281,7 @@ comptime {
     _ = @import("kernel_owner_client.zig");
     _ = @import("kernel_wal_wire.zig");
     _ = @import("index_manager_vopr.zig");
+    _ = @import("lite/allocator_v4.zig");
     _ = @import("lite/backend.zig");
     _ = @import("lite/benchmark.zig");
     _ = @import("lite/bridge.zig");
@@ -290,6 +292,7 @@ comptime {
     _ = @import("lite/mod.zig");
     _ = @import("lite/native.zig");
     _ = @import("lite/paths.zig");
+    _ = @import("lite/reclamation.zig");
     _ = @import("lite/restore_staging.zig");
     _ = @import("lite/secret_store.zig");
     _ = @import("lite/snapshot_test.zig");

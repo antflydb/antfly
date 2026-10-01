@@ -1825,6 +1825,7 @@ test "unconfigured remote catalog authority skips background work without borrow
     cfg.trusted_principal_issuer = "cluster";
     cfg.configureRemoteCatalogPublicationAuthority();
     try std.testing.expect(cfg.catalog_publication_authority_available);
+    cfg.setting_authority_secret = "separate-setting-authority";
     cfg.setting_authority_issuer = null;
     cfg.configureRemoteCatalogPublicationAuthority();
     try std.testing.expect(!cfg.catalog_publication_authority_available);

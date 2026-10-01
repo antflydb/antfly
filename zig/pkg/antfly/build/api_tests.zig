@@ -1202,7 +1202,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "distributed graph source read rejects topology change before aggregation",
             "hosted cross-range graph query expands explicit local start keys",
             "provisioned reads reject a group removed from the table topology",
-            "provisioned table read source falls back from read_index to stale on not leader",
+            "provisioned table read source rejects uncertified point reads and permits explicit stale reads",
             "catalog backed router skips non-serving relocation placements",
             "resolve group routes uses one router-owned snapshot callback for fanout",
             "system catalog parallel hosted candidate fanout sends only owned keys",
