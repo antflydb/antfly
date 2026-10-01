@@ -572,13 +572,21 @@ pub const ProvisionedKernelOwnerSource = struct {
         }
     }
 
-    fn stopApplyControl(self: *ProvisionedKernelOwnerSource) void {
+    /// Publish the control worker's stop without joining it. A deployment
+    /// sharing one cooperative scheduler must wake all owners before driving
+    /// their tasks to completion and reclaiming the sources.
+    pub fn beginApplyControlShutdown(self: *ProvisionedKernelOwnerSource) void {
         lock(&self.mutex);
         self.apply_control_stopping = true;
         self.apply_control_started.store(false, .release);
         const io = self.apply_control_io;
         if (io) |control_io| self.apply_control_wake.set(control_io);
         self.mutex.unlock();
+    }
+
+    fn stopApplyControl(self: *ProvisionedKernelOwnerSource) void {
+        self.beginApplyControlShutdown();
+        const io = self.apply_control_io;
         if (self.apply_control_future) |*future| future.await(io.?);
         self.apply_control_future = null;
         // Keep the borrowed Io value stable until source destruction: an
