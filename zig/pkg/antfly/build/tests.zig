@@ -2113,7 +2113,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, raft_storage_test_mod, true, true);
     const raft_storage_tests = b.addTest(.{
         .root_module = raft_storage_test_mod,
-        .filters = selectTestFilters(b, &.{}),
+        // Snapshot transport reaches the physical DB. Keep this suite scoped
+        // to its owners instead of collecting every transitive engine test.
+        .filters = selectTestFilters(b, &.{
+            "raft snapshot storage tests are reachable",
+            "file snapshot",
+            "native Raft snapshot",
+        }),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,

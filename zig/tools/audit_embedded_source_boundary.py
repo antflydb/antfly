@@ -249,9 +249,10 @@ def audit_modules(project: Path, modules: dict[str, Path], edges: dict[tuple[str
         # Antfly-generated sources merely because their cache is external.
         if module in external_modules and not path.is_relative_to(project):
             # A dependency may be configured with Antfly-owned named imports.
-            # Preserve those ownership edges even while excluding its sources.
+            # Preserve its ownership graph even while excluding its sources,
+            # including re-entry through another dependency-owned module.
             for (owner, _), target in edges.items():
-                if owner == module and (target not in external_modules or modules[target].resolve().is_relative_to(project)):
+                if owner == module:
                     pending.append((target, modules[target].resolve(), chain + [str(path)]))
             continue
         if not path.is_file():

@@ -158,6 +158,13 @@ fn lazy() void { _ = @import("local.zig"); }
             # Explicit dependencies cannot hide a declared Antfly import.
             with self.assertRaisesRegex(ValueError, "server coordination"):
                 audit_modules(project, modules, edges, "entry", external_modules={"generated"})
+            modules["dependency"] = cache / "dependency.zig"
+            indirect = {("entry", "generated"): "generated",
+                        ("generated", "dependency"): "dependency",
+                        ("dependency", "server"): "server"}
+            with self.assertRaisesRegex(ValueError, "server coordination"):
+                audit_modules(project, modules, indirect, "entry",
+                              external_modules={"generated", "dependency"})
 
     def test_target_struct_branch_preserves_local_imports(self):
         source = ('const backend = if (@import("builtin").os.tag == .freestanding) '
