@@ -15,7 +15,7 @@
 //! Production API surface shared by runtime entry points.
 //!
 //! Keep test harnesses and whole-module compile assertions in `mod.zig`; a
-//! production runtime importing this facade must not pull `e2e.zig` or another
+//! production runtime importing this facade must not pull `integration_test.zig` or another
 //! command runtime into its potential dependency graph.
 
 pub const cluster = @import("cluster.zig");

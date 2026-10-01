@@ -1297,7 +1297,7 @@ pub fn build(b: *std.Build) void {
     const gliner2_e2e_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-gliner2-e2e-bench",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bench/gliner2_e2e.zig"),
+            .root_source_file = b.path("src/bench/gliner2_bench.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -1356,7 +1356,7 @@ pub fn build(b: *std.Build) void {
     const clipclap_e2e_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-clipclap-e2e-bench",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bench/clipclap_e2e.zig"),
+            .root_source_file = b.path("src/bench/clipclap_bench.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -1396,7 +1396,7 @@ pub fn build(b: *std.Build) void {
     const qwen3_embedding_e2e_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-qwen3-embedding-e2e-bench",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bench/qwen3_embedding_e2e.zig"),
+            .root_source_file = b.path("src/bench/qwen3_embedding_bench.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -1426,7 +1426,7 @@ pub fn build(b: *std.Build) void {
     const nomic_e2e_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-nomic-e2e-bench",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bench/nomic_e2e.zig"),
+            .root_source_file = b.path("src/bench/nomic_bench.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -1456,7 +1456,7 @@ pub fn build(b: *std.Build) void {
     const reranker_e2e_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-reranker-e2e-bench",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bench/reranker_e2e.zig"),
+            .root_source_file = b.path("src/bench/reranker_bench.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -1724,7 +1724,7 @@ pub fn build(b: *std.Build) void {
     const audio_xiph_corpora_e2e = b.addExecutable(.{
         .name = "audio_xiph_corpora_e2e",
         .root_module = b.createModule(.{
-            .root_source_file = b.path(b.fmt("{s}/lib/audio/audio_xiph_corpora_e2e.zig", .{shared_lib_root})),
+            .root_source_file = b.path(b.fmt("{s}/lib/audio/audio_xiph_corpora_runner.zig", .{shared_lib_root})),
             .target = target,
             .optimize = .ReleaseFast,
         }),
@@ -1749,7 +1749,7 @@ pub fn build(b: *std.Build) void {
     const audio_misc_corpora_e2e = b.addExecutable(.{
         .name = "audio_misc_corpora_e2e",
         .root_module = b.createModule(.{
-            .root_source_file = b.path(b.fmt("{s}/lib/audio/audio_misc_corpora_e2e.zig", .{shared_lib_root})),
+            .root_source_file = b.path(b.fmt("{s}/lib/audio/audio_misc_corpora_runner.zig", .{shared_lib_root})),
             .target = target,
             .optimize = .ReleaseFast,
         }),

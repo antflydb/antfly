@@ -149,7 +149,15 @@ pub fn importPortableIntoLiteDb(
     defer deleteFileIfExists(io, tmp_lock_path) catch {};
     errdefer deleteFileIfExists(io, tmp_path) catch {};
 
+    var workspace = try lite_backend.native_docstore.?.reserveGenerationWorkspace();
+    defer {
+        // Close the prepared owner (later defers) and remove failed staging
+        // bytes before making their reservation available to live appends.
+        deleteFileIfExists(io, tmp_path) catch {};
+        workspace.deinit();
+    }
     var prepared = try LiteDb.createWithOptions(allocator, tmp_path, true, .{
+        .reclamation = workspace.options,
         .fsync = !lite_backend.native_docstore.?.file.no_sync,
         .writer_lock_marker = portable_generation_lease_magic,
     });
@@ -941,6 +949,48 @@ test "lite portable generation scavenging reaps stale data and lease-only crashe
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, stale_lock, .{}));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, lease_only_lock, .{}));
     try std.Io.Dir.cwd().access(io, active_lock, .{});
+}
+
+test "lite portable restore enforces staging budget and preserves target" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/budget-source.aflite", .{tmp.sub_path});
+    defer a.free(source_path);
+    const target_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/budget-target.aflite", .{tmp.sub_path});
+    defer a.free(target_path);
+    var portable = std.ArrayList(u8).empty;
+    defer portable.deinit(a);
+    {
+        var source = try LiteDb.createWithOptions(a, source_path, true, .{ .fsync = false });
+        defer source.close();
+        const value = try a.alloc(u8, 1200 * 1024);
+        defer a.free(value);
+        @memset(value, 'x');
+        @memcpy(value[0..9], "{\"text\":\"");
+        @memcpy(value[value.len - 2 ..], "\"}");
+        // Populate primary data directly: this is an admission test, so
+        // constructing a full-text index for the large token adds no coverage.
+        const key = try internal_keys.documentKeyAlloc(a, "large");
+        defer a.free(key);
+        try source.db.core.store.put(key, value);
+        try portable_backup.exportPortable(a, source.db.core.store, &portable);
+        try std.testing.expect(portable.items.len > 1024 * 1024);
+    }
+    var target = try LiteDb.createWithOptions(a, target_path, true, .{ .fsync = false, .reclamation = .{ .max_storage_bytes = 256 * 4096 } });
+    defer target.close();
+    const owner = target.backend.native_docstore.?;
+    const before_handle = owner.file.file.handle;
+    try std.testing.expectError(error.LiteStorageBudgetExceeded, importPortableIntoLiteDb(a, &target.db, &target.backend, portable.items));
+    try std.testing.expect(try isImportTargetEmpty(a, &target.db));
+    const status = try owner.reclamationStatus();
+    // Idle retirement can publish concurrently; adoption must retain the
+    // target inode and its empty logical contents on definite rejection.
+    try std.testing.expectEqual(before_handle, owner.file.file.handle);
+    try std.testing.expect(status.current_file_bytes <= 256 * 4096);
+    try std.testing.expectEqual(@as(u64, 0), status.temporary_bytes);
+    try std.testing.expect(!owner.generation_workspace_active);
+    try std.testing.expect((try owner.checkWithCancel(null)).valid);
 }
 
 test "lite portable publication never reports a retryable failure after adoption" {

@@ -7,7 +7,7 @@ test {
     _ = @import("finetune/test/test_layoutlmv3_finetune.zig");
     _ = @import("finetune/test/test_colqwen2_finetune.zig");
     _ = @import("finetune/test/test_gliner2_data.zig");
-    _ = @import("finetune/test/test_gliner2_e2e.zig");
+    _ = @import("finetune/test/gliner2_integration_test.zig");
     _ = @import("finetune/test/test_gliner2_backend_grad_parity.zig");
     _ = @import("finetune/test/test_gliner2_real_training.zig");
     _ = @import("finetune/test/test_gliner2_run_validation.zig");

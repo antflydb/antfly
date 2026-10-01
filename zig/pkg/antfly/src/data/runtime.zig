@@ -30660,10 +30660,11 @@ pub fn runFromIterator(
     try fs_paths.createDirPathPortable(setup_io.io(), resolved.snapshot_root_dir);
     try fs_paths.createDirPathPortable(setup_io.io(), resolved.auth_store_root_dir);
 
-    var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
+    var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.initWithOptions(
         alloc,
         setup_io.io(),
         if (loaded_config) |*cfg| cfg else null,
+        .{ .secret_store = if (secret_store_initialized) &secret_store else null },
     );
     defer active_audio_runtime.deinit();
 

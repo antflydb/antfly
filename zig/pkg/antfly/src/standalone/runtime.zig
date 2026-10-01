@@ -4773,10 +4773,11 @@ pub fn runFromIterator(
     if (comptime control_only_storage_sources)
         try storage_kernel_context.attachInferenceProvider(antfly_node);
 
-    var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
+    var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.initWithOptions(
         alloc,
         setup_io.io(),
         if (loaded_config) |*cfg| cfg else null,
+        .{ .secret_store = &secret_store },
     );
     defer active_audio_runtime.deinit();
 
