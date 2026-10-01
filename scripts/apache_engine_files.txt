@@ -43,6 +43,7 @@ zig/pkg/antfly/build/benches.zig
 zig/pkg/antfly/build/data_tests.zig
 zig/pkg/antfly/build/db_tests.zig
 zig/pkg/antfly/build/embedded.zig
+zig/pkg/antfly/build/embedded_boundary.zig
 zig/pkg/antfly/build/imports.zig
 zig/pkg/antfly/build/linked_tests.zig
 zig/pkg/antfly/build/metadata_tests.zig
@@ -103,11 +104,13 @@ zig/pkg/antfly/src/api/table_read_source.zig
 zig/pkg/antfly/src/api/table_write_source.zig
 zig/pkg/antfly/src/asset_producer_runtime.zig
 zig/pkg/antfly/src/capi/db.zig
+zig/pkg/antfly/src/capi/handles.zig
 zig/pkg/antfly/src/capi/inference.zig
 zig/pkg/antfly/src/capi/link_anchor.zig
 zig/pkg/antfly/src/capi/search_wire.zig
 zig/pkg/antfly/src/capi/sql.zig
 zig/pkg/antfly/src/capi/types.zig
+zig/pkg/antfly/src/capi_embedded_root.zig
 zig/pkg/antfly/src/chunking/chunk.zig
 zig/pkg/antfly/src/chunking/fixed.zig
 zig/pkg/antfly/src/chunking/inference.zig
@@ -130,6 +133,7 @@ zig/pkg/antfly/src/common/http/peer_disconnect_observer.zig
 zig/pkg/antfly/src/common/http/std_http_executor.zig
 zig/pkg/antfly/src/common/http/std_http_listener.zig
 zig/pkg/antfly/src/common/index_repair_status.zig
+zig/pkg/antfly/src/common/local_paths.zig
 zig/pkg/antfly/src/common/maintenance_scheduler.zig
 zig/pkg/antfly/src/common/migration_files.zig
 zig/pkg/antfly/src/common/owned_json.zig
@@ -197,8 +201,6 @@ zig/pkg/antfly/src/inference/mod.zig
 zig/pkg/antfly/src/inference_connection_abi.zig
 zig/pkg/antfly/src/inference_runtime/runtime.zig
 zig/pkg/antfly/src/introducer.zig
-zig/pkg/antfly/src/lite_capi_dependencies.zig
-zig/pkg/antfly/src/lite_capi_root.zig
 zig/pkg/antfly/src/lite_cli_root.zig
 zig/pkg/antfly/src/lite_main.zig
 zig/pkg/antfly/src/merger.zig
@@ -221,8 +223,7 @@ zig/pkg/antfly/src/metadata/restore_provisioning_contract.zig
 zig/pkg/antfly/src/metadata/schema_migration_finalization.zig
 zig/pkg/antfly/src/metadata/store_root_enrollment.zig
 zig/pkg/antfly/src/metadata/topology_protocol.zig
-zig/pkg/antfly/src/raft/feature_reads.zig
-zig/pkg/antfly/src/raft/read_gate.zig
+zig/pkg/antfly/src/public_capi_root.zig
 zig/pkg/antfly/src/raft/storage/catalog.zig
 zig/pkg/antfly/src/runtime_bridge.zig
 zig/pkg/antfly/src/runtime_callback_abi.zig
@@ -269,6 +270,7 @@ zig/pkg/antfly/src/section/typed_doc_values.zig
 zig/pkg/antfly/src/segment.zig
 zig/pkg/antfly/src/serverless/remote_uri.zig
 zig/pkg/antfly/src/source_owner_common.zig
+zig/pkg/antfly/src/source_owner_embedded_db.zig
 zig/pkg/antfly/src/source_owner_lite.zig
 zig/pkg/antfly/src/source_owner_storage.zig
 zig/pkg/antfly/src/sparse/sparse.zig
@@ -306,7 +308,6 @@ zig/pkg/antfly/src/sql/subquery_lowering.zig
 zig/pkg/antfly/src/sql/window_binding.zig
 zig/pkg/antfly/src/sql/window_names.zig
 zig/pkg/antfly/src/sql/window_runtime.zig
-zig/pkg/antfly/src/standalone/inference_provider.zig
 zig/pkg/antfly/src/storage/admission_waiter.zig
 zig/pkg/antfly/src/storage/artifact_footprint.zig
 zig/pkg/antfly/src/storage/artifact_input_capture.zig
@@ -503,7 +504,6 @@ zig/pkg/antfly/src/storage/db/mod.zig
 zig/pkg/antfly/src/storage/db/native_backup.zig
 zig/pkg/antfly/src/storage/db/native_backup_seal.zig
 zig/pkg/antfly/src/storage/db/native_backup_seal_contract.zig
-zig/pkg/antfly/src/storage/db/native_raft_snapshot.zig
 zig/pkg/antfly/src/storage/db/native_topology_receipt.zig
 zig/pkg/antfly/src/storage/db/online_graph_artifacts.zig
 zig/pkg/antfly/src/storage/db/online_integrity_shadow.zig
@@ -577,6 +577,7 @@ zig/pkg/antfly/src/storage/db/relational_row_transform.zig
 zig/pkg/antfly/src/storage/db/relational_rows.zig
 zig/pkg/antfly/src/storage/db/relational_store.zig
 zig/pkg/antfly/src/storage/db/relational_transition_contract.zig
+zig/pkg/antfly/src/storage/db/replicated_mutation.zig
 zig/pkg/antfly/src/storage/db/replication_contract.zig
 zig/pkg/antfly/src/storage/db/replication_effects.zig
 zig/pkg/antfly/src/storage/db/replication_ingress.zig
@@ -645,6 +646,7 @@ zig/pkg/antfly/src/storage/hot_standby/standby.zig
 zig/pkg/antfly/src/storage/hot_standby/sync_wait.zig
 zig/pkg/antfly/src/storage/hot_standby/validation.zig
 zig/pkg/antfly/src/storage/hot_standby/write_gate.zig
+zig/pkg/antfly/src/storage/inference_provider.zig
 zig/pkg/antfly/src/storage/internal_keys.zig
 zig/pkg/antfly/src/storage/kernel_owner_abi.zig
 zig/pkg/antfly/src/storage/kernel_runtime_services.zig
@@ -660,6 +662,7 @@ zig/pkg/antfly/src/storage/lite/index_storage.zig
 zig/pkg/antfly/src/storage/lite/mod.zig
 zig/pkg/antfly/src/storage/lite/native.zig
 zig/pkg/antfly/src/storage/lite/paths.zig
+zig/pkg/antfly/src/storage/lite/portable_restore.zig
 zig/pkg/antfly/src/storage/lite/restore_staging.zig
 zig/pkg/antfly/src/storage/lite/secret_store.zig
 zig/pkg/antfly/src/storage/lite/test_allocator.zig
@@ -724,6 +727,7 @@ zig/pkg/antfly/src/storage/projection_page_cache.zig
 zig/pkg/antfly/src/storage/projection_read_trace.zig
 zig/pkg/antfly/src/storage/projection_seal.zig
 zig/pkg/antfly/src/storage/range_protection.zig
+zig/pkg/antfly/src/storage/read_consistency.zig
 zig/pkg/antfly/src/storage/relational_index.zig
 zig/pkg/antfly/src/storage/relational_read_provider.zig
 zig/pkg/antfly/src/storage/relational_read_view.zig
@@ -775,8 +779,6 @@ zig/pkg/antfly/src/template.zig
 zig/pkg/antfly/src/template_remote.zig
 zig/pkg/antfly/src/test_error_logs.zig
 zig/pkg/antfly/src/tracing/antfly_trace_writer.zig
-zig/pkg/antfly/src/tracing/mod.zig
-zig/pkg/antfly/src/tracing/raft_trace_logger.zig
 zig/pkg/antfly/src/tracing/stderr_writer.zig
 zig/pkg/antfly/src/tracing/trace_file.zig
 zig/pkg/antfly/src/usermgr/mod.zig

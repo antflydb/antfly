@@ -13,6 +13,8 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const server_test_adapter = if (builtin.is_test) @import("../server_db_adapter.zig") else struct {};
+const builtin = @import("builtin");
 const replication_ingress = @import("replication_ingress.zig");
 const std = @import("std");
 const db_mod = @import("mod.zig");
@@ -37,7 +39,7 @@ test "relational index system merge tail streams REF5 oversized row with bounded
     try db.setSchemaJson(alloc, "{}");
     // A real first primary apply persists the physical namespace before the
     // separate retention admission. The bootstrap predates the retained cut.
-    try db.batchRaftReplicatedApply(.{ .timestamp_ns = 1, .writes = &.{.{ .key = "bootstrap", .value = "{}" }} }, .{ .term = 1, .index = 1 });
+    try server_test_adapter.applyOrdered(&db, .{ .timestamp_ns = 1, .writes = &.{.{ .key = "bootstrap", .value = "{}" }} }, .{ .term = 1, .index = 1 });
     const identity = try db.relationalTopologyIdentity();
     const scope: @import("online_source_contract.zig").Scope = .{
         .consumer_epoch = 1,
@@ -105,7 +107,7 @@ fn seal(input: types.BatchRequest) types.BatchRequest {
 }
 
 fn apply(db: *db_mod.DB, index: *u64, request: types.BatchRequest) !void {
-    try db.batchRaftReplicatedApply(request, .{ .term = 1, .index = index.* + 1 });
+    try server_test_adapter.applyOrdered(&db, request, .{ .term = 1, .index = index.* + 1 });
     index.* += 1;
 }
 
@@ -505,8 +507,8 @@ test "relational index system merge tail sessions decode bounded immutable fragm
         try std.testing.expect(!std.mem.eql(u8, &scope.pin(), &wrong_attempt.pin()));
         wrong_attempt.copy_attempt = .{ .donor_term = 1, .sequence = 0 };
         try std.testing.expectError(error.InvalidOnlineSourceCommand, wrong_attempt.validate());
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 });
-        try db.batchRaftReplicatedApply(.{ .timestamp_ns = 111, .writes = &.{ .{ .key = "a", .value = "{\"id\":1}" }, .{ .key = "b", .value = "{\"id\":2}" } }, .deletes = &.{"c"} }, .{ .term = 1, .index = 2 });
+        try server_test_adapter.applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 });
+        try server_test_adapter.applyOrdered(&db, .{ .timestamp_ns = 111, .writes = &.{ .{ .key = "a", .value = "{\"id\":1}" }, .{ .key = "b", .value = "{\"id\":2}" } }, .deletes = &.{"c"} }, .{ .term = 1, .index = 2 });
         var session = (try db.beginMergeTailRead(scope, 0)).?;
         defer session.deinit();
         const frame_digest = session.frameDigest();
@@ -524,7 +526,7 @@ test "relational index system merge tail sessions decode bounded immutable fragm
         try std.testing.expectEqual(@as(u64, 111), first.timestamps[0]);
         try std.testing.expect(!first.frame_complete);
         // Mutating the source after opening does not affect the pinned frame.
-        try db.batchRaftReplicatedApply(.{ .timestamp_ns = 222, .writes = &.{.{ .key = "b", .value = "{\"id\":3}" }} }, .{ .term = 1, .index = 3 });
+        try server_test_adapter.applyOrdered(&db, .{ .timestamp_ns = 222, .writes = &.{.{ .key = "b", .value = "{\"id\":3}" }} }, .{ .term = 1, .index = 3 });
         var second = (try session.next(alloc, 1, 1024, .none)).?;
         defer second.deinit();
         try std.testing.expectEqualStrings("b", second.writes[0].key);

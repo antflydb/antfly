@@ -54,7 +54,7 @@ test "native topology receipts survive restart and exact standby replay without 
     const identity = try primary.relationalTopologyIdentity();
     const fence: topology.Fence = .{ .namespace = ns, .role = .rewrite_source, .owner_group_id = 12, .peer_group_id = 14, .transition_id = 15, .attempt = 1, .admission_epoch = identity.next_epoch, .catalog_digest = identity.catalog_digest };
     const begin: @import("../db/types.zig").BatchRequest = .{ .relational_topology = .{ .fence = fence, .action = .begin } };
-    try std.testing.expectError(error.OnlineSourceScopeChanged, primary.batchRaftReplicatedApply(begin, .{ .term = 1, .index = 1 }));
+    try std.testing.expectError(error.OnlineSourceScopeChanged, @import("../server_db_adapter.zig").applyOrdered(&primary, begin, .{ .term = 1, .index = 1 }));
     try primary.batch(begin);
     try primary.batch(begin); // Lost acknowledgement, identical position.
     {

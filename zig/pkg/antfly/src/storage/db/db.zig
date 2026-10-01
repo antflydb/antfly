@@ -13,7 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const replication_ingress = @import("replication_ingress.zig");
+const server_test_adapter = if (builtin.is_test) @import("../server_db_adapter.zig") else struct {};
+const replicated_mutation = @import("replicated_mutation.zig");
 const std = @import("std");
 const GraphTtlSha256 = @import("antfly_hash").Sha256;
 const replication_contract = @import("replication_contract.zig");
@@ -5753,7 +5754,7 @@ pub const DB = struct {
     /// records are mutation-scoped; the three singleton keys remain readable
     /// only for rolling-upgrade recovery. A changed/missing mirror cannot
     /// silently discard a durability obligation.
-    fn flushDurableReplicationOutboxes(self: *DB) !void {
+    pub fn flushDurableReplicationOutboxes(self: *DB) !void {
         if (self.async_context.primary_replication_outbox_pending.load(.acquire)) self.durable_replication_outbox_maybe.store(true, .release);
         if (!self.durable_replication_outbox_maybe.load(.acquire)) return;
         const io = self.backend_runtime.io() orelse std.Options.debug_io;
@@ -9604,68 +9605,24 @@ pub const DB = struct {
     /// Applies one exact data-Raft log entry and persists its identity in the
     /// same primary-store batch. Replaying the entry after a crash becomes an
     /// allocation-light no-op before transforms or derived work execute.
-    fn requiresDurableLifecycleReplication(req: types.BatchRequest) bool {
-        return req.artifact_catalog != null or req.online_source != null or req.restore_staging != null or req.restore_staging_scope != null or
-            req.relational_topology != null or req.relational_generation_gc != null or req.split_transition != null or
-            req.split_checkpoint != null or req.split_replication != null or
-            req.merge_checkpoint != null or req.merge_replication != null or req.merge_proof_adoption != null;
-    }
-
-    pub fn batchRaftReplicatedApply(
-        self: *DB,
-        req: types.BatchRequest,
-        identity: RaftAppliedEntryIdentity,
-    ) anyerror!void {
-        const mirror_scoped_restore = requiresDurableLifecycleReplication(req) and self.replication_async_batch_mirror != null;
-        // HA is process-local and includes this node's Raft follower roots.
-        // Recover the local committed obligation before a Raft receipt can
-        // short-circuit replay after a crash between store and HA publication.
-        if (mirror_scoped_restore) try self.flushDurableReplicationOutboxes();
-        // Most restart replays should avoid executor health checks, resource
-        // admission, transform expansion, and derived-payload construction.
-        // batchInternal repeats this check under the mutation lock, which is
-        // the correctness fence if another caller advances the marker here.
-        if (try self.raftEntryAlreadyApplied(identity)) {
-            // Admission commits its write fence before sealing the immutable
-            // pin. A crash in that window must repair the exact pending cut
-            // before this outer replay fast path acknowledges the entry.
-            if (req.online_source) |command| if (command == .admit) {
-                if (comptime builtin.os.tag == .freestanding) {
-                    return error.UnsupportedPlatform;
-                } else {
-                    try self.applyOnlineSourceBatch(req, .{
-                        .validate_range_ownership = false,
-                        .wait_for_sync_level = false,
-                        .bypass_replication_write_gate = !mirror_scoped_restore,
-                        .raft_applied_entry_marker = identity,
-                    });
-                }
-            };
-            if (req.restore_staging) |command| if (command == .finish and
-                (command.finish.phase == .validated or command.finish.phase == .published))
-            {
-                const current = try readRaftAppliedEntry(self.alloc, self.core.store);
-                if (current != null and current.?.index == identity.index and current.?.term == identity.term)
-                    try self.prepareAppliedRestoreFinishReplay(req);
-            };
-            return;
-        }
-        var apply_req = req;
-        apply_req.sync_level = .write;
-        if (req.artifact_catalog) |command| if (req.online_source != null or req.merge_checkpoint != null) {
-            try @import("artifact_inventory.zig").validateRequest(req);
-            const context = try self.preflightArtifactAdmission(req, identity);
-            if (!try self.reconcileOrderedArtifactCatalogWithContext(command, identity.index, context)) return error.ArtifactCatalogDrift;
-        };
-        self.batchInternal(apply_req, null, .{
+    /// Execute a committed ordered mutation. The receipt and primary effects
+    /// share a store transaction; server replay policy is supplied by the caller.
+    pub fn applyOrderedCommittedMutation(self: *DB, request: types.BatchRequest, identity: RaftAppliedEntryIdentity, bypass_write_gate: bool) anyerror!void {
+        try self.batchInternal(request, null, .{
             .validate_range_ownership = false,
             .wait_for_sync_level = false,
-            .bypass_replication_write_gate = !mirror_scoped_restore,
+            .bypass_replication_write_gate = bypass_write_gate,
             .raft_applied_entry_marker = identity,
-        }) catch |err| switch (err) {
-            error.GraphMaintenanceInProgress => return error.RaftApplyWriterUnavailable,
-            else => return err,
-        };
+        });
+    }
+
+    pub fn recoverOrderedSourceAdmission(self: *DB, request: types.BatchRequest, identity: RaftAppliedEntryIdentity, bypass_write_gate: bool) !void {
+        try self.applyOnlineSourceBatch(request, .{
+            .validate_range_ownership = false,
+            .wait_for_sync_level = false,
+            .bypass_replication_write_gate = bypass_write_gate,
+            .raft_applied_entry_marker = identity,
+        });
     }
 
     /// A hidden initial child in native standalone has no data-Raft log. The
@@ -9795,7 +9752,7 @@ pub const DB = struct {
     /// without sending an empty source command through document/index work.
     /// The range and entry receipt share a batch so restart replay cannot
     /// narrow a range again after a later merge has expanded it.
-    fn applyRaftSplitFinalization(
+    fn applyRangeFinalization(
         self: *DB,
         transition: types.SplitTransitionMutation,
         identity: ?RaftAppliedEntryIdentity,
@@ -9888,7 +9845,7 @@ pub const DB = struct {
 
     /// Called only under the Raft owner's completion fence. Protocol-only
     /// entries may advance that fence without changing the native marker.
-    pub fn captureNativeRaftSnapshot(self: *DB, group_id: u64, through_index: u64) !@import("native_raft_snapshot.zig").Capture {
+    pub fn pinTransferablePrimarySnapshot(self: *DB) !TransferablePrimarySnapshot {
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         var namespace: [24]u8 = undefined;
@@ -9900,29 +9857,30 @@ pub const DB = struct {
             try @import("online_source.zig").requireTransferableSnapshots(&read, namespace);
         }
         const marker = try readRaftAppliedEntry(self.alloc, self.core.store);
-        if (group_id == 0 or (marker != null and marker.?.index > through_index)) return error.InvalidSnapshot;
         var primary = try self.core.pinNativeSnapshot();
         errdefer primary.deinit();
         switch (primary) {
             .logical => return error.UnsupportedSnapshotFormat,
             .lsm => |checkpoint| if (!checkpoint.storage.supportsHostPathGenerationPublication()) return error.UnsupportedSnapshotFormat,
         }
-        return .{ .alloc = self.alloc, .io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable, .identity = .{
-            .group_id = group_id,
-            .namespace = namespace,
-            .through_index = through_index,
-            .native_term = if (marker) |value| value.term else 0,
-            .native_index = if (marker) |value| value.index else 0,
-        }, .primary = primary };
+        return .{ .alloc = self.alloc, .io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable, .namespace = namespace, .receipt = marker, .primary = primary };
     }
 
-    pub fn verifyNativeRaftSnapshot(self: *DB, expected: @import("native_raft_snapshot.zig").Identity) !void {
-        var namespace: [24]u8 = undefined;
-        doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
-        if (!std.mem.eql(u8, &namespace, &expected.namespace)) return error.InvalidSnapshot;
+    pub const TransferablePrimarySnapshot = struct {
+        alloc: Allocator,
+        io: std.Io,
+        namespace: [24]u8,
+        receipt: ?RaftAppliedEntryIdentity,
+        primary: db_core.PinnedStoreSnapshot,
+    };
+
+    pub fn verifyTransferablePrimarySnapshot(self: *DB, namespace: [24]u8, receipt: ?RaftAppliedEntryIdentity) !void {
+        var actual_namespace: [24]u8 = undefined;
+        doc_identity.encodeNamespace(&actual_namespace, self.core.identity_namespace);
+        if (!std.mem.eql(u8, &actual_namespace, &namespace)) return error.InvalidSnapshot;
         const marker = try self.raftAppliedEntry();
-        if ((if (marker) |value| value.index else 0) != expected.native_index or
-            (if (marker) |value| value.term else 0) != expected.native_term) return error.InvalidSnapshot;
+        if ((if (marker) |value| value.index else 0) != (if (receipt) |value| value.index else 0) or
+            (if (marker) |value| value.term else 0) != (if (receipt) |value| value.term else 0)) return error.InvalidSnapshot;
         var read = try self.core.store.beginProbeTxn();
         defer read.abort();
         try @import("../source_pin_state.zig").requireNoPrepared(&read, namespace);
@@ -10575,38 +10533,32 @@ pub const DB = struct {
 
     /// Apply an already decoded committed batch. The mutation and its replay
     /// receipt remain in the same primary-store transaction.
-    pub fn applyReplicatedBatch(self: *DB, mutation: replication_effects_mod.BatchMutationPayload, sequence: u64) !void {
-        if (mutation.native_topology_position) |stamp| {
-            try self.batchInternal(mutation.request, null, .{
-                .validate_range_ownership = false,
-                .wait_for_sync_level = false,
-                .bypass_replication_write_gate = true,
-                .native_topology_position = stamp,
-                .replication_applied_lsn_marker = sequence,
-            });
-        } else if (mutation.ordinary_raft_entry orelse mutation.artifact_publication_raft_entry orelse mutation.artifact_publication_transport_raft_entry orelse mutation.merge_proof_adoption_raft_entry orelse mutation.artifact_catalog_raft_entry orelse mutation.initial_child_raft_entry orelse mutation.graph_retirement_raft_entry orelse mutation.restore_generation_admission_raft_entry) |entry| {
-            if (mutation.request.artifact_catalog) |command| if (mutation.request.online_source != null or mutation.request.merge_checkpoint != null) {
-                const context = try self.preflightArtifactAdmission(mutation.request, entry);
-                if (!try self.reconcileOrderedArtifactCatalogWithContext(command, entry.index, context)) return error.ArtifactCatalogDrift;
-            };
-            try self.batchInternal(mutation.request, null, .{
-                .validate_range_ownership = false,
-                .wait_for_sync_level = false,
-                .bypass_replication_write_gate = true,
-                .raft_applied_entry_marker = entry,
-                .replication_applied_lsn_marker = sequence,
-            });
-        } else if (mutation.request.online_source != null) {
-            var source_req = mutation.request;
-            source_req.sync_level = .write;
-            try self.batchInternal(source_req, null, .{
-                .validate_range_ownership = false,
-                .wait_for_sync_level = false,
-                .bypass_replication_write_gate = true,
-                .replication_applied_lsn_marker = sequence,
-                .online_source_applied_index = mutation.online_source_applied_index orelse return error.InvalidOnlineSourceCommand,
-            });
-        } else try self.batchReplicatedApplyWithMarker(mutation.request, sequence);
+    pub fn applyReplicatedBatch(self: *DB, mutation: replicated_mutation.Batch, sequence: u64) !void {
+        var request = mutation.request;
+        var options: BatchExecutionOptions = .{
+            .validate_range_ownership = false,
+            .wait_for_sync_level = false,
+            .bypass_replication_write_gate = true,
+            .replication_applied_lsn_marker = sequence,
+        };
+        switch (mutation.receipt) {
+            .native => |position| options.native_topology_position = position,
+            .ordered => |entry| options.raft_applied_entry_marker = entry,
+            .online_source => |index| {
+                request.sync_level = .write;
+                options.online_source_applied_index = index;
+            },
+            .none => request.sync_level = .write,
+        }
+        try self.batchInternal(request, null, options);
+    }
+
+    /// Reconcile an ordered source inventory before applying its mutation.
+    /// The store owns the admission fence; callers supply an exact receipt.
+    pub fn reconcileReplicatedArtifactAdmission(self: *DB, request: types.BatchRequest, entry: RaftAppliedEntryIdentity) !void {
+        const command = request.artifact_catalog orelse return;
+        const context = try self.preflightArtifactAdmission(request, entry);
+        if (!try self.reconcileOrderedArtifactCatalogWithContext(command, entry.index, context)) return error.ArtifactCatalogDrift;
     }
 
     pub fn applyReplicatedSchema(self: *DB, mutation: replication_effects_mod.SchemaMutation, sequence: u64) !void {
@@ -11519,7 +11471,7 @@ pub const DB = struct {
         // walking and encoding every document in a large request.
         var preencoded_replication_batch_payload: ?[]u8 = null;
         defer if (preencoded_replication_batch_payload) |payload| preparation_alloc.free(payload);
-        const scoped_restore_ha = opts.restore_staging != null or requiresDurableLifecycleReplication(effective_req);
+        const scoped_restore_ha = opts.restore_staging != null or replication_contract.requiresDurableLifecycleReplication(effective_req);
         if (!opts.bypass_replication_write_gate) if (self.replication_async_batch_mirror) |mirror| {
             preencoded_replication_batch_payload = (if (req.artifact_catalog != null)
                 replication_effects_mod.encodeArtifactCatalogMutationRequestAlloc(preparation_alloc, req, opts.raft_applied_entry_marker orelse return error.InvalidArtifactCatalogCommand)
@@ -26884,10 +26836,11 @@ pub const DB = struct {
     /// An NRSP primary is already verified and complete. Reconstruct only
     /// derived projections in its unpublished generation; never run optional
     /// transaction recovery or advance the replicated mutation watermark.
-    pub fn repairNativeRaftSnapshot(
+    pub fn repairReplicaPrimarySnapshot(
         alloc: Allocator,
         staged: *const generation_lifecycle.StagedGeneration,
-        identity: @import("native_raft_snapshot.zig").Identity,
+        namespace: [24]u8,
+        receipt: ?RaftAppliedEntryIdentity,
         root_generation: u64,
     ) !void {
         try staged.validatePath(staged.path());
@@ -26898,9 +26851,9 @@ pub const DB = struct {
             .start_index_workers = false,
             .lsm_root_generation = root_generation,
             .identity_namespace = .{
-                .table_id = std.mem.readInt(u64, identity.namespace[0..8], .big),
-                .shard_id = std.mem.readInt(u64, identity.namespace[8..16], .big),
-                .range_id = std.mem.readInt(u64, identity.namespace[16..24], .big),
+                .table_id = std.mem.readInt(u64, namespace[0..8], .big),
+                .shard_id = std.mem.readInt(u64, namespace[8..16], .big),
+                .range_id = std.mem.readInt(u64, namespace[16..24], .big),
             },
         };
         try finishSnapshotRuntimeRepair(alloc, staged.path(), options);
@@ -26908,7 +26861,7 @@ pub const DB = struct {
         // owner's transient in-memory structures.
         var verify = try DB.open(alloc, staged.path(), options);
         defer verify.close();
-        try verify.verifyNativeRaftSnapshot(identity);
+        try verify.verifyTransferablePrimarySnapshot(namespace, receipt);
         if (verify.core.index_manager.hasLoadFailures() or verify.core.index_manager.hasRepairUnavailableIndexes()) return error.RestoreIndexLoadIncomplete;
         try verify.core.index_manager.syncAll(true);
         try verify.core.syncStore(true);
@@ -32093,7 +32046,7 @@ pub const DB = struct {
         if (req.relational_topology) |command| {
             try self.applyRelationalTopologyControlWithReplication(command, opts.raft_applied_entry_marker, opts.replication_applied_lsn_marker, payload, opts.native_fk_generation_entry, if (native_control) .{ .request = req, .replay = opts.native_topology_position, .mirror = mirror_control } else null);
         } else {
-            try self.applyRaftSplitFinalization(req.split_transition.?, opts.raft_applied_entry_marker, opts.replication_applied_lsn_marker, payload);
+            try self.applyRangeFinalization(req.split_transition.?, opts.raft_applied_entry_marker, opts.replication_applied_lsn_marker, payload);
         }
         if (mirror_control) try self.flushDurableReplicationOutboxes();
     }
@@ -81386,7 +81339,7 @@ test "graph ownership cleanup runs on borrowed VoprIo before replicated merge" {
             const initial_status = (try database.loadIndexStatusSnapshot(database.alloc, "g")) orelse return error.GraphStatusSnapshotMissing;
             try std.testing.expectEqual(@as(u64, 200 * std.time.ns_per_day), initial_status.updated_at_ns);
             try database.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "z", .target = "a", .edge_type = "link", .weight = 1 }}, .sync_level = .full_index });
-            try database.batchRaftReplicatedApply(.{ .split_transition = .{ .kind = .finalize, .transition_id = 1, .attempt_epoch = 1, .destination_group_id = 2, .split_key = "m" } }, .{ .term = 1, .index = 1 });
+            try server_test_adapter.applyOrdered(&database, .{ .split_transition = .{ .kind = .finalize, .transition_id = 1, .attempt_epoch = 1, .destination_group_id = 2, .split_key = "m" } }, .{ .term = 1, .index = 1 });
             const merge = types.BatchRequest{ .merge_checkpoint = .{
                 .kind = .accept,
                 .transition_id = 10,
@@ -81397,7 +81350,7 @@ test "graph ownership cleanup runs on borrowed VoprIo before replicated merge" {
                 .merged_start = "",
                 .merged_end = "",
             } };
-            try std.testing.expectError(error.RaftApplyWriterUnavailable, database.batchRaftReplicatedApply(merge, .{ .term = 1, .index = 2 }));
+            try std.testing.expectError(error.RaftApplyWriterUnavailable, server_test_adapter.applyOrdered(&database, merge, .{ .term = 1, .index = 2 }));
             try std.testing.expectEqual(@as(u64, 1), (try database.raftAppliedEntry()).?.index);
             database.startResidentBackgroundWorkersIfNeeded();
             if (database.artifact_repair_metadata_future == null) return error.GraphMaintenanceWorkerMissing;
@@ -81407,7 +81360,7 @@ test "graph ownership cleanup runs on borrowed VoprIo before replicated merge" {
                 try io.sleep(.fromMilliseconds(100), .awake);
             }
             if (graph.ownershipTransitionPending()) return error.GraphOwnershipCleanupTimedOut;
-            try database.batchRaftReplicatedApply(merge, .{ .term = 1, .index = 2 });
+            try server_test_adapter.applyOrdered(&database, merge, .{ .term = 1, .index = 2 });
             try std.testing.expectEqual(@as(u64, 2), (try database.raftAppliedEntry()).?.index);
             try std.testing.expectEqualStrings("", database.getRange().end);
             const retired = try database.getEdges(database.alloc, "g", "a", "link", .in);
@@ -113103,14 +113056,14 @@ test "storage.hot_standby db applies timeline switch as durable replication boun
     {
         var db = try DB.open(alloc, std.mem.span(db_path), .{ .start_index_workers = false });
         defer db.close();
-        try replication_ingress.applyRecord(&db, switch_record);
+        try @import("replication_ingress.zig").applyRecord(&db, switch_record);
         try std.testing.expectEqual(@as(u64, 7), try db.replicationAppliedSequence());
     }
 
     var reopened = try DB.open(alloc, std.mem.span(db_path), .{ .start_index_workers = false });
     defer reopened.close();
     try std.testing.expectEqual(@as(u64, 7), try reopened.replicationAppliedSequence());
-    try replication_ingress.applyRecord(&reopened, switch_record);
+    try @import("replication_ingress.zig").applyRecord(&reopened, switch_record);
     try std.testing.expectEqual(@as(u64, 7), try reopened.replicationAppliedSequence());
 }
 
@@ -117292,8 +117245,8 @@ test "db replicated merge artifacts preserve graph ttl dense sparse projections 
                 .merge_artifacts = rows,
             };
             const identity: RaftAppliedEntryIdentity = .{ .term = 1, .index = 10 };
-            try receiver.batchRaftReplicatedApply(req, identity);
-            try receiver.batchRaftReplicatedApply(req, identity);
+            try server_test_adapter.applyOrdered(&receiver, req, identity);
+            try server_test_adapter.applyOrdered(&receiver, req, identity);
             if (start_workers) {
                 try receiver.runUntilIdle();
                 try expectMergeArtifactSearches(alloc, &receiver);
@@ -117363,7 +117316,7 @@ test "db replicated merge imports graph source asset and rebuilds ttl contender"
         .merged_end = "",
     } });
     try receiver.batch(.{ .writes = &.{.{ .key = "doc:a", .value = primary }}, .sync_level = .full_index });
-    try receiver.batchRaftReplicatedApply(.{
+    try server_test_adapter.applyOrdered(&receiver, .{
         .merge_replication = .{ .transition_id = 1, .donor_group_id = 2, .receiver_group_id = 3, .identity_namespace = receiver.core.identity_namespace },
         .merge_artifacts = rows,
     }, .{ .term = 1, .index = 10 });
@@ -118012,7 +117965,7 @@ test "db replicated merge keeps expired graph source suppressed until asset chan
         .merged_end = "",
     } });
     try receiver.batch(.{ .writes = &.{.{ .key = "doc:a", .value = primary }}, .sync_level = .enrichments });
-    try receiver.batchRaftReplicatedApply(.{
+    try server_test_adapter.applyOrdered(&receiver, .{
         .merge_replication = .{ .transition_id = 1, .donor_group_id = 2, .receiver_group_id = 3, .identity_namespace = receiver.core.identity_namespace },
         .merge_artifacts = rows,
     }, .{ .term = 1, .index = 10 });
@@ -119017,15 +118970,15 @@ test "db repair activation restarts unjournaled source races without penalizing 
             .ttl_cleanup = .{ .enabled = false },
         });
         defer db.close();
-        try db.batchRaftReplicatedApply(.{ .writes = &.{ .{ .key = "doc", .value = "{\"title\":\"alpha\"}" }, .{ .key = "historic", .value = "{\"title\":\"historical\"}" } }, .sync_level = .write }, .{ .term = 1, .index = 1 });
+        try server_test_adapter.applyOrdered(&db, .{ .writes = &.{ .{ .key = "doc", .value = "{\"title\":\"alpha\"}" }, .{ .key = "historic", .value = "{\"title\":\"historical\"}" } }, .sync_level = .write }, .{ .term = 1, .index = 1 });
         const repair_id = (try db.admitManagedIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" })).?;
         var catalog = try db.artifactInventoryCommand(alloc);
         defer catalog.catalogs.deinit(alloc);
         catalog.binding.effect_protocol = 15;
-        try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
         var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
         activation.publication_digest = activation.digest();
-        try db.batchRaftReplicatedApply(.{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
         for (0..8) |_| {
             const step = try db.advanceIndexRepairIntent(alloc, repair_id, .{ .max_activation_pause_ms = 1 });
             try std.testing.expect(!step.repaired and !step.terminal);
@@ -119045,7 +118998,7 @@ test "db repair activation restarts unjournaled source races without penalizing 
             try txn.put(&internal_keys.raft_document_applied_entry_key, &marker);
             try txn.put(primary, "{\"title\":\"beta\"}");
             try txn.commit();
-        } else try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{\"title\":\"beta\"}" }}, .sync_level = .write }, .{ .term = 1, .index = 4 });
+        } else try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"title\":\"beta\"}" }}, .sync_level = .write }, .{ .term = 1, .index = 4 });
         if (unjournaled) {
             const stale = try db.advanceIndexRepairIntent(alloc, repair_id, .{ .max_activation_pause_ms = 5_000 });
             try std.testing.expect(!stale.repaired and !stale.terminal);
@@ -119069,7 +119022,7 @@ test "db repair activation restarts unjournaled source races without penalizing 
         // the historic document or borrowing the newer global journal tip.
         var baseline_page = (try @import("artifact_producer_baseline.zig").prepareRaft(alloc, db.core.store)).?;
         defer baseline_page.deinit();
-        try db.batchRaftReplicatedApply(.{ .artifact_publication = baseline_page.command }, .{ .term = 1, .index = 5 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = baseline_page.command }, .{ .term = 1, .index = 5 });
         var plan = try db.core.index_manager.acquireWritePlanSnapshot();
         defer plan.release();
         for (0..16) |_| {
@@ -119102,7 +119055,7 @@ test "db repair activation restarts unjournaled source races without penalizing 
             try @import("artifact_source_gap.zig").record(&txn);
             try std.testing.expectError(error.EnrichmentSourceChanged, prepared.stageCurrent(&txn, db.root_incarnation));
         }
-        try db.batchRaftReplicatedApply(.{ .artifact_publication = try prepared.command() }, .{ .term = 1, .index = 6 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = try prepared.command() }, .{ .term = 1, .index = 6 });
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
         try std.testing.expect(try @import("artifact_producer_obligations.zig").lookupWork(alloc, &read, (try publication.authority(&read)).?, "historic") == null);
@@ -119119,7 +119072,7 @@ test "db repair activation automatically schedules bounded historical adoption a
     defer db.close();
     try db.addIndex(.{ .name = "first", .kind = .full_text, .config_json = "{}", .coverage_generation = 7 });
     try db.addIndex(.{ .name = "second", .kind = .full_text, .config_json = "{}", .coverage_generation = 9 });
-    try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "historic", .value = "{\"title\":\"historical\"}" }}, .sync_level = .full_index }, .{ .term = 1, .index = 1 });
+    try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "historic", .value = "{\"title\":\"historical\"}" }}, .sync_level = .full_index }, .{ .term = 1, .index = 1 });
     try db.runUntilIdle();
     var catalog = try db.artifactInventoryCommand(alloc);
     defer catalog.catalogs.deinit(alloc);
@@ -119137,13 +119090,13 @@ test "db repair activation automatically schedules bounded historical adoption a
         });
     }
     catalog.binding.effect_protocol = 15;
-    try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
     var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activation.publication_digest = activation.digest();
-    try db.batchRaftReplicatedApply(.{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
     var baseline = (try @import("artifact_producer_baseline.zig").prepareRaft(alloc, db.core.store)).?;
     defer baseline.deinit();
-    try db.batchRaftReplicatedApply(.{ .artifact_publication = baseline.command }, .{ .term = 1, .index = 4 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = baseline.command }, .{ .term = 1, .index = 4 });
     {
         var plan = try db.core.index_manager.acquireWritePlanSnapshot();
         defer plan.release();
@@ -119210,7 +119163,7 @@ test "db repair activation automatically schedules bounded historical adoption a
     };
     defer complete.deinit();
     try std.testing.expect(complete.atEnd());
-    try db.batchRaftReplicatedApply(.{ .artifact_publication = try complete.command() }, .{ .term = 1, .index = 5 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = try complete.command() }, .{ .term = 1, .index = 5 });
     var read = try db.core.store.beginReadTxn();
     defer read.abort();
     try std.testing.expectEqual(@as(u64, 0), (try @import("artifact_producer_obligations.zig").load(&read)).?.pending_documents);
@@ -139435,7 +139388,7 @@ test "storage.hot_standby merge proof adoption certifies receiver-local absent o
         try txn.commit();
     }
     const command: @import("merge_proof_adoption.zig").Command = .{ .transition_id = progress.transition_id, .attempt = progress.attempt, .source_pin = progress.source.pin_digest, .proof_digest = donor_proof.publication_digest, .record_digest = record_digest };
-    try db.batchRaftReplicatedApply(.{ .merge_proof_adoption = command }, .{ .term = 4, .index = 7 });
+    try server_test_adapter.applyOrdered(&db, .{ .merge_proof_adoption = command }, .{ .term = 4, .index = 7 });
     {
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
@@ -139444,7 +139397,7 @@ test "storage.hot_standby merge proof adoption certifies receiver-local absent o
     try std.testing.expectEqual(@as(u64, 7), (try db.raftAppliedEntry()).?.index);
     var wrong = command;
     wrong.record_digest = @splat(8);
-    try db.batchRaftReplicatedApply(.{ .merge_proof_adoption = wrong }, .{ .term = 4, .index = 8 });
+    try server_test_adapter.applyOrdered(&db, .{ .merge_proof_adoption = wrong }, .{ .term = 4, .index = 8 });
     var read = try db.core.store.beginReadTxn();
     defer read.abort();
     try std.testing.expectEqualDeep(publication.Position{ .raft = .{ .term = 4, .index = 7 } }, (try publication.artifactRevision(&read, receiver_bytes, output_key)).?);
@@ -139468,13 +139421,13 @@ test "storage.hot_standby stale merge proof adoption advances only its ordered w
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
         defer db.close();
         const before = db.core.nextDerivedSequence();
-        try db.batchRaftReplicatedApply(.{ .merge_proof_adoption = command }, .{ .term = 2, .index = 7 });
+        try server_test_adapter.applyOrdered(&db, .{ .merge_proof_adoption = command }, .{ .term = 2, .index = 7 });
         try std.testing.expectEqual(@as(u64, 7), (try db.raftAppliedEntry()).?.index);
         try std.testing.expectEqual(before, db.core.nextDerivedSequence());
     }
     var reopened = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer reopened.close();
-    try reopened.batchRaftReplicatedApply(.{ .merge_proof_adoption = command }, .{ .term = 2, .index = 7 });
+    try server_test_adapter.applyOrdered(&reopened, .{ .merge_proof_adoption = command }, .{ .term = 2, .index = 7 });
     try std.testing.expectEqual(@as(u64, 7), (try reopened.raftAppliedEntry()).?.index);
 }
 
@@ -139555,7 +139508,7 @@ test "online direct vector uncertified source cannot authorize unknown effects o
     try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
     var catalog = try db.artifactInventoryCommand(alloc);
     defer catalog.catalogs.deinit(alloc);
-    try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 1 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 1 });
     const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "a", "unknown");
     defer alloc.free(key);
     const value = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, null, &.{ 1, 2 });
@@ -139569,14 +139522,14 @@ test "online direct vector uncertified source cannot authorize unknown effects o
     // vector projection, because historical base values remain user data.
     request.merge_page.?.source.artifact_catalog = null;
     request.merge_page.?.digest = pages.commandDigest(request);
-    try std.testing.expectError(error.InvalidMergePage, db.batchRaftReplicatedApply(request, .{ .term = 1, .index = 2 }));
+    try std.testing.expectError(error.InvalidMergePage, server_test_adapter.applyOrdered(&db, request, .{ .term = 1, .index = 2 }));
     request.merge_page.?.source.artifact_catalog = catalog.binding;
     request.merge_page.?.digest = pages.commandDigest(request);
     const chunks = try pages.RowChunks(types.BatchRequest).init(request);
     var chunked = try chunks.requestAt(0);
     chunked.merge_page.?.source.artifact_catalog = null;
     chunked.merge_page.?.digest = pages.commandDigest(chunked);
-    try std.testing.expectError(error.InvalidMergePage, db.batchRaftReplicatedApply(chunked, .{ .term = 1, .index = 2 }));
+    try std.testing.expectError(error.InvalidMergePage, server_test_adapter.applyOrdered(&db, chunked, .{ .term = 1, .index = 2 }));
     try std.testing.expectEqual(@as(u64, 1), (try db.raftAppliedEntry()).?.index);
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, key));
 }
@@ -139608,8 +139561,8 @@ test "online direct vector Raft retention captures exact artifacts and rejects u
     try std.testing.expectEqual(@as(u64, 2), bounded_intents[0].retained_artifact_keys);
     try std.testing.expect(bounded_intents[0].retained_artifact_bytes > request.writes[0].value.len);
     try std.testing.expectError(error.RetainedEffectsFenceMismatch, db.batch(request));
-    try db.batchRaftReplicatedApply(request, .{ .term = 1, .index = 1 });
-    try db.batchRaftReplicatedApply(request, .{ .term = 1, .index = 1 });
+    try server_test_adapter.applyOrdered(&db, request, .{ .term = 1, .index = 1 });
+    try server_test_adapter.applyOrdered(&db, request, .{ .term = 1, .index = 1 });
     db.close();
     db = try DB.open(alloc, directory.path(), options);
     {
@@ -139626,7 +139579,7 @@ test "online direct vector Raft retention captures exact artifacts and rejects u
         try std.testing.expectEqual(@as(usize, 2), vectors);
         try std.testing.expectEqual(@as(u64, 1), (try retention.load(&txn)).?.latest);
     }
-    try db.batchRaftReplicatedApply(.{ .deletes = &.{"row"}, .sync_level = .full_index }, .{ .term = 1, .index = 2 });
+    try server_test_adapter.applyOrdered(&db, .{ .deletes = &.{"row"}, .sync_level = .full_index }, .{ .term = 1, .index = 2 });
     var txn = try db.core.store.beginReadTxn();
     defer txn.abort();
     var frame = (try retention.read(&txn, namespace, 1, @splat(9), 1)).?;
@@ -141831,24 +141784,24 @@ test "db merge receiver fences stale copies and retains retired transitions acro
             .identity_namespace = db.core.identity_namespace,
         };
         const payload: types.BatchRequest = .{ .merge_replication = copy, .writes = &.{.{ .key = "b", .value = "{}" }} };
-        try db.batchRaftReplicatedApply(payload, .{ .term = 1, .index = 1 });
+        try server_test_adapter.applyOrdered(&db, payload, .{ .term = 1, .index = 1 });
         try std.testing.expect((try db.get(alloc, "b")) == null);
-        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = first }, .{ .term = 1, .index = 2 });
-        try db.batchRaftReplicatedApply(payload, .{ .term = 1, .index = 3 });
+        try server_test_adapter.applyOrdered(&db, .{ .merge_checkpoint = first }, .{ .term = 1, .index = 2 });
+        try server_test_adapter.applyOrdered(&db, payload, .{ .term = 1, .index = 3 });
         var terminal = first;
         terminal.kind = .bootstrap_complete;
         terminal.bootstrap_applied_index = 3;
-        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = terminal }, .{ .term = 1, .index = 4 });
+        try server_test_adapter.applyOrdered(&db, .{ .merge_checkpoint = terminal }, .{ .term = 1, .index = 4 });
         terminal.kind = .finalize;
-        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = terminal }, .{ .term = 1, .index = 5 });
+        try server_test_adapter.applyOrdered(&db, .{ .merge_checkpoint = terminal }, .{ .term = 1, .index = 5 });
         try db.batch(.{ .writes = &.{.{ .key = "b", .value = "{\"public\":true}" }} });
         const before = db.core.nextDerivedSequence();
-        try db.batchRaftReplicatedApply(payload, .{ .term = 2, .index = 6 });
-        try db.batchRaftReplicatedApply(.{ .merge_replication = copy, .deletes = &.{"b"} }, .{ .term = 2, .index = 7 });
+        try server_test_adapter.applyOrdered(&db, payload, .{ .term = 2, .index = 6 });
+        try server_test_adapter.applyOrdered(&db, .{ .merge_replication = copy, .deletes = &.{"b"} }, .{ .term = 2, .index = 7 });
         // A stale artifact must be ignored before its payload is decoded.
         const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "b", "graph", "links", "c");
         defer alloc.free(artifact_key);
-        try db.batchRaftReplicatedApply(.{ .merge_replication = copy, .merge_artifacts = &.{.{ .key = artifact_key, .value = "invalid stale artifact" }} }, .{ .term = 2, .index = 8 });
+        try server_test_adapter.applyOrdered(&db, .{ .merge_replication = copy, .merge_artifacts = &.{.{ .key = artifact_key, .value = "invalid stale artifact" }} }, .{ .term = 2, .index = 8 });
         try std.testing.expect((try db.core.getStoreValue(alloc, artifact_key)) == null);
         try std.testing.expectEqual(before, db.core.nextDerivedSequence());
         try std.testing.expectEqual(@as(u64, 8), (try db.raftAppliedEntry()).?.index);
@@ -141860,17 +141813,17 @@ test "db merge receiver fences stale copies and retains retired transitions acro
         second.donor_group_id = 201;
         second.receiver_base_start = "a";
         second.merged_start = "";
-        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = second }, .{ .term = 2, .index = 9 });
-        try db.batchRaftReplicatedApply(payload, .{ .term = 2, .index = 10 });
+        try server_test_adapter.applyOrdered(&db, .{ .merge_checkpoint = second }, .{ .term = 2, .index = 9 });
+        try server_test_adapter.applyOrdered(&db, payload, .{ .term = 2, .index = 10 });
         second.kind = .bootstrap_complete;
         second.bootstrap_applied_index = 10;
-        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = second }, .{ .term = 2, .index = 11 });
+        try server_test_adapter.applyOrdered(&db, .{ .merge_checkpoint = second }, .{ .term = 2, .index = 11 });
         second.kind = .finalize;
-        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = second }, .{ .term = 2, .index = 12 });
+        try server_test_adapter.applyOrdered(&db, .{ .merge_checkpoint = second }, .{ .term = 2, .index = 12 });
     }
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
-    try db.batchRaftReplicatedApply(.{ .merge_checkpoint = first }, .{ .term = 3, .index = 13 });
+    try server_test_adapter.applyOrdered(&db, .{ .merge_checkpoint = first }, .{ .term = 3, .index = 13 });
     const raw = (try db.core.getStoreValue(alloc, merge_state_mod.key)).?;
     defer alloc.free(raw);
     var state = try merge_state_mod.decodeAlloc(alloc, raw);
@@ -141902,7 +141855,7 @@ test "db merge copy attempts fence delayed leaders before finalize across reopen
     const Apply = struct {
         fn command(db: *DB, index: *u64, req: types.BatchRequest) !void {
             index.* += 1;
-            try db.batchRaftReplicatedApply(req, .{ .term = 7, .index = index.* });
+            try server_test_adapter.applyOrdered(&db, req, .{ .term = 7, .index = index.* });
         }
     };
     var index: u64 = 0;
@@ -142127,9 +142080,9 @@ test "db replicated merge checkpoints keep rolled back receivers live across del
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
         defer db.close();
         try db.updateRange(.{ .start = "m", .end = "z" });
-        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 1 });
+        try server_test_adapter.applyOrdered(&db, .{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 1 });
         checkpoint.kind = .rollback;
-        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 2 });
+        try server_test_adapter.applyOrdered(&db, .{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 2 });
     }
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
@@ -142137,10 +142090,10 @@ test "db replicated merge checkpoints keep rolled back receivers live across del
         checkpoint.kind = kind;
         checkpoint.copy_attempt = .{ .donor_term = 2, .sequence = 1 };
         checkpoint.bootstrap_applied_index = if (kind == .bootstrap_complete or kind == .finalize) 100 else 0;
-        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 2, .index = index });
+        try server_test_adapter.applyOrdered(&db, .{ .merge_checkpoint = checkpoint }, .{ .term = 2, .index = index });
         try std.testing.expectEqualStrings("m", db.getRange().start);
     }
-    try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "n", .value = "{\"live\":true}" }} }, .{ .term = 2, .index = 8 });
+    try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "n", .value = "{\"live\":true}" }} }, .{ .term = 2, .index = 8 });
     const raw = (try db.core.getStoreValue(alloc, merge_state_mod.key)).?;
     defer alloc.free(raw);
     var state = try merge_state_mod.decodeAlloc(alloc, raw);
@@ -142175,20 +142128,20 @@ test "db terminal merge controls preserve a subsequent split across reopen" {
             var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
             defer db.close();
             try db.updateRange(.{ .start = "m", .end = "z" });
-            try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 1 });
+            try server_test_adapter.applyOrdered(&db, .{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 1 });
             checkpoint.kind = .bootstrap_complete;
             checkpoint.bootstrap_applied_index = 1;
-            try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 2 });
+            try server_test_adapter.applyOrdered(&db, .{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 2 });
             checkpoint.kind = terminal;
             checkpoint.bootstrap_applied_index = if (terminal == .finalize) 1 else 0;
-            try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 3 });
+            try server_test_adapter.applyOrdered(&db, .{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 3 });
             // Exercise the production split-start mutation, including its
             // persisted range, without replacing the terminal merge receipt.
             try db.core.prepareSplit("t");
             try db.core.completeSplitTransition(63, "t");
             checkpoint.kind = .accept;
             checkpoint.bootstrap_applied_index = 0;
-            try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 2, .index = 4 });
+            try server_test_adapter.applyOrdered(&db, .{ .merge_checkpoint = checkpoint }, .{ .term = 2, .index = 4 });
             try std.testing.expectEqualStrings(expected_start, db.getRange().start);
             try std.testing.expectEqualStrings("t", db.getRange().end);
         }
@@ -142199,23 +142152,25 @@ test "db terminal merge controls preserve a subsequent split across reopen" {
                 checkpoint.kind = kind;
                 checkpoint.copy_attempt = .{ .donor_term = 2, .sequence = 1 };
                 checkpoint.bootstrap_applied_index = if (kind == .bootstrap_complete or kind == .finalize) 100 else 0;
-                try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 2, .index = index });
+                try server_test_adapter.applyOrdered(&db, .{ .merge_checkpoint = checkpoint }, .{ .term = 2, .index = index });
                 try std.testing.expectEqualStrings(expected_start, db.getRange().start);
                 try std.testing.expectEqualStrings("t", db.getRange().end);
             }
             var conflicting = checkpoint;
             conflicting.donor_group_id = 99;
-            try std.testing.expectError(error.ConflictingMergeTransition, db.batchRaftReplicatedApply(
+            try std.testing.expectError(error.ConflictingMergeTransition, server_test_adapter.applyOrdered(
+                &db,
                 .{ .merge_checkpoint = conflicting },
                 .{ .term = 2, .index = 10 },
             ));
             conflicting = checkpoint;
             conflicting.merged_end = "zz";
-            try std.testing.expectError(error.ConflictingMergeTransition, db.batchRaftReplicatedApply(
+            try std.testing.expectError(error.ConflictingMergeTransition, server_test_adapter.applyOrdered(
+                &db,
                 .{ .merge_checkpoint = conflicting },
                 .{ .term = 2, .index = 10 },
             ));
-            try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "n", .value = "{\"live\":true}" }} }, .{ .term = 2, .index = 10 });
+            try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "n", .value = "{\"live\":true}" }} }, .{ .term = 2, .index = 10 });
             const raw = (try db.core.getStoreValue(alloc, merge_state_mod.key)).?;
             defer alloc.free(raw);
             var state = try merge_state_mod.decodeAlloc(alloc, raw);
@@ -142269,23 +142224,23 @@ test "db physical lsm split retains parent merge receipts and clears child recei
                 var parent = try DB.open(alloc, std.mem.span(parent_path), options);
                 defer parent.close();
                 try parent.updateRange(.{ .start = "a", .end = "m" });
-                try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 1 });
+                try server_test_adapter.applyOrdered(&parent, .{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 1 });
                 checkpoint.kind = .rollback;
-                try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 2 });
+                try server_test_adapter.applyOrdered(&parent, .{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 2 });
                 checkpoint.kind = .accept;
                 checkpoint.transition_id = 80;
                 checkpoint.donor_group_id = 81;
-                try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 3 });
+                try server_test_adapter.applyOrdered(&parent, .{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 3 });
                 checkpoint.kind = .begin_copy;
                 checkpoint.copy_attempt = .{ .donor_term = 1, .sequence = 1 };
-                try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 4 });
+                try server_test_adapter.applyOrdered(&parent, .{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 4 });
                 checkpoint.kind = .bootstrap_complete;
                 checkpoint.bootstrap_applied_index = 4;
-                try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 5 });
+                try server_test_adapter.applyOrdered(&parent, .{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 5 });
                 checkpoint.kind = terminal;
                 checkpoint.bootstrap_applied_index = if (terminal == .finalize) 4 else 0;
-                try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 6 });
-                try parent.batchRaftReplicatedApply(.{ .writes = &.{
+                try server_test_adapter.applyOrdered(&parent, .{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 6 });
+                try server_test_adapter.applyOrdered(&parent, .{ .writes = &.{
                     .{ .key = "b", .value = "{\"side\":\"parent\"}" },
                     .{ .key = right_key, .value = "{\"side\":\"child\"}" },
                 } }, .{ .term = 1, .index = 7 });
@@ -142321,7 +142276,7 @@ test "db physical lsm split retains parent merge receipts and clears child recei
                     checkpoint.kind = kind;
                     checkpoint.copy_attempt = .{ .donor_term = 2, .sequence = 1 };
                     checkpoint.bootstrap_applied_index = if (kind == .bootstrap_complete or kind == .finalize) 100 else 0;
-                    try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 2, .index = index });
+                    try server_test_adapter.applyOrdered(&parent, .{ .merge_checkpoint = checkpoint }, .{ .term = 2, .index = index });
                     try std.testing.expectEqualStrings("a", parent.getRange().start);
                     try std.testing.expectEqualStrings(split_key, parent.getRange().end);
                 }
@@ -142330,8 +142285,8 @@ test "db physical lsm split retains parent merge receipts and clears child recei
                 retired.transition_id = 70;
                 retired.donor_group_id = 71;
                 retired.bootstrap_applied_index = 0;
-                try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = retired }, .{ .term = 2, .index = 13 });
-                try parent.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "b", .value = "{\"live\":true}" }} }, .{ .term = 2, .index = 14 });
+                try server_test_adapter.applyOrdered(&parent, .{ .merge_checkpoint = retired }, .{ .term = 2, .index = 13 });
+                try server_test_adapter.applyOrdered(&parent, .{ .writes = &.{.{ .key = "b", .value = "{\"live\":true}" }} }, .{ .term = 2, .index = 14 });
                 const raw = (try parent.core.getStoreValue(alloc, merge_state_mod.key)).?;
                 defer alloc.free(raw);
                 var receipt = try merge_state_mod.decodeAlloc(alloc, raw);
@@ -142362,7 +142317,7 @@ test "db physical lsm split retains parent merge receipts and clears child recei
                 fresh.merged_end = fresh.receiver_base_end;
                 fresh.bootstrap_applied_index = 0;
                 fresh.copy_attempt = .{};
-                try child.batchRaftReplicatedApply(.{ .merge_checkpoint = fresh }, .{ .term = 1, .index = 1 });
+                try server_test_adapter.applyOrdered(&child, .{ .merge_checkpoint = fresh }, .{ .term = 1, .index = 1 });
                 try std.testing.expectEqual(@as(u64, 1), (try child.raftAppliedEntry()).?.index);
             }
             var reopened = try DB.open(alloc, std.mem.span(parent_path), options);
@@ -145581,12 +145536,12 @@ fn testScopedNativeArtifactRestore(standby: bool, replace_generated: bool, unver
             const payload = try replication_effects_mod.encodeBatchMutationRequestAlloc(alloc, batch);
             defer alloc.free(payload);
             const record: replication_record_mod.RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = index_number, .previous_lsn = index_number - 1, .payload = payload };
-            try replication_ingress.applyRecord(&target, record);
-            try replication_ingress.applyRecord(&target, record);
+            try @import("replication_ingress.zig").applyRecord(&target, record);
+            try @import("replication_ingress.zig").applyRecord(&target, record);
         } else {
-            try target.batchRaftReplicatedApply(batch, .{ .term = 1, .index = index_number });
+            try server_test_adapter.applyOrdered(&target, batch, .{ .term = 1, .index = index_number });
             // Lost acknowledgements replay without mutating the next page.
-            try target.batchRaftReplicatedApply(batch, .{ .term = 1, .index = index_number });
+            try server_test_adapter.applyOrdered(&target, batch, .{ .term = 1, .index = index_number });
         }
         if (batch.restore_staging.?.import_page.artifact_page) {
             artifact_pages += 1;
@@ -150969,7 +150924,7 @@ test "db ordered artifact inventory producer baseline resumes and includes behin
     defer alloc.free(follower_path);
     const Replicate = struct {
         fn apply(owners: [2]*DB, request: types.BatchRequest, position: RaftAppliedEntryIdentity) !void {
-            for (owners) |owner| try owner.batchRaftReplicatedApply(request, position);
+            for (owners) |owner| try server_test_adapter.applyOrdered(&owner, request, position);
         }
     };
     const options: OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
@@ -151183,21 +151138,21 @@ test "db ordered artifact inventory upload backpressure advances apply without f
     var db = try DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
     defer db.close();
     try db.setSchemaJson(alloc, "{}");
-    try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{}" }} }, .{ .term = 1, .index = 1 });
+    try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{}" }} }, .{ .term = 1, .index = 1 });
     var namespace: transport.Namespace = undefined;
     doc_identity.encodeNamespace(&namespace, db.core.identity_namespace);
     const hashes = [_]transport.Digest{transport.chunkDigest(0, "x")};
     var begin: transport.Request = .{ .action = .begin, .namespace = namespace, .publication_digest = @splat(1), .command_digest = @splat(2), .encoded_len = 1, .chunk_hashes = &hashes };
     for (0..transport.max_producer_uploads) |ordinal| {
         begin.publication_digest[0] = @intCast(ordinal);
-        try db.batchRaftReplicatedApply(.{ .artifact_publication_transport = begin }, .{ .term = 1, .index = ordinal + 2 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication_transport = begin }, .{ .term = 1, .index = ordinal + 2 });
     }
     const cut = db.core.store.lastReplaySequence(0);
     begin.publication_digest[0] = 99;
     const root = begin.proposedManifest().root();
-    try db.batchRaftReplicatedApply(.{ .artifact_publication_transport = begin }, .{ .term = 1, .index = 10 });
-    try db.batchRaftReplicatedApply(.{ .artifact_publication_transport = .{ .action = .chunk, .namespace = namespace, .publication_digest = begin.publication_digest, .manifest_root = root, .chunk_base64 = "eA==" } }, .{ .term = 1, .index = 11 });
-    try db.batchRaftReplicatedApply(.{ .artifact_publication_transport = .{ .action = .finalize, .namespace = namespace, .publication_digest = begin.publication_digest, .manifest_root = root } }, .{ .term = 1, .index = 12 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication_transport = begin }, .{ .term = 1, .index = 10 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication_transport = .{ .action = .chunk, .namespace = namespace, .publication_digest = begin.publication_digest, .manifest_root = root, .chunk_base64 = "eA==" } }, .{ .term = 1, .index = 11 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication_transport = .{ .action = .finalize, .namespace = namespace, .publication_digest = begin.publication_digest, .manifest_root = root } }, .{ .term = 1, .index = 12 });
     try std.testing.expectEqual(@as(u64, 12), (try db.raftAppliedEntry()).?.index);
     try std.testing.expectEqual(cut, db.core.store.lastReplaySequence(0));
     {
@@ -151210,7 +151165,7 @@ test "db ordered artifact inventory upload backpressure advances apply without f
     // Reclamation is ordered and bounded to one expired upload per begin;
     // the refused identity is eligible for admission again, not poisoned by
     // a permanent capacity-error receipt.
-    try db.batchRaftReplicatedApply(.{ .artifact_publication_transport = begin }, .{ .term = 1, .index = transport.max_upload_age_entries + 2 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication_transport = begin }, .{ .term = 1, .index = transport.max_upload_age_entries + 2 });
     var read = try db.core.store.beginReadTxn();
     defer read.abort();
     _ = try transport.decodeManifest(try read.get(&transport.manifestKey(namespace, begin.publication_digest)));
@@ -151263,14 +151218,14 @@ fn testGraphGenerationHeadFence(accepted_before_switch: bool) !void {
     try db.setSchemaJson(alloc, "{}");
     try db.addEnrichment(.{ .name = "relations", .kind = .asset, .field = "body", .content_type = "application/json" });
     try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"sources\":[{\"artifact\":\"relations\"}]}" });
-    try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"seed\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
+    try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"seed\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
     var catalog = try db.artifactInventoryCommand(alloc);
     defer catalog.catalogs.deinit(alloc);
     catalog.binding.effect_protocol = 15;
-    try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
     var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activation.publication_digest = activation.digest();
-    try db.batchRaftReplicatedApply(.{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
     const authority: publication.Authority = .{ .namespace = catalog.namespace, .epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest };
     const scope = try chunks.keyAlloc(alloc, "doc", "upstream");
     defer alloc.free(scope);
@@ -151288,7 +151243,7 @@ fn testGraphGenerationHeadFence(accepted_before_switch: bool) !void {
         try token.observePrecondition(asset_key, null, null);
     }
     const asset_command = try token.command(&.{.{ .family = .document_artifact, .key = asset_key, .value = "{}", .source_index = 0 }});
-    try db.batchRaftReplicatedApply(.{ .artifact_publication = asset_command }, .{ .term = 1, .index = 4 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = asset_command }, .{ .term = 1, .index = 4 });
     var pinned = try db.core.store.beginReadTxn();
     defer pinned.abort();
     const Check = struct {
@@ -151310,7 +151265,7 @@ fn testGraphGenerationHeadFence(accepted_before_switch: bool) !void {
     try context.publishGraphEffects(&[_]docstore_mod.KVPair{.{ .key = count_key, .value = &count }}, &.{});
     try std.testing.expectEqual(@as(usize, 1), context.commands.items.len);
     const graph_command = context.commands.items[0];
-    if (accepted_before_switch) try db.batchRaftReplicatedApply(.{ .artifact_publication = graph_command }, .{ .term = 1, .index = 5 });
+    if (accepted_before_switch) try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = graph_command }, .{ .term = 1, .index = 5 });
     {
         // Inject only a visibility change, under the actual Raft input-capture
         // boundary. No primary/asset bytes or asset receipt are changed.
@@ -151327,7 +151282,7 @@ fn testGraphGenerationHeadFence(accepted_before_switch: bool) !void {
         try txn.commit();
     }
     const before = db.core.store.lastReplaySequence(0);
-    try db.batchRaftReplicatedApply(.{ .artifact_publication = graph_command }, .{ .term = 1, .index = if (accepted_before_switch) 7 else 6 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = graph_command }, .{ .term = 1, .index = if (accepted_before_switch) 7 else 6 });
     try std.testing.expectEqual(before, db.core.store.lastReplaySequence(0));
     var current = try db.core.store.beginReadTxn();
     defer current.abort();
@@ -151359,14 +151314,14 @@ test "db ordered artifact inventory graph planning inherits selected extraction 
     try db.addEnrichment(.{ .name = "relations", .kind = .asset, .field = "body", .content_type = "application/json", .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}" });
     try db.addEnrichment(.{ .name = "copy", .kind = .asset, .source_artifact_name = "relations", .content_type = "application/json" });
     try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"sources\":[{\"artifact\":\"relations\"}]}" });
-    try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"seed\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
+    try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"seed\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
     var catalog = try db.artifactInventoryCommand(alloc);
     defer catalog.catalogs.deinit(alloc);
     catalog.binding.effect_protocol = 15;
-    try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
     var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activation.publication_digest = activation.digest();
-    try db.batchRaftReplicatedApply(.{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
     const authority: publication.Authority = .{ .namespace = catalog.namespace, .epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest };
     const scope = try @import("artifact_generation_scope.zig").extractionKeyAlloc(alloc, "doc", "relations");
     defer alloc.free(scope);
@@ -151443,7 +151398,7 @@ test "db ordered artifact inventory graph planning inherits selected extraction 
     const copy_effects = [_]publication.Mutation{.{ .family = .document_artifact, .key = copy_key, .value = "{}", .source_index = 0 }};
     var copy_command: publication.Command = .{ .producer_kind = .enrichment, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "copy", .producer_generation = catalog.binding.epoch, .producer_artifact_name = "copy", .sources = (&source)[0..1], .artifact_sources = &copy_guard, .mutations = &copy_effects, .publication_digest = @splat(0) };
     copy_command.publication_digest = copy_command.digest();
-    try db.batchRaftReplicatedApply(.{ .artifact_publication = copy_command }, .{ .term = 1, .index = 5 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = copy_command }, .{ .term = 1, .index = 5 });
     {
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
@@ -151458,7 +151413,7 @@ test "db ordered artifact inventory graph planning inherits selected extraction 
     defer alloc.free(count_key);
     const count = try @import("graph_edge_contender.zig").encodeVisibleCount(db.core.index_manager.coverageGenerationForIndex("g").?, 0);
     try context.publishGraphEffects(&[_]docstore_mod.KVPair{.{ .key = count_key, .value = &count }}, &.{});
-    try db.batchRaftReplicatedApply(.{ .artifact_publication = context.commands.items[0] }, .{ .term = 1, .index = 6 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = context.commands.items[0] }, .{ .term = 1, .index = 6 });
     var current = try db.core.store.beginReadTxn();
     defer current.abort();
     try std.testing.expect((try publication.readReceipt(&current, context.commands.items[0], context.commands.items[0].sources[0])) != null);
@@ -151490,7 +151445,7 @@ test "db ordered artifact inventory graph planning inherits selected extraction 
     try std.testing.expectError(error.EnrichmentSourceChanged, publication.validateArtifactSources(alloc, &replaced, copy_command.namespace, copy_command.sources, copy_command.artifact_sources));
     var empty_fence: @import("artifact_asset_publication.zig").UpstreamFence = .{ .key = stale_root, .requires_value = true };
     try std.testing.expectError(error.EnrichmentSourceChanged, empty_fence.bind(alloc, &replaced, empty_copy_command));
-    try db.batchRaftReplicatedApply(.{ .artifact_publication = context.commands.items[0] }, .{ .term = 1, .index = 8 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = context.commands.items[0] }, .{ .term = 1, .index = 8 });
     var post = try db.core.store.beginReadTxn();
     defer post.abort();
     try std.testing.expectEqual(publication.Rejection.stale_source, (try publication.rejected(&post, context.commands.items[0])).?.reason);
@@ -151531,7 +151486,7 @@ fn testAcceptedArtifactUpload(inject_missing_counter: bool) !void {
         try db.addEnrichment(.{ .name = "relations", .kind = .asset, .field = "body", .content_type = "application/json" });
         try db.addEnrichment(.{ .name = "other_relations", .kind = .asset, .field = "body", .content_type = "application/json" });
         try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"sources\":[{\"artifact\":\"relations\"},{\"artifact\":\"other_relations\"}]}" });
-        try db.batchRaftReplicatedApply(.{ .writes = &.{ .{ .key = "doc", .value = "{}" }, .{ .key = "neighbor", .value = "{}" } }, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
+        try server_test_adapter.applyOrdered(&db, .{ .writes = &.{ .{ .key = "doc", .value = "{}" }, .{ .key = "neighbor", .value = "{}" } }, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
         {
             // Replica-local historical markers are deliberately populated,
             // inconsistent and missing counters. Activation must establish a
@@ -151548,10 +151503,10 @@ fn testAcceptedArtifactUpload(inject_missing_counter: bool) !void {
         var catalog = try db.artifactInventoryCommand(alloc);
         defer catalog.catalogs.deinit(alloc);
         catalog.binding.effect_protocol = 15;
-        try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
         var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
         activation.publication_digest = activation.digest();
-        try db.batchRaftReplicatedApply(.{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
         const sources = try owned.alloc(publication.Source, 2);
         const preconditions = try owned.alloc(publication.ArtifactSource, 1);
         {
@@ -151582,10 +151537,10 @@ fn testAcceptedArtifactUpload(inject_missing_counter: bool) !void {
         const hash = transport.chunkDigest(0, encoded);
         const begin: transport.Request = .{ .action = .begin, .namespace = command.namespace, .publication_digest = command.publication_digest, .command_digest = command.digest(), .encoded_len = @intCast(encoded.len), .chunk_hashes = &.{hash} };
         root = begin.proposedManifest().root();
-        try db.batchRaftReplicatedApply(.{ .artifact_publication_transport = begin }, .{ .term = 1, .index = 4 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication_transport = begin }, .{ .term = 1, .index = 4 });
         const base64 = try owned.alloc(u8, std.base64.standard.Encoder.calcSize(encoded.len));
         _ = std.base64.standard.Encoder.encode(base64, encoded);
-        try db.batchRaftReplicatedApply(.{ .artifact_publication_transport = .{ .action = .chunk, .namespace = command.namespace, .publication_digest = command.publication_digest, .manifest_root = root, .chunk_base64 = base64 } }, .{ .term = 1, .index = 5 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication_transport = .{ .action = .chunk, .namespace = command.namespace, .publication_digest = command.publication_digest, .manifest_root = root, .chunk_base64 = base64 } }, .{ .term = 1, .index = 5 });
         if (inject_missing_counter) {
             // Fault injection, not migration: save an actual initialized
             // counter and remove it to exercise temporary baseline refusal.
@@ -151596,7 +151551,7 @@ fn testAcceptedArtifactUpload(inject_missing_counter: bool) !void {
             try txn.commit();
         }
         const before = db.core.store.lastReplaySequence(0);
-        try db.batchRaftReplicatedApply(.{ .artifact_publication_transport = .{ .action = .finalize, .namespace = command.namespace, .publication_digest = command.publication_digest, .manifest_root = root } }, .{ .term = 1, .index = 6 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication_transport = .{ .action = .finalize, .namespace = command.namespace, .publication_digest = command.publication_digest, .manifest_root = root } }, .{ .term = 1, .index = 6 });
         if (inject_missing_counter) {
             try std.testing.expectEqual(before, db.core.store.lastReplaySequence(0));
             var read = try db.core.store.beginReadTxn();
@@ -151642,15 +151597,15 @@ fn testAcceptedArtifactUpload(inject_missing_counter: bool) !void {
         // watermark. It cannot consume this upload or credit a receipt.
         var stale = recovered.?.request();
         stale.created_index = 2;
-        try db.batchRaftReplicatedApply(.{ .artifact_publication_transport = stale }, .{ .term = 2, .index = 7 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication_transport = stale }, .{ .term = 2, .index = 7 });
         try std.testing.expectEqual(committed, db.core.store.lastReplaySequence(0));
         try std.testing.expect(try db.advanceArtifactUploadRecovery());
     }
     const finalize_index: u64 = if (inject_missing_counter) 8 else 7;
     const finalize: transport.Request = if (recovered) |hint| hint.request() else .{ .action = .finalize, .namespace = command.namespace, .publication_digest = command.publication_digest, .manifest_root = root };
-    try db.batchRaftReplicatedApply(.{ .artifact_publication_transport = finalize }, .{ .term = 2, .index = finalize_index });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication_transport = finalize }, .{ .term = 2, .index = finalize_index });
     if (inject_missing_counter) committed = db.core.store.lastReplaySequence(0);
-    try db.batchRaftReplicatedApply(.{ .artifact_publication_transport = finalize }, .{ .term = 2, .index = finalize_index + 1 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication_transport = finalize }, .{ .term = 2, .index = finalize_index + 1 });
     try std.testing.expectEqual(committed, db.core.store.lastReplaySequence(0));
     const observed = try loadDerivedCoverageCounters(alloc, db.core.store, "g", command.producer_generation, null, null);
     try std.testing.expectEqual(@as(?u64, 0), observed.produced);
@@ -151687,7 +151642,7 @@ fn testAcceptedArtifactUpload(inject_missing_counter: bool) !void {
         condition.input_position = try publication.artifactRevision(&read, command.namespace, key);
         next.mutation_preconditions = (&condition)[0..1];
         next.publication_digest = next.digest();
-        try db.batchRaftReplicatedApply(.{ .artifact_publication = next }, .{ .term = 2, .index = finalize_index + 2 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = next }, .{ .term = 2, .index = finalize_index + 2 });
         var latest = try db.core.store.beginReadTxn();
         defer latest.abort();
         try std.testing.expectError(error.EnrichmentSourceChanged, provenance.readCurrentForSource(alloc, &latest, command, command.sources[0]));
@@ -151716,7 +151671,7 @@ fn testAcceptedArtifactUpload(inject_missing_counter: bool) !void {
         try validation.invalidate(alloc, &txn, (try publication.authority(&txn)).?);
         try txn.commit();
     }
-    try db.batchRaftReplicatedApply(.{ .artifact_publication = clean_page.command }, .{ .term = 2, .index = finalize_index + 3 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = clean_page.command }, .{ .term = 2, .index = finalize_index + 3 });
     {
         var latest = try db.core.store.beginReadTxn();
         defer latest.abort();
@@ -151728,7 +151683,7 @@ fn testAcceptedArtifactUpload(inject_missing_counter: bool) !void {
     defer repair_page.deinit();
     try std.testing.expect(repair_page.command.validation.?.repair_documents.len != 0);
     for (repair_page.command.validation.?.repair_documents) |document| try std.testing.expectEqualStrings("doc", document);
-    try db.batchRaftReplicatedApply(.{ .artifact_publication = repair_page.command }, .{ .term = 2, .index = finalize_index + 4 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = repair_page.command }, .{ .term = 2, .index = finalize_index + 4 });
     {
         var latest = try db.core.store.beginReadTxn();
         defer latest.abort();
@@ -151772,10 +151727,10 @@ test "db ordered artifact inventory upload resumes across restart and atomically
         var db = try DB.open(alloc, path, options);
         defer db.close();
         try db.setSchemaJson(alloc, "{}");
-        try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
+        try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
         var catalog = try db.artifactInventoryCommand(alloc);
         defer catalog.catalogs.deinit(alloc);
-        try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
         // A stale epoch is a deterministic rejection even when the authored
         // output is too large for one upload chunk. No partial artifact may
         // become visible before or after the final decision.
@@ -151785,26 +151740,26 @@ test "db ordered artifact inventory upload resumes across restart and atomically
         hashes = .{ transport.chunkDigest(0, encoded[0..codec.chunk_bytes]), transport.chunkDigest(1, encoded[codec.chunk_bytes..]) };
         begin = .{ .action = .begin, .namespace = command.namespace, .publication_digest = command.publication_digest, .command_digest = command.digest(), .encoded_len = @intCast(encoded.len), .chunk_hashes = &hashes };
         root = begin.proposedManifest().root();
-        try db.batchRaftReplicatedApply(.{ .artifact_publication_transport = begin }, .{ .term = 1, .index = 3 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication_transport = begin }, .{ .term = 1, .index = 3 });
         const base64 = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(codec.chunk_bytes));
         defer alloc.free(base64);
         _ = std.base64.standard.Encoder.encode(base64, encoded[0..codec.chunk_bytes]);
-        try db.batchRaftReplicatedApply(.{ .artifact_publication_transport = .{ .action = .chunk, .namespace = command.namespace, .publication_digest = command.publication_digest, .manifest_root = root, .ordinal = 0, .chunk_base64 = base64 } }, .{ .term = 1, .index = 4 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication_transport = .{ .action = .chunk, .namespace = command.namespace, .publication_digest = command.publication_digest, .manifest_root = root, .ordinal = 0, .chunk_base64 = base64 } }, .{ .term = 1, .index = 4 });
     }
     var reopened = try DB.open(alloc, path, options);
     defer reopened.close();
-    try reopened.batchRaftReplicatedApply(.{ .artifact_publication_transport = begin }, .{ .term = 2, .index = 5 });
+    try server_test_adapter.applyOrdered(&reopened, .{ .artifact_publication_transport = begin }, .{ .term = 2, .index = 5 });
     const tail = encoded[codec.chunk_bytes..];
     const base64 = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(tail.len));
     defer alloc.free(base64);
     _ = std.base64.standard.Encoder.encode(base64, tail);
-    try reopened.batchRaftReplicatedApply(.{ .artifact_publication_transport = .{ .action = .chunk, .namespace = command.namespace, .publication_digest = command.publication_digest, .manifest_root = root, .ordinal = 1, .chunk_base64 = base64 } }, .{ .term = 2, .index = 6 });
+    try server_test_adapter.applyOrdered(&reopened, .{ .artifact_publication_transport = .{ .action = .chunk, .namespace = command.namespace, .publication_digest = command.publication_digest, .manifest_root = root, .ordinal = 1, .chunk_base64 = base64 } }, .{ .term = 2, .index = 6 });
     const before = reopened.core.store.lastReplaySequence(0);
     const finalize: types.BatchRequest = .{ .artifact_publication_transport = .{ .action = .finalize, .namespace = command.namespace, .publication_digest = command.publication_digest, .manifest_root = root } };
-    try reopened.batchRaftReplicatedApply(finalize, .{ .term = 2, .index = 7 });
+    try server_test_adapter.applyOrdered(&reopened, finalize, .{ .term = 2, .index = 7 });
     // A lost finalize response retries from the terminal record after chunk
     // deletion; it never needs to resurrect the large original command.
-    try reopened.batchRaftReplicatedApply(finalize, .{ .term = 2, .index = 8 });
+    try server_test_adapter.applyOrdered(&reopened, finalize, .{ .term = 2, .index = 8 });
     try std.testing.expectEqual(before, reopened.core.store.lastReplaySequence(0));
     try std.testing.expectEqual(@as(u64, 8), (try reopened.raftAppliedEntry()).?.index);
     var read = try reopened.core.store.beginReadTxn();
@@ -151844,16 +151799,16 @@ test "db ordered artifact inventory idle upload retirement replays across owners
             var db = try DB.open(alloc, path, options);
             defer db.close();
             try db.setSchemaJson(alloc, "{}");
-            try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
+            try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
             var catalog = try db.artifactInventoryCommand(alloc);
             defer catalog.catalogs.deinit(alloc);
             catalog.binding.effect_protocol = 15;
-            try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
+            try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
             var activation: publication.Command = .{ .mode = .activate, .namespace = namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
             activation.publication_digest = activation.digest();
-            try db.batchRaftReplicatedApply(.{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
-            try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{\"changed\":true}" }}, .timestamp_ns = 101 }, .{ .term = 1, .index = 4 });
-            try db.batchRaftReplicatedApply(.{ .artifact_publication_transport = begin }, .{ .term = 1, .index = 5 });
+            try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
+            try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"changed\":true}" }}, .timestamp_ns = 101 }, .{ .term = 1, .index = 4 });
+            try server_test_adapter.applyOrdered(&db, .{ .artifact_publication_transport = begin }, .{ .term = 1, .index = 5 });
             {
                 var read = try db.core.store.beginReadTxn();
                 defer read.abort();
@@ -151863,8 +151818,8 @@ test "db ordered artifact inventory idle upload retirement replays across owners
                 const hint = tracker.observe(inventory, transport.RecoveryTracker.idle_ns, 0).?;
                 if (before_chunk) |expected| try std.testing.expectEqualDeep(expected, hint) else before_chunk = hint;
             }
-            try db.batchRaftReplicatedApply(.{ .artifact_publication_transport = .{ .action = .chunk, .namespace = namespace, .publication_digest = begin.publication_digest, .manifest_root = begin.proposedManifest().root(), .chunk_base64 = base64 } }, .{ .term = 1, .index = 6 });
-            try db.batchRaftReplicatedApply(.{ .artifact_publication_transport = before_chunk.?.request() }, .{ .term = 1, .index = 7 });
+            try server_test_adapter.applyOrdered(&db, .{ .artifact_publication_transport = .{ .action = .chunk, .namespace = namespace, .publication_digest = begin.publication_digest, .manifest_root = begin.proposedManifest().root(), .chunk_base64 = base64 } }, .{ .term = 1, .index = 6 });
+            try server_test_adapter.applyOrdered(&db, .{ .artifact_publication_transport = before_chunk.?.request() }, .{ .term = 1, .index = 7 });
             var read = try db.core.store.beginReadTxn();
             defer read.abort();
             const inventory = try transport.recoveryInventory(&read, namespace);
@@ -151878,8 +151833,8 @@ test "db ordered artifact inventory idle upload retirement replays across owners
         var reopened = try DB.open(alloc, path, options);
         defer reopened.close();
         const replay = reopened.core.store.lastReplaySequence(0);
-        try reopened.batchRaftReplicatedApply(.{ .artifact_publication_transport = after_chunk.?.request() }, .{ .term = 2, .index = 8 });
-        try reopened.batchRaftReplicatedApply(.{ .artifact_publication_transport = after_chunk.?.request() }, .{ .term = 2, .index = 9 });
+        try server_test_adapter.applyOrdered(&reopened, .{ .artifact_publication_transport = after_chunk.?.request() }, .{ .term = 2, .index = 8 });
+        try server_test_adapter.applyOrdered(&reopened, .{ .artifact_publication_transport = after_chunk.?.request() }, .{ .term = 2, .index = 9 });
         {
             var read = try reopened.core.store.beginReadTxn();
             defer read.abort();
@@ -151888,8 +151843,8 @@ test "db ordered artifact inventory idle upload retirement replays across owners
             try std.testing.expect((try transport.terminal(&read, namespace, begin.publication_digest)) == null);
             try std.testing.expectError(error.NotFound, read.get(&try transport.chunkKey(namespace, begin.publication_digest, 0)));
         }
-        try reopened.batchRaftReplicatedApply(.{ .artifact_publication_transport = begin }, .{ .term = 2, .index = 10 });
-        try reopened.batchRaftReplicatedApply(.{ .artifact_publication_transport = after_chunk.?.request() }, .{ .term = 2, .index = 11 });
+        try server_test_adapter.applyOrdered(&reopened, .{ .artifact_publication_transport = begin }, .{ .term = 2, .index = 10 });
+        try server_test_adapter.applyOrdered(&reopened, .{ .artifact_publication_transport = after_chunk.?.request() }, .{ .term = 2, .index = 11 });
         try std.testing.expectEqual(replay, reopened.core.store.lastReplaySequence(0));
         var read = try reopened.core.store.beginReadTxn();
         defer read.abort();
@@ -151982,7 +151937,7 @@ test "db ordered artifact inventory chunk publication authenticates complete set
         try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"chunks\"}]}" });
         try db.addEnrichment(.{ .name = "model", .kind = .embedding, .field = "body", .source_artifact_name = "chunks" });
         try db.addIndex(.{ .name = "sparse", .kind = .sparse_vector, .config_json = "{\"field\":\"sparse\",\"embedding_name\":\"model\"}" });
-        try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"text\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
+        try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"text\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
         var old = chunks.Builder.init();
         try old.append(0, "old zero");
         try old.append(1, "old one");
@@ -151998,10 +151953,10 @@ test "db ordered artifact inventory chunk publication authenticates complete set
         var catalog = try db.artifactInventoryCommand(alloc);
         defer catalog.catalogs.deinit(alloc);
         catalog.binding.effect_protocol = 15;
-        try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
         var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
         activation.publication_digest = activation.digest();
-        try db.batchRaftReplicatedApply(.{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
         var token = try Harness.capture(&db);
         defer token.deinit();
         var rows = try chunks.PreparedRows.init(alloc, "doc", "chunks", "body", &.{.{ .chunk_id = 0, .text = @constCast("new text") }});
@@ -152015,7 +151970,7 @@ test "db ordered artifact inventory chunk publication authenticates complete set
         const incomplete = try token.command(effects[0..2]);
         // The sender's next set is valid, but omitting the old tail cannot
         // pass the actual inventory fence or create an acceptance receipt.
-        try db.batchRaftReplicatedApply(.{ .artifact_publication = incomplete }, .{ .term = 1, .index = 4 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = incomplete }, .{ .term = 1, .index = 4 });
         {
             var read = try db.core.store.beginReadTxn();
             defer read.abort();
@@ -152032,7 +151987,7 @@ test "db ordered artifact inventory chunk publication authenticates complete set
         defer uncertified.deinit();
         const rejected = try uncertified.command(&.{.{ .family = .derived_vector, .key = vector_key, .value = vector, .source_index = 0 }});
         const before = db.core.store.lastReplaySequence(0);
-        try db.batchRaftReplicatedApply(.{ .artifact_publication = rejected }, .{ .term = 1, .index = 5 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = rejected }, .{ .term = 1, .index = 5 });
         try std.testing.expectEqual(before, db.core.store.lastReplaySequence(0));
         {
             var read = try db.core.store.beginReadTxn();
@@ -152045,7 +152000,7 @@ test "db ordered artifact inventory chunk publication authenticates complete set
         defer prepared.deinit();
         try std.testing.expectEqual(@as(usize, 2), prepared.batch.documents.len);
         try std.testing.expectEqual(@as(usize, 1), prepared.coverage.len);
-        try db.batchRaftReplicatedApply(.{ .artifact_publication = command }, .{ .term = 1, .index = 6 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = command }, .{ .term = 1, .index = 6 });
         {
             var read = try db.core.store.beginReadTxn();
             defer read.abort();
@@ -152071,7 +152026,7 @@ test "db ordered artifact inventory chunk publication authenticates complete set
         try std.testing.expectEqualStrings(rows.mutations[0].value.?, certified.value.?);
         try std.testing.expectEqualStrings(vector_key, certified.output_key);
         const accepted_vector = try certified.token.command(&.{.{ .family = .derived_vector, .key = certified.output_key, .value = vector, .source_index = 0 }});
-        try db.batchRaftReplicatedApply(.{ .artifact_publication = accepted_vector }, .{ .term = 1, .index = 7 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = accepted_vector }, .{ .term = 1, .index = 7 });
         {
             var read = try db.core.store.beginReadTxn();
             defer read.abort();
@@ -152140,14 +152095,14 @@ test "db ordered artifact inventory asset publication authenticates output and p
         try db.addEnrichment(.{ .name = "first", .kind = .asset, .field = "body", .content_type = "text/plain" });
         try db.addEnrichment(.{ .name = "second", .kind = .asset, .field = "body", .content_type = "text/plain" });
         try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"first\"},{\"artifact\":\"second\"}]}" });
-        try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"text\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
+        try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"text\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
         var catalog = try db.artifactInventoryCommand(alloc);
         defer catalog.catalogs.deinit(alloc);
         catalog.binding.effect_protocol = 15;
-        try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
         var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
         activation.publication_digest = activation.digest();
-        try db.batchRaftReplicatedApply(.{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
         try std.testing.checkAllAllocationFailures(alloc, Harness.checkCapture, .{&db});
         for ([_][]const u8{ "first", "second" }, [_][]const u8{ first_key, second_key }, 0..) |name, key, ordinal| {
             var token = try Harness.capture(&db, name);
@@ -152160,13 +152115,13 @@ test "db ordered artifact inventory asset publication authenticates output and p
             try std.testing.expectEqual(@as(usize, 2), prepared.coverage[0].artifact_keys.len);
             const forged = try token.command(&.{.{ .family = .document_artifact, .key = if (ordinal == 0) second_key else first_key, .value = name, .source_index = 0 }});
             try std.testing.expectError(error.InvalidBatchRequest, asset.prepare(alloc, forged, catalog.catalogs));
-            try db.batchRaftReplicatedApply(.{ .artifact_publication = command }, .{ .term = 1, .index = ordinal + 4 });
+            try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = command }, .{ .term = 1, .index = ordinal + 4 });
             var read = try db.core.store.beginReadTxn();
             defer read.abort();
             try std.testing.expect(try token.accepted(alloc, &read));
             try std.testing.expectEqualStrings(name, try read.get(key));
         }
-        try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .timestamp_ns = 101 }, .{ .term = 1, .index = 6 });
+        try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .timestamp_ns = 101 }, .{ .term = 1, .index = 6 });
         {
             var read = try db.core.store.beginReadTxn();
             defer read.abort();
@@ -152178,14 +152133,14 @@ test "db ordered artifact inventory asset publication authenticates output and p
             var token = try Harness.capture(&db, "second");
             defer token.deinit();
             const command = try token.command(&.{.{ .family = .document_artifact, .key = second_key, .value = "second", .source_index = 0 }});
-            try db.batchRaftReplicatedApply(.{ .artifact_publication = command }, .{ .term = 1, .index = 7 });
+            try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = command }, .{ .term = 1, .index = 7 });
         }
         for ([_][]const u8{ "first", "second" }, [_][]const u8{ first_key, second_key }, 0..) |name, key, ordinal| {
-            if (ordinal == 1) try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{\"revision\":2}" }}, .timestamp_ns = 102 }, .{ .term = 1, .index = 9 });
+            if (ordinal == 1) try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"revision\":2}" }}, .timestamp_ns = 102 }, .{ .term = 1, .index = 9 });
             var token = try Harness.capture(&db, name);
             defer token.deinit();
             const command = try token.command(&.{.{ .family = .document_artifact, .key = key, .value = null, .source_index = 0 }});
-            try db.batchRaftReplicatedApply(.{ .artifact_publication = command }, .{ .term = 1, .index = ordinal * 2 + 8 });
+            try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = command }, .{ .term = 1, .index = ordinal * 2 + 8 });
             const marker = try @import("artifact_coverage_epoch.zig").marker(alloc, @import("artifact_coverage_epoch.zig").forCommand(command), "text", db.core.index_manager.coverageGenerationForIndex("text").?, "doc");
             defer alloc.free(marker);
             var read = try db.core.store.beginReadTxn();
@@ -152223,11 +152178,11 @@ test "db ordered artifact inventory full text replay publishes physical coverage
         var catalog = try db.artifactInventoryCommand(alloc);
         defer catalog.catalogs.deinit(alloc);
         catalog.binding.effect_protocol = 15;
-        try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 1 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 1 });
         var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
         activation.publication_digest = activation.digest();
-        try db.batchRaftReplicatedApply(.{ .artifact_publication = activation }, .{ .term = 1, .index = 2 });
-        try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"durable projection\"}" }}, .sync_level = .full_index, .timestamp_ns = 100 }, .{ .term = 1, .index = 3 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 2 });
+        try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"durable projection\"}" }}, .sync_level = .full_index, .timestamp_ns = 100 }, .{ .term = 1, .index = 3 });
         try db.runUntilIdle();
         const entry = db.core.index_manager.textIndexEntry("text").?;
         saved = (try entry.persistent.loadProjectionSeal(alloc)) orelse return error.TestExpectedPhysicalProjectionSeal;
@@ -152339,7 +152294,7 @@ test "db ordered artifact inventory full text replay publishes physical coverage
                 try certificates.remove(&txn, "text");
                 try txn.commit();
             }
-            try db.batchRaftReplicatedApply(.{ .artifact_publication = try complete.command() }, .{ .term = 1, .index = 4 });
+            try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = try complete.command() }, .{ .term = 1, .index = 4 });
             var read = try db.core.store.beginReadTxn();
             defer read.abort();
             try std.testing.expectEqual(@as(u64, 0), (try @import("artifact_producer_obligations.zig").load(&read)).?.pending_documents);
@@ -152497,11 +152452,11 @@ test "db ordered artifact inventory materialization replay cut is owner local at
         var catalog = try db.artifactInventoryCommand(alloc);
         defer catalog.catalogs.deinit(alloc);
         namespace = catalog.namespace;
-        try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 1 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 1 });
         var activation: publication.Command = .{ .mode = .activate, .namespace = namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
         activation.publication_digest = activation.digest();
-        try db.batchRaftReplicatedApply(.{ .artifact_publication = activation }, .{ .term = 1, .index = 2 });
-        try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"one\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 3 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 2 });
+        try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"one\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 3 });
         {
             var read = try db.core.store.beginReadTxn();
             defer read.abort();
@@ -152511,7 +152466,7 @@ test "db ordered artifact inventory materialization replay cut is owner local at
             try std.testing.expectEqual(@as(u64, 0), source_guard.gap_epoch);
             try std.testing.expectEqual(db.core.store.lastReplaySequence(0), saved.replay_sequence.?);
         }
-        try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "other", .value = "{}" }}, .timestamp_ns = 101 }, .{ .term = 1, .index = 4 });
+        try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "other", .value = "{}" }}, .timestamp_ns = 101 }, .{ .term = 1, .index = 4 });
         try std.testing.expect(db.core.store.lastReplaySequence(0) > saved.replay_sequence.?);
         {
             var read = try db.core.store.beginReadTxn();
@@ -152542,7 +152497,7 @@ test "db ordered artifact inventory materialization replay cut is owner local at
             try std.testing.expectEqual(@as(u64, 1), source_guard.gap_epoch);
             try std.testing.expectEqual(@as(u64, 3), (try publication.inputRevision(&read, namespace, "doc")).?.raft.index);
         }
-        try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"two\"}" }}, .timestamp_ns = 102 }, .{ .term = 1, .index = 6 });
+        try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"two\"}" }}, .timestamp_ns = 102 }, .{ .term = 1, .index = 6 });
         {
             var read = try db.core.store.beginReadTxn();
             defer read.abort();
@@ -152588,13 +152543,13 @@ test "db ordered artifact inventory stale publications commit rejection without 
         var db = try DB.open(alloc, path, options);
         defer db.close();
         try db.setSchemaJson(alloc, "{}");
-        try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{\"text\":\"before\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
+        try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"text\":\"before\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
         var catalog = try db.artifactInventoryCommand(alloc);
         defer catalog.catalogs.deinit(alloc);
-        try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
         var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
         activation.publication_digest = activation.digest();
-        try db.batchRaftReplicatedApply(.{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
         {
             var read = try db.core.store.beginReadTxn();
             defer read.abort();
@@ -152607,21 +152562,21 @@ test "db ordered artifact inventory stale publications commit rejection without 
         stale_source = .{ .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "model", .producer_generation = 1, .producer_artifact_name = "model", .sources = (&source)[0..1], .mutations = &effects, .publication_digest = @splat(0) };
         stale_source.publication_digest = stale_source.digest();
         // A legitimate input commit wins after provider preparation/proposal.
-        try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{\"text\":\"after\"}" }}, .timestamp_ns = 101 }, .{ .term = 1, .index = 4 });
+        try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"text\":\"after\"}" }}, .timestamp_ns = 101 }, .{ .term = 1, .index = 4 });
         committed_replay = db.core.store.lastReplaySequence(0);
         const next_reservation = db.core.store.nextReplaySequence(1);
-        try db.batchRaftReplicatedApply(.{ .artifact_publication = stale_source }, .{ .term = 1, .index = 5 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = stale_source }, .{ .term = 1, .index = 5 });
         try std.testing.expectEqual(next_reservation, db.core.store.nextReplaySequence(1));
         stale_catalog = stale_source;
         stale_catalog.authority_epoch += 1;
         stale_catalog.publication_digest = stale_catalog.digest();
-        try db.batchRaftReplicatedApply(.{ .artifact_publication = stale_catalog }, .{ .term = 1, .index = 6 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = stale_catalog }, .{ .term = 1, .index = 6 });
         try std.testing.expectEqual(committed_replay, db.core.store.lastReplaySequence(0));
         try std.testing.expectEqual(@as(u64, 6), (try db.raftAppliedEntry()).?.index);
     }
     var reopened = try DB.open(alloc, path, options);
     defer reopened.close();
-    try reopened.batchRaftReplicatedApply(.{ .artifact_publication = stale_catalog }, .{ .term = 1, .index = 6 });
+    try server_test_adapter.applyOrdered(&reopened, .{ .artifact_publication = stale_catalog }, .{ .term = 1, .index = 6 });
     try std.testing.expectEqual(committed_replay, reopened.core.store.lastReplaySequence(0));
     var read = try reopened.core.store.beginReadTxn();
     defer read.abort();
@@ -152655,9 +152610,9 @@ test "db ordered artifact inventory commits receipt and detects catalog drift ac
         var command = try db.artifactInventoryCommand(alloc);
         defer command.catalogs.deinit(alloc);
         try std.testing.expect(!(try db.artifactInventoryStatus()).ready);
-        try db.batchRaftReplicatedApply(.{ .artifact_catalog = command }, .{ .term = 1, .index = 1 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = command }, .{ .term = 1, .index = 1 });
         try std.testing.expect((try db.artifactInventoryStatus()).ready);
-        try db.batchRaftReplicatedApply(.{ .artifact_catalog = command }, .{ .term = 1, .index = 1 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = command }, .{ .term = 1, .index = 1 });
     }
     var reopened = try DB.open(alloc, path, options);
     defer reopened.close();
@@ -152667,7 +152622,7 @@ test "db ordered artifact inventory commits receipt and detects catalog drift ac
     var next = try reopened.artifactInventoryCommand(alloc);
     defer next.catalogs.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 2), next.binding.epoch);
-    try reopened.batchRaftReplicatedApply(.{ .artifact_catalog = next }, .{ .term = 1, .index = 2 });
+    try server_test_adapter.applyOrdered(&reopened, .{ .artifact_catalog = next }, .{ .term = 1, .index = 2 });
     try std.testing.expect((try reopened.artifactInventoryStatus()).ready);
     // A stale command must fail its ordered CAS before reconciliation can
     // remove a legitimate newer local index or change its generation.
@@ -152708,7 +152663,7 @@ test "relational index system online admission defers during index structural mu
     try std.testing.expect(db.index_structural_mutation_mutex.tryLock());
     var held = true;
     defer if (held) db.index_structural_mutation_mutex.unlock();
-    try std.testing.expectError(error.StorageBusy, db.batchRaftReplicatedApply(command, .{ .term = 2, .index = 1 }));
+    try std.testing.expectError(error.StorageBusy, server_test_adapter.applyOrdered(&db, command, .{ .term = 2, .index = 1 }));
     db.index_structural_mutation_mutex.unlock();
     held = false;
     try std.testing.expect((try db.raftAppliedEntry()) == null);
@@ -152718,7 +152673,7 @@ test "relational index system online admission defers during index structural mu
         try std.testing.expect((try @import("../retained_effects.zig").load(&read)) == null);
         try std.testing.expect((try @import("../source_pin_state.zig").load(&read)) == null);
     }
-    try db.batchRaftReplicatedApply(command, .{ .term = 2, .index = 1 });
+    try server_test_adapter.applyOrdered(&db, command, .{ .term = 2, .index = 1 });
     try std.testing.expectEqual(@as(u64, 1), (try db.raftAppliedEntry()).?.index);
     {
         var read = try db.core.store.beginReadTxn();

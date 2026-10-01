@@ -35,7 +35,10 @@ pub const lsm_backend = runtime_impl.lsm_backend;
 
 const restore_staging_exports = @import("standalone/restore_staging_exports.zig");
 
-const storage_kernel_exports = @import("capi/db.zig");
+const storage_kernel_exports = @import("capi/server_owner.zig");
+comptime {
+    _ = @import("capi/db.zig");
+}
 
 const local_query_exports = @import("storage/local_query_provider.zig");
 

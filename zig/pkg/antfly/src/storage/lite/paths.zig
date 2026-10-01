@@ -15,7 +15,7 @@
 
 const std = @import("std");
 
-const config = @import("../../common/config.zig");
+const config = @import("../../common/local_paths.zig");
 
 pub fn defaultWorkspaceRootAlloc(allocator: std.mem.Allocator) ![]u8 {
     const base = try config.defaultLocalBaseDir(allocator);

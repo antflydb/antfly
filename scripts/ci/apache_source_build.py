@@ -49,8 +49,12 @@ def stage(root: Path, destination: Path) -> int:
             and group_for(entry, "all") == "elv2"
         ):
             removed += 1
+            if source.suffix == ".zig":
+                target = destination / entry
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text('comptime { @compileError("ELv2 implementation unavailable in Apache build"); }\n')
             continue
-        if not entry.startswith(("zig/", "scripts/", "LICENSES/")) and entry not in {
+        if not entry.startswith(("zig/", "scripts/", "specs/", "LICENSES/")) and entry not in {
             "LICENSE",
             "THIRD_PARTY_NOTICES.md",
         }:
@@ -66,7 +70,9 @@ def stage(root: Path, destination: Path) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--keep", type=Path, help="keep the staged source for inspection")
+    parser.add_argument("build_flags", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    flags = args.build_flags[1:] if args.build_flags[:1] == ["--"] else args.build_flags
     if args.keep:
         stage_dir = args.keep.resolve()
         stage_dir.mkdir(parents=True, exist_ok=True)
@@ -80,13 +86,14 @@ def main() -> None:
         environment = os.environ.copy()
         environment.pop("ZIG_LOCAL_CACHE_DIR", None)
         subprocess.run(
-            ["zig", "build", "lite", "-Doptimize=Debug", "-Dmetal=false", "-j1"],
+            ["zig", "build", "lite", "embedded-capi-check", "embedded-native-module-boundary-check",
+             "embedded-wasm-module-boundary-check", "wasm", "-Doptimize=Debug", "-Dmetal=false", *flags],
             cwd=stage_dir / "zig",
             env=environment,
             check=True,
         )
         subprocess.run(
-            ["zig", "build", "-Doptimize=Debug", "-Dmetal=false", "-j1"],
+            ["zig", "build", "-Doptimize=Debug", "-Dmetal=false", *flags],
             cwd=stage_dir / "zig/pkg/inference",
             env=environment,
             check=True,

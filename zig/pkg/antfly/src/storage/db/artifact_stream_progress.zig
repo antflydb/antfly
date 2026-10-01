@@ -504,14 +504,14 @@ test "ordered artifact inventory document stream closure requires current output
         } else try db.setSchemaJson(alloc, "{}");
         try db.addEnrichment(.{ .name = "model", .kind = .embedding, .field = "body", .expected_dims = if (dense) 2 else 0 });
         try db.addIndex(.{ .name = "vector", .kind = if (dense) .dense_vector else .sparse_vector, .config_json = if (dense) "{\"field\":\"dense\",\"dims\":2,\"embedding_name\":\"model\"}" else "{\"field\":\"sparse\",\"embedding_name\":\"model\"}" });
-        try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"hello\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"hello\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
         var catalog = try db.artifactInventoryCommand(alloc);
         defer catalog.catalogs.deinit(alloc);
         catalog.binding.effect_protocol = 15;
-        try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
         var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
         activation.publication_digest = activation.digest();
-        try db.batchRaftReplicatedApply(.{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
         var pinned_plan = try db.core.index_manager.acquireWritePlanSnapshot();
         var plan_held = true;
         defer if (plan_held) pinned_plan.release();
@@ -537,8 +537,8 @@ test "ordered artifact inventory document stream closure requires current output
         defer if (previous) |*closure| closure.deinit();
         for (0..3) |pass| {
             const index: u64 = 4 + @as(u64, @intCast(pass)) * 5;
-            if (pass == 1) try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .timestamp_ns = 101 }, .{ .term = 1, .index = index - 1 });
-            if (pass == 2) try db.batchRaftReplicatedApply(.{ .deletes = &.{"doc"}, .timestamp_ns = 102 }, .{ .term = 1, .index = index - 1 });
+            if (pass == 1) try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .timestamp_ns = 101 }, .{ .term = 1, .index = index - 1 });
+            if (pass == 2) try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .deletes = &.{"doc"}, .timestamp_ns = 102 }, .{ .term = 1, .index = index - 1 });
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
             const source = blk: {
@@ -551,7 +551,7 @@ test "ordered artifact inventory document stream closure requires current output
             const effects = [_]publication.Mutation{.{ .family = .base_vector, .key = output, .value = if (pass == 0) value else null, .source_index = 0 }};
             var command: publication.Command = .{ .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = request.index_name, .producer_generation = plan.coverageGeneration(request.index_name).?, .producer_artifact_name = @import("enrichment/enrichment_types.zig").requestEmbeddingName(request), .sources = (&source)[0..1], .mutations = &effects, .publication_digest = @splat(0) };
             command.publication_digest = command.digest();
-            try db.batchRaftReplicatedApply(.{ .artifact_publication = command }, .{ .term = 1, .index = index });
+            try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .artifact_publication = command }, .{ .term = 1, .index = index });
             try std.testing.expect(try @import("artifact_native_stream.zig").advance(alloc, db.core.store, db.root_incarnation, "doc", plan) == .closed);
             {
                 var read = try db.core.store.beginReadTxn();
@@ -619,7 +619,7 @@ test "ordered artifact inventory document stream closure requires current output
             }
             if (pass == 0) {
                 // Unrelated writes must not restart an owner-local stream.
-                try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "other", .value = "{}" }}, .timestamp_ns = 200 }, .{ .term = 1, .index = index + 1 });
+                try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .writes = &.{.{ .key = "other", .value = "{}" }}, .timestamp_ns = 200 }, .{ .term = 1, .index = index + 1 });
                 {
                     var read = try db.core.store.beginReadTxn();
                     defer read.abort();

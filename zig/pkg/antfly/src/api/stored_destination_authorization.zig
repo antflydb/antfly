@@ -22,7 +22,7 @@
 //! grant by including it in its request.
 
 const std = @import("std");
-const usermgr = @import("../usermgr/mod.zig");
+const usermgr = @import("../usermgr/user_manager.zig");
 
 pub const grant_field = "_antfly_destination_authorization_v1";
 pub const catalog_service_principal = "service:catalog";

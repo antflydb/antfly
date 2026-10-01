@@ -3322,7 +3322,7 @@ test "db ordered artifact inventory reconciles committed receiver catalog before
         .consumer_epoch = 1,
         .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
     };
-    try std.testing.expectError(error.IntegrityCatalogChanged, follower.batchRaftReplicatedApply(.{ .artifact_catalog = command, .online_source = .{ .admit = .{ .scope = invalid_scope, .artifact_catalog = command.binding } } }, .{ .term = 1, .index = 1 }));
+    try std.testing.expectError(error.IntegrityCatalogChanged, @import("../server_db_adapter.zig").applyOrdered(&follower, .{ .artifact_catalog = command, .online_source = .{ .admit = .{ .scope = invalid_scope, .artifact_catalog = command.binding } } }, .{ .term = 1, .index = 1 }));
     try std.testing.expect(follower.hasIndex("stale"));
     {
         var read = try follower.core.store.beginReadTxn();

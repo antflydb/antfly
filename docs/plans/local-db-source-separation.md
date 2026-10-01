@@ -34,7 +34,14 @@ Writer-cache identity includes adapter identity and borrowed lock identity.
 
 ## Engine boundary
 
-DB executes typed replicated mutations; `storage/db/replication_ingress.zig`
+DB executes normalized replicated mutations with one tagged receipt; wire
+versions and the eight Raft provenance alternatives stay in ingress adapters.
+Ordered entry retry, lifecycle admission, and group/completion-fence snapshot
+translation live in `storage/server_db_adapter.zig`. Local receipt writes,
+source-pin recovery, snapshot pins, repair proofs, and range finalization retain
+their existing store transactions and apply fences.
+
+`storage/db/replication_ingress.zig`
 owns envelope decoding and temporary payload allocation. Apply receipts remain
 atomic with primary mutations and derived effects. The engine also owns record
 and effect formats, durable outbox recovery, and local snapshot maintenance.
@@ -51,11 +58,37 @@ archives compile against that name together. Server runtime integration tests
 live under `storage/hot_standby`, with test-only hooks for white-box engine
 assertions. Production DB sources do not import those fixtures or runtimes.
 
-`zig build embedded-source-boundary-check` follows authored production imports
-from the embedded source root and physical DB, excluding test bodies. It rejects
-server coordination, missing sources, and imports outside the source owner, and
-runs with the existing storage test ownership audit. Native and WASM builds
-validate named module dependencies separately.
+The public C ABI has an independent root (`public_capi_root.zig`) and dependency
+facade (`capi_embedded_root.zig`). `capi/db.zig` owns its public exports;
+`capi/server_owner.zig` owns private storage-provider operations. Shared local
+handle state and the single handle registry live in `capi/handles.zig`. Server
+context, transaction recovery, and runtime hooks are opaque handle lifetimes
+with cleanup/release callbacks, preserving teardown order without importing
+server implementation types into public handles. Integration tests live in
+`capi/db_test.zig`, outside the production public source closure.
+
+Borrowed read consistency, routing deadlines, and table read callbacks do not
+import server quorum trackers or concrete routing sessions. Server join providers
+own those sessions and expose borrowed opaque state through their callbacks.
+The browser source profile contains DB and local query owners without native
+writer configuration. The local inference provider adapter lives in storage;
+standalone keeps a compatibility facade over the same implementation.
+
+`zig build embedded-source-boundary-check` follows authored imports from the
+embedded root, physical DB, and public C API, excluding test-only owners.
+`embedded-native-module-boundary-check` and `embedded-wasm-module-boundary-check`
+resolve named imports against each target's actual `Build.Module` import tables.
+They retain unknown conditional branches and select only conditions proven by
+the target or its generated build options. Native public C API object compilation
+is independently available through `zig build embedded-capi-check`.
+
+`python3 zig/tools/check_embedded_isolated_build.py` stages the working source
+inputs with server coordination and private C API implementations replaced
+by unconditional compile-time traps, then compiles the
+public C API and complete WASM artifact and checks their module graphs. It runs
+in `zig-full / x86_64` on main merges/full validation, not as a new per-PR gate.
+The traps satisfy Zig’s cache scans of dormant test imports; any live server
+import fails compilation and the module audit independently rejects its owner.
 
 Local index reconciliation has its own result summary; server provisioning
 keeps group/root counts separately. Local range observation limits and catalog
@@ -67,10 +100,10 @@ replica-catalog restore admission stays under server Raft storage.
 
 The physical DB and its complete local source closure must still move into
 `antfly-embedded`. The local source owner now uses shared APIs directly rather
-than server facades. The native C API's private server owner operations also
-need separate ownership, while its public local DB/inference surface and WASM
-build must remain independently buildable. Source-boundary checks and staged
-build verification will enforce that separation.
+than server facades. Public C API and private server operation ownership are now separate. Keep
+the isolated native/WASM checks passing throughout the physical package move.
+The licensing PR applies Apache classification to the local source closure;
+this structural PR preserves existing source licenses.
 
 ## Review and merge order
 

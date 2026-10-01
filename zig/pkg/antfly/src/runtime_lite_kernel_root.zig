@@ -15,7 +15,7 @@
 
 //! Apache embedded engine owner; no database HTTP or distributed entry points.
 pub const antfly_sources = @import("source_owner_lite.zig");
-pub const runtime_impl = @import("lite_capi_root.zig");
+pub const runtime_impl = @import("capi_embedded_root.zig");
 const std = @import("std");
 const bridge = @import("runtime_bridge.zig");
 const process = @import("runtime_process.zig");

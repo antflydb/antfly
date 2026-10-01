@@ -759,7 +759,7 @@ test "apply rw lock concurrent readers preserve writer exclusion through repeate
     }
 }
 
-const LockVoprHarness = struct {
+const LockVoprHarness = if (builtin.is_test) struct {
     const vopr = @import("vopr");
     runtime: *vopr.vopr_io.VoprIo,
     enabled: vopr.transition.List = .{},
@@ -794,7 +794,7 @@ const LockVoprHarness = struct {
         }
         return error.LockWaitersDidNotComplete;
     }
-};
+} else struct {};
 
 test "apply rw lock VOPR wakes shared and exclusive waiters without advancing time" {
     var runtime = try LockVoprHarness.vopr.vopr_io.VoprIo.init(.{});

@@ -77,10 +77,8 @@ pub const RoutingBudget = struct {
     }
 };
 
-pub const table_catalog = @This();
-
 pub const RouteBudget = struct {
-    clock: table_catalog.RoutingBudget = .{},
+    clock: RoutingBudget = .{},
     cancellation: ?@import("antfly_cancellation").CancellationToken = null,
 
     pub fn fromRequest(request: anytype) RouteBudget {

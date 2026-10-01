@@ -17,7 +17,7 @@
 //! Implementations stay in table_reads.zig.
 
 const std = @import("std");
-const read_gate = @import("../raft/read_gate.zig");
+const read_gate = @import("../storage/read_consistency.zig");
 const db_types = @import("../storage/db/types.zig");
 const runtime_preflight = @import("../storage/db/runtime_preflight.zig");
 const dynamic_field_capability = @import("../storage/db/dynamic_field_capability.zig");
@@ -124,6 +124,7 @@ pub const JoinReadView = struct {
     routing_session: ?*RoutingSessionHandle = null,
     source: TableReadSource,
     destroy: *const fn (*JoinReadView) void,
+
     pub fn deinit(self: *JoinReadView) void {
         self.destroy(self);
     }

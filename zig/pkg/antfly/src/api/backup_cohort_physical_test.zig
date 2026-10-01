@@ -92,9 +92,9 @@ fn testTopologyHAControls(comptime replicated: bool, comptime split: bool) !void
     const fence: topology.Fence = .{ .transition_id = 81, .attempt = 1, .admission_epoch = identity.next_epoch, .owner_group_id = 31, .peer_group_id = if (replicated) 32 else 31, .role = if (split) .split_source else if (replicated) .merge_source else .backup_snapshot, .namespace = namespace, .catalog_digest = identity.catalog_digest };
     const begin_request: @import("../storage/db/types.zig").BatchRequest = .{ .relational_topology = .{ .fence = fence, .action = .begin } };
     if (replicated) {
-        try source.batchRaftReplicatedApply(begin_request, .{ .index = 1, .term = 1 });
+        try @import("../storage/server_db_adapter.zig").applyOrdered(&source, begin_request, .{ .index = 1, .term = 1 });
         const first_lsn = primary.lastLsn();
-        try source.batchRaftReplicatedApply(begin_request, .{ .index = 1, .term = 1 });
+        try @import("../storage/server_db_adapter.zig").applyOrdered(&source, begin_request, .{ .index = 1, .term = 1 });
         try std.testing.expectEqual(first_lsn, primary.lastLsn());
     } else try source.batch(begin_request);
     var begin = (try primary.log.entryAt(alloc, primary.lastLsn())).?;
@@ -111,9 +111,9 @@ fn testTopologyHAControls(comptime replicated: bool, comptime split: bool) !void
     else
         .{ .relational_topology = .{ .fence = fence, .action = if (replicated) .abort_transition else .release } };
     if (replicated) {
-        try source.batchRaftReplicatedApply(release_request, .{ .index = 2, .term = 1 });
+        try @import("../storage/server_db_adapter.zig").applyOrdered(&source, release_request, .{ .index = 2, .term = 1 });
         const final_lsn = primary.lastLsn();
-        try source.batchRaftReplicatedApply(release_request, .{ .index = 2, .term = 1 });
+        try @import("../storage/server_db_adapter.zig").applyOrdered(&source, release_request, .{ .index = 2, .term = 1 });
         try std.testing.expectEqual(final_lsn, primary.lastLsn());
     } else try source.batch(release_request);
     var release = (try primary.log.entryAt(alloc, primary.lastLsn())).?;

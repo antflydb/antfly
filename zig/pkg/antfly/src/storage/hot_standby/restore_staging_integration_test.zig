@@ -96,25 +96,25 @@ test "relational integrity restore staging Raft controls retain HA append obliga
         };
         const begin: types.BatchRequest = .{ .restore_staging = .{ .begin = scope } };
         if (synchronous) {
-            try std.testing.expectError(error.InjectedRestoreMirrorWaitFailure, target.batchRaftReplicatedApply(begin, .{ .term = 1, .index = 1 }));
+            try std.testing.expectError(error.InjectedRestoreMirrorWaitFailure, @import("../server_db_adapter.zig").applyOrdered(&target, begin, .{ .term = 1, .index = 1 }));
             try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
         }
-        try target.batchRaftReplicatedApply(begin, .{ .term = 1, .index = 1 });
-        try target.batchRaftReplicatedApply(begin, .{ .term = 1, .index = 1 });
+        try @import("../server_db_adapter.zig").applyOrdered(&target, begin, .{ .term = 1, .index = 1 });
+        try @import("../server_db_adapter.zig").applyOrdered(&target, begin, .{ .term = 1, .index = 1 });
         try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
         var raft_index: u64 = 2;
         while (true) : (raft_index += 1) {
             var page = try target.prepareRestoreStagingPage(alloc, scope, &source, 128, .none);
             defer page.deinit();
             if (page.batch) |batch| {
-                try target.batchRaftReplicatedApply(batch, .{ .term = 1, .index = raft_index });
-                try target.batchRaftReplicatedApply(batch, .{ .term = 1, .index = raft_index });
+                try @import("../server_db_adapter.zig").applyOrdered(&target, batch, .{ .term = 1, .index = raft_index });
+                try @import("../server_db_adapter.zig").applyOrdered(&target, batch, .{ .term = 1, .index = raft_index });
             }
             if (page.phase == .imported) break;
         }
         for ([_]Phase{ .validated, .published }) |phase| {
             raft_index += 1;
-            try target.batchRaftReplicatedApply(.{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = phase } } }, .{ .term = 1, .index = raft_index });
+            try @import("../server_db_adapter.zig").applyOrdered(&target, .{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = phase } } }, .{ .term = 1, .index = raft_index });
         }
         var saw_import = false;
         for (1..primary.lastLsn() + 1) |lsn| {

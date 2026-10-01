@@ -22741,7 +22741,7 @@ pub const ProvisionedTableWriteSource = struct {
                     else
                         try applyReplicatedTransactionMutation(alloc, cached.db, table_name, group_id, apply_req);
                 } else if (raft_entry) |entry| {
-                    cached.db.batchRaftReplicatedApply(apply_req, entry) catch |err| {
+                    @import("../storage/server_db_adapter.zig").applyOrdered(&cached.db, apply_req, entry) catch |err| {
                         preserve_writer_on_error = err == error.RaftApplyWriterUnavailable;
                         return err;
                     };
@@ -22806,7 +22806,7 @@ pub const ProvisionedTableWriteSource = struct {
                     else
                         try applyReplicatedTransactionMutation(alloc, &db, table_name, group_id, apply_req);
                 } else if (raft_entry) |entry|
-                    try db.batchRaftReplicatedApply(apply_req, entry)
+                    try @import("../storage/server_db_adapter.zig").applyOrdered(&db, apply_req, entry)
                 else
                     try db.batchReplicatedApply(apply_req);
             }
@@ -27739,7 +27739,7 @@ pub const applyStorageKernelReplicatedBatch = physical_local_write.applyStorageK
 
 /// Apply one exact committed data-Raft entry inside the physical storage
 /// provider. The entry marker and mutation share the same backend commit.
-pub const applyStorageKernelReplicatedBatchAtRaftEntry = physical_local_write.applyStorageKernelReplicatedBatchAtRaftEntry;
+pub const applyStorageKernelReplicatedBatchAtRaftEntry = @import("../storage/server_db_adapter.zig").applyStorageKernelReplicatedBatchAtRaftEntry;
 
 const applyReplicatedTransactionMutation = physical_local_write.applyReplicatedTransactionMutation;
 
@@ -40336,7 +40336,7 @@ fn implementationTests() type {
             defer writer.deinit(alloc);
             try writer.db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
             try writer.db.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "z", .target = "a", .edge_type = "link", .weight = 1 }}, .sync_level = .full_index });
-            try writer.db.batchRaftReplicatedApply(.{ .split_transition = .{ .kind = .finalize, .transition_id = 1, .attempt_epoch = 1, .destination_group_id = 2, .split_key = "m" } }, .{ .term = 1, .index = 1 });
+            try @import("../storage/server_db_adapter.zig").applyOrdered(&writer.db, .{ .split_transition = .{ .kind = .finalize, .transition_id = 1, .attempt_epoch = 1, .destination_group_id = 2, .split_key = "m" } }, .{ .term = 1, .index = 1 });
             const merge = db_mod.types.BatchRequest{ .merge_checkpoint = .{
                 .kind = .accept,
                 .transition_id = 10,

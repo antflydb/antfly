@@ -15,9 +15,7 @@
 
 const std = @import("std");
 const trace_file = @import("trace_file.zig");
-const raft_engine = @import("raft_engine");
 const antfly_trace_writer = @import("antfly_trace_writer.zig");
-const raft_trace_logger = @import("raft_trace_logger.zig");
 
 /// A std.Io.Writer backed by libc write(2) to a trace output fd.
 ///
@@ -115,10 +113,7 @@ pub fn stderrAntflyTraceWriter() antfly_trace_writer.AntflyTraceWriter {
     return S.ndjson_writer.traceWriter();
 }
 
-/// Module-level singleton trace logger for Raft events.
-pub fn stderrRaftTraceLogger() raft_engine.core.TraceLogger {
-    const S = struct {
-        var ndjson_logger: raft_trace_logger.RaftNdjsonTraceLogger = .{ .writer = &trace_writer_instance, .shared_mutex = &trace_mutex };
-    };
-    return S.ndjson_logger.traceLogger();
+/// Borrowed process trace sink; adapters share the same output lock.
+pub fn traceSink() struct { writer: *std.Io.Writer, mutex: *std.atomic.Mutex } {
+    return .{ .writer = &trace_writer_instance, .mutex = &trace_mutex };
 }

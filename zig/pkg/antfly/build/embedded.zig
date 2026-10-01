@@ -260,7 +260,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     _ = lib;
 
     const capi_root_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/capi_root.zig"),
+        .root_source_file = b.path("pkg/antfly/src/public_capi_root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -278,13 +278,12 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     capi_root_mod.addImport("usermgr_storage", capi_usermgr_storage_mod);
 
     const capi_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/capi/db.zig"),
+        .root_source_file = b.path("pkg/antfly/src/public_capi_root.zig"),
         .target = target,
         .optimize = optimize,
         .pic = true,
     });
     antfly_imports.storage_boundary.configure(capi_mod, false, false);
-    capi_mod.addImport("antfly_source_root", capi_root_mod);
     capi_mod.addImport("antfly_platform", platform_mod);
     const capi_options = b.addOptions();
     capi_options.addOption(bool, "linked_storage", false);
@@ -294,9 +293,23 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     // directly (no archive/trap boundary either way).
     capi_options.addOption(bool, "inference_enabled", true);
     capi_mod.addOptions("capi_build_options", capi_options);
-    capi_mod.addImport("antfly_storage_root", capi_root_mod);
+    capi_root_mod.addOptions("capi_build_options", capi_options);
+    capi_root_mod.addImport("antfly_storage_root", capi_root_mod);
     capi_mod.addImport("antfly_vector", vector_mod);
     capi_mod.addImport("structlog", structlog_mod);
+
+    // Public C API compilation has its own physical/local source owner. No
+    // private storage-provider archive is needed to analyze this object.
+    antfly_imports.configureEmbedded(b, capi_mod, link_libc);
+    capi_mod.addImport("antfly_storage_root", capi_mod);
+    const capi_native_object = b.addObject(.{
+        .name = "antfly-embedded-capi",
+        .root_module = capi_mod,
+    });
+    const capi_native_check = b.step("embedded-capi-check", "Compile the public C API with its independent local source owner");
+    capi_native_check.dependOn(&capi_native_object.step);
+    const capi_boundary = @import("embedded_boundary.zig").add(b, capi_mod);
+    b.step("embedded-native-module-boundary-check", "Resolve the native public C API source and module boundary").dependOn(&capi_boundary.step);
 
     // The C ABI links the Apache Lite owner, enrichment and inference archives.
     // The ELv2 executable has its own storage owner for server-only exports;
@@ -514,23 +527,23 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi lite drains an antfly embedder with no api_url through the embedded inference provider",
         "capi inference options are prefix compatible and reject unknown flags and reserved bits",
         "capi inference calls reject null, closed, and database handles",
-        "capi inference lists models and reports route errors with the runtime's JSON",
+        "capi inference lists models and reports route errors",
         "capi inference embeds text with a local model",
         "capi inference reranks documents with a local model",
         "capi inference chunks text without a model",
         "capi inference generates text with a local model and rejects streaming",
         "capi inference pull rejects invalid requests with a JSON error",
-        "capi inference pulls a model with progress into the handle's models directory",
+        "capi inference pulls a model with progress",
         "capi inference streaming reports request errors without a model",
         "capi get edges json does not double free a non-empty edge slice",
         "run until idle no-progress error maps to a dedicated stalled ABI code, not internal",
         "capi lite merged indexes JSON discovers a standalone asset extractor and chunk enrichment with no owning index",
         "capi lite run until idle drains a standalone chunk enrichment with no owning index",
-        "capi lite AddIndexJSON registers a graph config's nested resolvers",
+        "capi lite AddIndexJSON registers a graph config",
         "capi lite AddIndexJSON restores the enrichment catalog when admission rejects the index",
     };
     const capi_tests = b.addTest(.{
-        .root_module = capi_mod,
+        .root_module = capi_root_mod,
         // Storage-backed Mach-O ReleaseSafe codegen needs 12 GiB headroom.
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
         .filters = selectTestFilters(b, &capi_default_filters),
@@ -553,7 +566,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .embedded_db_mod = embedded_db_mod,
         .embedded_support_mod = embedded_support_mod,
         .capi_root_mod = capi_root_mod,
-        .capi_mod = capi_mod,
+        .capi_mod = capi_root_mod,
         .libantfly_link_mod = libantfly_link_mod,
         .install_libantfly = install_libantfly,
         .install_capi_header = install_capi_header,

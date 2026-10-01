@@ -134,6 +134,7 @@ fn JoinReadBinding(comptime Source: type) type {
         session: table_catalog.RoutingSession,
         alloc: std.mem.Allocator,
         routed: Source,
+        session: table_catalog.RoutingSession,
         fn acquire(ptr: *anyopaque, alloc: std.mem.Allocator, budget: table_router.RouteBudget) !*@import("table_read_source.zig").JoinReadView {
             try budget.check();
             const source: *Source = @ptrCast(@alignCast(ptr));

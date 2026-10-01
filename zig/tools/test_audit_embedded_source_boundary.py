@@ -16,11 +16,40 @@
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from audit_embedded_source_boundary import audit, production_imports
+from check_embedded_isolated_build import stage_sources
+
+from audit_embedded_source_boundary import audit, production_imports, audit_modules
 
 
 class EmbeddedBoundaryTest(unittest.TestCase):
+    def test_isolated_stage_keeps_working_sources_and_omits_server_owners(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory) / "repo"
+            stage = Path(directory) / "stage"
+            files = {
+                "zig/pkg/antfly/src/storage/db/db.zig": "local working change",
+                "zig/pkg/antfly/src/storage/server_db_adapter.zig": "server",
+                "zig/pkg/antfly/src/capi/server_owner.zig": "private server",
+                "zig/pkg/antfly/src/tracing/server_raft_writer.zig": "raft trace",
+                "specs/openapi/public.yaml": "contract",
+                "scripts/codegen.py": "generator",
+                "docs/plan.md": "unrelated",
+            }
+            for name, content in files.items():
+                path = repository / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content)
+            listing = b"\0".join(name.encode() for name in files) + b"\0"
+            with patch("check_embedded_isolated_build.subprocess.check_output", return_value=listing):
+                self.assertEqual(stage_sources(repository, stage), 3)
+            self.assertEqual((stage / "zig/pkg/antfly/src/storage/db/db.zig").read_text(), "local working change")
+            self.assertTrue((stage / "specs/openapi/public.yaml").is_file())
+            self.assertTrue((stage / "scripts/codegen.py").is_file())
+            self.assertIn('@compileError("server implementation unavailable', (stage / "zig/pkg/antfly/src/capi/server_owner.zig").read_text())
+            self.assertFalse((stage / "docs/plan.md").exists())
+
     def test_dynamic_imports_fail_closed(self):
         with self.assertRaisesRegex(ValueError, "literal source owner"):
             production_imports("const server = @import(source_path);")
@@ -69,6 +98,58 @@ fn lazy() void { _ = @import("local.zig"); }
                 entry.write_text(f'const db = @import("{dependency}");')
                 with self.assertRaisesRegex(ValueError, message):
                     audit(root, ["root.zig"])
+
+    def test_test_only_owner_and_nonempty_fallback(self):
+        source = '\n'.join([
+            'const fixture = if (builtin.is_test) @import("raft/fixture.zig") else struct {};',
+            'const oracle = if (builtin.is_test) @import("lmdb_engine") else struct { const local = @import("fallback.zig"); };',
+            'const Harness = if (builtin.is_test) struct { const runtime = @import("vopr"); } else struct {};',
+        ])
+        self.assertEqual(production_imports(source, include_named=True), ["fallback.zig"])
+
+    def test_target_alternatives_keep_unknown_options(self):
+        source = ('const remote = if (builtin.os.tag == .freestanding or build_options.minimal) '
+                  '@import("stub.zig") else @import("remote");')
+        self.assertEqual(production_imports(source, include_named=True, target_os="freestanding"), ["stub.zig"])
+        self.assertEqual(production_imports(source, include_named=True, target_os="linux"), ["stub.zig", "remote"])
+
+    def test_disabled_backend_guard_excludes_only_its_function(self):
+        source = ('fn disabled() void { if (comptime !build_options.enable_pjrt) return error.Unavailable; '
+                  '_ = @import("pjrt"); } fn other() void { _ = @import("local.zig"); }')
+        self.assertEqual(production_imports(source, include_named=True, options={"enable_pjrt": False}), ["local.zig"])
+        self.assertEqual(production_imports(source, include_named=True, options={"enable_pjrt": True}), ["pjrt", "local.zig"])
+        self.assertEqual(production_imports(source, include_named=True, options={}), ["pjrt", "local.zig"])
+
+    def test_target_struct_branch_preserves_local_imports(self):
+        source = ('const backend = if (@import("builtin").os.tag == .freestanding) '
+                  'struct { const local = @import("portable.zig"); } else @import("native");')
+        self.assertEqual(production_imports(source, include_named=True, target_os="freestanding"), ["builtin", "portable.zig"])
+        self.assertEqual(production_imports(source, include_named=True, target_os="linux"), ["builtin", "native"])
+
+    def test_named_modules_use_their_own_import_tables(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            first = project / "first.zig"
+            second = project / "second.zig"
+            local = project / "local.zig"
+            first.write_text('const child = @import("shared");')
+            second.write_text('const local = @import("shared");')
+            local.write_text("")
+            self.assertEqual(audit_modules(project, {"first": first, "second": second, "local": local},
+                {("first", "shared"): "second", ("second", "shared"): "local"}, "first"), 3)
+            with self.assertRaisesRegex(ValueError, "unresolved module"):
+                audit_modules(project, {"first": first}, {}, "first")
+
+    def test_named_module_cannot_hide_a_server_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            owner = project / "pkg/antfly/src/storage/server_db_adapter.zig"
+            owner.parent.mkdir(parents=True)
+            owner.write_text("")
+            entry = project / "entry.zig"
+            entry.write_text('const innocent_name = @import("contracts");')
+            with self.assertRaisesRegex(ValueError, "server coordination"):
+                audit_modules(project, {"entry": entry, "server": owner}, {("entry", "contracts"): "server"}, "entry")
 
 
 if __name__ == "__main__":

@@ -26,6 +26,13 @@ import check_apache_boundary as boundary
 
 
 class ApacheBoundaryTests(unittest.TestCase):
+    def test_production_closure_excludes_explicit_server_test_owners(self):
+        _, errors = self.check_fixture('test "server integration" { _ = @import("main.zig"); }\n'
+            'const fixture = if (builtin.is_test) @import("main.zig") else struct {};')
+        self.assertEqual(errors, [])
+        _, errors = self.check_fixture('fn lazy() void { _ = @import("main.zig"); }')
+        self.assertTrue(any("non-Apache dependency" in error for error in errors))
+
     def check_fixture(self, source: str, files: dict[str, str] | None = None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

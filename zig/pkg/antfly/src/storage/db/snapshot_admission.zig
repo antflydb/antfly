@@ -20,6 +20,7 @@
 //! caller's lease, even when a waiting capture has closed reader admission.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const apply_rw_lock_mod = @import("apply_rw_lock.zig");
 
 pub const SnapshotAdmission = struct {
@@ -128,7 +129,7 @@ test "storage.db snapshot admission capture explicitly lends maintenance permiss
     try std.testing.expect(!admission.lock.tryLockShared());
 }
 
-const AdmissionVoprHarness = struct {
+const AdmissionVoprHarness = if (builtin.is_test) struct {
     const vopr = @import("vopr");
     runtime: *vopr.vopr_io.VoprIo,
 
@@ -163,7 +164,7 @@ const AdmissionVoprHarness = struct {
         }
         return error.AdmissionTasksDidNotComplete;
     }
-};
+} else struct {};
 
 test "storage.db snapshot admission VOPR capture excludes another task and cancellation retires its waiter" {
     const Work = struct {

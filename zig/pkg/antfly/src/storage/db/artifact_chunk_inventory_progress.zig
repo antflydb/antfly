@@ -259,7 +259,7 @@ test "ordered artifact inventory reconstruction orders bounded pages and resumes
     try db.addEnrichment(.{ .name = "units", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"document_extraction\"}" });
     try db.addEnrichment(.{ .name = "unit-chunks", .kind = .chunk, .field = "body", .source_artifact_name = "units", .chunk_size = 4 });
     try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"chunks\"}]}" });
-    try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"text\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"text\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
     var expected = chunks.Builder.init();
     {
         var txn = try db.core.store.beginWriteTxn();
@@ -282,10 +282,10 @@ test "ordered artifact inventory reconstruction orders bounded pages and resumes
     var catalog = try db.artifactInventoryCommand(alloc);
     defer catalog.catalogs.deinit(alloc);
     catalog.binding.effect_protocol = 15;
-    try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
     var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activation.publication_digest = activation.digest();
-    try db.batchRaftReplicatedApply(.{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
     var index: u64 = 4;
     var pages: usize = 0;
     var raced = false;
@@ -365,7 +365,7 @@ test "ordered artifact inventory reconstruction orders bounded pages and resumes
                 try std.testing.expectError(error.DurableRootIncarnationUnavailable, page.stage(&txn, db.root_incarnation + 1));
                 _ = try page.stage(&txn, db.root_incarnation);
             }
-            try db.batchRaftReplicatedApply(.{ .artifact_publication = command }, .{ .term = 1, .index = index });
+            try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .artifact_publication = command }, .{ .term = 1, .index = index });
             index += 1;
             {
                 var txn = try db.core.store.beginWriteTxn();
@@ -375,7 +375,7 @@ test "ordered artifact inventory reconstruction orders bounded pages and resumes
             if (!page.complete) {
                 // Simulate a lost delivery reply: replay at a new log index is
                 // idempotent and cannot advance the accepted prefix twice.
-                try db.batchRaftReplicatedApply(.{ .artifact_publication = command }, .{ .term = 1, .index = index });
+                try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .artifact_publication = command }, .{ .term = 1, .index = index });
                 index += 1;
                 var txn = try db.core.store.beginReadTxn();
                 defer txn.abort();
@@ -433,7 +433,7 @@ test "ordered artifact inventory reconstruction orders bounded pages and resumes
                 };
                 if (unit_pages == 0) try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &txn, db.root_incarnation, command, plan.plan() });
             }
-            try db.batchRaftReplicatedApply(.{ .artifact_publication = command }, .{ .term = 1, .index = index });
+            try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .artifact_publication = command }, .{ .term = 1, .index = index });
             index += 1;
             if (page.complete) {
                 var txn = try db.core.store.beginReadTxn();

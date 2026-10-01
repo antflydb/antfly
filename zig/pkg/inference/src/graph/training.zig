@@ -2467,7 +2467,7 @@ fn resolveWrtParams(
 
 // ── PJRT compile-once training session ─────────────────────────────
 
-const pjrt_compiler_mod = @import("pjrt_compiler.zig");
+const pjrt_compiler_mod = if (build_options.enable_pjrt) @import("pjrt_compiler.zig") else struct {};
 const build_options = @import("build_options");
 const pjrt_pkg = if (build_options.enable_pjrt) @import("pjrt") else struct {
     pub const pjrt = struct {

@@ -459,7 +459,7 @@ test "initial self FK reserves one hidden child owner and no duplicate parent ro
         var db = try @import("../../storage/db/db.zig").DB.open(alloc, db_path, db_options);
         defer db.close();
         try std.testing.expectError(error.InitialChildNotPublished, db.lookup(alloc, "unpublished", .{}));
-        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .provision_initial_child, .fence = child_fence, .initial_child_provision = .{
+        try @import("../../storage/server_db_adapter.zig").applyOrdered(&db, .{ .relational_topology = .{ .action = .provision_initial_child, .fence = child_fence, .initial_child_provision = .{
             .schema_json = bound_schema,
             .child_table_name = child.name,
             .plan_id = id,
@@ -501,7 +501,7 @@ test "initial self FK reserves one hidden child owner and no duplicate parent ro
         var db = try @import("../../storage/db/db.zig").DB.open(alloc, db_path, db_options);
         defer db.close();
         try std.testing.expectError(error.InitialChildNotPublished, db.lookup(alloc, "unpublished", .{}));
-        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .release_initial_child, .fence = child_fence, .initial_child_control = .{
+        try @import("../../storage/server_db_adapter.zig").applyOrdered(&db, .{ .relational_topology = .{ .action = .release_initial_child, .fence = child_fence, .initial_child_control = .{
             .plan_id = id,
             .plan_digest = bootstrap.plan_digest,
             .schema_version = candidate.schema_version,

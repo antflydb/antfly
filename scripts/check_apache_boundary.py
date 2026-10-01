@@ -34,9 +34,14 @@ from license_headers import (
     read_header,
 )
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "zig/tools"))
+from audit_embedded_source_boundary import production_source
+
 SOURCE_ROOT = "zig/pkg/antfly/src/"
 ENTRYPOINTS = (
     "runtime_lite_kernel_root.zig",
+    "public_capi_root.zig",
     "runtime_inference_root.zig",
     "runtime_inference_main.zig",
     "runtime_enrichment_compute_root.zig",
@@ -199,7 +204,7 @@ SOURCE_MODULES = {
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_reranking_openapi/root.zig",
     ),
     "antfly_resolver": ("zig/lib/resolver/src/mod.zig",),
-    "antfly_root": ("zig/pkg/antfly/src/lite_capi_root.zig",),
+    "antfly_root": ("zig/pkg/antfly/src/capi_embedded_root.zig",),
     "antfly_s3_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_s3_openapi/root.zig",
     ),
@@ -214,7 +219,7 @@ SOURCE_MODULES = {
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_sort_openapi/root.zig",
     ),
     "antfly_source_root": ("zig/pkg/antfly/src/source_owner_lite.zig",),
-    "antfly_storage_root": ("zig/pkg/antfly/src/lite_capi_root.zig",),
+    "antfly_storage_root": ("zig/pkg/antfly/src/capi_embedded_root.zig",),
     "antfly_synthesizing": ("zig/lib/synthesizing/src/mod.zig",),
     "antfly_transcribing": ("zig/lib/transcribing/src/mod.zig",),
     "antfly_vector": ("zig/lib/vector/src/mod.zig",),
@@ -447,7 +452,7 @@ def check_sources(root: Path = ROOT) -> tuple[set[str], list[str]]:
         source = path.read_text()
         if not third_party and has_elv2_notice(source):
             errors.append(f"conflicting ELv2 notice in Apache source: {name}")
-        dependencies = list(source_dependencies(source))
+        dependencies = list(source_dependencies(production_source(source)))
         for dependency in dependencies:
             if dependency.path is None:
                 line = source.count("\n", 0, dependency.offset) + 1

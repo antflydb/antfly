@@ -1239,12 +1239,7 @@ pub fn resolveLocalBaseDir(alloc: std.mem.Allocator, cfg: ?*const Config) ![]u8 
     return try defaultLocalBaseDir(alloc);
 }
 
-pub fn defaultLocalBaseDir(alloc: std.mem.Allocator) ![]u8 {
-    const home_var = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
-    const home = platform.env.getenv(home_var) orelse return try alloc.dupe(u8, "antflydb");
-    if (home.len == 0) return try alloc.dupe(u8, "antflydb");
-    return try std.fs.path.join(alloc, &.{ home, ".antfly" });
-}
+pub const defaultLocalBaseDir = @import("local_paths.zig").defaultLocalBaseDir;
 
 fn parseMetadataConfig(
     alloc: std.mem.Allocator,

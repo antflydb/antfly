@@ -13,6 +13,8 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const server_test_adapter = if (builtin.is_test) @import("../server_db_adapter.zig") else struct {};
+const builtin = @import("builtin");
 const hot_standby_publisher_adapter = @import("../hot_standby/db_commit.zig");
 const hot_standby_write_gate_adapter = @import("../hot_standby/write_gate.zig");
 const replication_ingress = @import("replication_ingress.zig");
@@ -218,7 +220,7 @@ test "self-FK dual owner preserves one admission fence across begin stage and ac
         // A transaction admitted before the fence must resolve before the
         // dual-role parent can stage the new accepted generation.
         const old_txn = try db.beginTransaction(1_700_000_000_000_000_000);
-        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .begin, .fence = fence } }, .{ .term = 1, .index = 1 });
+        try server_test_adapter.applyOrdered(&db, .{ .relational_topology = .{ .action = .begin, .fence = fence } }, .{ .term = 1, .index = 1 });
         try std.testing.expectError(error.TransactionTopologyBusy, db.applyRelationalTopologyControl(.{ .action = .stage_child_generation, .fence = fence, .child_generations = &.{transition} }, null));
         try db.abortTransaction(old_txn, 1_700_000_000_000_000_001);
     }
@@ -233,9 +235,9 @@ test "self-FK dual owner preserves one admission fence across begin stage and ac
         split.transition_id = 99;
         split.admission_epoch += 1;
         try std.testing.expectError(error.IntegrityTopologyBusy, db.applyRelationalTopologyControl(.{ .action = .begin, .fence = split }, null));
-        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .begin, .fence = fence } }, .{ .term = 1, .index = 1 });
-        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .stage_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 1, .index = 2 });
-        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .stage_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 1, .index = 2 });
+        try server_test_adapter.applyOrdered(&db, .{ .relational_topology = .{ .action = .begin, .fence = fence } }, .{ .term = 1, .index = 1 });
+        try server_test_adapter.applyOrdered(&db, .{ .relational_topology = .{ .action = .stage_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 1, .index = 2 });
+        try server_test_adapter.applyOrdered(&db, .{ .relational_topology = .{ .action = .stage_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 1, .index = 2 });
     }
     {
         var db = try db_mod.DB.open(alloc, path, options);
@@ -243,8 +245,8 @@ test "self-FK dual owner preserves one admission fence across begin stage and ac
         try std.testing.expect((try db.relationalTopologyStatus()).fence.?.eql(fence));
         try std.testing.expect(try db.childGenerationSourcePinsSchemaJson(next_json));
         try std.testing.expectError(error.GenerationAdmissionActivationRequired, db.applyRelationalTopologyControl(.{ .action = .release, .fence = fence }, null));
-        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .activate_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 1, .index = 3 });
-        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .activate_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 1, .index = 3 });
+        try server_test_adapter.applyOrdered(&db, .{ .relational_topology = .{ .action = .activate_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 1, .index = 3 });
+        try server_test_adapter.applyOrdered(&db, .{ .relational_topology = .{ .action = .activate_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 1, .index = 3 });
     }
     {
         var db = try db_mod.DB.open(alloc, path, options);
@@ -257,8 +259,8 @@ test "self-FK dual owner preserves one admission fence across begin stage and ac
             defer read.abort();
             try std.testing.expectError(error.GenerationAdmissionAcknowledgementPending, admission.requireDualInstallReady(&read, fence));
         }
-        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .acknowledge_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 1, .index = 4 });
-        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .acknowledge_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 1, .index = 4 });
+        try server_test_adapter.applyOrdered(&db, .{ .relational_topology = .{ .action = .acknowledge_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 1, .index = 4 });
+        try server_test_adapter.applyOrdered(&db, .{ .relational_topology = .{ .action = .acknowledge_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 1, .index = 4 });
     }
     {
         var db = try db_mod.DB.open(alloc, path, options);
@@ -314,11 +316,11 @@ test "self-FK owner retains one fence through parent ACK and atomic child instal
         try std.testing.expectError(error.GenerationAdmissionPending, db.applyRelationalTopologyControl(.{ .action = .cancel_child_generation_source, .fence = abandoned }, null));
         try db.applyRelationalTopologyControl(.{ .action = .cancel, .fence = abandoned, .child_generations = &.{transition} }, null);
         try db.applyRelationalTopologyControl(.{ .action = .cancel_child_generation_source, .fence = abandoned }, null);
-        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .begin, .fence = fence } }, .{ .term = 1, .index = 1 });
-        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .stage_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 1, .index = 2 });
+        try server_test_adapter.applyOrdered(&db, .{ .relational_topology = .{ .action = .begin, .fence = fence } }, .{ .term = 1, .index = 1 });
+        try server_test_adapter.applyOrdered(&db, .{ .relational_topology = .{ .action = .stage_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 1, .index = 2 });
         try std.testing.expectError(error.GenerationAdmissionActivationRequired, db.applyRelationalTopologyControl(.{ .action = .release, .fence = fence }, null));
         try std.testing.expectError(error.ForeignKeyGenerationPublicationRequired, db.setSchemaJson(alloc, next_json));
-        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .activate_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 1, .index = 3 });
+        try server_test_adapter.applyOrdered(&db, .{ .relational_topology = .{ .action = .activate_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 1, .index = 3 });
         try std.testing.expect((try db.relationalTopologyStatus()).fence.?.eql(fence));
         try std.testing.expectError(error.GenerationAdmissionChanged, db.applyRelationalTopologyControl(.{ .action = .cancel, .fence = fence, .child_generations = &.{transition} }, null));
         {
@@ -326,7 +328,7 @@ test "self-FK owner retains one fence through parent ACK and atomic child instal
             defer read.abort();
             try std.testing.expectError(error.GenerationAdmissionAcknowledgementPending, admission.requireDualInstallReady(&read, fence));
         }
-        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .acknowledge_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 1, .index = 4 });
+        try server_test_adapter.applyOrdered(&db, .{ .relational_topology = .{ .action = .acknowledge_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 1, .index = 4 });
         try std.testing.expectError(error.InvalidIntegrityOperation, db.batch(.{ .deletes = &.{admission.dual_acknowledged_fence_key} }));
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
@@ -364,8 +366,8 @@ test "self-FK owner retains one fence through parent ACK and atomic child instal
         var next_json_digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(next_json, &next_json_digest, .{});
         const command: topology.Command = .{ .action = .install_child_schema, .fence = fence, .child_schema_install = .{ .schema_json = next_json, .before_schema_json_digest = old_json_digest, .schema_json_digest = next_json_digest, .before_catalog_digest = before_digest, .after_catalog_digest = after_digest } };
-        try reopened.batchRaftReplicatedApply(.{ .relational_topology = command }, .{ .term = 1, .index = 5 });
-        try reopened.batchRaftReplicatedApply(.{ .relational_topology = command }, .{ .term = 1, .index = 5 });
+        try server_test_adapter.applyOrdered(&reopened, .{ .relational_topology = command }, .{ .term = 1, .index = 5 });
+        try server_test_adapter.applyOrdered(&reopened, .{ .relational_topology = command }, .{ .term = 1, .index = 5 });
         try std.testing.expect((try reopened.relationalTopologyStatus()).fence == null);
         {
             var read = try reopened.core.store.beginReadTxn();
@@ -406,9 +408,9 @@ test "self-FK owner retains one fence through parent ACK and atomic child instal
             var standby = try db_mod.DB.open(alloc, standby_path, options);
             defer standby.close();
             try standby.setSchemaJson(alloc, old_json);
-            try standby.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .begin, .fence = fence } }, .{ .term = 2, .index = 1 });
-            try standby.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .stage_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 2, .index = 2 });
-            try standby.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .activate_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 2, .index = 3 });
+            try server_test_adapter.applyOrdered(&standby, .{ .relational_topology = .{ .action = .begin, .fence = fence } }, .{ .term = 2, .index = 1 });
+            try server_test_adapter.applyOrdered(&standby, .{ .relational_topology = .{ .action = .stage_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 2, .index = 2 });
+            try server_test_adapter.applyOrdered(&standby, .{ .relational_topology = .{ .action = .activate_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 2, .index = 3 });
             try std.testing.expectError(error.GenerationAdmissionAcknowledgementPending, replication_ingress.applyRecord(&standby, replication_record));
             try std.testing.expect((try standby.relationalTopologyStatus()).fence.?.eql(fence));
             const old = (try standby.getSchemaJson(alloc)).?;
@@ -419,7 +421,7 @@ test "self-FK owner retains one fence through parent ACK and atomic child instal
             var standby = try db_mod.DB.open(alloc, standby_path, options);
             defer standby.close();
             try std.testing.expect((try standby.relationalTopologyStatus()).fence.?.eql(fence));
-            try standby.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .acknowledge_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 2, .index = 4 });
+            try server_test_adapter.applyOrdered(&standby, .{ .relational_topology = .{ .action = .acknowledge_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 2, .index = 4 });
             try replication_ingress.applyRecord(&standby, replication_record);
             try replication_ingress.applyRecord(&standby, replication_record);
             try std.testing.expect((try standby.relationalTopologyStatus()).fence == null);
@@ -459,10 +461,10 @@ test "self-FK owner retains one fence through parent ACK and atomic child instal
         var bad = try db_mod.DB.open(alloc, bad_path, options);
         defer bad.close();
         try bad.setSchemaJson(alloc, old_json);
-        try bad.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .begin, .fence = bad_fence } }, .{ .term = 2, .index = 1 });
-        try bad.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .stage_child_generation, .fence = bad_fence, .child_generations = &.{forged_transition} } }, .{ .term = 2, .index = 2 });
-        try bad.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .activate_child_generation, .fence = bad_fence, .child_generations = &.{forged_transition} } }, .{ .term = 2, .index = 3 });
-        try bad.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .acknowledge_child_generation, .fence = bad_fence, .child_generations = &.{forged_transition} } }, .{ .term = 2, .index = 4 });
+        try server_test_adapter.applyOrdered(&bad, .{ .relational_topology = .{ .action = .begin, .fence = bad_fence } }, .{ .term = 2, .index = 1 });
+        try server_test_adapter.applyOrdered(&bad, .{ .relational_topology = .{ .action = .stage_child_generation, .fence = bad_fence, .child_generations = &.{forged_transition} } }, .{ .term = 2, .index = 2 });
+        try server_test_adapter.applyOrdered(&bad, .{ .relational_topology = .{ .action = .activate_child_generation, .fence = bad_fence, .child_generations = &.{forged_transition} } }, .{ .term = 2, .index = 3 });
+        try server_test_adapter.applyOrdered(&bad, .{ .relational_topology = .{ .action = .acknowledge_child_generation, .fence = bad_fence, .child_generations = &.{forged_transition} } }, .{ .term = 2, .index = 4 });
     }
     {
         var bad = try db_mod.DB.open(alloc, bad_path, options);
@@ -480,7 +482,7 @@ test "self-FK owner retains one fence through parent ACK and atomic child instal
         var next_json_digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(next_json, &next_json_digest, .{});
         const install: topology.Command = .{ .action = .install_child_schema, .fence = bad_fence, .child_schema_install = .{ .schema_json = next_json, .before_schema_json_digest = old_json_digest, .schema_json_digest = next_json_digest, .before_catalog_digest = before_digest, .after_catalog_digest = after_digest } };
-        try std.testing.expectError(error.GenerationAdmissionChanged, bad.batchRaftReplicatedApply(.{ .relational_topology = install }, .{ .term = 2, .index = 5 }));
+        try std.testing.expectError(error.GenerationAdmissionChanged, server_test_adapter.applyOrdered(&bad, .{ .relational_topology = install }, .{ .term = 2, .index = 5 }));
         try std.testing.expect((try bad.relationalTopologyStatus()).fence.?.eql(bad_fence));
         const still_old = (try bad.getSchemaJson(alloc)).?;
         defer alloc.free(still_old);
@@ -602,8 +604,8 @@ test "child FK generation schema install commits catalog and source release with
     changed.before_schema_json_digest = @splat(9);
     try std.testing.expectError(error.IntegrityCatalogChanged, db.installPublishedChildSchema(alloc, after_json, changed));
     const command: topology.Command = .{ .action = .install_child_schema, .fence = fence, .child_schema_install = .{ .schema_json = after_json, .before_schema_json_digest = before_schema_json_digest, .schema_json_digest = schema_json_digest, .before_catalog_digest = before_digest, .after_catalog_digest = after_digest } };
-    try db.batchRaftReplicatedApply(.{ .relational_topology = command }, publication.raft_entry);
-    try db.batchRaftReplicatedApply(.{ .relational_topology = command }, publication.raft_entry);
+    try server_test_adapter.applyOrdered(&db, .{ .relational_topology = command }, publication.raft_entry);
+    try server_test_adapter.applyOrdered(&db, .{ .relational_topology = command }, publication.raft_entry);
     const installed = (try db.getSchemaJson(alloc)).?;
     defer alloc.free(installed);
     try std.testing.expectEqualStrings(after_json, installed);
@@ -751,9 +753,9 @@ test "initial FK child owner stays hidden across restart until replicated releas
             .public_schema_json_digest = public_digest,
             .catalog_digest = catalog_digest,
         } };
-        try db.batchRaftReplicatedApply(.{ .relational_topology = provision }, .{ .term = 2, .index = 1 });
-        try db.batchRaftReplicatedApply(.{ .relational_topology = provision }, .{ .term = 2, .index = 1 });
-        try std.testing.expectError(error.InitialChildProvisionAlreadyCommitted, db.batchRaftReplicatedApply(.{ .relational_topology = provision }, .{ .term = 2, .index = 2 }));
+        try server_test_adapter.applyOrdered(&db, .{ .relational_topology = provision }, .{ .term = 2, .index = 1 });
+        try server_test_adapter.applyOrdered(&db, .{ .relational_topology = provision }, .{ .term = 2, .index = 1 });
+        try std.testing.expectError(error.InitialChildProvisionAlreadyCommitted, server_test_adapter.applyOrdered(&db, .{ .relational_topology = provision }, .{ .term = 2, .index = 2 }));
         try std.testing.expectError(error.InitialChildNotPublished, db.batch(.{ .writes = &.{.{ .key = "leak", .value = "{}" }} }));
         try std.testing.expectError(error.InitialChildNotPublished, db.lookup(alloc, "leak", .{}));
         // The release controller must be able to probe self-parent witness
@@ -824,19 +826,19 @@ test "initial FK child owner stays hidden across restart until replicated releas
         } };
         var wrong = release;
         wrong.initial_child_control.?.plan_digest = @splat(9);
-        try std.testing.expectError(error.InitialChildPublicationChanged, db.batchRaftReplicatedApply(.{ .relational_topology = wrong }, .{ .term = 2, .index = 2 }));
+        try std.testing.expectError(error.InitialChildPublicationChanged, server_test_adapter.applyOrdered(&db, .{ .relational_topology = wrong }, .{ .term = 2, .index = 2 }));
         const self_key = try @import("relational_integrity_generation_admission.zig").scopeKey("table:11", "self_fk");
         const self_scope_bytes = try db.core.store.get(alloc, &self_key);
         defer alloc.free(self_scope_bytes);
         var corrupted = try db.core.store.beginWriteTxn();
         try corrupted.delete(&self_key);
         try corrupted.commit();
-        try std.testing.expectError(error.InitialChildPublicationChanged, db.batchRaftReplicatedApply(.{ .relational_topology = release }, .{ .term = 2, .index = 2 }));
+        try std.testing.expectError(error.InitialChildPublicationChanged, server_test_adapter.applyOrdered(&db, .{ .relational_topology = release }, .{ .term = 2, .index = 2 }));
         var repaired = try db.core.store.beginWriteTxn();
         try repaired.put(&self_key, self_scope_bytes);
         try repaired.commit();
-        try db.batchRaftReplicatedApply(.{ .relational_topology = release }, .{ .term = 2, .index = 2 });
-        try db.batchRaftReplicatedApply(.{ .relational_topology = release }, .{ .term = 2, .index = 2 });
+        try server_test_adapter.applyOrdered(&db, .{ .relational_topology = release }, .{ .term = 2, .index = 2 });
+        try server_test_adapter.applyOrdered(&db, .{ .relational_topology = release }, .{ .term = 2, .index = 2 });
         const stored = try db.core.store.get(alloc, hidden.key);
         defer alloc.free(stored);
         try std.testing.expectEqual(hidden.Phase.released, (try hidden.Record.decode(stored)).phase);
@@ -1250,13 +1252,13 @@ test "relational integrity accepted generation survives restart and bounded two-
             const command = page.command(namespace.shard_id, namespace);
             read.deinit();
             read_open = false;
-            try db.batchRaftReplicatedApply(.{ .relational_generation_gc = command }, .{ .term = 1, .index = @intCast(pages * 2 + 1) });
+            try server_test_adapter.applyOrdered(&db, .{ .relational_generation_gc = command }, .{ .term = 1, .index = @intCast(pages * 2 + 1) });
             // Raft replay is idempotent, whereas a fresh stale proposal must
             // not silently advance the progress CAS or delete a new value.
-            try db.batchRaftReplicatedApply(.{ .relational_generation_gc = command }, .{ .term = 1, .index = @intCast(pages * 2 + 1) });
+            try server_test_adapter.applyOrdered(&db, .{ .relational_generation_gc = command }, .{ .term = 1, .index = @intCast(pages * 2 + 1) });
             const progress_before_stale = try db.core.store.get(alloc, retirement.gc_progress_key);
             defer alloc.free(progress_before_stale);
-            try db.batchRaftReplicatedApply(.{ .relational_generation_gc = command }, .{ .term = 1, .index = @intCast(pages * 2 + 2) });
+            try server_test_adapter.applyOrdered(&db, .{ .relational_generation_gc = command }, .{ .term = 1, .index = @intCast(pages * 2 + 2) });
             const progress_after_stale = try db.core.store.get(alloc, retirement.gc_progress_key);
             defer alloc.free(progress_after_stale);
             try std.testing.expectEqualSlices(u8, progress_before_stale, progress_after_stale);
@@ -1303,7 +1305,7 @@ test "relational integrity accepted generation survives restart and bounded two-
 }
 
 fn applyRestoreReplica(db: *db_mod.DB, request: @import("types.zig").BatchRequest, index: u64, ha: bool) !void {
-    if (!ha) return db.batchRaftReplicatedApply(request, .{ .term = 1, .index = index });
+    if (!ha) return server_test_adapter.applyOrdered(&db, request, .{ .term = 1, .index = index });
     const alloc = std.testing.allocator;
     const payload = try @import("replication_effects.zig").encodeBatchMutationRequestAlloc(alloc, request);
     defer alloc.free(payload);
@@ -2164,14 +2166,14 @@ test "relational integrity topology handoff transfers routed companions with res
     try std.testing.expect((try destination.relationalTopologyStatus()).fence != null);
     const replication: @import("types.zig").SplitReplicationContext = .{ .transition_id = 800, .attempt_epoch = 1, .source_group_id = 601, .destination_group_id = 602, .identity_namespace = destination_owner.namespace, .bootstrap_sequence = 10, .operation = .checkpoint, .sequence = 10 };
     const checkpoint: @import("types.zig").SplitReplicationCheckpoint = .{ .kind = .destination_begin, .transition_id = 800, .attempt_epoch = 1, .source_group_id = 601, .destination_group_id = 602, .range_start = "m", .range_end = "", .delta_sequence = 10 };
-    try destination.batchRaftReplicatedApply(.{ .split_replication = replication, .split_checkpoint = checkpoint }, .{ .term = 1, .index = 10 });
+    try server_test_adapter.applyOrdered(&destination, .{ .split_replication = replication, .split_checkpoint = checkpoint }, .{ .term = 1, .index = 10 });
     var row_replication = replication;
     row_replication.operation = .bootstrap_chunk;
-    try destination.batchRaftReplicatedApply(.{ .split_replication = row_replication, .writes = &.{.{ .key = "z", .value = "{\"id\":999}" }} }, .{ .term = 1, .index = 11 });
+    try server_test_adapter.applyOrdered(&destination, .{ .split_replication = row_replication, .writes = &.{.{ .key = "z", .value = "{\"id\":999}" }} }, .{ .term = 1, .index = 11 });
     var complete = checkpoint;
     complete.kind = .destination_complete;
-    try destination.batchRaftReplicatedApply(.{ .split_replication = replication, .split_checkpoint = complete }, .{ .term = 1, .index = 12 });
-    try source.batchRaftReplicatedApply(.{ .split_transition = .{ .kind = .finalize, .transition_id = 800, .attempt_epoch = 1, .destination_group_id = 602, .split_key = "m" } }, .{ .term = 1, .index = 12 });
+    try server_test_adapter.applyOrdered(&destination, .{ .split_replication = replication, .split_checkpoint = complete }, .{ .term = 1, .index = 12 });
+    try server_test_adapter.applyOrdered(&source, .{ .split_transition = .{ .kind = .finalize, .transition_id = 800, .attempt_epoch = 1, .destination_group_id = 602, .split_key = "m" } }, .{ .term = 1, .index = 12 });
     try std.testing.expect((try source.relationalTopologyStatus()).fence == null);
     try destination.applyRelationalTopologyControl(.{ .action = .release, .fence = destination_fence }, null);
     try std.testing.expect((try destination.relationalTopologyStatus()).fence == null);
@@ -2316,10 +2318,10 @@ fn testMergeIntegrityHandoff(comptime rollback: bool, comptime empty: bool, comp
     try source.applyRelationalTopologyControl(.{ .action = .begin, .fence = source_fence }, null);
     try destination.batch(.{ .relational_topology = .{ .action = .begin, .fence = destination_fence } });
     var checkpoint: types.MergeReplicationCheckpoint = .{ .kind = .accept, .transition_id = 980, .donor_group_id = 901, .receiver_group_id = 902, .receiver_base_start = "", .receiver_base_end = "m", .merged_start = "", .merged_end = "" };
-    try destination.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 1 });
+    try server_test_adapter.applyOrdered(&destination, .{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 1 });
     if (empty) {
         checkpoint.kind = .rollback;
-        try destination.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 2 });
+        try server_test_adapter.applyOrdered(&destination, .{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 2 });
         try destination.applyRelationalTopologyControl(.{ .action = .abort_transition, .fence = destination_fence }, null);
         try source.applyRelationalTopologyControl(.{ .action = .abort_transition, .fence = source_fence }, null);
         try std.testing.expect((try destination.relationalTopologyStatus()).fence == null);
@@ -2340,10 +2342,10 @@ fn testMergeIntegrityHandoff(comptime rollback: bool, comptime empty: bool, comp
     }
     checkpoint.kind = .begin_copy;
     checkpoint.copy_attempt = manifest.merge_copy_attempt;
-    try destination.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 2 });
+    try server_test_adapter.applyOrdered(&destination, .{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 2 });
     var stale = checkpoint;
     stale.copy_attempt.sequence = 0;
-    try std.testing.expectError(error.IntegrityHandoffSequenceChanged, destination.batchRaftReplicatedApply(.{ .merge_checkpoint = stale }, .{ .term = 1, .index = 3 }));
+    try std.testing.expectError(error.IntegrityHandoffSequenceChanged, server_test_adapter.applyOrdered(&destination, .{ .merge_checkpoint = stale }, .{ .term = 1, .index = 3 }));
     try std.testing.expectError(error.IntegrityHandoffIncomplete, destination.applyRelationalTopologyControl(.{ .action = .prune, .fence = destination_fence }, null));
     if (!rollback) {
         while (true) {
@@ -2355,11 +2357,11 @@ fn testMergeIntegrityHandoff(comptime rollback: bool, comptime empty: bool, comp
         }
         checkpoint.kind = .bootstrap_complete;
         checkpoint.bootstrap_applied_index = 10;
-        try destination.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 4 });
+        try server_test_adapter.applyOrdered(&destination, .{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 4 });
         try std.testing.expectError(error.MergeTransitionNotReady, destination.applyRelationalTopologyControl(.{ .action = .release, .fence = destination_fence }, null));
         checkpoint.kind = .finalize;
         checkpoint.bootstrap_applied_index = 11;
-        try destination.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 5 });
+        try server_test_adapter.applyOrdered(&destination, .{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 5 });
         destination.close();
         destination = try db_mod.DB.open(alloc, destination_path, destination_options);
         try destination.batch(.{ .relational_topology = .{ .action = .release, .fence = destination_fence } });
@@ -2374,7 +2376,7 @@ fn testMergeIntegrityHandoff(comptime rollback: bool, comptime empty: bool, comp
         return;
     }
     checkpoint.kind = .rollback;
-    try destination.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 4 });
+    try server_test_adapter.applyOrdered(&destination, .{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 4 });
     try std.testing.expectError(error.IntegrityTopologyChanged, destination.applyRelationalTopologyControl(.{ .action = .transfer, .fence = destination_fence, .transfer = .{ .begin = manifest } }, null));
     destination.close();
     destination = try db_mod.DB.open(alloc, destination_path, destination_options);

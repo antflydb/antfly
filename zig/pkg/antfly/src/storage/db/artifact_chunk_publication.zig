@@ -776,11 +776,11 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
     try db.addEnrichment(.{ .name = "units", .kind = .asset, .field = "url", .producer_json = "{\"type\":\"document_extraction\"}" });
     try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .source_artifact_name = "units", .chunk_size = 4 });
     try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"chunks\"}]}" });
-    try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{\"url\":\"input\"}" }}, .timestamp_ns = 1 }, .{ .term = 1, .index = 1 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"url\":\"input\"}" }}, .timestamp_ns = 1 }, .{ .term = 1, .index = 1 });
     var ordered = try db.artifactInventoryCommand(alloc);
     defer ordered.catalogs.deinit(alloc);
     ordered.binding.effect_protocol = 15;
-    try db.batchRaftReplicatedApply(.{ .artifact_catalog = ordered }, .{ .term = 1, .index = 2 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .artifact_catalog = ordered }, .{ .term = 1, .index = 2 });
     var read = try db.core.store.beginReadTxn();
     var read_open = true;
     defer if (read_open) read.abort();
@@ -1597,7 +1597,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
     db_open = true;
     // Lost-reply retry is applied through the real ordered control path after
     // restart, with no re-enumeration or second advancement of the prefix.
-    try db.batchRaftReplicatedApply(.{ .artifact_publication = terminal_command.? }, .{ .term = 1, .index = 12 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .artifact_publication = terminal_command.? }, .{ .term = 1, .index = 12 });
     {
         var reopened = try db.core.store.beginReadTxn();
         defer reopened.abort();
@@ -2107,7 +2107,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
         try std.testing.expectEqual(.publish, accepted_child.command.mode);
         try std.testing.expectEqualStrings("chunks", accepted_child.command.producer_name);
         try std.testing.expectEqualStrings(unit_key, accepted_child.command.producer_scope_key);
-        try db.batchRaftReplicatedApply(.{ .artifact_publication = accepted_child.command }, .{ .term = 1, .index = 17 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .artifact_publication = accepted_child.command }, .{ .term = 1, .index = 17 });
         const before_accepted_retry = dispatched.calls;
         for (0..3) |_| try std.testing.expectError(error.ArtifactPublicationPending, @import("enrichment/enrichment_runtime.zig").servicePendingArtifactUnitJobs(runtime, "doc", .{}));
         try std.testing.expectEqual(before_accepted_retry, dispatched.calls);

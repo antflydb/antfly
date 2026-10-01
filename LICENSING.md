@@ -85,3 +85,12 @@ wasm64) use the Apache first-party engine and inference sources. Their installs
 include the Apache LICENSE, source map, asset manifest, and canonical third-party
 notices. The SciPy-derived assignment solver retains its BSD-3-Clause notice in
 source and in native and WASM distributions.
+
+The public C API uses `capi/db.zig`, `capi/handles.zig`, and
+`capi_embedded_root.zig`. Private server operations use the ELv2
+`capi/server_owner.zig` and `storage/server_db_adapter.zig`. Borrowed read
+consistency is local storage code; quorum tracking and Raft snapshot protocol
+adapters remain server code. Explicit test-only imports do not expand a
+product’s production license closure. The full Zig suite validates the Apache
+Lite, inference, public C API, and WASM builds with ELv2 implementations replaced
+by compile-time traps. Any live ELv2 dependency fails that build.

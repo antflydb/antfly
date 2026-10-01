@@ -31,7 +31,10 @@ pub fn applyRecord(db: *DB, record: record_mod.RecordView) !void {
         .batch_mutation => {
             var decoded = try effects.decodeBatchMutationRequest(db.alloc, record);
             defer decoded.deinit();
-            try db.applyReplicatedBatch(decoded.value, record.lsn);
+            const mutation = try normalizeBatch(decoded.value);
+            if (mutation.receipt == .ordered and (mutation.request.online_source != null or mutation.request.merge_checkpoint != null))
+                try db.reconcileReplicatedArtifactAdmission(mutation.request, mutation.receipt.ordered);
+            try db.applyReplicatedBatch(mutation, record.lsn);
         },
         .metadata_mutation => {
             var metadata = try effects.decodeMetadataMutation(db.alloc, record);
@@ -78,4 +81,38 @@ pub fn applyDerivedRecord(db: *DB, record: record_mod.RecordView) !u64 {
 pub fn applyCallback(ctx: *anyopaque, record: record_mod.RecordView) !void {
     const db: *DB = @ptrCast(@alignCast(ctx));
     try applyRecord(db, record);
+}
+
+/// Preserve envelope provenance precedence after version-specific validation.
+/// DB receives one receipt rather than interpreting the wire's optional fields.
+pub fn normalizeBatch(payload: effects.BatchMutationPayload) !@import("replicated_mutation.zig").Batch {
+    return .{ .request = payload.request, .receipt = if (payload.native_topology_position) |position|
+        .{ .native = position }
+    else if (payload.ordinary_raft_entry orelse payload.artifact_publication_raft_entry orelse payload.artifact_publication_transport_raft_entry orelse payload.merge_proof_adoption_raft_entry orelse payload.artifact_catalog_raft_entry orelse payload.initial_child_raft_entry orelse payload.graph_retirement_raft_entry orelse payload.restore_generation_admission_raft_entry) |entry|
+        .{ .ordered = entry }
+    else if (payload.request.online_source != null)
+        .{ .online_source = payload.online_source_applied_index orelse return error.InvalidOnlineSourceCommand }
+    else
+        .none };
+}
+
+test "storage.db replication ingress normalizes every ordered provenance field" {
+    const std = @import("std");
+    inline for (.{ "ordinary_raft_entry", "artifact_publication_raft_entry", "artifact_publication_transport_raft_entry", "merge_proof_adoption_raft_entry", "artifact_catalog_raft_entry", "initial_child_raft_entry", "graph_retirement_raft_entry", "restore_generation_admission_raft_entry" }) |field| {
+        var payload: effects.BatchMutationPayload = .{ .request = .{} };
+        @field(payload, field) = .{ .term = 7, .index = 19 };
+        const normalized = try normalizeBatch(payload);
+        try std.testing.expect(normalized.receipt == .ordered);
+        try std.testing.expectEqual(@as(u64, 7), normalized.receipt.ordered.term);
+        try std.testing.expectEqual(@as(u64, 19), normalized.receipt.ordered.index);
+    }
+    const ordinary = try normalizeBatch(.{ .request = .{} });
+    try std.testing.expect(ordinary.receipt == .none);
+    const native = try normalizeBatch(.{
+        .request = .{},
+        .native_topology_position = .{ .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .sequence = 23 },
+        .ordinary_raft_entry = .{ .term = 7, .index = 19 },
+    });
+    try std.testing.expect(native.receipt == .native);
+    try std.testing.expectEqual(@as(u64, 23), native.receipt.native.sequence);
 }

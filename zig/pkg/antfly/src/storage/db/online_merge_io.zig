@@ -309,8 +309,8 @@ test "relational index system online admission facts are unbound read only and r
     same_ordinary.scope.receiver_namespace = db.core.identity_namespace;
     same_ordinary.operation = .{ .admission = .receiver };
     try std.testing.expect(!(try Fetch.run(&db, same_ordinary)).eligible);
-    try std.testing.expectError(error.IntegrityTopologyBusy, db.batchRaftReplicatedApply(.{ .artifact_catalog = artifact_command, .online_source = .{ .admit = .{ .scope = bound, .artifact_catalog = facts.artifact_catalog } } }, .{ .term = 2, .index = 1 }));
-    try db.batchRaftReplicatedApply(.{}, .{ .term = 2, .index = 1 });
+    try std.testing.expectError(error.IntegrityTopologyBusy, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .artifact_catalog = artifact_command, .online_source = .{ .admit = .{ .scope = bound, .artifact_catalog = facts.artifact_catalog } } }, .{ .term = 2, .index = 1 }));
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{}, .{ .term = 2, .index = 1 });
     try std.testing.expectEqual(@as(u64, 1), (try db.raftAppliedEntry()).?.index);
     checkpoint.kind = .rollback;
     try db.batch(.{ .merge_checkpoint = checkpoint });
@@ -320,7 +320,7 @@ test "relational index system online admission facts are unbound read only and r
     try db.core.store.put(@import("merge_state.zig").legacy_key, active_merge_raw);
     try std.testing.expectError(error.IntegrityTopologyBusy, Fetch.run(&db, request));
     try std.testing.expect(!(try Fetch.run(&db, same_ordinary)).eligible);
-    try std.testing.expectError(error.IntegrityTopologyBusy, db.batchRaftReplicatedApply(.{ .artifact_catalog = artifact_command, .online_source = .{ .admit = .{ .scope = bound, .artifact_catalog = facts.artifact_catalog } } }, .{ .term = 2, .index = 2 }));
+    try std.testing.expectError(error.IntegrityTopologyBusy, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .artifact_catalog = artifact_command, .online_source = .{ .admit = .{ .scope = bound, .artifact_catalog = facts.artifact_catalog } } }, .{ .term = 2, .index = 2 }));
     try std.testing.expectEqual(@as(u64, 1), (try db.raftAppliedEntry()).?.index);
     {
         var read = try db.core.store.beginReadTxn();
@@ -334,7 +334,7 @@ test "relational index system online admission facts are unbound read only and r
     // The ordered catalog and admission commit together. Followers reconcile
     // the exact committed inventory before admitting, while native rewrite
     // admission repeats its local artifact predicate (covered below).
-    try db.batchRaftReplicatedApply(.{ .artifact_catalog = artifact_command, .online_source = .{ .admit = .{ .scope = bound, .artifact_catalog = facts.artifact_catalog } } }, .{ .term = 2, .index = 2 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .artifact_catalog = artifact_command, .online_source = .{ .admit = .{ .scope = bound, .artifact_catalog = facts.artifact_catalog } } }, .{ .term = 2, .index = 2 });
     try std.testing.expectError(error.IntegrityTopologyBusy, Fetch.run(&db, request));
     // Once admission has retained the source, a new graph index or
     // independently produced enrichment would invalidate the row-derived
@@ -364,18 +364,18 @@ test "relational index system online admission facts are unbound read only and r
     // Merely retaining a source (without an active topology freeze) must
     // exclude receiver controls, while leaving ordinary source writes free.
     try std.testing.expectError(error.IntegrityTopologyBusy, db.batch(.{ .merge_checkpoint = checkpoint }));
-    try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .fence = bound.fence, .action = .begin } }, .{ .term = 2, .index = 3 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .relational_topology = .{ .fence = bound.fence, .action = .begin } }, .{ .term = 2, .index = 3 });
     // Rejected commands cannot stall behind an active topology/source fence.
     // The empty exact-entry apply records no row effects or retained frame.
-    try db.batchRaftReplicatedApply(.{}, .{ .term = 2, .index = 4 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{}, .{ .term = 2, .index = 4 });
     try std.testing.expectEqual(@as(u64, 4), (try db.raftAppliedEntry()).?.index);
     {
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
         try std.testing.expectEqual(@as(u64, 0), (try @import("../retained_effects.zig").load(&read)).?.latest);
     }
-    try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .fence = bound.fence, .action = .abort_transition } }, .{ .term = 2, .index = 5 });
-    try db.batchRaftReplicatedApply(.{ .online_source = .{ .release = bound } }, .{ .term = 2, .index = 6 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .relational_topology = .{ .fence = bound.fence, .action = .abort_transition } }, .{ .term = 2, .index = 5 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .release = bound } }, .{ .term = 2, .index = 6 });
     const released = try Fetch.run(&db, request);
     try std.testing.expect(released.eligible);
     try std.testing.expectEqual(@as(u64, 2), released.donor_term);

@@ -198,3 +198,10 @@ test "storage.hot_standby engine shared admission pins generation across role ch
     try std.testing.expectError(error.HAReadOnlyStandby, gate.check());
     try std.testing.expect(gate.shared.state.isStandbyRole());
 }
+
+pub fn requiresDurableLifecycleReplication(req: @import("types.zig").BatchRequest) bool {
+    return req.artifact_catalog != null or req.online_source != null or req.restore_staging != null or req.restore_staging_scope != null or
+        req.relational_topology != null or req.relational_generation_gc != null or req.split_transition != null or
+        req.split_checkpoint != null or req.split_replication != null or
+        req.merge_checkpoint != null or req.merge_replication != null or req.merge_proof_adoption != null;
+}
