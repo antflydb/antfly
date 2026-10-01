@@ -27993,6 +27993,15 @@ const RemoteMetadataSource = struct {
     }
 
     fn storeRootReadiness(self: *RemoteMetadataSource) !bool {
+        // Registration probes readiness before every other metadata call it
+        // makes. A deterministic workload that injects an unreachable/stale
+        // leader through `fetch_head_error` must see that same fault here,
+        // exactly as `fetchHeadWithBudget` already does for ordinary status
+        // reads; otherwise this probe instead reaches live transport the
+        // workload never modeled a response for.
+        if (@import("builtin").is_test) {
+            if (self.test_faults.fetch_head_error) |err| return err;
+        }
         return self.withMetadataApiClient(bool, struct {
             fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, _: void) !bool {
                 return client.storeRootReadiness(base_uri);
@@ -28001,6 +28010,9 @@ const RemoteMetadataSource = struct {
     }
 
     fn storeRootSigningReadiness(self: *RemoteMetadataSource) !bool {
+        if (@import("builtin").is_test) {
+            if (self.test_faults.fetch_head_error) |err| return err;
+        }
         return self.withMetadataApiClient(bool, struct {
             fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, _: void) !bool {
                 return client.storeRootSigningReadiness(base_uri);
