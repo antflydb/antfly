@@ -303,6 +303,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const capi_native_object = b.addObject(.{
         .name = "antfly-embedded-capi",
         .root_module = capi_mod,
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
     });
     const capi_native_check = b.step("embedded-capi-check", "Compile the public C API with its independent local source owner");
     capi_native_check.dependOn(&capi_native_object.step);

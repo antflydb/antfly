@@ -71,7 +71,9 @@ Borrowed read consistency, routing deadlines, and table read callbacks do not
 import server quorum trackers or concrete routing sessions. Server join providers
 own those sessions and expose borrowed opaque state through their callbacks.
 The browser source profile contains DB and local query owners without native
-writer configuration. The local inference provider adapter lives in storage;
+writer configuration. Portable restore and transaction tracing have local
+owners; remote backup-location handling and Raft trace adaptation stay outside
+the browser profile. The local inference provider adapter lives in storage;
 standalone keeps a compatibility facade over the same implementation.
 
 `zig build embedded-source-boundary-check` follows authored imports from the

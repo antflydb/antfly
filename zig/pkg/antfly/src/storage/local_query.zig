@@ -222,13 +222,22 @@ pub fn executeStorageKernelGraphEdges(
     try local_graph.validateGraphEdgesTensorAccessPath(alloc, req);
     _ = try currentIdentityReadGenerationForDb(req.identity_read_generation, db);
     const graph_entry = db.core.graphIndex(req.index_name) orelse return error.IndexNotFound;
-    const edges = try graph_entry.index.getEdges(alloc, req.key, "", req.direction);
+    const result = try graph_entry.index.getEdgesByTypesBoundedWithStatsAt(
+        alloc,
+        req.key,
+        req.edge_types,
+        req.direction,
+        req.max_edges,
+        req.max_owned_bytes,
+        req.max_scanned_rows,
+        if (req.ttl_now_ns != 0) req.ttl_now_ns else platform_time.realtimeNs(),
+    );
     errdefer {
-        for (edges) |edge| graph_mod.GraphIndex.freeEdge(alloc, edge);
-        if (edges.len > 0) alloc.free(edges);
+        for (result.edges) |edge| graph_mod.GraphIndex.freeEdge(alloc, edge);
+        if (result.edges.len > 0) alloc.free(result.edges);
     }
     try checkQueryDeadline(control_req);
-    return .{ .edges = edges };
+    return .{ .edges = result.edges, .scanned_rows = @intCast(result.scanned_rows) };
 }
 
 pub fn validateGraphHydrateIncomingIndexIdentity(
