@@ -9,7 +9,7 @@ behavior changes belong to #893.
 ## Source owners
 
 - `zig/pkg/antfly-embedded` owns embedded facades, shared schema types, and
-  Antfly inference provider adapters (including Vertex and Bedrock).
+  Antfly Inference provider adapters (including Vertex and Bedrock).
 - `zig/pkg/inference/src/host` owns inference host/worker implementation and
   portable request/execution contracts.
 - `zig/lib/runtime` owns borrowed runtime ABIs, cancellation, cache budgets,
