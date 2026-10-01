@@ -537,7 +537,7 @@ Independent of Antenna, serving span checkpoints (Decide) through the
 learned `classifier` would fix the legacy classification path. It is not on
 the critical path because step 0 can score Decide in PyTorch.
 
-## Status (2026-09-25)
+## Status (2026-09-29)
 
 ### Step 0: baselines (done)
 
@@ -608,6 +608,22 @@ different sizes; see the report for caveats).
   [work-log/completed/inference/antenna/2026-09-26-native-distillation.md](../../../../../work-log/completed/inference/antenna/2026-09-26-native-distillation.md).
   `scripts/antenna/distill_pool.py --wikipedia` adds encyclopedic passages to
   the text pool for held-out breadth.
+- **Native end to end:** distilling on a mixed pool (`distill_pool.py
+  --source`: web sentences with free-form types, commands, comments,
+  questions and abstracts next to news and Wikipedia; one epoch, 34,264
+  steps) and then fine-tuning on the pilot rows, all in Zig on resident
+  Metal, gives 0.734 / 0.368 classification and 0.719 / 0.629 NER F1.
+  gliner2.5-base fine-tuned the same way reaches 0.808 / 0.467 and
+  0.723 / 0.624: NER matches, and classification trails by 0.07-0.10. The
+  probe `scripts/antenna/gap_probe.py` places the remaining gap in the
+  classification label markers; the next pool adds real label sets.
+- **Decision head:** a Laya decision head trained on the frozen Antenna trunk
+  (`scripts/antenna/init_decision_head.py`, `freeze_layers` set to the layer
+  count plus one; Open-Jev, then Laya's step-0 split) scores 0.476 on Laya's
+  step-0 typed-decision eval, against
+  0.387 for released Laya-large and about 0.62 for Laya's full step-0
+  fine-tune. The trunk stays bit-identical, so it keeps serving the GLiNER
+  heads.
 
 ### Step 2: fused ModernBERT training attention (done)
 

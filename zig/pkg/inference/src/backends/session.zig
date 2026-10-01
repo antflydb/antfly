@@ -558,6 +558,9 @@ pub const Session = struct {
     vtable: *const VTable,
     close_protection: ?CloseProtection = null,
     run_admission: ?RunAdmission = null,
+    /// Borrowed from the session owner, backed by its retained model lease.
+    /// Copies share one ledger so concurrent requests cannot reuse the credit.
+    generation_workspace: ?*memory.ReservedGenerationWorkspace = null,
     output_geometry: ?SequenceOutputGeometry = null,
     cached_decoder_geometry: ?CachedDecoderGeometry = null,
     /// Explicit stage contract: these small control tensors are equal across
@@ -565,6 +568,12 @@ pub const Session = struct {
     broadcast_inputs: []const []const u8 = &.{},
     /// Borrowed from the model/runtime owner; stable for every session copy.
     execution_gate: ?*std.atomic.Mutex = null,
+
+    /// Stable planning capacity, shared by all copies of this session. Live
+    /// contention is resolved by workspace acquisition after chunk selection.
+    pub fn generationWorkspaceCapacity(self: Session) ?memory.AdmissionAmounts {
+        return if (self.generation_workspace) |workspace| workspace.capacity else null;
+    }
 
     pub const VTable = struct {
         hasLayaDecisions: ?*const fn (ptr: *anyopaque) bool = null,

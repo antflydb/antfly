@@ -94,6 +94,7 @@ pub const Lease = struct {
 
         var epoch: u64 = 1;
         var kind: AcquireKind = .acquired;
+        var expires_at_ms = std.math.add(u64, now_ms, ttl_ms) catch std.math.maxInt(u64);
         if (current_raw) |raw| {
             const parsed = try std.json.parseFromSlice(LeaseRecord, self.allocator, raw, .{
                 .allocate = .alloc_always,
@@ -101,6 +102,8 @@ pub const Lease = struct {
             defer parsed.deinit();
 
             const current = parsed.value;
+            if (current.expires_at_ms > now_ms and std.mem.eql(u8, current.owner_id, owner_id))
+                expires_at_ms = @max(expires_at_ms, current.expires_at_ms);
             if (current.expires_at_ms > now_ms and !std.mem.eql(u8, current.owner_id, owner_id)) {
                 return .{ .acquired = false, .epoch = current.epoch, .expires_at_ms = current.expires_at_ms };
             }
@@ -110,8 +113,6 @@ pub const Lease = struct {
                 std.math.add(u64, current.epoch, 1) catch return error.LeaseEpochOverflow;
             kind = if (current.expires_at_ms == 0) .acquired else if (current.expires_at_ms > now_ms) .renewed else .takeover;
         }
-
-        const expires_at_ms = std.math.add(u64, now_ms, ttl_ms) catch std.math.maxInt(u64);
 
         const payload = try std.json.Stringify.valueAlloc(self.allocator, LeaseRecord{
             .owner_id = owner_id,
@@ -145,7 +146,9 @@ pub const Lease = struct {
         defer parsed.deinit();
         if (!std.mem.eql(u8, parsed.value.owner_id, owner_id) or
             parsed.value.epoch != epoch or parsed.value.expires_at_ms <= now_ms) return false;
-        const expires_at_ms = std.math.add(u64, now_ms, ttl_ms) catch std.math.maxInt(u64);
+        // Independently scheduled heartbeats can sample their clocks out of
+        // commit order. An older sample must never shorten the durable tenure.
+        const expires_at_ms = @max(parsed.value.expires_at_ms, std.math.add(u64, now_ms, ttl_ms) catch std.math.maxInt(u64));
         const payload = try std.json.Stringify.valueAlloc(self.allocator, LeaseRecord{
             .owner_id = owner_id,
             .expires_at_ms = expires_at_ms,
@@ -330,6 +333,13 @@ test "lease release preserves tenure fencing across owner ID reuse" {
     try std.testing.expect(!(try lease.releaseFenced("worker", first.epoch)));
     try std.testing.expect(!(try lease.renewFenced("worker", first.epoch, 1200, 250)));
     try std.testing.expect(try lease.renewFenced("worker", second.epoch, 1200, 250));
+    try std.testing.expect(try lease.renewFenced("worker", second.epoch, 1150, 250));
+    const renewed = (try lease.load(alloc)).?;
+    defer alloc.free(renewed.owner_id);
+    try std.testing.expectEqual(@as(u64, 1450), renewed.expires_at_ms);
+    const same_tenure = try lease.tryAcquireFenced("worker", 1125, 250);
+    try std.testing.expectEqual(second.epoch, same_tenure.epoch);
+    try std.testing.expectEqual(@as(u64, 1450), same_tenure.expires_at_ms);
     const third = try lease.tryAcquireFenced("worker", 1500, 250);
     try std.testing.expect(third.epoch > second.epoch);
     try std.testing.expectEqual(AcquireKind.takeover, third.kind);

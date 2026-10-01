@@ -211,8 +211,9 @@ const Fixture = struct {
         self.target_open[i] = true;
         try self.dbs[i].setSchemaJson(self.alloc, target.table.schema_json);
         try self.dbs[i].reserveRestoreStagingScoped(self.alloc, scope);
-        const handoff = try stages.mappedEmptyGenerationHandoffForGroup(self.alloc, job.value.plan, job.value.plan_digest, target.ranges[0].group_id);
-        try self.dbs[i].installRestoreStagingBootstrap(self.alloc, .{ .scope = scope, .table_name = target.table.name, .schema_json = target.table.schema_json, .read_schema_json = target.table.read_schema_json, .indexes_json = target.table.indexes_json, .byte_range = .{ .start = "", .end = "" }, .generation_admission = try stages.expectedGenerationAdmissionReceiptForGroup(self.alloc, job.value.plan, job.value.plan_digest, target.ranges[0].group_id), .source_generation_proof_digest = try stages.sourceGenerationProofDigestForGroup(job.value.plan, target.ranges[0].group_id), .empty_generation_handoff = if (handoff) |mapped| .{ .source_summary_digest = mapped.command.source_summary_digest, .retired_digest = mapped.command.retired_digest, .retired_count = mapped.command.retired_count, .expected_install_receipt_digest = mapped.expected_receipt_digest } else null });
+        const bootstrap = try stages.ownerBootstrapForRangeIndex(self.alloc, job.value.plan, job.value.plan_digest, target, 0);
+        try std.testing.expectEqual(scope.digest(), bootstrap.scope.digest());
+        try self.dbs[i].installRestoreStagingBootstrap(self.alloc, bootstrap);
         _ = try @import("../metadata/table_provisioner.zig").reconcileDbIndexesWithOptions(self.alloc, self.dbs[i], target.table.indexes_json, .{ .restore_build_only = true });
     }
 
@@ -686,8 +687,8 @@ fn runRewriteWithFailure(comptime Driver: type, invalid_tail: bool, non_raft: bo
         return error.RewriteWorkerDidNotComplete;
     }
     try std.testing.expectEqual(!empty_generation, fixture.tail_injected);
-    try std.testing.expectEqual(@as(usize, if (empty_generation and !unsupported_native_empty) 3 else 0), fixture.destination_handoff_writes);
-    try std.testing.expectEqual(empty_generation, fixture.destination_handoff_identity_reads != 0);
+    try std.testing.expectEqual(@as(usize, if (!unsupported_native_empty and !invalid_tail) 3 else 0), fixture.destination_handoff_writes);
+    try std.testing.expectEqual(empty_generation or !invalid_tail, fixture.destination_handoff_identity_reads != 0);
     if (non_raft) {
         for (fixture.donors) |donor| try std.testing.expect((try donor.raftAppliedEntry()) == null);
         for (fixture.dbs, fixture.target_open) |target, opened| if (opened) try std.testing.expect((try target.raftAppliedEntry()) == null);
@@ -886,7 +887,15 @@ fn publishSourceChildSchema(alloc: std.mem.Allocator, parent: *db.DB, source: *d
     try std.testing.expect((try source.relationalTopologyStatus()).fence == null);
 }
 pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http.StatusSource, persistence: ?restore_jobs.ReplicatedPersistence, policy: Policy) !void {
-    const alloc = std.testing.allocator;
+    // This corpus benchmark measures restore work, not Mach-O/DWARF stack
+    // unwinding for every allocation. Keep safety and leak checks enabled;
+    // ordinary correctness fixtures retain the testing allocator's traces.
+    var benchmark_allocator: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer if (policy.benchmark_rows > 1) {
+        const allocator_status = benchmark_allocator.deinit();
+        std.debug.assert(allocator_status == .ok);
+    };
+    const alloc = if (policy.benchmark_rows > 1) benchmark_allocator.allocator() else std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1069,8 +1078,9 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
         opened += 1;
         try database.setSchemaJson(alloc, target.table.schema_json);
         try database.reserveRestoreStagingScoped(alloc, scope);
-        const handoff = try stages.mappedEmptyGenerationHandoffForGroup(alloc, job.value.plan, job.value.plan_digest, target.ranges[0].group_id);
-        try database.installRestoreStagingBootstrap(alloc, .{ .scope = scope, .table_name = target.table.name, .schema_json = target.table.schema_json, .read_schema_json = target.table.read_schema_json, .indexes_json = target.table.indexes_json, .byte_range = .{ .start = "", .end = "" }, .generation_admission = try stages.expectedGenerationAdmissionReceiptForGroup(alloc, job.value.plan, job.value.plan_digest, target.ranges[0].group_id), .source_generation_proof_digest = try stages.sourceGenerationProofDigestForGroup(job.value.plan, target.ranges[0].group_id), .empty_generation_handoff = if (handoff) |mapped| .{ .source_summary_digest = mapped.command.source_summary_digest, .retired_digest = mapped.command.retired_digest, .retired_count = mapped.command.retired_count, .expected_install_receipt_digest = mapped.expected_receipt_digest } else null });
+        const bootstrap = try stages.ownerBootstrapForRangeIndex(alloc, job.value.plan, job.value.plan_digest, target, 0);
+        try std.testing.expectEqual(scope.digest(), bootstrap.scope.digest());
+        try database.installRestoreStagingBootstrap(alloc, bootstrap);
         _ = try @import("../metadata/table_provisioner.zig").reconcileDbIndexesWithOptions(alloc, database, target.table.indexes_json, .{ .restore_build_only = true });
         // Match production provisioning: initialization is local and hidden;
         // only the authorized owner generation may start emitting HA effects.

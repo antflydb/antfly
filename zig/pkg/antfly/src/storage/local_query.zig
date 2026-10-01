@@ -220,25 +220,12 @@ pub fn executeStorageKernelGraphEdges(
     };
     try checkQueryDeadline(control_req);
     try distributed_graph.validateGraphEdgesTensorAccessPath(alloc, req);
-    _ = try currentIdentityReadGenerationForDb(req.identity_read_generation, db);
-    const graph_entry = db.core.graphIndex(req.index_name) orelse return error.IndexNotFound;
-    const now_ns = if (req.ttl_now_ns == 0) graph_entry.index.clock.nowRealtimeNs() else req.ttl_now_ns;
-    const bounded = try graph_entry.index.getEdgesByTypesBoundedWithStatsAt(
-        alloc,
-        req.key,
-        req.edge_types,
-        req.direction,
-        req.max_edges,
-        req.max_owned_bytes,
-        req.max_scanned_rows,
-        now_ns,
-    );
+    const result = try db.graphEdgesForInternalReadBoundedAt(alloc, req.index_name, req.key, req.edge_types, req.direction, req.identity_read_generation, req.ttl_now_ns, req.max_edges, req.max_owned_bytes, req.max_scanned_rows);
     errdefer {
-        for (bounded.edges) |edge| graph_mod.GraphIndex.freeEdge(alloc, edge);
-        if (bounded.edges.len > 0) alloc.free(bounded.edges);
+        graph_mod.GraphIndex.freeEdges(alloc, result.edges);
     }
     try checkQueryDeadline(control_req);
-    return .{ .edges = bounded.edges, .scanned_rows = @intCast(bounded.scanned_rows) };
+    return .{ .edges = result.edges, .scanned_rows = @intCast(result.scanned_rows) };
 }
 
 pub fn validateGraphHydrateIncomingIndexIdentity(

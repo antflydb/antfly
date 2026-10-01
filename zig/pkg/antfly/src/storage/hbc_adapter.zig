@@ -18211,6 +18211,40 @@ pub const HBCIndex = struct {
         return .{ .generation = generation, .source_sequence = generation.covered_source_sequence.load(.acquire) };
     }
 
+    /// The immutable posting generation is the query and restart authority.
+    /// Mutable HBC metadata may already describe the next source capture,
+    /// before its posting WAL transaction has committed.
+    pub const NativeServingSnapshot = struct {
+        active_count: u64,
+        node_count: u64,
+        root_node: u64,
+        source_sequence: u64,
+        publish_generation: u64,
+    };
+
+    pub fn nativeServingSnapshot(self: *HBCIndex) ?NativeServingSnapshot {
+        if (!self.nativeHbcAuthoritative()) return null;
+        const generation = self.acquireExperimentalPostingReadGeneration() orelse return null;
+        defer generation.release();
+        return .{
+            .active_count = generation.search_view.active_count,
+            .node_count = generation.search_view.node_count,
+            .root_node = generation.search_view.root_node,
+            .source_sequence = generation.covered_source_sequence.load(.acquire),
+            .publish_generation = generation.search_view.publish_generation,
+        };
+    }
+
+    /// Checkpoint sidecars must describe the same generation queries serve.
+    /// A missing native reader cannot be replaced with mutable HBC metadata.
+    pub fn servingActiveCountForCheckpoint(self: *HBCIndex) ?u64 {
+        if (self.experimentalPostingWalAuthoritative()) {
+            const snapshot = self.nativeServingSnapshot() orelse return null;
+            return snapshot.active_count;
+        }
+        return self.stats().active_count;
+    }
+
     /// Caller-owned, synchronous query scope. Catalog lifetime and primary
     /// identity/source snapshots are held by the DB owner outside this scope.
     pub const QuerySnapshot = struct {

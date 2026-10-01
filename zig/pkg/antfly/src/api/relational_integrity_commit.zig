@@ -195,6 +195,27 @@ test "distributed txn cascade scalar equality uses row coercions without losing 
     try std.testing.expectError(error.InvalidIntegrityRecord, scalarAssignmentEqual(.datetime, .{ .string = "invalid" }, .{ .integer = 0 }));
 }
 
+fn observationQuery(alloc: Allocator, keys: []const []const u8, schema_version: u32, generation_set: planner.storage.Digest) ![]u8 {
+    const Query = struct {
+        keys: []const []const u8,
+        schema_version: u32,
+        generation_set: planner.storage.Digest,
+        pub fn jsonStringify(value: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+            try stream.beginObject();
+            try stream.objectField("kind");
+            try stream.write("observations");
+            try stream.objectField("keys");
+            try @import("../storage/db/relational_integrity_json.zig").write(value.keys, stream);
+            try stream.objectField("schema_version");
+            try stream.write(value.schema_version);
+            try stream.objectField("generation_set");
+            try stream.write(value.generation_set);
+            try stream.endObject();
+        }
+    };
+    return std.json.Stringify.valueAlloc(alloc, Query{ .keys = keys, .schema_version = schema_version, .generation_set = generation_set }, .{});
+}
+
 const Builder = struct {
     const FinalReference = struct { child: *Work, definition: native.ForeignKey, address: planner.storage.Address, reference: planner.storage.Reference };
     const FinalPartial = struct { child: *Work, dependency: planner.PartialDependency };
@@ -205,6 +226,7 @@ const Builder = struct {
     read_view: ?*reads.JoinReadView = null,
     read_view_attempted: bool = false,
     metadata: []const TableRecord,
+    ranges: []const RangeRecord = &.{},
     loaded: std.ArrayList(*Loaded) = .empty,
     output: std.ArrayList(contract.TableCommitRequest) = .empty,
     command_lists: std.ArrayList(std.ArrayList(planner.storage.Command)) = .empty,
@@ -426,10 +448,58 @@ const Builder = struct {
         return item;
     }
 
+    fn preloadOwnerObservations(self: *Builder, table: *Loaded, keys: []const []const u8) !bool {
+        // Only native providers with strict read-index absence proofs support
+        // this internal owner batch. Other explicit fixtures keep point reads.
+        if (!self.source.strict_read_index_absence or self.ranges.len == 0 or keys.len < 2) return false;
+        const record = try self.metadataTable(table.name);
+        const Bucket = struct { group_id: u64, keys: std.ArrayList([]const u8) = .empty };
+        var buckets: std.ArrayList(Bucket) = .empty;
+        for (keys) |key| {
+            if (key.len == 0 or key.len > 512) return false;
+            const group_id = for (self.ranges) |range| {
+                if (range.table_id == record.table_id and std.mem.order(u8, range.start_key, key) != .gt and
+                    (range.end_key == null or std.mem.order(u8, key, range.end_key.?) == .lt)) break range.group_id;
+            } else return error.PreparedGenerationChanged;
+            const index = for (buckets.items, 0..) |bucket, i| {
+                if (bucket.group_id == group_id) break i;
+            } else bucket: {
+                try buckets.append(self.alloc, .{ .group_id = group_id });
+                break :bucket buckets.items.len - 1;
+            };
+            try buckets.items[index].keys.append(self.alloc, key);
+        }
+        for (buckets.items) |bucket| {
+            var offset: usize = 0;
+            while (offset < bucket.keys.items.len) {
+                var end = @min(offset + 8, bucket.keys.items.len);
+                var query = try observationQuery(self.alloc, bucket.keys.items[offset..end], table.view.version(), @import("../storage/db/relational_integrity_activation_contract.zig").generationSet(table.catalog));
+                while (query.len > 4096 and end > offset + 1) {
+                    end -= 1;
+                    query = try observationQuery(self.alloc, bucket.keys.items[offset..end], table.view.version(), @import("../storage/db/relational_integrity_activation_contract.zig").generationSet(table.catalog));
+                }
+                if (query.len > 4096) return error.TransactionTooLarge;
+                var response = (try self.lookup(table.name, bucket.keys.items[offset], .{ .relational_integrity_jobs_json = query })) orelse return error.InvalidIntegrityRecord;
+                defer response.deinit(self.alloc);
+                const Item = struct { key: []const u8, row: ?types.LookupResult };
+                const result = try std.json.parseFromSliceLeaky(struct { observations: []const Item }, self.alloc, response.json, .{ .allocate = .alloc_always });
+                if (result.observations.len != end - offset) return error.InvalidIntegrityRecord;
+                for (result.observations, bucket.keys.items[offset..end]) |item, key| {
+                    if (!std.mem.eql(u8, item.key, key)) return error.InvalidIntegrityRecord;
+                    const row: ?reads.LookupResponse = if (item.row) |value| .{ .json = value.json, .version = value.version orelse return error.MissingPrimaryObservation, .expected_content_digest = value.expected_content_digest } else null;
+                    _ = try self.recordWork(table, key, row);
+                }
+                offset = end;
+            }
+        }
+        return true;
+    }
+
     /// Independent primary observations may share a routing view, but never
     /// the builder's mutable arena. Drain every bounded Io task before copying
     /// results and publishing predicates on the caller, including on failure.
     fn preloadWork(self: *Builder, table: *Loaded, keys: []const []const u8) !void {
+        if (try self.preloadOwnerObservations(table, keys)) return;
         const borrow = self.control.fanout_io orelse self.control.deadline_io orelse return;
         if (keys.len < 2) return;
         const Slot = struct {
@@ -695,11 +765,18 @@ const Builder = struct {
     }
 
     fn statementState(self: *Builder, table: []const u8, address: planner.storage.Address) !StatementState {
+        return self.statementStateFenced(table, address, null, null);
+    }
+
+    fn statementStateFenced(self: *Builder, table: []const u8, address: planner.storage.Address, schema_version: ?u32, generation_set: ?planner.storage.Digest) !StatementState {
         var state: StatementState = .{};
         var continuation: ?[]const u8 = null;
         var count: usize = 0;
         while (true) {
-            const query = try std.json.Stringify.valueAlloc(self.alloc, .{ .kind = "references", .address = address, .after = continuation, .limit = @as(u32, 128) }, .{});
+            const query = if (schema_version != null)
+                try std.json.Stringify.valueAlloc(self.alloc, .{ .kind = "references", .address = address, .after = continuation, .limit = @as(u32, 128), .schema_version = schema_version, .generation_set = generation_set }, .{})
+            else
+                try std.json.Stringify.valueAlloc(self.alloc, .{ .kind = "references", .address = address, .after = continuation, .limit = @as(u32, 128) }, .{});
             var response = (try self.lookup(table, &address.routing, .{ .relational_integrity_jobs_json = query })) orelse break;
             defer response.deinit(self.alloc);
             try self.charge(response.json.len);
@@ -950,10 +1027,18 @@ fn prepareModeInternal(alloc: Allocator, source: reads.TableReadSource, metadata
     return prepareModeWithTiming(alloc, source, metadata, requests, request_control, repair_table, statement, previous, validate_statement, &.{});
 }
 
+fn prepareModeRouted(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, requests: []const contract.TableCommitRequest, request_control: RequestContext, repair_table: ?[]const u8, statement: bool, previous: []const contract.TableCommitRequest, validate_statement: bool) !Prepared {
+    return prepareModeRoutedWithTiming(alloc, source, metadata, ranges, requests, request_control, repair_table, statement, previous, validate_statement, &.{});
+}
+
 fn prepareModeWithTiming(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, requests: []const contract.TableCommitRequest, request_control: RequestContext, repair_table: ?[]const u8, statement: bool, previous: []const contract.TableCommitRequest, validate_statement: bool, modes: []const native.ConstraintTiming) !Prepared {
+    return prepareModeRoutedWithTiming(alloc, source, metadata, &.{}, requests, request_control, repair_table, statement, previous, validate_statement, modes);
+}
+
+fn prepareModeRoutedWithTiming(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, requests: []const contract.TableCommitRequest, request_control: RequestContext, repair_table: ?[]const u8, statement: bool, previous: []const contract.TableCommitRequest, validate_statement: bool, modes: []const native.ConstraintTiming) !Prepared {
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
-    var builder: Builder = .{ .alloc = arena.allocator(), .source = source, .metadata = metadata, .control = try boundedControl(request_control), .repair_table = repair_table, .statement = statement, .previous = previous, .constraint_timing = modes };
+    var builder: Builder = .{ .alloc = arena.allocator(), .source = source, .metadata = metadata, .ranges = ranges, .control = try boundedControl(request_control), .repair_table = repair_table, .statement = statement, .previous = previous, .constraint_timing = modes };
     defer builder.deinit();
     try builder.output.appendSlice(builder.alloc, requests);
     for (requests) |request| {
@@ -1298,7 +1383,7 @@ pub fn prepareWithCoverageControlled(alloc: Allocator, source: reads.TableReadSo
 /// This phase only reads and prepares owned commands. A leader read barrier
 /// timing out here proves no commit has been attempted, unlike a timeout from
 /// the distributed commit call itself. Preserve that distinction at the API.
-fn preparationError(err: anyerror) anyerror {
+pub fn preparationError(err: anyerror) anyerror {
     return switch (err) {
         error.ReadIndexTimeout, error.CatalogRoutingSnapshotTimeout, error.Timeout, error.NotLeader, error.GroupLeaderUnavailable, error.LeaderUnavailable, error.DistributedQueryUnavailable, error.StorageReadTemporarilyUnavailable, error.ConcurrencyUnavailable, error.ResourceTemporarilyUnavailable => blk: {
             if (preparation_diagnostic_gate.admit(@import("antfly_platform").time.monotonicNs()))
@@ -1312,7 +1397,7 @@ fn preparationError(err: anyerror) anyerror {
 
 fn prepareWithCoverageOnce(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, requests: []const contract.TableCommitRequest, request: RequestContext) !Prepared {
     const control = try boundedControl(request);
-    var prepared = try prepareControlled(alloc, source, metadata, requests, control);
+    var prepared = try prepareModeRouted(alloc, source, metadata, ranges, requests, control, null, false, &.{}, false);
     errdefer prepared.deinit();
     const names = try alloc.alloc([]const u8, prepared.tables.len);
     defer alloc.free(names);
@@ -1355,6 +1440,77 @@ test "distributed txn partial witness scan translates distinct clock epochs with
     try std.testing.expect((try partialWitnessScanOptions(.{}, "query")).execution_deadline_ns == null);
     const platform: RequestContext = .{ .deadline_ns = after + std.time.ns_per_s };
     try std.testing.expectEqual(platform.deadline_ns, (try partialWitnessScanOptions(platform, "query")).execution_deadline_ns);
+}
+
+/// Fresh public batches may reject a definite constraint violation before
+/// admitting transaction state. This is read-only: a passing observation never
+/// authorizes a commit, whose version/generation guards still run in prepare.
+/// Retained transaction-ID recovery must bypass this path and resume its sealed
+/// plan/decision instead. Evaluate the complete normalized statement so releases,
+/// replacements, and cascades are visible to its own claim checks.
+pub fn rejectDefiniteConflicts(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, prepared: []const contract.TableCommitRequest, request: RequestContext) !void {
+    // A fixture or adapter that cannot certify read-index absence must keep
+    // native transactional validation as its sole rejection authority.
+    if (!source.strict_read_index_absence) return;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var builder: Builder = .{ .alloc = arena.allocator(), .source = source, .metadata = metadata, .control = try boundedControl(request) };
+    defer builder.deinit();
+    for (prepared) |table| {
+        const record = try builder.metadataTable(table.table_name);
+        const Bucket = struct { group_id: u64, addresses: std.ArrayList(planner.storage.Address) = .empty };
+        var buckets: std.ArrayList(Bucket) = .empty;
+        const Commands = struct { items: std.ArrayList(planner.storage.Command) = .empty, needs_references: bool = false };
+        var by_address: std.AutoHashMapUnmanaged(planner.storage.Address, Commands) = .empty;
+        for (table.integrity_commands) |command| {
+            const entry = try by_address.getOrPut(builder.alloc, command.address);
+            if (!entry.found_existing) entry.value_ptr.* = .{};
+            try entry.value_ptr.items.append(builder.alloc, command);
+            entry.value_ptr.needs_references = entry.value_ptr.needs_references or command.operation == .release or command.operation == .repair_release;
+        }
+        var command_it = by_address.iterator();
+        while (command_it.next()) |entry| {
+            const address = entry.key_ptr.*;
+            // Releases need the full reference set to prove RESTRICT. Other
+            // commands need only the claim, never its potentially large fanout.
+            if (entry.value_ptr.needs_references) {
+                var state = try builder.statementStateFenced(table.table_name, address, table.relational_schema_version, table.relational_integrity_generation_set);
+                try builder.applyStatementCommands(&state, address, entry.value_ptr.items.items, true);
+                continue;
+            }
+            const group_id = for (ranges) |range| {
+                if (range.table_id == record.table_id and std.mem.order(u8, range.start_key, &address.routing) != .gt and
+                    (range.end_key == null or std.mem.order(u8, &address.routing, range.end_key.?) == .lt)) break range.group_id;
+            } else return error.PreparedGenerationChanged;
+            const bucket_index = for (buckets.items, 0..) |bucket, i| {
+                if (bucket.group_id == group_id) break i;
+            } else bucket: {
+                try buckets.append(builder.alloc, .{ .group_id = group_id });
+                break :bucket buckets.items.len - 1;
+            };
+            try buckets.items[bucket_index].addresses.append(builder.alloc, address);
+        }
+        for (buckets.items) |bucket| {
+            var offset: usize = 0;
+            while (offset < bucket.addresses.items.len) {
+                const addresses = bucket.addresses.items[offset..@min(offset + 8, bucket.addresses.items.len)];
+                const query = try std.json.Stringify.valueAlloc(builder.alloc, .{ .kind = "claims", .addresses = addresses, .schema_version = table.relational_schema_version, .generation_set = table.relational_integrity_generation_set }, .{});
+                if (query.len > 4096) return error.TransactionTooLarge;
+                var response = (try builder.lookup(table.table_name, &addresses[0].routing, .{ .relational_integrity_jobs_json = query })) orelse return error.InvalidIntegrityRecord;
+                defer response.deinit(builder.alloc);
+                try builder.charge(response.json.len);
+                const Item = struct { address: planner.storage.Address, claim: ?planner.storage.Claim };
+                const result = try std.json.parseFromSliceLeaky(struct { claims: []const Item }, builder.alloc, response.json, .{ .allocate = .alloc_always });
+                if (result.claims.len != addresses.len) return error.InvalidIntegrityRecord;
+                for (result.claims, addresses) |item, address| {
+                    if (!std.meta.eql(item.address, address)) return error.InvalidIntegrityRecord;
+                    var state: Builder.StatementState = .{ .claim = item.claim };
+                    try builder.applyStatementCommands(&state, address, by_address.get(address).?.items.items, true);
+                }
+                offset += addresses.len;
+            }
+        }
+    }
 }
 
 /// Administrative recovery may edit invalid rows, not bypass new-value checks.
@@ -2569,10 +2725,20 @@ fn testNativeCascade(generated: bool) !void {
     const Fixture = struct {
         db: *db_mod.DB,
         reference_pages: usize = 0,
+        observation_batches: usize = 0,
+        claim_batches: usize = 0,
+        lookup_failure: ?anyerror = null,
         fn lookup(ptr: *anyopaque, allocator: Allocator, _: []const u8, key: []const u8, options: types.LookupOptions, consistency: gate.ReadConsistency) !?reads.LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(gate.ReadConsistency.read_index, consistency);
-            if (options.relational_integrity_jobs_json.len != 0) self.reference_pages += 1;
+            if (self.lookup_failure) |err| return err;
+            if (options.relational_integrity_jobs_json.len != 0) {
+                var kind = try std.json.parseFromSlice(struct { kind: []const u8 }, allocator, options.relational_integrity_jobs_json, .{ .ignore_unknown_fields = true });
+                defer kind.deinit();
+                if (std.mem.eql(u8, kind.value.kind, "references")) self.reference_pages += 1;
+                if (std.mem.eql(u8, kind.value.kind, "observations")) self.observation_batches += 1;
+                if (std.mem.eql(u8, kind.value.kind, "claims")) self.claim_batches += 1;
+            }
             const result = (try self.db.lookup(allocator, key, options)) orelse return null;
             const internal = options.relational_integrity_catalog or options.relational_integrity_jobs_json.len != 0 or options.relational_index_status_json.len != 0 or options.relational_activation_json.len != 0;
             return .{ .json = result.json, .version = if (internal) 0 else result.version orelse try self.db.getTimestamp(allocator, key), .expected_content_digest = result.expected_content_digest };
@@ -2587,12 +2753,13 @@ fn testNativeCascade(generated: bool) !void {
             try std.testing.expectEqual(@as(usize, 1), prepared.tables.len);
             const request = prepared.tables[0];
             const txn = try database.beginTransactionWithId(@splat(id), @as(u64, id) * 100);
+            errdefer database.abortTransaction(txn, @as(u64, id) * 100 + 1) catch {};
             try database.writeTransaction(txn, .{ .relational_schema_version = request.relational_schema_version, .relational_integrity_generation_set = request.relational_integrity_generation_set, .writes = request.writes, .deletes = request.deletes, .predicates = request.predicates, .integrity_commands = request.integrity_commands });
             try database.commitTransaction(txn, @as(u64, id) * 100 + 1);
         }
     };
     var fixture: Fixture = .{ .db = &db };
-    const source: reads.TableReadSource = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = Fixture.scan, .query = Fixture.query } };
+    const source: reads.TableReadSource = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = Fixture.scan, .query = Fixture.query }, .strict_read_index_absence = true };
     const tables = [_]TableRecord{.{ .table_id = 500, .name = "rows", .placement_role = "data", .schema_json = declaration }};
     const ranges = [_]RangeRecord{.{ .group_id = 501, .table_id = 500, .start_key = "" }};
     var inserted = try prepareWithCoverage(alloc, source, &tables, &ranges, &.{.{ .table_name = "rows", .writes = &.{
@@ -2600,7 +2767,31 @@ fn testNativeCascade(generated: bool) !void {
         .{ .key = "c", .value = if (generated) "{\"seed\":1,\"parent\":1}" else "{\"id\":2,\"parent\":1}" },
     } }});
     defer inserted.deinit();
+    try std.testing.expectEqual(@as(usize, 1), fixture.observation_batches);
+    // Fresh inserts and same-statement parent/child establishment pass the
+    // read-only check; an existing owner rejects before creating any txn.
+    try rejectDefiniteConflicts(alloc, source, &tables, &ranges, inserted.tables, .{});
+    try std.testing.expectEqual(@as(usize, 1), fixture.claim_batches);
     try Fixture.commit(&db, inserted, 1);
+    var duplicate = try prepareWithCoverage(alloc, source, &tables, &ranges, &.{.{ .table_name = "rows", .writes = &.{.{ .key = "duplicate", .value = if (generated) "{\"seed\":0,\"parent\":null}" else "{\"id\":1,\"parent\":null}" }} }});
+    defer duplicate.deinit();
+    try std.testing.expectError(error.UniqueConstraintViolation, rejectDefiniteConflicts(alloc, source, &tables, &ranges, duplicate.tables, .{}));
+    try std.testing.expect((try db.lookup(alloc, "duplicate", .{})) == null);
+    fixture.lookup_failure = error.ReadIndexTimeout;
+    try std.testing.expectError(error.ReadIndexTimeout, rejectDefiniteConflicts(alloc, source, &tables, &ranges, duplicate.tables, .{}));
+    fixture.lookup_failure = null;
+    var superseded = duplicate.tables[0];
+    superseded.relational_schema_version = 999;
+    try std.testing.expectError(error.PreparedGenerationChanged, rejectDefiniteConflicts(alloc, source, &tables, &ranges, &.{superseded}, .{}));
+    // Passing a negative check is never a commit certificate. A racing owner
+    // still wins at native prepare, with the original version/generation guards.
+    var optimistic = try prepareWithCoverage(alloc, source, &tables, &ranges, &.{.{ .table_name = "rows", .writes = &.{.{ .key = "optimistic", .value = if (generated) "{\"seed\":8,\"parent\":null}" else "{\"id\":9,\"parent\":null}" }} }});
+    defer optimistic.deinit();
+    try rejectDefiniteConflicts(alloc, source, &tables, &ranges, optimistic.tables, .{});
+    var winner = try prepareWithCoverage(alloc, source, &tables, &ranges, &.{.{ .table_name = "rows", .writes = &.{.{ .key = "winner", .value = if (generated) "{\"seed\":8,\"parent\":null}" else "{\"id\":9,\"parent\":null}" }} }});
+    defer winner.deinit();
+    try Fixture.commit(&db, winner, 4);
+    try std.testing.expectError(error.UniqueConstraintViolation, Fixture.commit(&db, optimistic, 5));
     if (generated) {
         var updated = try prepareWithCoverage(alloc, source, &tables, &ranges, &.{.{ .table_name = "rows", .writes = &.{.{ .key = "p", .value = "{\"seed\":9007199254740993,\"parent\":null}" }} }});
         defer updated.deinit();
@@ -2610,13 +2801,16 @@ fn testNativeCascade(generated: bool) !void {
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, child.json, .{ .parse_numbers = false });
         defer parsed.deinit();
         try std.testing.expectEqualStrings("9007199254740994", parsed.value.object.get("parent").?.number_string);
-        fixture.reference_pages = 0;
     }
+    fixture.reference_pages = 0;
     var removed = try prepareWithCoverage(alloc, source, &tables, &ranges, &.{.{ .table_name = "rows", .deletes = &.{"p"} }});
     defer removed.deinit();
     try std.testing.expectEqual(@as(usize, 2), removed.tables[0].deletes.len);
     try std.testing.expectEqual(@as(usize, 2), removed.tables[0].predicates.len);
     try std.testing.expectEqual(@as(usize, 2), fixture.reference_pages);
+    // Cascaded detaches/releases are evaluated together, never as isolated
+    // probes against the pre-statement parent claim.
+    try rejectDefiniteConflicts(alloc, source, &tables, &ranges, removed.tables, .{});
     try Fixture.commit(&db, removed, if (generated) 3 else 2);
     try std.testing.expect((try db.lookup(alloc, "p", .{})) == null);
     try std.testing.expect((try db.lookup(alloc, "c", .{})) == null);

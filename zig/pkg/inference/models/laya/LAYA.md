@@ -1030,9 +1030,10 @@ that row, so the training loss is a held-out learning curve.
   - RLCD's Gaussian logit exploration, which already diverged on 77-option
     Banking77 ([Recommended recipe](#recommended-recipe)). About a third of Open-Jev
     choice questions have 9 or 16 options.
-  - The trainer has no learning-rate schedule (no warmup, no decay). A
-    constant 2.5e-5 at batch 1 over 21k steps is 50× longer than the runs it
-    was tuned on.
+  - The learning rate: cosine decay from 2.5e-5 with no warmup, at batch 1
+    over 21k steps, 50× longer than the runs it was tuned on. (An earlier
+    version of this section said the trainer had no schedule; it has had
+    cosine decay throughout.)
 **Result: soft CE, seed 42 — Open-Jev learned, our eval unchanged.** The same
 run with `"objective": "soft_ce"`. Train time 7.2 h, peak 27.4 GB.
 - It trained stably. Mean CE per 2,000 steps: 1.11, 0.97, 0.90, 0.90, 0.82,
@@ -1061,7 +1062,7 @@ run with `"objective": "soft_ce"`. Train time 7.2 h, peak 27.4 GB.
   different base model and a different eval.
 - So this run cannot separate "the packed encoder learns slowly" from "this
   recipe learns slowly". Candidates:
-  - no learning-rate schedule;
+  - no learning-rate warmup;
   - batch 1;
   - a released encoder whose trunk learned to depend on seeing the question.
 - The deciding control is an unpacked run on the same mix, evaluated on Open-Jev
@@ -1163,6 +1164,60 @@ fusion.
 - A cheap test that keeps caching: give the trunk fixed positions after the
   full head budget (`head_max_len`), so that every question sits *before* the
   state in position space, as in the released layout.
+
+**Question-first positions and a pointer head (2026-09-29): neither closes
+the gap.** Same 16k subset and recipe as the layout control.
+- *Question-first positions* (`packing.question_first`) give every branch
+  logical positions from 0, as the question has in the unpacked layout. The
+  trunk starts after the question budget (`head_max_len` + 3), or as far
+  right as fits. Only positions change; the trunk stays cacheable.
+- *Pointer head* (`laya.decision_head: "pointer"`, from
+  [Jeeves](#lessons-from-jeeves-research-2026-09-29)) replaces the scorer
+  MLP. It projects the head's output at the question's `[CLS]` anchor to a
+  query, and at each option marker to a key, both through a shared
+  `pointer.norm`, and scores their dot product over √256.
+  - A new pointer head is initialized Kaiming-uniform, with zero biases.
+  - It trains in its own optimizer group at `pointer_lr` (1e-3), 10× the
+    head's rate.
+
+| Layout, 16k subset | Open-Jev val | `s0-eval` | `s0-eval` choice / score / noul | Final train CE (last fifth) |
+| --- | ---: | ---: | --- | ---: |
+| Label prior | 0.600 | | | |
+| Packed | 0.607 | 0.463 | 0.386 / 0.418 / 0.601 | 0.89 |
+| Packed, question-first | 0.621 | 0.476 | 0.439 / 0.418 / 0.592 | 0.91 |
+| Packed, pointer head | 0.546 | 0.334 | 0.237 / 0.273 / 0.513 | 0.93 |
+| Fused, K = 30 | 0.605 | 0.476 | 0.461 / 0.385 / 0.614 | 0.88 |
+| Unpacked | 0.701 | 0.607 | 0.583 / 0.546 / 0.711 | 0.74 |
+
+**Reading.**
+- Question-first positions are within one seed's noise of packed (the
+  three-seed spread was ±0.014). So the order in which RoPE sees question
+  and state is not what costs packed its accuracy.
+- The pointer head learned, but it trails the released scorer by 0.06–0.13.
+  The scorer is pretrained with the rest of the model; a pointer head
+  learned from scratch on 16k decisions does not catch up. Jeeves trains its
+  pointer on a 9B decoder whose states already carry the decision.
+- Every encoder-side variant tried leaves the gap to unpacked open:
+  question-blind lower layers, full fusion per question, token order, and
+  the decision head. What remains is the encoder base, as the Jeeves and
+  MoJev evidence suggests.
+
+**Two Metal training faults found on the way** (both fixed, with tests):
+- *Fused gather of `add(matrix, bias)` with integer indices.* The
+  interpreter fuses a gather whose source is `add(matrix, bias)`, which
+  includes any LayerNorm output. Metal's fused kernel
+  (`primGatherAddBiasAxis0`) reads its indices as floats, so training's
+  int32 indices truncated to 0 and every gathered row was row 0. Integer
+  indices now take the typed gather and a separate add. Test: "laya resident
+  Metal gathers rows of a LayerNorm output".
+- *Transposed-left `dot_general`.* Autodiff emits weight gradients as `Aᵀ·B`
+  without materializing the transpose. Metal ran those on the host, so a
+  Laya step took about 60 s instead of 1.1 s. Fixed in #913.
+- The first two pointer runs were lost to these faults and to
+  initialization: a saturated softmax from unnormalized inputs, then a
+  zero-initialized query that learned too slowly. They are not results.
+  Test: "laya pointer head gradients agree between native and resident
+  Metal".
 
 ### Candidate mode on Banking77 (step 0b)
 
@@ -2197,7 +2252,7 @@ Ordered to make Laya more Jev-like at the lowest cost. Each step has a gate.
 
 | Step | Retraining | Status | Gate |
 | --- | --- | --- | --- |
-| 0. Qualify packed accuracy | fine-tune | question mode **fails** the gate: 0.450 packed vs 0.621 unpacked over three seeds at equal budget (0.471 vs 0.671 on a larger recipe); distillation does not help (0.451); a question-aware trunk (`trunk_sees: "questions"`) reaches 0.554. 33× more data (Open-Jev, soft CE) leaves it at 0.464. A same-data control shows the packed layout itself learns slowly: on Open-Jev validation, unpacked 0.701 vs packed 0.607 at 16k decisions. Candidate mode: Banking77 0.819 mean over two seeds with soft CE | Packed within noise of unpacked at equal budget on accuracy, soft CE, and ECE, over several seeds |
+| 0. Qualify packed accuracy | fine-tune | question mode **fails** the gate: 0.450 packed vs 0.621 unpacked over three seeds at equal budget (0.471 vs 0.671 on a larger recipe); distillation does not help (0.451); a question-aware trunk (`trunk_sees: "questions"`) reaches 0.554. 33× more data (Open-Jev, soft CE) leaves it at 0.464. A same-data control shows the packed layout itself learns slowly: on Open-Jev validation, unpacked 0.701 vs packed 0.607 at 16k decisions. Per-question upper layers, question-first positions and a pointer head do not close it (best 0.621). Candidate mode: Banking77 0.819 mean over two seeds with soft CE | Packed within noise of unpacked at equal budget on accuracy, soft CE, and ECE, over several seeds |
 | 1a. State cache across rows and requests | no | done (CPU and Metal) | Exact against the full row and the oracle; follow-up questions skip trunk projections and feed-forward work |
 | 1b. Segment attention | no | done (CPU and Metal); multi-row batching done (CPU and Metal, question and candidate modes) | Work proportional to visible keys; no `[L, L]` masks; physical cap raised to 32,768; cached rows compute branch queries only. Several rows per call: exact against running each row alone, isolated by construction; not yet composed with the trunk cache |
 | 1c. Metal and CUDA packed kernels | no | Metal: fused kernels not pursued (encoder GPU work dominates; device scoring gave 2–4% and was reverted after a race). CUDA: not started | CUDA needs a segment-attention kernel, per-token RoPE, and admission of packed configs before any packed row can run there |

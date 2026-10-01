@@ -3489,8 +3489,18 @@ test "opaque metadata compound rewrite admission preserves job and source reserv
             .replace = .{ .table = original, .ranges = &.{range}, .fences = &.{scope.fence} },
             .rewrite_sources = &.{scope},
             .rewrite = .{ .preserve_document = true, .source_schemas = &.{original.schema_json}, .target_schema = original.schema_json, .program_digest = @splat(6) },
+            .generation_handoffs = &.{.{
+                .source_group_id = 301,
+                .target_group_id = 401,
+                .source_namespace = scope.fence.namespace,
+                .admissions = &.{},
+                .admissions_digest = try @import("portable_backup.zig").sourceGenerationAdmissionSummaryDigest(scope.fence.namespace, &.{}),
+                .retired_digest = @splat(8),
+                .retired_count = 0,
+            }},
         }},
     };
+    try plan.validate(alloc);
     const plan_json = try std.json.Stringify.valueAlloc(a, plan, .{});
     const key = "\x00\x00__api_restore_jobs__:0000000000000007";
     const value = "{\"job_id\":7,\"attempt_id\":1,\"staging_attempt_id\":1,\"source_kind\":\"schema_rewrite\",\"phase\":\"queued\"}";
@@ -3501,7 +3511,7 @@ test "opaque metadata compound rewrite admission preserves job and source reserv
     defer replacement.deinit();
     try std.testing.expect(try replacement.snapshotBuilder().installSnapshot(alloc, group, 1, encoded));
     for ([_]*metadata_apply_client.RaftApplyStore{ &source, &replacement }) |owner| {
-        const stored = (try owner.getRestoreJobValue(alloc, group, key)).?;
+        const stored = (try owner.getRestoreJobValue(alloc, group, key)) orelse return error.TestExpectedRestoreJob;
         defer alloc.free(stored);
         try std.testing.expectEqualStrings(value, stored);
         var admitted = (try owner.loadRestoreStaging(alloc, group, plan.id)).?;

@@ -11890,6 +11890,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const bias_metal = bias_buf.metal_tensor orelse return null;
         const indices_metal = indices_buf.metal_tensor orelse return null;
         if (!input_metal.isDevice() or !bias_metal.isDevice() or !indices_metal.isDevice()) return null;
+        // The fused kernel reads float indices. Integer indices (training's
+        // i32 runtime inputs) would be read as float bit patterns, which
+        // truncate to row 0; leave them to the typed gather and a separate add.
+        if (indices_buf.integer_storage or indices_metal.dtype != .f32 or input_metal.dtype != .f32 or bias_metal.dtype != .f32) return null;
         if (bias_metal.elemCount() != cols) return null;
         const index_count = indices_metal.elemCount();
         if (index_count == 0) return null;
@@ -35740,6 +35744,9 @@ test "metal_compute: dot_general with a transposed left operand stays on the dev
     const cases = [_]struct { a: []const f32, b: []const f32, a_shape: []const i32, b_shape: []const i32, a_dims: []const i64, b_dims: []const i64, lc: []const u8, rc: []const u8, batch: []const u8, want: []const f32, out: []const i64 }{
         .{ .a = &a_values, .b = &b_values, .a_shape = &.{ 3, 2 }, .b_shape = &.{ 3, 2 }, .a_dims = &.{ 3, 2 }, .b_dims = &.{ 3, 2 }, .lc = &.{0}, .rc = &.{0}, .batch = &.{}, .want = &.{ 6, 8, 8, 10 }, .out = &.{ 2, 2 } },
         .{ .a = &a_batched, .b = &b_batched, .a_shape = &.{ 2, 3, 2 }, .b_shape = &.{ 2, 3, 2 }, .a_dims = &.{ 2, 3, 2 }, .b_dims = &.{ 2, 3, 2 }, .lc = &.{1}, .rc = &.{1}, .batch = &.{0}, .want = &.{ 6, 8, 8, 10, 12, 16, 16, 20 }, .out = &.{ 2, 2, 2 } },
+        // One output column, as a pointer head's query gradient (keysᵀ·dS).
+        .{ .a = &a_batched, .b = &.{ 1, 0, 1, 2, 1, 0 }, .a_shape = &.{ 2, 3, 2 }, .b_shape = &.{ 2, 3, 1 }, .a_dims = &.{ 2, 3, 2 }, .b_dims = &.{ 2, 3, 1 }, .lc = &.{1}, .rc = &.{1}, .batch = &.{0}, .want = &.{ 6, 8, 5, 8 }, .out = &.{ 2, 2, 1 } },
+        .{ .a = &a_values, .b = &.{ 1, 0, 1 }, .a_shape = &.{ 3, 2 }, .b_shape = &.{ 3, 1 }, .a_dims = &.{ 3, 2 }, .b_dims = &.{ 3, 1 }, .lc = &.{0}, .rc = &.{0}, .batch = &.{}, .want = &.{ 6, 8 }, .out = &.{ 2, 1 } },
     };
     for (cases) |case| {
         const a_host = try metal_cb.fromFloat32Shape(case.a, case.a_shape);

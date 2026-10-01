@@ -405,3 +405,12 @@ pub fn productionVoprCompileMaxRss(target: std.Build.ResolvedTarget) usize {
     // footprint; this is not an Antfly runtime memory limit.
     return @as(usize, if (target.result.os.tag == .macos) 18 else 16) * 1024 * 1024 * 1024;
 }
+
+/// Required native integration selections use the ordinary run/inventory path.
+/// Keep their execution budget and reject environment skips independently of
+/// compiler optimization or CI job layout.
+pub fn addRequiredTestRunArtifact(b: *std.Build, artifact: *std.Build.Step.Compile, timeout_ms: u64) *std.Build.Step.Run {
+    const run = addFilteredTestRunArtifact(b, artifact);
+    run.addArgs(&.{ "--require-no-skips", b.fmt("--timeout-ms={d}", .{timeout_ms}) });
+    return run;
+}
