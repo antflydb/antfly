@@ -17,11 +17,13 @@ const httpx = @import("httpx");
 const config_mod = @import("config.zig");
 const transcribing = @import("antfly_transcribing");
 const readers = @import("antfly_readers");
+const secrets = @import("secrets.zig");
 const synthesizing = @import("antfly_synthesizing");
 
 pub const ActiveRuntime = struct {
     pub const Options = struct {
         client: httpx.ClientConfig = .{},
+        secret_store: ?*secrets.FileStore = null,
     };
 
     alloc: ?std.mem.Allocator = null,
@@ -83,19 +85,49 @@ pub const ActiveRuntime = struct {
         if (has_transcribing) {
             out.transcribing_runtime = try alloc.create(transcribing.Runtime);
             out.transcribing_runtime.?.* = transcribing.Runtime.init(alloc);
-            try out.transcribing_runtime.?.loadFromRegistry(out.client.?, &loaded.transcribers);
+            var resolved_registry = transcribing.Registry.init(alloc);
+            defer resolved_registry.deinit();
+            var it = loaded.transcribers.configs.iterator();
+            while (it.next()) |entry| {
+                var resolved = try transcribing.cloneConfig(alloc, entry.value_ptr.*);
+                defer transcribing.deinitConfig(alloc, &resolved);
+                try resolveProviderDefaults(alloc, &resolved, options.secret_store);
+                try resolved_registry.registerConfig(entry.key_ptr.*, resolved);
+            }
+            resolved_registry.default_provider = loaded.transcribers.default_provider;
+            try out.transcribing_runtime.?.loadFromRegistry(out.client.?, &resolved_registry);
         }
 
         if (has_readers) {
             out.readers_runtime = try alloc.create(readers.Runtime);
             out.readers_runtime.?.* = readers.Runtime.init(alloc);
-            try out.readers_runtime.?.loadFromRegistry(out.client.?, &loaded.readers);
+            var resolved_registry = readers.Registry.init(alloc);
+            defer resolved_registry.deinit();
+            var it = loaded.readers.configs.iterator();
+            while (it.next()) |entry| {
+                var resolved = try readers.cloneConfig(alloc, entry.value_ptr.*);
+                defer readers.deinitConfig(alloc, &resolved);
+                try resolveProviderDefaults(alloc, &resolved, options.secret_store);
+                try resolved_registry.registerConfig(entry.key_ptr.*, resolved);
+            }
+            resolved_registry.default_provider = loaded.readers.default_provider;
+            try out.readers_runtime.?.loadFromRegistry(out.client.?, &resolved_registry);
         }
 
         if (has_synthesizing) {
             out.synthesizing_runtime = try alloc.create(synthesizing.Runtime);
             out.synthesizing_runtime.?.* = synthesizing.Runtime.init(alloc);
-            try out.synthesizing_runtime.?.loadFromRegistry(out.client.?, &loaded.text_to_speech);
+            var resolved_registry = synthesizing.Registry.init(alloc);
+            defer resolved_registry.deinit();
+            var it = loaded.text_to_speech.configs.iterator();
+            while (it.next()) |entry| {
+                var resolved = try synthesizing.cloneConfig(alloc, entry.value_ptr.*);
+                defer synthesizing.deinitConfig(alloc, &resolved);
+                try resolveProviderDefaults(alloc, &resolved, options.secret_store);
+                try resolved_registry.registerConfig(entry.key_ptr.*, resolved);
+            }
+            resolved_registry.default_provider = loaded.text_to_speech.default_provider;
+            try out.synthesizing_runtime.?.loadFromRegistry(out.client.?, &resolved_registry);
         }
 
         // Publish the new registry set as one final, non-failing phase. A
@@ -215,4 +247,54 @@ test "audio runtime rolls back globals when a later provider fails to load" {
     try std.testing.expectError(error.UnsupportedSynthesizingProvider, ActiveRuntime.init(alloc, io.io(), &cfg));
     try std.testing.expect(transcribing.getActiveRuntime() == previous_stt);
     try std.testing.expect(synthesizing.getActiveRuntime() == previous_tts);
+}
+
+// Audio and reader libraries receive resolved credentials at startup, just as
+// explicit secret references in their configuration do. Keep provider defaults
+// here so these Apache-licensed adapters do not depend on the server's store.
+fn resolveProviderDefaults(alloc: std.mem.Allocator, cfg: anytype, store: ?*secrets.FileStore) !void {
+    const Config = @TypeOf(cfg.*);
+    const has_bearer = if (@hasField(Config, "bearer_token")) cfg.bearer_token != null else false;
+    const provider = @tagName(cfg.provider);
+    const env_name: ?[]const u8 = if (std.mem.eql(u8, provider, "openai"))
+        "OPENAI_API_KEY"
+    else if (std.mem.eql(u8, provider, "antfly"))
+        "ANTFLY_INFERENCE_API_KEY"
+    else
+        null;
+    if (!has_bearer) if (env_name) |name| {
+        var source = try secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key, name);
+        defer source.deinit(alloc);
+        const resolved = try source.resolveOwned(alloc, store);
+        if (cfg.api_key) |old| alloc.free(old);
+        cfg.api_key = resolved;
+    };
+    if (cfg.provider == .openai and cfg.base_url == null) {
+        if (@hasField(Config, "url")) {
+            if (cfg.resolvedUrl()) |url| cfg.base_url = try alloc.dupe(u8, url);
+        }
+        if (cfg.base_url == null) cfg.base_url = secrets.envValueOwned(alloc, "OPENAI_BASE_URL");
+    }
+}
+
+test "audio runtime provider defaults resolve OpenAI credentials and endpoint aliases" {
+    const alloc = std.testing.allocator;
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/test-audio-defaults-{d}.json", .{std.Io.Clock.awake.now(std.testing.io).nanoseconds});
+    defer alloc.free(path);
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var store = try secrets.FileStore.init(alloc, path);
+    defer store.deinit();
+    var entry = try store.put(alloc, "openai.api_key", "test-key");
+    defer entry.deinit(alloc);
+    inline for (.{ transcribing, readers, synthesizing }) |lib| {
+        var cfg = try lib.cloneConfig(alloc, .{ .provider = .openai });
+        defer lib.deinitConfig(alloc, &cfg);
+        try resolveProviderDefaults(alloc, &cfg, &store);
+        try std.testing.expectEqualStrings("test-key", cfg.api_key.?);
+    }
+    var cfg = try transcribing.cloneConfig(alloc, .{ .provider = .openai, .api_key = "explicit", .url = "http://custom/v1" });
+    defer transcribing.deinitConfig(alloc, &cfg);
+    try resolveProviderDefaults(alloc, &cfg, &store);
+    try std.testing.expectEqualStrings("explicit", cfg.api_key.?);
+    try std.testing.expectEqualStrings("http://custom/v1", cfg.base_url.?);
 }

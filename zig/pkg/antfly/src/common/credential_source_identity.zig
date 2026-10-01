@@ -14,7 +14,7 @@ pub fn fromSecretValue(secret: ?secrets.SecretValue) CredentialSourceIdentity {
     const value = secret orelse return CredentialSourceIdentity.none();
     return switch (value) {
         .literal => |literal| CredentialSourceIdentity.literalSecret(literal),
-        .secret_ref => |reference| CredentialSourceIdentity.secretReference(reference),
+        .secret_ref, .provider_default => |reference| CredentialSourceIdentity.secretReference(reference),
         .env_var => |name| CredentialSourceIdentity.environmentVariable(name),
     };
 }
