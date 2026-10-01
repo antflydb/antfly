@@ -697,6 +697,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_preload_model_spec_test_step = b.step("antfly-common-preload-model-spec-test", "Run preload model CLI parser tests");
     lib_preload_model_spec_test_step.dependOn(&run_lib_preload_model_spec_tests.step);
 
+    const provider_default_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "audio runtime", "bearer auth header cache provider defaults" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_provider_default_tests = addFilteredTestRunArtifact(b, provider_default_tests);
+    b.step("antfly-provider-defaults-test", "Verify provider endpoint and credential defaults").dependOn(&run_provider_default_tests.step);
+
     const lib_common_secrets_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "file secret store", "bearer auth header cache", "remote content runtime", "secret contract", "secret record" },
@@ -1865,6 +1873,24 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lite_native_tests = addFilteredTestRunArtifact(b, lite_native_tests);
     const lite_native_test_step = b.step("lite-native-test", "Run Lite native backend tests");
     lite_native_test_step.dependOn(&run_lite_native_tests.step);
+    const lite_storage_tests = b.addTest(.{
+        .root_module = lite_native_test_mod,
+        .filters = &.{"storage.lite."},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("lite-storage-test", "Run all Lite storage tests without unrelated imported suites").dependOn(&addFilteredTestRunArtifact(b, lite_storage_tests).step);
+    const lite_allocator_tests = b.addTest(.{
+        .root_module = lite_native_test_mod,
+        .filters = &.{ "lite allocator v4", "lite reclamation", "lite group commit", "lite online vacuum" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("lite-allocator-test", "Qualify revision-4 ownership, retirement and independent page reuse").dependOn(&addFilteredTestRunArtifact(b, lite_allocator_tests).step);
+    const lite_reclamation_tests = b.addTest(.{
+        .root_module = lite_native_test_mod,
+        .filters = &.{ "lite reclamation", "lite group commit", "lite online vacuum" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("lite-reclamation-test", "Qualify Lite owner reclamation, reader retention and storage pressure").dependOn(&addFilteredTestRunArtifact(b, lite_reclamation_tests).step);
     const portable_wal_tests = b.addTest(.{
         .root_module = lite_native_test_mod,
         .filters = &.{"portable WAL"},
@@ -4664,6 +4690,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_test_step.dependOn(&run_public_api_parity_aggregate_tests.step);
     unit_test_step.dependOn(&run_lib_template_tests.step);
     unit_test_step.dependOn(&run_lib_audio_tests.step);
+    unit_test_step.dependOn(&run_provider_default_tests.step);
     unit_test_step.dependOn(lib_standalone_runtime_test_step);
     // The aggregate's storage HA shard owns the library tests. Keep only the
     // command-root coverage that the shard cannot discover; `antfly-storage-hot-standby-test` remains
