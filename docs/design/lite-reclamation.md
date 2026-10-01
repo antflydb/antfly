@@ -49,8 +49,16 @@ var db = try embedded.DB.openLite(allocator, path, .{
 defer db.close();
 ```
 
-Default assessment occurs after 64 MiB of file growth once the file reaches
-256 MiB. An assessment walks live ordered-index metadata, not historical chains
+Default assessment occurs after 64 MiB of file growth or committed data
+retirement once the file reaches 256 MiB. Retirement activity includes released
+physical data pages and retired inline record bytes, so partially live packed
+pages can also trigger compaction. Shared external value lengths are excluded;
+retiring an append's old record never counts its entire shared value. Activity is counted at
+publication from scalar allocator state; aborted transactions and allocator
+housekeeping do not contribute. Activity assessments use the smaller of the
+growth interval and minimum reclamation threshold, so deleting data can trigger
+shrinking while physical size remains stable. Successful rewrites reset both
+assessment baselines; reopen assesses afresh. An assessment walks live ordered-index metadata, not historical chains
 or external value payloads. A rewrite is eligible only when both physical size
 exceeds twice estimated compact size and estimated savings reach 256 MiB. These
 are provisional, configurable defaults; sustained benchmark qualification must
@@ -95,6 +103,15 @@ early under capacity pressure only when the old journal is at least twice the
 new snapshot size, ensuring a net metadata reduction. Creation checks the format
 footprint and reserve against the budget and disk headroom before touching an
 existing artifact; an undersized limit fails with `LiteStorageBudgetExceeded`.
+Portable restore reserves an exclusive generation workspace before creating its
+staging owner. Staging inherits a byte limit after subtracting the live inode and
+retained generations; physical shrinking is disabled on that disposable owner
+to avoid nesting rewrite workspace. Ordinary staging mutations enforce the
+limit and collector reserve. Adoption rechecks aggregate bytes, disk headroom,
+and collector capacity before rename. Failed staging-file cleanup runs before
+the reservation is released. Pinned old readers continue to count against the
+live budget after adoption. Native `Connection` options propagate reclamation
+settings through open and create.
 The rewrite reserves the larger of twice estimated compact size and an assessment
 interval. When capacity or an aggregate budget is available, it constrains allocation in
 the initial copy and residual change replay. Exhausting the reservation safely
@@ -291,6 +308,11 @@ Replacement creation initializes and syncs the complete selected format on the
 staged inode before rename; initialization failure preserves the original artifact.
 Vacuum reports and hysteresis use the final image size after allocator publication,
 including the recovery-slot rebase and its metadata checkpoint.
+Secret entry/head writes use the owner transaction queue, including its admission
+and rollback rules. Definite pre-publication failures preserve the previous
+revision, truncate private tail bytes, and return the original error. Failure
+after a checkpoint publication attempt, or failed rollback, fences the store
+with `OutcomeUnknown` until reopen.
 Compact-size estimation models the destination format, including migration, typed
 long-key pages, and the fixed point of allocator root and counter snapshot pages.
 Revision 4 omits the legacy namespace directory. Graph audits and vacuum ownership

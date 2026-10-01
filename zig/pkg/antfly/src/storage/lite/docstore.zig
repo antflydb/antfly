@@ -30,6 +30,173 @@ const maintenance = @import("../maintenance.zig");
 const Allocator = std.mem.Allocator;
 const bounded_cursor_test_documents: usize = 512;
 
+test "lite reclamation restore adoption rejects oversized generations" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "restore-budget-live.aflite");
+    defer a.free(path);
+    const staged_path = try testPath(a, tmp, "restore-budget-staged.aflite");
+    defer a.free(staged_path);
+    var live = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .max_storage_bytes = 128 * 4096 } });
+    defer live.close();
+    live.maintenance_start_suppressed = true;
+    var staged = try Store.createWithOptions(a, staged_path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer staged.close();
+    staged.maintenance_start_suppressed = true;
+    const value = try a.alloc(u8, 600 * 1024);
+    defer a.free(value);
+    @memset(value, 'v');
+    try staged.putCatalogRecord("large", value);
+    const before = live.file.activeCheckpoint();
+    try std.testing.expectError(error.LiteStorageBudgetExceeded, live.replaceWithPreparedGeneration(&staged));
+    try std.testing.expectEqualDeep(before, live.file.activeCheckpoint());
+    try std.testing.expect((try live.getCatalogRecordAlloc(a, "large")) == null);
+}
+
+test "lite reclamation restore workspace bounds staging and releases admission" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "workspace-live.aflite");
+    defer a.free(path);
+    const staged_path = try testPath(a, tmp, "workspace-staged.aflite");
+    defer a.free(staged_path);
+    const limit = 256 * 4096;
+    var live = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .max_storage_bytes = limit } });
+    defer live.close();
+    live.maintenance_start_suppressed = true;
+    var workspace = try live.reserveGenerationWorkspace();
+    var reserved = true;
+    defer if (reserved) workspace.deinit();
+    try std.testing.expectEqual(limit, (try live.reclamationStatus()).totalBytes());
+    try std.testing.expectError(error.FileBusy, live.reserveGenerationWorkspace());
+    try std.testing.expectError(error.FileBusy, live.vacuum());
+    var staged = try Store.createWithOptions(a, staged_path, .{ .io = std.testing.io, .no_sync = true, .reclamation = workspace.options });
+    defer staged.close();
+    staged.maintenance_start_suppressed = true;
+    const value = try a.alloc(u8, limit);
+    defer a.free(value);
+    @memset(value, 'v');
+    const before = staged.file.activeCheckpoint();
+    const before_size = (try staged.file.file.stat(std.testing.io)).size;
+    try std.testing.expectError(error.LiteStorageBudgetExceeded, staged.putCatalogRecord("oversized", value));
+    try std.testing.expectEqualDeep(before, staged.file.activeCheckpoint());
+    try std.testing.expectEqual(before_size, (try staged.file.file.stat(std.testing.io)).size);
+    try staged.putCatalogRecord("small", "accepted");
+    var pinned = try live.beginRead();
+    defer pinned.abort();
+    _ = try live.replaceWithPreparedGeneration(&staged);
+    workspace.deinit();
+    reserved = false;
+    const status = try live.reclamationStatus();
+    try std.testing.expectEqual(@as(u64, 0), status.temporary_bytes);
+    try std.testing.expectEqual(before_size, status.retired_file_bytes);
+    try std.testing.expect(status.totalBytes() <= limit);
+    const actual = (try live.getCatalogRecordAlloc(a, "small")).?;
+    defer a.free(actual);
+    try std.testing.expectEqualStrings("accepted", actual);
+}
+
+test "lite reclamation restore rechecks disk capacity at publication" {
+    const Probe = struct {
+        fn available(context: *anyopaque, _: []const u8) !u64 {
+            const bytes: *u64 = @ptrCast(@alignCast(context));
+            return bytes.*;
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "restore-disk-live.aflite");
+    defer a.free(path);
+    const staged_path = try testPath(a, tmp, "restore-disk-staged.aflite");
+    defer a.free(staged_path);
+    var available: u64 = 1024 * 1024;
+    var live = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .disk_headroom_bytes = 4096, .capacity_probe = .{ .context = &available, .available = Probe.available } } });
+    defer live.close();
+    live.maintenance_start_suppressed = true;
+    var workspace = try live.reserveGenerationWorkspace();
+    defer workspace.deinit();
+    var staged = try Store.createWithOptions(a, staged_path, .{ .io = std.testing.io, .no_sync = true, .reclamation = workspace.options });
+    defer staged.close();
+    staged.maintenance_start_suppressed = true;
+    try staged.putCatalogRecord("small", "value");
+    available = 4095;
+    const before = live.file.activeCheckpoint();
+    try std.testing.expectError(error.LiteInsufficientDiskSpace, live.replaceWithPreparedGeneration(&staged));
+    try std.testing.expectEqualDeep(before, live.file.activeCheckpoint());
+}
+
+test "lite reclamation shrinking observes deletions without growth" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "shrink-activity.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .minimum_reclaim_bytes = 16 * 1024, .assessment_bytes = 64 * 1024 * 1024 } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    const value = try a.alloc(u8, 128 * 1024);
+    defer a.free(value);
+    @memset(value, 'v');
+    var write = try store.beginWrite();
+    try write.put("large", value);
+    try write.commit();
+    try store.maintainOnce(false);
+    try std.testing.expectEqual(@as(u64, 1), store.maintenance_policy.status.assessment_count);
+    write = try store.beginWrite();
+    try write.delete("large");
+    try write.commit();
+    for (0..32) |_| try store.maintainOnce(false);
+    const status = try store.reclamationStatus();
+    try std.testing.expectEqual(@as(u64, 1), status.rewrite_count);
+    try std.testing.expect(status.current_file_bytes < 64 * 1024);
+    const assessments = status.assessment_count;
+    for (0..32) |_| try store.maintainOnce(false);
+    // Collector metadata alone must not trigger repeated full assessments.
+    try std.testing.expectEqual(assessments, (try store.reclamationStatus()).assessment_count);
+}
+
+test "lite reclamation shrinking observes partially live packed records" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "shrink-packed.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .minimum_reclaim_bytes = 32 * 1024, .assessment_bytes = 64 * 1024 * 1024 } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    const value: [1536]u8 = @splat('v');
+    var write = try store.beginWrite();
+    for (0..128) |i| {
+        var key: [16]u8 = undefined;
+        try write.put(try std.fmt.bufPrint(&key, "key-{d:0>4}", .{i}), &value);
+    }
+    try write.commit();
+    try store.maintainOnce(false);
+    write = try store.beginWrite();
+    // Two adjacent records share each bundle. Leave one record alive in
+    // every bundle: most dead inline bytes do not release a physical page.
+    for (0..64) |i| {
+        var key: [16]u8 = undefined;
+        try write.delete(try std.fmt.bufPrint(&key, "key-{d:0>4}", .{i * 2}));
+    }
+    try write.commit();
+    const before = (try store.reclamationStatus()).current_file_bytes;
+    for (0..32) |_| try store.maintainOnce(false);
+    const status = try store.reclamationStatus();
+    try std.testing.expectEqual(@as(u64, 1), status.rewrite_count);
+    try std.testing.expect(status.current_file_bytes < before);
+    var read = try store.beginRead();
+    defer read.abort();
+    for (0..64) |i| {
+        var key: [16]u8 = undefined;
+        try std.testing.expectEqualSlices(u8, &value, try read.get(try std.fmt.bufPrint(&key, "key-{d:0>4}", .{i * 2 + 1})));
+    }
+    try std.testing.expect((try store.checkWithCancel(null)).valid);
+}
+
 test "lite reclamation capacity reserve sustains bounded overwrites" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -553,6 +720,7 @@ pub const Store = struct {
     maintenance_wake: std.Io.Event = .unset,
     maintenance_cancel: maintenance.CancelToken = .{},
     maintenance_running: bool = false,
+    generation_workspace_active: bool = false,
     maintenance_start_suppressed: bool = false,
     test_maintenance_cycles: if (@import("builtin").is_test) std.atomic.Value(u64) else void = if (@import("builtin").is_test) .init(0) else {},
     admission_refresh_size: u64 = 0,
@@ -808,7 +976,7 @@ pub const Store = struct {
             if (self.maintenance_cancel.requested.load(.acquire)) break;
             lockStore(self);
             const deferred = failed or self.maintenance_policy.status.state == .deferred;
-            const blocked = self.maintenance_running or self.file.change_capture != null;
+            const blocked = self.maintenance_running or self.generation_workspace_active or self.file.change_capture != null;
             self.mutex.unlock();
             if (deferred) {
                 retry_at = std.Io.Clock.awake.now(io).addDuration(std.Io.Duration.fromMilliseconds(self.maintenance_policy.options.retry_ms));
@@ -834,7 +1002,7 @@ pub const Store = struct {
         {
             lockStore(self);
             defer self.mutex.unlock();
-            if (self.maintenance_running or self.file.change_capture != null) return;
+            if (self.maintenance_running or self.generation_workspace_active or self.file.change_capture != null) return;
             if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeUnknown;
             if (try self.file.retirementNeedsService()) {
                 try self.refreshAdmissionAssumeLocked();
@@ -848,9 +1016,10 @@ pub const Store = struct {
         var snapshot = blk: {
             lockStore(self);
             defer self.mutex.unlock();
-            if (self.maintenance_running or self.file.change_capture != null) return;
+            if (self.maintenance_running or self.generation_workspace_active or self.file.change_capture != null) return;
             try self.maintenance_cancel.check();
             const size = (try self.file.file.stat(self.file.runtime())).size;
+            self.maintenance_policy.retirement_bytes = self.file.retirement_activity_bytes;
             if (!force and !self.maintenance_policy.due(size)) return;
             if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeUnknown;
             var source = try native.NativeFile.openWithIo(self.allocator, self.file.runtime(), self.file.path, .{ .read_only = true, .resource_manager = self.resource_manager });
@@ -913,6 +1082,7 @@ pub const Store = struct {
         const report = try self.performVacuum(&self.maintenance_cancel, true);
         lockStore(self);
         defer self.mutex.unlock();
+        self.maintenance_policy.retirement_bytes = self.file.retirement_activity_bytes;
         self.maintenance_policy.completed(report.after_size, report.reclaimed_bytes);
     }
 
@@ -966,6 +1136,7 @@ pub const Store = struct {
         var status = self.maintenance_policy.status;
         status.allocator_enabled = self.file.header.indexed_reclamation;
         status.shrinking_enabled = self.maintenance_policy.options.enabled;
+        status.retirement_activity_bytes = self.file.retirement_activity_bytes;
         status.retired_file_bytes = self.retired_file_bytes;
         status.current_file_bytes = (try self.file.file.stat(self.file.runtime())).size;
         const now = std.Io.Clock.awake.now(self.file.runtime());
@@ -1026,6 +1197,7 @@ pub const Store = struct {
         const report = try self.performVacuum(cancel, false);
         lockStore(self);
         defer self.mutex.unlock();
+        self.maintenance_policy.retirement_bytes = self.file.retirement_activity_bytes;
         self.maintenance_policy.completed(report.after_size, report.reclaimed_bytes);
         return report;
     }
@@ -1038,7 +1210,7 @@ pub const Store = struct {
         var source = blk: {
             lockStore(self);
             defer self.mutex.unlock();
-            if (self.file.change_capture != null or (self.maintenance_running and !automatic)) {
+            if (self.generation_workspace_active or self.file.change_capture != null or (self.maintenance_running and !automatic)) {
                 std.log.warn("lite vacuum refused: another maintenance cycle owns the workspace", .{});
                 return error.FileBusy;
             }
@@ -1218,6 +1390,52 @@ pub const Store = struct {
         return snapshot;
     }
 
+    /// One owner reservation covers the entire disposable generation. It
+    /// excludes competing rewrites and protects capacity from live appends.
+    pub const GenerationWorkspace = struct {
+        owner: *Store,
+        options: reclamation.Options,
+
+        pub fn deinit(self: *GenerationWorkspace) void {
+            const owner = self.owner;
+            lockStore(owner);
+            owner.generation_workspace_active = false;
+            owner.maintenance_policy.status.temporary_bytes = 0;
+            owner.admission_refresh_size = 0;
+            owner.maintenance_wake.set(owner.file.runtime());
+            owner.mutex.unlock();
+            owner.startMaintenance();
+            self.* = undefined;
+        }
+    };
+
+    pub fn reserveGenerationWorkspace(self: *Store) !GenerationWorkspace {
+        if (self.read_only) return error.ReadOnly;
+        lockStore(self);
+        defer self.mutex.unlock();
+        if (self.generation_workspace_active or self.maintenance_running or self.file.change_capture != null) return error.FileBusy;
+        if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeUnknown;
+        const status = try self.reclamationStatusAssumeLocked();
+        var options = self.maintenance_policy.options;
+        const minimum = native.NativeFile.minimumOwnerStorageBytes(options.page_reuse);
+        var limit: ?u64 = null;
+        if (options.max_storage_bytes != 0) {
+            limit = options.max_storage_bytes -| status.current_file_bytes -| status.retired_file_bytes;
+            if (limit.? < minimum) return error.LiteStorageBudgetExceeded;
+        }
+        if (try self.availableDiskBytes()) |available| {
+            const disk_limit = available -| options.disk_headroom_bytes;
+            if (disk_limit < minimum) return error.LiteInsufficientDiskSpace;
+            limit = @min(limit orelse disk_limit, disk_limit);
+        }
+        options.enabled = false; // No second rewrite workspace inside staging.
+        options.max_storage_bytes = limit orelse 0;
+        self.generation_workspace_active = true;
+        self.maintenance_policy.status.temporary_bytes = limit orelse 0;
+        self.admission_refresh_size = 0;
+        return .{ .owner = self, .options = options };
+    }
+
     /// Publishes an offline, fully finalized store generation while fencing
     /// all live readers and writers. The prepared store remains valid only so
     /// its retired descriptor can be closed by normal teardown.
@@ -1244,8 +1462,24 @@ pub const Store = struct {
         if (self.secret_store_uncertain or self.file.checkpoint_publication_uncertain) return error.OutcomeUnknown;
         if (try self.file.hasSecretState()) return error.LiteImportTargetNotEmpty;
         const old_bytes = (try self.file.file.stat(io)).size;
+        const prepared_bytes = (try prepared.file.file.stat(prepared.file.runtime())).size;
+        const options = self.maintenance_policy.options;
+        const reserve = try prepared.file.retirementReserveBytes();
+        const reusable = if (try prepared.file.allocatorStats()) |stats| stats.reusable_pages *| prepared.file.header.page_size else 0;
+        if (options.max_storage_bytes != 0 and old_bytes +| self.retired_file_bytes +| prepared_bytes > options.max_storage_bytes) return error.LiteStorageBudgetExceeded;
+        // A generation that consumes its own collector reserve would strand
+        // its new owner at the cap immediately after adoption.
+        if (options.max_storage_bytes != 0) {
+            const remaining = options.max_storage_bytes -| old_bytes -| self.retired_file_bytes -| prepared_bytes;
+            if (remaining +| reusable < reserve) return error.LiteStorageBudgetExceeded;
+        }
+        if (try self.availableDiskBytes()) |available| if (available < options.disk_headroom_bytes +| (reserve -| reusable)) return error.LiteInsufficientDiskSpace;
         const old_handle = self.file.file.handle;
-        defer if (self.file.file.handle != old_handle) self.retireReadGeneration(old_bytes);
+        defer if (self.file.file.handle != old_handle) {
+            self.retireReadGeneration(old_bytes);
+            self.maintenance_policy.next_assessment_size = 0;
+            self.maintenance_policy.assessed_retirement_bytes = self.file.retirement_activity_bytes;
+        };
         return try self.file.replaceWithPreparedGeneration(&prepared.file);
     }
 

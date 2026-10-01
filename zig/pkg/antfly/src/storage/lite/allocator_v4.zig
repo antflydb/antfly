@@ -103,6 +103,9 @@ pub const State = struct {
     root_page: u64 = 0,
     allocations: u64 = 0,
     collected: u64 = 0,
+    /// Unpublished data-page releases; harvested only at owner publication.
+    released_data_pages: u64 = 0,
+    retired_inline_bytes: u64 = 0,
     checkpointing: bool = false,
     force_checkpoint: bool = false,
 

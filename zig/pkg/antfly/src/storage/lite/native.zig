@@ -2357,6 +2357,8 @@ pub const NativeFile = struct {
     /// Private rewrite images use their separately admitted workspace instead.
     reserve_retirement_capacity: bool = false,
     maintenance_publication: bool = false,
+    /// Committed reclamation activity, independent of physical file growth.
+    retirement_activity_bytes: u64 = 0,
     vacuum_workspace_limit: ?u64 = null,
     vacuum_target_indexed: bool = false,
     ledger: ?*allocator_v4.State = null,
@@ -3008,10 +3010,12 @@ pub const NativeFile = struct {
                     const root, const length = switch (raw[4]) {
                         @intFromEnum(PageKind.document) => blk: {
                             const record = try decodeDocumentEntry(try decodePagePayload(raw, .document));
+                            state.retired_inline_bytes +|= record.key.len + record.value.len;
                             break :blk .{ record.external_value_root_page, record.external_value_len };
                         },
                         @intFromEnum(PageKind.catalog) => blk: {
                             const record = try decodeCatalogEntry(try decodePagePayload(raw, .catalog));
+                            state.retired_inline_bytes +|= record.key.len + record.value.len;
                             break :blk .{ record.external_value_root_page, record.external_value_len };
                         },
                         else => return error.InvalidNativeAllocator,
@@ -3059,7 +3063,10 @@ pub const NativeFile = struct {
 
     fn releaseRetiredPage(self: *NativeFile, state: *allocator_v4.State, page: u64) !bool {
         const last = try state.releaseDeferred(page);
-        if (last) try state.retireCollected(.{ .epoch = self.publicationEpoch(), .page = page, .kind = .metadata });
+        if (last) {
+            try state.retireCollected(.{ .epoch = self.publicationEpoch(), .page = page, .kind = .metadata });
+            state.released_data_pages +|= 1;
+        }
         return last;
     }
 
@@ -7324,6 +7331,12 @@ pub const NativeFile = struct {
         self.header.checkpoints[next_slot] = checkpoint;
         self.header.active_checkpoint = next_slot;
         self.checkpoint_publication_uncertain = false;
+        if (self.ledger) |state| {
+            self.retirement_activity_bytes +|= state.released_data_pages *| self.header.page_size;
+            self.retirement_activity_bytes +|= state.retired_inline_bytes;
+            state.released_data_pages = 0;
+            state.retired_inline_bytes = 0;
+        }
     }
 
     fn syncIfRequired(self: *NativeFile) !void {

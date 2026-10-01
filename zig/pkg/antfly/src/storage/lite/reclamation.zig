@@ -49,6 +49,7 @@ pub const Status = struct {
     pending_data_retirement_objects: u64 = 0,
     reused_pages: u64 = 0,
     retired_objects_serviced: u64 = 0,
+    retirement_activity_bytes: u64 = 0,
     retired_file_bytes: u64 = 0,
     retired_generations: u64 = 0,
     retained_readers: u64 = 0,
@@ -72,6 +73,8 @@ pub const Policy = struct {
     options: Options = .{},
     status: Status = .{},
     next_assessment_size: u64 = 0,
+    retirement_bytes: u64 = 0,
+    assessed_retirement_bytes: u64 = 0,
 
     pub fn init(options: Options) !Policy {
         try options.validate();
@@ -82,11 +85,15 @@ pub const Policy = struct {
     }
 
     pub fn due(self: Policy, size: u64) bool {
-        return self.options.enabled and size >= self.options.minimum_reclaim_bytes and size >= self.next_assessment_size;
+        const activity_due = self.retirement_bytes -| self.assessed_retirement_bytes >=
+            @min(self.options.assessment_bytes, self.options.minimum_reclaim_bytes);
+        return self.options.enabled and size >= self.options.minimum_reclaim_bytes and
+            (size >= self.next_assessment_size or activity_due);
     }
 
     pub fn assessed(self: *Policy, physical: u64, compact: u64, live: u64, sequence: u64) bool {
         self.next_assessment_size = physical +| self.options.assessment_bytes;
+        self.assessed_retirement_bytes = self.retirement_bytes;
         self.status.assessment_count +|= 1;
         self.status.compact_size_estimate = compact;
         self.status.live_bytes_estimate = live;
@@ -97,6 +104,7 @@ pub const Policy = struct {
 
     pub fn completed(self: *Policy, physical: u64, reclaimed: u64) void {
         self.next_assessment_size = physical +| self.options.assessment_bytes;
+        self.assessed_retirement_bytes = self.retirement_bytes;
         self.status.rewrite_count +|= 1;
         self.status.last_reclaimed_bytes = reclaimed;
         self.status.state = if (self.options.enabled) .idle else .disabled;
