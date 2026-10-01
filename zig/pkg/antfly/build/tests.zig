@@ -4641,6 +4641,28 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     raft_transport_test_step.dependOn(&run_raft_transport_tests.step);
     raft_transport_test_step.dependOn(&run_raft_queued_transport_tests.step);
 
+    const server_db_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/server_db_integration_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, server_db_test_mod, true, true);
+    const local_recovery_tests = b.addTest(.{
+        .root_module = server_db_test_mod,
+        .filters = &.{"local transaction recovery"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-local-transaction-recovery-test", "Run local transaction recovery regressions").dependOn(&addFilteredTestRunArtifact(b, local_recovery_tests).step);
+    const server_db_filters = [_][]const u8{ "storage.server_db_integration_test.", "storage.server_transaction_recovery." };
+    const server_db_tests = b.addTest(.{
+        .root_module = server_db_test_mod,
+        .filters = &server_db_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_server_db_tests = addCuratedTestRunArtifact(b, server_db_tests, &server_db_filters);
+    b.step("antfly-server-db-test", "Run server ordered apply and transaction recovery integration tests").dependOn(&run_server_db_tests.step);
+    unit_test_step.dependOn(&run_server_db_tests.step);
+
     const raft_storage_test_step = b.step("antfly-raft-storage-test", "Run Raft snapshot artifact storage tests");
     raft_storage_test_step.dependOn(&run_raft_storage_tests.step);
 
@@ -5261,6 +5283,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     integration_test_step.dependOn(&run_maintenance_worker_tests.step);
 
     const graph_metric_fan_in_filters = [_][]const u8{
+        "local graph metric reads reject invalid freshness without leaking",
         "query parser accepts direct graph metric reads",
         "query parser accepts graph metric rerank",
         "api query contract bounds graph metric top k",
@@ -5327,6 +5350,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_graph_metric_fan_in_tests = @import("test_support.zig").addCuratedTestRunArtifact(b, graph_metric_fan_in_tests, &graph_metric_fan_in_filters);
     unit_test_step.dependOn(&run_graph_metric_fan_in_tests.step);
+    b.step("antfly-graph-metric-contract-test", "Run graph metric request and response contract tests").dependOn(&run_graph_metric_fan_in_tests.step);
 
     const graph_metric_remote_wire_filters = [_][]const u8{
         "api http client authenticates only the internal API namespace",
@@ -6040,6 +6064,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "unit-storage-test",
         "Run the storage portion of the default antfly-unit-test target in bounded codegen shards",
     );
+    unit_storage_sharded_test_step.dependOn(&run_server_db_tests.step);
+    lib_storage_test_step.dependOn(&run_server_db_tests.step);
     const unit_storage_shard_audit = b.addSystemCommand(&.{"python3"});
     unit_storage_shard_audit.addFileArg(b.path("tools/audit_storage_test_shards.py"));
     unit_storage_shard_audit.addArg("--root");
@@ -6052,6 +6078,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         }
     }
     for (@import("storage_owner_tests.zig").test_sources) |source| {
+        unit_storage_shard_audit.addArg("--dedicated");
+        unit_storage_shard_audit.addFileArg(b.path(b.fmt("pkg/antfly/src/storage/{s}", .{source})));
+    }
+    for ([_][]const u8{ "server_db_integration_test.zig", "server_transaction_recovery.zig" }) |source| {
         unit_storage_shard_audit.addArg("--dedicated");
         unit_storage_shard_audit.addFileArg(b.path(b.fmt("pkg/antfly/src/storage/{s}", .{source})));
     }

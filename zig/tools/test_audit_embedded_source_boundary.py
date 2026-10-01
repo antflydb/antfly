@@ -31,6 +31,10 @@ class EmbeddedBoundaryTest(unittest.TestCase):
             files = {
                 "zig/pkg/antfly/src/storage/db/db.zig": "local working change",
                 "zig/pkg/antfly/src/storage/server_db_adapter.zig": "server",
+                "zig/pkg/antfly/src/storage/server_transaction_dispatch.zig": "server dispatch",
+                "zig/pkg/antfly/src/storage/server_transaction_recovery.zig": "server recovery",
+                "zig/pkg/antfly/src/storage/server_transaction_recovery_contract.zig": "server contract",
+                "zig/pkg/antfly/src/storage/server_db_integration_test.zig": "server fixture",
                 "zig/pkg/antfly/src/capi/server_owner.zig": "private server",
                 "zig/pkg/antfly/src/tracing/server_raft_writer.zig": "raft trace",
                 "specs/openapi/public.yaml": "contract",
@@ -43,7 +47,7 @@ class EmbeddedBoundaryTest(unittest.TestCase):
                 path.write_text(content)
             listing = b"\0".join(name.encode() for name in files) + b"\0"
             with patch("check_embedded_isolated_build.subprocess.check_output", return_value=listing):
-                self.assertEqual(stage_sources(repository, stage), 3)
+                self.assertEqual(stage_sources(repository, stage), 7)
             self.assertEqual((stage / "zig/pkg/antfly/src/storage/db/db.zig").read_text(), "local working change")
             self.assertTrue((stage / "specs/openapi/public.yaml").is_file())
             self.assertTrue((stage / "scripts/codegen.py").is_file())

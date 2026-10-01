@@ -355,6 +355,10 @@ pub const RecoveryResolver = struct {
     local_participant: ?[]const u8 = null,
 
     pub fn config(self: *const RecoveryResolver) db_mod.transaction_runtime.Config {
+        return @import("../storage/server_transaction_recovery.zig").configFor(RecoveryResolver, @constCast(self), serverConfig);
+    }
+
+    pub fn serverConfig(self: *const RecoveryResolver) @import("../storage/server_transaction_recovery.zig").Config {
         return .{
             .enabled = true,
             .lease_owned = self.lease_owned,
@@ -2996,7 +3000,7 @@ test "distributed txn scoped participant recovery survives LSM reopen without re
     var resolver: RecoveryResolver = .{ .alloc = alloc, .worker = .{ .ptr = &recorder, .vtable = &.{ .begin_group = Recorder.begin, .prepare_group = Recorder.prepare, .resolve_group = Recorder.resolve, .status_group = Recorder.status } }, .lease_owned = true };
     var reopened = try db_mod.DB.open(alloc, path, .{ .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false });
     defer reopened.close();
-    const stats = try reopened.runTransactionRecoveryOnce(resolver.config());
+    const stats = try @import("../storage/server_transaction_recovery.zig").runDbRecoveryOnce(&reopened, resolver.serverConfig());
     try std.testing.expectEqual(@as(usize, 1), recorder.calls);
     try std.testing.expectEqual(@as(u64, 1), stats.notification_successes);
     try std.testing.expectError(error.TxnNotFound, reopened.getTransactionStatus(txn_id));
@@ -3855,7 +3859,7 @@ fn implementationTests() type {
             });
             try db.resolveTransactionIntents(txn_id, .committed, 2_000);
 
-            const stats = try db.runTransactionRecoveryOnce(resolver.config());
+            const stats = try @import("../storage/server_transaction_recovery.zig").runDbRecoveryOnce(&db, resolver.serverConfig());
             try std.testing.expect(stats.notification_attempts > 0);
             try std.testing.expect(stats.notification_successes > 0);
             try std.testing.expectEqual(@as(usize, 1), recorder.calls);
@@ -3912,7 +3916,7 @@ fn implementationTests() type {
                 .writes = &.{.{ .key = "doc:fresh-pending", .value = "{\"title\":\"value\"}" }},
             });
 
-            const stats = try db.runTransactionRecoveryOnce(resolver.config());
+            const stats = try @import("../storage/server_transaction_recovery.zig").runDbRecoveryOnce(&db, resolver.serverConfig());
             try std.testing.expectEqual(@as(u64, 0), stats.notification_attempts);
             try std.testing.expectEqual(@as(u64, 0), stats.auto_aborted);
             try std.testing.expectEqual(@as(usize, 0), recorder.calls);

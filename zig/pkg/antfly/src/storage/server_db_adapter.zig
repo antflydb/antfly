@@ -105,7 +105,20 @@ pub fn applyStorageKernelReplicatedBatchAtRaftEntry(
     // applied entry before the native marker gets a chance to short-circuit.
     @import("../api/local_write_test_hooks.zig").runTestBeforeBatchExecutionHook();
     if (req.transaction != null)
-        try @import("local_write.zig").applyReplicatedTransactionMutationAtRaftEntry(alloc, db, table_name, group_id, req, raft_entry)
+        try @import("server_transaction_dispatch.zig").applyReplicatedTransactionMutationAtRaftEntry(alloc, db, table_name, group_id, req, raft_entry)
     else
         try applyOrdered(&db, req, raft_entry);
+}
+
+/// The seed coordinator verifies the complete manifest and every artifact before
+/// installation, then publishes the repaired staged generation before reads.
+pub fn restoreAuthenticatedReplicaToStagedGeneration(
+    staged: *const @import("db/generation_lifecycle.zig").StagedGeneration,
+    alloc: std.mem.Allocator,
+    snapshot_root: []const u8,
+    path: []const u8,
+    opts: @import("db/db.zig").OpenOptions,
+    namespace: @import("db/doc_identity.zig").Namespace,
+) !void {
+    try @import("db/db.zig").DB.restoreIdentityPreservingSnapshotToStagedGeneration(staged, alloc, snapshot_root, path, opts, namespace);
 }

@@ -447,6 +447,10 @@ pub const StorageOwnerTransactionRecovery = struct {
     }
 
     pub fn dbConfig(self: *StorageOwnerTransactionRecovery) db_mod.transaction_runtime.Config {
+        return @import("../storage/server_transaction_recovery.zig").configFor(StorageOwnerTransactionRecovery, self, serverConfig);
+    }
+
+    fn serverConfig(self: *StorageOwnerTransactionRecovery) @import("../storage/server_transaction_recovery.zig").Config {
         return .{
             .enabled = true,
             .lease_owned = self.config.lease_owned != 0,
@@ -4723,7 +4727,7 @@ pub fn replicatedBatchStorageKernelJson(
     if (owned.req.row_policy_publication != null) return .invalid_argument;
     if (owned.req.relational_index_maintenance) |command| if (command.owner_group_id != handle.storage_owner_group_id) return storageOwnerStatusFromError(error.PreparedGenerationChanged);
 
-    local_write.applyStorageKernelReplicatedBatch(
+    @import("../storage/server_transaction_dispatch.zig").applyStorageKernelReplicatedBatch(
         handle.alloc,
         &handle.db,
         handle.storage_owner_table_name orelse return .invalid_argument,

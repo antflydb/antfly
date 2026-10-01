@@ -182,6 +182,7 @@ def production_imports(source: str, *, include_named: bool = False, target_os: s
 def server_source(relative: str) -> bool:
     return (
         relative.startswith(FORBIDDEN)
+        or relative.startswith("storage/server_")
         or (
             relative.startswith("metadata/")
             and (
@@ -189,7 +190,7 @@ def server_source(relative: str) -> bool:
                 or relative.startswith("metadata/storage/")
             )
         )
-        or relative in {"system_catalog/server_call.zig", "storage/server_db_adapter.zig", "storage/metadata_hot_standby_port.zig", "tracing/server_raft_writer.zig", "tracing/raft_trace_logger.zig", "tracing/mod.zig", "capi/server_owner.zig", "capi_root.zig", "capi_dependencies.zig"}
+        or relative in {"server_db_integration_test_root.zig", "system_catalog/server_call.zig", "storage/server_db_adapter.zig", "storage/metadata_hot_standby_port.zig", "tracing/server_raft_writer.zig", "tracing/raft_trace_logger.zig", "tracing/mod.zig", "capi/server_owner.zig", "capi_root.zig", "capi_dependencies.zig"}
     )
 
 
