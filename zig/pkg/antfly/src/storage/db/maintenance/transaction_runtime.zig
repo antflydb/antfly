@@ -21,7 +21,6 @@ const lsm_backend = @import("../../lsm_backend.zig");
 const mem_backend = @import("../../mem_backend.zig");
 const transactions_mod = @import("../../transactions.zig");
 const build_options = @import("build_options");
-const tracing = @import("../../../tracing/mod.zig");
 const types = @import("../types.zig");
 const ownership_mod = @import("../ownership.zig");
 const resolution_mod = @import("../transaction_resolution.zig");

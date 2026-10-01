@@ -19,8 +19,8 @@ const catalog = @import("../storage/db/relational_integrity_catalog.zig");
 const planner = @import("relational_integrity.zig");
 const types = @import("../storage/db/types.zig");
 const native = @import("../storage/relational_index.zig");
-const TableRecord = @import("../metadata/table_manager.zig").TableRecord;
-const RangeRecord = @import("../metadata/table_manager.zig").RangeRecord;
+const TableRecord = @import("../common/topology_records.zig").TableRecord;
+const RangeRecord = @import("../common/topology_records.zig").RangeRecord;
 const Allocator = std.mem.Allocator;
 const RequestContext = @import("operation.zig").RequestContext;
 var preparation_diagnostic_gate: @import("bounded_diagnostic_gate.zig").Gate = .{};
@@ -1487,7 +1487,7 @@ test "distributed txn activation failure guards absence and abandons repaired pa
     const Fixture = struct {
         present: bool,
         address: planner.storage.Address,
-        fn lookup(ptr: *anyopaque, allocator: Allocator, _: []const u8, _: []const u8, _: types.LookupOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
+        fn lookup(ptr: *anyopaque, allocator: Allocator, _: []const u8, _: []const u8, _: types.LookupOptions, _: @import("../storage/read_consistency.zig").ReadConsistency) !?reads.LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (!self.present) return null;
             return .{ .json = try std.json.Stringify.valueAlloc(allocator, .{ .address = self.address, .claim = planner.storage.Claim{ .tuple = "tuple", .parent_table = "parents", .parent_key = "p", .schema_version = 1 } }, .{}), .version = 0 };
@@ -1588,7 +1588,7 @@ test "empty activation page validates source catalog without probing external pa
     const Fake = struct {
         catalog: []const u8,
         calls: usize = 0,
-        fn lookup(ptr: *anyopaque, allocator: Allocator, name: []const u8, key: []const u8, opts: types.LookupOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
+        fn lookup(ptr: *anyopaque, allocator: Allocator, name: []const u8, key: []const u8, opts: types.LookupOptions, _: @import("../storage/read_consistency.zig").ReadConsistency) !?reads.LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("children", name);
             try std.testing.expectEqualStrings("", key);
@@ -1651,10 +1651,10 @@ test "distributed txn preparation pins one routing view and releases it" {
             const self: *@This() = @fieldParentPtr("view", view);
             self.releases += 1;
         }
-        fn original(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: types.LookupOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
+        fn original(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: types.LookupOptions, _: @import("../storage/read_consistency.zig").ReadConsistency) !?reads.LookupResponse {
             return error.TestUnexpectedResult;
         }
-        fn lookup(ptr: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: types.LookupOptions, consistency: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
+        fn lookup(ptr: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: types.LookupOptions, consistency: @import("../storage/read_consistency.zig").ReadConsistency) !?reads.LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(.read_index, consistency);
             self.lookups += 1;
@@ -1688,7 +1688,7 @@ test "distributed txn primary prefetch retries transient owner reads once after 
             return .{ .nanoseconds = self.now_ns.load(.acquire) };
         }
 
-        fn lookup(ptr: *anyopaque, alloc: Allocator, _: []const u8, key: []const u8, opts: types.LookupOptions, consistency: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
+        fn lookup(ptr: *anyopaque, alloc: Allocator, _: []const u8, key: []const u8, opts: types.LookupOptions, consistency: @import("../storage/read_consistency.zig").ReadConsistency) !?reads.LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const index = key[0] - 'a';
             const attempt = self.calls[index].fetchAdd(1, .monotonic);
@@ -1775,7 +1775,7 @@ test "distributed txn primary prefetch owns observations and drains failed batch
     const Fixture = struct {
         calls: std.atomic.Value(usize) = .init(0),
         fail: bool,
-        fn lookup(ptr: *anyopaque, alloc: Allocator, _: []const u8, key: []const u8, opts: types.LookupOptions, consistency: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
+        fn lookup(ptr: *anyopaque, alloc: Allocator, _: []const u8, key: []const u8, opts: types.LookupOptions, consistency: @import("../storage/read_consistency.zig").ReadConsistency) !?reads.LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             _ = self.calls.fetchAdd(1, .monotonic);
             try std.testing.expectEqual(.read_index, consistency);
@@ -1878,9 +1878,9 @@ test "distributed txn global unique coverage checks every owner and rejects stal
         ready: bool = false,
         stale: bool = false,
         conflict_claim: ?planner.storage.Claim = null,
-        fn lookup(ptr: *anyopaque, allocator: Allocator, _: []const u8, key: []const u8, opts: types.LookupOptions, consistency: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
+        fn lookup(ptr: *anyopaque, allocator: Allocator, _: []const u8, key: []const u8, opts: types.LookupOptions, consistency: @import("../storage/read_consistency.zig").ReadConsistency) !?reads.LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(@import("../raft/read_gate.zig").ReadConsistency.read_index, consistency);
+            try std.testing.expectEqual(@import("../storage/read_consistency.zig").ReadConsistency.read_index, consistency);
             try std.testing.expect(opts.execution_deadline_ns != null);
             if (opts.relational_integrity_catalog) return .{ .json = try allocator.dupe(u8, self.envelope), .version = 0 };
             if (opts.relational_integrity_jobs_json.len != 0) {
@@ -1907,10 +1907,10 @@ test "distributed txn global unique coverage checks every owner and rejects stal
             };
             return .{ .json = try std.json.Stringify.valueAlloc(allocator, status, .{}), .version = 0 };
         }
-        fn scan(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: types.ScanOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.ScanResponse {
+        fn scan(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: types.ScanOptions, _: @import("../storage/read_consistency.zig").ReadConsistency) !?reads.ScanResponse {
             return error.UnexpectedCall;
         }
-        fn query(_: *anyopaque, _: Allocator, _: []const u8, _: types.SearchRequest, _: @import("../raft/read_gate.zig").ReadConsistency) !?@import("query_response.zig").QueryResponse {
+        fn query(_: *anyopaque, _: Allocator, _: []const u8, _: types.SearchRequest, _: @import("../storage/read_consistency.zig").ReadConsistency) !?@import("query_response.zig").QueryResponse {
             return error.UnexpectedCall;
         }
     };
@@ -1999,15 +1999,15 @@ test "distributed txn session statement checks immediate references and overlays
         const Fake = struct {
             p: []const u8,
             c: []const u8,
-            fn lookup(ptr: *anyopaque, allocator: Allocator, table: []const u8, _: []const u8, options: types.LookupOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
+            fn lookup(ptr: *anyopaque, allocator: Allocator, table: []const u8, _: []const u8, options: types.LookupOptions, _: @import("../storage/read_consistency.zig").ReadConsistency) !?reads.LookupResponse {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 if (options.relational_integrity_catalog) return .{ .json = try allocator.dupe(u8, if (std.mem.eql(u8, table, "p")) self.p else self.c), .version = 0 };
                 return null;
             }
-            fn scan(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: types.ScanOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.ScanResponse {
+            fn scan(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: types.ScanOptions, _: @import("../storage/read_consistency.zig").ReadConsistency) !?reads.ScanResponse {
                 return error.UnexpectedCall;
             }
-            fn query(_: *anyopaque, _: Allocator, _: []const u8, _: types.SearchRequest, _: @import("../raft/read_gate.zig").ReadConsistency) !?@import("query_response.zig").QueryResponse {
+            fn query(_: *anyopaque, _: Allocator, _: []const u8, _: types.SearchRequest, _: @import("../storage/read_consistency.zig").ReadConsistency) !?@import("query_response.zig").QueryResponse {
                 return error.UnexpectedCall;
             }
         };
@@ -2057,7 +2057,7 @@ test "distributed txn deferred unique overlay permits repair and validates immed
         envelope: []const u8,
         initial: bool = false,
         claims: []const planner.storage.Command = &.{},
-        fn lookup(ptr: *anyopaque, allocator: Allocator, _: []const u8, key: []const u8, opts: types.LookupOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
+        fn lookup(ptr: *anyopaque, allocator: Allocator, _: []const u8, key: []const u8, opts: types.LookupOptions, _: @import("../storage/read_consistency.zig").ReadConsistency) !?reads.LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (opts.relational_integrity_catalog) return .{ .json = try allocator.dupe(u8, self.envelope), .version = 0 };
             if (opts.relational_integrity_jobs_json.len != 0) {
@@ -2150,7 +2150,7 @@ test "distributed txn expression partial unique declarations bind activation ret
     defer alloc.free(envelope);
     const Fake = struct {
         envelope: []const u8,
-        fn lookup(ptr: *anyopaque, allocator: Allocator, _: []const u8, _: []const u8, opts: types.LookupOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
+        fn lookup(ptr: *anyopaque, allocator: Allocator, _: []const u8, _: []const u8, opts: types.LookupOptions, _: @import("../storage/read_consistency.zig").ReadConsistency) !?reads.LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (opts.relational_integrity_catalog) return .{ .json = try allocator.dupe(u8, self.envelope), .version = 0 };
             return error.UnexpectedCall;
@@ -2220,7 +2220,7 @@ test "distributed txn activation projection validates selected fields without fu
     defer alloc.free(catalog_payload);
     const Fake = struct {
         catalog: []const u8,
-        fn lookup(ptr: *anyopaque, allocator: Allocator, _: []const u8, key: []const u8, opts: types.LookupOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
+        fn lookup(ptr: *anyopaque, allocator: Allocator, _: []const u8, key: []const u8, opts: types.LookupOptions, _: @import("../storage/read_consistency.zig").ReadConsistency) !?reads.LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (opts.relational_integrity_catalog) {
                 try std.testing.expectEqualStrings("", key);
@@ -2228,14 +2228,14 @@ test "distributed txn activation projection validates selected fields without fu
             }
             return error.UnexpectedCall;
         }
-        fn scan(_: *anyopaque, allocator: Allocator, _: []const u8, _: []const u8, _: []const u8, opts: types.ScanOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.ScanResponse {
+        fn scan(_: *anyopaque, allocator: Allocator, _: []const u8, _: []const u8, _: []const u8, opts: types.ScanOptions, _: @import("../storage/read_consistency.zig").ReadConsistency) !?reads.ScanResponse {
             var query_input = try std.json.parseFromSlice(struct { index: []const u8, fields: []const []const u8 }, allocator, opts.relational_query_json, .{ .ignore_unknown_fields = true });
             defer query_input.deinit();
             try std.testing.expectEqualStrings("by_id", query_input.value.index);
             try std.testing.expectEqual(@as(usize, 4), query_input.value.fields.len);
             return .{ .ndjson = try allocator.dupe(u8, "{\"_id\":\"parent-row\",\"row\":{\"id\":9007199254740993,\"parent_id\":9007199254740993,\"x\":1,\"g\":1}}\n") };
         }
-        fn query(_: *anyopaque, _: Allocator, _: []const u8, _: types.SearchRequest, _: @import("../raft/read_gate.zig").ReadConsistency) !?@import("query_response.zig").QueryResponse {
+        fn query(_: *anyopaque, _: Allocator, _: []const u8, _: types.SearchRequest, _: @import("../storage/read_consistency.zig").ReadConsistency) !?@import("query_response.zig").QueryResponse {
             return error.UnexpectedCall;
         }
     };
@@ -2317,18 +2317,18 @@ test "distributed txn public integrity adapter enlists generated parent commands
         parent_catalog: []const u8,
         child_catalog: []const u8,
         lookups: usize = 0,
-        fn lookup(ptr: *anyopaque, allocator: Allocator, table: []const u8, key: []const u8, opts: types.LookupOptions, consistency: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
+        fn lookup(ptr: *anyopaque, allocator: Allocator, table: []const u8, key: []const u8, opts: types.LookupOptions, consistency: @import("../storage/read_consistency.zig").ReadConsistency) !?reads.LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(@import("../raft/read_gate.zig").ReadConsistency.read_index, consistency);
+            try std.testing.expectEqual(@import("../storage/read_consistency.zig").ReadConsistency.read_index, consistency);
             if (opts.relational_integrity_catalog) return .{ .json = try allocator.dupe(u8, if (std.mem.eql(u8, table, "parents")) self.parent_catalog else self.child_catalog), .version = 0 };
             self.lookups += 1;
             try std.testing.expectEqualStrings("child-1", key);
             return null;
         }
-        fn scan(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: types.ScanOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.ScanResponse {
+        fn scan(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: types.ScanOptions, _: @import("../storage/read_consistency.zig").ReadConsistency) !?reads.ScanResponse {
             return error.UnexpectedCall;
         }
-        fn query(_: *anyopaque, _: Allocator, _: []const u8, _: types.SearchRequest, _: @import("../raft/read_gate.zig").ReadConsistency) !?@import("query_response.zig").QueryResponse {
+        fn query(_: *anyopaque, _: Allocator, _: []const u8, _: types.SearchRequest, _: @import("../storage/read_consistency.zig").ReadConsistency) !?@import("query_response.zig").QueryResponse {
             return error.UnexpectedCall;
         }
     };
@@ -2406,7 +2406,7 @@ test "distributed txn atomic cascade closure handles delete cycles update cycles
             addresses: [2]planner.storage.Address = undefined,
             reference_reads: usize = 0,
             omit_primary_proof: bool = false,
-            fn lookup(ptr: *anyopaque, allocator: Allocator, table: []const u8, _: []const u8, opts: types.LookupOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
+            fn lookup(ptr: *anyopaque, allocator: Allocator, table: []const u8, _: []const u8, opts: types.LookupOptions, _: @import("../storage/read_consistency.zig").ReadConsistency) !?reads.LookupResponse {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 const i: usize = if (std.mem.eql(u8, table, "a")) 0 else 1;
                 if (opts.relational_integrity_catalog) return .{ .json = try allocator.dupe(u8, if (i == 0) self.a else self.b), .version = 0 };
@@ -2425,10 +2425,10 @@ test "distributed txn atomic cascade closure handles delete cycles update cycles
                 }
                 return .{ .json = try allocator.dupe(u8, "{\"id\":1}"), .version = 7, .expected_content_digest = if (self.omit_primary_proof) null else @as([32]u8, @splat(7)) };
             }
-            fn scan(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: types.ScanOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.ScanResponse {
+            fn scan(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: types.ScanOptions, _: @import("../storage/read_consistency.zig").ReadConsistency) !?reads.ScanResponse {
                 return error.UnexpectedCall;
             }
-            fn query(_: *anyopaque, _: Allocator, _: []const u8, _: types.SearchRequest, _: @import("../raft/read_gate.zig").ReadConsistency) !?@import("query_response.zig").QueryResponse {
+            fn query(_: *anyopaque, _: Allocator, _: []const u8, _: types.SearchRequest, _: @import("../storage/read_consistency.zig").ReadConsistency) !?@import("query_response.zig").QueryResponse {
                 return error.UnexpectedCall;
             }
         };
@@ -2488,7 +2488,7 @@ test "distributed txn deferred NO ACTION retains unchanged child proof through f
         claim: planner.storage.Claim = undefined,
         address: planner.storage.Address = undefined,
         reference: planner.storage.Reference = undefined,
-        fn lookup(ptr: *anyopaque, allocator: Allocator, table: []const u8, key: []const u8, opts: types.LookupOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
+        fn lookup(ptr: *anyopaque, allocator: Allocator, table: []const u8, key: []const u8, opts: types.LookupOptions, _: @import("../storage/read_consistency.zig").ReadConsistency) !?reads.LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (opts.relational_integrity_catalog) return .{ .json = try allocator.dupe(u8, if (std.mem.eql(u8, table, "p")) self.parent_catalog else self.child_catalog), .version = 0 };
             if (opts.relational_integrity_jobs_json.len != 0) {
@@ -2501,10 +2501,10 @@ test "distributed txn deferred NO ACTION retains unchanged child proof through f
             if (std.mem.eql(u8, key, "new")) return null;
             return .{ .json = try allocator.dupe(u8, "{\"id\":1}"), .version = 7, .expected_content_digest = @splat(7) };
         }
-        fn scan(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: types.ScanOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.ScanResponse {
+        fn scan(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: types.ScanOptions, _: @import("../storage/read_consistency.zig").ReadConsistency) !?reads.ScanResponse {
             return error.UnexpectedCall;
         }
-        fn query(_: *anyopaque, _: Allocator, _: []const u8, _: types.SearchRequest, _: @import("../raft/read_gate.zig").ReadConsistency) !?@import("query_response.zig").QueryResponse {
+        fn query(_: *anyopaque, _: Allocator, _: []const u8, _: types.SearchRequest, _: @import("../storage/read_consistency.zig").ReadConsistency) !?@import("query_response.zig").QueryResponse {
             return error.UnexpectedCall;
         }
     };
@@ -2552,7 +2552,7 @@ test "distributed txn generated parent values drive canonical cascade assignment
 
 fn testNativeCascade(generated: bool) !void {
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-    const gate = @import("../raft/read_gate.zig");
+    const gate = @import("../storage/read_consistency.zig");
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2624,7 +2624,7 @@ fn testNativeCascade(generated: bool) !void {
 
 test "distributed txn MATCH PARTIAL nullable witnesses survive alternate deletion and apply last-witness actions" {
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-    const gate = @import("../raft/read_gate.zig");
+    const gate = @import("../storage/read_consistency.zig");
     const alloc = std.testing.allocator;
     inline for (.{ "restrict", "cascade", "set_null" }) |action| {
         var tmp = std.testing.tmpDir(.{});

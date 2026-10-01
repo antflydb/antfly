@@ -443,14 +443,14 @@ test "relational index system online source controls survive LSM reopen with ato
         var uncertifiable = scope;
         uncertifiable.fence.namespace.range_id = 0;
         try std.testing.expectError(error.InvalidOnlineSourceCommand, uncertifiable.validate());
-        try std.testing.expectError(error.InvalidOnlineSourceCommand, db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = uncertifiable, .limit = retained.max_frame_bytes } } }, .{ .term = 1, .index = 1 }));
-        try std.testing.expectError(error.InvalidOnlineSourceCommand, db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope } }, .restore_staging_plan_id = @splat(1) }, .{ .term = 1, .index = 1 }));
+        try std.testing.expectError(error.InvalidOnlineSourceCommand, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = uncertifiable, .limit = retained.max_frame_bytes } } }, .{ .term = 1, .index = 1 }));
+        try std.testing.expectError(error.InvalidOnlineSourceCommand, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } }, .restore_staging_plan_id = @splat(1) }, .{ .term = 1, .index = 1 }));
         {
             var read = try db.core.store.beginReadTxn();
             defer read.abort();
             try std.testing.expect(try retained.load(&read) == null);
         }
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope, .limit = retained.max_frame_bytes } } }, .{ .term = 1, .index = 1 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope, .limit = retained.max_frame_bytes } } }, .{ .term = 1, .index = 1 });
         try std.testing.expectEqual(@as(u64, 0), (try db.onlineSourceStatus(scope)).start);
         try std.testing.expectEqual(@as(u64, 1), (try db.onlineSourceStatus(scope)).admitted_applied_index);
         {
@@ -467,13 +467,13 @@ test "relational index system online source controls survive LSM reopen with ato
         }
         // Admission itself leaves source writes online, with a single retained
         // after-image frame committed alongside the two rows and apply marker.
-        try db.batchRaftReplicatedApply(.{ .timestamp_ns = 111, .writes = &.{ .{ .key = "a", .value = "{\"v\":1}" }, .{ .key = "b", .value = "{\"v\":2}" } } }, .{ .term = 1, .index = 2 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .timestamp_ns = 111, .writes = &.{ .{ .key = "a", .value = "{\"v\":1}" }, .{ .key = "b", .value = "{\"v\":2}" } } }, .{ .term = 1, .index = 2 });
         try std.testing.expectEqual(@as(u64, 1), db.core.table_catalog.row_count);
         var second = scope;
         second.consumer_epoch = 2;
         // Reserve a complete maximum frame before admitting another consumer:
         // a lagging receiver cannot reduce write headroom to a zero-progress trap.
-        try std.testing.expectError(error.RetainedEffectsFull, db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = second, .limit = retained.max_frame_bytes } } }, .{ .term = 1, .index = 3 }));
+        try std.testing.expectError(error.RetainedEffectsFull, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = second, .limit = retained.max_frame_bytes } } }, .{ .term = 1, .index = 3 }));
         try std.testing.expectError(error.OnlineSourceScopeChanged, db.onlineSourceStatus(second));
         {
             var read = try db.core.store.beginReadTxn();
@@ -490,14 +490,14 @@ test "relational index system online source controls survive LSM reopen with ato
             try stage(&txn, .{ .acknowledge = .{ .scope = scope, .previous = 0, .next = 1 } }, 0);
         }
         try std.testing.expectEqual(@as(u64, 0), (try db.onlineSourceStatus(scope)).acknowledged);
-        try std.testing.expectError(error.IntegrityTopologyFenceMissing, db.batchRaftReplicatedApply(.{ .online_source = .{ .final_fence = .{ .scope = scope, .expected_sequence = 1 } } }, .{ .term = 1, .index = 3 }));
+        try std.testing.expectError(error.IntegrityTopologyFenceMissing, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .final_fence = .{ .scope = scope, .expected_sequence = 1 } } }, .{ .term = 1, .index = 3 }));
         var wrong = scope;
         wrong.fence.attempt += 1;
-        try std.testing.expectError(error.OnlineSourceScopeChanged, db.batchRaftReplicatedApply(.{ .online_source = .{ .acknowledge = .{ .scope = wrong, .previous = 0, .next = 1 } } }, .{ .term = 1, .index = 3 }));
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .acknowledge = .{ .scope = scope, .previous = 0, .next = 1 } } }, .{ .term = 1, .index = 3 });
-        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .fence = scope.fence, .action = .begin } }, .{ .term = 1, .index = 4 });
-        try std.testing.expectError(error.RetainedEffectsCursorMismatch, db.batchRaftReplicatedApply(.{ .online_source = .{ .final_fence = .{ .scope = scope, .expected_sequence = 0 } } }, .{ .term = 1, .index = 5 }));
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .final_fence = .{ .scope = scope, .expected_sequence = 1 } } }, .{ .term = 1, .index = 5 });
+        try std.testing.expectError(error.OnlineSourceScopeChanged, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .acknowledge = .{ .scope = wrong, .previous = 0, .next = 1 } } }, .{ .term = 1, .index = 3 }));
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .acknowledge = .{ .scope = scope, .previous = 0, .next = 1 } } }, .{ .term = 1, .index = 3 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .relational_topology = .{ .fence = scope.fence, .action = .begin } }, .{ .term = 1, .index = 4 });
+        try std.testing.expectError(error.RetainedEffectsCursorMismatch, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .final_fence = .{ .scope = scope, .expected_sequence = 0 } } }, .{ .term = 1, .index = 5 }));
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .final_fence = .{ .scope = scope, .expected_sequence = 1 } } }, .{ .term = 1, .index = 5 });
         const cut = try db.onlineSourceStatus(scope);
         try std.testing.expectEqual(Phase.fenced, cut.phase);
         try std.testing.expectEqual(@as(u64, 5), cut.applied_index);
@@ -508,19 +508,19 @@ test "relational index system online source controls survive LSM reopen with ato
         defer db.close();
         const cut = try db.onlineSourceStatus(scope);
         try std.testing.expectEqual(Phase.fenced, cut.phase);
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .final_fence = .{ .scope = scope, .expected_sequence = 1 } } }, .{ .term = 1, .index = 5 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .final_fence = .{ .scope = scope, .expected_sequence = 1 } } }, .{ .term = 1, .index = 5 });
         try std.testing.expectEqualSlices(u8, &cut.cut_digest, &(try db.onlineSourceStatus(scope)).cut_digest);
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .release = scope } }, .{ .term = 1, .index = 6 });
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .reclaim = .{ .scope = scope, .frame_limit = 1, .byte_limit = 1 } } }, .{ .term = 1, .index = 7 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .release = scope } }, .{ .term = 1, .index = 6 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .reclaim = .{ .scope = scope, .frame_limit = 1, .byte_limit = 1 } } }, .{ .term = 1, .index = 7 });
         // An old admission receipt is still a no-op after release/reclaim;
         // replay must not resurrect the pin or require its removed files.
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 });
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
         const state = (try retained.load(&read)).?;
         try std.testing.expectEqual(@as(u64, 0), state.retained_bytes);
         try std.testing.expectEqual(@as(u64, 1), state.reclaimed);
-        try std.testing.expectError(error.OnlineSourceScopeChanged, db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 8 }));
+        try std.testing.expectError(error.OnlineSourceScopeChanged, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 8 }));
     }
 }
 
@@ -565,7 +565,7 @@ test "relational index system online source standby replay preserves admission c
         const request = commands[i];
         const raft_index: u64 = 11 + @as(u64, @intCast(i));
         const lsn: u64 = 1 + @as(u64, @intCast(i));
-        try source.batchRaftReplicatedApply(request, .{ .term = 1, .index = raft_index });
+        try @import("../server_db_adapter.zig").applyOrdered(&source, request, .{ .term = 1, .index = raft_index });
         const payload = if (request.online_source != null)
             try effects.encodeOnlineSourceMutationRequestAlloc(alloc, request, raft_index)
         else
@@ -597,7 +597,7 @@ test "relational index system online source standby replay preserves admission c
     try std.testing.expectEqualSlices(u8, &expected_certificate, &(try standby.onlineSourceStatus(scope)).snapshot_certificate);
     var wrong = certificate;
     wrong.cut.retained_start = 1;
-    try std.testing.expectError(error.SourceSnapshotCutMismatch, source.batchRaftReplicatedApply(.{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = wrong } } }, .{ .term = 1, .index = 15 }));
+    try std.testing.expectError(error.SourceSnapshotCutMismatch, @import("../server_db_adapter.zig").applyOrdered(&source, .{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = wrong } } }, .{ .term = 1, .index = 15 }));
     try std.testing.expectEqualSlices(u8, &expected_certificate, &(try source.onlineSourceStatus(scope)).snapshot_certificate);
 }
 
@@ -679,8 +679,8 @@ test "relational index system native rewrite authority clocks survive pin crash 
     var forged = scope;
     forged.authority = .raft;
     forged.copy_attempt.donor_term = 1;
-    try std.testing.expectError(error.OnlineSourceScopeChanged, primary.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = forged } } }, .{ .term = 1, .index = 1 }));
-    try std.testing.expectError(error.OnlineSourceScopeChanged, primary.batchRaftReplicatedApply(.{}, .{ .term = 1, .index = 1 }));
+    try std.testing.expectError(error.OnlineSourceScopeChanged, @import("../server_db_adapter.zig").applyOrdered(&primary, .{ .online_source = .{ .admit = .{ .scope = forged } } }, .{ .term = 1, .index = 1 }));
+    try std.testing.expectError(error.OnlineSourceScopeChanged, @import("../server_db_adapter.zig").applyOrdered(&primary, .{}, .{ .term = 1, .index = 1 }));
     try std.testing.expectEqual(@as(u64, 4), try Helper.sequence(&primary));
     replica.close();
     replica = try DB.DB.open(alloc, replica_path, options);

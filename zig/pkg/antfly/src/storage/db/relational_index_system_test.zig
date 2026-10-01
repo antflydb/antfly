@@ -13,6 +13,8 @@
 // limitations.
 
 //! End-to-end LSM lifecycle and standby contracts, plus reproducible work counts.
+const server_test_adapter = if (builtin.is_test) @import("../server_db_adapter.zig") else struct {};
+const builtin = @import("builtin");
 const hot_standby_publisher_adapter = @import("../hot_standby/db_commit.zig");
 const replication_ingress = @import("replication_ingress.zig");
 const std = @import("std");
@@ -926,7 +928,7 @@ test "relational index system restore receipts require local coverage through fa
     var decoded_page = try batch_api.parseInternalBatchRequest(alloc, encoded_page);
     defer decoded_page.deinit(alloc);
     try std.testing.expectEqual(.write, decoded_page.req.sync_level);
-    try target.batchRaftReplicatedApply(decoded_page.req, .{ .index = 1, .term = 1 });
+    try server_test_adapter.applyOrdered(&target, decoded_page.req, .{ .index = 1, .term = 1 });
     try std.testing.expectError(error.RestoreStagingInProgress, target.lookup(alloc, "a", .{}));
     {
         var imported = (try target.restoreStagingStatus(alloc)).?;
@@ -960,7 +962,7 @@ test "relational index system restore receipts require local coverage through fa
             const entry_index = if (trial == 0) raft_index else raft_index - 1;
             var pending: usize = 0;
             for (0..32) |_| {
-                target.batchRaftReplicatedApply(request, .{ .index = entry_index, .term = 1 }) catch |err| switch (err) {
+                server_test_adapter.applyOrdered(&target, request, .{ .index = entry_index, .term = 1 }) catch |err| switch (err) {
                     error.RestoreProjectionCatchUpPending => {
                         pending += 1;
                         continue;
@@ -989,9 +991,9 @@ test "relational index system restore receipts require local coverage through fa
     target.replication_write_gate = .{ .shared = .{ .state = standby_gate.storageWriteState() } };
     // Superseded entries and an unrelated scope must not perform maintenance
     // against the current generation, even when its local coverage is missing.
-    try target.batchRaftReplicatedApply(.{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .validated } } }, .{ .index = 2, .term = 1 });
+    try server_test_adapter.applyOrdered(&target, .{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .validated } } }, .{ .index = 2, .term = 1 });
     try std.testing.expectEqual(.building, (try target.relationalIndexBuildStatus("tenant_id")).state);
-    try target.batchRaftReplicatedApply(.{ .restore_staging = .{ .finish = .{ .scope = @splat(99), .phase = .published } } }, .{ .index = 3, .term = 1 });
+    try server_test_adapter.applyOrdered(&target, .{ .restore_staging = .{ .finish = .{ .scope = @splat(99), .phase = .published } } }, .{ .index = 3, .term = 1 });
     try std.testing.expectEqual(.building, (try target.relationalIndexBuildStatus("tenant_id")).state);
     var replication_pending: usize = 0;
     for (0..32) |_| {
@@ -1756,7 +1758,7 @@ test "relational index system replicated merge fences stale attempts and rebuild
     try applyTopology(&db, &index, winning_request);
     // Exact Raft replay, then a stale owner's request at a NEW applied index:
     // neither may leave old secondary tuples or change the winning row.
-    try db.batchRaftReplicatedApply(winning_request, .{ .term = 7, .index = index });
+    try server_test_adapter.applyOrdered(&db, winning_request, .{ .term = 7, .index = index });
     try applyTopology(&db, &index, old_request);
     try applyTopology(&db, &index, .{ .merge_replication = old_copy, .deletes = &.{"b\x00"} });
     db.close();
@@ -1779,7 +1781,7 @@ test "relational index system replicated merge fences stale attempts and rebuild
 
 fn applyTopology(db: *db_mod.DB, index: *u64, request: db_mod.types.BatchRequest) !void {
     index.* += 1;
-    try db.batchRaftReplicatedApply(request, .{ .term = 7, .index = index.* });
+    try server_test_adapter.applyOrdered(&db, request, .{ .term = 7, .index = index.* });
 }
 
 test "relational index system replicated split checkpoints and sparse deltas preserve native companions across reopen" {
@@ -1817,7 +1819,7 @@ test "relational index system replicated split checkpoints and sparse deltas pre
     try std.testing.expectError(error.RelationalIndexNotReady, db.beginRelationalRows(alloc, .{ .index = "tenant_id" }));
     const request: db_mod.types.BatchRequest = .{ .split_replication = copy, .writes = &.{ .{ .key = "x\x00", .value = "{\"tenant\":1,\"id\":9}" }, .{ .key = "y", .value = "{\"tenant\":1,\"id\":8}" } } };
     try applyTopology(&db, &index, request);
-    try db.batchRaftReplicatedApply(request, .{ .term = 7, .index = index });
+    try server_test_adapter.applyOrdered(&db, request, .{ .term = 7, .index = index });
     db.close();
     db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
     try applyTopology(&db, &index, .{ .split_replication = control, .split_checkpoint = checkpoint });
@@ -1830,7 +1832,7 @@ test "relational index system replicated split checkpoints and sparse deltas pre
     delta.previous_sequence = 9;
     const update: db_mod.types.BatchRequest = .{ .split_replication = delta, .writes = &.{.{ .key = "x\x00", .value = "{\"tenant\":1,\"id\":7}" }}, .deletes = &.{"y"} };
     try applyTopology(&db, &index, update);
-    try db.batchRaftReplicatedApply(update, .{ .term = 7, .index = index });
+    try server_test_adapter.applyOrdered(&db, update, .{ .term = 7, .index = index });
     try applyTopology(&db, &index, update);
     _ = try ready(&db);
     try expectIndexRows(&db, &.{"x\x00"});

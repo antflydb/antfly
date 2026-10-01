@@ -16,7 +16,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
-const scraping = @import("antfly_scraping");
+const scraping = if (builtin.os.tag == .freestanding) @import("db/scraping_stub.zig") else @import("antfly_scraping");
 const common_secrets = @import("../common/secrets.zig");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const backups_api = @import("../api/local_backups.zig");
@@ -321,26 +321,6 @@ pub fn applyStorageKernelReplicatedBatch(
         try applyReplicatedTransactionMutation(alloc, db, table_name, group_id, req)
     else
         try db.batchReplicatedApply(req);
-}
-
-pub fn applyStorageKernelReplicatedBatchAtRaftEntry(
-    alloc: std.mem.Allocator,
-    db: *db_mod.DB,
-    table_name: []const u8,
-    group_id: u64,
-    req: db_mod.types.BatchRequest,
-    raft_entry: db_mod.RaftAppliedEntryIdentity,
-) !void {
-    // The leader admitted this immutable command under the descriptor pinned
-    // in its Raft entry. A follower may already have a newer durable schema
-    // when it catches up; validating against that schema would make apply
-    // order depend on metadata delivery and can even reject an already
-    // applied entry before the native marker gets a chance to short-circuit.
-    runTestBeforeBatchExecutionHook();
-    if (req.transaction != null)
-        try applyReplicatedTransactionMutationAtRaftEntry(alloc, db, table_name, group_id, req, raft_entry)
-    else
-        try db.batchRaftReplicatedApply(req, raft_entry);
 }
 
 pub fn applyReplicatedTransactionMutation(

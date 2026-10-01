@@ -245,26 +245,26 @@ test "relational index system native Raft snapshot preserves exact typed primary
     const pin_mod = @import("source_pin.zig");
     pin_mod.test_failure = .after_prepare;
     defer pin_mod.test_failure = .none;
-    try std.testing.expectError(error.InjectedSourcePinFailure, source.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 2, .index = 1 }));
+    try std.testing.expectError(error.InjectedSourcePinFailure, @import("../server_db_adapter.zig").applyOrdered(&source, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 2, .index = 1 }));
     pin_mod.test_failure = .none;
-    try std.testing.expectError(error.OnlineSourcePinPending, source.captureNativeRaftSnapshot(22, 1));
-    try source.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 2, .index = 1 });
-    try std.testing.expectError(error.OnlineSourcePinPending, source.captureNativeRaftSnapshot(22, 1));
+    try std.testing.expectError(error.OnlineSourcePinPending, @import("../server_db_adapter.zig").captureSnapshot(&source, 22, 1));
+    try @import("../server_db_adapter.zig").applyOrdered(&source, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 2, .index = 1 });
+    try std.testing.expectError(error.OnlineSourcePinPending, @import("../server_db_adapter.zig").captureSnapshot(&source, 22, 1));
     const certificate = try source.prepareOnlineSourcePublication(scope, .none);
-    try source.batchRaftReplicatedApply(.{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = certificate } } }, .{ .term = 2, .index = 2 });
-    try source.batchRaftReplicatedApply(.{ .timestamp_ns = 987654321, .writes = &.{.{ .key = "a", .value = "{\"n\":9007199254740993}" }} }, .{ .term = 2, .index = 5 });
+    try @import("../server_db_adapter.zig").applyOrdered(&source, .{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = certificate } } }, .{ .term = 2, .index = 2 });
+    try @import("../server_db_adapter.zig").applyOrdered(&source, .{ .timestamp_ns = 987654321, .writes = &.{.{ .key = "a", .value = "{\"n\":9007199254740993}" }} }, .{ .term = 2, .index = 5 });
     const txn_id = [_]u8{7} ** 16;
     _ = try source.beginReplicatedTransactionAtRaftEntry(txn_id, 987654322, 987654322, &.{"participant"}, false, false, .{ .term = 2, .index = 6 });
     try source.writeReplicatedTransactionAtRaftEntry(txn_id, .{ .writes = &.{.{ .key = "prepared", .value = "{\"n\":4}" }} }, .{ .term = 2, .index = 7 });
-    try source.batchRaftReplicatedApply(.{ .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = 1 } } }, .{ .term = 2, .index = 8 });
-    try std.testing.expectError(error.InvalidSnapshot, source.captureNativeRaftSnapshot(22, 4));
+    try @import("../server_db_adapter.zig").applyOrdered(&source, .{ .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = 1 } } }, .{ .term = 2, .index = 8 });
+    try std.testing.expectError(error.InvalidSnapshot, @import("../server_db_adapter.zig").captureSnapshot(&source, 22, 4));
     // Requested through-index includes protocol-only entries without a native
     // mutation marker; the exact native cut remains separately authenticated.
-    var capture = try source.captureNativeRaftSnapshot(22, 10);
+    var capture = try @import("../server_db_adapter.zig").captureSnapshot(&source, 22, 10);
     defer capture.deinit();
     var expected_txn = try source.core.store.beginReadTxn();
     defer expected_txn.abort();
-    try source.batchRaftReplicatedApply(.{ .timestamp_ns = 987654323, .writes = &.{.{ .key = "later", .value = "{\"n\":2}" }} }, .{ .term = 2, .index = 11 });
+    try @import("../server_db_adapter.zig").applyOrdered(&source, .{ .timestamp_ns = 987654323, .writes = &.{.{ .key = "later", .value = "{\"n\":2}" }} }, .{ .term = 2, .index = 11 });
     var writer: std.Io.Writer.Allocating = .init(alloc);
     defer writer.deinit();
     const canceled: std.atomic.Value(bool) = .init(true);
@@ -276,7 +276,7 @@ test "relational index system native Raft snapshot preserves exact typed primary
     {
         var target = try db_mod.DB.open(alloc, target_path, .{ .open_mode = .query_readonly, .primary_only_readonly = true, .start_index_workers = false, .start_optional_runtimes = false });
         defer target.close();
-        try target.verifyNativeRaftSnapshot(capture.identity);
+        try @import("../server_db_adapter.zig").verifySnapshot(&target, capture.identity);
         var actual_txn = try target.core.store.beginReadTxn();
         defer actual_txn.abort();
         var cursor = try expected_txn.openCursor();

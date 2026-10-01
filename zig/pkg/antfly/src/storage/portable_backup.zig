@@ -3980,7 +3980,7 @@ test "relational index system source snapshot certificate survives transfer rest
         if (relational) try db.setSchemaJson(alloc,
             \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"},"padding":{"type":"string"}},"required":["n"],"additionalProperties":false}}}}
         );
-        try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "a", .value = document }} }, .{ .term = 2, .index = cut.applied_index });
+        try @import("server_db_adapter.zig").applyOrdered(&db, .{ .writes = &.{.{ .key = "a", .value = document }} }, .{ .term = 2, .index = cut.applied_index });
         {
             var txn = try db.core.store.beginWriteTxn();
             errdefer txn.abort();
@@ -4110,7 +4110,7 @@ test "relational index system source snapshot certificate survives transfer rest
         try std.testing.expectError(error.Canceled, exportPortableToWriterWithOptions(alloc, db.core.store, &output.writer, .{ .source_certificate = .{ .cut = cut, .output = &certificate }, .cancellation = .fromAtomic(&canceled) }));
         try std.testing.expect(certificate == null);
         // A later owner generation cannot be mislabeled as the admitted cut.
-        try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "b", .value = "{\"n\":4}" }} }, .{ .term = 2, .index = 12 });
+        try @import("server_db_adapter.zig").applyOrdered(&db, .{ .writes = &.{.{ .key = "b", .value = "{\"n\":4}" }} }, .{ .term = 2, .index = 12 });
         try std.testing.expectError(error.SourceSnapshotCutMismatch, exportPortableToWriterWithOptions(alloc, db.core.store, &output.writer, .{ .source_certificate = .{ .cut = cut, .output = &certificate } }));
         try std.testing.expect(certificate == null);
         var wrong_retained_cut = cut;

@@ -544,7 +544,7 @@ test "restore owner verified decoder rewrite history compiles once across produc
     try source.setSchemaJson(alloc, definitions[63]);
     var rows: [256]db.types.BatchWrite = undefined;
     for (&rows, 0..) |*row, i| row.* = .{ .key = try std.fmt.allocPrint(a, "row:{d:0>8}", .{i}), .value = "{\"x\":7}" };
-    try source.batchRaftReplicatedApply(.{ .timestamp_ns = 42, .writes = &rows }, .{ .term = 1, .index = 1 });
+    try @import("server_db_adapter.zig").applyOrdered(&source, .{ .timestamp_ns = 42, .writes = &rows }, .{ .term = 1, .index = 1 });
     var frame = std.ArrayList(u8).empty;
     defer frame.deinit(alloc);
     var header: [16]u8 = undefined;
@@ -593,7 +593,7 @@ test "restore owner verified decoder rewrite history compiles once across produc
                 try std.testing.expectEqual(@as(usize, 1), self.target.rewrite_program_cache.entry.?.refs.load(.acquire));
                 self.target.rewrite_program_cache.evict(std.testing.io);
             }
-            try self.target.batchRaftReplicatedApply(batch, .{ .term = 1, .index = self.index });
+            try @import("server_db_adapter.zig").applyOrdered(&self.target, batch, .{ .term = 1, .index = self.index });
             if (self.lose_reply) {
                 self.lose_reply = false;
                 return error.InjectedReplyLoss;
@@ -721,7 +721,7 @@ test "restore owner verified decoder peer rewrite certificate chunks survive reo
     var random = std.Random.DefaultPrng.init(71942);
     for (padding) |*byte| byte.* = 'a' + random.random().uintLessThan(u8, 26);
     const document = try std.fmt.allocPrint(a, "{{\"padding\":\"{s}\"}}", .{padding});
-    try source.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "a", .value = document }}, .timestamp_ns = 123 }, .{ .term = 1, .index = 1 });
+    try @import("server_db_adapter.zig").applyOrdered(&source, .{ .writes = &.{.{ .key = "a", .value = document }}, .timestamp_ns = 123 }, .{ .term = 1, .index = 1 });
     const identity = try source.relationalTopologyIdentity();
     const source_scope: @import("db/online_source_contract.zig").Scope = .{
         .fence = .{ .role = .rewrite_source, .transition_id = 1, .attempt = 1, .owner_group_id = 12, .peer_group_id = 22, .namespace = source_ns, .admission_epoch = identity.next_epoch, .catalog_digest = identity.catalog_digest },
@@ -729,9 +729,9 @@ test "restore owner verified decoder peer rewrite certificate chunks survive reo
         .consumer_epoch = 1,
         .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
     };
-    try source.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = source_scope, .limit = @import("retained_effects.zig").default_limit } } }, .{ .term = 1, .index = 2 });
+    try @import("server_db_adapter.zig").applyOrdered(&source, .{ .online_source = .{ .admit = .{ .scope = source_scope, .limit = @import("retained_effects.zig").default_limit } } }, .{ .term = 1, .index = 2 });
     const certificate = try source.prepareOnlineSourcePublication(source_scope, .none);
-    try source.batchRaftReplicatedApply(.{ .online_source = .{ .publish_certificate = .{ .scope = source_scope, .certificate = certificate } } }, .{ .term = 1, .index = 3 });
+    try @import("server_db_adapter.zig").applyOrdered(&source, .{ .online_source = .{ .publish_certificate = .{ .scope = source_scope, .certificate = certificate } } }, .{ .term = 1, .index = 3 });
     const transfer = @import("db/source_artifact_transfer.zig");
     const descriptor = try transfer.describe(&source, source_scope, .none);
     try std.testing.expect(descriptor.total_bytes > transfer.max_chunk_bytes);
@@ -755,7 +755,7 @@ test "restore owner verified decoder peer rewrite certificate chunks survive reo
             var batch = value;
             batch.restore_staging_scope = self.scope_digest;
             self.index += 1;
-            try self.target.batchRaftReplicatedApply(batch, .{ .term = 1, .index = self.index });
+            try @import("server_db_adapter.zig").applyOrdered(&self.target, batch, .{ .term = 1, .index = self.index });
         }
     };
     var apply: Apply = .{ .target = &target, .scope_digest = scope.digest() };
@@ -933,7 +933,7 @@ fn testVerifiedDecoder(comptime portable: bool) !void {
             }
             var batch = request;
             batch.restore_staging_scope = scopeDigest(self.target);
-            try self.target.batchRaftReplicatedApply(batch, .{ .index = self.index, .term = 1 });
+            try @import("server_db_adapter.zig").applyOrdered(&self.target, batch, .{ .index = self.index, .term = 1 });
         }
         fn scopeDigest(target_db: *db.DB) staging.Digest {
             var progress = (target_db.restoreStagingStatus(std.testing.allocator) catch unreachable).?;

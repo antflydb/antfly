@@ -48607,7 +48607,7 @@ fn implementationTests() type {
                 var db = try antfly.db.DB.open(alloc, path, .{ .start_index_workers = false });
                 defer db.close();
                 try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"acknowledged\"}" }} });
-                try db.batchRaftReplicatedApply(finalize, split_entry);
+                try @import("../storage/server_db_adapter.zig").applyOrdered(&db, finalize, split_entry);
                 try std.testing.expectEqualStrings("doc:k", db.getRange().end);
                 try std.testing.expectEqual(split_entry, (try db.raftAppliedEntry()).?);
             }
@@ -48617,9 +48617,9 @@ fn implementationTests() type {
                 try std.testing.expectEqualStrings("doc:k", db.getRange().end);
                 var invalid = finalize;
                 invalid.split_transition.?.split_key = "doc:z";
-                try std.testing.expectError(error.InvalidSplitRange, db.batchRaftReplicatedApply(invalid, merge_entry));
+                try std.testing.expectError(error.InvalidSplitRange, @import("../storage/server_db_adapter.zig").applyOrdered(&db, invalid, merge_entry));
                 try std.testing.expectEqual(split_entry, (try db.raftAppliedEntry()).?);
-                try db.batchRaftReplicatedApply(.{ .merge_checkpoint = .{
+                try @import("../storage/server_db_adapter.zig").applyOrdered(&db, .{ .merge_checkpoint = .{
                     .kind = .accept,
                     .transition_id = 42,
                     .donor_group_id = 2,
@@ -48630,13 +48630,13 @@ fn implementationTests() type {
                     .merged_end = "",
                 } }, merge_entry);
                 try std.testing.expectEqualStrings("", db.getRange().end);
-                try db.batchRaftReplicatedApply(finalize, split_entry);
+                try @import("../storage/server_db_adapter.zig").applyOrdered(&db, finalize, split_entry);
                 try std.testing.expectEqualStrings("", db.getRange().end);
             }
             {
                 var db = try antfly.db.DB.open(alloc, path, .{ .start_index_workers = false });
                 defer db.close();
-                try db.batchRaftReplicatedApply(finalize, split_entry);
+                try @import("../storage/server_db_adapter.zig").applyOrdered(&db, finalize, split_entry);
                 try std.testing.expectEqualStrings("", db.getRange().end);
                 try std.testing.expectEqual(merge_entry, (try db.raftAppliedEntry()).?);
                 const value = (try db.get(alloc, "doc:a")) orelse return error.TestExpectedDocument;
@@ -48668,7 +48668,7 @@ fn implementationTests() type {
                 var db = try antfly.db.DB.open(alloc, path, .{ .start_index_workers = false });
                 defer db.close();
                 try db.batch(.{ .writes = &.{.{ .key = "doc:counter", .value = "{\"count\":0}" }} });
-                try db.batchRaftReplicatedApply(increment, first_entry);
+                try @import("../storage/server_db_adapter.zig").applyOrdered(&db, increment, first_entry);
                 try std.testing.expectEqual(first_entry, (try db.raftAppliedEntry()).?);
             }
 
@@ -48678,10 +48678,10 @@ fn implementationTests() type {
 
                 // Replaying the exact accepted entry after process reconstruction is a
                 // no-op; a different term at the same index is never accepted as it.
-                try db.batchRaftReplicatedApply(increment, first_entry);
+                try @import("../storage/server_db_adapter.zig").applyOrdered(&db, increment, first_entry);
                 try std.testing.expectError(
                     error.ConflictingRaftAppliedEntry,
-                    db.batchRaftReplicatedApply(increment, .{ .term = 5, .index = 11 }),
+                    @import("../storage/server_db_adapter.zig").applyOrdered(&db, increment, .{ .term = 5, .index = 11 }),
                 );
 
                 const raw = (try db.get(alloc, "doc:counter")) orelse return error.TestExpectedDocument;
@@ -48691,7 +48691,7 @@ fn implementationTests() type {
                 try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("count").?.integer);
 
                 const second_entry: antfly.db.types.RaftAppliedEntryIdentity = .{ .term = 5, .index = 12 };
-                try db.batchRaftReplicatedApply(increment, second_entry);
+                try @import("../storage/server_db_adapter.zig").applyOrdered(&db, increment, second_entry);
                 try std.testing.expectEqual(second_entry, (try db.raftAppliedEntry()).?);
 
                 // Structural import into a new Raft history deliberately clears the
@@ -48699,7 +48699,7 @@ fn implementationTests() type {
                 try db.clearRaftAppliedEntry();
                 try std.testing.expectEqual(null, try db.raftAppliedEntry());
                 const imported_history_entry: antfly.db.types.RaftAppliedEntryIdentity = .{ .term = 1, .index = 1 };
-                try db.batchRaftReplicatedApply(increment, imported_history_entry);
+                try @import("../storage/server_db_adapter.zig").applyOrdered(&db, increment, imported_history_entry);
                 try std.testing.expectEqual(imported_history_entry, (try db.raftAppliedEntry()).?);
                 const reset_raw = (try db.get(alloc, "doc:counter")) orelse return error.TestExpectedDocument;
                 defer alloc.free(reset_raw);

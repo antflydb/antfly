@@ -1036,6 +1036,14 @@ jobs:
           fi
           exit "$status"
 
+      - name: Verify isolated embedded C API and WASM builds
+        run: >-
+          taskset -c ${{ steps.cpus.outputs.list }}
+          python3 zig/tools/check_embedded_isolated_build.py --
+          --build-runner ${{ steps.cpus.outputs.build_runner }}
+          --maxrss ${{ steps.cpus.outputs.max_rss }}
+          --summary all
+
       - name: Release correctness-fixture workspace
         if: always() && env.ANTFLY_TEST_WORKSPACE != ''
         run: |

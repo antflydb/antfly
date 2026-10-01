@@ -630,9 +630,9 @@ test "ordered artifact inventory projection completion reconstructs independent 
     var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activation.publication_digest = activation.digest();
     for ([_]*db_mod.DB{ &source, &target }) |db| {
-        try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 1 });
-        try db.batchRaftReplicatedApply(.{ .artifact_publication = activation }, .{ .term = 1, .index = 2 });
-        try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"independent replica\"}" }}, .sync_level = .full_index, .timestamp_ns = 100 }, .{ .term = 1, .index = 3 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 1 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 2 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"independent replica\"}" }}, .sync_level = .full_index, .timestamp_ns = 100 }, .{ .term = 1, .index = 3 });
         try db.runUntilIdle();
         var pin = try db.core.index_manager.acquireWritePlanSnapshot();
         defer pin.release();
@@ -669,9 +669,9 @@ test "ordered artifact inventory projection completion reconstructs independent 
         try txn.commit();
     }
     const command = try prepared.command();
-    try target.batchRaftReplicatedApply(.{ .artifact_publication = command }, .{ .term = 1, .index = 4 });
+    try @import("../server_db_adapter.zig").applyOrdered(&target, .{ .artifact_publication = command }, .{ .term = 1, .index = 4 });
     // Lost replies retry the same ordered entry without reopening obligations.
-    try target.batchRaftReplicatedApply(.{ .artifact_publication = command }, .{ .term = 1, .index = 4 });
+    try @import("../server_db_adapter.zig").applyOrdered(&target, .{ .artifact_publication = command }, .{ .term = 1, .index = 4 });
     var read = try target.core.store.beginReadTxn();
     defer read.abort();
     try std.testing.expectEqual(target.root_incarnation, (try certificates.load(&read, &certificates.key("text"))).?.root);
@@ -702,9 +702,9 @@ test "ordered artifact inventory completion control verifies independent roots b
     var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activation.publication_digest = activation.digest();
     for ([_]*db_mod.DB{ &source, &target }) |db| {
-        try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 1 });
-        try db.batchRaftReplicatedApply(.{ .artifact_publication = activation }, .{ .term = 1, .index = 2 });
-        try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 3 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 1 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 2 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 3 });
     }
     var pin = try source.core.index_manager.acquireWritePlanSnapshot();
     defer pin.release();
@@ -773,17 +773,17 @@ test "ordered artifact inventory completion control verifies independent roots b
         try std.testing.expectError(error.EnrichmentSourceChanged, prepareCommand(alloc, &read, target.root_incarnation, forged, receiver_plan.plan()));
     }
     for ([_]*db_mod.DB{ &source, &target }) |db| {
-        try db.batchRaftReplicatedApply(.{ .artifact_publication = command }, .{ .term = 1, .index = 4 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .artifact_publication = command }, .{ .term = 1, .index = 4 });
         // A lost completion reply must not double-decrement the work counter.
-        try db.batchRaftReplicatedApply(.{ .artifact_publication = command }, .{ .term = 1, .index = 5 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .artifact_publication = command }, .{ .term = 1, .index = 5 });
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
         try std.testing.expectEqual(@as(u64, 0), (try obligations.load(&read)).?.pending_documents);
         try std.testing.expectEqual(null, try obligations.lookupWork(alloc, &read, (try publication.authority(&read)).?, "doc"));
     }
     // A new input reopens work. Old completion cannot discharge the new cut.
-    try source.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{\"v\":2}" }}, .timestamp_ns = 101 }, .{ .term = 1, .index = 6 });
-    try source.batchRaftReplicatedApply(.{ .artifact_publication = command }, .{ .term = 1, .index = 7 });
+    try @import("../server_db_adapter.zig").applyOrdered(&source, .{ .writes = &.{.{ .key = "doc", .value = "{\"v\":2}" }}, .timestamp_ns = 101 }, .{ .term = 1, .index = 6 });
+    try @import("../server_db_adapter.zig").applyOrdered(&source, .{ .artifact_publication = command }, .{ .term = 1, .index = 7 });
     {
         var read = try source.core.store.beginReadTxn();
         defer read.abort();
@@ -807,7 +807,7 @@ test "ordered artifact inventory completion control verifies independent roots b
     var decoded = try @import("artifact_publication_transport_codec.zig").decodeBorrowed(alloc, queue.bytes orelse return error.TestUnexpectedResult);
     defer decoded.deinit();
     try std.testing.expectEqual(.complete_streams, decoded.command.mode);
-    try source.batchRaftReplicatedApply(.{ .artifact_publication = decoded.command }, .{ .term = 1, .index = 8 });
+    try @import("../server_db_adapter.zig").applyOrdered(&source, .{ .artifact_publication = decoded.command }, .{ .term = 1, .index = 8 });
     var read = try source.core.store.beginReadTxn();
     defer read.abort();
     try std.testing.expectEqual(@as(u64, 0), (try obligations.load(&read)).?.pending_documents);
@@ -827,10 +827,10 @@ test "ordered artifact inventory completion leaves extraction-owned scope pendin
     var catalog = try db.artifactInventoryCommand(alloc);
     defer catalog.catalogs.deinit(alloc);
     catalog.binding.effect_protocol = 15;
-    try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 1 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 1 });
     var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activation.publication_digest = activation.digest();
-    try db.batchRaftReplicatedApply(.{ .artifact_publication = activation }, .{ .term = 1, .index = 2 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 2 });
     var pin = try db.core.index_manager.acquireWritePlanSnapshot();
     defer pin.release();
     const plan = if (pin.plan().completion_plan) |*value| value else return error.TestUnexpectedResult;
@@ -857,11 +857,11 @@ test "ordered artifact inventory completion never skips an unverified index requ
     var catalog = try db.artifactInventoryCommand(alloc);
     defer catalog.catalogs.deinit(alloc);
     catalog.binding.effect_protocol = 15;
-    try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 1 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 1 });
     var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activation.publication_digest = activation.digest();
-    try db.batchRaftReplicatedApply(.{ .artifact_publication = activation }, .{ .term = 1, .index = 2 });
-    try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"text\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 3 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 2 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"text\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 3 });
     var pin = try db.core.index_manager.acquireWritePlanSnapshot();
     defer pin.release();
     try std.testing.expectEqual(.closed, try @import("artifact_native_stream.zig").advance(alloc, db.core.store, db.root_incarnation, "doc", pin.plan()));
@@ -877,7 +877,7 @@ test "ordered artifact inventory completion never skips an unverified index requ
         };
         defer page.deinit();
         try std.testing.expect(!page.atEnd());
-        try db.batchRaftReplicatedApply(.{ .artifact_publication = try page.command() }, .{ .term = 1, .index = iteration + 4 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .artifact_publication = try page.command() }, .{ .term = 1, .index = iteration + 4 });
     }
     try std.testing.expect(stopped);
     var read = try db.core.store.beginReadTxn();

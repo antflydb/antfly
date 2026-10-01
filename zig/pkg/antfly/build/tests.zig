@@ -6061,6 +6061,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_storage_shard_audit_step.dependOn(&unit_storage_shard_audit.step);
     const embedded_source_boundary = b.addSystemCommand(&.{"python3"});
     embedded_source_boundary.addFileArg(b.path("tools/audit_embedded_source_boundary.py"));
+    embedded_source_boundary.addArgs(&.{ "--entry", "embedded_root.zig", "--entry", "storage/db/db.zig", "--entry", "public_capi_root.zig" });
     const embedded_source_boundary_tests = b.addSystemCommand(&.{"python3"});
     embedded_source_boundary_tests.addFileArg(b.path("tools/test_audit_embedded_source_boundary.py"));
     const embedded_source_boundary_step = b.step(

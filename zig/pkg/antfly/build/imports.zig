@@ -210,6 +210,7 @@ pub const AntflyRootImports = struct {
         // The public/test facade exposes the whole implementation. Production
         // archives use the owner constructors below to keep caches independent.
         self.configureBase(mod, link_libc);
+        self.configureServerContracts(mod);
         mod.addImport("antfly_lite_options", self.lite_options);
         inline for (import_table) |entry| mod.addImport(entry.name, @field(self, entry.field));
         addSnowballModule(b, mod);
@@ -331,6 +332,23 @@ pub const AntflyRootImports = struct {
         "usermgr_server_openapi",
     };
 
+    /// Public local C API: no server provisioning, quorum observer, or routers.
+    pub fn configureEmbedded(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
+        self.configureDatabase(mod, link_libc);
+        inline for (.{
+            "casbin",           "extraction_openapi", "inference_api", "inference_config_openapi",
+            "matcher",          "middleware_openapi", "resolver",      "s3_openapi",
+            "scraping_openapi", "vectorindex",
+        }) |field| self.addImport(mod, field);
+        mod.addImport("antfly_lite_options", self.lite_options);
+        addSnowballModule(b, mod);
+    }
+
+    fn configureServerContracts(self: @This(), mod: *std.Build.Module) void {
+        mod.addImport("antfly_provision_contract", self.provision_contract);
+        mod.addImport("antfly_read_state_observer", self.read_state_observer);
+    }
+
     pub fn configureStorage(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
         self.configureStorageDependencies(b, mod, link_libc);
         mod.addImport("antfly_lite_options", self.lite_options);
@@ -338,6 +356,7 @@ pub const AntflyRootImports = struct {
 
     fn configureStorageDependencies(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
         self.configureDatabase(mod, link_libc);
+        self.configureServerContracts(mod);
         inline for (storage_imports) |field| self.addImport(mod, field);
         addSnowballModule(b, mod);
     }
@@ -357,6 +376,7 @@ pub const AntflyRootImports = struct {
 
     pub fn configureApi(self: @This(), mod: *std.Build.Module, link_libc: bool) void {
         self.configureDatabase(mod, link_libc);
+        self.configureServerContracts(mod);
         inline for (api_imports) |field| self.addImport(mod, field);
         mod.addImport("antfly_openapi_specs", self.embedded_openapi);
     }
@@ -387,8 +407,6 @@ pub const AntflyRootImports = struct {
         mod.addImport("antfly_cache_budget", self.cache_budget);
         mod.addImport("antfly_runtime_abi", self.runtime_abi);
         mod.addImport("antfly_runtime_fs", self.runtime_fs);
-        mod.addImport("antfly_provision_contract", self.provision_contract);
-        mod.addImport("antfly_read_state_observer", self.read_state_observer);
         mod.addImport("antfly_inference_bridge", self.inference_bridge);
         mod.addImport("antfly_public_limits", self.public_limits);
         mod.addImport("antfly_template_content", self.template_content);

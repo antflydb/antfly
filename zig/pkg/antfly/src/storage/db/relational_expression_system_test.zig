@@ -213,8 +213,8 @@ test "relational index system staged restore preserves historical absence and re
     var before = (try target.restoreStagingStatus(alloc)).?;
     defer before.deinit();
     try std.testing.expectEqual(@as(u64, 0), before.value.rows);
-    try target.batchRaftReplicatedApply(page.batch.?, .{ .index = 1, .term = 1 });
-    try target.batchRaftReplicatedApply(page.batch.?, .{ .index = 1, .term = 1 });
+    try @import("../server_db_adapter.zig").applyOrdered(&target, page.batch.?, .{ .index = 1, .term = 1 });
+    try @import("../server_db_adapter.zig").applyOrdered(&target, page.batch.?, .{ .index = 1, .term = 1 });
     target.close();
     target = try db_mod.DB.open(alloc, target_directory.path(), .{ .identity_namespace = target_namespace, .start_optional_runtimes = false });
     const key = try internal.relationalRowKeyAlloc(alloc, "old");

@@ -44,7 +44,10 @@ pub const enrichment_lease = @import("enrichment/enrichment_lease.zig");
 pub const enrichment_state = @import("enrichment/enrichment_state.zig");
 pub const enrichment_runtime = @import("enrichment/enrichment_runtime.zig");
 pub const enrichment_worker = @import("enrichment/enrichment_worker.zig");
-pub const chunker = @import("enrichment/chunker.zig");
+pub const chunker = if (builtin.os.tag == .freestanding)
+    @import("enrichment/chunker_stub.zig")
+else
+    @import("enrichment/chunker.zig");
 pub const enrichment_utf8_text = @import("enrichment/utf8_text.zig");
 pub const derived_types = @import("derived/derived_types.zig");
 pub const derived_worker = @import("derived/derived_worker.zig");

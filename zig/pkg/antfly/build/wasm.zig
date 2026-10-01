@@ -400,6 +400,9 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     antfly_wasm_mod.addImport("antfly_embedded_api", antfly_embedded_api_pkg_wasm_mod);
     antfly_wasm_mod.addImport("inference_runtime", inference_wasm_inference_mod);
 
+    const wasm_boundary = @import("embedded_boundary.zig").add(b, antfly_wasm_mod);
+    b.step("embedded-wasm-module-boundary-check", "Resolve the browser engine and inference module boundary").dependOn(&wasm_boundary.step);
+
     antfly_wasm_mod.single_threaded = true;
     const antfly_wasm = b.addExecutable(.{
         .name = "antfly_wasm",

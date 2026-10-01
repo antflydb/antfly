@@ -678,10 +678,10 @@ test "ordered artifact inventory projection sidecar transitions revoke completio
     var catalog = try db.artifactInventoryCommand(alloc);
     defer catalog.catalogs.deinit(alloc);
     catalog.binding.effect_protocol = 15;
-    try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 1 });
+    try @import("../../server_db_adapter.zig").applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 1 });
     var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activation.publication_digest = activation.digest();
-    try db.batchRaftReplicatedApply(.{ .artifact_publication = activation }, .{ .term = 1, .index = 2 });
+    try @import("../../server_db_adapter.zig").applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 2 });
     const sidecar = try checkpointPathAlloc(alloc, path);
     defer alloc.free(sidecar);
     const Probe = struct {

@@ -17,9 +17,10 @@
 # SPDX-License-Identifier: Elastic-2.0
 """Audit the local engine's authored production imports, before its package move.
 
-Named build modules are validated by the native/WASM builds. This check follows
-literal relative imports, including imports inside otherwise lazy declarations;
-only Zig test bodies are excluded. Missing sources fail rather than disappear
+The default check follows authored relative imports. Build targets additionally
+pass their actual named module tables, resolving each import in its source owner.
+Test bodies and explicit test-only owners are excluded; target import alternatives
+are selected only when the target proves the condition. Missing sources fail rather than disappear
 from the inventory. It deliberately does not infer licensing from directory names.
 """
 
@@ -50,7 +51,7 @@ def mask_literals(source: str) -> str:
     )
 
 
-def production_imports(source: str) -> list[str]:
+def production_imports(source: str, *, include_named: bool = False, target_os: str | None = None, options: dict[str, bool] | None = None) -> list[str]:
     """Skip comments, strings and complete test bodies, preserving lazy imports."""
     masked = mask_literals(source)
     stack: list[int] = []
@@ -68,6 +69,82 @@ def production_imports(source: str) -> list[str]:
     for test in re.finditer(r"\btest\s*\{", masked):
         brace = masked.index("{", test.start(), test.end())
         excluded.append((test.start(), ends[brace]))
+    for container in re.finditer(r'\bif\s*\(\s*builtin\.is_test\s*\)\s*struct\s*\{', masked):
+        brace = masked.index("{", container.start(), container.end())
+        excluded.append((brace, ends[brace]))
+    # The false branch must be an empty owner: a production call then fails
+    # compilation instead of silently reaching a server fixture.
+    test_owner = re.compile(
+        r'\bconst\s+\w+\s*=\s*if\s*\(\s*builtin\.is_test\s*\)'
+        r'\s*@import\(\s*"[^"\n]+"\s*\)\s*else\s*struct\s*\{\s*\}\s*;'
+    )
+    for owner in test_owner.finditer(source):
+        if masked[owner.start():owner.start() + 5] == "const":
+            excluded.append((owner.start(), owner.end()))
+    for test_import in re.finditer(
+        r'\bif\s*\(\s*builtin\.is_test\s*\)\s*(@import\(\s*"[^"\n]+"\s*\))\s*else\b', source
+    ):
+        if masked[test_import.start():test_import.start() + 2] == "if":
+            excluded.append((test_import.start(1), test_import.end(1)))
+    if target_os:
+        def skip_space(offset: int) -> int:
+            while offset < len(masked) and masked[offset].isspace():
+                offset += 1
+            return offset
+
+        def expression_end(offset: int) -> int | None:
+            if masked.startswith("struct", offset):
+                brace = skip_space(offset + len("struct"))
+                if brace < len(masked) and masked[brace] == "{":
+                    return ends[brace]
+            imported = IMPORT.match(source, offset)
+            if imported:
+                suffix = re.match(r"(?:\.\w+)*", source[imported.end():])
+                return imported.end() + len(suffix[0])
+            return None
+
+        for conditional in re.finditer(r"\bif\s*\(", masked):
+            opening = masked.index("(", conditional.start(), conditional.end())
+            depth, closing = 1, opening + 1
+            while closing < len(masked) and depth:
+                depth += (masked[closing] == "(") - (masked[closing] == ")")
+                closing += 1
+            condition = source[opening + 1:closing - 1].replace('@import("builtin")', "builtin")
+            terms = []
+            for term in re.split(r"\s+or\s+", condition):
+                term = term.strip().removeprefix("comptime ")
+                os_check = re.fullmatch(r'builtin\.os\.tag\s*(==|!=)\s*\.(\w+)', term)
+                if os_check:
+                    terms.append((target_os == os_check[2]) == (os_check[1] == "=="))
+                elif term == "builtin.is_test":
+                    terms.append(False)
+                elif options is not None and term.startswith("build_options."):
+                    terms.append(options.get(term.removeprefix("build_options.")))
+                else:
+                    terms.append(None)
+            value = True if True in terms else False if all(term is False for term in terms) else None
+            if value is None:
+                continue
+            first = skip_space(closing)
+            first_end = expression_end(first)
+            if first_end is None:
+                continue
+            otherwise = skip_space(first_end)
+            if not re.match(r"else\b", masked[otherwise:]):
+                continue
+            second = skip_space(otherwise + 4)
+            second_end = expression_end(second)
+            if second_end is not None:
+                excluded.append((second, second_end) if value else (first, first_end))
+    if options is not None:
+        for guard in re.finditer(r'\bif\s*\(\s*(?:comptime\s+)?(!?)build_options\.(\w+)\s*\)\s*return(?:\s+[^;]*)?;', masked):
+            value = options.get(guard[2])
+            if value is None or (not value if guard[1] else value) is not True:
+                continue
+            containers = [(start, end) for start, end in ends.items() if start < guard.start() < end]
+            if containers:
+                _, end = min(containers, key=lambda pair: pair[1] - pair[0])
+                excluded.append((guard.end(), end))
     result = []
     for call in re.finditer(r"@import\b", masked):
         if any(start <= call.start() < end for start, end in excluded):
@@ -75,7 +152,7 @@ def production_imports(source: str) -> list[str]:
         match = IMPORT.match(source, call.start())
         if match is None:
             raise ValueError("production imports must declare a literal source owner")
-        if match[1].endswith(".zig"):
+        if include_named or match[1].endswith(".zig"):
             result.append(match[1])
     return result
 
@@ -90,7 +167,7 @@ def server_source(relative: str) -> bool:
                 or relative.startswith("metadata/storage/")
             )
         )
-        or relative == "system_catalog/server_call.zig"
+        or relative in {"system_catalog/server_call.zig", "storage/server_db_adapter.zig", "tracing/server_raft_writer.zig", "tracing/raft_trace_logger.zig", "tracing/mod.zig", "storage/db/native_raft_snapshot.zig", "capi/server_owner.zig", "capi_root.zig", "capi_dependencies.zig"}
     )
 
 
@@ -128,6 +205,47 @@ def audit(root: Path, entries: list[str]) -> dict[str, list[str]]:
     return graph
 
 
+def audit_modules(project: Path, modules: dict[str, Path], edges: dict[tuple[str, str], str], entry: str, target_os: str | None = None) -> int:
+    """Resolve source imports against the actual target's Build.Module table."""
+    project = project.resolve()
+    source_root = project / "pkg/antfly/src"
+    pending = collections.deque([(entry, modules[entry].resolve(), [])])
+    visited: set[tuple[str, Path]] = set()
+    while pending:
+        module, path, chain = pending.popleft()
+        if (module, path) in visited:
+            continue
+        visited.add((module, path))
+        if path.is_relative_to(source_root) and server_source(path.relative_to(source_root).as_posix()):
+            raise ValueError("embedded module imports server coordination: " + " -> ".join(chain + [str(path)]))
+        # Third-party modules have their own source/license owners. The build
+        # table makes these explicit; this audit checks Antfly-owned sources.
+        if not path.is_relative_to(project):
+            continue
+        if not path.is_file():
+            raise ValueError(f"missing module source: {path}")
+        options = {}
+        option_owner = edges.get((module, "build_options"))
+        if option_owner in modules and modules[option_owner].is_file():
+            options = {name: value == "true" for name, value in re.findall(
+                r"pub const (\w+): bool = (true|false);", modules[option_owner].read_text()
+            )}
+        for imported in production_imports(path.read_text(), include_named=True, target_os=target_os, options=options):
+            if imported in {"std", "builtin"}:
+                continue
+            next_chain = chain + [str(path)]
+            if imported.endswith(".zig"):
+                dependency = (path.parent / imported).resolve()
+                if not dependency.is_relative_to(project):
+                    raise ValueError(f"{path} imports outside Antfly's source owner: {imported}")
+                pending.append((module, dependency, next_chain))
+            else:
+                target = entry if imported == "root" else edges.get((module, imported))
+                if target is None or target not in modules:
+                    raise ValueError(f"unresolved module import {imported!r} in {path} (owner {module})")
+                pending.append((target, modules[target].resolve(), next_chain))
+    return len(visited)
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -137,8 +255,22 @@ def main() -> None:
     )
     parser.add_argument("--entry", action="append")
     parser.add_argument("--json", type=Path)
+    parser.add_argument("--project", type=Path)
+    parser.add_argument("--module", nargs=2, action="append", default=[])
+    parser.add_argument("--module-import", nargs=3, action="append", default=[])
+    parser.add_argument("--entry-module")
+    parser.add_argument("--target-os")
     args = parser.parse_args()
     try:
+        if args.entry_module:
+            count = audit_modules(
+                args.project or Path(__file__).resolve().parents[1],
+                {name: Path(path) for name, path in args.module},
+                {(owner, name): target for owner, name, target in args.module_import},
+                args.entry_module, args.target_os,
+            )
+            print(f"Embedded module boundary: {count} resolved sources, no server coordination imports.")
+            return
         graph = audit(
             args.root, args.entry or ["embedded_root.zig", "storage/db/db.zig"]
         )

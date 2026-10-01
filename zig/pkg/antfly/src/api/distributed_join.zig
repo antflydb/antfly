@@ -2221,7 +2221,7 @@ const JoinReadBinding = struct {
             // A finalizer may fan out further, but cannot upgrade the topology
             // admitted by its coordinator to a newer split/rename generation.
             if (source.route_fence) |expected| {
-                const catalog = view.session.catalog();
+                const catalog = view.sessionAs(table_catalog.RoutingSession).catalog();
                 const actual = (try catalog.vtable.route_fence.?(catalog.ptr, expected.route.group_id)) orelse return error.TopologyChanged;
                 if (actual.metadata_group_id != expected.metadata_group_id or
                     !std.meta.eql(actual.metadata_incarnation, expected.metadata_incarnation) or
@@ -2229,7 +2229,7 @@ const JoinReadBinding = struct {
                     !std.meta.eql(actual.route, expected.route)) return error.TopologyChanged;
             }
             result.view = view;
-            result.ctx.routing_session = &view.session;
+            result.ctx.routing_session = view.sessionAs(table_catalog.RoutingSession);
             result.source = view.source;
         }
         return result;
@@ -9583,6 +9583,7 @@ test "distributed join finalizer refuses to replace an admitted split topology" 
         released: usize = 0,
         const Holder = struct {
             view: table_reads.JoinReadView,
+            session: table_catalog.RoutingSession,
             owner: *ThisFixture,
             allocator: std.mem.Allocator,
         };
@@ -9592,12 +9593,13 @@ test "distributed join finalizer refuses to replace an admitted split topology" 
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const holder = try a.create(Holder);
             self.generation.retain();
-            holder.* = .{ .owner = self, .allocator = a, .view = .{ .session = self.generation.session(a, undefined, true), .source = undefined, .destroy = destroy } };
+            holder.* = .{ .owner = self, .allocator = a, .session = self.generation.session(a, undefined, true), .view = .{ .session = undefined, .source = undefined, .destroy = destroy } };
+            holder.view.session = &holder.session;
             return &holder.view;
         }
         fn destroy(view: *table_reads.JoinReadView) void {
             const holder: *Holder = @fieldParentPtr("view", view);
-            view.session.deinit();
+            holder.session.deinit();
             holder.owner.released += 1;
             holder.allocator.destroy(holder);
         }

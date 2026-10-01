@@ -122,7 +122,7 @@ test "relational index system source publication job survives polling deadlines 
         try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"original\":true}" }} });
         const identity = try db.relationalTopologyIdentity();
         scope = .{ .fence = .{ .admission_epoch = identity.next_epoch, .transition_id = 7, .attempt = 1, .owner_group_id = 2, .peer_group_id = 3, .role = .merge_source, .namespace = identity.namespace, .catalog_digest = identity.catalog_digest }, .receiver_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .consumer_epoch = 1, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } };
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 });
         var gate: Gate = .{};
         db.source_publication.test_gate = &gate;
         try std.testing.expect(try db.source_publication.poll(db, scope, .none) == null);
@@ -150,7 +150,7 @@ test "relational index system source publication job survives polling deadlines 
         scope.consumer_epoch = 2;
         scope.fence.transition_id = 8;
         scope.copy_attempt.sequence = 2;
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 2 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 2 });
         var gate: Gate = .{};
         db.source_publication.test_gate = &gate;
         try std.testing.expect(try db.source_publication.poll(db, scope, .none) == null);
@@ -171,7 +171,7 @@ test "relational index system source publication job survives polling deadlines 
         scope.consumer_epoch = 3;
         scope.fence.transition_id = 9;
         scope.copy_attempt.sequence = 3;
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 3 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 3 });
         var gate: Gate = .{};
         db.source_publication.test_gate = &gate;
         try std.testing.expect(try db.source_publication.poll(db, scope, .none) == null);
@@ -181,7 +181,7 @@ test "relational index system source publication job survives polling deadlines 
         // Replicated release signals only the matching exporter. It returns
         // without opening its gate or joining the job; the worker observes
         // the cancellation independently and relinquishes its pin resources.
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .release = scope } }, .{ .term = 1, .index = 4 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .release = scope } }, .{ .term = 1, .index = 4 });
         try std.testing.expect(db.source_publication.canceled.load(.acquire));
         try db.source_publication.completed.wait(io);
         try std.testing.expectEqual(error.Canceled, db.source_publication.failure.?);

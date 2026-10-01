@@ -69,7 +69,7 @@ fn sourceOutboxRecovery(native_authority: bool) !void {
         };
         db.replication_async_batch_mirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .remote_write, .standby_names = &.{"standby"}, .failure_policy = .block }, .sync_wait_ctx = &ack, .sync_wait_fn = Ack.wait };
         const request: @import("../db/types.zig").BatchRequest = .{ .online_source = .{ .admit = .{ .scope = scope } } };
-        try std.testing.expectError(error.InjectedSourceMirrorWaitFailure, if (native_authority) db.batch(request) else db.batchRaftReplicatedApply(request, .{ .term = 1, .index = 11 }));
+        try std.testing.expectError(error.InjectedSourceMirrorWaitFailure, if (native_authority) db.batch(request) else @import("../server_db_adapter.zig").applyOrdered(&db, request, .{ .term = 1, .index = 11 }));
         try std.testing.expectEqual(@as(u64, if (native_authority) 1 else 11), (try db.onlineSourceStatus(scope)).admitted_applied_index);
         try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
         // Simulate loss of process-local mirror state before its outstanding
@@ -81,7 +81,7 @@ fn sourceOutboxRecovery(native_authority: bool) !void {
         defer db.close();
         db.replication_async_batch_mirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .remote_write, .standby_names = &.{"standby"}, .failure_policy = .block }, .sync_wait_ctx = &ack, .sync_wait_fn = Ack.wait };
         const request: @import("../db/types.zig").BatchRequest = .{ .online_source = .{ .admit = .{ .scope = scope } } };
-        if (native_authority) try db.batch(request) else try db.batchRaftReplicatedApply(request, .{ .term = 1, .index = 11 });
+        if (native_authority) try db.batch(request) else try @import("../server_db_adapter.zig").applyOrdered(&db, request, .{ .term = 1, .index = 11 });
         try std.testing.expect(ack.calls >= 2);
         try std.testing.expectEqual(@as(u64, if (native_authority) 2 else 1), primary.lastLsn());
         var entry = (try primary.log.entryAt(alloc, 1)) orelse return error.TestUnexpectedResult;

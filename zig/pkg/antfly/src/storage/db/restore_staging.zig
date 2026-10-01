@@ -16,6 +16,8 @@
 //! and native generated-artifact caches cross the source/target boundary;
 //! identities and constraints are allocated by the target schema/row pipeline.
 
+const server_test_adapter = if (builtin.is_test) @import("../server_db_adapter.zig") else struct {};
+const builtin = @import("builtin");
 const replication_ingress = @import("replication_ingress.zig");
 const std = @import("std");
 const identity = @import("doc_identity.zig");
@@ -327,7 +329,7 @@ test "native restore artifact phase cannot skip row fencing or mutate logical pr
 }
 
 fn applyTestPage(alloc: Allocator, db: *@import("antfly_source_root").antfly_sources.physical_db.DB, req: @import("types.zig").BatchRequest, index: u64, ha: bool) !void {
-    if (!ha) return db.batchRaftReplicatedApply(req, .{ .term = 1, .index = index });
+    if (!ha) return server_test_adapter.applyOrdered(&db, req, .{ .term = 1, .index = index });
     const payload = try @import("replication_effects.zig").encodeBatchMutationRequestAlloc(alloc, req);
     defer alloc.free(payload);
     try replication_ingress.applyRecord(db, .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = index, .previous_lsn = index - 1, .payload = payload });

@@ -161,7 +161,7 @@ const Fixture = struct {
         }
         const i = try index(name);
         self.donor_indices[i] += 1;
-        if (self.non_raft) try self.donors[i].batch(request) else try self.donors[i].batchRaftReplicatedApply(request, .{ .index = self.donor_indices[i], .term = 1 });
+        if (self.non_raft) try self.donors[i].batch(request) else try @import("../storage/server_db_adapter.zig").applyOrdered(&self.donors[i], request, .{ .index = self.donor_indices[i], .term = 1 });
         return {};
     }
     fn sourceLookup(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, key: []const u8, opts: db.types.LookupOptions, _: read_gate.ReadConsistency) !?reads.LookupResponse {
@@ -288,7 +288,7 @@ const Fixture = struct {
             mutation.restore_staging_scope = self.fixture.scopes[self.index].digest();
             const is_import_page = if (request.restore_staging) |command| command == .import_page else false;
             const apply_started_ns = if (is_import_page) @import("antfly_platform").time.monotonicNs() else 0;
-            if (self.fixture.non_raft) try self.fixture.dbs[self.index].batchWithVisibilityCancellation(mutation, context.cancellation) else try self.fixture.dbs[self.index].batchRaftReplicatedApply(mutation, .{ .index = self.fixture.indices[self.index], .term = 1 });
+            if (self.fixture.non_raft) try self.fixture.dbs[self.index].batchWithVisibilityCancellation(mutation, context.cancellation) else try @import("../storage/server_db_adapter.zig").applyOrdered(&self.fixture.dbs[self.index], mutation, .{ .index = self.fixture.indices[self.index], .term = 1 });
             if (is_import_page) {
                 const elapsed_ns = @import("antfly_platform").time.monotonicNs() - apply_started_ns;
                 self.fixture.import_apply_elapsed_ns +|= elapsed_ns;
@@ -589,7 +589,7 @@ fn runRewriteWithFailure(comptime Driver: type, invalid_tail: bool, non_raft: bo
         const source_identity = try original.relationalTopologyIdentity();
         try std.testing.expectEqual(@as(@TypeOf(source_identity.generation_handoff_receipt_authority), if (non_raft) .native else .raft), source_identity.generation_handoff_receipt_authority);
         const initial: db.types.BatchRequest = .{ .timestamp_ns = 123, .writes = &.{ .{ .key = "row", .value = "{\"id\":1,\"x\":2}" }, .{ .key = "removed", .value = "{\"id\":3,\"x\":4}" } } };
-        if (non_raft) try original.batch(initial) else try original.batchRaftReplicatedApply(initial, .{ .index = 1, .term = 1 });
+        if (non_raft) try original.batch(initial) else try @import("../storage/server_db_adapter.zig").applyOrdered(&original, initial, .{ .index = 1, .term = 1 });
         // v1 rows remain physically present but no active/read definition
         // names their epoch. Admission must include the native history map.
         if (i == 0) try original.setSchemaJson(alloc, active_schema);

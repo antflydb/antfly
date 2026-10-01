@@ -132,6 +132,7 @@ fn JoinReadBinding(comptime Source: type) type {
         view: @import("table_read_source.zig").JoinReadView,
         alloc: std.mem.Allocator,
         routed: Source,
+        session: table_catalog.RoutingSession,
         fn acquire(ptr: *anyopaque, alloc: std.mem.Allocator, budget: table_router.RouteBudget) !*@import("table_read_source.zig").JoinReadView {
             try budget.check();
             const source: *Source = @ptrCast(@alignCast(ptr));
@@ -139,20 +140,21 @@ fn JoinReadBinding(comptime Source: type) type {
             errdefer alloc.destroy(self);
             self.alloc = alloc;
             self.routed = source.*;
+            self.session = try table_catalog.RoutingSession.init(alloc, source.catalog, source.catalog.deadlineFrom(budget.clock));
             self.view = .{
-                .session = try table_catalog.RoutingSession.init(alloc, source.catalog, source.catalog.deadlineFrom(budget.clock)),
+                .session = &self.session,
                 .source = undefined,
                 .destroy = destroy,
             };
-            errdefer self.view.session.deinit();
+            errdefer self.session.deinit();
             try budget.check();
-            self.routed.catalog = self.view.session.catalog();
+            self.routed.catalog = self.session.catalog();
             self.view.source = self.routed.source();
             return &self.view;
         }
         fn destroy(view: *@import("table_read_source.zig").JoinReadView) void {
             const self: *@This() = @fieldParentPtr("view", view);
-            self.view.session.deinit();
+            self.session.deinit();
             self.alloc.destroy(self);
         }
     };
@@ -4141,7 +4143,8 @@ pub const ProvisionedTableReadSource = struct {
         };
     }
 
-    fn bindIncomingGraphRoutes(ptr: *anyopaque, cache: *distributed_graph.IncomingSourceGroupCache) void {
+    fn bindIncomingGraphRoutes(ptr: *anyopaque, cache_ptr: *anyopaque) void {
+        const cache: *distributed_graph.IncomingSourceGroupCache = @ptrCast(@alignCast(cache_ptr));
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         _ = self.withIncomingGraphRoutes(cache);
     }
@@ -6894,7 +6897,8 @@ pub const HostedProvisionedTableReadSource = struct {
         };
     }
 
-    fn bindIncomingGraphRoutes(ptr: *anyopaque, cache: *distributed_graph.IncomingSourceGroupCache) void {
+    fn bindIncomingGraphRoutes(ptr: *anyopaque, cache_ptr: *anyopaque) void {
+        const cache: *distributed_graph.IncomingSourceGroupCache = @ptrCast(@alignCast(cache_ptr));
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         _ = self.withIncomingGraphRoutes(cache);
     }
