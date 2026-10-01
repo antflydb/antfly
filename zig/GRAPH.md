@@ -80,11 +80,16 @@ runs at most one bounded cleanup page for weak sync levels after the primary
 apply lock is released. Remaining durable jobs continue through resident
 maintenance. Recovery, explicit maintenance, and `full_index` drain endpoint
 jobs completely; `full_index` also waits for the resulting cleanup replay cut,
-including cleanup completed concurrently by a resident worker. Foreground cleanup retains the callback
+including cleanup completed concurrently by a resident worker. Foreground drains
+check cancellation between atomic pages, leaving remaining jobs for maintenance
+without undoing the primary commit. Foreground cleanup retains the callback
 dispatcher and committed-effects observer. Replicated apply executes only its
 ordered command and leaves subsequent cleanup to the owner leader. Raft ownership is
 checked before local planning, including before the first applied-entry marker
-exists. Pending jobs survive restart and leader changes.
+exists. Pending jobs survive restart and leader changes. Standalone HA mirrors the exact
+selected relationship identities and job removals, encoded under the apply fence
+and reused by its durable outbox and stream; standbys never replan cleanup from
+their own directory rebuild progress.
 
 A transactionally maintained admission count fences graph reads only for jobs
 with incident inline edges. Empty jobs do not interrupt unrelated traversals.

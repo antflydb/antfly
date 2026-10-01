@@ -9689,6 +9689,10 @@ pub const DB = struct {
         if (try self.graphCleanupRequiresRaft()) return false;
         var pages: usize = 0;
         while (pages < max_pages and try self.core.store.hasGraphEndpointCleanup()) {
+            // The primary mutation is already durable. Cancellation can leave
+            // queued maintenance for the resident owner, but must never interrupt
+            // a page halfway through its atomic commit. Explicit drains use .none.
+            if (opts.visibility_cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
             try self.batchInternal(.{ .graph_endpoint_cleanup = true, .sync_level = .write }, null, .{
                 .document_child_range_dispatcher = opts.document_child_range_dispatcher,
                 .committed_batch_effects_observer = opts.committed_batch_effects_observer,
@@ -11980,7 +11984,10 @@ pub const DB = struct {
         var preencoded_ha_batch_payload: ?[]u8 = null;
         defer if (preencoded_ha_batch_payload) |payload| preparation_alloc.free(payload);
         const scoped_restore_ha = opts.restore_staging != null or requiresDurableLifecycleHA(effective_req);
-        if (!opts.bypass_ha_write_gate) if (self.ha_async_batch_mirror) |mirror| {
+        const local_graph_cleanup = req.graph_endpoint_cleanup and !req.graph_endpoint_cleanup_planned;
+        // Cleanup identities depend on the current incoming directory. Encode
+        // that bounded page under apply after selection, never the planner command.
+        if (!opts.bypass_ha_write_gate and !local_graph_cleanup) if (self.ha_async_batch_mirror) |mirror| {
             preencoded_ha_batch_payload = (if (req.artifact_catalog != null)
                 ha_effects_mod.encodeArtifactCatalogMutationRequestAlloc(preparation_alloc, req, opts.raft_applied_entry_marker orelse return error.InvalidArtifactCatalogCommand)
             else if (opts.raft_applied_entry_marker) |entry|
@@ -12575,7 +12582,7 @@ pub const DB = struct {
             // Recheck under the apply fence: ownership may have changed since
             // the scheduler or foreground drain probed it.
             if (try self.graphCleanupRequiresRaft()) return error.InvalidBatchRequest;
-            effective_req.graph_endpoint_cleanup = false;
+            effective_req.graph_endpoint_cleanup_planned = true;
             graph_cleanup_page = try self.core.store.prepareGraphEndpointCleanupPage(self.alloc);
             if (graph_cleanup_page) |page| {
                 const graph_deletes = try graphEndpointCleanupDeletesAlloc(preparation_alloc, page);
@@ -12583,6 +12590,14 @@ pub const DB = struct {
                 initialized_cleanup_deletes = graph_deletes.len;
                 effective_req.graph_deletes = graph_deletes;
                 effective_req.deletes = page.deletes;
+            }
+            // The selected identities and job removals share the primary apply
+            // fence. Both the durable HA outbox and stream reuse these bytes.
+            // Encoding failures abort before commit even for async mirroring:
+            // falling back to a planner command could fork authoritative state.
+            if (!opts.bypass_ha_write_gate and self.ha_async_batch_mirror != null) {
+                try types.validateGraphEndpointCleanupCommand(effective_req);
+                preencoded_ha_batch_payload = try ha_effects_mod.encodeBatchMutationRequestAlloc(preparation_alloc, effective_req);
             }
         }
 
@@ -158892,5 +158907,114 @@ test "db graph endpoint cleanup pages weak sync has one page budget and full ind
             try std.testing.expect(try db.runStandaloneGraphEndpointCleanupStep());
             try std.testing.expect(!try db.core.store.hasGraphEndpointCleanup());
         }
+    }
+}
+
+test "db graph endpoint cleanup pages cancellation stops between commits" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("review-cleanup-cancel");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+    try db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{}" }}, .sync_level = .write });
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const jobs = try scratch.alloc(docstore_mod.KVPair, 257);
+    for (jobs, 0..) |*job, i| {
+        const endpoint = try std.fmt.allocPrint(scratch, "isolated:{d}", .{i});
+        job.* = .{ .key = try internal_keys.graphEndpointCleanupKeyAlloc(scratch, endpoint), .value = endpoint };
+    }
+    try db.core.store.putBatch(jobs, &.{});
+    const Capture = struct {
+        calls: usize = 0,
+        canceled: std.atomic.Value(bool) = .init(false),
+        fn observe(ptr: *anyopaque, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls == 2) self.canceled.store(true, .release);
+        }
+    };
+    var capture = Capture{};
+    try std.testing.expectError(error.EnrichmentWaitCanceled, db.batchInternal(.{ .writes = &.{.{ .key = "unrelated", .value = "{}" }}, .sync_level = .full_index }, null, .{ .committed_batch_effects_observer = .{ .ptr = &capture, .apply = Capture.observe }, .visibility_cancellation = .fromAtomic(&capture.canceled) }));
+    try std.testing.expectEqual(@as(usize, 2), capture.calls);
+    try std.testing.expect(try db.core.store.hasGraphEndpointCleanup());
+    const committed_key = try encodeStoreLookupKeyAlloc(&db, alloc, "unrelated");
+    defer alloc.free(committed_key);
+    const committed = try db.core.store.get(alloc, committed_key);
+    alloc.free(committed);
+    // Cancellation preserves the primary commit and the unfinished durable job.
+    try std.testing.expect(try db.runStandaloneGraphEndpointCleanupStep());
+    try std.testing.expect(!try db.core.store.hasGraphEndpointCleanup());
+}
+
+test "db graph endpoint cleanup pages HA mirrors exact effects across directory progress" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |sync_mirror| {
+        var primary_dir = try TestDirectory.init("ha-cleanup-primary");
+        defer primary_dir.cleanup();
+        var replica_dir = try TestDirectory.init("ha-cleanup-replica");
+        defer replica_dir.cleanup();
+        var log_dir = try TestDirectory.init("ha-cleanup-log");
+        defer log_dir.cleanup();
+        var slots_dir = try TestDirectory.init("ha-cleanup-slots");
+        defer slots_dir.cleanup();
+        var stream = try ha_primary_mod.Primary.open(alloc, log_dir.path().ptr, slots_dir.path().ptr, .{ .cluster_id = 200, .shard_id = 3, .table_id = 9, .timeline_id = 1, .epoch = 1 }, .{});
+        defer stream.close();
+        var primary = try DB.open(alloc, primary_dir.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer primary.close();
+        var replica = try DB.open(alloc, replica_dir.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer replica.close();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const rows = try scratch.alloc(docstore_mod.KVPair, 300);
+        for (rows, 0..) |*row, i| row.* = .{ .key = try std.fmt.allocPrint(scratch, "doc:{d}", .{i}), .value = "{}" };
+        const job = try internal_keys.graphEndpointCleanupKeyAlloc(scratch, "hub");
+        for ([_]*DB{ &primary, &replica }) |db| {
+            try db.core.store.putBatch(rows, &.{});
+            try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+            try db.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "hub", .edge_type = "R" }}, .sync_level = .full_index });
+            try db.core.store.put(job, "hub");
+        }
+        // A base restore or physical rewrite can leave the standby's local
+        // incoming directory incomplete. It must not spend this HA command
+        // rebuilding a page instead of applying the primary's retirements.
+        try replica.core.store.invalidateGraphDirectories();
+        const Wait = struct {
+            fn wait(_: *anyopaque, active: *ha_primary_mod.Primary, target: u64, _: ha_primary_mod.SyncPolicy) !void {
+                try active.standbyStatusUpdate("standby-a", active.identity.timeline_id, target, target);
+            }
+        };
+        var wait_ctx: u8 = 0;
+        const names = [_][]const u8{"standby-a"};
+        if (sync_mirror) try stream.createSlot("standby-a", 0);
+        var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
+        primary.ha_async_batch_mirror = .{
+            .primary = &stream,
+            .last_lsn = &last_lsn,
+            .sync_policy = if (sync_mirror) .{ .mode = .remote_apply, .standby_names = &names, .failure_policy = .block } else .{},
+            .sync_wait_ctx = &wait_ctx,
+            .sync_wait_fn = Wait.wait,
+        };
+        try std.testing.expect(try primary.runStandaloneGraphEndpointCleanupStep());
+        var entry = (try stream.log.entryAt(alloc, last_lsn.load(.acquire))).?;
+        defer entry.deinit(alloc);
+        var decoded = try ha_effects_mod.decodeBatchMutationRequest(alloc, entry.record);
+        defer decoded.deinit();
+        try std.testing.expect(decoded.value.request.graph_endpoint_cleanup);
+        try std.testing.expect(decoded.value.request.graph_endpoint_cleanup_planned);
+        try std.testing.expectEqual(@as(usize, 1), decoded.value.request.graph_deletes.len);
+        try std.testing.expectEqual(@as(usize, 1), decoded.value.request.deletes.len);
+        try replica.applyHAReplicationRecord(entry.record);
+        try std.testing.expect(!try primary.core.store.hasGraphEndpointCleanup());
+        try std.testing.expect(!try replica.core.store.hasGraphEndpointCleanup());
+        // Exact retirement is authoritative even before directory repair and
+        // derived replay. Duplicate delivery cannot consume another page.
+        const artifact = try internal_keys.graphRelationshipArtifactKeyAlloc(scratch, "a", "g", "R", "hub", "a", "");
+        for ([_]*DB{ &primary, &replica }) |db| try std.testing.expect(try db.core.store.graphRelationshipRetired(artifact));
+        try replica.applyHAReplicationRecord(entry.record);
+        try std.testing.expectEqual(entry.record.lsn, try replica.haAppliedReplicationLsn());
     }
 }
