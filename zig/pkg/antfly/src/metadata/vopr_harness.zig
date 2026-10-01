@@ -6928,6 +6928,7 @@ pub const MetadataAdminVoprSource = struct {
             .fk_initial_create_work,
             .fk_initial_retirement_page,
             .store_root_enroll,
+            .store_root_enrollment_status,
             .fk_initial_retirement_signed_page,
             .fk_initial_retirement_ack,
             .fk_initial_parent_decision,
