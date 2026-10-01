@@ -42,7 +42,7 @@ The current corpus is intentionally small. Add fixtures incrementally as each
 codec lane is implemented or broadened.
 
 For broader upstream sweeps that should not bloat the checked-in corpus, use the
-opt-in harnesses in [`../../lib/image/e2e`](../../lib/image/e2e), starting with
+opt-in harnesses in [`../../lib/image/corpus`](../../lib/image/corpus), starting with
 the `libjpeg-turbo/seed-corpora` JPEG runner.
 
 Regenerate the synthetic WebP fixtures from the `zig/` directory:
