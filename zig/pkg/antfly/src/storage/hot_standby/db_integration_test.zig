@@ -355,8 +355,8 @@ test "row-policy Raft apply persists fail-closed intent and finalizes after rest
         mirrored_options.replication_async_metadata_mirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary) };
         var mirrored = try DB.open(alloc, path, mirrored_options);
         defer mirrored.close();
-        try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.active, mirrored.row_policy_gate.currentPhase());
-        try std.testing.expectError(error.RowPolicyAuthenticationRequired, mirrored.row_policy_gate.enterRaw());
+        try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.active, mirrored.local_execution.row_policy_gate.currentPhase());
+        try std.testing.expectError(error.RowPolicyAuthenticationRequired, mirrored.local_execution.row_policy_gate.enterRaw());
     }
     var follower_tmp = try TestDirectory.init("row-policy-follower");
     defer follower_tmp.cleanup();
@@ -2577,7 +2577,7 @@ test "storage.hot_standby db mirrors and applies schema metadata mutation record
 
     // Promotion must preserve public constraints, not merely the physical row
     // codec. Removing the test-only standby gate models the authority handoff.
-    standby_db.replication_write_gate = null;
+    standby_db.local_execution.replication_write_gate = null;
     try std.testing.expectError(error.InvalidBatchRequest, standby_db.batch(.{
         .writes = &.{.{
             .key = "row:invalid",

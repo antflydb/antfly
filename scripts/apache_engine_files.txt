@@ -489,6 +489,7 @@ zig/pkg/antfly/src/storage/db/lease.zig
 zig/pkg/antfly/src/storage/db/maintenance/graph_metric_runtime.zig
 zig/pkg/antfly/src/storage/db/maintenance/sparse_compaction_runtime.zig
 zig/pkg/antfly/src/storage/db/maintenance/text_merge_runtime.zig
+zig/pkg/antfly/src/storage/db/maintenance/transaction_recovery_driver.zig
 zig/pkg/antfly/src/storage/db/maintenance/transaction_runtime.zig
 zig/pkg/antfly/src/storage/db/maintenance/ttl_runtime.zig
 zig/pkg/antfly/src/storage/db/merge_artifact_catalog.zig

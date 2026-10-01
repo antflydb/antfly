@@ -147167,7 +147167,7 @@ test "source vector migration converts legacy ANN generations in both modes" {
         if (mode == .offline) try std.testing.expectEqual(.complete, try offline.run(alloc, std.testing.io, path, request, .{ .open = options }));
         var migrated = try DB.open(alloc, path, options);
         defer migrated.close();
-        try std.testing.expectEqual(.vector_store, migrated.table_storage.dense_embeddings);
+        try std.testing.expectEqual(.vector_store, migrated.local_execution.table_storage.dense_embeddings);
         try std.testing.expect(migrated.core.index_manager.denseIndex("model").?.native_physical_v2);
         try std.testing.expect(migrated.core.index_manager.sourceMigrationServingComplete());
         var result = try migrated.search(alloc, .{ .index_name = "model", .dense = .{ .vector = &.{ 1, 0, 0 }, .k = 1 }, .limit = 1 });

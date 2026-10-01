@@ -296,3 +296,16 @@ identity-preserving staging, validation, and repair remain Apache local primitiv
 Raft and coordinator fixtures run in a dedicated server suite; authored engine
 sources no longer import their test adapter. See `local-db-source-separation.md`
 for lifecycle and test ownership details.
+
+
+### Shared recovery execution owner
+
+Foreground writes and transaction recovery now share one local execution-state
+owner for mutable admission, publication, storage settings, statistics and
+synchronization. Recovery holds explicit borrowed capabilities and uses a
+synchronous view with private scratch state, replacing the copied DB wrapper.
+The generic transaction recovery driver belongs to the Apache local source
+closure; it owns scheduling, leases, scan cursors, pause/resume and draining.
+Server policy validation, participant fan-out and coordinator decisions remain
+in ELv2 server owners. The unused core-only and local free-function recovery
+shortcuts have been removed; managed one-shot recovery uses runtime dispatch.
