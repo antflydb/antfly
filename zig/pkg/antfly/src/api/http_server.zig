@@ -3985,7 +3985,7 @@ pub const ApiHttpServer = struct {
     /// The cache pointer must never target the temporary returned-by-value
     /// server used during construction.
     pub fn bindIncomingGraphRoutes(self: *ApiHttpServer, source: table_reads.TableReadSource) void {
-        source.bindIncomingGraphRoutes(&self.incoming_graph_routes);
+        source.bindIncomingGraphRoutes(@ptrCast(&self.incoming_graph_routes));
     }
 
     pub fn initForTestingWithRequestAllocator(

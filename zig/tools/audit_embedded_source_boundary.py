@@ -51,7 +51,7 @@ def mask_literals(source: str) -> str:
     )
 
 
-def production_imports(source: str, *, include_named: bool = False, target_os: str | None = None, options: dict[str, bool] | None = None) -> list[str]:
+def production_exclusions(source: str, *, target_os: str | None = None, options: dict[str, bool] | None = None) -> tuple[str, list[tuple[int, int]]]:
     """Skip comments, strings and complete test bodies, preserving lazy imports."""
     masked = mask_literals(source)
     stack: list[int] = []
@@ -145,6 +145,22 @@ def production_imports(source: str, *, include_named: bool = False, target_os: s
             if containers:
                 _, end = min(containers, key=lambda pair: pair[1] - pair[0])
                 excluded.append((guard.end(), end))
+    return masked, excluded
+
+
+def production_source(source: str) -> str:
+    """Preserve source offsets while removing explicitly test-owned code."""
+    _, excluded = production_exclusions(source)
+    chars = list(source)
+    for start, end in excluded:
+        for offset in range(start, end):
+            if chars[offset] != "\n":
+                chars[offset] = " "
+    return "".join(chars)
+
+
+def production_imports(source: str, *, include_named: bool = False, target_os: str | None = None, options: dict[str, bool] | None = None) -> list[str]:
+    masked, excluded = production_exclusions(source, target_os=target_os, options=options)
     result = []
     for call in re.finditer(r"@import\b", masked):
         if any(start <= call.start() < end for start, end in excluded):

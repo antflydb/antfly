@@ -190,7 +190,7 @@ pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
         state.server.deinit();
         return fail(err);
     };
-    if (reads.*) |read_source| read_source.bindIncomingGraphRoutes(&state.server.incoming_graph_routes);
+    if (reads.*) |read_source| read_source.bindIncomingGraphRoutes(@ptrCast(&state.server.incoming_graph_routes));
     state.request_alloc_abi = .fromStd(&state.server.alloc);
     context.out_handle.* = state;
     context.out_request_alloc.* = &state.request_alloc_abi;

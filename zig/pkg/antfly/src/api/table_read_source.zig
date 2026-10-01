@@ -113,15 +113,14 @@ pub const ParsedTextStatsHttpResponse = union(enum) {
     }
 };
 /// Request-owned immutable topology plus a read adapter bound to that topology.
+pub const RoutingSessionHandle = opaque {};
+pub const IncomingGraphRouteCache = opaque {};
+
 pub const JoinReadView = struct {
-    /// Borrowed server routing state, owned by the provider until destroy.
-    /// Local readers use source and lifetime callbacks without knowing its type.
-    session: *anyopaque,
+    /// Server-owned routing lease; only server adapters interpret this handle.
+    routing_session: ?*RoutingSessionHandle = null,
     source: TableReadSource,
     destroy: *const fn (*JoinReadView) void,
-    pub fn sessionAs(self: *JoinReadView, comptime Session: type) *Session {
-        return @ptrCast(@alignCast(self.session));
-    }
 
     pub fn deinit(self: *JoinReadView) void {
         self.destroy(self);
@@ -579,7 +578,7 @@ pub const TableReadSource = struct {
         document_artifact_manifests_group_local_routed: ?*const fn (*anyopaque, std.mem.Allocator, metadata_api.CatalogRouteFence, u64, []const u8, []const u8, read_gate.ReadConsistency) anyerror!?db_types.DocumentArtifactManifestList = null,
         bind_incoming_graph_routes: ?*const fn (
             ptr: *anyopaque,
-            cache: *anyopaque,
+            cache: *IncomingGraphRouteCache,
         ) void = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
@@ -1193,7 +1192,7 @@ pub const TableReadSource = struct {
 
     pub fn bindIncomingGraphRoutes(
         self: TableReadSource,
-        cache: *anyopaque,
+        cache: *IncomingGraphRouteCache,
     ) void {
         const bind = self.vtable.bind_incoming_graph_routes orelse return;
         bind(self.ptr, cache);

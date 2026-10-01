@@ -142,7 +142,7 @@ fn JoinReadBinding(comptime Source: type) type {
             self.routed = source.*;
             self.session = try table_catalog.RoutingSession.init(alloc, source.catalog, source.catalog.deadlineFrom(budget.clock));
             self.view = .{
-                .session = &self.session,
+                .routing_session = @ptrCast(&self.session),
                 .source = undefined,
                 .destroy = destroy,
             };
@@ -4143,10 +4143,9 @@ pub const ProvisionedTableReadSource = struct {
         };
     }
 
-    fn bindIncomingGraphRoutes(ptr: *anyopaque, cache_ptr: *anyopaque) void {
-        const cache: *distributed_graph.IncomingSourceGroupCache = @ptrCast(@alignCast(cache_ptr));
+    fn bindIncomingGraphRoutes(ptr: *anyopaque, cache: *@import("table_read_source.zig").IncomingGraphRouteCache) void {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        _ = self.withIncomingGraphRoutes(cache);
+        _ = self.withIncomingGraphRoutes(@ptrCast(@alignCast(cache)));
     }
 
     pub fn warmTableGroup(self: *ProvisionedTableReadSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8) !void {
@@ -6897,10 +6896,9 @@ pub const HostedProvisionedTableReadSource = struct {
         };
     }
 
-    fn bindIncomingGraphRoutes(ptr: *anyopaque, cache_ptr: *anyopaque) void {
-        const cache: *distributed_graph.IncomingSourceGroupCache = @ptrCast(@alignCast(cache_ptr));
+    fn bindIncomingGraphRoutes(ptr: *anyopaque, cache: *@import("table_read_source.zig").IncomingGraphRouteCache) void {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        _ = self.withIncomingGraphRoutes(cache);
+        _ = self.withIncomingGraphRoutes(@ptrCast(@alignCast(cache)));
     }
 
     fn lookup(
