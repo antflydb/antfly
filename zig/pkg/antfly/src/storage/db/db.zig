@@ -9678,14 +9678,40 @@ pub const DB = struct {
     }
 
     fn drainStandaloneGraphEndpointCleanup(self: *DB) !bool {
+        return self.drainStandaloneGraphEndpointCleanupWithOptions(.{});
+    }
+
+    fn drainStandaloneGraphEndpointCleanupWithOptions(self: *DB, opts: BatchExecutionOptions) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
+        // Most batches create no endpoint jobs. Avoid authority probes and
+        // maintenance admission altogether on their completion path.
+        if (!try self.core.store.hasGraphEndpointCleanup()) return false;
         if (try self.graphCleanupRequiresRaft()) return false;
         var drained = false;
         while (try self.core.store.hasGraphEndpointCleanup()) {
-            try self.batch(.{ .graph_endpoint_cleanup = true, .sync_level = .write });
+            try self.batchInternal(.{ .graph_endpoint_cleanup = true, .sync_level = .write }, null, .{
+                .document_child_range_dispatcher = opts.document_child_range_dispatcher,
+                .committed_batch_effects_observer = opts.committed_batch_effects_observer,
+            });
             drained = true;
         }
         return drained;
+    }
+
+    /// Shared completion for ordinary, profiled, callback and transaction
+    /// batches, after the serialized primary apply section has finished.
+    /// Replicated apply must only execute its exact command; its owner drives
+    /// cleanup independently through subsequent ordered Raft entries.
+    fn finishBatchGraphEndpointCleanup(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
+        if (req.graph_endpoint_cleanup or !opts.wait_for_sync_level or
+            opts.raft_applied_entry_marker != null or opts.ha_applied_lsn_marker != null or
+            opts.native_initial_child_entry != null or opts.restore_staging != null or
+            req.restore_staging_scope != null or req.restore_staging != null) return;
+        const drained = try self.drainStandaloneGraphEndpointCleanupWithOptions(opts);
+        // A resident worker can finish before the foreground queue probe.
+        // Deletes/transforms must still include its newly committed replay cut.
+        if (req.sync_level == .full_index and (drained or req.deletes.len != 0 or req.transforms.len != 0))
+            try self.waitForCurrentSyncLevelWithCancellation(.full_index, opts.visibility_cancellation);
     }
 
     fn graphCleanupRequiresRaft(self: *DB) !bool {
@@ -9734,6 +9760,9 @@ pub const DB = struct {
     fn runStandaloneGraphEndpointCleanupStep(self: *DB) !bool {
         if (try self.graphCleanupRequiresRaft()) return false;
         if (!try self.core.store.hasGraphEndpointCleanup()) {
+            // A ready directory needs no work. Idle owners must not contend
+            // with user mutations for the apply lock every scheduler turn.
+            if (try self.core.store.graphIncomingDirectoryReady()) return false;
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
             if (try self.graphCleanupRequiresRaft()) return false;
@@ -9761,6 +9790,7 @@ pub const DB = struct {
     /// The leader selects exact identities before proposal. Followers apply
     /// these afterimages rather than consulting their local directory progress.
     pub fn prepareGraphEndpointCleanupBatch(self: *DB, alloc: Allocator) !?GraphEndpointCleanupBatch {
+        if (!try self.core.store.hasGraphEndpointCleanup() and try self.core.store.graphIncomingDirectoryReady()) return null;
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         if (!try self.core.store.hasGraphEndpointCleanup()) {
@@ -9788,12 +9818,6 @@ pub const DB = struct {
         } else {
             try self.batchInternal(req, null, .{});
         }
-        if (!req.graph_endpoint_cleanup) {
-            const drained = try self.drainStandaloneGraphEndpointCleanup();
-            // The background worker may have drained the job before this
-            // foreground probe. Include its replay cut in full-index deletes.
-            if (req.sync_level == .full_index and (drained or req.deletes.len != 0 or req.transforms.len != 0)) try self.waitForCurrentSyncLevel(.full_index);
-        }
     }
 
     pub fn batchWithVisibilityCancellation(self: *DB, req: types.BatchRequest, cancellation: types.CancellationToken) anyerror!void {
@@ -9803,10 +9827,6 @@ pub const DB = struct {
             logBatchProfile(req, profile);
         } else {
             try self.batchInternal(req, null, .{ .visibility_cancellation = cancellation });
-        }
-        if (!req.graph_endpoint_cleanup) {
-            const drained = try self.drainStandaloneGraphEndpointCleanup();
-            if (req.sync_level == .full_index and (drained or req.deletes.len != 0 or req.transforms.len != 0)) try self.waitForCurrentSyncLevelWithCancellation(.full_index, cancellation);
         }
     }
 
@@ -11537,6 +11557,9 @@ pub const DB = struct {
                 },
                 else => return err,
             };
+            // Completion errors happen after commit. Keep this outside the
+            // preparation retry handler so they cannot replay the user batch.
+            try self.finishBatchGraphEndpointCleanup(req, opts);
             return;
         }
     }
@@ -13083,7 +13106,7 @@ pub const DB = struct {
         }
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_writes_ns, extract_writes_start_ns);
 
-        if (effective_req.writes.len != 0 and try self.core.store.hasGraphRetirements()) {
+        if (effective_req.writes.len != 0 and try self.core.store.mayHaveGraphRetirements()) {
             for (effective_req.writes, 0..) |write, write_index| {
                 // Semantic no-ops retain retirement; a real owner update starts
                 // a new projection lifecycle and replays its durable inputs.
@@ -158669,4 +158692,111 @@ test "db graph endpoint cleanup pages respect raft ownership before first applie
     try db.core.store.put(job, "hub");
     try std.testing.expect(!try db.runStandaloneGraphEndpointCleanupStep());
     try std.testing.expect(try db.core.store.hasGraphEndpointCleanup());
+}
+
+test "db graph endpoint cleanup pages full index completion covers every local write entry point" {
+    const alloc = std.testing.allocator;
+    const Capture = struct {
+        calls: usize = 0,
+        fn observe(ptr: *anyopaque, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+        }
+        fn dispatch(_: *anyopaque, _: Allocator, _: DocumentArtifactChildRangeDispatch) !void {}
+    };
+    for (0..6) |mode| {
+        var directory = try TestDirectory.init("completion-entry-points");
+        defer directory.cleanup();
+        var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+        try db.batch(.{ .writes = &.{.{ .key = "hub", .value = "{}" }}, .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "hub", .edge_type = "R" }}, .timestamp_ns = 1, .sync_level = .full_index });
+        const req: types.BatchRequest = .{ .deletes = &.{"hub"}, .sync_level = .full_index };
+        var capture = Capture{};
+        const dispatcher = DocumentArtifactChildRangeDispatcher{ .ptr = &capture, .apply = Capture.dispatch };
+        switch (mode) {
+            0 => try db.batchTransactionCompatible(req),
+            1 => {
+                var profile = BatchProfile{};
+                try db.batchProfiled(req, &profile);
+            },
+            2 => try db.batchWithDocumentArtifactChildRangeDispatcher(req, dispatcher),
+            3 => {
+                try db.batchWithDocumentArtifactChildRangeDispatcherAndCommittedEffectsObserver(req, dispatcher, .{ .ptr = &capture, .apply = Capture.observe });
+                // The observer sees both the primary delete and its cleanup.
+                try std.testing.expect(capture.calls >= 2);
+            },
+            4 => {
+                const txn = try db.beginTransaction(10);
+                try db.writeTransaction(txn, .{ .deletes = req.deletes });
+                try db.resolveTransactionIntentsWithSyncLevel(txn, .committed, 20, .full_index);
+            },
+            5 => try db.batchWithoutRangeValidation(req),
+            else => unreachable,
+        }
+        try std.testing.expect(!try db.core.store.hasGraphEndpointCleanup());
+        const edges = try db.getEdges(alloc, "g", "a", "", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 0), edges.len);
+    }
+}
+
+test "db graph endpoint cleanup pages ordinary writes do not drain directory migration" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |graph_index| {
+        var directory = try TestDirectory.init("write-migration-bounded");
+        defer directory.cleanup();
+        var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        if (graph_index) try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        // Seed unrelated historical rows directly: the regression exercises
+        // the next DB write, not extraction/replay for the fixture corpus.
+        const writes = try scratch.alloc(docstore_mod.KVPair, 600);
+        for (writes, 0..) |*write, i| {
+            const key = try std.fmt.allocPrint(scratch, "doc:{d}", .{i});
+            write.* = .{ .key = try encodeStoreLookupKeyAlloc(&db, scratch, key), .value = "{}" };
+        }
+        try db.core.store.putBatch(writes, &.{});
+        // Existing pre-migration stores lack a ready marker.
+        try db.core.store.delete(internal_keys.graph_incoming_ready_key);
+        try db.batch(.{ .writes = &.{.{ .key = "new", .value = "{}" }}, .sync_level = .write });
+        try std.testing.expect(!try db.core.store.graphIncomingDirectoryReady());
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, internal_keys.graph_incoming_cursor_key));
+        if (graph_index) {
+            try std.testing.expect(try db.runStandaloneGraphEndpointCleanupStep());
+            try std.testing.expect(!try db.core.store.graphIncomingDirectoryReady());
+            const cursor = try db.core.store.get(alloc, internal_keys.graph_incoming_cursor_key);
+            alloc.free(cursor);
+            // Another ordinary write cannot consume the remaining pages.
+            try db.batch(.{ .writes = &.{.{ .key = "other", .value = "{}" }}, .sync_level = .write });
+            try std.testing.expect(!try db.core.store.graphIncomingDirectoryReady());
+            while (try db.runStandaloneGraphEndpointCleanupStep()) {}
+            try std.testing.expect(try db.core.store.graphIncomingDirectoryReady());
+        }
+    }
+}
+
+test "db graph endpoint cleanup pages incomplete directory preserves owner retirement lifecycle" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("retirement-owner-fallback");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"v\":1}" }}, .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R" }}, .sync_level = .full_index });
+    try db.batch(.{ .graph_deletes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R" }}, .sync_level = .full_index });
+    const artifact = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, "a", "g", "R", "b", "a", "");
+    defer alloc.free(artifact);
+    try std.testing.expect(try db.core.store.graphRelationshipRetired(artifact));
+    try db.core.store.delete(internal_keys.graph_incoming_ready_key);
+    // A semantic no-op must retain the retirement even without a summary.
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"v\":1}" }}, .sync_level = .write });
+    try std.testing.expect(try db.core.store.graphRelationshipRetired(artifact));
+    // Only this owner's changed lifecycle removes its marker.
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"v\":2}" }}, .sync_level = .write });
+    try std.testing.expect(!try db.core.store.graphRelationshipRetired(artifact));
+    try std.testing.expect(!try db.core.store.graphIncomingDirectoryReady());
 }

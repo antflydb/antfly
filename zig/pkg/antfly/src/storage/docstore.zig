@@ -1544,8 +1544,18 @@ pub const DocStore = struct {
         return .{ .alloc = alloc, .writes = owned_writes, .deletes = try deletes.toOwnedSlice(alloc), .inspected = inspected, .bytes = bytes };
     }
 
+    /// Exact maintenance query: explicitly completes directory migration.
+    /// Write admission must use mayHaveGraphRetirements instead.
     pub fn hasGraphRetirements(self: *DocStore) !bool {
         try self.ensureGraphIncomingDirectory();
+        return self.mayHaveGraphRetirements();
+    }
+
+    /// Constant-time conservative admission hint. An incomplete directory
+    /// returns true: callers check the authoritative owner/relationship prefix
+    /// they need, rather than migrating unrelated primary rows on a write.
+    /// Explicit migration/maintenance owns directory progress.
+    pub fn mayHaveGraphRetirements(self: *DocStore) !bool {
         var txn = try self.beginReadTxn();
         defer txn.abort();
         var maybe: ?bool = null;
@@ -1963,12 +1973,9 @@ pub const DocStore = struct {
         participant: ?@import("commit_participant.zig").Participant,
     ) !void {
         const graph_bulk = deletes.len == 0 and options.mode == .bulk_ingest;
-        if (graph_bulk) {
-            for (writes) |write| if (internal_keys.isGraphEdgeArtifactKey(write.key)) {
-                try self.ensureGraphIncomingDirectory();
-                break;
-            };
-        }
+        // The retirement mask reads candidate markers from this same writer
+        // transaction. It remains authoritative during directory migration,
+        // so bulk ingestion never needs a foreground whole-store backfill.
         var batch = try self.beginWriteBatchWithOptions(options);
         errdefer batch.abort();
         if (participant) |observer| try batch.setCommitParticipant(observer);
@@ -5547,4 +5554,38 @@ test "graph endpoint cleanup byte admission releases partial page allocations" {
         }
     };
     try std.testing.checkAllAllocationFailures(alloc, Check.run, .{&store});
+}
+
+test "graph relationship bulk ingestion preserves direct append and retirement during migration" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 1, .bulk_ingest_flush_threshold_multiplier = 2 });
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const writes = try scratch.alloc(KVPair, 600);
+    for (writes, 0..) |*write, i| {
+        const owner = try std.fmt.allocPrint(scratch, "owner:{d:0>4}", .{i});
+        write.* = .{ .key = try internal_keys.graphRelationshipArtifactKeyAlloc(scratch, owner, "g", "R", "hub", owner, "id"), .value = "payload" };
+    }
+    try store.putBatch(writes, &.{});
+    const retired = try internal_keys.graphRetirementKeyAlloc(scratch, writes[0].key);
+    try store.put(retired, "1");
+    try store.delete(internal_keys.graph_incoming_ready_key);
+    // Incomplete directory/count coverage cannot cause retired bulk rows to
+    // reappear, and unrelated rows still use the sorted append fast path.
+    const before = backend.snapshotWriteStats().sorted_ingest_runs;
+    try store.putBatchWithReplayWithOptions(null, writes, &.{}, null, .{ .mode = .bulk_ingest });
+    try std.testing.expectEqual(before + 1, backend.snapshotWriteStats().sorted_ingest_runs);
+    try std.testing.expectError(error.NotFound, store.get(alloc, writes[0].key));
+    const live = try store.get(alloc, writes[1].key);
+    defer alloc.free(live);
+    try std.testing.expectEqualStrings("payload", live);
+    try std.testing.expect(!try store.graphIncomingDirectoryReady());
+    try std.testing.expectError(error.NotFound, store.get(alloc, internal_keys.graph_incoming_cursor_key));
+    // Only bounded maintenance creates a migration checkpoint.
+    try std.testing.expect(!try store.backfillGraphIncomingDirectoryPage());
+    try std.testing.expect(!try store.graphIncomingDirectoryReady());
 }

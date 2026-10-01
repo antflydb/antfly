@@ -41,9 +41,14 @@ artifact writes and deletes. New stores mark the directory ready on their first
 user-record write. Older stores backfill at most 256 keys or 256 KiB of temporary
 key data per transaction (one oversized key may form its own page). A durable
 cursor resumes migration after interruption; readers use the directory only
-when the final ready marker commits. Endpoint deletion records a durable cleanup
-job instead of enumerating all incoming relationships in the foreground. Each
-cleanup command advances at most one migration page, then processes at most 256
+when the final ready marker commits. Ordinary document upserts do not advance
+migration: a constant-time retirement summary remains conservative while the
+directory is incomplete, and changed owner documents check their authoritative retirement
+prefixes. Bulk relationship ingestion similarly checks only the candidate
+retirement keys in its writer transaction. Maintenance makes directory progress
+one page at a time; idle ready owners avoid acquiring the apply lock. Endpoint
+deletion records a durable cleanup job instead of enumerating all incoming
+relationships in the foreground. Each cleanup command advances at most one migration page, then processes at most 256
 relationship retirements and completed endpoint jobs in total, or 256 KiB of
 directory and job-key data (one oversized record may form its own page). Empty
 endpoint jobs share a page instead of requiring separate replicated commands.
@@ -67,9 +72,15 @@ automatically; callers using
 the movable `DB.open` form must call `startResidentBackgroundWorkersIfNeeded`
 after installing the DB at its final address to enable resident maintenance.
 Explicit worker suppression leaves cleanup to writes, recovery, and maintenance
-calls. Raft ownership is checked before local planning, including before the
-first applied-entry marker exists. Pending jobs survive restart and leader
-changes.
+calls. Local batch completion is shared by ordinary writes, profiled writes,
+transaction writes/resolution, and storage callback entry points. Completion
+drains endpoint jobs after the primary apply lock is released; `full_index`
+also waits for the resulting cleanup replay cut, including cleanup completed
+concurrently by a resident worker. Foreground cleanup retains the callback
+dispatcher and committed-effects observer. Replicated apply executes only its
+ordered command and leaves subsequent cleanup to the owner leader. Raft ownership is
+checked before local planning, including before the first applied-entry marker
+exists. Pending jobs survive restart and leader changes.
 
 A transactionally maintained admission count fences graph reads only for jobs
 with incident inline edges. Empty jobs do not interrupt unrelated traversals.
