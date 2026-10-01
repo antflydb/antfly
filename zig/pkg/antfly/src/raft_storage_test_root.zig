@@ -7,6 +7,7 @@
 //     https://www.antfly.io/licensing/ELv2-license
 
 const std = @import("std");
+pub const antfly_sources = @import("source_owner_physical.zig");
 const native_snapshot = @import("raft/storage/native_snapshot.zig");
 const file_snapshot_store = @import("raft/storage/file_snapshot_store.zig");
 
