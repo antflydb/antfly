@@ -14436,6 +14436,9 @@ test "httpx lookup revalidates missing catalog bindings across restore" {
 
         fn catalog(ptr: *anyopaque, alloc: std.mem.Allocator, _: operation_contract.RequestContext, call: system_catalog.Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            // This fixture has no row-policy publication. The production
+            // admission path treats that absence as an unprotected table.
+            if (call == .policy_publication_status) return error.RowPolicyCatalogChanged;
             const target = switch (call) {
                 .resolve => |target| target,
                 else => return error.UnexpectedTestCall,
