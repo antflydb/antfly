@@ -4,6 +4,9 @@
 
 import importlib.util
 import json
+import os
+import shutil
+import subprocess
 import unittest
 import sys
 import tempfile
@@ -123,6 +126,14 @@ class BuildFailureEvidence(unittest.TestCase):
                 mock.patch.object(
                     measurement, "measured_build", side_effect=fake_build
                 ),
+                # This case exercises the explicit contract rollover. Host disk
+                # pressure has its own runtime trigger and must not change the
+                # mocked sequence of builds.
+                mock.patch.object(
+                    measurement.shutil,
+                    "disk_usage",
+                    return_value=mock.Mock(free=64 << 30),
+                ),
             ):
                 measurement.main()
             self.assertEqual(seen, [name for name, _ in expected])
@@ -170,6 +181,77 @@ class BuildFailureEvidence(unittest.TestCase):
         self.assertEqual(command[0], sys.executable)
         self.assertEqual(Path(command[1]).name, "run_bounded_zig_build.py")
         self.assertEqual(command[2:], ["--zig", "pinned-zig", "--", *arguments])
+
+
+class StorageCompilationDiscovery(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.zig = shutil.which(os.environ.get("ANTFLY_ZIG", "zig"))
+        if not cls.zig:
+            raise unittest.SkipTest("Zig is required for build-graph regression tests")
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.temp.cleanup)
+        cls.root = Path(cls.temp.name)
+        fixtures = cls.root / "tools/fixtures"
+        fixtures.mkdir(parents=True)
+        source = Path(__file__).parent / "fixtures"
+        shutil.copyfile(source / "storage_compilation.zig", cls.root / "build.zig")
+        shutil.copyfile(source / "build_profiles.zig", fixtures / "build_profiles.zig")
+        (cls.root / "project_build.zig").write_text(r"""
+const std = @import("std");
+pub fn create(b: *std.Build) ?void {
+    const omit = b.option([]const u8, "omit", "Omit a required consumer");
+    const target = b.standardTargetOptions(.{});
+    const files = b.addWriteFiles();
+    const root = files.add("main.zig", "pub fn main() void {}\n");
+    inline for (.{
+        "storage-owner-tests", "storage-owner-source-tests", "storage-owner-enrichment-tests",
+        "api-table-read-tests", "api-table-write-tests", "api-table-write-lifecycle-tests", "data-runtime-tests",
+    }) |name| {
+        if (omit == null or !std.mem.eql(u8, omit.?, name)) {
+            const exe = b.addExecutable(.{ .name = name, .root_module = b.createModule(.{
+                .root_source_file = root, .target = target, .optimize = .Debug,
+            }) });
+            b.step(name, name).dependOn(&exe.step);
+        }
+    }
+    // Any accidental inclusion of another owner fixture fails compilation.
+    const unrelated = b.addExecutable(.{
+        .name = "storage-owner-handoff-reopen-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = files.add("unrelated.zig", "comptime { @compileError(\"unrelated owner fixture compiled\"); }"),
+            .target = target, .optimize = .Debug,
+        }),
+    });
+    b.step("unrelated", "unrelated").dependOn(&unrelated.step);
+    inline for (.{ "cli", "distributed", "storage_kernel", "enrichment_compute", "serverless", "inference", "api_kernel" }) |unit| {
+        _ = b.step("runtime-unit-" ++ unit, unit);
+    }
+    return {};
+}
+""")
+
+    def build(self, *args):
+        return subprocess.run(
+            [self.zig, "build", "check-storage-compilation", "-j2", *args],
+            cwd=self.root,
+            text=True,
+            capture_output=True,
+            timeout=120,
+        )
+
+    def test_extra_owner_fixture_does_not_expand_audit(self):
+        result = self.build()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_missing_required_artifact_reports_its_identity(self):
+        for name in ("storage-owner-source-tests", "api-table-read-tests"):
+            with self.subTest(name=name):
+                result = self.build(f"-Domit={name}")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    f"missing audited storage test artifact: {name}", result.stderr
+                )
 
 
 if __name__ == "__main__":

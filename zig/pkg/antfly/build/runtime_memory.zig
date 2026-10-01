@@ -45,13 +45,27 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
     if (profile.host.os.tag == .linux and profile.host.cpu.arch == .x86_64 and
         target.os.tag == .linux and target.cpu.arch == .x86_64 and target.abi == .gnu and
         target.cpu.model == baseline_cpu.model and target.cpu.features.eql(baseline_cpu.features) and
-        profile.optimize == .ReleaseFast and profile.strip and profile.cpu_inference and !profile.sanitize_thread)
+        (profile.optimize == .ReleaseFast or profile.optimize == .ReleaseSafe) and
+        profile.strip and profile.cpu_inference and !profile.sanitize_thread)
     {
         // Cold Zig 0.16 x86_64 Linux CPU ReleaseFast, stripped, with empty
         // local/global caches. See COMPILATION.md for measurements and the
         // matched 22 GiB scheduler experiment. Preserve headroom above peaks;
         // storage and inference must be able to overlap on a normal runner.
-        const gib: usize = switch (unit) {
+        // Run 36903575966 also measured this exact ReleaseSafe profile.
+        // Its archives compiled successfully but conservative admission
+        // serialized the build until the E2E job's 90-minute deadline.
+        // Retain margins above rounded Zig MaxRSS and allow the two largest
+        // units to overlap within the existing 22 GiB aggregate budget.
+        const gib: usize = if (profile.optimize == .ReleaseSafe) switch (unit) {
+            .api_kernel => 7,
+            .distributed => 8,
+            .storage_kernel => 12,
+            .enrichment_compute => 3,
+            .serverless => 5,
+            .inference => 8,
+            .cli => 3,
+        } else switch (unit) {
             .api_kernel => 5,
             .distributed => 5,
             .storage_kernel => 8,
@@ -124,7 +138,7 @@ test "measured release reservations admit storage with inference and preserve un
         var profile = measured;
         profile.host = macos;
         try std.testing.expectEqual(runtimeCompileMaxRss(unit, conservative), runtimeCompileMaxRss(unit, profile));
-        inline for (.{ .Debug, .ReleaseSafe, .ReleaseSmall }) |mode| {
+        inline for (.{ .Debug, .ReleaseSmall }) |mode| {
             profile = measured;
             profile.optimize = mode;
             try std.testing.expectEqual(runtimeCompileMaxRss(unit, conservative), runtimeCompileMaxRss(unit, profile));
@@ -150,4 +164,26 @@ test "measured release reservations admit storage with inference and preserve un
             try std.testing.expectEqual(runtimeCompileMaxRss(unit, fallback), runtimeCompileMaxRss(unit, profile));
         }
     }
+}
+
+test "measured ReleaseSafe CPU archives overlap within the E2E runner budget" {
+    const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .cpu_model = .baseline, .os_tag = .linux, .abi = .gnu });
+    const measured: CompileMemoryProfile = .{ .host = linux, .target = linux, .optimize = .ReleaseSafe, .strip = true, .cpu_inference = true };
+    const gib = 1024 * 1024 * 1024;
+    // Zig's summary rounds MaxRSS. Add a whole GiB to each reported peak
+    // before requiring headroom, rather than treating 8G as an exact sample.
+    const peak_upper_bounds = [_]usize{ 5, 6, 9, 2, 4, 6, 2 };
+    for (std.meta.tags(RuntimeLibraryUnit), peak_upper_bounds) |unit, upper| {
+        try std.testing.expect(runtimeCompileMaxRss(unit, measured) > upper * gib);
+        var fallback = measured;
+        fallback.cpu_inference = false;
+        try std.testing.expect(runtimeCompileMaxRss(unit, measured) <= runtimeCompileMaxRss(unit, fallback));
+        var unstripped = measured;
+        unstripped.strip = false;
+        try std.testing.expectEqual(runtimeCompileMaxRss(unit, fallback), runtimeCompileMaxRss(unit, unstripped));
+        var sanitized = measured;
+        sanitized.sanitize_thread = true;
+        try std.testing.expectEqual(runtimeCompileMaxRss(unit, fallback), runtimeCompileMaxRss(unit, sanitized));
+    }
+    try std.testing.expect(runtimeCompileMaxRss(.storage_kernel, measured) + runtimeCompileMaxRss(.inference, measured) <= 22 * gib);
 }

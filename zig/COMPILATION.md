@@ -226,7 +226,8 @@ the source-mutation matrix does not prove independence for every leaf file.
 
 These per-archive reservations, adopted from that measurement, apply only to
 native x86_64 Linux hosts building baseline x86_64 GNU, stripped ReleaseFast,
-with CPU inference and no thread sanitizer; other profiles keep their
+with CPU inference and no thread sanitizer. The same target/backend fences
+also admit the ReleaseSafe profile measured below; other profiles keep their
 previous claims.
 
 | Runtime archive | Largest sampled compiler RSS across the pair | New claim |
@@ -238,6 +239,28 @@ previous claims.
 | Serverless | 2.65 GiB | 4 GiB |
 | CLI | 1.25 GiB | 2 GiB |
 | Enrichment | 0.80 GiB | 2 GiB |
+
+The [2026-10-01 full E2E build](https://github.com/antflydb/antfly/actions/runs/36903575966/job/110509376054)
+completed all 35 build steps in stripped ReleaseSafe just as the 90-minute
+job deadline expired, preventing artifact upload. Its rounded Zig MaxRSS
+summaries support these separate admission reservations:
+
+| Runtime archive | Reported MaxRSS | ReleaseSafe claim |
+| --- | ---: | ---: |
+| Storage | 8G | 12 GiB |
+| Inference | 5G | 8 GiB |
+| Distributed | 5G | 8 GiB |
+| API | 4G | 7 GiB |
+| Serverless | 3G | 5 GiB |
+| CLI | 1G | 3 GiB |
+| Enrichment | 1G | 3 GiB |
+
+These are scheduler reservations, not process memory limits. Each leaves
+headroom above the rounded observation. Storage and inference now fit together
+inside the existing 22 GiB aggregate budget, whereas the previous 20/16 GiB
+claims serialized them. This removes that admission bottleneck without
+increasing runner size or the deadline; a matched CI rerun must establish the
+resulting wall time.
 
 ### C API composition
 
