@@ -1,12 +1,12 @@
-# Audio E2E
+# Audio corpus integration runners
 
-This directory documents opt-in end-to-end harnesses for broader upstream audio
+This directory documents opt-in integration harnesses for broader upstream audio
 corpora. These are not part of the checked-in codec corpus contract under
 `lib/audio/testdata/`; they are a wider pure-Zig regression sweep.
 
 Current harness:
 
-- [`../audio_xiph_corpora_e2e.zig`](../audio_xiph_corpora_e2e.zig)
+- [`../audio_xiph_corpora_runner.zig`](../audio_xiph_corpora_runner.zig)
   - clones or reuses upstream sources for:
     - `xiph/vorbis`
     - `xiph/opus`
@@ -37,7 +37,7 @@ Current harness:
     add checked external `.ogg`/`.oga`/`.opus` fixture files to the recursive
     sweep
 
-- [`../audio_misc_corpora_e2e.zig`](../audio_misc_corpora_e2e.zig)
+- [`../audio_misc_corpora_runner.zig`](../audio_misc_corpora_runner.zig)
   - fetches or reuses external non-Xiph audio samples for:
     - `lieff/minimp3` public `.bit`/`.pcm` vector pairs
     - public AAC and MP4/M4A sample assets
@@ -62,19 +62,19 @@ The target fetches missing corpora and reuses cached fixtures. Add
 Quick local status:
 
 ```sh
-zig run lib/audio/audio_xiph_corpora_e2e.zig -- status /tmp/audio-xiph-corpora
+zig run lib/audio/audio_xiph_corpora_runner.zig -- status /tmp/audio-xiph-corpora
 ```
 
 Optional explicit cache preparation:
 
 ```sh
-zig run lib/audio/audio_xiph_corpora_e2e.zig -- fetch /tmp/audio-xiph-corpora
+zig run lib/audio/audio_xiph_corpora_runner.zig -- fetch /tmp/audio-xiph-corpora
 ```
 
 Run the broad sweep:
 
 ```sh
-zig run lib/audio/audio_xiph_corpora_e2e.zig -- run /tmp/audio-xiph-corpora
+zig run lib/audio/audio_xiph_corpora_runner.zig -- run /tmp/audio-xiph-corpora
 ```
 
 Current clean summary:
@@ -87,5 +87,5 @@ Misc MP3/AAC/MP4: success=12 expected_unsupported=0 unsupported=0 decode_failed=
 Single-file probe:
 
 ```sh
-zig run lib/audio/audio_xiph_corpora_e2e.zig -- probe-one /tmp/audio-xiph-corpora vorbis/test/whatever.ogg
+zig run lib/audio/audio_xiph_corpora_runner.zig -- probe-one /tmp/audio-xiph-corpora vorbis/test/whatever.ogg
 ```

@@ -45,8 +45,8 @@ pub const specs = [_]common.TestSpec{
     },
     .{
         .step_name = "test-gliner2-e2e",
-        .root_source_file = "src/finetune/test/test_gliner2_e2e.zig",
-        .description = "Run synthetic GLiNER2 full-encoder LoRA e2e tests",
+        .root_source_file = "src/finetune/test/gliner2_integration_test.zig",
+        .description = "Run synthetic GLiNER2 full-encoder LoRA integration tests",
         .imports = &.{ .antfly_platform, .build_options, .ml, .inference_internal },
         .native_link = .default,
     },

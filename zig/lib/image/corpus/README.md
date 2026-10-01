@@ -1,12 +1,12 @@
-# Image E2E
+# Image corpus integration runners
 
-This directory holds opt-in end-to-end harnesses for broad upstream image
+This directory holds opt-in integration harnesses for broad upstream image
 corpora. These are not part of the checked-in conformance contract in
 `testdata/image/`; they are a wider regression sweep.
 
 Current harness:
 
-- [`../src/image_jpeg_seed_corpora_e2e.zig`](../src/image_jpeg_seed_corpora_e2e.zig)
+- [`../src/image_jpeg_seed_corpora_runner.zig`](../src/image_jpeg_seed_corpora_runner.zig)
   - clones or reuses the official `libjpeg-turbo/seed-corpora` checkout
   - walks all `.jpg` / `.jpeg` files
   - probes each JPEG in a subprocess so decoder panics are isolated as `CRASH`
@@ -37,25 +37,25 @@ zig build image-jpeg-seed-corpora-e2e
 Quick local status:
 
 ```sh
-zig run lib/image/src/image_jpeg_seed_corpora_e2e.zig -- status /tmp/libjpeg-turbo-seed-corpora
+zig run lib/image/src/image_jpeg_seed_corpora_runner.zig -- status /tmp/libjpeg-turbo-seed-corpora
 ```
 
 Or directly:
 
 ```sh
-zig run lib/image/src/image_jpeg_seed_corpora_e2e.zig -- run /tmp/libjpeg-turbo-seed-corpora
+zig run lib/image/src/image_jpeg_seed_corpora_runner.zig -- run /tmp/libjpeg-turbo-seed-corpora
 ```
 
 Optional `djpeg` triage:
 
 ```sh
-zig run lib/image/src/image_jpeg_seed_corpora_e2e.zig -- triage-djpeg /tmp/libjpeg-turbo-seed-corpora
+zig run lib/image/src/image_jpeg_seed_corpora_runner.zig -- triage-djpeg /tmp/libjpeg-turbo-seed-corpora
 ```
 
 Optional `djpeg` pixel-parity sweep:
 
 ```sh
-zig run lib/image/src/image_jpeg_seed_corpora_e2e.zig -- triage-djpeg-parity /tmp/libjpeg-turbo-seed-corpora
+zig run lib/image/src/image_jpeg_seed_corpora_runner.zig -- triage-djpeg-parity /tmp/libjpeg-turbo-seed-corpora
 ```
 
 The `djpeg`-based commands pin the reference decoder to scalar
@@ -65,7 +65,7 @@ default DCT settings or libjpeg-turbo SIMD backend differences.
 Single-file parity inspection:
 
 ```sh
-zig run lib/image/src/image_jpeg_seed_corpora_e2e.zig -- compare-one /tmp/libjpeg-turbo-seed-corpora bugs/decompress/github_347/overflow2.jpg
+zig run lib/image/src/image_jpeg_seed_corpora_runner.zig -- compare-one /tmp/libjpeg-turbo-seed-corpora bugs/decompress/github_347/overflow2.jpg
 ```
 
 `compare-one` prints:

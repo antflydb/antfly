@@ -226,7 +226,7 @@ pub fn addConformance(b: *std.Build, options: AddConformanceOptions) AddConforma
     const image_jpeg_seed_corpora_e2e = b.addExecutable(.{
         .name = "image-jpeg-seed-corpora-e2e",
         .root_module = b.createModule(.{
-            .root_source_file = options.root.path(b, "src/image_jpeg_seed_corpora_e2e.zig"),
+            .root_source_file = options.root.path(b, "src/image_jpeg_seed_corpora_runner.zig"),
             .target = target,
             .optimize = optimize,
         }),

@@ -147,7 +147,7 @@ pub const CreateBgeResult = struct {
 pub fn createBge(ctx: Context) CreateBgeResult {
     const b = ctx.b;
     const module_options: std.Build.Module.CreateOptions = .{
-        .root_source_file = ctx.path("src/bench/bge_m3_e2e.zig"),
+        .root_source_file = ctx.path("src/bench/bge_m3_bench.zig"),
         .target = ctx.target,
         .optimize = ctx.optimize,
     };

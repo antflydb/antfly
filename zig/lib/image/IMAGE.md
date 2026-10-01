@@ -290,7 +290,7 @@ and `testimgari.jpg` from `libjpeg-turbo/testimages/`; a second subset from
 restart/progressive edge cases, including large valid overflow-regression
 seeds pinning the baseline path against DC/coefficient ranges that exceed
 signed 32-bit intermediates. The opt-in upstream sweep in
-`lib/image/e2e/README.md` runs the full `libjpeg-turbo/seed-corpora` checkout,
+`lib/image/corpus/README.md` runs the full `libjpeg-turbo/seed-corpora` checkout,
 one JPEG per subprocess so malformed seeds show up as `CRASH` instead of
 aborting the whole run.
 

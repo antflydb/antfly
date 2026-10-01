@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// End-to-end test: load real bge-small-en-v1.5 SafeTensors model through WasmCompute.
+// Model pipeline integration test: load real bge-small-en-v1.5 SafeTensors model through WasmCompute.
 //
 // Requires models/BAAI/bge-small-en-v1.5/model.safetensors to exist.
 // Run with: zig build test
@@ -74,7 +74,7 @@ fn loadSafetensorsModel(allocator: std.mem.Allocator) !struct { compute: wasm_co
     return .{ .compute = compute, .config = config };
 }
 
-test "e2e: bge-small-en-v1.5 SafeTensors forward pass" {
+test "integration: bge-small-en-v1.5 SafeTensors forward pass" {
     const allocator = std.testing.allocator;
 
     const loaded = loadSafetensorsModel(allocator) catch |err| {
@@ -134,7 +134,7 @@ test "e2e: bge-small-en-v1.5 SafeTensors forward pass" {
     try std.testing.expect(max_abs > 0.001);
 }
 
-test "e2e: bge-small-en-v1.5 forward pass seq_len=16" {
+test "integration: bge-small-en-v1.5 forward pass seq_len=16" {
     const allocator = std.testing.allocator;
 
     const loaded = loadSafetensorsModel(allocator) catch |err| {
