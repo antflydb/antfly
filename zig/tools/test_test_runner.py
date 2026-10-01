@@ -75,13 +75,23 @@ class TestRunnerSelection(unittest.TestCase):
             self.assertIn("1 skipped", result.stderr)
         result = subprocess.run(
             args + ["--list-tests", "--timeout-ms=1"],
-            text=True, capture_output=True, timeout=5,
+            text=True,
+            capture_output=True,
+            timeout=5,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("TEST\tselection.test.environment unavailable", result.stderr)
         result = subprocess.run(
-            [str(self.binary), "--test-filter", "does not exist", "--allow-empty-test-filter", "--require-no-skips"],
-            text=True, capture_output=True, timeout=5,
+            [
+                str(self.binary),
+                "--test-filter",
+                "does not exist",
+                "--allow-empty-test-filter",
+                "--require-no-skips",
+            ],
+            text=True,
+            capture_output=True,
+            timeout=5,
         )
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("matched no runnable tests", result.stderr)
@@ -89,8 +99,15 @@ class TestRunnerSelection(unittest.TestCase):
     def test_execution_budget_excludes_compilation_and_bounds_a_stuck_test(self):
         for limit, expected in ((20, 124), (5000, 0)):
             result = subprocess.run(
-                [str(self.binary), "--test-filter", "progress body", f"--timeout-ms={limit}"],
-                text=True, capture_output=True, timeout=7,
+                [
+                    str(self.binary),
+                    "--test-filter",
+                    "progress body",
+                    f"--timeout-ms={limit}",
+                ],
+                text=True,
+                capture_output=True,
+                timeout=7,
             )
             self.assertEqual(result.returncode, expected, result.stderr)
             if expected:
