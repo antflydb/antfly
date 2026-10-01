@@ -369,8 +369,9 @@ test "db identity namespace reassignment refreshes transaction recovery hook con
         @intFromPtr(local_ctx),
         @intFromPtr(server_recovery.test_support.runtimeConfig(db.transaction_runtime.?).local_resolution_ctx.?),
     );
-    try std.testing.expect(local_ctx.stable_owner != null);
-    try std.testing.expect(local_ctx.stable_owner.? != &db);
+    try std.testing.expect(local_ctx.execution != null);
+    try std.testing.expect(local_ctx.execution.?.core == db.core);
+    try std.testing.expect(local_ctx.execution.?.local_execution == db.local_execution);
 
     try db.reassignIdentityNamespaceForInternalTransition(new_namespace);
     try std.testing.expect(db.core.identity_namespace.eql(new_namespace));
@@ -1457,7 +1458,7 @@ test "db transaction recovery shares serving visibility and invalidates query ca
     });
     defer db.close();
     try engine.test_support.prepareTransactionRecoveryOwner(engine.test_support.dbPointer(&db));
-    const recovery = db.transaction_recovery_local_context.?.stable_owner.?;
+    const recovery = db.transaction_recovery_local_context.?.execution.?;
     try std.testing.expect(&db.core.identity_visibility == &recovery.core.identity_visibility);
     try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }} });
     try std.testing.expect(try engine.test_support.allDocsVisibleSummaryFast(engine.test_support.dbPointer(&db), null));
@@ -1509,20 +1510,20 @@ test "db transaction recovery borrows replacement enrichment only during resolut
     defer db.close();
     try db.addIndex(.{ .name = "ft_recovery", .kind = .full_text, .config_json = "{}" });
     try engine.test_support.prepareTransactionRecoveryOwner(engine.test_support.dbPointer(&db));
-    const recovery = db.transaction_recovery_local_context.?.stable_owner.?;
-    try std.testing.expect(recovery.enrichment_runtime == null);
+    const recovery = db.transaction_recovery_local_context.?.execution.?;
+    try std.testing.expectEqual(db.enrichment_runtime, recovery.async_context.enrichment_runtime);
     const original = db.enrichment_runtime.?;
     var replacement = embedder_mod.DeterministicDenseEmbedder{};
     try db.reconfigureEnrichmentRuntimePaused(.{ .dense_embedder = replacement.interface() });
     try std.testing.expect(db.enrichment_runtime.? != original);
-    try std.testing.expect(recovery.enrichment_runtime == null);
+    try std.testing.expectEqual(db.enrichment_runtime, recovery.async_context.enrichment_runtime);
     const config = server_recovery.test_support.runtimeConfig(db.transaction_runtime.?);
     const txn_id = try db.beginTransaction(1_000);
     try db.writeTransaction(txn_id, .{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"recovered\"}" }},
     });
     try config.resolve_local_fn.?(config.local_resolution_ctx.?, txn_id, .committed, 2_000);
-    try std.testing.expect(recovery.enrichment_runtime == null);
+    try std.testing.expectEqual(db.enrichment_runtime, recovery.async_context.enrichment_runtime);
     const sequence = db.core.nextDerivedSequence();
     try std.testing.expect(sequence > 0);
     try std.testing.expectEqual(sequence, db.enrichment_runtime.?.stats().target_sequence);
@@ -1541,7 +1542,7 @@ test "db transaction recovery borrows replacement enrichment only during resolut
     const deleted = try db.beginTransaction(3_000);
     try db.writeTransaction(deleted, .{ .deletes = &.{"doc:a"} });
     try config.resolve_local_fn.?(config.local_resolution_ctx.?, deleted, .committed, 4_000);
-    try std.testing.expect(recovery.enrichment_runtime == null);
+    try std.testing.expectEqual(db.enrichment_runtime, recovery.async_context.enrichment_runtime);
 }
 
 test "db transaction recovery provider guard survives failed enrichment replacement" {
@@ -1584,19 +1585,19 @@ test "db transaction recovery provider guard survives failed enrichment replacem
     try std.testing.expectEqual(original, db.enrichment_runtime.?);
     try std.testing.expect(recovery.provider_mutex.tryLock());
     recovery.provider_mutex.unlock(db.backend_runtime.io().?);
-    try std.testing.expect(recovery.stable_owner.?.enrichment_runtime == null);
+    try std.testing.expectEqual(db.enrichment_runtime, recovery.execution.?.async_context.enrichment_runtime);
     const config = server_recovery.test_support.runtimeConfig(db.transaction_runtime.?);
     const txn_id = try db.beginTransaction(1_000);
     try db.writeTransaction(txn_id, .{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"after failure\"}" }},
     });
     try config.resolve_local_fn.?(config.local_resolution_ctx.?, txn_id, .committed, 2_000);
-    try std.testing.expect(recovery.stable_owner.?.enrichment_runtime == null);
+    try std.testing.expectEqual(db.enrichment_runtime, recovery.execution.?.async_context.enrichment_runtime);
     try std.testing.expect(recovery.provider_mutex.tryLock());
     recovery.provider_mutex.unlock(db.backend_runtime.io().?);
 }
 
-test "db transaction recovery stable owner observes split shadow lifetime" {
+test "db transaction recovery borrowed execution observes split shadow lifetime" {
     const alloc = std.testing.allocator;
 
     var path_tmp = try TestDirectory.init("db");
@@ -1617,8 +1618,9 @@ test "db transaction recovery stable owner observes split shadow lifetime" {
     try engine.test_support.prepareTransactionRecoveryOwner(engine.test_support.dbPointer(&db));
     const recovery_ctx = db.transaction_recovery_local_context orelse
         return error.TransactionRecoveryOwnerUnbound;
-    try std.testing.expect(recovery_ctx.stable_owner != null);
-    try std.testing.expect(recovery_ctx.stable_owner.?.shadow == null);
+    try std.testing.expect(recovery_ctx.execution != null);
+    var recovery_view = engine.test_support.transactionRecoveryExecutionView(&db);
+    try std.testing.expect(activeSplitShadow(&recovery_view) == null);
 
     try db.addIndex(.{
         .name = "ft_split_recovery",
@@ -1628,14 +1630,14 @@ test "db transaction recovery stable owner observes split shadow lifetime" {
     try db.createShadowIndexManager("doc:m", "");
     try std.testing.expect(recovery_ctx.split_shadow != null);
     try std.testing.expect(recovery_ctx.split_shadow.?.manager == db.shadow.?.manager);
-    try std.testing.expect(activeSplitShadow(recovery_ctx.stable_owner.?) == db.shadow.?);
+    try std.testing.expect(activeSplitShadow(&recovery_view) == db.shadow.?);
     // Ticket counters and synchronization must have one address even though
-    // the recovery wrapper was captured before the split began.
-    try std.testing.expect(&activeSplitShadow(recovery_ctx.stable_owner.?).?.next_ticket == &db.shadow.?.next_ticket);
+    // the execution view was captured before the split began.
+    try std.testing.expect(&activeSplitShadow(&recovery_view).?.next_ticket == &db.shadow.?.next_ticket);
 
     try db.closeShadowIndexManager();
     try std.testing.expect(recovery_ctx.split_shadow == null);
-    try std.testing.expect(activeSplitShadow(recovery_ctx.stable_owner.?) == null);
+    try std.testing.expect(activeSplitShadow(&recovery_view) == null);
 }
 
 test "db merge receiver fences stale copies and retains retired transitions across reopen" {
@@ -2410,8 +2412,8 @@ test "db ordered artifact inventory producer baseline resumes and includes behin
         };
         var capture: Capture = .{};
         defer if (capture.command) |bytes| alloc.free(bytes);
-        db.artifact_publication_dispatcher = .{ .ptr = &capture, .enqueue = Capture.enqueue };
-        defer db.artifact_publication_dispatcher = null;
+        db.local_execution.artifact_publication_dispatcher = .{ .ptr = &capture, .enqueue = Capture.enqueue };
+        defer db.local_execution.artifact_publication_dispatcher = null;
         try std.testing.expectError(error.ResourceBudgetExceeded, db.advanceArtifactProducerBaselinePage());
         capture.refuse = false;
         // Enqueue owns the serialized page after preparation releases its
@@ -2988,8 +2990,8 @@ fn testAcceptedArtifactUpload(inject_missing_counter: bool) !void {
             }
         };
         var capture: Capture = .{};
-        db.artifact_publication_dispatcher = .{ .ptr = &capture, .enqueue = Capture.enqueue };
-        defer db.artifact_publication_dispatcher = null;
+        db.local_execution.artifact_publication_dispatcher = .{ .ptr = &capture, .enqueue = Capture.enqueue };
+        defer db.local_execution.artifact_publication_dispatcher = null;
         try std.testing.expectError(error.ResourceLimitExceeded, db.advanceArtifactUploadRecovery());
         try std.testing.expectEqual(@as(u64, 0), db.artifact_upload_recovery_cursor.load(.acquire));
         capture.refused = false;
@@ -3976,11 +3978,11 @@ test "relational index system online admission defers during index structural mu
         .copy_attempt = .{ .donor_term = 2, .sequence = 1 },
     };
     const command: types.BatchRequest = .{ .online_source = .{ .admit = .{ .scope = scope } } };
-    try std.testing.expect(db.index_structural_mutation_mutex.tryLock());
+    try std.testing.expect(db.local_execution.index_structural_mutation_mutex.tryLock());
     var held = true;
-    defer if (held) db.index_structural_mutation_mutex.unlock();
+    defer if (held) db.local_execution.index_structural_mutation_mutex.unlock();
     try std.testing.expectError(error.StorageBusy, server_test_adapter.applyOrdered(&db, command, .{ .term = 2, .index = 1 }));
-    db.index_structural_mutation_mutex.unlock();
+    db.local_execution.index_structural_mutation_mutex.unlock();
     held = false;
     try std.testing.expect((try db.orderedApplyReceipt()) == null);
     {
@@ -4038,4 +4040,46 @@ test "db transaction batched acknowledgement migration preserves legacy replay a
     const complete = try db.getUnresolvedTransactionParticipants(alloc, txn);
     defer transactions_mod.freeParticipantList(alloc, complete);
     try std.testing.expectEqual(@as(usize, 0), complete.len);
+}
+
+test "db transaction recovery observes admission replacement after execution binding" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("db");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, std.mem.span(directory.path().ptr), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .transaction_recovery = .{ .enabled = true },
+    });
+    defer db.close();
+    try engine.test_support.prepareTransactionRecoveryOwner(&db);
+    const txn_id = try db.beginTransaction(1_000);
+    try db.writeTransaction(txn_id, .{
+        .writes = &.{.{ .key = "doc:guarded", .value = "{\"title\":\"recovered\"}" }},
+    });
+    const Gate = struct {
+        blocked: bool = true,
+        calls: usize = 0,
+        fn check(ptr: *const anyopaque) !void {
+            const gate: *@This() = @constCast(@as(*const @This(), @ptrCast(@alignCast(ptr))));
+            gate.calls += 1;
+            if (gate.blocked) return error.TestRecoveryAdmissionClosed;
+        }
+    };
+    var gate: Gate = .{};
+    // Rebinding occurs after recovery has retained its execution capabilities.
+    db.local_execution.replication_write_gate = .{ .primary = .{ .ptr = &gate, .check_fn = Gate.check } };
+    const context = db.transaction_runtime.?.local.?.config;
+    try std.testing.expectError(error.TestRecoveryAdmissionClosed, context.resolve_local_fn.?(context.local_resolution_ctx.?, txn_id, .committed, 2_000));
+    try std.testing.expectEqual(@as(usize, 1), gate.calls);
+    var intents = try db.core.collectTransactionIntentBatch(alloc, txn_id);
+    defer intents.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), intents.writes.len);
+    gate.blocked = false;
+    // Exercise the normal bound resolver, not a hand-constructed test view.
+    try context.resolve_local_fn.?(context.local_resolution_ctx.?, txn_id, .committed, 2_000);
+    const value = (try db.get(alloc, "doc:guarded")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("{\"title\":\"recovered\"}", value);
+    try std.testing.expect(gate.calls > 1);
 }

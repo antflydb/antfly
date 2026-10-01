@@ -500,7 +500,7 @@ fn verifyOpenedReplicaRowPolicy(
     };
     if (expected) |program| {
         if (db.core.table_catalog.row_policy_phase != .active) return error.SeedReplicaPolicyMismatch;
-        const installed = if (db.row_policy_bundle) |*bundle| bundle else return error.SeedReplicaPolicyMismatch;
+        const installed = if (db.local_execution.row_policy_bundle) |*bundle| bundle else return error.SeedReplicaPolicyMismatch;
         if (!(try policyInstallSnapshotsEqual(alloc, installed.parsed.value, program.*))) return error.SeedReplicaPolicyMismatch;
     } else if (db.core.table_catalog.row_policy_phase != .disabled) {
         return error.SeedReplicaPolicyMismatch;

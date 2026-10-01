@@ -3295,9 +3295,9 @@ pub fn storageOwnerOpen(
         .storage_owner_target_observer = request.target_observer,
     };
     defer if (!success) handle.db.close();
-    handle.db.row_policy_authority_secret = owned_policy_secret;
-    handle.db.row_policy_authority_issuer = owned_policy_issuer;
-    handle.db.row_policy_table_name = owned_table_name;
+    handle.db.local_execution.row_policy_authority_secret = owned_policy_secret;
+    handle.db.local_execution.row_policy_authority_issuer = owned_policy_issuer;
+    handle.db.local_execution.row_policy_table_name = owned_table_name;
     if (runtime_hooks) |hooks| handle.db.setCoordinatedTtl(hooks.coordinatedTtlPort(), request.group_id);
     if (request.target_observer.notify != null) handle.db.setQueryVisibilityHook(.{
         .ptr = handle,

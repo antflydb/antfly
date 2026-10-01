@@ -93,7 +93,7 @@ pub fn executeJson(db: *DB, alloc: Allocator, request: wire.Request, cancellatio
         .artifact => |operation| @import("source_artifact_transfer.zig").executeJson(db, alloc, operation, cancellation),
         .revoke => std.json.Stringify.valueAlloc(alloc, wire.Prepared{ .scope = request.scope, .request = .{ .relational_topology = .{ .fence = request.scope.fence, .action = .abort_transition } } }, .{}),
         .publication => blk: {
-            const certificate = try db.source_publication.poll(db, request.scope, cancellation);
+            const certificate = try db.local_execution.source_publication.poll(db, request.scope, cancellation);
             break :blk std.json.Stringify.valueAlloc(alloc, certificate, .{});
         },
     };
@@ -101,7 +101,7 @@ pub fn executeJson(db: *DB, alloc: Allocator, request: wire.Request, cancellatio
 
 fn rewriteTailJson(db: *DB, alloc: Allocator, scope: source.Scope, after: u64, offset: u32, max_bytes: u32, cancellation: types.CancellationToken) ![]u8 {
     const io = db.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
-    const cache = &db.online_merge_reader;
+    const cache = &db.local_execution.online_merge_reader;
     try cache.mutex.lock(io);
     defer cache.mutex.unlock(io);
     try cancellation.check();
@@ -806,7 +806,7 @@ pub fn requireAdmissibleSourceAtCommitAssumeApply(db: *DB, alloc: Allocator) !vo
 fn rowDerivedTransferIndexesAssumeApply(db: *DB, alloc: Allocator, coordinated: bool) !bool {
     // Protocol support alone does not prove that this owner's backend can
     // produce and retain the immutable native source pin.
-    if (db.backend_runtime.filesystemIo() == null or db.physical_root_mode != .filesystem_managed or db.source_vectors.load(.acquire) != null) return false;
+    if (db.backend_runtime.filesystemIo() == null or db.physical_root_mode != .filesystem_managed or db.local_execution.source_vectors.load(.acquire) != null) return false;
     switch (db.core.primary_store_owner) {
         .lsm => |owner| {
             const backend = owner.handle.backend;
@@ -951,7 +951,7 @@ fn encodePrepared(alloc: Allocator, scope: source.Scope, request: ?types.BatchRe
 
 fn prepareTailJson(db: *DB, alloc: Allocator, scope: source.Scope, receipt: pages.Progress, cancellation: types.CancellationToken) ![]u8 {
     const io = db.backend_runtime.io() orelse return error.BackendRuntimeIoUnavailable;
-    const cache = &db.online_merge_reader;
+    const cache = &db.local_execution.online_merge_reader;
     try cache.mutex.lock(io);
     defer cache.mutex.unlock(io);
     // No apply fence is held while taking the cache lock. Revalidate after

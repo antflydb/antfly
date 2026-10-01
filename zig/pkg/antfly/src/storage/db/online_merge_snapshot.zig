@@ -140,7 +140,7 @@ fn number(comptime T: type, reader: *verifier.ObjectReader, object: u32, offset:
 pub fn executeJson(db: *DB, alloc: Allocator, scope: source.Scope, receipt: pages.Progress, certificate: Certificate, cancellation: types.CancellationToken) ![]u8 {
     try @import("online_merge_io.zig").requireSnapshotIndexes(db, alloc, receipt.source, certificate);
     const io = db.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
-    const shared = &db.online_merge_reader;
+    const shared = &db.local_execution.online_merge_reader;
     try shared.mutex.lock(io);
     defer shared.mutex.unlock(io);
     const progress = try db.onlineSourceStatus(scope);

@@ -814,8 +814,8 @@ test "ordered artifact inventory completion control verifies independent roots b
     };
     var queue: Queue = .{};
     defer if (queue.bytes) |bytes| alloc.free(bytes);
-    source.artifact_publication_dispatcher = .{ .ptr = &queue, .enqueue = Queue.enqueue };
-    defer source.artifact_publication_dispatcher = null;
+    source.local_execution.artifact_publication_dispatcher = .{ .ptr = &queue, .enqueue = Queue.enqueue };
+    defer source.local_execution.artifact_publication_dispatcher = null;
     source.artifact_producer_work_retry_after_ns.store(0, .release);
     _ = try source.advanceArtifactProducerWorkPage();
     var decoded = try @import("artifact_publication_transport_codec.zig").decodeBorrowed(alloc, queue.bytes orelse return error.TestUnexpectedResult);

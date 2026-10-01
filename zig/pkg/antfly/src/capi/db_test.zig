@@ -1229,7 +1229,7 @@ test "storage owner runtime status distinguishes absent and busy source vectors"
         defer unregisterTestHandle(handle_id);
         handle.db.backend_runtime.durable_jobs.drainOwner(handle.db.repair_cleanup_owner_id);
         var response: kernel_owner_abi.OwnedBytes = .{};
-        if (handle.db.source_vectors.load(.acquire)) |source| {
+        if (handle.db.local_execution.source_vectors.load(.acquire)) |source| {
             // Holding the mutex on this thread makes both the missing-field
             // bug and any blocking-lock replacement deterministic.
             while (!source.mutex.tryLock()) antfly.platform_time.yieldBriefly();
@@ -1444,7 +1444,7 @@ test "Lite raw rows fail closed during row-policy owner transition" {
     {
         const guard = enterHandle(handle_ptr, .exclusive) orelse return error.TestUnexpectedResult;
         defer guard.leave();
-        try guard.handle.db.row_policy_gate.beginPreparing(.disabled);
+        try guard.handle.db.local_execution.row_policy_gate.beginPreparing(.disabled);
     }
 
     var out: capi.Buffer = .{};

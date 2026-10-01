@@ -125,20 +125,20 @@ test "relational index system source publication job survives polling deadlines 
         scope = .{ .fence = .{ .admission_epoch = identity.next_epoch, .transition_id = 7, .attempt = 1, .owner_group_id = 2, .peer_group_id = 3, .role = .merge_source, .namespace = identity.namespace, .catalog_digest = identity.catalog_digest }, .receiver_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .consumer_epoch = 1, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } };
         try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 });
         var gate: Gate = .{};
-        db.source_publication.test_gate = &gate;
-        try std.testing.expect(try db.source_publication.poll(db, scope, .none) == null);
+        db.local_execution.source_publication.test_gate = &gate;
+        try std.testing.expect(try db.local_execution.source_publication.poll(db, scope, .none) == null);
         try gate.entered.wait(io);
-        const task = db.source_publication.future.?.any_future;
-        for (0..3) |_| try std.testing.expect(try db.source_publication.poll(db, scope, .none) == null);
+        const task = db.local_execution.source_publication.future.?.any_future;
+        for (0..3) |_| try std.testing.expect(try db.local_execution.source_publication.poll(db, scope, .none) == null);
         const canceled: std.atomic.Value(bool) = .init(true);
-        try std.testing.expectError(error.Canceled, db.source_publication.poll(db, scope, Cancellation.fromAtomic(&canceled)));
-        try std.testing.expect(!db.source_publication.completed.isSet());
-        try std.testing.expect(task == db.source_publication.future.?.any_future);
+        try std.testing.expectError(error.Canceled, db.local_execution.source_publication.poll(db, scope, Cancellation.fromAtomic(&canceled)));
+        try std.testing.expect(!db.local_execution.source_publication.completed.isSet());
+        try std.testing.expect(task == db.local_execution.source_publication.future.?.any_future);
         gate.proceed.set(io);
-        try db.source_publication.completed.wait(io);
-        certificate = (try db.source_publication.poll(db, scope, .none)).?;
+        try db.local_execution.source_publication.completed.wait(io);
+        certificate = (try db.local_execution.source_publication.poll(db, scope, .none)).?;
         try std.testing.expectEqual(@as(u64, 1), certificate.cut.applied_index);
-        try std.testing.expect(certificate.eql((try db.source_publication.poll(db, scope, .none)).?));
+        try std.testing.expect(certificate.eql((try db.local_execution.source_publication.poll(db, scope, .none)).?));
     }
     {
         const db = try DB.openOwned(alloc, path, options);
@@ -146,15 +146,15 @@ test "relational index system source publication job survives polling deadlines 
         defer if (open) db.closeOwned();
         // Restart discovers the durable completed receipt without scheduling
         // another exporter or recapturing the live primary.
-        try std.testing.expect(certificate.eql((try db.source_publication.poll(db, scope, .none)).?));
-        try std.testing.expect(db.source_publication.future == null);
+        try std.testing.expect(certificate.eql((try db.local_execution.source_publication.poll(db, scope, .none)).?));
+        try std.testing.expect(db.local_execution.source_publication.future == null);
         scope.consumer_epoch = 2;
         scope.fence.transition_id = 8;
         scope.copy_attempt.sequence = 2;
         try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 2 });
         var gate: Gate = .{};
-        db.source_publication.test_gate = &gate;
-        try std.testing.expect(try db.source_publication.poll(db, scope, .none) == null);
+        db.local_execution.source_publication.test_gate = &gate;
+        try std.testing.expect(try db.local_execution.source_publication.poll(db, scope, .none) == null);
         try gate.entered.wait(io);
         // Gate remains closed. Teardown must cancel the independent I/O task
         // and join it before releasing its DB, allocator, or filesystem.
@@ -164,9 +164,9 @@ test "relational index system source publication job survives polling deadlines 
     {
         const db = try DB.openOwned(alloc, path, options);
         defer db.closeOwned();
-        try std.testing.expect(try db.source_publication.poll(db, scope, .none) == null);
-        try db.source_publication.completed.wait(io);
-        const retried = (try db.source_publication.poll(db, scope, .none)).?;
+        try std.testing.expect(try db.local_execution.source_publication.poll(db, scope, .none) == null);
+        try db.local_execution.source_publication.completed.wait(io);
+        const retried = (try db.local_execution.source_publication.poll(db, scope, .none)).?;
         try std.testing.expectEqual(@as(u64, 2), retried.cut.applied_index);
         const old_scope = scope;
         scope.consumer_epoch = 3;
@@ -174,18 +174,18 @@ test "relational index system source publication job survives polling deadlines 
         scope.copy_attempt.sequence = 3;
         try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 3 });
         var gate: Gate = .{};
-        db.source_publication.test_gate = &gate;
-        try std.testing.expect(try db.source_publication.poll(db, scope, .none) == null);
+        db.local_execution.source_publication.test_gate = &gate;
+        try std.testing.expect(try db.local_execution.source_publication.poll(db, scope, .none) == null);
         try gate.entered.wait(io);
-        db.source_publication.cancelScope(io, old_scope);
-        try std.testing.expect(!db.source_publication.canceled.load(.acquire));
+        db.local_execution.source_publication.cancelScope(io, old_scope);
+        try std.testing.expect(!db.local_execution.source_publication.canceled.load(.acquire));
         // Replicated release signals only the matching exporter. It returns
         // without opening its gate or joining the job; the worker observes
         // the cancellation independently and relinquishes its pin resources.
         try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .release = scope } }, .{ .term = 1, .index = 4 });
-        try std.testing.expect(db.source_publication.canceled.load(.acquire));
-        try db.source_publication.completed.wait(io);
-        try std.testing.expectEqual(error.Canceled, db.source_publication.failure.?);
+        try std.testing.expect(db.local_execution.source_publication.canceled.load(.acquire));
+        try db.local_execution.source_publication.completed.wait(io);
+        try std.testing.expectEqual(error.Canceled, db.local_execution.source_publication.failure.?);
         try std.testing.expectEqual(@import("online_source.zig").Phase.released, (try db.onlineSourceStatus(scope)).phase);
     }
 }

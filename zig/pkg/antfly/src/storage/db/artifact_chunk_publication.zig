@@ -1944,7 +1944,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
         };
         var dispatched = CaptureDispatch{};
         defer if (dispatched.encoded) |bytes| alloc.free(bytes);
-        db.artifact_publication_dispatcher = .{ .ptr = &dispatched, .enqueue = CaptureDispatch.enqueue };
+        db.local_execution.artifact_publication_dispatcher = .{ .ptr = &dispatched, .enqueue = CaptureDispatch.enqueue };
         try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
         const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
         const before_worker = blk: {
