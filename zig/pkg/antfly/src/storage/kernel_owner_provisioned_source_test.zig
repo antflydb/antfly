@@ -1274,6 +1274,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     defer edges_response.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), edges_response.edges.len);
     try std.testing.expectEqualStrings("doc:b", edges_response.edges[0].target);
+    try std.testing.expect(edges_response.scanned_rows >= edges_response.edges.len);
 
     var manifest = (try read_source.source().documentArtifactManifest(
         alloc,

@@ -267,7 +267,7 @@ pub fn HandleRegistryOf(comptime T: type) type {
         const max_chunks = max_slots / chunk_len;
         /// Handle values are 8-byte aligned offsets into the reservation.
         const stride_shift = 3;
-        const reserve_address_space = @bitSizeOf(usize) == 64 and switch (builtin.os.tag) {
+        pub const reserve_address_space = @bitSizeOf(usize) == 64 and switch (builtin.os.tag) {
             .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly, .ios => true,
             else => false,
         };

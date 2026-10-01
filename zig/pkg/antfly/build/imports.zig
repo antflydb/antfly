@@ -383,6 +383,7 @@ pub const AntflyRootImports = struct {
 
     pub fn configureServerless(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
         self.configureDatabase(mod, link_libc);
+        self.configureServerContracts(mod);
         inline for (.{
             "inference_api", "inference_config_openapi", "middleware_openapi",
             "s3_openapi",    "scraping_openapi",         "vectorindex",

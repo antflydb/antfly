@@ -86,7 +86,7 @@ def main() -> None:
         environment = os.environ.copy()
         environment.pop("ZIG_LOCAL_CACHE_DIR", None)
         subprocess.run(
-            ["zig", "build", "lite", "embedded-capi-check", "embedded-native-module-boundary-check",
+            ["zig", "build", "lite", "capi-smoke", "embedded-capi-check", "embedded-native-module-boundary-check",
              "embedded-wasm-module-boundary-check", "wasm", "-Doptimize=Debug", "-Dmetal=false", *flags],
             cwd=stage_dir / "zig",
             env=environment,
