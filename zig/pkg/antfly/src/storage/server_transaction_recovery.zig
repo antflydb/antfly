@@ -23,7 +23,6 @@ const transactions_mod = @import("transactions.zig");
 const build_options = @import("build_options");
 const types = @import("db/types.zig");
 const ownership_mod = @import("db/ownership.zig");
-const resolution_mod = @import("db/transaction_resolution.zig");
 const platform_clock = @import("antfly_platform").clock;
 const background_runtime_mod = @import("background_runtime.zig");
 

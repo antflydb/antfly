@@ -34,7 +34,6 @@ pub const ownership = @import("ownership.zig");
 pub const generation_lifecycle = @import("generation_lifecycle.zig");
 pub const native_backup = @import("native_backup.zig");
 pub const logical_snapshot_manifest_file_name = @import("core.zig").logical_snapshot_manifest_file_name;
-pub const transaction_resolution = @import("transaction_resolution.zig");
 pub const apply_state = @import("derived/apply_state.zig");
 pub const embedder = @import("enrichment/embedder.zig");
 pub const enrichment_artifact_codec = @import("enrichment/artifact_codec.zig");
@@ -208,7 +207,6 @@ test {
     _ = docstore;
     _ = lease;
     _ = ownership;
-    _ = transaction_resolution;
     _ = apply_state;
     _ = embedder;
     _ = enrichment_artifact_codec;
