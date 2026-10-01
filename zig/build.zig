@@ -3659,7 +3659,7 @@ pub fn build(b: *std.Build) void {
     lib_preload_model_spec_test_step.dependOn(&run_lib_preload_model_spec_tests.step);
 
     const provider_default_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = lib_test_mod,
         .filters = &.{ "audio runtime", "bearer auth header cache provider defaults" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
