@@ -44199,18 +44199,38 @@ fn consumerTests() type {
             var host_sentinel: antfly.raft.ManagedHttpHostService = undefined;
             server.data_raft = &host_sentinel;
             server.data_raft_metadata_sync_requested = .init(false);
-            try server.refreshDataRaftMetadataForBatchWithBudget(source.awakeNs() + std.time.ns_per_s, null);
+            // `refreshDataRaftMetadataForBatchWithBudget` builds its own
+            // routing clock from `self.dataRaftIo()`, which is null here
+            // (backend_runtime is never set in this test) and so checks the
+            // deadline against `platform_time.monotonicNs()` -- a different
+            // clock, on a different epoch, than `source.io`'s "awake" clock
+            // that `source.awakeNs()` reads. A deadline computed from one
+            // and checked against the other is not "too tight under load",
+            // it is simply wrong on every run; only widening the budget
+            // happened to mask it when the two epochs started close
+            // together. This call means to test success, not timing, so
+            // give it a deadline that cannot expire under either clock
+            // instead of trying to translate between them.
+            try server.refreshDataRaftMetadataForBatchWithBudget(std.math.maxInt(u64), null);
             try std.testing.expect(server.data_raft_metadata_sync_requested.load(.acquire));
             try std.testing.expectEqual(forwarding_clone_count, source.test_faults.snapshot_result_clones);
             server.data_raft_metadata_sync_requested.store(false, .release);
             try std.testing.expectError(error.Timeout, server.refreshDataRaftMetadataForBatchWithBudget(0, null));
             var canceled_preflight: antfly.raft.transport.http_common.RequestCancellation = .{};
             canceled_preflight.cancel();
-            try std.testing.expectError(error.Cancelled, server.refreshDataRaftMetadataForBatchWithBudget(source.awakeNs() + std.time.ns_per_s, &canceled_preflight));
+            // Cancellation is checked before the deadline (RouteBudget.check),
+            // so the clock mismatch above cannot mask this assertion -- but
+            // use the same non-expiring deadline for consistency with the
+            // success case above.
+            try std.testing.expectError(error.Cancelled, server.refreshDataRaftMetadataForBatchWithBudget(std.math.maxInt(u64), &canceled_preflight));
             try std.testing.expect(!server.data_raft_metadata_sync_requested.load(.acquire));
             server.data_raft = null;
             for ([_]DataRaftMutationDiscovery{ .catalog, .cached }) |discovery| {
-                const endpoint = (try server.dataApiUriForNode(alloc, 2, .{ .discovery = discovery }, source.awakeNs() + std.time.ns_per_s)).?;
+                // Same clock mismatch as above: dataApiUriForNode ->
+                // acquireDataForwardingPeers also builds its routing clock
+                // from self.dataRaftIo() (null, backend_runtime unset), not
+                // source.io.
+                const endpoint = (try server.dataApiUriForNode(alloc, 2, .{ .discovery = discovery }, std.math.maxInt(u64))).?;
                 defer alloc.free(endpoint);
                 try std.testing.expectEqualStrings("http://new", endpoint);
                 try std.testing.expectEqual(forwarding_clone_count, source.test_faults.snapshot_result_clones);
