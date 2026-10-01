@@ -17343,7 +17343,7 @@ pub const IndexManager = struct {
 
     pub fn graphRetirementAdmissionOpen(self: *const IndexManager) bool {
         if (self.graph_retirement_closed.load(.acquire)) return false;
-        if (self.primary_store) |store| if (store.hasGraphEndpointCleanup() catch true) return false;
+        if (self.primary_store) |store| if (store.graphEndpointCleanupBlocksReads() catch true) return false;
         return true;
     }
 

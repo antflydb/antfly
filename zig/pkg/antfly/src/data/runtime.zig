@@ -6428,7 +6428,7 @@ pub const DataServer = struct {
             var status = try std.json.parseFromSlice(struct { pending: bool, graph_deletes: []const antfly.db.types.GraphEdgeDelete, deletes: []const []const u8 }, self.alloc, response.json, .{});
             defer status.deinit();
             if (status.value.pending) {
-                try self.proposeRaftBatchGroupWithLeaderWait(self.alloc, range.group_id, table.name, .{ .graph_deletes = status.value.graph_deletes, .deletes = status.value.deletes, .sync_level = .write }, .{ .discovery = .cached, .allow_remote_forward = false, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) }, 100 * std.time.ns_per_ms);
+                try self.proposeRaftBatchGroupWithLeaderWait(self.alloc, range.group_id, table.name, .{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true, .graph_deletes = status.value.graph_deletes, .deletes = status.value.deletes, .sync_level = .write }, .{ .discovery = .cached, .allow_remote_forward = false, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) }, 100 * std.time.ns_per_ms);
                 return;
             }
         }

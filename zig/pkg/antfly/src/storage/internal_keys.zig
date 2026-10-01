@@ -3484,3 +3484,11 @@ pub fn graphEndpointCleanupKeyAlloc(alloc: Allocator, endpoint: []const u8) ![]u
     const hex = std.fmt.bytesToHex(digest, .lower);
     return std.mem.concat(alloc, u8, &.{ graph_endpoint_cleanup_prefix, &hex });
 }
+
+/// Local admission summary. Missing summaries conservatively fence old queues.
+pub const graph_endpoint_cleanup_count_key = "\x00\x00__metadata__:graph_endpoint_cleanup_active_count:v1";
+pub const graph_endpoint_cleanup_ref_prefix = "\x00\x00__metadata__:graph_endpoint_cleanup_active:v1:";
+pub fn isGraphEndpointCleanupControlKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, graph_endpoint_cleanup_prefix) or
+        std.mem.startsWith(u8, key, graph_endpoint_cleanup_ref_prefix) or std.mem.eql(u8, key, graph_endpoint_cleanup_count_key);
+}

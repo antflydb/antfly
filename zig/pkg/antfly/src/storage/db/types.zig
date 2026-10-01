@@ -380,6 +380,8 @@ pub const BatchRequest = struct {
     transforms: []const DocumentTransform = &.{},
     /// Private owner-leader maintenance: one bounded durable endpoint page.
     graph_endpoint_cleanup: bool = false,
+    /// Exact leader-selected effects; replicas must never replan this page.
+    graph_endpoint_cleanup_planned: bool = false,
     graph_writes: []const GraphEdgeWrite = &.{},
     graph_deletes: []const GraphEdgeDelete = &.{},
     predicates: []const TransactionVersionPredicate = &.{},
@@ -5046,14 +5048,36 @@ pub fn requiresGraphRelationshipProtocol(req: BatchRequest) bool {
 /// Cleanup is a private, effect-bearing command, never a flag that can be
 /// attached to a public mutation or a lifecycle control.
 pub fn validateGraphEndpointCleanupCommand(req: BatchRequest) !void {
-    if (!req.graph_endpoint_cleanup) return;
+    if (!req.graph_endpoint_cleanup) {
+        if (req.graph_endpoint_cleanup_planned) return error.InvalidBatchRequest;
+        return;
+    }
+    if (req.graph_endpoint_cleanup_planned) try validatePlannedGraphEndpointCleanup(req);
     const defaults = BatchRequest{};
     inline for (std.meta.fields(BatchRequest)) |field| {
-        if (comptime !std.mem.eql(u8, field.name, "graph_endpoint_cleanup") and !std.mem.eql(u8, field.name, "timestamp_ns") and !std.mem.eql(u8, field.name, "sync_level")) {
-            const value = @field(req, field.name);
-            if (comptime @typeInfo(field.type) == .pointer and @typeInfo(field.type).pointer.size == .slice) {
-                if (value.len != 0) return error.InvalidBatchRequest;
-            } else if (!std.meta.eql(value, @field(defaults, field.name))) return error.InvalidBatchRequest;
+        if (comptime !std.mem.eql(u8, field.name, "graph_endpoint_cleanup") and !std.mem.eql(u8, field.name, "graph_endpoint_cleanup_planned") and !std.mem.eql(u8, field.name, "timestamp_ns") and !std.mem.eql(u8, field.name, "sync_level")) {
+            if (comptime std.mem.eql(u8, field.name, "deletes") or std.mem.eql(u8, field.name, "graph_deletes")) {
+                if (!req.graph_endpoint_cleanup_planned and @field(req, field.name).len != 0) return error.InvalidBatchRequest;
+            } else {
+                const value = @field(req, field.name);
+                if (comptime @typeInfo(field.type) == .pointer and @typeInfo(field.type).pointer.size == .slice) {
+                    if (value.len != 0) return error.InvalidBatchRequest;
+                } else if (!std.meta.eql(value, @field(defaults, field.name))) return error.InvalidBatchRequest;
+            }
         }
+    }
+}
+
+/// Planned pages can only remove inline edges and this maintenance queue.
+/// In particular, the constraint exemption never admits a document deletion.
+fn validatePlannedGraphEndpointCleanup(req: BatchRequest) !void {
+    const keys = @import("../internal_keys.zig");
+    if (req.graph_deletes.len + req.deletes.len > 256) return error.InvalidBatchRequest;
+    for (req.deletes) |key| {
+        if (!std.mem.startsWith(u8, key, keys.graph_endpoint_cleanup_prefix) or key.len != keys.graph_endpoint_cleanup_prefix.len + 64) return error.InvalidBatchRequest;
+        for (key[keys.graph_endpoint_cleanup_prefix.len..]) |byte| if (!std.ascii.isHex(byte)) return error.InvalidBatchRequest;
+    }
+    for (req.graph_deletes) |edge| {
+        if (edge.owner_document.len != 0 or edge.index_name.len == 0 or edge.source.len == 0 or edge.target.len == 0) return error.InvalidBatchRequest;
     }
 }

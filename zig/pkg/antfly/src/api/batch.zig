@@ -1472,6 +1472,7 @@ fn parseBatchRequestWithOptions(
             .writes = writes,
             .deletes = deletes,
             .transforms = transforms,
+            .graph_endpoint_cleanup_planned = if (root.get("_graph_endpoint_cleanup_planned")) |value| if (allow_internal and value == .bool) value.bool else return error.InvalidBatchRequest else false,
             .graph_endpoint_cleanup = if (root.get("_graph_endpoint_cleanup")) |value| if (allow_internal and value == .bool) value.bool else return error.InvalidBatchRequest else false,
             .graph_writes = graph_writes,
             .graph_deletes = graph_deletes,
@@ -1492,10 +1493,10 @@ fn parseBatchRequestWithOptions(
     };
     try @import("../storage/range_protection.zig").validateRequest(result_value.req);
     if (!allow_internal) {
-        const prefix = @import("../storage/internal_keys.zig").graph_endpoint_cleanup_prefix;
-        for (result_value.req.writes) |write| if (std.mem.startsWith(u8, write.key, prefix)) return error.InvalidBatchRequest;
-        for (result_value.req.deletes) |key| if (std.mem.startsWith(u8, key, prefix)) return error.InvalidBatchRequest;
-        for (result_value.req.transforms) |transform| if (std.mem.startsWith(u8, transform.key, prefix)) return error.InvalidBatchRequest;
+        const keys = @import("../storage/internal_keys.zig");
+        for (result_value.req.writes) |write| if (keys.isGraphEndpointCleanupControlKey(write.key)) return error.InvalidBatchRequest;
+        for (result_value.req.deletes) |key| if (keys.isGraphEndpointCleanupControlKey(key)) return error.InvalidBatchRequest;
+        for (result_value.req.transforms) |transform| if (keys.isGraphEndpointCleanupControlKey(transform.key)) return error.InvalidBatchRequest;
     }
     try db_mod.types.validateGraphEndpointCleanupCommand(result_value.req);
     try merge_pages.validateRequest(result_value.req);
@@ -1778,6 +1779,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
         try writer.writeAll(",\"_integrity\":");
         try writer.writeAll(encoded_integrity.items);
     }
+    if (req.graph_endpoint_cleanup_planned) try writer.writeAll(",\"_graph_endpoint_cleanup_planned\":true");
     if (req.graph_endpoint_cleanup) try writer.writeAll(",\"_graph_endpoint_cleanup\":true");
     if (req.graph_writes.len > 0) {
         try writer.writeAll(",\"_graph_writes\":[");
@@ -3072,4 +3074,22 @@ fn consumerTests() type {
 }
 comptime {
     if (@import("builtin").is_test) _ = consumer_tests;
+}
+
+test "internal batch graph endpoint cleanup command isolates planned effects" {
+    const alloc = std.testing.allocator;
+    const keys = @import("../storage/internal_keys.zig");
+    const job = try keys.graphEndpointCleanupKeyAlloc(alloc, "hub");
+    defer alloc.free(job);
+    const encoded = try encodeBatchRequest(alloc, .{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true, .deletes = &.{job}, .graph_deletes = &.{.{ .index_name = "g", .source = "a", .target = "hub", .edge_type = "R", .edge_id = "id", .owner = "owner" }} });
+    defer alloc.free(encoded);
+    var parsed = try parseInternalBatchRequest(alloc, encoded);
+    defer parsed.deinit(alloc);
+    try std.testing.expect(parsed.req.graph_endpoint_cleanup_planned);
+    try std.testing.expectEqualStrings(job, parsed.req.deletes[0]);
+    try std.testing.expectEqualStrings("owner", parsed.req.graph_deletes[0].owner);
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, .{ .graph_endpoint_cleanup_planned = true }));
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, .{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true, .writes = &.{.{ .key = "document", .value = "{}" }} }));
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, .{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true, .graph_deletes = &.{.{ .index_name = "g", .source = "a", .target = "hub", .edge_type = "R", .owner_document = "fact" }} }));
 }

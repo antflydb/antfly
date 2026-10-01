@@ -43,16 +43,39 @@ key data per transaction (one oversized key may form its own page). A durable
 cursor resumes migration after interruption; readers use the directory only
 when the final ready marker commits. Endpoint deletion records a durable cleanup
 job instead of enumerating all incoming relationships in the foreground. Each
-cleanup command advances at most one migration page, then retires at most 256
-incoming relationships or 256 KiB of directory data (one oversized record may
-form its own page). Each committed retirement removes its directory entry, so
+cleanup command advances at most one migration page, then processes at most 256
+relationship retirements and completed endpoint jobs in total, or 256 KiB of
+directory and job-key data (one oversized record may form its own page). Empty
+endpoint jobs share a page instead of requiring separate replicated commands.
+Each committed retirement removes its directory entry, so
 restarting at the target prefix resumes without retaining the full adjacency.
 
 In data-Raft deployments the owner leader proposes cleanup through the ordinary
 replicated writer, one page per control round. Commands carry the leader-selected
 relationship identities; followers never replan from local directory progress.
-Standalone DB writes and recovery drain the same commands locally. Pending jobs survive restart and leader changes.
-Graph reads return `StorageBusy` until cleanup completes. New inline
+Planned commands are private and isolated: their only effects are inline
+relationship deletions and cleanup-job removals. They cannot delete documents or
+change constraint metadata, so completion also works on tables with unique or
+foreign-key constraints.
+
+Standalone DB writes and recovery drain the same commands locally. Resident
+standalone owners also register with the shared maintenance scheduler, processing
+one bounded page per turn independently of foreground writes, including after
+TTL expiry. Idle maintenance also backfills the incoming directory in bounded
+pages before future deletions. `DB.openOwned` installs a stable owner
+automatically; callers using
+the movable `DB.open` form must call `startResidentBackgroundWorkersIfNeeded`
+after installing the DB at its final address to enable resident maintenance.
+Explicit worker suppression leaves cleanup to writes, recovery, and maintenance
+calls. Raft ownership is checked before local planning, including before the
+first applied-entry marker exists. Pending jobs survive restart and leader
+changes.
+
+A transactionally maintained admission count fences graph reads only for jobs
+with incident inline edges. Empty jobs do not interrupt unrelated traversals.
+Older queues or invalidated directories without a complete admission summary
+remain conservatively fenced until their jobs drain. Graph reads return
+`StorageBusy` while an incident-edge job remains pending. New inline
 relationships targeting a pending endpoint receive the deterministic rejection
 `IntegrityTopologyBusy`, allowing Raft to advance to subsequent cleanup entries.
 Independent fact documents keep their own lifecycle. Portable export returns

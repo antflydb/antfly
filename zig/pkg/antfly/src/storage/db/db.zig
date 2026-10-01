@@ -5305,6 +5305,8 @@ pub const DB = struct {
     source_vector_storage: ?*lsm_backend_mod.NativeStorage = null,
     closed: bool = false,
     stable_address: bool = false,
+    graph_cleanup_worker: ?background_runtime_mod.MaintenanceScheduler.Handle = null,
+    graph_cleanup_stop: std.atomic.Value(bool) = .init(false),
     alloc: Allocator,
     runtime_alloc: Allocator,
     generation_read_lease: ?generation_lifecycle.ReadLease,
@@ -7529,6 +7531,7 @@ pub const DB = struct {
         self.scheduleDurableHAOutboxRecovery();
         self.startArtifactRepairMetadataWorkerIfNeeded();
         self.startQuarantineRetryWorkerIfNeeded();
+        self.startGraphEndpointCleanupWorker();
     }
 
     pub fn closeOwned(self: *DB) void {
@@ -8465,6 +8468,7 @@ pub const DB = struct {
     /// deterministic scheduler drains them. Destruction still happens through
     /// the ordinary close path after the drain completes.
     pub fn beginTeardown(self: *DB) void {
+        self.graph_cleanup_stop.store(true, .release);
         if (self.enrichment_runtime) |runtime| runtime.beginTeardown();
         if (self.transaction_runtime) |runtime| runtime.beginTeardown();
     }
@@ -8575,6 +8579,7 @@ pub const DB = struct {
         self.artifact_producer_work_cursor = null;
         self.stopPortableActivationRetryWorker();
         self.stopQuarantineRetryWorker();
+        self.stopGraphEndpointCleanupWorker();
         if (self.transaction_runtime) |runtime| {
             runtime.deinit();
             self.runtime_alloc.destroy(runtime);
@@ -9674,12 +9679,7 @@ pub const DB = struct {
 
     fn drainStandaloneGraphEndpointCleanup(self: *DB) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
-        const native = blk: {
-            var read = try self.core.store.beginReadTxn();
-            defer read.abort();
-            break :blk if (read.get(&internal_keys.raft_document_applied_entry_key)) |_| true else |err| if (err == error.NotFound) false else return err;
-        };
-        if (native) return false;
+        if (try self.graphCleanupRequiresRaft()) return false;
         var drained = false;
         while (try self.core.store.hasGraphEndpointCleanup()) {
             try self.batch(.{ .graph_endpoint_cleanup = true, .sync_level = .write });
@@ -9688,11 +9688,68 @@ pub const DB = struct {
         return drained;
     }
 
+    fn graphCleanupRequiresRaft(self: *DB) !bool {
+        return blk: {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            if (try @import("../source_authority.zig").load(&read)) |authority| if (authority.kind == .raft) break :blk true;
+            break :blk if (read.get(&internal_keys.raft_document_applied_entry_key)) |_| true else |err| if (err == error.NotFound) false else return err;
+        };
+    }
+
+    fn startGraphEndpointCleanupWorker(self: *DB) void {
+        if (comptime builtin.os.tag == .freestanding) return;
+        if (!self.stable_address or !self.optional_runtime_workers_enabled or self.open_mode != .writer or self.graph_cleanup_worker != null) return;
+        if (self.graphCleanupRequiresRaft() catch true) return;
+        const scheduler = self.backend_runtime.maintenanceScheduler() catch |err| {
+            std.log.warn("graph cleanup scheduler unavailable: {}", .{err});
+            return;
+        };
+        self.graph_cleanup_stop.store(false, .release);
+        self.graph_cleanup_worker = scheduler.register(self, graphEndpointCleanupWorkerStep) catch |err| {
+            std.log.warn("graph cleanup worker unavailable: {}", .{err});
+            return;
+        };
+    }
+
+    fn stopGraphEndpointCleanupWorker(self: *DB) void {
+        self.graph_cleanup_stop.store(true, .release);
+        if (self.graph_cleanup_worker) |*worker| {
+            worker.await(self.backend_runtime.io().?);
+            self.graph_cleanup_worker = null;
+        }
+    }
+
+    fn graphEndpointCleanupWorkerStep(self: *DB) ?u64 {
+        if (self.graph_cleanup_stop.load(.acquire)) return null;
+        const progressed = self.runStandaloneGraphEndpointCleanupStep() catch |err| {
+            std.log.warn("graph endpoint cleanup deferred: {}", .{err});
+            return 250;
+        };
+        return if (progressed) 1 else 100;
+    }
+
+    /// Every enqueue path is serviced independently of subsequent foreground
+    /// writes. Each scheduler turn commits at most one bounded page.
+    fn runStandaloneGraphEndpointCleanupStep(self: *DB) !bool {
+        if (try self.graphCleanupRequiresRaft()) return false;
+        if (!try self.core.store.hasGraphEndpointCleanup()) {
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            if (try self.graphCleanupRequiresRaft()) return false;
+            if (self.core.index_manager.hasGraphIndexes() and !try self.core.store.graphIncomingDirectoryReady())
+                return !try self.core.store.backfillGraphIncomingDirectoryPage();
+            return false;
+        }
+        try self.batchInternal(.{ .graph_endpoint_cleanup = true, .sync_level = .write }, null, .{});
+        return true;
+    }
+
     pub const GraphEndpointCleanupBatch = struct {
         page: docstore_mod.DocStore.GraphEndpointCleanupPage,
         graph_deletes: []types.GraphEdgeDelete,
         pub fn request(self: *const @This()) types.BatchRequest {
-            return .{ .graph_deletes = self.graph_deletes, .deletes = self.page.deletes, .sync_level = .write };
+            return .{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true, .graph_deletes = self.graph_deletes, .deletes = self.page.deletes, .sync_level = .write };
         }
         pub fn deinit(self: *@This()) void {
             for (self.graph_deletes) |*item| item.deinit(self.page.alloc);
@@ -9706,14 +9763,20 @@ pub const DB = struct {
     pub fn prepareGraphEndpointCleanupBatch(self: *DB, alloc: Allocator) !?GraphEndpointCleanupBatch {
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
-        if (!try self.core.store.hasGraphEndpointCleanup()) return null;
+        if (!try self.core.store.hasGraphEndpointCleanup()) {
+            // Build local directory coverage ahead of future endpoint deletes,
+            // without proposing empty Raft maintenance entries.
+            if (self.core.index_manager.hasGraphIndexes() and !try self.core.store.graphIncomingDirectoryReady())
+                _ = try self.core.store.backfillGraphIncomingDirectoryPage();
+            return null;
+        }
         var page = (try self.core.store.prepareGraphEndpointCleanupPage(alloc)) orelse return null;
         errdefer page.deinit();
         return .{ .page = page, .graph_deletes = try graphEndpointCleanupDeletesAlloc(alloc, page) };
     }
 
     fn requireGraphEndpointCleanupReady(self: *DB) !void {
-        if (!try self.core.store.hasGraphEndpointCleanup()) return;
+        if (!try self.core.store.graphEndpointCleanupBlocksReads()) return;
         return error.StorageBusy;
     }
 
@@ -9727,7 +9790,9 @@ pub const DB = struct {
         }
         if (!req.graph_endpoint_cleanup) {
             const drained = try self.drainStandaloneGraphEndpointCleanup();
-            if (drained and req.sync_level == .full_index) try self.waitForCurrentSyncLevel(.full_index);
+            // The background worker may have drained the job before this
+            // foreground probe. Include its replay cut in full-index deletes.
+            if (req.sync_level == .full_index and (drained or req.deletes.len != 0 or req.transforms.len != 0)) try self.waitForCurrentSyncLevel(.full_index);
         }
     }
 
@@ -9741,7 +9806,7 @@ pub const DB = struct {
         }
         if (!req.graph_endpoint_cleanup) {
             const drained = try self.drainStandaloneGraphEndpointCleanup();
-            if (drained and req.sync_level == .full_index) try self.waitForCurrentSyncLevelWithCancellation(.full_index, cancellation);
+            if (req.sync_level == .full_index and (drained or req.deletes.len != 0 or req.transforms.len != 0)) try self.waitForCurrentSyncLevelWithCancellation(.full_index, cancellation);
         }
     }
 
@@ -9947,7 +10012,7 @@ pub const DB = struct {
         req: types.BatchRequest,
         identity: RaftAppliedEntryIdentity,
     ) anyerror!void {
-        if (req.graph_endpoint_cleanup) return error.InvalidBatchRequest;
+        if (req.graph_endpoint_cleanup and !req.graph_endpoint_cleanup_planned) return error.InvalidBatchRequest;
         const mirror_scoped_restore = requiresDurableLifecycleHA(req) and self.ha_async_batch_mirror != null;
         // HA is process-local and includes this node's Raft follower roots.
         // Recover the local committed obligation before a Raft receipt can
@@ -11612,6 +11677,7 @@ pub const DB = struct {
             .writes = effective_ops.writes,
             .deletes = effective_ops.deletes,
             .graph_endpoint_cleanup = req.graph_endpoint_cleanup,
+            .graph_endpoint_cleanup_planned = req.graph_endpoint_cleanup_planned,
             .graph_writes = effective_graph_writes,
             .graph_deletes = effective_graph_deletes,
             .transforms = &.{},
@@ -11661,7 +11727,7 @@ pub const DB = struct {
         if (opts.transaction_resolution == null and !scoped_restore_ha_apply and !live_ha_apply) {
             for (effective_ops.writes) |write| if (isProtectedIntegrityKey(write.key) or isProtectedRangeWriteKey(write.key)) return error.InvalidIntegrityOperation;
             for (effective_ops.deletes) |key| if (isProtectedIntegrityKey(key) or isProtectedRangeWriteKey(key)) return error.InvalidIntegrityOperation;
-            if (hasCoordinatedConstraints(request_schema_view) and opts.restore_staging == null and req.split_replication == null and req.merge_replication == null and (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0))
+            if (!req.graph_endpoint_cleanup_planned and hasCoordinatedConstraints(request_schema_view) and opts.restore_staging == null and req.split_replication == null and req.merge_replication == null and (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0))
                 return error.ForeignKeyCoordinationRequired;
         }
         if (req.relational_schema_version) |version| {
@@ -12474,7 +12540,10 @@ pub const DB = struct {
             identity_visibility_deletes.deinit(self.alloc);
         }
 
-        if (req.graph_endpoint_cleanup) {
+        if (req.graph_endpoint_cleanup and !req.graph_endpoint_cleanup_planned) {
+            // Recheck under the apply fence: ownership may have changed since
+            // the scheduler or foreground drain probed it.
+            if (try self.graphCleanupRequiresRaft()) return error.InvalidBatchRequest;
             effective_req.graph_endpoint_cleanup = false;
             graph_cleanup_page = try self.core.store.prepareGraphEndpointCleanupPage(self.alloc);
             if (graph_cleanup_page) |page| {
@@ -158502,4 +158571,102 @@ fn graphEndpointCleanupDeletesAlloc(alloc: Allocator, page: docstore_mod.DocStor
         initialized += 1;
     }
     return items;
+}
+
+test "db graph endpoint cleanup pages finish on constrained tables" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("constrained-cleanup");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    );
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+    try db.batchRaftReplicatedApply(.{ .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "hub", .edge_type = "R" }} }, .{ .term = 1, .index = 1 });
+    // Seed the durable state produced by a coordinated document deletion.
+    const job = try internal_keys.graphEndpointCleanupKeyAlloc(alloc, "hub");
+    defer alloc.free(job);
+    try db.core.store.put(job, "hub");
+    var cleanup = (try db.prepareGraphEndpointCleanupBatch(alloc)).?;
+    defer cleanup.deinit();
+    try std.testing.expectEqual(@as(usize, 1), cleanup.page.deletes.len);
+    try db.batchRaftReplicatedApply(cleanup.request(), .{ .term = 1, .index = 2 });
+    try std.testing.expect(!try db.core.store.hasGraphEndpointCleanup());
+    try db.runUntilIdle();
+    const edges = try db.getEdges(alloc, "g", "a", "", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 0), edges.len);
+    try std.testing.expectError(error.InvalidBatchRequest, db.batchRaftReplicatedApply(.{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true, .deletes = &.{"document"} }, .{ .term = 1, .index = 3 }));
+    try std.testing.expectError(error.ForeignKeyCoordinationRequired, db.batchRaftReplicatedApply(.{ .deletes = &.{"document"} }, .{ .term = 1, .index = 3 }));
+}
+
+test "db graph endpoint cleanup pages progress after standalone ttl without another write" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("ttl-cleanup-worker");
+    defer directory.cleanup();
+    const db = try DB.openOwned(alloc, directory.path(), .{ .start_index_workers = false });
+    defer db.closeOwned();
+    try std.testing.expect(db.graph_cleanup_worker != null);
+    try db.setSchema(.{ .version = 1, .default_type = "_default", .ttl_duration_ns = std.time.ns_per_s });
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+    try db.batch(.{ .writes = &.{.{ .key = "hub", .value = "{}" }}, .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "hub", .edge_type = "R" }}, .timestamp_ns = currentTimeNs() - 2 * std.time.ns_per_s, .sync_level = .full_index });
+    try initStoppedTtlRuntimeForTest(db, .{ .enabled = true, .grace_period_ns = 0 });
+    try db.ttl_runtime.?.runOnce();
+    try std.testing.expectEqual(@as(u64, 0), try db.getTimestamp(alloc, "hub"));
+    const deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
+    while (try db.core.store.hasGraphEndpointCleanup()) {
+        if (monotonicTimeNs() >= deadline) return error.CleanupWorkerDidNotProgress;
+        sleepNs(std.time.ns_per_ms);
+    }
+    // With explicit worker suppression the foreground maintenance API remains
+    // available; autonomous owners instead make progress without another write.
+    try db.runUntilIdle();
+    const edges = try db.getEdges(alloc, "g", "a", "", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 0), edges.len);
+}
+
+test "db graph endpoint cleanup pages batch unrelated deletes without blocking graph reads" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("empty-cleanup-pages");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+    try db.batchRaftReplicatedApply(.{ .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R" }}, .sync_level = .full_index }, .{ .term = 1, .index = 1 });
+    try db.runUntilIdle();
+    try db.core.store.ensureGraphIncomingDirectory();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const deletes = try scratch.alloc([]const u8, 600);
+    for (deletes, 0..) |*key, i| key.* = try std.fmt.allocPrint(scratch, "isolated:{d}", .{i});
+    try db.batchRaftReplicatedApply(.{ .deletes = deletes }, .{ .term = 1, .index = 2 });
+    try std.testing.expect(try db.core.store.hasGraphEndpointCleanup());
+    try std.testing.expect(!try db.core.store.graphEndpointCleanupBlocksReads());
+    const edges = try db.getEdges(alloc, "g", "a", "", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    for ([_]usize{ 256, 256, 88 }, 0..) |size, i| {
+        var page = (try db.prepareGraphEndpointCleanupBatch(alloc)).?;
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 0), page.graph_deletes.len);
+        try std.testing.expectEqual(size, page.page.deletes.len);
+        try db.batchRaftReplicatedApply(page.request(), .{ .term = 1, .index = 3 + i });
+    }
+    try std.testing.expect(!try db.core.store.hasGraphEndpointCleanup());
+}
+
+test "db graph endpoint cleanup pages respect raft ownership before first applied marker" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("raft-cleanup-authority");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .online_source_authority = .raft, .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    const job = try internal_keys.graphEndpointCleanupKeyAlloc(alloc, "hub");
+    defer alloc.free(job);
+    try db.core.store.put(job, "hub");
+    try std.testing.expect(!try db.runStandaloneGraphEndpointCleanupStep());
+    try std.testing.expect(try db.core.store.hasGraphEndpointCleanup());
 }

@@ -373,6 +373,56 @@ fn columnarMutationToken(txn: anytype, cached: *?internal_keys.ColumnarMutationT
     return token;
 }
 
+fn updateGraphEndpointCleanupAdmission(txn: anytype, alloc: Allocator, key: []const u8, endpoint: ?[]const u8) anyerror!void {
+    if (!std.mem.startsWith(u8, key, internal_keys.graph_endpoint_cleanup_prefix)) return;
+    const ref = try std.mem.concat(alloc, u8, &.{ internal_keys.graph_endpoint_cleanup_ref_prefix, key[internal_keys.graph_endpoint_cleanup_prefix.len..] });
+    defer alloc.free(ref);
+    const raw_count = txn.get(internal_keys.graph_endpoint_cleanup_count_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    var count: u64 = 0;
+    if (raw_count) |raw| {
+        if (raw.len != 8) return error.InvalidGraphSegment;
+        count = std.mem.readInt(u64, raw[0..8], .little);
+    } else {
+        // A partial older queue has no complete admission summary. Preserve
+        // the conservative fallback until it drains, then initialize anew.
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        const row = try cursor.seekAtOrAfter(internal_keys.graph_endpoint_cleanup_prefix);
+        if (row != null and std.mem.startsWith(u8, row.?.key, internal_keys.graph_endpoint_cleanup_prefix)) {
+            if (endpoint == null) txn.delete(ref) catch |err| if (err != error.NotFound) return err;
+            return;
+        }
+    }
+    const already_active = if (txn.get(ref)) |_| true else |err| if (err == error.NotFound) false else return err;
+    if (endpoint) |target| {
+        if (!already_active) {
+            const ready = if (txn.get(internal_keys.graph_incoming_ready_key)) |_| true else |err| if (err == error.NotFound) false else return err;
+            var active = !ready;
+            if (ready) {
+                const prefix = try internal_keys.graphIncomingPrefixAlloc(alloc, target);
+                defer alloc.free(prefix);
+                var cursor = try txn.openCursor();
+                defer cursor.close();
+                const row = try cursor.seekAtOrAfter(prefix);
+                active = row != null and std.mem.startsWith(u8, row.?.key, prefix);
+            }
+            if (active) {
+                count = try std.math.add(u64, count, 1);
+                try txn.put(ref, "1");
+            }
+        }
+    } else if (already_active) {
+        count = try std.math.sub(u64, count, 1);
+        try txn.delete(ref);
+    }
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, count, .little);
+    try txn.put(internal_keys.graph_endpoint_cleanup_count_key, &bytes);
+}
+
 pub const DocStore = struct {
     payload_store: ?artifact_payload.Store = null,
     payload_capture_inline: bool = false,
@@ -664,6 +714,7 @@ pub const DocStore = struct {
         }
 
         pub fn put(self: *Txn, key: []const u8, value: []const u8) anyerror!void {
+            try updateGraphEndpointCleanupAdmission(self, self.alloc, key, value);
             if (internal_keys.isInternalUserKey(key) and !self.graph_directory_checked) {
                 self.graph_directory_checked = true;
                 try initializeEmptyGraphIncomingDirectory(self);
@@ -692,6 +743,7 @@ pub const DocStore = struct {
         }
 
         pub fn delete(self: *Txn, key: []const u8) anyerror!void {
+            try updateGraphEndpointCleanupAdmission(self, self.alloc, key, null);
             try removeGraphRetirementReference(self, self.alloc, key, &self.graph_retirements_maybe);
             if (try internal_keys.graphIncomingKeyAlloc(self.alloc, key)) |incoming| {
                 defer self.alloc.free(incoming);
@@ -828,6 +880,7 @@ pub const DocStore = struct {
             }
 
             pub fn put(self: @This(), key: []const u8, value: []const u8) anyerror!void {
+                try updateGraphEndpointCleanupAdmission(self, self.alloc, key, value);
                 if (internal_keys.isInternalUserKey(key) and !self.graph_directory_checked.*) {
                     self.graph_directory_checked.* = true;
                     try initializeEmptyGraphIncomingDirectory(self);
@@ -859,6 +912,8 @@ pub const DocStore = struct {
             }
 
             fn appendPutChecked(self: @This(), key: []const u8, value: []const u8, retirement_checked: bool) anyerror!void {
+                if (std.mem.startsWith(u8, key, internal_keys.graph_endpoint_cleanup_prefix) and self.unordered_bulk_append_puts) return error.Unsupported;
+                try updateGraphEndpointCleanupAdmission(self, self.alloc, key, value);
                 if (internal_keys.isInternalUserKey(key) and !self.graph_directory_checked.*) {
                     self.graph_directory_checked.* = true;
                     try initializeEmptyGraphIncomingDirectory(self);
@@ -904,6 +959,7 @@ pub const DocStore = struct {
             }
 
             pub fn delete(self: @This(), key: []const u8) anyerror!void {
+                try updateGraphEndpointCleanupAdmission(self, self.alloc, key, null);
                 try removeGraphRetirementReference(self, self.alloc, key, self.graph_retirements_maybe);
                 if (try internal_keys.graphIncomingKeyAlloc(self.alloc, key)) |incoming| {
                     defer self.alloc.free(incoming);
@@ -1353,6 +1409,16 @@ pub const DocStore = struct {
         }
     };
 
+    pub fn graphIncomingDirectoryReady(self: *DocStore) !bool {
+        var read = try self.beginReadTxn();
+        defer read.abort();
+        _ = read.get(internal_keys.graph_incoming_ready_key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        return true;
+    }
+
     pub fn hasGraphEndpointCleanup(self: *DocStore) !bool {
         var read = try self.beginReadTxn();
         defer read.abort();
@@ -1360,6 +1426,25 @@ pub const DocStore = struct {
         defer cursor.close();
         const row = (try cursor.seekAtOrAfter(internal_keys.graph_endpoint_cleanup_prefix)) orelse return false;
         return std.mem.startsWith(u8, row.key, internal_keys.graph_endpoint_cleanup_prefix);
+    }
+
+    /// Empty endpoint jobs do not change the graph and need not fence reads.
+    /// This transactionally maintained summary avoids scanning the job queue on
+    /// every traversal. Old queues without a summary remain conservatively fenced.
+    pub fn graphEndpointCleanupBlocksReads(self: *DocStore) !bool {
+        var read = try self.beginReadTxn();
+        defer read.abort();
+        const count = read.get(internal_keys.graph_endpoint_cleanup_count_key) catch |err| switch (err) {
+            error.NotFound => {
+                var cursor = try read.openPhysicalCursorAdapter();
+                defer cursor.close();
+                const row = (try cursor.seekAtOrAfter(internal_keys.graph_endpoint_cleanup_prefix)) orelse return false;
+                return std.mem.startsWith(u8, row.key, internal_keys.graph_endpoint_cleanup_prefix);
+            },
+            else => return err,
+        };
+        if (count.len != 8) return error.InvalidGraphSegment;
+        return std.mem.readInt(u64, count[0..8], .little) != 0;
     }
 
     /// Borrowed transaction check keeps every insertion path, including bulk
@@ -1400,37 +1485,52 @@ pub const DocStore = struct {
         {
             var read = try self.beginReadTxn();
             defer read.abort();
-            var cursor = try read.openPhysicalCursorAdapter();
-            defer cursor.close();
-            const job = (try cursor.seekAtOrAfter(internal_keys.graph_endpoint_cleanup_prefix)) orelse return null;
-            if (!std.mem.startsWith(u8, job.key, internal_keys.graph_endpoint_cleanup_prefix)) return null;
-            const expected_job = try internal_keys.graphEndpointCleanupKeyAlloc(alloc, job.value);
-            defer alloc.free(expected_job);
-            if (!std.mem.eql(u8, expected_job, job.key)) return error.InvalidGraphSegment;
-            const job_key = try alloc.dupe(u8, job.key);
-            defer alloc.free(job_key);
-            const prefix = try internal_keys.graphIncomingPrefixAlloc(alloc, job.value);
-            defer alloc.free(prefix);
-            var row = try cursor.seekAtOrAfter(prefix);
-            while (row) |entry| {
-                if (!std.mem.startsWith(u8, entry.key, prefix)) break;
-                if (inspected >= 256 or (inspected > 0 and bytes +| entry.key.len +| entry.value.len > 256 * 1024)) break;
-                const expected_entry = (try internal_keys.graphIncomingKeyAlloc(alloc, entry.value)) orelse return error.InvalidGraphSegment;
-                defer alloc.free(expected_entry);
-                if (!std.mem.eql(u8, expected_entry, entry.key)) return error.InvalidGraphSegment;
-                const retired = try internal_keys.graphRetirementKeyAlloc(alloc, entry.value);
-                errdefer alloc.free(retired);
-                const value = try alloc.dupe(u8, "1");
-                errdefer alloc.free(value);
-                try writes.append(alloc, .{ .key = retired, .value = value });
-                inspected += 1;
-                bytes +|= entry.key.len +| entry.value.len;
-                row = try cursor.next();
-            }
-            if (row == null or !std.mem.startsWith(u8, row.?.key, prefix)) {
+            var jobs = try read.openPhysicalCursorAdapter();
+            defer jobs.close();
+            var incoming = try read.openPhysicalCursorAdapter();
+            defer incoming.close();
+            var job_row = try jobs.seekAtOrAfter(internal_keys.graph_endpoint_cleanup_prefix);
+            if (job_row == null or !std.mem.startsWith(u8, job_row.?.key, internal_keys.graph_endpoint_cleanup_prefix)) return null;
+            while (job_row) |job| {
+                if (!std.mem.startsWith(u8, job.key, internal_keys.graph_endpoint_cleanup_prefix)) break;
+                if (inspected + deletes.items.len >= 256) break;
+                const expected_job = try internal_keys.graphEndpointCleanupKeyAlloc(alloc, job.value);
+                defer alloc.free(expected_job);
+                if (!std.mem.eql(u8, expected_job, job.key)) return error.InvalidGraphSegment;
+                const job_key = try alloc.dupe(u8, job.key);
+                defer alloc.free(job_key);
+                const prefix = try internal_keys.graphIncomingPrefixAlloc(alloc, job.value);
+                defer alloc.free(prefix);
+                var row = try incoming.seekAtOrAfter(prefix);
+                while (row) |entry| {
+                    if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+                    if (inspected + deletes.items.len >= 256 or (inspected + deletes.items.len > 0 and bytes +| entry.key.len +| entry.value.len > 256 * 1024)) break;
+                    const expected_entry = (try internal_keys.graphIncomingKeyAlloc(alloc, entry.value)) orelse return error.InvalidGraphSegment;
+                    defer alloc.free(expected_entry);
+                    if (!std.mem.eql(u8, expected_entry, entry.key)) return error.InvalidGraphSegment;
+                    const retired = try internal_keys.graphRetirementKeyAlloc(alloc, entry.value);
+                    const value = alloc.dupe(u8, "1") catch |err| {
+                        alloc.free(retired);
+                        return err;
+                    };
+                    writes.append(alloc, .{ .key = retired, .value = value }) catch |err| {
+                        alloc.free(retired);
+                        alloc.free(value);
+                        return err;
+                    };
+                    inspected += 1;
+                    bytes +|= entry.key.len +| entry.value.len;
+                    row = try incoming.next();
+                }
+                if (row != null and std.mem.startsWith(u8, row.?.key, prefix)) break;
+                if (inspected + deletes.items.len >= 256 or (inspected + deletes.items.len > 0 and bytes +| job_key.len > 256 * 1024)) break;
                 const owned_job = try alloc.dupe(u8, job_key);
-                errdefer alloc.free(owned_job);
-                try deletes.append(alloc, owned_job);
+                deletes.append(alloc, owned_job) catch |err| {
+                    alloc.free(owned_job);
+                    return err;
+                };
+                bytes +|= job_key.len;
+                job_row = try jobs.next();
             }
         }
         const owned_writes = try writes.toOwnedSlice(alloc);
@@ -1466,7 +1566,7 @@ pub const DocStore = struct {
         // A new physical rewrite restarts clearing even if a previous rebuild
         // was interrupted: its checkpoint described a different primary range.
         try txn.put(internal_keys.graph_directory_reset_key, &.{0});
-        for ([_][]const u8{ internal_keys.graph_incoming_ready_key, internal_keys.graph_incoming_cursor_key }) |key| {
+        for ([_][]const u8{ internal_keys.graph_incoming_ready_key, internal_keys.graph_incoming_cursor_key, internal_keys.graph_endpoint_cleanup_count_key }) |key| {
             txn.delete(key) catch |err| switch (err) {
                 error.NotFound => {},
                 else => return err,
@@ -5418,4 +5518,33 @@ test "graph endpoint cleanup byte admission preserves independent facts" {
     defer alloc.free(retained);
     try std.testing.expectEqualStrings("fact", retained);
     try std.testing.expect(!try store.hasGraphEndpointCleanup());
+}
+
+test "graph endpoint cleanup byte admission releases partial page allocations" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf);
+    defer cleanupTmp(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    for ([_][]const u8{ "a", "b" }) |source| {
+        const edge = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, source, "g", "R", "hub");
+        defer alloc.free(edge);
+        try store.put(edge, "edge");
+    }
+    try store.ensureGraphIncomingDirectory();
+    for ([_][]const u8{ "hub", "empty" }) |endpoint| {
+        const job = try internal_keys.graphEndpointCleanupKeyAlloc(alloc, endpoint);
+        defer alloc.free(job);
+        try store.put(job, endpoint);
+    }
+    const Check = struct {
+        fn run(page_alloc: Allocator, input: *DocStore) !void {
+            var page = (try input.prepareGraphEndpointCleanupPage(page_alloc)).?;
+            defer page.deinit();
+            try std.testing.expectEqual(@as(usize, 2), page.writes.len);
+            try std.testing.expectEqual(@as(usize, 2), page.deletes.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{&store});
 }
