@@ -13319,7 +13319,11 @@ pub const DataServer = struct {
         const budget: antfly.metadata_http_client.RequestBudget = .{ .deadline_ns = deadline_ns, .io = self.dataRaftIo(), .cancellation = route.cancellation };
         try remote.lockWithBudget(&remote.cache_mutex, budget);
         defer remote.cache_mutex.unlock();
-        return if (remote.control_read_generation) |peers| peers.retain() else error.MetadataSnapshotUnavailable;
+        // Catalog invalidation revokes read/planning authority, not endpoint
+        // discovery. A cache-only admitted write may still contact a previous
+        // endpoint: the receiver must validate its group, leadership and the
+        // unchanged write-route fence. Never refresh or infer authority here.
+        return if (remote.control_read_generation orelse remote.forwarding_hint_generation) |peers| peers.retain() else error.GroupLeaderUnavailable;
     }
 
     fn dataApiUriForNode(
@@ -24840,6 +24844,9 @@ const RemoteMetadataSource = struct {
     cached_peer_snapshot: ?antfly.metadata_api.AdminSnapshot = null,
     cached_peer_snapshot_owner: ?*ControlSnapshotOwner = null,
     control_read_generation: ?*ControlReadGeneration = null,
+    /// One immutable retired endpoint view for cache-only write forwarding.
+    /// This is never usable as catalog, placement or read authority.
+    forwarding_hint_generation: ?*ControlReadGeneration = null,
     control_read_generation_at_ms: u64 = 0,
     control_read_refresh_mutex: std.atomic.Mutex = .unlocked,
     // Bounded across peer-view replacement; routing changes bypass cooldown.
@@ -24986,6 +24993,7 @@ const RemoteMetadataSource = struct {
         lockAtomic(&self.cache_mutex);
         if (self.join_planning_generation) |planning| planning.release();
         if (self.control_read_generation) |routing| routing.release();
+        if (self.forwarding_hint_generation) |routing| routing.release();
         if (self.diagnostic_snapshot) |*snapshot| freeAdminSnapshotOwned(self.alloc, snapshot);
         releaseSnapshot(self.alloc, self.cached_snapshot_owner, self.cached_snapshot);
         releaseSnapshot(self.alloc, self.cached_peer_snapshot_owner, self.cached_peer_snapshot);
@@ -25343,7 +25351,8 @@ const RemoteMetadataSource = struct {
         retired_snapshot = self.cached_snapshot;
         retired_routing_snapshot = self.cached_routing_snapshot;
         self.cached_snapshot = null;
-        const retired_peers = self.control_read_generation;
+        const retired_hint = if (self.control_read_generation != null) self.forwarding_hint_generation else null;
+        if (self.control_read_generation) |peers| self.forwarding_hint_generation = peers;
         self.control_read_generation = null;
         self.cached_routing_snapshot = null;
         self.cached_head = null;
@@ -25354,7 +25363,7 @@ const RemoteMetadataSource = struct {
         self.snapshot_invalidation_generation +%= 1;
         self.cache_mutex.unlock();
         if (retired_planning) |planning| planning.release();
-        if (retired_peers) |peers| peers.release();
+        if (retired_hint) |peers| peers.release();
         releaseSnapshot(self.alloc, retired_owner, retired_snapshot);
         releaseSnapshot(self.alloc, retired_peer_owner, retired_peer_snapshot);
         if (retired_routing_snapshot) |snapshot| snapshot.release(self.alloc);
@@ -34160,7 +34169,7 @@ fn consumerTests() type {
             const alloc = std.testing.allocator;
             const Http = antfly.common.http;
             const VoprIo = @import("vopr").vopr_io.VoprIo;
-            const Mode = enum { recover, short_deadline, exhausted, late_response, canceled_response };
+            const Mode = enum { recover, truncated_response, short_deadline, exhausted, late_response, canceled_response };
             const Fake = struct {
                 clock: *VoprIo,
                 mode: Mode,
@@ -34176,7 +34185,7 @@ fn consumerTests() type {
                     try std.testing.expectEqual(expected_ms, request.timeout_ms.?);
                     if (self.calls == 1 or self.mode == .exhausted) {
                         try self.clock.advance(@as(u64, expected_ms) * std.time.ns_per_ms);
-                        return error.Timeout;
+                        return if (self.mode == .truncated_response) error.InvalidResponse else error.Timeout;
                     }
                     try std.testing.expectEqual(@as(usize, 2), self.calls);
                     try self.clock.advance(if (self.mode == .late_response) 8 * std.time.ns_per_s else 1_400 * std.time.ns_per_ms);
@@ -34202,7 +34211,7 @@ fn consumerTests() type {
                 };
                 const result = source.readSystemCatalog(alloc, context, .{ .write_validation = "docs" });
                 switch (mode) {
-                    .recover => {
+                    .recover, .truncated_response => {
                         const body = try result;
                         defer alloc.free(body);
                         try std.testing.expectEqualStrings("null", body);
@@ -44198,6 +44207,19 @@ fn consumerTests() type {
 
             try std.testing.expect(source.control_read_generation == null);
             try std.testing.expectEqualStrings("http://restarted", latest.nodes.get(2).?);
+            // Cache-only write forwarding can retain endpoint hints after a
+            // catalog mutation without reviving the invalidated read view.
+            const forwarding_deadline = server.dataRaftMonotonicNs() + std.time.ns_per_s;
+            const hint = (try server.acquireDataForwardingPeers(.{ .discovery = .cached }, forwarding_deadline)).?;
+            defer hint.release();
+            try std.testing.expect(hint == latest);
+            try std.testing.expectError(error.Timeout, server.acquireDataForwardingPeers(.{ .discovery = .cached }, 0));
+            var canceled_forwarding: antfly.raft.transport.http_common.RequestCancellation = .{};
+            canceled_forwarding.cancel();
+            try std.testing.expectError(error.Cancelled, server.acquireDataForwardingPeers(.{ .discovery = .cached, .cancellation = &canceled_forwarding }, forwarding_deadline));
+            source.invalidateCache();
+            try std.testing.expect(source.control_read_generation == null);
+            try std.testing.expect(source.forwarding_hint_generation == hint);
             const clone_count = source.test_faults.snapshot_result_clones;
             const observed = try cloneAdminSnapshotOwned(alloc, snapshot);
             const head = RemoteMetadataSource.snapshotHead(&observed);

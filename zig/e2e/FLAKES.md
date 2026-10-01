@@ -69,9 +69,33 @@ under ReadIndex returns availability, and descriptor disappearance after an
 authenticated route cannot certify a row miss. Focused regressions preserve
 stale semantics and native certified absence. The v23 frozen-binary mixed
 soak is still running; its results do not qualify later source changes.
-The v23 run has also reproduced a schema publication failure and progressive
-quickstart first-result failures. Those signatures remain open; the deadline
-fix below does not establish their causes or qualify the publication path.
+The v23 run also reproduced two schema HTTP 500 failures: a parent point read
+after publication and a child read after cascading delete. Both report a
+system-catalog `ReadFailed` collapsed into `RuntimeBoundaryFailure`. Its
+quickstart soak completed with 196/200 progressive passes and four other cases
+200/200 each. All four progressive failures were completion stalls after both
+indexes became queryable, with repeated `EnrichmentLeaseFenceLost` warnings.
+They were not first-result failures. These runs do not qualify later changes.
+
+The HTTP executor now retrieves std.http's underlying header/body read error
+before crossing archive boundaries. Truncated response bodies become
+`InvalidResponse`, which the existing read-only catalog retry loop handles
+inside its original deadline. It also checks that the HTTP framing reached its
+terminal state: a premature Content-Length EOF can otherwise expose a valid
+JSON prefix as success. The fault matrix covers both transfer encodings and
+buffered/streamed GET/POST, with one send per request and no success flush for
+partial streams. The executor never retries a delivered mutation or treats
+partial bytes as a successful response. Catalog invalidation retains
+one immutable endpoint-hint generation for admitted cache-only write forwarding;
+it remains unavailable to authoritative reads and planning, and the receiving
+owner still checks group leadership and the unchanged write-route fence.
+
+Enrichment renews the exact admitted lease epoch throughout a replay pass,
+including text provider waits and draining concurrent lanes. Writer contention
+retries promptly within the lease slack. Independently scheduled renewals cannot
+shorten durable expiry, and renewal updates the cached scheduling deadline and
+statistics only for the matching held tenure. Durable write fences still reject
+expired or superseded epochs. Qualification of these changes remains pending.
 
 Owner admission now preserves the request's deadline, executor clock and
 cancellation through ordinary lookup and lease acquisition. Descriptor reads

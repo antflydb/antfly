@@ -105737,6 +105737,47 @@ test "db leased enrichment worker generates dense embeddings" {
     try expectDenseEmbeddingArtifactValue(alloc, artifacts[0].value, enrichment_artifact_codec.hashSource("generated vector text"), 3);
 }
 
+test "db leased enrichment worker renews text replay tenure across provider waits" {
+    const alloc = std.testing.allocator;
+    const Slow = struct {
+        calls: usize = 0,
+        fn embed(ptr: *anyopaque, a: Allocator, name: []const u8, text: []const u8, dims: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            // Plain text uses no document-transform heartbeat guard. The
+            // replay tenure must survive several renewal intervals itself.
+            sleepNs(2500 * std.time.ns_per_ms);
+            var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+            return deterministic.interface().embedDense(a, name, text, dims);
+        }
+    };
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var slow = Slow{};
+    var db = try DB.open(alloc, path_tmp.path(), .{
+        .start_optional_runtime_workers = false,
+        .enrichment = .{
+            .owner_id = "text-replay-owner",
+            .lease_ttl_ms = 1000,
+            .dense_embedder = .{ .ptr = &slow, .dense_embed_fn = Slow.embed },
+        },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense\"}}",
+    });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"slow text provider\"}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    const stats = db.enrichment_runtime.?.stats();
+    try std.testing.expectEqual(@as(usize, 1), slow.calls);
+    try std.testing.expectEqual(@as(u64, 0), stats.lost_leases);
+    try std.testing.expectEqual(db.core.nextEnrichmentSequence(), stats.applied_sequence);
+    try std.testing.expect(stats.has_lease);
+    try std.testing.expect(db.enrichment_runtime.?.ownership.renewal_count > 0);
+}
+
 test "db leased enrichment worker backs off while a stale owner holds the lease" {
     const alloc = std.testing.allocator;
 
