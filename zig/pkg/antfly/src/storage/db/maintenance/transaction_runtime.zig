@@ -558,12 +558,21 @@ test "local transaction recovery factory releases owned adapters on initializati
             return error.FactoryInitializationFailed;
         }
     };
+    // Force creation of an owned erased adapter around a borrowed backend.
+    // The caller's store remains live after factory failure and runtime close.
+    const Handle = struct {
+        store: backend_erased.Store,
+        pub fn backendStore(self: *@This()) backend_erased.Store {
+            return self.store;
+        }
+    };
+    var handle = Handle{ .store = store };
     var ctx: u8 = 0;
-    try std.testing.expectError(error.FactoryInitializationFailed, Runtime.init(alloc, &store, background.ptr(), .{
+    try std.testing.expectError(error.FactoryInitializationFailed, Runtime.init(alloc, &handle, background.ptr(), .{
         .enabled = true,
         .factory = .{ .ptr = &ctx, .create = Failure.create },
     }));
-    var disabled = try Runtime.init(alloc, &store, background.ptr(), .{
+    var disabled = try Runtime.init(alloc, &handle, background.ptr(), .{
         .enabled = false,
         .factory = .{ .ptr = &ctx, .create = Failure.create },
     });
