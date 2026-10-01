@@ -96,7 +96,7 @@ pub fn normalizeBatch(payload: effects.BatchMutationPayload) !@import("replicate
         .none };
 }
 
-test "storage.db replication ingress normalizes every ordered provenance field" {
+test "normalizes every ordered provenance field" {
     const std = @import("std");
     inline for (.{ "ordinary_raft_entry", "artifact_publication_raft_entry", "artifact_publication_transport_raft_entry", "merge_proof_adoption_raft_entry", "artifact_catalog_raft_entry", "initial_child_raft_entry", "graph_retirement_raft_entry", "restore_generation_admission_raft_entry" }) |field| {
         var payload: effects.BatchMutationPayload = .{ .request = .{} };
