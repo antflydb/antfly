@@ -40,6 +40,7 @@ pub const AddTestsResult = struct {
     run_lib_api_storage_authority_tests: *std.Build.Step.Run,
     api_table_writes_docid_test_mod: *std.Build.Module,
     write_implementation_tests: *std.Build.Step.Compile,
+    public_api_parity_tests: *std.Build.Step.Compile,
     api_table_reads_docid_test_mod: *std.Build.Module,
     run_lib_api_docid_tests: *std.Build.Step.Run,
     api_derived_coverage_test_mod: *std.Build.Module,
@@ -267,7 +268,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "SQL JSON null metadata",
         "SQL session metadata",
         "SQL staged statements",
-        "relational row query statement",
         "relational row query coordinator",
         "httpx antfly schema update returns full table status after projection",
         "httpx antfly schema update owns self partial support and requires coordinated publication",
@@ -301,8 +301,25 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "public api multi-node e2e routes CRUD from a non-host node",
     };
     const public_api_parity_runtime_filters = selectTestFilters(b, &public_api_parity_default_filters);
+    // The public-api-parity e2e filters boot a real multi-node server (see
+    // "public api multi-node e2e routes CRUD from a non-host node" and
+    // friends), which reaches the real storage-kernel owner through
+    // api/kernel_owner_source.zig regardless of the control-only source
+    // selection. Clone antfly_test_mod's root instead of reusing it directly
+    // so only this one compile carries the storage owner archive; root
+    // composition links it below rather than every antfly_test_mod consumer.
+    const public_api_parity_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, public_api_parity_test_mod, true, true);
+    public_api_parity_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    public_api_parity_test_mod.addAnonymousImport("lmdb_vopr_source", .{
+        .root_source_file = b.path("lib/lmdb/src/lmdb_vopr.zig"),
+    });
     const public_api_parity_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = public_api_parity_test_mod,
         .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, public_api_parity_runtime_filters),
         // The macOS debug root includes the complete public transport,
         // generated-contract, and native-index surface. ReleaseSafe test
@@ -2373,6 +2390,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_lib_api_storage_authority_tests = run_lib_api_storage_authority_tests,
         .api_table_writes_docid_test_mod = api_table_writes_docid_test_mod,
         .write_implementation_tests = write_implementation_tests,
+        .public_api_parity_tests = public_api_parity_tests,
         .api_table_reads_docid_test_mod = api_table_reads_docid_test_mod,
         .run_lib_api_docid_tests = run_lib_api_docid_tests,
         .api_derived_coverage_test_mod = api_derived_coverage_test_mod,

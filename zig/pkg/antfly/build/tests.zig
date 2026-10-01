@@ -83,6 +83,9 @@ pub const AddTestsResult = struct {
     standalone_runtime_test_step: *std.Build.Step,
     standalone_initial_fk_tests: *std.Build.Step.Compile,
     standalone_policy_ha_tests: *std.Build.Step.Compile,
+    lite_cmd_tests: *std.Build.Step.Compile,
+    lib_standalone_runtime_tests: *std.Build.Step.Compile,
+    public_api_parity_tests: *std.Build.Step.Compile,
     vopr_test_step: *std.Build.Step,
     integration_test_step: *std.Build.Step,
     chaos_test_step: *std.Build.Step,
@@ -2447,6 +2450,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_raft_transition_runtime_docid_tests = api_tests_addTests_result.run_raft_transition_runtime_docid_tests;
     const run_api_table_writes_production_regression_unit_tests = api_tests_addTests_result.run_api_table_writes_production_regression_unit_tests;
     const run_lib_docid_lifecycle_tests = api_tests_addTests_result.run_lib_docid_lifecycle_tests;
+    const public_api_parity_tests = api_tests_addTests_result.public_api_parity_tests;
 
     const openapi_root_check_step = b.step("openapi-root-check", "Check that the bundled root OpenAPI spec matches the modular Zig specs");
     openapi_root_check_step.dependOn(&openapi_root_check.step);
@@ -4397,8 +4401,31 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const system_catalog_standalone_step = b.step("antfly-system-catalog-standalone-test", "Run standalone catalog checkpoint and rollback tests");
     system_catalog_standalone_step.dependOn(&b.addRunArtifact(system_catalog_standalone_tests).step);
+    // This filter set boots the real CLI/standalone and Lite server paths
+    // (HA, hot-standby, Lite adoption, ...), which reach the real
+    // storage-kernel owner through api/kernel_owner_source.zig the same way
+    // production does, regardless of the control-only source selection.
+    // Clone standalone_runtime_test_mod instead of reusing it directly so
+    // only this one compile carries the storage owner archive; root
+    // composition links it below rather than every standalone runtime
+    // consumer (system_catalog_standalone_tests, standalone_restore_tests).
+    const lib_standalone_runtime_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/standalone_runtime_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    standalone_runtime_imports.configure(b, lib_standalone_runtime_test_mod, true, true);
+    lib_standalone_runtime_test_mod.addImport("antfly_openapi_specs", standalone_runtime_imports.runtime.embedded_openapi);
+    const usermgr_storage_lib_standalone_runtime_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    usermgr_storage_lib_standalone_runtime_test_mod.addImport("antfly_root", lib_standalone_runtime_test_mod);
+    usermgr_storage_lib_standalone_runtime_test_mod.addImport("antfly_platform", platform_mod);
+    lib_standalone_runtime_test_mod.addImport("usermgr_storage", usermgr_storage_lib_standalone_runtime_test_mod);
     const lib_standalone_runtime_tests = b.addTest(.{
-        .root_module = standalone_runtime_test_mod,
+        .root_module = lib_standalone_runtime_test_mod,
         .filters = &.{
             "standalone runtime module compiles",
             "standalone.runtime.test.system catalog",
@@ -6590,6 +6617,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .standalone_runtime_test_step = lib_standalone_runtime_test_step,
         .standalone_initial_fk_tests = standalone_initial_fk_tests,
         .standalone_policy_ha_tests = standalone_policy_ha_tests,
+        .lite_cmd_tests = lite_cmd_tests,
+        .lib_standalone_runtime_tests = lib_standalone_runtime_tests,
+        .public_api_parity_tests = public_api_parity_tests,
         .vopr_test_step = vopr_test_step,
         .integration_test_step = integration_test_step,
         .chaos_test_step = chaos_test_step,
