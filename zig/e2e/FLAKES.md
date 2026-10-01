@@ -57,8 +57,8 @@ HTTP failures as well as transport failures. This concrete false-absence defect
 is fixed; the retained cluster does not establish which endpoint returned the
 unproved miss, so final qualification must include the publication path.
 
-Qualification of the final merged executable remains pending; earlier frozen
-600/600 recovery runs do not qualify these subsequent architectural changes.
+Earlier frozen 600/600 recovery runs do not qualify these subsequent
+architectural changes; the final v25 qualification is recorded below.
 
 The v22 mixed soak passed Autograph and FK recovery 200/200 each, but schema
 publication passed 198/200: two successful jobs were followed by a frontend
@@ -68,7 +68,7 @@ stage. Two additional false-absence paths are now guarded: a missing route
 under ReadIndex returns availability, and descriptor disappearance after an
 authenticated route cannot certify a row miss. Focused regressions preserve
 stale semantics and native certified absence. The v23 frozen-binary mixed
-soak is still running; its results do not qualify later source changes.
+soak completed; its results do not qualify later source changes.
 The v23 run also reproduced two schema HTTP 500 failures: a parent point read
 after publication and a child read after cascading delete. Both report a
 system-catalog `ReadFailed` collapsed into `RuntimeBoundaryFailure`. Its
@@ -95,7 +95,46 @@ including text provider waits and draining concurrent lanes. Writer contention
 retries promptly within the lease slack. Independently scheduled renewals cannot
 shorten durable expiry, and renewal updates the cached scheduling deadline and
 statistics only for the matching held tenure. Durable write fences still reject
-expired or superseded epochs. Qualification of these changes remains pending.
+expired or superseded epochs.
+
+Final v25 native macOS arm64 qualification completed on 2026-10-01 against
+the frozen Debug server from `a70f7dd221`, SHA-256
+`1e703bb3542313233ad67be092a06b20e1e55e9fb85e18ce76482c4b4505d1fb`.
+The repository regression loop passed Autograph, snapshot-owner FK recovery,
+and publication-reply-loss schema recovery **200/200 each**, with exit code 0.
+The shared-process quickstart loop passed progressive indexing and all four
+preceding managed-index cases **200/200 each**, also with exit code 0. These
+results are not pooled with earlier executable revisions. Linux CI remains a
+separate gate: run `36819027473` lost the x86_64 runner and its E2E build failed
+before running tests because shared fixture modules received duplicate
+`antfly_build_info_version` link objects. Final executable link inputs now attach
+once per root module, independently of the number of filtered test executables.
+
+Hosted initial, self and truncate FK recovery selections now execute in the
+normal native Zig unit inventory, serially after ordinary unit work. The focused
+`antfly-api-hosted-recovery-test` target reuses those compiler artifacts without
+running the whole inventory. They inherit the selected build mode (Debug by
+default), require zero skips and retain a 15-minute execution deadline per suite
+through the shared test runner. E2E jobs package only the server; there are no
+separate FK runner lanes or fixture optimization overrides. Approved PR runs
+use the reusable workflow on main, so this workflow layout takes effect only
+after merge; the old workflow still expects the removed fixture packaging.
+
+The native migration check exposed single-voter self-FK DDL returning HTTP 500
+with `StorageReadTemporarilyUnavailable` before proposal admission. Those
+fixtures waited for public catalog readiness, while only the three-voter case
+proved the metadata frontend's routed ReadIndex identity and integrity-catalog
+readiness. All self-FK publication cases now establish that same read-only
+prerequisite before submitting DDL once. The barrier retries only transient
+readiness errors; it does not retry a possibly delivered mutation or weaken
+restart/lost-reply proofs.
+
+Final native Debug migration verification passed initial FK **8/8**, self-FK
+**4/4** and external-parent/graph truncate **7/7**, with zero skips, failures or
+leaks and all 34 build steps successful. External-parent/graph fixtures accept
+asynchronous CREATE admission while preserving the subsequent table barriers
+and all recovery assertions. Shared-runner regressions passed 11/11, shard
+tests passed 9/9, and workflow lint, shell syntax and Zig formatting passed.
 
 Owner admission now preserves the request's deadline, executor clock and
 cancellation through ordinary lookup and lease acquisition. Descriptor reads

@@ -77,16 +77,6 @@ fi
 zig version
 
 build_steps=(antfly)
-case "${ANTFLY_CI_BUILD_FK_RECOVERY:-false}" in
-  true)
-    build_steps+=(antfly-hosted-fk-recovery-binaries)
-    # Recovery fixtures are correctness tests; keep their checks independently
-    # of the server packaging mode while reusing its provider archives.
-    build_args+=("-Dhosted-fk-optimize=${ANTFLY_CI_FK_RECOVERY_OPTIMIZE:-Debug}")
-    ;;
-  false) ;;
-  *) echo "ANTFLY_CI_BUILD_FK_RECOVERY must be true or false" >&2; exit 2 ;;
-esac
 if [[ "$build_capi" == "true" ]]; then
   build_steps+=(capi capi-smoke)
 fi

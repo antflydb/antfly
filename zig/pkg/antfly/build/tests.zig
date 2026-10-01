@@ -6578,6 +6578,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         &run_sparse_unit_tests.step,
     });
 
+    // Recovery services contend for the same local persistence resources. Run
+    // this bounded native integration suffix after ordinary unit work, without
+    // another runner or another provider-archive build. Focused targets retain
+    // independent run nodes over the same compiler artifacts.
+    var recovery_tail: ?*std.Build.Step = null;
+    for (api_tests_addTests_result.hosted_recovery_tests) |tests| {
+        const run = @import("test_support.zig").addRequiredTestRunArtifact(b, tests, 15 * 60 * 1000);
+        if (recovery_tail) |previous| {
+            run.step.dependOn(previous);
+        } else {
+            for (unit_test_step.dependencies.items) |dependency| run.step.dependOn(dependency);
+        }
+        recovery_tail = &run.step;
+    }
+    unit_test_step.dependOn(recovery_tail.?);
+    integration_test_step.dependOn(api_tests_addTests_result.hosted_recovery_step);
+
     return .{
         .vopr_soak_test_step = vopr_soak_test_step,
         .storage_workload_soak_step = storage_workload_soak_step,
