@@ -23,7 +23,7 @@ const lib_sql_build_support = @import("lib/sql/build_support.zig");
 const yacc_build = @import("lib/yacc/build_support.zig");
 const tools_build = @import("tools/build_support.zig");
 
-const pkg_antfly_build_codegen = @import("pkg/antfly/build/codegen.zig");
+const pkg_antfly_build_codegen = @import("build_support/openapi.zig");
 const addOpenApiRootCheckStep = pkg_antfly_build_codegen.addOpenApiRootCheckStep;
 const addOpenApiSourceSteps = pkg_antfly_build_codegen.addOpenApiSourceSteps;
 
@@ -237,6 +237,16 @@ pub fn create(b: *std.Build) ?Artifacts {
     openapi_regen_step.dependOn(&update_public_openapi.step);
     const openapi_check_step = b.step("check-openapi", "Compare checked-in OpenAPI sources without modifying them");
     openapi_check_step.dependOn(&openapi_sources.check.step);
+    const openapi_docs_test_mod = b.createModule(.{
+        .root_source_file = b.path("build_support/openapi_exact_sort_test.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    openapi_docs_test_mod.addAnonymousImport("public_types.zig", .{ .root_source_file = b.path("pkg/antfly-embedded/src/openapi/generated/antfly_public_openapi/types.zig") });
+    openapi_docs_test_mod.addAnonymousImport("metadata_types.zig", .{ .root_source_file = b.path("pkg/antfly-embedded/src/openapi/generated/antfly_metadata_openapi/types.zig") });
+    openapi_docs_test_mod.addAnonymousImport("client_types.zig", .{ .root_source_file = b.path("pkg/antfly-client/src/openapi/generated/antfly_client_openapi/types.zig") });
+    const openapi_docs_test = b.addTest(.{ .root_module = openapi_docs_test_mod });
+    openapi_check_step.dependOn(&b.addRunArtifact(openapi_docs_test).step);
     const yacc_codegen = yacc_build.addCompiler(b, b.path("lib/yacc"), target, optimize);
     b.step("yacc-zig", "Build and install the standalone Zig yacc generator").dependOn(&b.addInstallArtifact(yacc_codegen, .{}).step);
     const yacc_tests = b.addTest(.{ .root_module = b.createModule(.{
@@ -306,7 +316,9 @@ pub fn create(b: *std.Build) ?Artifacts {
     const openapi_root_check = addOpenApiRootCheckStep(b);
     openapi_check_step.dependOn(&openapi_root_check.step);
     const openapi_modules = pkg_antfly_build_codegen.createCommittedModules(b, .{
-        .root = b.path("pkg/antfly/src/openapi/generated"),
+        .root = b.path("pkg/antfly-embedded/src/openapi/generated"),
+        .client_root = b.path("pkg/antfly-client/src/openapi/generated"),
+        .server_root = b.path("pkg/antfly-server-api/src/openapi/generated"),
         .target = target,
         .optimize = optimize,
         .httpx = httpx_mod,
@@ -314,6 +326,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .export_modules = true,
     });
     const public_openapi_mod = openapi_modules.public;
+    const public_server_openapi_mod = openapi_modules.public_server;
     const client_openapi_mod = openapi_modules.client;
     const schema_openapi_mod = openapi_modules.schema;
     const indexes_openapi_mod = openapi_modules.indexes;
@@ -323,7 +336,9 @@ pub fn create(b: *std.Build) ?Artifacts {
     const admin_openapi_mod = openapi_modules.admin;
     const internal_openapi_mod = openapi_modules.internal;
     const usermgr_openapi_mod = openapi_modules.usermgr;
+    const usermgr_server_openapi_mod = openapi_modules.usermgr_server;
     const metadata_openapi_mod = openapi_modules.metadata;
+    const metadata_server_openapi_mod = openapi_modules.metadata_server;
     const logging_openapi_mod = openapi_modules.logging;
     const audio_openapi_mod = openapi_modules.audio;
     const middleware_openapi_mod = openapi_modules.middleware;
@@ -341,6 +356,40 @@ pub fn create(b: *std.Build) ?Artifacts {
     const openai_api_mod = openapi_modules.openai_api;
     const exa_api_mod = openapi_modules.exa_api;
     const tavily_api_mod = openapi_modules.tavily_api;
+
+    // Schema checks execute on the build host even during cross compilation.
+    const openapi_check_json = b.createModule(.{
+        .root_source_file = b.path("lib/json/src/mod.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    const openapi_check_httpx = b.createModule(.{
+        .root_source_file = b.path("lib/httpx/src/httpx.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    openapi_check_httpx.addImport("antfly-json", openapi_check_json);
+    const openapi_check_modules = pkg_antfly_build_codegen.createCommittedModules(b, .{
+        .root = b.path("pkg/antfly-embedded/src/openapi/generated"),
+        .client_root = b.path("pkg/antfly-client/src/openapi/generated"),
+        .server_root = b.path("pkg/antfly-server-api/src/openapi/generated"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .httpx = openapi_check_httpx,
+        .json = openapi_check_json,
+    });
+    const openapi_split_test_mod = b.createModule(.{
+        .root_source_file = b.path("build_support/openapi_split_test.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    openapi_split_test_mod.addImport("antfly_public_openapi", openapi_check_modules.public);
+    openapi_split_test_mod.addImport("antfly_public_server_openapi", openapi_check_modules.public_server);
+    openapi_split_test_mod.addImport("antfly_metadata_openapi", openapi_check_modules.metadata);
+    openapi_split_test_mod.addImport("antfly_metadata_server_openapi", openapi_check_modules.metadata_server);
+    openapi_split_test_mod.addImport("antfly_usermgr_openapi", openapi_check_modules.usermgr);
+    openapi_split_test_mod.addImport("antfly_usermgr_server_openapi", openapi_check_modules.usermgr_server);
+    openapi_check_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = openapi_split_test_mod })).step);
 
     // Handlebars template engine
     const handlebars_dep = b.dependency("handlebars", .{ .target = target, .optimize = optimize });
@@ -739,9 +788,288 @@ pub fn create(b: *std.Build) ?Artifacts {
     });
     const inference_steps = @import("pkg/inference/build/integration.zig").add(inference_workflow, inference_wasm_jinja, inference_wasm_platform);
 
+    const cancellation_mod = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/cancellation.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const cache_budget_mod = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/cache_budget.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cache_budget_mod.addImport("antfly_platform", platform_mod);
+    const runtime_abi_mod = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    runtime_abi_mod.addImport("httpx", httpx_mod);
+    runtime_abi_mod.addImport("antfly_platform", platform_mod);
+    const runtime_fs_mod = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/fs.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    runtime_fs_mod.addImport("antfly_platform", platform_mod);
+    const provision_contract_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/metadata/provision_contract.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const read_state_observer_mod = b.createModule(.{
+        .root_source_file = b.path("lib/raft/src/read_state_observer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    read_state_observer_mod.addImport("raft_engine", raft_engine_mod);
+    const private_error_diagnostics_mod = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/private_error_diagnostics.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    private_error_diagnostics_mod.addImport("antfly_platform", platform_mod);
+    const inference_bridge_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/bridge.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_bridge_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
+    inference_bridge_mod.addImport("antfly_image", image_mod);
+    const inference_provider_failure_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/provider_failure.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_provider_failure_mod.addImport("antfly_inference_bridge", inference_bridge_mod);
+    inference_provider_failure_mod.addImport("antfly_private_error_diagnostics", private_error_diagnostics_mod);
+    inference_provider_failure_mod.addImport("antfly_platform", platform_mod);
+    const public_limits_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/api/public_limits.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const template_content_mod = b.createModule(.{
+        .root_source_file = b.path("lib/template/src/content_part.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const sparse_embedding_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/sparse_embedding.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const inference_worker_rpc_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/worker_rpc.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_worker_rpc_mod.addImport("httpx", httpx_mod);
+    const inference_embedding_wire_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/embedding_wire.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_embedding_wire_mod.addImport("httpx", httpx_mod);
+    const inference_types_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/types.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_types_mod.addImport("antfly_generating", generating_mod);
+    const inference_work_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/work.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_work_mod.addImport("antfly_scraping", scraping_mod);
+    inference_work_mod.addImport("antfly_image", image_mod);
+    const inference_worker_wire_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/worker_wire.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_worker_wire_mod.addImport("antfly_inference_bridge", inference_bridge_mod);
+    inference_worker_wire_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
+    inference_worker_wire_mod.addImport("httpx", httpx_mod);
+    inference_worker_wire_mod.addImport("antfly_inference_worker_rpc", inference_worker_rpc_mod);
+    inference_worker_wire_mod.addImport("antfly_inference_work", inference_work_mod);
+    inference_worker_wire_mod.addImport("antfly_public_limits", public_limits_mod);
+    const inference_openai_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/inference/providers/openai.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_openai_mod.addImport("httpx", httpx_mod);
+    inference_openai_mod.addImport("openai_api", openai_api_mod);
+    inference_openai_mod.addImport("antfly_inference_types", inference_types_mod);
+    const inference_provider_defaults_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/inference/providers/provider_defaults.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const inference_bedrock_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/inference/providers/bedrock.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_bedrock_mod.addImport("antfly_cancellation", cancellation_mod);
+    inference_bedrock_mod.addImport("httpx", httpx_mod);
+    inference_bedrock_mod.addImport("antfly_inference_types", inference_types_mod);
+    inference_bedrock_mod.addImport("antfly_inference_work", inference_work_mod);
+    inference_bedrock_mod.addImport("antfly_credentials", credentials_mod);
+    inference_bedrock_mod.addImport("antfly_inference_provider_defaults", inference_provider_defaults_mod);
+    inference_bedrock_mod.addImport("antfly_template_content", template_content_mod);
+    const inference_local_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/inference/providers/local.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_local_mod.addImport("antfly_cancellation", cancellation_mod);
+    inference_local_mod.addImport("httpx", httpx_mod);
+    inference_local_mod.addImport("inference_api", inference_api_mod);
+    inference_local_mod.addImport("antfly_inference_types", inference_types_mod);
+    inference_local_mod.addImport("antfly_inference_work", inference_work_mod);
+    inference_local_mod.addImport("antfly_template_content", template_content_mod);
+    const inference_vertex_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/inference/providers/vertex.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_vertex_mod.addImport("antfly_scraping", scraping_mod);
+    inference_vertex_mod.addImport("httpx", httpx_mod);
+    inference_vertex_mod.addImport("antfly_google", google_mod);
+    inference_vertex_mod.addImport("antfly_inference_types", inference_types_mod);
+    inference_vertex_mod.addImport("antfly_inference_provider_defaults", inference_provider_defaults_mod);
+    const inference_list_models_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/inference/providers/list_models.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_list_models_mod.addImport("httpx", httpx_mod);
+    inference_list_models_mod.addImport("antfly_inference_bedrock", inference_bedrock_mod);
+    inference_list_models_mod.addImport("antfly_inference_vertex", inference_vertex_mod);
+    inference_list_models_mod.addImport("antfly_inference_provider_defaults", inference_provider_defaults_mod);
+    const inference_remote_capabilities_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/inference/remote_capabilities.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_remote_capabilities_mod.addImport("antfly_platform", platform_mod);
+    inference_remote_capabilities_mod.addImport("httpx", httpx_mod);
+    inference_remote_capabilities_mod.addImport("antfly_inference_work", inference_work_mod);
+    inference_remote_capabilities_mod.addImport("antfly_cancellation", cancellation_mod);
+    const inference_execution_control_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/execution_control.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_execution_control_mod.addImport("antfly_platform", platform_mod);
+    inference_execution_control_mod.addImport("antfly_cancellation", cancellation_mod);
+    const inference_execution_context_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/inference/execution_context.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_execution_context_mod.addImport("antfly_platform", platform_mod);
+    inference_execution_context_mod.addImport("httpx", httpx_mod);
+    inference_execution_context_mod.addImport("antfly_inference_remote_capabilities", inference_remote_capabilities_mod);
+    inference_execution_context_mod.addImport("antfly_cancellation", cancellation_mod);
+    inference_execution_context_mod.addImport("antfly_inference_execution_control", inference_execution_control_mod);
+    const inference_request_types_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/request_types.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_request_types_mod.addImport("antfly_inference_execution_control", inference_execution_control_mod);
+    const inference_runtime_paths_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/runtime_paths.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_runtime_paths_mod.addImport("antfly_platform", platform_mod);
+    inference_runtime_paths_mod.addImport("inference_server", inference_server_mod);
+    const inference_query_embedding_cache_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/inference/providers/query_embedding_cache.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_query_embedding_cache_mod.addImport("antfly_cache_budget", cache_budget_mod);
+    inference_query_embedding_cache_mod.addImport("antfly_platform", platform_mod);
+    const inference_host_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/host.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_host_mod.addImport("httpx", httpx_mod);
+    inference_host_mod.addImport("antfly_readers", readers_mod);
+    inference_host_mod.addImport("antfly_transcribing", transcribing_mod);
+    inference_host_mod.addImport("antfly_extracting", extracting_mod);
+    inference_host_mod.addImport("antfly_scraping", scraping_mod);
+    inference_host_mod.addImport("antfly_template_content", template_content_mod);
+    inference_host_mod.addImport("antfly_sparse_embedding", sparse_embedding_mod);
+    inference_host_mod.addImport("antfly_inference_types", inference_types_mod);
+    inference_host_mod.addImport("antfly_inference_work", inference_work_mod);
+    inference_host_mod.addImport("antfly_inference_request_types", inference_request_types_mod);
+    inference_host_mod.addImport("antfly_inference_execution_control", inference_execution_control_mod);
+    inference_host_mod.addImport("antfly_inference_runtime_paths", inference_runtime_paths_mod);
+    inference_host_mod.addImport("inference_server", inference_server_mod);
+    inference_host_mod.addImport("antfly_inference_bridge", inference_bridge_mod);
+    inference_host_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
+    inference_host_mod.addImport("antfly_platform", platform_mod);
+    inference_host_mod.addImport("inference_api", inference_api_mod);
+    inference_host_mod.addImport("inference_chunker", inference_chunker_mod);
+    inference_host_mod.addImport("antfly_chunking", chunking_mod);
+    inference_host_mod.addImport("antfly_inference_worker_rpc", inference_worker_rpc_mod);
+    inference_host_mod.addImport("antfly_inference_worker_wire", inference_worker_wire_mod);
+    inference_host_mod.addImport("antfly_inference_provider_failure", inference_provider_failure_mod);
+    const inference_openai_tests = b.addTest(.{ .root_module = inference_openai_mod });
+    b.step("antfly-embedded-inference-openai-test", "Run embedded inference OpenAI provider tests")
+        .dependOn(&b.addRunArtifact(inference_openai_tests).step);
+    const embedded_inference_providers_test_step = b.step("antfly-embedded-inference-providers-test", "Run embedded inference provider and discovery tests");
+    inline for (.{
+        inference_provider_defaults_mod,
+        inference_bedrock_mod,
+        inference_local_mod,
+        inference_vertex_mod,
+        inference_list_models_mod,
+        inference_remote_capabilities_mod,
+        inference_execution_context_mod,
+    }) |module| {
+        embedded_inference_providers_test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module })).step);
+    }
     const antfly_imports = AntflyRootImports{
         .sql_parser = sql_parser_mod,
         .storage_boundary = @import("pkg/antfly/build/storage_boundary.zig").create(b, b.path("pkg/antfly/src"), target, optimize),
+        .cancellation = cancellation_mod,
+        .cache_budget = cache_budget_mod,
+        .runtime_abi = runtime_abi_mod,
+        .runtime_fs = runtime_fs_mod,
+        .provision_contract = provision_contract_mod,
+        .read_state_observer = read_state_observer_mod,
+        .private_error_diagnostics = private_error_diagnostics_mod,
+        .inference_bridge = inference_bridge_mod,
+        .inference_provider_failure = inference_provider_failure_mod,
+        .public_limits = public_limits_mod,
+        .template_content = template_content_mod,
+        .sparse_embedding = sparse_embedding_mod,
+        .inference_worker_wire = inference_worker_wire_mod,
+        .inference_worker_rpc = inference_worker_rpc_mod,
+        .inference_embedding_wire = inference_embedding_wire_mod,
+        .inference_types = inference_types_mod,
+        .inference_work = inference_work_mod,
+        .inference_openai = inference_openai_mod,
+        .inference_provider_defaults = inference_provider_defaults_mod,
+        .inference_bedrock = inference_bedrock_mod,
+        .inference_local = inference_local_mod,
+        .inference_list_models = inference_list_models_mod,
+        .inference_vertex = inference_vertex_mod,
+        .inference_remote_capabilities = inference_remote_capabilities_mod,
+        .inference_execution_context = inference_execution_context_mod,
+        .inference_request_types = inference_request_types_mod,
+        .inference_runtime_paths = inference_runtime_paths_mod,
+        .inference_query_embedding_cache = inference_query_embedding_cache_mod,
+        .inference_host = inference_host_mod,
         .build_info = build_info,
         .build_options = build_options,
         .lite_options = antfly_storage_build.createLiteOptions(b, lite_local_inference_runtime),
@@ -752,6 +1080,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         }),
         .raft_engine = raft_engine_mod,
         .public_openapi = public_openapi_mod,
+        .public_server_openapi = public_server_openapi_mod,
         .client_openapi = client_openapi_mod,
         .schema_openapi = schema_openapi_mod,
         .indexes_openapi = indexes_openapi_mod,
@@ -763,7 +1092,9 @@ pub fn create(b: *std.Build) ?Artifacts {
         .admin_openapi = admin_openapi_mod,
         .internal_openapi = internal_openapi_mod,
         .metadata_openapi = metadata_openapi_mod,
+        .metadata_server_openapi = metadata_server_openapi_mod,
         .usermgr_openapi = usermgr_openapi_mod,
+        .usermgr_server_openapi = usermgr_server_openapi_mod,
         .logging_openapi = logging_openapi_mod,
         .audio_openapi = audio_openapi_mod,
         .middleware_openapi = middleware_openapi_mod,

@@ -17,7 +17,7 @@
 //! throughout multi-page listing/footer discovery. Ownership stays with caller.
 const std = @import("std");
 const storage = @import("../../storage/object_storage.zig");
-const Token = @import("../../common/cancellation.zig").CancellationToken;
+const Token = @import("antfly_cancellation").CancellationToken;
 const Allocator = std.mem.Allocator;
 
 pub const ReadAuthority = struct {

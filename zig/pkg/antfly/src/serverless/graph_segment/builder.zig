@@ -16,7 +16,7 @@
 //! of degree; only integer edges survive between input documents/batches.
 const std = @import("std");
 const wire = @import("packed.zig");
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const edge_type = @import("../../graph/edge_type.zig");
 const Allocator = std.mem.Allocator;
 

@@ -15,6 +15,8 @@ pub const index_writer_prefix = "\x00\x00__metadata__:index_span_writer:";
 const index_forward_prefix = "\x00\x00R\x01";
 pub const index_id_bytes = 12;
 pub const index_span_digest_bytes = 16;
+/// Bounds a transaction's retained local range observations.
+pub const max_proofs = 16384;
 pub const bucket_count = 257;
 pub const index_bucket_sentinel: u16 = bucket_count;
 pub const IndexSpan = struct {

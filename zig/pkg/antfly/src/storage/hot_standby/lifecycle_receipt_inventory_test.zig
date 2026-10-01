@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const admin_api = @import("../../admin/mod.zig");
-const fs_paths = @import("../../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const admin_exec = @import("admin_exec.zig");
 const fencing = @import("fencing.zig");
 const http_admin = @import("http_admin.zig");

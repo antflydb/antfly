@@ -1597,6 +1597,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const api_http_runtime_default_filters = [_][]const u8{
         "unconfigured remote catalog authority skips background work without borrowing internal credentials",
+        "usermgr openapi module generates extractor surface for routed endpoints",
+        "generated extractors: path param structs exist",
+        "generated extractors: route table covers public API",
         "artifact enrichment accepts typed chunker and rejects ambiguous legacy config",
         "artifact enrichment list does not expose internal JSON or producer credentials",
         "typed enrichment producer and graph scorer normalize to legacy storage fields",
@@ -2127,7 +2130,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, raft_storage_test_mod, true, true);
     const raft_storage_tests = b.addTest(.{
         .root_module = raft_storage_test_mod,
-        .filters = selectTestFilters(b, &.{}),
+        // Snapshot transport reaches the physical DB. Keep this suite scoped
+        // to its owners instead of collecting every transitive engine test.
+        .filters = selectTestFilters(b, &.{
+            "raft snapshot storage tests are reachable",
+            "raft.storage.file_snapshot_store.",
+            "raft.storage.native_snapshot.",
+        }),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -4457,19 +4466,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone.runtime.test.system catalog",
             "catalog.domain.",
             "standalone runtime local generator accepts media url data uris",
-            "local generate message conversion preserves tool history and admission",
-            "inference worker",
-            "provider failure logging",
-            "provider owner logs private cause",
             "standalone runtime local dense embed preserves borrowed binary media",
-            "standalone numeric result ABI",
-            "standalone raster embedding control",
             "standalone encoded reader ABI round trips borrowed payloads",
             "standalone raster reader ABI preserves borrowed strided pages and identity",
-            "encoded reader ABI enforces resolved model capabilities",
             "standalone runtime local generator preflights mixed resident media exactly",
             "standalone runtime local generator refuses decode allocation beyond preflight",
-            "linked generator validates concrete MIME and decoded pixels",
             "standalone inference middleware reuses public API authentication",
             "standalone CORS middleware",
             "standalone runtime local replica reconcile permit blocks only active startup catch-up",
@@ -4509,14 +4510,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone preserves effective process envelope provenance for inference",
             "standalone kernel JIT mode precedence is CLI then environment then config",
             "inference config falls back to common config",
-            "standalone prompt cache detaches resource observer before owner teardown",
             "inference admission bridge charges combined native residency to resource manager",
             "standalone tokenizer bridge enforces growth and permits exact teardown",
-            "standalone inference keep alive parses compound durations and zero",
-            "standalone preload bridge preserves A4B residency controls",
-            "standalone data directory does not change the default models directory",
-            "standalone linked inference ABI validates the supported function-table prefix",
-            "linked inference ABI rejects mismatched context and function-table prefixes",
             "standalone local inference lifetime distinguishes deadline from upstream cancellation",
             "standalone resolves the default secret store before full config parsing",
             "standalone runtime secret store follows projected symlink rotation",
@@ -4552,7 +4547,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "Lease executor accepts optional CertificateRequest with projected CA and verified hostname",
             "Lease executor accepts TLS 1.2 optional CertificateRequest",
             "Lease executor rejects optional CertificateRequest hostname mismatch",
-            "linked rerank documents become server content parts with attachment references",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -4568,9 +4562,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_standalone_runtime_test_step = b.step("antfly-standalone-runtime-test", "Run focused standalone runtime tests");
     const run_lib_standalone_runtime_tests = addFilteredTestRunArtifact(b, lib_standalone_runtime_tests);
     lib_standalone_runtime_test_step.dependOn(&run_lib_standalone_runtime_tests.step);
-    // Real hidden-owner publication crosses the storage-kernel C ABI. Link
-    // this one fixture separately rather than making every standalone
-    // inference/runtime unit test carry the storage owner artifact.
+    // Real hidden-owner publication crosses the storage-kernel C ABI. Give
+    // these fixtures their own control-only source profile, separate from
+    // the resident storage owners used by the runtime and restore slices.
     const standalone_initial_fk_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/standalone_runtime_test_root.zig"),
         .target = target,
@@ -4627,6 +4621,32 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 18 else 7) * 1024 * 1024 * 1024,
     });
+    inline for (.{
+        test_imports.runtime.inference_bridge,
+        test_imports.runtime.inference_provider_failure,
+        test_imports.runtime.inference_worker_wire,
+    }) |module| {
+        lib_standalone_runtime_test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module })).step);
+    }
+    const inference_host_tests = b.addTest(.{
+        .root_module = test_imports.runtime.inference_host,
+        .filters = &.{
+            "local generate message conversion preserves tool history and admission",
+            "inference worker",
+            "standalone numeric result ABI",
+            "standalone raster embedding control",
+            "encoded reader ABI enforces resolved model capabilities",
+            "linked generator validates concrete MIME and decoded pixels",
+            "standalone prompt cache detaches resource observer before owner teardown",
+            "standalone inference keep alive parses compound durations and zero",
+            "standalone preload bridge preserves A4B residency controls",
+            "standalone data directory does not change the default models directory",
+            "standalone linked inference ABI validates the supported function-table prefix",
+            "linked rerank documents become server content parts with attachment references",
+        },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
+    });
+    lib_standalone_runtime_test_step.dependOn(&b.addRunArtifact(inference_host_tests).step);
     // Keep the complete API worker fixture out of the inference-heavy runtime
     // object. Compile this narrow integration slice independently so adding
     // restore coverage does not inflate every standalone runtime test build.
@@ -4673,6 +4693,28 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const raft_transport_test_step = b.step("antfly-raft-transport-test", "Run raft transport and route reconciliation unit tests");
     raft_transport_test_step.dependOn(&run_raft_transport_tests.step);
     raft_transport_test_step.dependOn(&run_raft_queued_transport_tests.step);
+
+    const server_db_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/server_db_integration_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, server_db_test_mod, true, true);
+    const local_recovery_tests = b.addTest(.{
+        .root_module = server_db_test_mod,
+        .filters = &.{"local transaction recovery"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-local-transaction-recovery-test", "Run local transaction recovery regressions").dependOn(&addFilteredTestRunArtifact(b, local_recovery_tests).step);
+    const server_db_filters = [_][]const u8{ "storage.server_db_integration_test.", "storage.server_transaction_recovery." };
+    const server_db_tests = b.addTest(.{
+        .root_module = server_db_test_mod,
+        .filters = &server_db_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_server_db_tests = addCuratedTestRunArtifact(b, server_db_tests, &server_db_filters);
+    b.step("antfly-server-db-test", "Run server ordered apply and transaction recovery integration tests").dependOn(&run_server_db_tests.step);
+    unit_test_step.dependOn(&run_server_db_tests.step);
 
     const raft_storage_test_step = b.step("antfly-raft-storage-test", "Run Raft snapshot artifact storage tests");
     raft_storage_test_step.dependOn(&run_raft_storage_tests.step);
@@ -5295,6 +5337,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     integration_test_step.dependOn(&run_maintenance_worker_tests.step);
 
     const graph_metric_fan_in_filters = [_][]const u8{
+        "local graph metric reads reject invalid freshness without leaking",
         "query parser accepts direct graph metric reads",
         "query parser accepts graph metric rerank",
         "api query contract bounds graph metric top k",
@@ -5361,6 +5404,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_graph_metric_fan_in_tests = @import("test_support.zig").addCuratedTestRunArtifact(b, graph_metric_fan_in_tests, &graph_metric_fan_in_filters);
     unit_test_step.dependOn(&run_graph_metric_fan_in_tests.step);
+    b.step("antfly-graph-metric-contract-test", "Run graph metric request and response contract tests").dependOn(&run_graph_metric_fan_in_tests.step);
 
     const graph_metric_remote_wire_filters = [_][]const u8{
         "api http client authenticates only the internal API namespace",
@@ -5850,6 +5894,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.backfill_state.",
             "storage.db.batcher.",
             "storage.db.config.",
+            "storage.db.apply_receipts.",
+            "storage.db.durable_outbox.",
+            "storage.db.durable_outbox_store.",
+            "storage.db.primary_effect.",
+            "storage.db.replication_contract.",
+            "storage.db.replication_ingress.",
+            "storage.db.replication_effects.",
+            "storage.db.commit_integration.",
+            "storage.db.replication_record.",
+
             "storage.db.column_read_cache.",
             "storage.db.column_scan_plan.",
             "storage.db.db.",
@@ -5867,7 +5921,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.graph_retirement_config.",
             "storage.db.graph_retirement_seal.",
             "storage.db.empty_generation_handoff.",
-            "storage.db.native_topology_receipt.",
             "storage.db.receipt_position.",
             "storage.db.graph_edge_ttl_expiration.",
             "storage.db.graph_edge_ttl_tombstone.",
@@ -5876,7 +5929,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.merge_contract.",
             "storage.db.merge_page_system_test.",
             "storage.db.merge_page_wire.",
-            "storage.db.native_raft_snapshot.",
             "storage.db.online_merge_io.",
             "storage.db.online_integrity_shadow.",
             "storage.db.online_merge_io_contract.",
@@ -5986,6 +6038,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.backup_bundle.",
             "storage.backup_bundle_io.",
             "storage.backup_codec.",
+            "storage.backup_restore.",
             "storage.backup_repository.",
             "storage.coverage_identity.",
             "storage.coordinated_ttl.",
@@ -6066,6 +6119,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "unit-storage-test",
         "Run the storage portion of the default antfly-unit-test target in bounded codegen shards",
     );
+    unit_storage_sharded_test_step.dependOn(&run_server_db_tests.step);
+    lib_storage_test_step.dependOn(&run_server_db_tests.step);
     const unit_storage_shard_audit = b.addSystemCommand(&.{"python3"});
     unit_storage_shard_audit.addFileArg(b.path("tools/audit_storage_test_shards.py"));
     unit_storage_shard_audit.addArg("--root");
@@ -6081,6 +6136,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         unit_storage_shard_audit.addArg("--dedicated");
         unit_storage_shard_audit.addFileArg(b.path(b.fmt("pkg/antfly/src/storage/{s}", .{source})));
     }
+    for ([_][]const u8{ "server_db_integration_test.zig", "server_transaction_recovery.zig" }) |source| {
+        unit_storage_shard_audit.addArg("--dedicated");
+        unit_storage_shard_audit.addFileArg(b.path(b.fmt("pkg/antfly/src/storage/{s}", .{source})));
+    }
     unit_storage_shard_audit.addArg("--runtime-partition-source");
     unit_storage_shard_audit.addFileArg(b.path("pkg/antfly/src/storage/db/db.zig"));
     for (unit_storage_db_core_lane_filters) |lane_filter| {
@@ -6091,6 +6150,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "Verify every test-bearing storage module belongs to a bounded codegen shard",
     );
     unit_storage_shard_audit_step.dependOn(&unit_storage_shard_audit.step);
+    const embedded_source_boundary = b.addSystemCommand(&.{"python3"});
+    embedded_source_boundary.addFileArg(b.path("tools/audit_embedded_source_boundary.py"));
+    embedded_source_boundary.addArgs(&.{ "--entry", "embedded_root.zig", "--entry", "storage/db/db.zig", "--entry", "public_capi_root.zig" });
+    const embedded_source_boundary_tests = b.addSystemCommand(&.{"python3"});
+    embedded_source_boundary_tests.addFileArg(b.path("tools/test_audit_embedded_source_boundary.py"));
+    const embedded_source_boundary_step = b.step(
+        "embedded-source-boundary-check",
+        "Verify the authored local engine sources do not import server coordination",
+    );
+    embedded_source_boundary_step.dependOn(&embedded_source_boundary.step);
+    embedded_source_boundary_step.dependOn(&embedded_source_boundary_tests.step);
+    unit_storage_shard_audit.step.dependOn(embedded_source_boundary_step);
     const storage_runtime_filter_is_default =
         lib_storage_runtime_filters.len == 1 and
         std.mem.eql(u8, lib_storage_runtime_filters[0], "storage.");
@@ -6670,9 +6741,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .chaos_test_step = chaos_test_step,
         .compiled_recall_tests = compiled_recall_tests,
         .storage_test_step = lib_storage_test_step,
-        // The CLI and its meta/registry tests share a root module. Register
-        // that consumer once so all three link the production ABI providers.
-        .linked_consumer_tests = std.mem.concat(b.allocator, *std.Build.Step.Compile, &.{ api_tests_addTests_result.linked_consumer_tests, data_tests_addTests_result.linked_consumer_tests, &.{ provisioned_query_visibility_tests.consumer.executable, graph_metric_remote_wire_tests.consumer.executable, vopr_cli } }) catch @panic("OOM"),
+        // Runtime/restore and VOPR CLI/meta/registry slices each share a root.
+        // Register both roots once to link their production ABI providers.
+        .linked_consumer_tests = std.mem.concat(b.allocator, *std.Build.Step.Compile, &.{ api_tests_addTests_result.linked_consumer_tests, data_tests_addTests_result.linked_consumer_tests, &.{ provisioned_query_visibility_tests.consumer.executable, graph_metric_remote_wire_tests.consumer.executable, lib_standalone_runtime_tests, vopr_cli } }) catch @panic("OOM"),
     };
 }
 

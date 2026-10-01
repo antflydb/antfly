@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const filter = @import("filter.zig");
 const foreign_source = @import("source.zig");
 const postgres_libpq = @import("postgres_libpq.zig");

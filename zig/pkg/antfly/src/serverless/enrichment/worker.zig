@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const api_codec = @import("../api/codec.zig");
 const api_types = @import("../api/types.zig");
 const artifacts_mod = @import("../artifacts/mod.zig");

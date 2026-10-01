@@ -16,61 +16,7 @@ const std = @import("std");
 const db_types = @import("../storage/db/types.zig");
 const read_gate = @import("read_gate.zig");
 
-pub const FeatureReads = struct {
-    gate: read_gate.EnrichmentReadGate,
-
-    pub fn init(read_safety_barrier: read_gate.ReadSafetyBarrier) FeatureReads {
-        return .{ .gate = read_gate.EnrichmentReadGate.init(read_safety_barrier) };
-    }
-
-    pub fn prepareSearchWithConsistency(
-        self: FeatureReads,
-        group_id: u64,
-        req: db_types.SearchRequest,
-        consistency: read_gate.ReadConsistency,
-    ) !void {
-        try self.gate.prepareSearch(group_id, req, consistency);
-    }
-
-    pub fn prepareSearch(self: FeatureReads, group_id: u64, req: db_types.SearchRequest) !void {
-        try self.prepareSearchWithConsistency(group_id, req, .read_index);
-    }
-
-    pub fn prepareLookupWithConsistency(
-        self: FeatureReads,
-        group_id: u64,
-        key: []const u8,
-        opts: db_types.LookupOptions,
-        consistency: read_gate.ReadConsistency,
-    ) !void {
-        try self.gate.prepareLookup(group_id, key, opts, consistency);
-    }
-
-    pub fn prepareLookup(self: FeatureReads, group_id: u64, key: []const u8, opts: db_types.LookupOptions) !void {
-        try self.prepareLookupWithConsistency(group_id, key, opts, .read_index);
-    }
-
-    pub fn prepareScanWithConsistency(
-        self: FeatureReads,
-        group_id: u64,
-        from_key: []const u8,
-        to_key: []const u8,
-        opts: db_types.ScanOptions,
-        consistency: read_gate.ReadConsistency,
-    ) !void {
-        try self.gate.prepareScan(group_id, from_key, to_key, opts, consistency);
-    }
-
-    pub fn prepareScan(
-        self: FeatureReads,
-        group_id: u64,
-        from_key: []const u8,
-        to_key: []const u8,
-        opts: db_types.ScanOptions,
-    ) !void {
-        try self.prepareScanWithConsistency(group_id, from_key, to_key, opts, .read_index);
-    }
-};
+pub const FeatureReads = @import("../storage/read_consistency.zig").FeatureReads;
 
 test "feature reads facade forwards typed requests with explicit consistency" {
     const Recorder = struct {

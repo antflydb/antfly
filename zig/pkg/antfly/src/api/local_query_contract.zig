@@ -18,7 +18,7 @@ const std = @import("std");
 const graph_mod = @import("../graph/graph.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
-const distributed_graph = @import("distributed_graph.zig");
+const distributed_graph = @import("local_graph.zig");
 const platform_time = @import("antfly_platform").time;
 const distributed_stats_mod = @import("../search/distributed_stats.zig");
 const db_mod = @import("../storage/db/control_root.zig");
@@ -690,9 +690,9 @@ pub const graph_paths = @import("../graph/paths.zig");
 
 pub const graph_query_mod = @import("../graph/query.zig");
 
-pub const public_limits = @import("public_limits.zig");
+pub const public_limits = @import("antfly_public_limits");
 
-pub const table_read_source = @import("table_read_source.zig");
+pub const table_read_source = @import("../storage/db/dynamic_field_capability.zig");
 
 pub const fusion_mod = @import("../search/fusion.zig");
 
@@ -700,7 +700,7 @@ pub const regex_mod = @import("../search/regex.zig");
 
 pub const ObservedDynamicFieldCapabilitySet = table_read_source.ObservedDynamicFieldCapabilitySet;
 
-pub const DynamicFieldObservationQuery = table_read_source.DynamicFieldObservationQuery;
+pub const DynamicFieldObservationQuery = table_read_source.ObservationQuery;
 
 pub const backend_current_root_generation: u64 = 0;
 
@@ -6351,7 +6351,7 @@ pub fn appendGraphMetricRerankField(
     try out.append(alloc, '}');
 }
 
-fn appendGraphMetricPersonalizationFields(
+pub fn appendGraphMetricPersonalizationFields(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
     first: *bool,

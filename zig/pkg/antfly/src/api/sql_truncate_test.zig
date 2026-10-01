@@ -49,7 +49,7 @@ const Fixture = struct {
     fn status(_: *anyopaque) !metadata.MetadataStatus {
         return .{ .metadata_group_id = 1, .metrics = .{} };
     }
-    fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: operation.RequestContext, call: domain.Call) ![]u8 {
+    fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
         const self = cast(ptr);
         self.catalog_reads += 1;
         return switch (call) {

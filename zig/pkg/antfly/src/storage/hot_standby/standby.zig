@@ -23,9 +23,9 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Crc32 = @import("antfly_hash").Crc32;
 const replication_log = @import("replication_log.zig");
-const replication_record = @import("replication_record.zig");
+const replication_record = @import("../db/replication_record.zig");
 const wal_mod = @import("../wal_runtime.zig");
-const fs_paths = @import("../../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const platform_sync = @import("antfly_platform").sync;
 
 const progress_magic = [8]u8{ 'A', 'F', 'H', 'A', 'P', 'R', 'G', '\n' };

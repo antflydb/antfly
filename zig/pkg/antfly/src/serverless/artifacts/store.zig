@@ -39,7 +39,7 @@ pub fn chargeReadBudget(remaining: *u64, amount: u64) !void {
     remaining.* -= amount;
 }
 const Allocator = std.mem.Allocator;
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 pub const sha256_checksum_len: usize = std.crypto.hash.sha2.Sha256.digest_length * 2;
 pub const sha256_artifact_id_prefix = "sha256:";

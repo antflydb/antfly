@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const raft_engine = @import("raft_engine");
-const read_state_observer_mod = @import("read_state_observer.zig");
+const read_state_observer_mod = @import("antfly_read_state_observer");
 
 pub const RoutedStateMachine = struct {
     metadata_group_id: ?raft_engine.core.types.GroupId = null,

@@ -225,7 +225,7 @@ pub const Scenario = struct {
             model: []const u8,
             roles: []const []const u8,
             contents: []const []const u8,
-            _: @import("../inference/types.zig").GenerationOptions,
+            _: @import("antfly_inference_types").GenerationOptions,
         ) ![]u8 {
             const self: *State = @ptrCast(@alignCast(ptr));
             self.local_generation_calls += 1;

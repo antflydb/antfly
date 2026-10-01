@@ -16,6 +16,7 @@ const std = @import("std");
 const ant_json = @import("antfly-json");
 const matcher = @import("antfly_matcher");
 const metadata_openapi = @import("antfly_metadata_openapi");
+const metadata_server_openapi = @import("antfly_metadata_server_openapi");
 const tables_api = @import("tables.zig");
 const indexes_api = @import("indexes.zig");
 const coverage_policy = @import("coverage_policy.zig");
@@ -104,7 +105,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
     // replication_sources). For indexes, parse from the raw body to preserve
     // type-specific fields (external, dimension, edge_types, etc.) that the
     // generated IndexConfig struct doesn't capture.
-    var parsed = metadata_openapi.server.parseCreateTableBody(alloc, body) catch {
+    var parsed = metadata_server_openapi.server.parseCreateTableBody(alloc, body) catch {
         var fallback = try tables_api.parseCreateTableRequest(alloc, body);
         errdefer fallback.deinit(alloc);
         // Raw public fields were validated above. The compatibility parser
@@ -1311,7 +1312,7 @@ test "table contract encodes internal create table request back to public json" 
 
     const body = try encodeCreateTableRequest(std.testing.allocator, req);
     defer std.testing.allocator.free(body);
-    var parsed = try metadata_openapi.server.parseCreateTableBody(std.testing.allocator, body);
+    var parsed = try metadata_server_openapi.server.parseCreateTableBody(std.testing.allocator, body);
     defer parsed.deinit();
     var raw = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer raw.deinit();

@@ -30,7 +30,6 @@ const mapper = @import("document_mapper.zig");
 const relational_store = @import("relational_store.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const replay_source_mod = @import("derived/replay_source.zig");
-const transaction_runtime_mod = @import("maintenance/transaction_runtime.zig");
 const mem_backend_mod = @import("../mem_backend.zig");
 const persistent_mod = @import("../persistent.zig");
 const range_state_mod = @import("range_state.zig");
@@ -44,7 +43,7 @@ const public_schema_json_key = "\x00\x00__metadata__:schema_json";
 const shard_mod = @import("../shard.zig");
 const hbc_mod = @import("../hbc_adapter.zig");
 const ttl_mod = @import("../ttl.zig");
-const fs_paths = @import("../../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const native_artifact_sink = @import("../native_artifact_sink.zig");
 const lsm_table_file = @import("../lsm/table_file.zig");
 const graph_mod = @import("../../graph/graph.zig");
@@ -62,7 +61,7 @@ const store_snapshot_file_name = "store.bin";
 const store_snapshot_v2_magic = "AFSTKV02";
 const logical_store_artifact_format = "antfly-kv-stream";
 const logical_store_artifact_version: u32 = 2;
-pub const logical_snapshot_manifest_file_name = "SNAPSHOT.json";
+pub const logical_snapshot_manifest_file_name = @import("../backup_codec.zig").logical_snapshot_manifest_file_name;
 const logical_snapshot_manifest_format_version: u32 = 1;
 const store_snapshot_batch_entries: usize = 8192;
 const store_snapshot_batch_bytes: usize = 8 * 1024 * 1024;
@@ -1210,26 +1209,6 @@ pub const DBCore = struct {
         try self.index_manager.loadCatalogOnly(self.store);
     }
 
-    pub fn runTransactionRecoveryOnce(
-        self: *DBCore,
-        alloc: Allocator,
-        config: transaction_runtime_mod.Config,
-    ) !types.TransactionRecoveryStats {
-        var identity_ctx = try TransactionRecoveryIdentityContext.init(
-            alloc,
-            self.store,
-            self.identity_namespace,
-            if (self.schema) |schema| if (schema.storage_mode == .relational) schema.relational_columns else null else null,
-            if (self.schema) |schema| if (schema.storage_mode == .relational) schema.version else 0 else 0,
-        );
-        defer identity_ctx.deinit();
-        identity_ctx.resource_manager = self.index_manager.resource_manager;
-        identity_ctx.io = self.index_manager.checkpointIo();
-        var effective_config = config;
-        effective_config.resolution_extra_hooks = transactionRecoveryIdentityHooks(&identity_ctx);
-        return try transaction_runtime_mod.recoverOnce(alloc, self.store, effective_config);
-    }
-
     /// Pins the backend-neutral primary image used by portable snapshots.
     /// Keep this logical even for an LSM-backed source: portable backups are
     /// intentionally restorable into any supported primary backend.
@@ -2338,30 +2317,30 @@ pub const DBCore = struct {
         return try manager.validateIntentSnapshot(txn_id, expected_revision);
     }
 
-    pub fn loadTransactionHAOutbox(
+    pub fn loadTransactionReplicationOutbox(
         self: *DBCore,
         alloc: Allocator,
         txn_id: transactions_mod.TxnId,
-    ) !transactions_mod.HAOutbox {
+    ) !transactions_mod.ReplicationOutbox {
         var manager = try self.initTxnManager();
         defer manager.deinit();
-        return try manager.loadHAOutbox(alloc, txn_id);
+        return try manager.loadReplicationOutbox(alloc, txn_id);
     }
 
-    pub fn transactionHasHAOutbox(self: *DBCore, txn_id: transactions_mod.TxnId) !bool {
+    pub fn transactionHasReplicationOutbox(self: *DBCore, txn_id: transactions_mod.TxnId) !bool {
         var manager = try self.initTxnManager();
         defer manager.deinit();
-        return try manager.hasHAOutbox(txn_id);
+        return try manager.hasReplicationOutbox(txn_id);
     }
 
-    pub fn clearTransactionHAOutbox(
+    pub fn clearTransactionReplicationOutbox(
         self: *DBCore,
         txn_id: transactions_mod.TxnId,
-        kind: transactions_mod.HAOutboxKind,
+        kind: transactions_mod.ReplicationOutboxKind,
     ) !void {
         var manager = try self.initTxnManager();
         defer manager.deinit();
-        try manager.clearHAOutbox(txn_id, kind);
+        try manager.clearReplicationOutbox(txn_id, kind);
     }
 
     pub fn collectTransactionIntentDocumentKeys(

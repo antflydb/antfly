@@ -35,11 +35,11 @@ const enrichment_mod = @import("../enrichment/mod.zig");
 const search_sources = @import("../search_sources.zig");
 const runtime_manager = @import("manager.zig");
 const managed_embedder = @import("../../inference/managed_embedder.zig");
-const bedrock = @import("../../inference/bedrock.zig");
+const bedrock = @import("antfly_inference_bedrock");
 const foreign_mod = @import("../../foreign/mod.zig");
 const scraping = @import("antfly_scraping");
 const object_store_support = @import("../object_store_support.zig");
-const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
+const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const common_config = @import("../../common/config.zig");
 
 pub const BootstrapConfig = struct {

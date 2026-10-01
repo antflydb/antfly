@@ -4,10 +4,10 @@
 //! Production-mode conformance probe for the independently code-generated
 //! inference archive. This executable deliberately imports only the ABI
 //! declarations and resolves the exported function table from the linked
-//! archive; it cannot inline or directly call inference_host.zig.
+//! archive; it cannot inline or directly call pkg/inference/src/host/host.zig.
 
 const std = @import("std");
-const bridge = @import("standalone/inference_bridge.zig");
+const bridge = @import("antfly_inference_bridge");
 
 pub fn main() !void {
     const table = bridge.antfly_standalone_inference_get_function_table();

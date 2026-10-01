@@ -12,12 +12,14 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const replication_ingress = @import("../storage/db/replication_ingress.zig");
+const hot_standby_publisher_adapter = @import("../storage/hot_standby/db_commit.zig");
 const std = @import("std");
 const store_report_update = @import("../metadata/store_report_update.zig");
 const store_report_baseline = @import("../metadata/store_report_baseline.zig");
 const report_collection = @import("../metadata/report_collection.zig");
 const system_catalog = @import("../system_catalog/domain.zig");
-const runtime_io_abi = @import("../runtime_io_abi.zig");
+const runtime_io_abi = @import("antfly_runtime_abi").io_abi;
 const ant_json = @import("antfly-json");
 const httpx = @import("httpx");
 const platform_sync = @import("antfly_platform").sync;
@@ -28,7 +30,7 @@ const antfly = @import("runtime_root.zig");
 const indexes_api = @import("../api/indexes.zig");
 const json_helpers = @import("../api/json_helpers.zig");
 const internal_service_auth = @import("../api/internal_service_auth.zig");
-const fs_paths = @import("../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const process_memory_budget = @import("../common/process_memory_budget.zig");
 const runtime_status = @import("../api/runtime_status.zig");
 const artifact_publication_dispatch = @import("../storage/artifact_publication_dispatch.zig");
@@ -2760,11 +2762,11 @@ pub const HealthSource = struct {
     fn writeHAMetrics(self: *HealthSource, writer: *std.Io.Writer) !void {
         const ds = self.data_server;
         const ctx = ds.ha_cfg.admin_context;
-        const primary = if (ctx) |ha_ctx|
-            ha_ctx.primary orelse ds.ha_cfg.internal_primary
+        const primary = if (ctx) |replication_ctx|
+            replication_ctx.primary orelse ds.ha_cfg.internal_primary
         else
             ds.ha_cfg.internal_primary;
-        const standby = if (ctx) |ha_ctx| ha_ctx.standby else null;
+        const standby = if (ctx) |replication_ctx| replication_ctx.standby else null;
 
         try appendDualHAMetric(writer, "antfly_standby_runtime_configured", "gauge", "Whether this data runtime has any HA role configured", if (primary != null or standby != null) 1 else 0);
 
@@ -4453,10 +4455,10 @@ pub const HASyncWaitConfig = struct {
     max_rounds: usize = 200,
     sleep_ns: u64 = 10 * std.time.ns_per_ms,
     poll_ctx: ?*anyopaque = null,
-    poll_fn: ?antfly.db.HAProgressPollFn = null,
+    poll_fn: ?antfly.hot_standby.sync_wait.HotStandbyProgressPollFn = null,
 };
 
-fn haPrimarySyncWaitFromConfig(cfg: HASyncWaitConfig) antfly.db.HAPrimaryProgressSyncWait {
+fn haPrimarySyncWaitFromConfig(cfg: HASyncWaitConfig) antfly.hot_standby.sync_wait.HotStandbyPrimaryProgressSyncWait {
     return .{
         .max_rounds = cfg.max_rounds,
         .sleep_ns = cfg.sleep_ns,
@@ -5738,14 +5740,14 @@ pub const DataServer = struct {
     ha_state_mutex: std.atomic.Mutex = .unlocked,
     /// Global primary mutation/capture ordering point. All DB/catalog writers
     /// share this instance through their HA mirror configuration.
-    ha_mutation_barrier: antfly.db.HAMutationBarrier = .{},
+    ha_mutation_barrier: antfly.db.MutationBarrier = .{},
     ha_seed_capture_active: std.atomic.Value(bool) = .init(false),
     ha_public_gate_state: antfly.hot_standby.public_gate_state.State = .{},
     ha_admin_server: ?antfly.hot_standby.http_admin.Server = null,
     ha_internal_server: ?antfly.hot_standby.http_internal.Server = null,
     ha_standby_replication_http_executor: ?antfly.common.http.StdHttpExecutor = null,
     ha_promoted_primary: ?antfly.hot_standby.primary.Primary = null,
-    ha_primary_sync_wait: antfly.db.HAPrimaryProgressSyncWait = .{},
+    ha_primary_sync_wait: antfly.hot_standby.sync_wait.HotStandbyPrimaryProgressSyncWait = .{},
     ha_primary_mirror_last_lsn: std.atomic.Value(u64) = .init(0),
     ha_primary_mirror_failure_count: std.atomic.Value(u64) = .init(0),
     ha_primary_mirror_last_gate_lsn: std.atomic.Value(u64) = .init(0),
@@ -6690,17 +6692,17 @@ pub const DataServer = struct {
                 api_server_cfg.online_merge_io = .{ .ptr = self, .execute_fn = onlineMergeIo };
         }
         _ = self.read_source.withHAReadGate(self.haReadGate());
-        const ha_write_gate = self.haWriteGate();
+        const replication_write_gate = self.haWriteGate();
         const ha_primary_mirror = self.haPrimaryMirror();
         if (self.status_source.standalone_hot_standby) |metadata_ha| {
-            try metadata_ha.bindMirror(ha_write_gate, ha_primary_mirror);
+            try metadata_ha.bindMirror(replication_write_gate, ha_primary_mirror);
             if (ha_primary_mirror != null) try prepareStandaloneMetadataStartup(metadata_ha);
         }
-        _ = try self.write_source.withHAWriteGate(ha_write_gate);
+        _ = try self.write_source.withHAWriteGate(replication_write_gate);
         _ = try self.write_source.withHAMirror(ha_primary_mirror);
         _ = self.write_source.withReplicaRetirementOwnership(self.replicaRetirementOwnership());
         if (comptime linked_storage) {
-            _ = self.kernel_owner_source.?.withHAControls(ha_write_gate, ha_primary_mirror);
+            _ = self.kernel_owner_source.?.withHotStandbyControls(replication_write_gate, ha_primary_mirror);
         }
         if (self.data_raft_apply) |apply_sm| {
             _ = apply_sm.write_source.withReplicaRetirementOwnership(self.replicaRetirementOwnership());
@@ -6715,7 +6717,7 @@ pub const DataServer = struct {
             });
             _ = apply_sm.write_source.withRestoreAccess(api_server_cfg.node_config, restore_network_io, restore_filesystem_io);
             _ = apply_sm.write_source.withRemoteContent(api_server_cfg.remote_content);
-            _ = try apply_sm.write_source.withHAWriteGate(ha_write_gate);
+            _ = try apply_sm.write_source.withHAWriteGate(replication_write_gate);
             _ = try apply_sm.write_source.withHAMirror(ha_primary_mirror);
             apply_sm.write_source.setLocalChangeHook(self.localChangeHook());
             apply_sm.write_source.setLocalIndexRepairDebtHook(self.localIndexRepairDebtHook());
@@ -7065,7 +7067,7 @@ pub const DataServer = struct {
         self.alloc.destroy(job);
     }
 
-    pub fn applyHAReplicationRecord(self: *DataServer, record: antfly.hot_standby.replication_record.RecordView) !void {
+    pub fn applyHotStandbyReplicationRecord(self: *DataServer, record: antfly.hot_standby.replication_record.RecordView) !void {
         if (isWholeInstanceHAControlRecord(record)) return;
         if (record.kind == .metadata_mutation and record.table_id == 0 and record.shard_id == 0) {
             const metadata_ha = self.status_source.standalone_hot_standby orelse return error.HAMetadataAuthorityUnavailable;
@@ -7101,13 +7103,13 @@ pub const DataServer = struct {
                             .begin => |scope| if (!std.mem.eql(u8, &scope.digest(), &descriptor.scope.digest())) return error.RestoreStagingScopeChanged,
                             else => return error.InvalidRestoreStagingCommand,
                         }
-                        return self.applyHAHiddenOwnerRecord(record, descriptor);
+                        return self.applyHotStandbyHiddenOwnerRecord(record, descriptor);
                     }
                 }
-                if (try self.readHAHiddenOwnerBootstrap(record.shard_id, record.table_id)) |value| {
+                if (try self.readHotStandbyHiddenOwnerBootstrap(record.shard_id, record.table_id)) |value| {
                     var descriptor = value;
                     defer descriptor.deinit();
-                    return self.applyHAHiddenOwnerRecord(record, descriptor.value);
+                    return self.applyHotStandbyHiddenOwnerRecord(record, descriptor.value);
                 }
                 var private = (try self.captureHAPrivateProvisioning(self.alloc, &snapshot)) orelse return err;
                 defer private.deinit();
@@ -7120,7 +7122,7 @@ pub const DataServer = struct {
                 } else null) |owner| {
                     const confirmed_root = try self.hiddenInitialRootFromRemoteAuthority(owner.range.group_id);
                     try self.primePrivateInitialChildOwner(owner, confirmed_root);
-                    return (try self.ensureKernelOwnerSource()).applyHAInitialChildOwnerRecord(owner.range.group_id, owner.table.name, record);
+                    return (try self.ensureKernelOwnerSource()).applyHotStandbyInitialChildOwnerRecord(owner.range.group_id, owner.table.name, record);
                 }
                 const owner = for (owners) |candidate| {
                     if (candidate.scope.target_namespace.table_id == record.table_id and candidate.scope.target_namespace.shard_id == record.shard_id) break candidate;
@@ -7128,15 +7130,15 @@ pub const DataServer = struct {
                 const source = self.liveRuntimeWriteSource();
                 try self.primePrivateRestoreOwner(source, owner);
                 if (comptime linked_storage) {
-                    try (try self.ensureKernelOwnerSource()).applyHAHiddenOwnerRecord(self.alloc, owner.range.group_id, owner.table.name, owner.scope.digest(), record);
-                } else try source.applyHAReplicationRecordGroupLocal(self.alloc, owner.range.group_id, owner.table.name, record);
+                    try (try self.ensureKernelOwnerSource()).applyHotStandbyHiddenOwnerRecord(self.alloc, owner.range.group_id, owner.table.name, owner.scope.digest(), record);
+                } else try source.applyHotStandbyReplicationRecordGroupLocal(self.alloc, owner.range.group_id, owner.table.name, record);
                 return;
             },
             else => return err,
         };
         if (comptime linked_storage) {
             const owner_source = try self.ensureKernelOwnerSource();
-            try owner_source.applyHAReplicationRecordGroupLocal(
+            try owner_source.applyHotStandbyReplicationRecordGroupLocal(
                 route.group_id,
                 route.table_name,
                 record,
@@ -7144,7 +7146,7 @@ pub const DataServer = struct {
             self.write_source.publishStorageOwnerHAChange(self.alloc, route.table_name, record);
             return;
         }
-        try self.write_source.applyHAReplicationRecordGroupLocal(
+        try self.write_source.applyHotStandbyReplicationRecordGroupLocal(
             self.alloc,
             route.group_id,
             route.table_name,
@@ -7153,7 +7155,7 @@ pub const DataServer = struct {
     }
 
     pub const HACatalogCommit = struct {
-        mirror: antfly.db.HAAsyncEffectMirror,
+        mirror: antfly.db.ReplicationAsyncEffectMirror,
         generation: u64,
         lsn: u64,
     };
@@ -7166,17 +7168,17 @@ pub const DataServer = struct {
         const generation = self.ha_public_gate_state.currentGeneration();
         try self.ha_public_gate_state.checkWrite(generation);
         const mirror = self.haPrimaryMirror() orelse return error.HACatalogReplicationUnavailable;
-        if (mirror.primary.identity.table_id != 0 or mirror.primary.identity.shard_id != 0)
+        if (mirror.publisher.identity().table_id != 0 or mirror.publisher.identity().shard_id != 0)
             return error.HACatalogRequiresWholeInstance;
         errdefer self.ha_public_gate_state.publishPrimaryFence(true);
-        const lsn = try mirror.primary.append(.{
+        const lsn = try (try hot_standby_publisher_adapter.runtimePrimary(mirror)).append(.{
             .kind = .metadata_mutation,
             .payload_codec = .json,
             .table_id = 0,
             .shard_id = 0,
             .payload = payload,
         });
-        try mirror.primary.log.wal.sync(true);
+        try (try hot_standby_publisher_adapter.runtimePrimary(mirror)).log.wal.sync(true);
         self.ha_primary_mirror_last_lsn.store(lsn, .release);
         return .{ .mirror = mirror, .generation = generation, .lsn = lsn };
     }
@@ -7191,9 +7193,9 @@ pub const DataServer = struct {
             const generation = self.ha_public_gate_state.currentGeneration();
             try self.ha_public_gate_state.checkWrite(generation);
             const mirror = self.haPrimaryMirror() orelse return error.HACatalogReplicationUnavailable;
-            if (mirror.primary.identity.table_id != 0 or mirror.primary.identity.shard_id != 0)
+            if (mirror.publisher.identity().table_id != 0 or mirror.publisher.identity().shard_id != 0)
                 return error.HACatalogRequiresWholeInstance;
-            break :blk .{ .mirror = mirror, .generation = generation, .lsn = mirror.primary.lastLsn() };
+            break :blk .{ .mirror = mirror, .generation = generation, .lsn = (try hot_standby_publisher_adapter.runtimePrimary(mirror)).lastLsn() };
         };
         try self.acknowledgeHACatalogCreate(commit);
     }
@@ -7205,21 +7207,21 @@ pub const DataServer = struct {
         const mirror = commit.mirror;
         // Do not hold the transition mutex while waiting for receiver acks.
         if (mirror.sync_wait_fn) |wait| {
-            try wait(mirror.sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.primary, commit.lsn, mirror.sync_policy);
+            try wait(mirror.sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.publisher.ptr, commit.lsn, mirror.sync_policy);
         }
         platform_sync.lockYielding(&self.ha_state_mutex);
         defer self.ha_state_mutex.unlock();
         try self.ha_public_gate_state.checkWrite(commit.generation);
-        const gate = try antfly.hot_standby.commit_gate.evaluate(mirror.primary, commit.lsn, mirror.sync_policy);
+        const gate = try antfly.hot_standby.commit_gate.evaluate(try hot_standby_publisher_adapter.runtimePrimary(mirror), commit.lsn, mirror.sync_policy);
         if (!gate.shouldAcknowledge()) return error.SyncPolicyUnsatisfied;
     }
 
-    pub fn applyHAReplicationRecordCallback(ctx: *anyopaque, record: antfly.hot_standby.replication_record.RecordView) anyerror!void {
+    pub fn applyHotStandbyReplicationRecordCallback(ctx: *anyopaque, record: antfly.hot_standby.replication_record.RecordView) anyerror!void {
         const self: *DataServer = @ptrCast(@alignCast(ctx));
-        try self.applyHAReplicationRecord(record);
+        try self.applyHotStandbyReplicationRecord(record);
     }
 
-    fn applyHAHiddenOwnerRecord(self: *DataServer, record: antfly.hot_standby.replication_record.RecordView, descriptor: @import("../storage/db/restore_staging_contract.zig").OwnerBootstrap) !void {
+    fn applyHotStandbyHiddenOwnerRecord(self: *DataServer, record: antfly.hot_standby.replication_record.RecordView, descriptor: @import("../storage/db/restore_staging_contract.zig").OwnerBootstrap) !void {
         try descriptor.validate();
         if (descriptor.scope.target_namespace.table_id != record.table_id or descriptor.scope.target_namespace.shard_id != record.shard_id) return error.RestoreStagingScopeChanged;
         const source = self.liveRuntimeWriteSource();
@@ -7239,8 +7241,8 @@ pub const DataServer = struct {
         // post-seed hidden owner disappears from an offline subsequent seed.
         try @import("../storage/hot_standby/restore_owner_registry.zig").record(self.alloc, registry_io, registry_root, descriptor);
         if (comptime linked_storage) {
-            try (try self.ensureKernelOwnerSource()).applyHAHiddenOwnerRecord(self.alloc, record.shard_id, descriptor.table_name, descriptor.scope.digest(), record);
-        } else try source.applyHAReplicationRecordGroupLocal(self.alloc, record.shard_id, descriptor.table_name, record);
+            try (try self.ensureKernelOwnerSource()).applyHotStandbyHiddenOwnerRecord(self.alloc, record.shard_id, descriptor.table_name, descriptor.scope.digest(), record);
+        } else try source.applyHotStandbyReplicationRecordGroupLocal(self.alloc, record.shard_id, descriptor.table_name, record);
         if (try canceledRestoreScope(self.alloc, record)) |scope| {
             if (!std.mem.eql(u8, &scope, &descriptor.scope.digest())) return error.RestoreStagingScopeChanged;
             const terminals = try self.haRestoreTerminalLedger();
@@ -7260,7 +7262,7 @@ pub const DataServer = struct {
         // metadata or acknowledging HA replay. Recovery rechecks the terminal
         // ledger and exact native scope, then drains all resident generations.
         if (comptime linked_storage) {
-            if (try self.readHAHiddenOwnerBootstrap(group_id, terminal.table_id)) |value| {
+            if (try self.readHotStandbyHiddenOwnerBootstrap(group_id, terminal.table_id)) |value| {
                 var descriptor = value;
                 defer descriptor.deinit();
                 if (!std.mem.eql(u8, &scope, &descriptor.value.scope.digest()) or descriptor.value.scope.target_namespace.shard_id != group_id) return error.RestoreStagingScopeChanged;
@@ -7287,9 +7289,9 @@ pub const DataServer = struct {
         return control.finish.scope;
     }
 
-    fn readHAHiddenOwnerBootstrap(self: *DataServer, group_id: u64, table_id: u64) !?std.json.Parsed(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap) {
-        if (comptime linked_storage) return (try self.ensureKernelOwnerSource()).readHAHiddenOwnerBootstrap(self.alloc, group_id, table_id);
-        return self.liveRuntimeWriteSource().readHAHiddenOwnerBootstrap(self.alloc, group_id, table_id);
+    fn readHotStandbyHiddenOwnerBootstrap(self: *DataServer, group_id: u64, table_id: u64) !?std.json.Parsed(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap) {
+        if (comptime linked_storage) return (try self.ensureKernelOwnerSource()).readHotStandbyHiddenOwnerBootstrap(self.alloc, group_id, table_id);
+        return self.liveRuntimeWriteSource().readHotStandbyHiddenOwnerBootstrap(self.alloc, group_id, table_id);
     }
 
     fn primeHAHiddenOwner(self: *DataServer, bootstrap: @import("../storage/db/restore_staging_contract.zig").OwnerBootstrap) !void {
@@ -7489,7 +7491,7 @@ pub const DataServer = struct {
             &batch,
             standby,
             self,
-            DataServer.applyHAReplicationRecordCallback,
+            DataServer.applyHotStandbyReplicationRecordCallback,
             .{
                 .standby_apply = .{
                     .max_records = ha_replication_default_max_records_per_apply,
@@ -7792,7 +7794,7 @@ pub const DataServer = struct {
         if (self.status_source.standalone_hot_standby) |metadata_ha| try metadata_ha.bindMirror(self.haWriteGate(), ha_primary_mirror);
         _ = self.write_source.withPreparedHAMirror(ha_primary_mirror);
         if (comptime linked_storage) {
-            _ = self.kernel_owner_source.?.withHAControls(self.haWriteGate(), ha_primary_mirror);
+            _ = self.kernel_owner_source.?.withHotStandbyControls(self.haWriteGate(), ha_primary_mirror);
         }
         if (self.data_raft_apply) |apply_sm| {
             _ = apply_sm.write_source.withPreparedHAMirror(ha_primary_mirror);
@@ -7891,15 +7893,15 @@ pub const DataServer = struct {
         self.ha_public_gate_state.publishPrimaryFence(true);
     }
 
-    fn haWriteGate(self: *DataServer) ?antfly.db.HAWriteGate {
+    fn haWriteGate(self: *DataServer) ?antfly.db.ReplicationWriteGate {
         const ctx = self.ha_cfg.admin_context orelse return null;
         if (ctx.standby != null or ctx.primary != null) return .{ .shared = .{
-            .state = &self.ha_public_gate_state,
+            .state = self.ha_public_gate_state.storageWriteState(),
         } };
         return null;
     }
 
-    fn haPrimaryMirror(self: *DataServer) ?antfly.db.HAAsyncEffectMirror {
+    fn haPrimaryMirror(self: *DataServer) ?antfly.db.ReplicationAsyncEffectMirror {
         if (self.ha_cfg.admin_context) |ctx| {
             if (ctx.standby != null) return null;
             if (ctx.primary) |primary| return self.haPrimaryMirrorFor(primary);
@@ -7908,9 +7910,9 @@ pub const DataServer = struct {
         return null;
     }
 
-    fn haPrimaryMirrorFor(self: *DataServer, primary: *antfly.hot_standby.primary.Primary) antfly.db.HAAsyncEffectMirror {
-        var mirror = antfly.db.HAAsyncEffectMirror{
-            .primary = primary,
+    fn haPrimaryMirrorFor(self: *DataServer, primary: *antfly.hot_standby.primary.Primary) antfly.db.ReplicationAsyncEffectMirror {
+        var mirror = antfly.db.ReplicationAsyncEffectMirror{
+            .publisher = hot_standby_publisher_adapter.bind(primary),
             .mutation_barrier = &self.ha_mutation_barrier,
             .transition_mutex = &self.ha_state_mutex,
             .last_lsn = &self.ha_primary_mirror_last_lsn,
@@ -7924,7 +7926,7 @@ pub const DataServer = struct {
         };
         if (mirror.sync_policy.mode != .async and mirror.sync_policy.failure_policy == .block) {
             mirror.sync_wait_ctx = &self.ha_primary_sync_wait;
-            mirror.sync_wait_fn = antfly.db.HAPrimaryProgressSyncWait.wait;
+            mirror.sync_wait_fn = antfly.hot_standby.sync_wait.HotStandbyPrimaryProgressSyncWait.wait;
         }
         return mirror;
     }
@@ -8101,24 +8103,24 @@ pub const DataServer = struct {
             if (@import("private_provisioning.zig").find(hidden_owners, group_id)) |owner| {
                 if (comptime linked_storage) {
                     try self.primePrivateRestoreOwner(self.liveRuntimeWriteSource(), owner);
-                    try (try self.ensureKernelOwnerSource()).captureHASeedHiddenReplicaSnapshot(alloc, table.name, group_id, owner.scope.digest(), snapshot_token, destination_root);
-                } else try self.liveRuntimeWriteSource().captureHASeedHiddenReplicaSnapshot(alloc, table.name, group_id, owner.scope.digest(), snapshot_token, destination_root);
+                    try (try self.ensureKernelOwnerSource()).captureHotStandbySeedHiddenReplicaSnapshot(alloc, table.name, group_id, owner.scope.digest(), snapshot_token, destination_root);
+                } else try self.liveRuntimeWriteSource().captureHotStandbySeedHiddenReplicaSnapshot(alloc, table.name, group_id, owner.scope.digest(), snapshot_token, destination_root);
             } else if (for (initial_owners) |owner| {
                 if (owner.range.group_id == group_id) break owner;
             } else null) |owner| {
                 if (comptime linked_storage) {
                     const confirmed_root = try self.hiddenInitialRootFromRemoteAuthority(owner.range.group_id);
                     try self.primePrivateInitialChildOwner(owner, confirmed_root);
-                    try (try self.ensureKernelOwnerSource()).captureHASeedInitialChildReplicaSnapshot(table.name, group_id, snapshot_token, destination_root);
+                    try (try self.ensureKernelOwnerSource()).captureHotStandbySeedInitialChildReplicaSnapshot(table.name, group_id, snapshot_token, destination_root);
                 } else return error.HASeedSnapshotIncompleteTopology;
             } else if (findHANativeRestoreOwner(native_projection.owners, group_id)) |owner| {
                 if (comptime linked_storage) {
                     try self.primeHAHiddenOwner(owner);
-                    try (try self.ensureKernelOwnerSource()).captureHASeedHiddenReplicaSnapshot(alloc, table.name, group_id, owner.scope.digest(), snapshot_token, destination_root);
-                } else try self.liveRuntimeWriteSource().captureHASeedHiddenReplicaSnapshot(alloc, table.name, group_id, owner.scope.digest(), snapshot_token, destination_root);
+                    try (try self.ensureKernelOwnerSource()).captureHotStandbySeedHiddenReplicaSnapshot(alloc, table.name, group_id, owner.scope.digest(), snapshot_token, destination_root);
+                } else try self.liveRuntimeWriteSource().captureHotStandbySeedHiddenReplicaSnapshot(alloc, table.name, group_id, owner.scope.digest(), snapshot_token, destination_root);
             } else if (comptime linked_storage) {
-                try (try self.ensureKernelOwnerSource()).captureHASeedReplicaSnapshot(table.name, group_id, snapshot_token, destination_root);
-            } else try self.write_source.captureHASeedReplicaSnapshot(alloc, table.name, group_id, snapshot_token, destination_root);
+                try (try self.ensureKernelOwnerSource()).captureHotStandbySeedReplicaSnapshot(table.name, group_id, snapshot_token, destination_root);
+            } else try self.write_source.captureHotStandbySeedReplicaSnapshot(alloc, table.name, group_id, snapshot_token, destination_root);
             const store_path = try std.fs.path.join(alloc, &.{ destination_root, "store.bin" });
             defer alloc.free(store_path);
             const digest = try haSeedSnapshotFileSha256HexAlloc(alloc, io, store_path);
@@ -8252,7 +8254,7 @@ pub const DataServer = struct {
     /// the exclusive HA mutation boundary. Background enrichment completion is
     /// itself a durable primary mutation and must never be waited on while that
     /// boundary is closed; doing so deadlocks capture and every HA state route.
-    /// The bounded verification inside DB.snapshotHASeed closes the remaining
+    /// The bounded verification inside DB.snapshotWithMaintenanceDeadline closes the remaining
     /// race and converts it into a retryable busy result.
     fn prepareDefaultHASeedSnapshotMaintenance(self: *DataServer) !void {
         if (self.status_source.standalone_hot_standby) |metadata_ha| try metadata_ha.prepareCheckpoint();
@@ -8734,7 +8736,7 @@ pub const DataServer = struct {
             .kind = .artifact,
         } }};
         const CheckpointRelease = struct {
-            lease: *antfly.db.HAMutationBarrier.ExclusiveLease,
+            lease: *antfly.db.MutationBarrier.ExclusiveLease,
             lease_held: *bool,
             state_mutex: *std.atomic.Mutex,
             state_mutex_held: *bool,
@@ -11457,7 +11459,7 @@ pub const DataServer = struct {
             if (self.ha_cfg.internal_primary) |primary| {
                 const admin = self.ha_cfg.admin_context orelse return error.RowPolicyUnsupported;
                 const mirror = self.write_source.ha_async_mirror orelse return error.RowPolicyUnsupported;
-                if (admin.standby != null or admin.primary != primary or mirror.primary != primary or
+                if (admin.standby != null or admin.primary != primary or mirror.publisher.ptr != @as(*anyopaque, @ptrCast(primary)) or
                     primary.identity.table_id != 0 or primary.identity.shard_id != 0)
                     return error.RowPolicyUnsupported;
                 try self.ha_public_gate_state.checkWrite(self.ha_public_gate_state.currentGeneration());
@@ -20354,7 +20356,7 @@ pub const DataServer = struct {
         defer snapshot.deinit();
         if (try snapshot.get(group_id)) |terminal| {
             const source = self.liveRuntimeWriteSource();
-            if (try self.readHAHiddenOwnerBootstrap(group_id, terminal.table_id)) |value| {
+            if (try self.readHotStandbyHiddenOwnerBootstrap(group_id, terminal.table_id)) |value| {
                 var descriptor = value;
                 defer descriptor.deinit();
                 if (!std.mem.eql(u8, &terminal.scope, &descriptor.value.scope.digest())) return error.RestoreStagingScopeChanged;
@@ -27416,7 +27418,7 @@ const RemoteMetadataSource = struct {
         return last_err;
     }
 
-    fn readSystemCatalog(self: *RemoteMetadataSource, alloc: std.mem.Allocator, request: antfly.public_api.operation.RequestContext, input: @import("../system_catalog/domain.zig").Call) ![]u8 {
+    fn readSystemCatalog(self: *RemoteMetadataSource, alloc: std.mem.Allocator, request: antfly.public_api.operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
         // The forwarding envelope bounds one RPC, not the complete read.
         // Share the caller's existing snapshot allowance across attempts so
         // a slow/failed peer cannot consume a fresh budget or prematurely
@@ -27483,7 +27485,7 @@ const RemoteMetadataSource = struct {
         }
         var bounded = request;
         bounded.deadline_ns = started +| remaining;
-        bounded.deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&self.io);
+        bounded.deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&self.io);
         const slot = &self.validation_slots[std.hash.Wyhash.hash(0, name) % self.validation_slots.len];
         while (!slot.mutex.tryLock()) {
             try bounded.ensureActive();
@@ -27541,11 +27543,11 @@ const RemoteMetadataSource = struct {
         }
     }
 
-    fn isSystemCatalogMutation(input: @import("../system_catalog/domain.zig").Call) bool {
+    fn isSystemCatalogMutation(input: @import("../system_catalog/server_call.zig").Call) bool {
         return input.isMutation();
     }
 
-    fn remoteSystemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, request: antfly.public_api.operation.RequestContext, input: @import("../system_catalog/domain.zig").Call) ![]u8 {
+    fn remoteSystemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, request: antfly.public_api.operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         try request.ensureActive();
         if (input == .write_validation) return self.readWriteValidation(alloc, request, input.write_validation);
@@ -34118,7 +34120,7 @@ fn consumerTests() type {
                 fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: Http.HttpRequest) !Http.HttpResponse {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog"));
-                    var parsed = try std.json.parseFromSlice(system_catalog.Call, a, request.body, .{});
+                    var parsed = try std.json.parseFromSlice(@import("../system_catalog/server_call.zig").Call, a, request.body, .{});
                     defer parsed.deinit();
                     const body = switch (parsed.value) {
                         .write_validation_revision => blk: {
@@ -34264,7 +34266,7 @@ fn consumerTests() type {
                 defer source.deinit();
                 const context: antfly.public_api.operation.RequestContext = .{
                     .deadline_ns = source.awakeNs() + (if (mode == .short_deadline) @as(u64, 3 * std.time.ns_per_s) else remote_metadata_snapshot_timeout_ns),
-                    .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&io),
+                    .deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io),
                     .cancellation = cancellation.token(),
                 };
                 const result = source.readSystemCatalog(alloc, context, .{ .write_validation = "docs" });
@@ -34532,7 +34534,7 @@ fn consumerTests() type {
                     event.waitUncancelable(io);
                 }
             };
-            var tasks: [@import("../common/threaded_io_limits.zig").backend_runtime_control]std.Io.Future(void) = undefined;
+            var tasks: [@import("antfly_runtime_fs").threaded_io_limits.backend_runtime_control]std.Io.Future(void) = undefined;
             var started: usize = 0;
             defer {
                 release.set(control_io);
@@ -34546,7 +34548,7 @@ fn consumerTests() type {
 
             const raft_io = backend_runtime.ptr().raftOutboundIo().?;
             var raft_release: std.Io.Event = .unset;
-            var raft_tasks: [@import("../common/threaded_io_limits.zig").backend_runtime_raft_outbound]std.Io.Future(void) = undefined;
+            var raft_tasks: [@import("antfly_runtime_fs").threaded_io_limits.backend_runtime_raft_outbound]std.Io.Future(void) = undefined;
             var raft_started: usize = 0;
             defer {
                 raft_release.set(raft_io);
@@ -34591,7 +34593,7 @@ fn consumerTests() type {
             // task graph uses the separately admitted forwarding lane.
             const api_io = backend_runtime.ptr().apiIo().?;
             var api_release: std.Io.Event = .unset;
-            var api_tasks: [@import("../common/threaded_io_limits.zig").backend_runtime_api]std.Io.Future(void) = undefined;
+            var api_tasks: [@import("antfly_runtime_fs").threaded_io_limits.backend_runtime_api]std.Io.Future(void) = undefined;
             var api_started: usize = 0;
             defer {
                 api_release.set(api_io);
@@ -34639,7 +34641,7 @@ fn consumerTests() type {
             // cannot consume the capacity needed to replicate and confirm their work.
             const forward_io = forward_lane.io();
             var forward_release: std.Io.Event = .unset;
-            var forward_tasks: [@import("../common/threaded_io_limits.zig").backend_runtime_request_forward]std.Io.Future(void) = undefined;
+            var forward_tasks: [@import("antfly_runtime_fs").threaded_io_limits.backend_runtime_request_forward]std.Io.Future(void) = undefined;
             var forward_started: usize = 0;
             defer {
                 forward_release.set(forward_io);
@@ -41825,10 +41827,10 @@ fn consumerTests() type {
             defer server.deinit();
             try server.initApiServer();
 
-            const source_gate = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;
+            const source_gate = server.write_source.replication_write_gate orelse return error.TestExpectedEqual;
             switch (source_gate) {
                 .shared => |gate| {
-                    try std.testing.expect(gate.state == &server.ha_public_gate_state);
+                    try std.testing.expect(gate.state.ptr == @as(*const anyopaque, @ptrCast(&server.ha_public_gate_state)));
                     try std.testing.expect(gate.generation == null);
                 },
                 .primary, .fenced_primary, .standby => return error.TestExpectedEqual,
@@ -41979,7 +41981,7 @@ fn consumerTests() type {
             });
             defer alloc.free(payload);
 
-            try server.applyHAReplicationRecord(.{
+            try replication_ingress.applyRecord(&server, .{
                 .kind = .batch_mutation,
                 .payload_codec = .json,
                 .cluster_id = 100,
@@ -42007,10 +42009,10 @@ fn consumerTests() type {
             });
             try std.testing.expectEqual(
                 @as(usize, 1),
-                try standby.applyAvailable(&server, DataServer.applyHAReplicationRecordCallback),
+                try standby.applyAvailable(&server, DataServer.applyHotStandbyReplicationRecordCallback),
             );
             try std.testing.expectEqual(@as(u64, 2), standby.currentProgress().applied_lsn);
-            try std.testing.expectError(error.HAReplicationRecordMissingTableId, server.applyHAReplicationRecord(.{
+            try std.testing.expectError(error.HAReplicationRecordMissingTableId, replication_ingress.applyRecord(&server, .{
                 .kind = .batch_mutation,
                 .payload_codec = .json,
                 .cluster_id = 100,
@@ -42582,9 +42584,9 @@ fn consumerTests() type {
             try server.initApiServer();
 
             const public_read_gate_before = server.read_source.ha_read_gate orelse return error.TestExpectedEqual;
-            const public_write_gate_before = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;
-            try std.testing.expect(server.http_server.?.haMutationPolicy().failover_safe_mutations_only);
-            try std.testing.expect(server.http_server.?.haMutationPolicy().remote_apply_mutations_enabled);
+            const public_write_gate_before = server.write_source.replication_write_gate orelse return error.TestExpectedEqual;
+            try std.testing.expect(server.http_server.?.hotStandbyMutationPolicy().failover_safe_mutations_only);
+            try std.testing.expect(server.http_server.?.hotStandbyMutationPolicy().remote_apply_mutations_enabled);
             try std.testing.expectError(error.HAReadRequiresPrimary, public_read_gate_before.check(.stale));
             try std.testing.expectError(error.HAPromotedStandbyRequiresPrimaryOpen, public_write_gate_before.check());
 
@@ -42609,10 +42611,10 @@ fn consumerTests() type {
             // Promotion changes authority, not durability coverage. This process is
             // still participating in continuous HA, so local-only mutations must
             // remain rejected while RemoteApply-backed document writes stay enabled.
-            try std.testing.expect(server.http_server.?.haMutationPolicy().failover_safe_mutations_only);
-            try std.testing.expect(server.http_server.?.haMutationPolicy().remote_apply_mutations_enabled);
+            try std.testing.expect(server.http_server.?.hotStandbyMutationPolicy().failover_safe_mutations_only);
+            try std.testing.expect(server.http_server.?.hotStandbyMutationPolicy().remote_apply_mutations_enabled);
             const public_read_gate_after = server.read_source.ha_read_gate orelse return error.TestExpectedEqual;
-            const public_write_gate_after = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;
+            const public_write_gate_after = server.write_source.replication_write_gate orelse return error.TestExpectedEqual;
             try std.testing.expect(std.meta.eql(public_read_gate_before, public_read_gate_after));
             try std.testing.expect(std.meta.eql(public_write_gate_before, public_write_gate_after));
             try public_read_gate_before.check(.stale);
@@ -42794,7 +42796,7 @@ fn consumerTests() type {
             try server.initApiServer();
 
             const public_read_gate = server.read_source.ha_read_gate orelse return error.TestExpectedEqual;
-            const public_write_gate = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;
+            const public_write_gate = server.write_source.replication_write_gate orelse return error.TestExpectedEqual;
             try std.testing.expectError(error.HAReadRequiresPrimary, public_read_gate.check(.stale));
             try std.testing.expectError(error.HAPromotedStandbyRequiresPrimaryOpen, public_write_gate.check());
 
@@ -42834,7 +42836,7 @@ fn consumerTests() type {
             const BindingProbe = struct {
                 busy: bool = true,
                 attempts: usize = 0,
-                fn bind(ptr: *anyopaque, _: ?antfly.db.HAWriteGate, _: ?antfly.db.HAAsyncEffectMirror) !void {
+                fn bind(ptr: *anyopaque, _: ?antfly.db.ReplicationWriteGate, _: ?antfly.db.ReplicationAsyncEffectMirror) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.attempts += 1;
                     if (self.busy) return error.MetadataHABindingBusy;
@@ -43942,7 +43944,7 @@ fn consumerTests() type {
             defer source.deinit();
             try std.testing.expectError(error.Cancelled, source.statusSource().acquireJoinPlanning(.{
                 .clock = .{ .deadline_ns = platform_time.monotonicNs() + 250 * std.time.ns_per_ms },
-                .cancellation = @import("../common/cancellation.zig").CancellationToken.fromAtomic(&fake.canceled),
+                .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&fake.canceled),
             }));
             try std.testing.expectEqual(@as(usize, 1), fake.calls);
             try std.testing.expect(source.control_read_generation == null);
@@ -43973,7 +43975,7 @@ fn consumerTests() type {
             defer observed.release();
             try std.testing.expectError(error.Timeout, source.refreshControlReadGenerationAfterMiss(observed, .{ .clock = .{ .deadline_ns = 0 } }));
             var canceled: std.atomic.Value(bool) = .init(true);
-            try std.testing.expectError(error.Cancelled, source.refreshControlReadGenerationAfterMiss(observed, .{ .cancellation = @import("../common/cancellation.zig").CancellationToken.fromAtomic(&canceled) }));
+            try std.testing.expectError(error.Cancelled, source.refreshControlReadGenerationAfterMiss(observed, .{ .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&canceled) }));
             try std.testing.expect(source.control_read_generation == observed);
             source.test_faults.fetch_head_error = error.ConnectionRefused;
             // A missing route forces a fresh head even inside the cache TTL.
@@ -45494,7 +45496,7 @@ fn consumerTests() type {
             defer clock.deinit();
             const context: antfly.public_api.distributed_txn.PreDecisionContext = .{
                 .deadline_ns = 2 * std.time.ns_per_s,
-                .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&clock.io()),
+                .deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&clock.io()),
             };
             try std.testing.expectEqual(@as(?u64, 2 * std.time.ns_per_s - response_reserve_ns), DataServer.preDecisionLeaderWaitNs(context));
             clock.monotonic_ns = 1_200 * std.time.ns_per_ms;
@@ -46517,7 +46519,7 @@ fn implementationTests() type {
                     fn store(ptr: *anyopaque) *antfly.metadata.RaftApplyStore {
                         return @ptrCast(@alignCast(ptr));
                     }
-                    fn bind(ptr: *anyopaque, gate: ?antfly.db.HAWriteGate, mirror: ?antfly.db.HAAsyncEffectMirror) !void {
+                    fn bind(ptr: *anyopaque, gate: ?antfly.db.ReplicationWriteGate, mirror: ?antfly.db.ReplicationAsyncEffectMirror) !void {
                         try store(ptr).bindHA(gate, mirror);
                     }
                     fn prepare(ptr: *anyopaque) !void {
@@ -46678,9 +46680,9 @@ fn implementationTests() type {
                 const descriptor: @import("../storage/db/restore_staging.zig").OwnerBootstrap = .{ .scope = scope, .table_name = "hidden", .schema_json = "{}", .indexes_json = "{}", .byte_range = .{ .start = "", .end = "" } };
                 const begin_payload = try antfly.hot_standby.effects.encodeBatchMutationWithRestoreBootstrapAlloc(scratch, .{ .restore_staging = .{ .begin = scope } }, descriptor);
                 const begin_record: antfly.hot_standby.replication_record.RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .table_id = 8, .shard_id = 88, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = begin_payload };
-                try standby.applyHAReplicationRecord(begin_record);
+                try replication_ingress.applyRecord(&standby, begin_record);
                 try standby.write_source.clearWriteCache();
-                try standby.applyHAReplicationRecord(begin_record);
+                try replication_ingress.applyRecord(&standby, begin_record);
                 const cancel_payload = try antfly.hot_standby.effects.encodeBatchMutationRequestAlloc(scratch, .{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .canceled } } });
                 var cancel_record = begin_record;
                 cancel_record.lsn = 2;
@@ -46693,7 +46695,7 @@ fn implementationTests() type {
                 var wrong_scope = scope.digest();
                 wrong_scope[0] ^= 1;
                 try std.testing.expectError(error.RestoreStagingScopeChanged, standby.write_source.retireCanceledRestoreOwner(alloc, 88, 8, wrong_scope, standby.replicaRetirementOwnership()));
-                try standby.applyHAReplicationRecord(cancel_record);
+                try replication_ingress.applyRecord(&standby, cancel_record);
                 _ = try std.Io.Dir.cwd().statFile(io_impl.io(), canceled_root, .{});
                 canceled_lease.deinit(alloc);
                 // Crash/restart after terminal acknowledgement and before cleanup:
@@ -46705,12 +46707,12 @@ fn implementationTests() type {
                 _ = standby.write_source.withReplicaRetirementOwnership(standby.replicaRetirementOwnership());
                 try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io_impl.io(), canceled_root, .{}));
                 try standby.write_source.clearWriteCache();
-                try standby.applyHAReplicationRecord(cancel_record);
+                try replication_ingress.applyRecord(&standby, cancel_record);
                 const canceled_registry_root = try standby.haRestoreOwnerMetadataRoot(scratch);
                 var canceled_registry = try @import("../storage/hot_standby/restore_owner_registry.zig").load(alloc, io_impl.io(), canceled_registry_root);
                 defer canceled_registry.deinit();
                 try std.testing.expectEqual(@as(usize, 0), canceled_registry.owners.len);
-                try std.testing.expect((try standby.write_source.readHAHiddenOwnerBootstrap(alloc, 88, 8)) == null);
+                try std.testing.expect((try standby.write_source.readHotStandbyHiddenOwnerBootstrap(alloc, 88, 8)) == null);
                 var active_descriptor = descriptor;
                 active_descriptor.table_name = "active-hidden";
                 active_descriptor.scope.target_namespace = .{ .table_id = 9, .shard_id = 99, .range_id = 99 };
@@ -46720,7 +46722,7 @@ fn implementationTests() type {
                 active_begin.lsn = 3;
                 active_begin.previous_lsn = 2;
                 active_begin.payload = try antfly.hot_standby.effects.encodeBatchMutationWithRestoreBootstrapAlloc(scratch, .{ .restore_staging = .{ .begin = active_descriptor.scope } }, active_descriptor);
-                try standby.applyHAReplicationRecord(active_begin);
+                try replication_ingress.applyRecord(&standby, active_begin);
 
                 // The replay-created group is absent from both public placement and
                 // the local Raft catalog. A later OFFLINE seed must still retain it.
@@ -46796,13 +46798,13 @@ fn implementationTests() type {
                     var next_seed = try next_standby.prepareDefaultHASeedSnapshot(alloc, .{ .capture_root = next_capture, .generation = "second-offline-reseed" });
                     defer next_seed.deinit(alloc);
                     // Terminal replay needs neither source schema nor a retained DB.
-                    try next_standby.applyHAReplicationRecord(cancel_record);
-                    try std.testing.expectError(error.RestoreStagingCanceled, next_standby.applyHAReplicationRecord(begin_record));
+                    try replication_ingress.applyRecord(&next_standby, cancel_record);
+                    try std.testing.expectError(error.RestoreStagingCanceled, replication_ingress.applyRecord(&next_standby, begin_record));
                     var wrong_cancel = cancel_record;
                     wrong_cancel.payload = try antfly.hot_standby.effects.encodeBatchMutationRequestAlloc(scratch, .{ .restore_staging = .{ .finish = .{ .scope = active_descriptor.scope.digest(), .phase = .canceled } } });
-                    try std.testing.expectError(error.RestoreStagingScopeChanged, next_standby.applyHAReplicationRecord(wrong_cancel));
+                    try std.testing.expectError(error.RestoreStagingScopeChanged, replication_ingress.applyRecord(&next_standby, wrong_cancel));
                     wrong_cancel.payload = try antfly.hot_standby.effects.encodeBatchMutationRequestAlloc(scratch, .{ .writes = &.{.{ .key = "resurrect", .value = "{}" }}, .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .canceled } } });
-                    try std.testing.expectError(error.InvalidBatchRequest, next_standby.applyHAReplicationRecord(wrong_cancel));
+                    try std.testing.expectError(error.InvalidBatchRequest, replication_ingress.applyRecord(&next_standby, wrong_cancel));
                     var terminal_view = try (try next_standby.haRestoreTerminalLedger()).snapshot();
                     defer terminal_view.deinit();
                     const canceled = (try terminal_view.get(88)).?;
@@ -46825,8 +46827,8 @@ fn implementationTests() type {
                     try std.testing.expect(try compacted.get(88) == null);
                     try std.testing.expectEqual(active_begin.lsn, (try compacted.floor()).?.lsn);
                 }
-                try std.testing.expectError(error.HAReplayBelowReclamationFloor, standby.applyHAReplicationRecord(begin_record));
-                try std.testing.expectError(error.HAReplayBelowReclamationFloor, standby.applyHAReplicationRecord(cancel_record));
+                try std.testing.expectError(error.HAReplayBelowReclamationFloor, replication_ingress.applyRecord(&standby, begin_record));
+                try std.testing.expectError(error.HAReplayBelowReclamationFloor, replication_ingress.applyRecord(&standby, cancel_record));
                 const floor_seed_root = try std.fs.path.join(scratch, &.{ parent_absolute, "floor-seed-capture" });
                 var floor_seed = try standby.prepareDefaultHASeedSnapshot(alloc, .{ .capture_root = floor_seed_root, .generation = "terminal-floor-seed" });
                 defer floor_seed.deinit(alloc);
@@ -47264,7 +47266,7 @@ fn implementationTests() type {
                 fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
                     return error.UnexpectedCatalogLookup;
                 }
-                fn bind(ptr: *anyopaque, gate: ?antfly.db.HAWriteGate, mirror: ?antfly.db.HAAsyncEffectMirror) !void {
+                fn bind(ptr: *anyopaque, gate: ?antfly.db.ReplicationWriteGate, mirror: ?antfly.db.ReplicationAsyncEffectMirror) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expect(gate != null);
                     try std.testing.expect(mirror != null);
@@ -47301,14 +47303,14 @@ fn implementationTests() type {
             var server = DataServer.initFromLocalMetadataSources(std.testing.allocator, .{ .replica_root_dir = "unused-metadata-port", .replica_catalog_path = "unused-metadata-port-catalog" }, .{ .ptr = &probe, .vtable = &.{ .admin_snapshot = Probe.admin, .free_admin_snapshot = Probe.freeAdmin } }, .{ .ptr = &probe, .vtable = &.{ .status = Probe.status }, .standalone_hot_standby = port });
             defer server.deinit();
             const record: antfly.hot_standby.replication_record.RecordView = .{ .kind = .metadata_mutation, .payload_codec = .json, .cluster_id = 1, .table_id = 0, .shard_id = 0, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = "metadata-effects" };
-            try server.applyHAReplicationRecord(record);
+            try replication_ingress.applyRecord(&server, record);
             try std.testing.expectEqual(@as(usize, 1), probe.applied);
             var binary_record = record;
             binary_record.payload_codec = .binary;
-            try server.applyHAReplicationRecord(binary_record);
+            try replication_ingress.applyRecord(&server, binary_record);
             try std.testing.expectEqual(@as(usize, 2), probe.applied);
             server.status_source.standalone_hot_standby = null;
-            try std.testing.expectError(error.HAMetadataAuthorityUnavailable, server.applyHAReplicationRecord(record));
+            try std.testing.expectError(error.HAMetadataAuthorityUnavailable, replication_ingress.applyRecord(&server, record));
             server.status_source.standalone_hot_standby = port;
             probe.preparation_error = error.HASyncCommitWouldBlock;
             try DataServer.prepareStandaloneMetadataStartup(port);
@@ -47328,7 +47330,7 @@ fn implementationTests() type {
             defer server.ha_state_mutex.unlock();
             try server.rewireHAPromotionMirrors();
             try std.testing.expectEqual(@as(usize, 1), probe.bound);
-            try std.testing.expect(server.write_source.ha_async_mirror.?.primary == &primary);
+            try std.testing.expect(server.write_source.ha_async_mirror.?.publisher.ptr == @as(*anyopaque, @ptrCast(&primary)));
         }
 
         test "data runtime private cancel proof recovers a restarted native terminal owner" {
@@ -47407,7 +47409,7 @@ fn implementationTests() type {
                 try std.testing.expectError(error.RestoreStagingCanceled, writer.db.batch(.{ .writes = &.{.{ .key = "forbidden", .value = "{}" }} }));
                 _ = try writer.db.finishRestoreStaging(alloc, recovery.scope.digest(), .canceled);
                 const canceled_snapshot = try std.fs.path.join(scratch, &.{ root, "canceled-owner-seed" });
-                try restarted.write_source.captureHASeedHiddenReplicaSnapshot(alloc, recovery.table.name, 701, recovery.scope.digest(), "canceled-owner", canceled_snapshot);
+                try restarted.write_source.captureHotStandbySeedHiddenReplicaSnapshot(alloc, recovery.table.name, 701, recovery.scope.digest(), "canceled-owner", canceled_snapshot);
             }
             // A cancellation capability is not HA's broader terminal replay mode.
             // Seed a durable published marker and verify the cold-open path rejects it.
@@ -48764,9 +48766,9 @@ fn implementationTests() type {
                 var db = try antfly.db.DB.open(alloc, path, .{ .start_index_workers = false });
                 defer db.close();
                 try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"acknowledged\"}" }} });
-                try db.batchRaftReplicatedApply(finalize, split_entry);
+                try @import("../storage/server_db_adapter.zig").applyOrdered(&db, finalize, split_entry);
                 try std.testing.expectEqualStrings("doc:k", db.getRange().end);
-                try std.testing.expectEqual(split_entry, (try db.raftAppliedEntry()).?);
+                try std.testing.expectEqual(split_entry, (try db.orderedApplyReceipt()).?);
             }
             {
                 var db = try antfly.db.DB.open(alloc, path, .{ .start_index_workers = false });
@@ -48774,9 +48776,9 @@ fn implementationTests() type {
                 try std.testing.expectEqualStrings("doc:k", db.getRange().end);
                 var invalid = finalize;
                 invalid.split_transition.?.split_key = "doc:z";
-                try std.testing.expectError(error.InvalidSplitRange, db.batchRaftReplicatedApply(invalid, merge_entry));
-                try std.testing.expectEqual(split_entry, (try db.raftAppliedEntry()).?);
-                try db.batchRaftReplicatedApply(.{ .merge_checkpoint = .{
+                try std.testing.expectError(error.InvalidSplitRange, @import("../storage/server_db_adapter.zig").applyOrdered(&db, invalid, merge_entry));
+                try std.testing.expectEqual(split_entry, (try db.orderedApplyReceipt()).?);
+                try @import("../storage/server_db_adapter.zig").applyOrdered(&db, .{ .merge_checkpoint = .{
                     .kind = .accept,
                     .transition_id = 42,
                     .donor_group_id = 2,
@@ -48787,15 +48789,15 @@ fn implementationTests() type {
                     .merged_end = "",
                 } }, merge_entry);
                 try std.testing.expectEqualStrings("", db.getRange().end);
-                try db.batchRaftReplicatedApply(finalize, split_entry);
+                try @import("../storage/server_db_adapter.zig").applyOrdered(&db, finalize, split_entry);
                 try std.testing.expectEqualStrings("", db.getRange().end);
             }
             {
                 var db = try antfly.db.DB.open(alloc, path, .{ .start_index_workers = false });
                 defer db.close();
-                try db.batchRaftReplicatedApply(finalize, split_entry);
+                try @import("../storage/server_db_adapter.zig").applyOrdered(&db, finalize, split_entry);
                 try std.testing.expectEqualStrings("", db.getRange().end);
-                try std.testing.expectEqual(merge_entry, (try db.raftAppliedEntry()).?);
+                try std.testing.expectEqual(merge_entry, (try db.orderedApplyReceipt()).?);
                 const value = (try db.get(alloc, "doc:a")) orelse return error.TestExpectedDocument;
                 defer alloc.free(value);
                 try std.testing.expectEqualStrings("{\"title\":\"acknowledged\"}", value);
@@ -48825,8 +48827,8 @@ fn implementationTests() type {
                 var db = try antfly.db.DB.open(alloc, path, .{ .start_index_workers = false });
                 defer db.close();
                 try db.batch(.{ .writes = &.{.{ .key = "doc:counter", .value = "{\"count\":0}" }} });
-                try db.batchRaftReplicatedApply(increment, first_entry);
-                try std.testing.expectEqual(first_entry, (try db.raftAppliedEntry()).?);
+                try @import("../storage/server_db_adapter.zig").applyOrdered(&db, increment, first_entry);
+                try std.testing.expectEqual(first_entry, (try db.orderedApplyReceipt()).?);
             }
 
             {
@@ -48835,10 +48837,10 @@ fn implementationTests() type {
 
                 // Replaying the exact accepted entry after process reconstruction is a
                 // no-op; a different term at the same index is never accepted as it.
-                try db.batchRaftReplicatedApply(increment, first_entry);
+                try @import("../storage/server_db_adapter.zig").applyOrdered(&db, increment, first_entry);
                 try std.testing.expectError(
                     error.ConflictingRaftAppliedEntry,
-                    db.batchRaftReplicatedApply(increment, .{ .term = 5, .index = 11 }),
+                    @import("../storage/server_db_adapter.zig").applyOrdered(&db, increment, .{ .term = 5, .index = 11 }),
                 );
 
                 const raw = (try db.get(alloc, "doc:counter")) orelse return error.TestExpectedDocument;
@@ -48848,16 +48850,16 @@ fn implementationTests() type {
                 try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("count").?.integer);
 
                 const second_entry: antfly.db.types.RaftAppliedEntryIdentity = .{ .term = 5, .index = 12 };
-                try db.batchRaftReplicatedApply(increment, second_entry);
-                try std.testing.expectEqual(second_entry, (try db.raftAppliedEntry()).?);
+                try @import("../storage/server_db_adapter.zig").applyOrdered(&db, increment, second_entry);
+                try std.testing.expectEqual(second_entry, (try db.orderedApplyReceipt()).?);
 
                 // Structural import into a new Raft history deliberately clears the
                 // group-local fence, allowing that history to begin at a lower index.
-                try db.clearRaftAppliedEntry();
-                try std.testing.expectEqual(null, try db.raftAppliedEntry());
+                try db.clearOrderedApplyReceipt();
+                try std.testing.expectEqual(null, try db.orderedApplyReceipt());
                 const imported_history_entry: antfly.db.types.RaftAppliedEntryIdentity = .{ .term = 1, .index = 1 };
-                try db.batchRaftReplicatedApply(increment, imported_history_entry);
-                try std.testing.expectEqual(imported_history_entry, (try db.raftAppliedEntry()).?);
+                try @import("../storage/server_db_adapter.zig").applyOrdered(&db, increment, imported_history_entry);
+                try std.testing.expectEqual(imported_history_entry, (try db.orderedApplyReceipt()).?);
                 const reset_raw = (try db.get(alloc, "doc:counter")) orelse return error.TestExpectedDocument;
                 defer alloc.free(reset_raw);
                 var reset_parsed = try std.json.parseFromSlice(std.json.Value, alloc, reset_raw, .{});
@@ -54397,7 +54399,7 @@ fn implementationTests() type {
                 const io = virtual_io.io();
                 var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
                     .backend = .manual,
-                    .lane_limits = .{ .request_forward = @import("../common/threaded_io_limits.zig").request_forward_workers_per_request },
+                    .lane_limits = .{ .request_forward = @import("antfly_runtime_fs").threaded_io_limits.request_forward_workers_per_request },
                     .borrowed_io = .{ .general = io, .control = io, .request_forward = io },
                 });
                 defer runtime.deinit();
@@ -55256,12 +55258,12 @@ fn implementationTests() type {
             try server.initApiServer();
 
             const source_mirror = server.write_source.ha_async_mirror orelse return error.TestExpectedEqual;
-            try std.testing.expect(source_mirror.primary == &primary);
+            try std.testing.expect(source_mirror.publisher.ptr == @as(*anyopaque, @ptrCast(&primary)));
             const owner_mirror = if (comptime linked_storage)
                 server.kernel_owner_source.?.ha_async_mirror orelse return error.TestExpectedEqual
             else
                 server.provisioned_storage.write_cache.ha_async_mirror orelse return error.TestExpectedEqual;
-            try std.testing.expect(owner_mirror.primary == &primary);
+            try std.testing.expect(owner_mirror.publisher.ptr == @as(*anyopaque, @ptrCast(&primary)));
 
             _ = try server.write_source.source().batch(alloc, "docs", .{
                 .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
@@ -55380,19 +55382,19 @@ fn implementationTests() type {
             defer server.deinit();
             try server.initApiServer();
 
-            const source_gate = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;
+            const source_gate = server.write_source.replication_write_gate orelse return error.TestExpectedEqual;
             switch (source_gate) {
                 .shared => |gate| {
-                    try std.testing.expect(gate.state == &server.ha_public_gate_state);
+                    try std.testing.expect(gate.state.ptr == @as(*const anyopaque, @ptrCast(&server.ha_public_gate_state)));
                     try std.testing.expect(gate.generation == null);
                 },
                 .standby, .fenced_primary, .primary => return error.TestExpectedEqual,
             }
 
-            const cache_gate = server.provisioned_storage.write_cache.ha_write_gate orelse return error.TestExpectedEqual;
+            const cache_gate = server.provisioned_storage.write_cache.replication_write_gate orelse return error.TestExpectedEqual;
             switch (cache_gate) {
                 .shared => |gate| {
-                    try std.testing.expect(gate.state == &server.ha_public_gate_state);
+                    try std.testing.expect(gate.state.ptr == @as(*const anyopaque, @ptrCast(&server.ha_public_gate_state)));
                     try std.testing.expect(gate.generation == null);
                 },
                 .standby, .fenced_primary, .primary => return error.TestExpectedEqual,

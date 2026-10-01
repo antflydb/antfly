@@ -68,7 +68,7 @@ test "online graph snapshot receiver rebinds native effects without changing sou
     var request: types.BatchRequest = .{ .merge_replication = context, .merge_page = .{ .source = identity, .sequence = 1, .phase = .tail, .exhausted = false, .digest = @splat(0), .tail = .{ .fragment = .{ .sequence = 1, .offset = 0, .total_effects = 1, .frame_digest = @splat(4) } }, .artifact_effects = &.{.{ .key = edge, .value = value }} }, .sync_level = .write };
     request.merge_page.?.digest = pages.commandDigest(request);
     const source_digest = request.merge_page.?.digest;
-    try receiver.batchRaftReplicatedApply(request, .{ .term = 1, .index = 2 });
+    try @import("../server_db_adapter.zig").applyOrdered(&receiver, request, .{ .term = 1, .index = 2 });
     {
         const actual = try receiver.core.store.get(alloc, edge);
         defer alloc.free(actual);
@@ -87,12 +87,12 @@ test "online graph snapshot receiver rebinds native effects without changing sou
     const ordered = try receiver.core.store.get(alloc, inventory.ordered_key);
     defer alloc.free(ordered);
     try receiver.core.store.delete(inventory.ordered_key);
-    try receiver.batchRaftReplicatedApply(request, .{ .term = 1, .index = 3 });
+    try @import("../server_db_adapter.zig").applyOrdered(&receiver, request, .{ .term = 1, .index = 3 });
     try receiver.core.store.put(inventory.ordered_key, ordered);
     request.merge_page.?.sequence = 2;
     request.merge_page.?.tail.?.fragment.sequence = 2;
     request.merge_page.?.artifact_effects = &.{.{ .key = edge, .value = null }};
     request.merge_page.?.digest = pages.commandDigest(request);
-    try receiver.batchRaftReplicatedApply(request, .{ .term = 1, .index = 4 });
+    try @import("../server_db_adapter.zig").applyOrdered(&receiver, request, .{ .term = 1, .index = 4 });
     try std.testing.expectError(error.NotFound, receiver.core.store.get(alloc, edge));
 }

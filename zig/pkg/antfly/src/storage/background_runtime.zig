@@ -19,7 +19,7 @@ const platform = @import("antfly_platform");
 const runtime_backend = @import("runtime_backend.zig");
 const storage_io = @import("lsm_backend/storage_io.zig");
 const threaded_connect_io = @import("../common/threaded_connect_io.zig");
-const threaded_io_limits = @import("../common/threaded_io_limits.zig");
+const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const bounded_worker_lane = @import("../common/bounded_worker_lane.zig");
 pub const MaintenanceScheduler = @import("../common/maintenance_scheduler.zig").Scheduler;
 

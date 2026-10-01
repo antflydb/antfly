@@ -32,7 +32,7 @@ const resource_manager_mod = @import("../resource_manager.zig");
 const index_repair_status = @import("../../common/index_repair_status.zig");
 const dense_native_storage_phase = @import("../../common/dense_native_storage_phase.zig");
 const document_content_hash = @import("document_content_hash.zig");
-pub const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+pub const CancellationToken = @import("antfly_cancellation").CancellationToken;
 pub const IndexRepairStatus = index_repair_status.IndexRepairStatus;
 pub const DenseNativeStoragePhase = dense_native_storage_phase.DenseNativeStoragePhase;
 pub const DocumentContentHash = document_content_hash.Digest;
@@ -1415,7 +1415,7 @@ pub const LookupOptions = struct {
     /// Internal, absolute monotonic deadline used by routed lookups. It is not
     /// part of the public lookup projection contract and is never serialized.
     execution_deadline_ns: ?u64 = null,
-    execution_io: ?@import("../../runtime_io_abi.zig").Borrow = null,
+    execution_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
     /// Borrowed request cancellation source. Callers must keep it alive for
     /// the synchronous lookup call.
     cancellation: ?CancellationToken = null,
@@ -3994,11 +3994,14 @@ pub const IndexRepairWake = union(enum) {
     }
 };
 
-/// Exact data-Raft entry persisted atomically with one document mutation.
-pub const RaftAppliedEntryIdentity = struct {
+/// Exact ordered mutation receipt persisted atomically with primary effects.
+pub const OrderedApplyReceipt = struct {
     term: u64,
     index: u64,
 };
+
+/// Server source compatibility; the durable term/index encoding is unchanged.
+pub const RaftAppliedEntryIdentity = OrderedApplyReceipt;
 
 pub const ArtifactRepairResult = struct {
     scanned: u64 = 0,

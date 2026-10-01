@@ -17,7 +17,7 @@
 //! repeatedly walking ancestors after restart. No file payload is read or
 //! truncated (SSTs may still be hard-linked by a live owner).
 const std = @import("std");
-const fs = @import("../../common/fs_paths.zig");
+const fs = @import("antfly_runtime_fs").fs_paths;
 
 pub const max_path = 4096;
 pub const max_depth = 64;

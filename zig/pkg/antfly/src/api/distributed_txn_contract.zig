@@ -31,11 +31,11 @@ pub const status_server_response_reserve_ms: u32 = 50;
 /// Process-local execution context established by the receiving node. This is
 /// never serialized directly across the wire.
 pub const PreDecisionContext = struct {
-    route_fence: ?@import("../metadata/api.zig").CatalogRouteFence = null,
+    route_fence: ?@import("../metadata/catalog_route_contract.zig").CatalogRouteFence = null,
     restore_staging_scope: ?[32]u8 = null,
     restore_staging_plan_id: ?[16]u8 = null,
     deadline_ns: ?u64 = null,
-    deadline_io: ?@import("../runtime_io_abi.zig").Borrow = null,
+    deadline_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
     cancellation: db_types.CancellationToken = .none,
 };
 

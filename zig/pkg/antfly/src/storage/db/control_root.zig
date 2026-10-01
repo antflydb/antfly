@@ -19,21 +19,19 @@
 const runtime_preflight = @import("runtime_preflight.zig");
 const runtime_callbacks = @import("runtime_callbacks.zig");
 const structured_filter_validation = @import("query/structured_filter_validation.zig");
-const ha_contract = @import("ha_contract.zig");
+const replication_contract = @import("replication_contract.zig");
 const document_artifact_child_range = @import("document_artifact_child_range.zig");
-const ha_commit_gate = @import("../hot_standby/commit_gate.zig");
-const ha_primary = @import("../hot_standby/primary.zig");
-const platform_time = @import("antfly_platform").time;
 
 pub const types = @import("types.zig");
 pub const coordinated_ttl = @import("../coordinated_ttl.zig");
-pub const RaftAppliedEntryIdentity = types.RaftAppliedEntryIdentity;
+pub const OrderedApplyReceipt = types.OrderedApplyReceipt;
+pub const RaftAppliedEntryIdentity = OrderedApplyReceipt;
 pub const aggregations = @import("aggregations_contract.zig");
 pub const algebraic = @import("algebraic/control_root.zig");
 pub const doc_filter_wire = @import("doc_filter_wire.zig");
 pub const background_runtime = @import("../background_runtime.zig");
 pub const LsmOwnerKind = background_runtime.LsmOwnerKind;
-pub const logical_snapshot_manifest_file_name = @import("../hot_standby/seed_topology.zig").logical_snapshot_manifest_name;
+pub const logical_snapshot_manifest_file_name = @import("../backup_codec.zig").logical_snapshot_manifest_file_name;
 pub const query_metrics = @import("query_metrics.zig");
 pub const enrichment_utf8_text = @import("enrichment/utf8_text.zig");
 pub const documentExtractionStoredUnitFingerprintAlloc = @import("enrichment/document_unit_fingerprint.zig").storedPayloadLegacyFingerprintAlloc;
@@ -47,47 +45,14 @@ pub const CandidateSource = runtime_callbacks.CandidateSource;
 pub const EntityUpsert = runtime_callbacks.EntityUpsert;
 pub const EntitySink = runtime_callbacks.EntitySink;
 pub const PromotionOwner = runtime_callbacks.PromotionOwner;
-pub const HAReplicationRecordView = @import("../hot_standby/replication_record.zig").RecordView;
-pub const HAAsyncEffectMirror = ha_contract.AsyncEffectMirror;
-pub const HAAsyncBatchMirror = ha_contract.AsyncBatchMirror;
-pub const HAAsyncMetadataMirror = ha_contract.AsyncMetadataMirror;
-pub const HAMutationBarrier = @import("../hot_standby/mutation_barrier.zig").MutationBarrier;
-pub const HASyncWaitFn = ha_contract.SyncWaitFn;
-pub const HAWriteGate = ha_contract.WriteGate;
-pub const HAProgressPollFn = *const fn (
-    ctx: *anyopaque,
-    primary: *ha_primary.Primary,
-    target_lsn: u64,
-    policy: ha_primary.SyncPolicy,
-    round: usize,
-) anyerror!void;
-pub const HAPrimaryProgressSyncWait = struct {
-    max_rounds: usize = 64,
-    sleep_ns: u64 = 0,
-    poll_ctx: ?*anyopaque = null,
-    poll_fn: ?HAProgressPollFn = null,
+pub const ReplicationRecordView = @import("replication_record.zig").RecordView;
+pub const ReplicationAsyncEffectMirror = replication_contract.AsyncEffectMirror;
+pub const ReplicationAsyncBatchMirror = replication_contract.AsyncBatchMirror;
+pub const ReplicationAsyncMetadataMirror = replication_contract.AsyncMetadataMirror;
+pub const MutationBarrier = @import("antfly_runtime_abi").mutation_barrier.MutationBarrier;
+pub const ReplicationSyncWaitFn = replication_contract.SyncWaitFn;
+pub const ReplicationWriteGate = replication_contract.WriteGate;
 
-    pub fn wait(ctx: *anyopaque, primary: *ha_primary.Primary, target_lsn: u64, policy: ha_primary.SyncPolicy) !void {
-        const self: *@This() = @ptrCast(@alignCast(ctx));
-        if (policy.mode == .async) return;
-        if (self.max_rounds == 0) return error.HASyncCommitWaitLimitExceeded;
-
-        var round: usize = 0;
-        while (round < self.max_rounds) : (round += 1) {
-            if (self.poll_fn) |poll| {
-                const poll_ctx = self.poll_ctx orelse return error.HASyncCommitWaitMissingContext;
-                try poll(poll_ctx, primary, target_lsn, policy, round);
-            }
-
-            const gate = try ha_commit_gate.evaluate(primary, target_lsn, policy);
-            if (gate.shouldAcknowledge()) return;
-            if (gate.action == .reject) return error.SyncPolicyUnsatisfied;
-            if (self.sleep_ns > 0) platform_time.sleepNs(self.sleep_ns);
-        }
-
-        return error.HASyncCommitWouldBlock;
-    }
-};
 pub const DocumentArtifactChildRangeApplyBatch = document_artifact_child_range.ApplyBatch;
 pub const TextMemoryAttributionStats = @import("text_memory_stats.zig").TextMemoryAttributionStats;
 pub const TextFieldStats = @import("../../search/distributed_stats.zig").TextFieldStats;

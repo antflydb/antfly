@@ -15,7 +15,7 @@
 const std = @import("std");
 const raft_engine = @import("raft_engine");
 const db_types = @import("../storage/db/types.zig");
-const read_state_observer_mod = @import("state_machine/read_state_observer.zig");
+const read_state_observer_mod = @import("antfly_read_state_observer");
 
 /// Tracks quorum ReadIndex requests until the matching ReadState has crossed
 /// this replica's state-machine apply boundary. Registration is request
@@ -217,60 +217,17 @@ pub const AppliedReadTracker = struct {
     }
 };
 
-pub const EnrichmentReadKind = enum {
-    search,
-    lookup,
-    scan,
-};
-
-pub const ReadConsistency = enum {
-    stale,
-    leader_lease,
-    read_index,
-};
-
-/// Starts a Raft ReadIndex operation and returns as soon as it has been
-/// admitted to the local RawNode. This is deliberately not a read barrier:
-/// callers that will inspect state must separately wait for a ReadSafetyBarrier.
-pub const ReadIndexRequester = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        request_read_index: *const fn (ptr: *anyopaque, group_id: u64, request_ctx: []const u8) anyerror!void,
-    };
-
-    pub fn requestReadIndex(self: ReadIndexRequester, group_id: u64, request_ctx: []const u8) !void {
-        try self.vtable.request_read_index(self.ptr, group_id, request_ctx);
-    }
-};
-
-pub const ReadSafetyBarrier = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        wait_read_safe: *const fn (ptr: *anyopaque, group_id: u64, request_ctx: []const u8) anyerror!void,
-        capture_frozen: ?*const fn (*anyopaque, u64) anyerror!FrozenProof = null,
-        validate_frozen: ?*const fn (*anyopaque, u64, FrozenProof, ?u64, @import("../common/cancellation.zig").CancellationToken) anyerror!void = null,
-    };
-
-    pub const FrozenProof = struct {
-        incarnation: u128,
-        term: u64,
-        applied_index: u64,
-
-        pub fn validate(self: @This(), incarnation: u128, term: u64, is_leader: bool, quorum_index: u64) !void {
-            if (!is_leader or incarnation != self.incarnation or term != self.term) return error.NotLeader;
-            if (quorum_index > self.applied_index) return error.ReadUnavailable;
-        }
-    };
-
-    pub fn waitReadSafe(self: ReadSafetyBarrier, group_id: u64, request_ctx: []const u8) !void {
-        try self.vtable.wait_read_safe(self.ptr, group_id, request_ctx);
-    }
-};
-
+const read_contract = @import("../storage/read_consistency.zig");
+pub const EnrichmentReadKind = read_contract.EnrichmentReadKind;
+pub const ReadConsistency = read_contract.ReadConsistency;
+pub const ReadIndexRequester = read_contract.ReadIndexRequester;
+pub const ReadSafetyBarrier = read_contract.ReadSafetyBarrier;
+pub const ReadSafetyCallback = read_contract.ReadSafetyCallback;
+pub const CallbackReadSafetyBarrier = read_contract.CallbackReadSafetyBarrier;
+pub const alreadyReadSafeBarrier = read_contract.alreadyReadSafeBarrier;
+pub const unavailableReadSafetyBarrier = read_contract.unavailableReadSafetyBarrier;
+pub const EnrichmentReadIndexRequester = read_contract.EnrichmentReadIndexRequester;
+pub const EnrichmentReadGate = read_contract.EnrichmentReadGate;
 test "frozen read quorum proof is observable without falsely completing apply" {
     var tracker = AppliedReadTracker.init(std.testing.allocator, 7);
     defer tracker.deinit();
@@ -294,163 +251,6 @@ test "frozen read quorum proof is observable without falsely completing apply" {
     try std.testing.expectError(error.NotLeader, proof.validate(7, 4, true, 10));
     try std.testing.expectError(error.NotLeader, proof.validate(8, 3, true, 10));
     try std.testing.expectError(error.NotLeader, proof.validate(7, 3, false, 10));
-}
-
-pub const ReadSafetyCallback = *const fn (ctx: ?*anyopaque, group_id: u64, request_ctx: []const u8) anyerror!void;
-
-pub const CallbackReadSafetyBarrier = struct {
-    ctx: ?*anyopaque,
-    callback: ReadSafetyCallback,
-
-    pub fn init(ctx: ?*anyopaque, callback: ReadSafetyCallback) CallbackReadSafetyBarrier {
-        return .{
-            .ctx = ctx,
-            .callback = callback,
-        };
-    }
-
-    pub fn barrier(self: *const CallbackReadSafetyBarrier) ReadSafetyBarrier {
-        return .{
-            .ptr = @constCast(self),
-            .vtable = &.{
-                .wait_read_safe = waitReadSafe,
-            },
-        };
-    }
-
-    fn waitReadSafe(ptr: *anyopaque, group_id: u64, request_ctx: []const u8) !void {
-        const self: *const CallbackReadSafetyBarrier = @ptrCast(@alignCast(ptr));
-        try self.callback(self.ctx, group_id, request_ctx);
-    }
-};
-
-/// Use only when the caller owns non-replicated or otherwise already-fenced
-/// state. The explicit name makes this proof obligation visible at call sites.
-pub fn alreadyReadSafeBarrier() ReadSafetyBarrier {
-    return .{
-        .ptr = undefined,
-        .vtable = &.{
-            .wait_read_safe = waitReadSafeNoop,
-        },
-    };
-}
-
-fn waitReadSafeNoop(_: *anyopaque, _: u64, _: []const u8) !void {}
-
-/// Fail-closed placeholder for a replicated read source whose owner has not
-/// installed its applied-state barrier yet.
-pub fn unavailableReadSafetyBarrier() ReadSafetyBarrier {
-    return .{
-        .ptr = undefined,
-        .vtable = &.{
-            .wait_read_safe = waitReadSafeUnavailable,
-        },
-    };
-}
-
-fn waitReadSafeUnavailable(_: *anyopaque, _: u64, _: []const u8) !void {
-    return error.ReadSafetyBarrierUnavailable;
-}
-
-pub const EnrichmentReadIndexRequester = struct {
-    requester: ReadIndexRequester,
-
-    pub fn init(requester: ReadIndexRequester) EnrichmentReadIndexRequester {
-        return .{ .requester = requester };
-    }
-
-    pub fn request(
-        self: EnrichmentReadIndexRequester,
-        group_id: u64,
-        kind: EnrichmentReadKind,
-        consistency: ReadConsistency,
-    ) !void {
-        if (consistency == .stale) return;
-        var buf: [96]u8 = undefined;
-        const request_ctx = try enrichmentRequestContext(&buf, kind, consistency);
-        try self.requester.requestReadIndex(group_id, request_ctx);
-    }
-
-    pub fn requestSearch(self: EnrichmentReadIndexRequester, group_id: u64, consistency: ReadConsistency) !void {
-        try self.request(group_id, .search, consistency);
-    }
-
-    pub fn requestLookup(self: EnrichmentReadIndexRequester, group_id: u64, consistency: ReadConsistency) !void {
-        try self.request(group_id, .lookup, consistency);
-    }
-
-    pub fn requestScan(self: EnrichmentReadIndexRequester, group_id: u64, consistency: ReadConsistency) !void {
-        try self.request(group_id, .scan, consistency);
-    }
-};
-
-pub const EnrichmentReadGate = struct {
-    barrier: ReadSafetyBarrier,
-
-    pub fn init(barrier: ReadSafetyBarrier) EnrichmentReadGate {
-        return .{ .barrier = barrier };
-    }
-
-    pub fn prepare(
-        self: EnrichmentReadGate,
-        group_id: u64,
-        kind: EnrichmentReadKind,
-        consistency: ReadConsistency,
-    ) !void {
-        if (consistency == .stale) return;
-
-        var buf: [96]u8 = undefined;
-        const request_ctx = try enrichmentRequestContext(&buf, kind, consistency);
-        try self.barrier.waitReadSafe(group_id, request_ctx);
-    }
-
-    pub fn prepareSearch(
-        self: EnrichmentReadGate,
-        group_id: u64,
-        req: db_types.SearchRequest,
-        consistency: ReadConsistency,
-    ) !void {
-        _ = req;
-        try self.prepare(group_id, .search, consistency);
-    }
-
-    pub fn prepareLookup(
-        self: EnrichmentReadGate,
-        group_id: u64,
-        key: []const u8,
-        opts: db_types.LookupOptions,
-        consistency: ReadConsistency,
-    ) !void {
-        _ = key;
-        _ = opts;
-        try self.prepare(group_id, .lookup, consistency);
-    }
-
-    pub fn prepareScan(
-        self: EnrichmentReadGate,
-        group_id: u64,
-        from_key: []const u8,
-        to_key: []const u8,
-        opts: db_types.ScanOptions,
-        consistency: ReadConsistency,
-    ) !void {
-        _ = from_key;
-        _ = to_key;
-        _ = opts;
-        try self.prepare(group_id, .scan, consistency);
-    }
-};
-
-fn enrichmentRequestContext(
-    buf: []u8,
-    kind: EnrichmentReadKind,
-    consistency: ReadConsistency,
-) ![]const u8 {
-    return try std.fmt.bufPrint(
-        buf,
-        "enrichment:{s}:{s}",
-        .{ @tagName(kind), @tagName(consistency) },
-    );
 }
 
 test "enrichment read gate supports explicit consistency modes" {
