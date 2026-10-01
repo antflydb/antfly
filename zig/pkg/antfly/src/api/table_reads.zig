@@ -3624,6 +3624,7 @@ pub const ProvisionedTableReadSource = struct {
     fn physicalSource(self: *ProvisionedTableReadSource) TableReadSource {
         return .{
             .ptr = self,
+            .strict_read_index_absence = true,
             .vtable = &.{
                 .lookup = unsupportedPhysicalTopLevelLookup,
                 .scan = unsupportedPhysicalTopLevelScan,
@@ -4083,7 +4084,7 @@ pub const ProvisionedTableReadSource = struct {
     pub fn source(self: *ProvisionedTableReadSource) TableReadSource {
         return .{
             .ptr = self,
-            .strict_read_index_absence = if (self.local_read_source) |local| local.strict_read_index_absence else false,
+            .strict_read_index_absence = if (self.local_read_source) |local| local.strict_read_index_absence else !control_only_storage_sources,
             .remote_statement_fences_safe = if (self.local_read_source) |local| local.remote_statement_fences_safe else false,
             .supports_sql_range_guards = true,
             .vtable = &.{
@@ -4244,7 +4245,7 @@ pub const ProvisionedTableReadSource = struct {
         if (consistency == .stale or group_ids.len == 0) return;
         const strict_relational = request == .scan and request.scan.opts.isRelational();
         const allow_stale_fallback = !strict_relational and !(consistency == .read_index and request == .lookup and
-            (if (self.local_read_source) |local| local.strict_read_index_absence else false));
+            self.source().strict_read_index_absence);
         const plan = planFanout(.query, self.io_impl, group_ids.len);
         if (!plan.parallel) {
             for (group_ids) |group_id| {
@@ -11408,7 +11409,7 @@ fn lookupProvisionedHostedLocal(
     expected_identity_namespace: ?db_mod.DocIdentityNamespace,
 ) !?LookupResponse {
     return lookupProvisionedLocal(resident_db, cache, replica_root_dir, catalog, read_safety_barrier, alloc, group_id, lsm_root_generation, backend_runtime, table_name, key, opts, consistency, read_activity_held, expected_identity_namespace) catch |err| switch (err) {
-        error.NotLeader => if (consistency == .stale) err else try lookupProvisionedLocal(resident_db, cache, replica_root_dir, catalog, read_safety_barrier, alloc, group_id, lsm_root_generation, backend_runtime, table_name, key, opts, .stale, read_activity_held, expected_identity_namespace),
+        error.NotLeader => if (consistency != .leader_lease) err else try lookupProvisionedLocal(resident_db, cache, replica_root_dir, catalog, read_safety_barrier, alloc, group_id, lsm_root_generation, backend_runtime, table_name, key, opts, .stale, read_activity_held, expected_identity_namespace),
         else => err,
     };
 }
@@ -17414,6 +17415,13 @@ fn consumerTests() type {
             stale_input.consistency = .stale;
             try std.testing.expectError(error.NotFound, operations.lookup(std.testing.allocator, context, stale_input));
             var provisioned = ProvisionedTableReadSource.init("unused", catalog, .{ .ptr = &fixture, .vtable = &.{ .wait_read_safe = Fixture.notLeader } });
+            // The embedded physical owner must prove read-index absence too;
+            // its admission cannot fall back to a stale read on leader loss.
+            if (comptime !control_only_storage_sources) {
+                try std.testing.expect(provisioned.source().strict_read_index_absence);
+                try std.testing.expect(provisioned.physicalSource().strict_read_index_absence);
+                try std.testing.expectError(error.NotLeader, provisioned.prepareGroupsForReadAdmission(std.testing.allocator, &.{7}, .{ .lookup = .{ .key = "absent", .opts = .{} } }, .read_index));
+            }
             _ = provisioned.withLocalReadSource(hosted.local_read_source.?);
             try std.testing.expect(provisioned.source().strict_read_index_absence);
             try std.testing.expect(hosted.source().strict_read_index_absence);

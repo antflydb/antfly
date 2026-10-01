@@ -1,5 +1,72 @@
 # Zig runtime flakes
 
+## 2026-10-01: full CI discovery drift and virtual HTTP teardown
+
+[Run 36903575966](https://github.com/antflydb/antfly/actions/runs/36903575966)
+failed physical storage compilation discovery after a fourth owner fixture was
+added. The bounded audit now names its three measured owner fixtures and four
+consumer fixtures explicitly. Missing and duplicate identities still fail;
+unrelated owner fixtures remain covered by their normal targets. Real build
+graph regressions prove that an unrelated, deliberately uncompilable owner
+fixture is excluded and that omitting either a required owner or consumer fails.
+The storage shard manifest also now imports `hot_standby/primary_effect.zig`.
+
+The cancelled Zig job had already reported two deterministic API fixture
+failures. The authority fixture now exercises a partially configured dedicated
+authority, since absent dedicated fields intentionally inherit valid trusted
+principal credentials. The rewrite fixture supplies its mandatory generation
+handoff proof, including a nonzero owner retirement digest, while preserving
+the atomic admission, idempotency, and unchanged live-schema assertions.
+
+The same job timed out with a data-runtime test process still alive. Local
+Debug reproduction retained the active UNIQUE/FK three-owner history and a
+stack blocked in `Client.drainShutdown` during deferred `DataServer.deinit`.
+Admitted HTTP requests still needed virtual tasks to unwind, but teardown had
+stopped driving the scheduler. Composite shutdown now closes outbound read
+admission with the other owners. The history publishes every initialized
+node's stop, runs bounded scheduler cancellation/drain, checks that read-client
+leases are gone, and only then reclaims node state. This also runs on failure
+paths so a scenario failure can be reported instead of hidden by cleanup.
+
+Once teardown could report failures, local Debug execution also exposed a
+replicated merge stack overflow. A hardware watchpoint caught LSM open
+scratch writes overwriting a parked driver's context. The managed DB opener
+now selects `OpenOptions` before a single `DB.open`, instead of allocating a
+large DB-valued return slot for each policy branch. The original 8 MiB VOPR
+stack is retained, and the isolated merge regression passes.
+
+The embedded provisioned point-read path did not advertise authoritative
+read-index absence and still allowed a leader-loss stale fallback. The hosted
+UNIQUE/FK coordinator therefore exhausted placements on an uncertified 404
+following split cutover. Both physical and orchestration sources now expose
+the strict capability, admission preserves quorum failures, and direct
+`read_index` lookups cannot downgrade to stale. The history retains one physical
+ownership path and passes its merge/split/restart and constraint assertions.
+Apply-control shutdown also publishes its stop and wake separately from joining,
+so a borrowed scheduler can complete its uncancellable wait before reclamation.
+
+The store-report retry fixture now injects registration failures through the
+registration transport, rather than an unused snapshot-fetch seam. Its runner
+waits for the round's own completion and preserves unrelated runtime tasks
+between rounds. The focused retry regression passes.
+
+The full E2E binary build completed all 35 compilation steps at its 90-minute
+deadline and was cancelled before upload. Narrow ReleaseSafe CPU reservations
+now admit storage and inference concurrently under the existing 22 GiB budget,
+with margins above that run's rounded compiler MaxRSS. See
+[COMPILATION.md](COMPILATION.md#runtime-compilation-memory-reservations).
+These measurements identify admission serialization; they do not yet establish
+the fixed build's CI wall time.
+
+Validation: the full data-runtime target passed 53 implementation and 177
+consumer tests; the two reported API fixtures passed; all 461 hot-standby tests
+and the storage ownership audit passed; 19 build-discovery/shard tests and both
+memory-admission tests passed. The reproduced merge stack regression passed
+200/200 fresh-process repetitions using `scripts/ci/zig_vopr_soak.py`'s bounded
+process runner. The mocked compilation rollover test now fixes its disk-free
+observation so a nearly full developer disk cannot alter its expected build
+sequence.
+
 ## 2026-09-29: metadata WAL barriers and uncertain promotion outcomes (#919)
 
 [Issue #919](https://github.com/antflydb/antfly/issues/919) records an Autograph
