@@ -13881,7 +13881,7 @@ fn exerciseStandalonePolicyPublication(use_ha: bool) !void {
         });
         // Normal owner provisioning binds the public table name alongside
         // physical identity before a principal proof can be verified.
-        standby_owner.row_policy_table_name = table_name;
+        standby_owner.local_execution.row_policy_table_name = table_name;
         var owner_open = true;
         defer if (owner_open) standby_owner.close();
         // A portable owner seed carries the exact range as well as schema.
@@ -13930,7 +13930,7 @@ fn exerciseStandalonePolicyPublication(use_ha: bool) !void {
             .start_index_workers = false,
             .start_optional_runtimes = false,
         });
-        promoted_owner.row_policy_table_name = table_name;
+        promoted_owner.local_execution.row_policy_table_name = table_name;
         defer promoted_owner.close();
         _ = try promoted_owner.loadRowPolicyReceipt(status.value.generation, .serving_install);
         try std.testing.expectError(error.RowPolicyAuthenticationRequired, promoted_owner.get(alloc, "absent"));
