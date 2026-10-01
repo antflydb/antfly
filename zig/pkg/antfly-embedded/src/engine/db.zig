@@ -37,6 +37,7 @@ pub const LiteStorageStatus = support.lite.backend.StorageStatus;
 pub const LiteStatus = support.lite.backend.FullStatus;
 
 pub const OpenOptions = struct {
+    lite_reclamation: support.lite.backend.ReclamationOptions = .{},
     open_mode: db_mod.OpenOptions.OpenMode = .writer,
     map_size: usize = 256 * 1024 * 1024,
     no_sync: bool = false,
@@ -103,6 +104,7 @@ pub const DB = struct {
 
     pub fn openLiteWithProfile(alloc: Allocator, path: []const u8, opts: OpenOptions, profile: Profile) !DB {
         var lite_backend = try support.lite.backend.Handle.open(alloc, path, .{
+            .reclamation = opts.lite_reclamation,
             .read_only = openModeRequiresReadOnlyBackends(opts.open_mode),
             .no_sync = opts.no_sync,
             .io = liteIo(opts),
@@ -113,6 +115,7 @@ pub const DB = struct {
     pub fn createLiteWithProfile(alloc: Allocator, path: []const u8, opts: OpenOptions, profile: Profile) !DB {
         if (!openModeCanWrite(opts.open_mode)) return error.InvalidArgument;
         var lite_backend = try support.lite.backend.Handle.createWithOptions(alloc, path, .{
+            .reclamation = opts.lite_reclamation,
             .exclusive = true,
             .no_sync = opts.no_sync,
             .io = liteIo(opts),

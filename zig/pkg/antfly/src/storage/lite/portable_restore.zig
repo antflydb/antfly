@@ -136,7 +136,15 @@ pub fn importPortableIntoLiteDb(
     defer deleteFileIfExists(io, tmp_lock_path) catch {};
     errdefer deleteFileIfExists(io, tmp_path) catch {};
 
+    var workspace = try lite_backend.native_docstore.?.reserveGenerationWorkspace();
+    defer {
+        // Close the prepared owner (later defers) and remove failed staging
+        // bytes before making their reservation available to live appends.
+        deleteFileIfExists(io, tmp_path) catch {};
+        workspace.deinit();
+    }
     var prepared = try LiteDb.createWithOptions(allocator, tmp_path, true, .{
+        .reclamation = workspace.options,
         .fsync = !lite_backend.native_docstore.?.file.no_sync,
         .writer_lock_marker = portable_generation_lease_magic,
     });
@@ -235,17 +243,17 @@ pub fn scavengePortableRestoreGenerations(
 
 pub const RestoreWorkProfile = struct {
     started: u64,
-    fn init() RestoreWorkProfile {
+    pub fn init() RestoreWorkProfile {
         return .{ .started = if (builtin.is_test and @import("antfly_platform").env.getenvBool("ANTFLY_TEST_WORK_PROFILE")) platform_time.monotonicNs() else 0 };
     }
-    fn markTime(self: *RestoreWorkProfile, label: []const u8) void {
+    pub fn markTime(self: *RestoreWorkProfile, label: []const u8) void {
         if (self.started == 0) return;
         const now = platform_time.monotonicNs();
         std.debug.print("\nWORK restore {s} ns={d}\n", .{ label, now - self.started });
         self.started = now;
     }
 
-    fn mark(self: *RestoreWorkProfile, db: *db_mod.DB, label: []const u8) void {
+    pub fn mark(self: *RestoreWorkProfile, db: *db_mod.DB, label: []const u8) void {
         if (self.started == 0) return;
         const now = platform_time.monotonicNs();
         const stats = db.core.index_manager.snapshotLsmWriteStats();

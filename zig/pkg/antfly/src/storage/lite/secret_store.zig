@@ -171,16 +171,30 @@ pub const Store = struct {
         defer if (indexed) |bytes| self.allocator.free(bytes);
         var head_bytes: [8]u8 = undefined;
         std.mem.writeInt(u64, &head_bytes, revision, .little);
-        sync.lockYielding(&self.docs.mutex);
-        defer self.docs.mutex.unlock();
-        // Index writers can publish while wrapping; use their latest checkpoint.
-        if (try self.head() != previous) return error.Conflict;
-        self.docs.file.putCatalogBatch(&.{
+        const Request = struct {
+            store: *Store,
+            previous: u64,
+            mutations: []const native.CatalogMutation,
+            fn apply(context: *anyopaque, file: *native.NativeFile) !void {
+                const request: *@This() = @ptrCast(@alignCast(context));
+                // Index writers can publish during wrapping. Recheck under
+                // the owner fence and publish the entry/head atomically.
+                if (try request.store.head() != request.previous) return error.Conflict;
+                try file.putCatalogBatch(request.mutations);
+            }
+        };
+        var request = Request{ .store = self, .previous = previous, .mutations = &.{
             .{ .key = &entry_key, .value = indexed orelse "", .is_delete = value == null },
             .{ .key = &(self.prefix ++ "head".*), .value = &head_bytes },
-        }) catch {
-            self.docs.secret_store_uncertain = true;
-            return error.OutcomeUnknown;
+        } };
+        self.docs.submitMutation(&request, Request.apply) catch |err| {
+            sync.lockYielding(&self.docs.mutex);
+            defer self.docs.mutex.unlock();
+            if (self.docs.file.checkpoint_publication_uncertain or err == error.OutcomeUnknown) {
+                self.docs.secret_store_uncertain = true;
+                return error.OutcomeUnknown;
+            }
+            return err;
         };
         return .{ .revision = revision };
     }
@@ -262,6 +276,32 @@ fn expectValue(store: *Store, key: []const u8, expected: []const u8, revision: u
     defer value.deinit(std.testing.allocator);
     try std.testing.expectEqual(revision, value.value.?.revision);
     try std.testing.expectEqualSlices(u8, expected, value.value.?.secret.bytes);
+}
+
+test "lite secrets admission failure rolls back without fencing readers" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp);
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .reclamation = .{ .enabled = false, .max_storage_bytes = native.NativeFile.minimumOwnerStorageBytes(true) } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var provider = TestProvider{};
+    var secrets = try Store.init(a, &docs, "scope", provider.provider());
+    defer secrets.deinit();
+    const value: [8192]u8 = @splat('s');
+    const before = docs.file.activeCheckpoint();
+    const before_size = (try docs.file.file.stat(std.testing.io)).size;
+    try std.testing.expectError(error.LiteStorageBudgetExceeded, secrets.nativeStore().?.writer.put("scope", "key", &value, .absent));
+    try std.testing.expectEqualDeep(before, docs.file.activeCheckpoint());
+    try std.testing.expectEqual(before_size, (try docs.file.file.stat(std.testing.io)).size);
+    try std.testing.expect(!docs.secret_store_uncertain);
+    try std.testing.expectEqual(@as(u64, 0), (try secrets.source().refresh("scope")).revision);
+    try std.testing.expect((try docs.checkWithCancel(null)).valid);
+    docs.maintenance_policy.options.max_storage_bytes = 0;
+    _ = try secrets.nativeStore().?.writer.put("scope", "key", &value, .absent);
+    try expectValue(&secrets, "key", &value, 1);
 }
 
 test "lite secrets embedding host retains live resolver through rotation snapshot and reopen" {
@@ -537,7 +577,7 @@ const SyncFault = struct {
     }
 };
 
-test "lite secrets uncertain publication fences all adapters and recovers atomically" {
+test "lite secrets publication errors distinguish rollback from uncertain outcomes" {
     const alloc = std.testing.allocator;
     var vtable = std.Options.debug_io.vtable.*;
     vtable.fileSync = SyncFault.fileSync;
@@ -553,6 +593,7 @@ test "lite secrets uncertain publication fences all adapters and recovers atomic
         {
             var docs = try docstore.Store.createWithOptions(alloc, path, .{ .exclusive = true, .io = io });
             defer docs.close();
+            docs.maintenance_start_suppressed = true;
             var store = try Store.init(alloc, &docs, "scope", provider.provider());
             defer store.deinit();
             var other = try Store.init(alloc, &docs, "scope", provider.provider());
@@ -561,12 +602,19 @@ test "lite secrets uncertain publication fences all adapters and recovers atomic
             SyncFault.remaining = fail_sync;
             defer SyncFault.remaining = 0;
             const writer = store.nativeStore().?.writer;
-            try std.testing.expectError(error.OutcomeUnknown, if (removing) writer.removeOverride("scope", "key", .{ .exact = 1 }) else writer.put("scope", "key", "after", .{ .exact = 1 }));
+            const mutation = if (removing) writer.removeOverride("scope", "key", .{ .exact = 1 }) else writer.put("scope", "key", "after", .{ .exact = 1 });
+            try std.testing.expectError(if (fail_sync == 1) error.InputOutput else error.OutcomeUnknown, mutation);
             try std.testing.expectEqual(@as(usize, 0), SyncFault.remaining);
-            try std.testing.expectError(error.OutcomeUnknown, other.source().resolve(alloc, "scope", "key", .{}));
-            try std.testing.expectError(error.OutcomeUnknown, other.source().listMetadata(alloc, "scope", .{}));
-            try std.testing.expectError(error.OutcomeUnknown, other.source().refresh("scope"));
-            try std.testing.expectError(error.OutcomeUnknown, other.nativeStore().?.writer.removeOverride("scope", "key", .any));
+            if (fail_sync == 1) {
+                try expectValue(&other, "key", "before", 1);
+                try std.testing.expect(!docs.secret_store_uncertain);
+                try std.testing.expect((try docs.checkWithCancel(null)).valid);
+            } else {
+                try std.testing.expectError(error.OutcomeUnknown, other.source().resolve(alloc, "scope", "key", .{}));
+                try std.testing.expectError(error.OutcomeUnknown, other.source().listMetadata(alloc, "scope", .{}));
+                try std.testing.expectError(error.OutcomeUnknown, other.source().refresh("scope"));
+                try std.testing.expectError(error.OutcomeUnknown, other.nativeStore().?.writer.removeOverride("scope", "key", .any));
+            }
         }
         var docs = try docstore.Store.open(alloc, path, false);
         defer docs.close();
