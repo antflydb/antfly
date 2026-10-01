@@ -4823,7 +4823,7 @@ pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json:
     // Lite has no authenticated principal capability. Hold a raw lease for
     // the entire statement, including DDL paths that do not call row APIs,
     // so policy activation cannot race an already-admitted SQL statement.
-    var row_policy_lease = try handle.db.row_policy_gate.enterRaw();
+    var row_policy_lease = try handle.db.local_execution.row_policy_gate.enterRaw();
     defer row_policy_lease.release();
     const sql = @import("sql.zig");
     const Budget = antfly.capi_dependencies.sql_memory_budget;

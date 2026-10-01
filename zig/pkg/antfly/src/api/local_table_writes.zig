@@ -329,7 +329,7 @@ pub const BoundTableWriteSource = struct {
         const db = try self.activeDb();
 
         const raw_indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
-        try db.configureTableStorage(req.storage orelse db.table_storage);
+        try db.configureTableStorage(req.storage orelse db.local_execution.table_storage);
         const schema_json = tables_api.effectiveSchemaJson(req.schema_json);
         const expanded_indexes_json = try tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(alloc, table_name, raw_indexes_json, schema_json);
         defer alloc.free(expanded_indexes_json);

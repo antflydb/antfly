@@ -30,7 +30,6 @@ const mapper = @import("document_mapper.zig");
 const relational_store = @import("relational_store.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const replay_source_mod = @import("derived/replay_source.zig");
-const transaction_runtime_mod = @import("maintenance/transaction_runtime.zig");
 const mem_backend_mod = @import("../mem_backend.zig");
 const persistent_mod = @import("../persistent.zig");
 const range_state_mod = @import("range_state.zig");
@@ -1208,26 +1207,6 @@ pub const DBCore = struct {
 
     pub fn loadIndexCatalogOnly(self: *DBCore) !void {
         try self.index_manager.loadCatalogOnly(self.store);
-    }
-
-    pub fn runTransactionRecoveryOnce(
-        self: *DBCore,
-        alloc: Allocator,
-        config: transaction_runtime_mod.Config,
-    ) !types.TransactionRecoveryStats {
-        var identity_ctx = try TransactionRecoveryIdentityContext.init(
-            alloc,
-            self.store,
-            self.identity_namespace,
-            if (self.schema) |schema| if (schema.storage_mode == .relational) schema.relational_columns else null else null,
-            if (self.schema) |schema| if (schema.storage_mode == .relational) schema.version else 0 else 0,
-        );
-        defer identity_ctx.deinit();
-        identity_ctx.resource_manager = self.index_manager.resource_manager;
-        identity_ctx.io = self.index_manager.checkpointIo();
-        var effective_config = config;
-        effective_config.resolution_extra_hooks = transactionRecoveryIdentityHooks(&identity_ctx);
-        return try transaction_runtime_mod.recoverOnce(alloc, self.store, effective_config);
     }
 
     /// Pins the backend-neutral primary image used by portable snapshots.

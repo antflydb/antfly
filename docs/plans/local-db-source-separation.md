@@ -129,6 +129,25 @@ initialization, while callback contexts survive the DB. Local maintenance can
 run without a participant resolver, preserves distributed pending decisions,
 and retains failed local resolutions for a later bounded pass.
 
+The local and server policies instantiate the same
+`storage/db/maintenance/transaction_recovery_driver.zig` lifecycle. It owns
+bounded scan cursors, clocks, leases, scheduling, pause/resume, statistics, and
+worker draining. Only policy validation and the bounded recovery pass differ;
+participant callbacks and coordinator decisions remain server-owned. Managed
+one-shot recovery uses the runtime's policy dispatch; the unused core-only
+one-shot shortcut has been removed.
+
+Foreground writes and recovery share one heap-owned `LocalExecutionState` for
+admission, publication, mutable storage settings, visibility statistics, and
+synchronization. The stable recovery context retains explicit borrowed core,
+executor, runtime and immutable open resources. Each resolution constructs a
+synchronous execution view with private scratch state; it never copies the DB
+wrapper, caches, mutexes or atomics. Provider replacement is fenced while that
+view borrows providers, and the view cannot enqueue work retaining its address.
+Recovery joins before shared publication caches or execution state are freed.
+Namespace and split shadow changes remain visible through their existing shared
+owners and apply fences.
+
 The server restore adapter owns authenticated replica installation entry points.
 The DB exposes identity-preserving installation, namespace checks, staging,
 validation, and repair without importing the seed coordinator.

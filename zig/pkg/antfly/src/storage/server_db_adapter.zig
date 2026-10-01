@@ -30,7 +30,7 @@ pub fn applyOrdered(
     identity: types.RaftAppliedEntryIdentity,
 ) anyerror!void {
     const db = physicalOwner(owner);
-    const mirror_scoped_restore = requiresDurableLifecycleReplication(req) and db.replication_async_batch_mirror != null;
+    const mirror_scoped_restore = requiresDurableLifecycleReplication(req) and db.local_execution.replication_async_batch_mirror != null;
     // Hot standby is process-local and includes this node's Raft follower roots.
     // Recover the local committed obligation before a Raft receipt can
     // short-circuit replay after a crash between store and hot-standby publication.

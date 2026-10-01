@@ -182,7 +182,7 @@ pub fn run(alloc: Allocator, io: std.Io, root: []const u8, request: contract.Req
             }
             if (job.value.active() or job.value.published()) return error.VectorMigrationAlreadyExists;
         }
-        if (source.table_storage.dense_embeddings != .primary_lsm) return error.VectorMigrationAlreadyPublished;
+        if (source.local_execution.table_storage.dense_embeddings != .primary_lsm) return error.VectorMigrationAlreadyPublished;
         if (source.primary_backend != .lsm) return error.VectorStoreRequiresLocalSingleShardTable;
         const cancelled_path = try std.fs.path.join(alloc, &.{ live, cancellation_file });
         defer alloc.free(cancelled_path);
@@ -337,7 +337,7 @@ pub fn cancel(alloc: Allocator, io: std.Io, root: []const u8, request: contract.
     const identity = blk: {
         var source = try db.DB.open(alloc, transition.path, open);
         defer source.close();
-        if (source.table_storage.dense_embeddings != .primary_lsm) return error.VectorMigrationAlreadyPublished;
+        if (source.local_execution.table_storage.dense_embeddings != .primary_lsm) return error.VectorMigrationAlreadyPublished;
         if (try source.vectorMigrationStatus(alloc)) |raw| {
             defer alloc.free(raw);
             var job = try std.json.parseFromSlice(contract.Job, alloc, raw, .{});

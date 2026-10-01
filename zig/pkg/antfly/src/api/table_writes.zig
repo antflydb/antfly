@@ -2536,7 +2536,7 @@ pub const ProvisionedTableWriteCache = struct {
     fn applyRuntimeHooksToDb(self: *ProvisionedTableWriteCache, db: *db_mod.DB, table_name: []const u8, group_id: u64, owner_state: ?*PromotionOwnerState) void {
         // Every managed owner, including adopted startup/restore owners, must
         // bind signed policy proofs to its stable cache-entry table identity.
-        db.row_policy_table_name = table_name;
+        db.local_execution.row_policy_table_name = table_name;
         db.setCoordinatedTtl(self.coordinated_ttl, group_id);
         db.setResolutionCandidateSource(self.resolution_candidate_source);
         db.setEntitySink(self.entity_sink);
@@ -3227,7 +3227,7 @@ pub const ProvisionedTableWriteCache = struct {
                 try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
                 const owned_policy_table_name = try allocator.dupe(u8, policy_table_name);
                 db.owned_row_policy_table_name = owned_policy_table_name;
-                db.row_policy_table_name = owned_policy_table_name;
+                db.local_execution.row_policy_table_name = owned_policy_table_name;
                 return .{
                     .db = db,
                     .start_bulk_session = switch (open_mode) {
@@ -20503,7 +20503,7 @@ pub const ProvisionedTableWriteSource = struct {
                         }
                         target_generations[group_index] = entry.lsm_root_generation;
                         try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, cached.db);
-                        try cached.db.configureTableStorage(req.storage orelse cached.db.table_storage);
+                        try cached.db.configureTableStorage(req.storage orelse cached.db.local_execution.table_storage);
                         try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
                         // Catalog admission and local create can race an earlier
                         // startup/status open of this generation. The entry
@@ -42505,7 +42505,7 @@ fn implementationTests() type {
             try std.testing.expectEqual(@as(u32, 1), enrichment_runtime.config.inline_retry_max_attempts);
             try std.testing.expectEqual(std.math.maxInt(u32), enrichment_runtime.config.worker_retry_max_attempts);
             try std.testing.expect(!enrichment_runtime.stats().worker_started);
-            try std.testing.expect(!db.optional_runtime_workers_enabled);
+            try std.testing.expect(!db.local_execution.optional_runtime_workers_enabled);
             try std.testing.expect(db.ttl_runtime == null);
             try std.testing.expect(db.transaction_runtime == null);
             try std.testing.expect(db.text_merge_runtime == null);

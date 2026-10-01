@@ -955,7 +955,7 @@ test "relational index system restore receipts require local coverage through fa
             try std.testing.expectEqual(.building, (try target.relationalIndexBuildStatus("tenant_id")).state);
             try std.testing.expectError(error.IndexRebuilding, target.finishRestoreStaging(alloc, scope.digest(), phase));
             if (trial == 1) {
-                target.replication_write_gate = .{ .shared = .{ .state = standby_gate.storageWriteState() } };
+                target.local_execution.replication_write_gate = .{ .shared = .{ .state = standby_gate.storageWriteState() } };
                 try std.testing.expectError(error.HAReadOnlyStandby, target.prepareRestoreStagingIndexesStep(alloc, scope.digest()));
             }
             const request: db_mod.types.BatchRequest = .{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = phase } } };
@@ -988,7 +988,7 @@ test "relational index system restore receipts require local coverage through fa
     try resetRestoreIndexCoverage(&target, false);
     target.close();
     target = try db_mod.DB.open(alloc, target_directory.path(), target_options);
-    target.replication_write_gate = .{ .shared = .{ .state = standby_gate.storageWriteState() } };
+    target.local_execution.replication_write_gate = .{ .shared = .{ .state = standby_gate.storageWriteState() } };
     // Superseded entries and an unrelated scope must not perform maintenance
     // against the current generation, even when its local coverage is missing.
     try server_test_adapter.applyOrdered(&target, .{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .validated } } }, .{ .index = 2, .term = 1 });
@@ -2637,7 +2637,7 @@ test "relational index system LSM build work is linear in rows times indexes" {
         try std.testing.expectEqual(count, check_records);
         for (0..256) |_| {
             _ = try db.runRelationalIndexMaintenancePass();
-            if (!db.relational_index_maintenance_sweep.isPending()) break;
+            if (!db.local_execution.relational_index_maintenance_sweep.isPending()) break;
         } else return error.MaintenanceDidNotBecomeIdle;
         try std.testing.expect(!try db.runRelationalIndexMaintenancePass() or index_count > 16);
         std.debug.print("LSM primary/CHECK scans indexes={d} rows={d} primary_records={d} check_records={d}\n", .{ index_count, count, primary_records, check_records });

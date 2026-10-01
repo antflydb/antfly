@@ -1348,7 +1348,7 @@ test "relational integrity restore follower repairs projection and CHECK debt be
         const encoded = try @import("../schema.zig").serializeSchema(owned, target.core.schema.?);
         const scope: restore.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = source_options.identity_namespace.?, .target_namespace = options.identity_namespace.?, .target_schema_digest = restore.digest(encoded) };
         try target.reserveRestoreStagingScoped(alloc, scope);
-        if (ha) target.replication_write_gate = .{ .shared = .{ .state = gate.storageWriteState() } };
+        if (ha) target.local_execution.replication_write_gate = .{ .shared = .{ .state = gate.storageWriteState() } };
         try applyRestoreReplica(&target, .{ .restore_staging = .{ .begin = scope } }, 1, ha);
         var index: u64 = 2;
         var crashed = false;
@@ -1363,7 +1363,7 @@ test "relational integrity restore follower repairs projection and CHECK debt be
                     open = false;
                     target = try db_mod.DB.open(alloc, path, options);
                     open = true;
-                    if (ha) target.replication_write_gate = .{ .shared = .{ .state = gate.storageWriteState() } };
+                    if (ha) target.local_execution.replication_write_gate = .{ .shared = .{ .state = gate.storageWriteState() } };
                     try applyRestoreReplica(&target, batch, index, ha);
                     // Model the last physical projection watermark being
                     // lost at the crash cut while the primary Raft/HA receipt
@@ -1753,8 +1753,8 @@ test "relational integrity scoped two phase resolution mirrors binary claims thr
     const slots_path = try std.fmt.allocPrintSentinel(owned, ".zig-cache/tmp/{s}/ha-2pc-slots", .{tmp.sub_path}, 0);
     var primary = try primary_mod.Primary.open(alloc, log_path, slots_path, .{ .cluster_id = 1, .timeline_id = 1, .epoch = 1, .table_id = 10, .shard_id = 11 }, .{});
     defer primary.close();
-    target.replication_async_batch_mirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .async } };
-    defer target.replication_async_batch_mirror = null;
+    target.local_execution.replication_async_batch_mirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .async } };
+    defer target.local_execution.replication_async_batch_mirror = null;
     var view = target.core.acquireSchemaView().?;
     defer view.release();
     var tuple_plan = try tuples.TuplePlan.init(alloc, view.tableSchema().*, view.physicalLayout(), &.{.{ .column = "id" }});
@@ -1808,8 +1808,8 @@ test "relational integrity live two phase HA replay preserves rows and binary cl
     const slots_path = try std.fmt.allocPrintSentinel(owned, ".zig-cache/tmp/{s}/live-slots", .{tmp.sub_path}, 0);
     var primary = try primary_mod.Primary.open(alloc, log_path, slots_path, .{ .cluster_id = 1, .timeline_id = 1, .epoch = 1, .table_id = 10, .shard_id = 11 }, .{});
     defer primary.close();
-    db.replication_async_batch_mirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .async } };
-    defer db.replication_async_batch_mirror = null;
+    db.local_execution.replication_async_batch_mirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .async } };
+    defer db.local_execution.replication_async_batch_mirror = null;
     var view = db.core.acquireSchemaView().?;
     defer view.release();
     var plan = try tuples.TuplePlan.init(alloc, view.tableSchema().*, view.physicalLayout(), &.{.{ .column = "id" }});

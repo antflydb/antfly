@@ -87,7 +87,7 @@ test "relational integrity restore staging Raft controls retain HA append obliga
             defer stored_bootstrap.deinit();
             try std.testing.expectEqualStrings("docs", stored_bootstrap.value.table_name);
         }
-        target.replication_async_batch_mirror = .{
+        target.local_execution.replication_async_batch_mirror = .{
             .publisher = hot_standby_publisher_adapter.bind(&primary),
             .sync_policy = .{ .mode = if (synchronous) .remote_write else .async, .standby_names = &.{"standby"}, .failure_policy = .block },
             .sync_wait_ctx = &ack,
