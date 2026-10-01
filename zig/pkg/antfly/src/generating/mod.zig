@@ -167,8 +167,10 @@ const BackendState = struct {
         state.alloc = alloc;
         state.cfg = cfg;
         state.api_key = switch (cfg.provider) {
-            .antfly => try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.api_key orelse inference_api_key, "ANTFLY_INFERENCE_API_KEY"),
-            .gemini => try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.api_key, "GEMINI_API_KEY"),
+            .antfly => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key orelse inference_api_key, "ANTFLY_INFERENCE_API_KEY"),
+            .openai => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key, "OPENAI_API_KEY"),
+            .openrouter => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key, "OPENROUTER_API_KEY"),
+            .gemini => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key, "GEMINI_API_KEY"),
             else => try common_secrets.SecretValue.initConfig(alloc, cfg.api_key),
         };
         errdefer if (state.api_key) |*api_key| api_key.deinit(alloc);
@@ -462,7 +464,7 @@ fn optionalBearerAuthHeaderOwned(
 ) !?[]u8 {
     return state.auth_header_cache.getOwned(state.alloc, alloc, api_key_ref, state.secret_store) catch |err| switch (err) {
         error.SecretNotFound => switch (api_key_ref.*) {
-            .env_var => return null,
+            .env_var, .provider_default => return null,
             else => return err,
         },
         else => return err,
@@ -479,7 +481,7 @@ fn textContent(message: ChatMessage) ?[]const u8 {
 
 test "generating optional env auth is skipped when unset" {
     const alloc = std.testing.allocator;
-    var api_key = try common_secrets.SecretValue.initConfigOrEnv(alloc, null, "ANTFLY_TEST_GENERATING_MISSING_API_KEY");
+    var api_key = try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, null, "ANTFLY_TEST_GENERATING_MISSING_API_KEY");
     defer api_key.deinit(alloc);
 
     var state = BackendState{
@@ -1270,6 +1272,52 @@ test "generating backend tools complete agent conversations across all remote ad
         defer final.deinit();
         try std.testing.expectEqualStrings("done", final.content);
         try std.testing.expectEqual(@as(usize, 0), final.tool_calls.len);
+        try group.await(io);
+        if (failure) |err| return err;
+    }
+}
+
+test "generating backend defaults OpenAI and OpenRouter credentials from the store" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/test-generator-defaults-{d}.json", .{std.Io.Clock.awake.now(io).nanoseconds});
+    defer alloc.free(path);
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var store = try common_secrets.FileStore.init(alloc, path);
+    defer store.deinit();
+    const Check = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer stored-key", req.header("Authorization") orelse return error.TestUnexpectedResult);
+        }
+        fn serve(server: *httpx.TestServer, failure: *?anyerror) void {
+            server.handleOne() catch |err| {
+                failure.* = err;
+            };
+        }
+    };
+    inline for (.{ Provider.openai, Provider.openrouter }) |provider| {
+        const key = if (provider == .openai) "openai.api_key" else "openrouter.api_key";
+        var entry = try store.put(alloc, key, "stored-key");
+        defer entry.deinit(alloc);
+        var server = try httpx.TestServer.start(alloc, io, &.{.{
+            .method = .POST,
+            .path = "/chat/completions",
+            .assert_request = Check.request,
+            .respond = .{ .body = "{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}" },
+        }});
+        defer server.deinit();
+        var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+        defer client.deinit();
+        var factory = BackendFactory.initWithOptions(alloc, &client, .{ .secret_store = &store });
+        var generator = try factory.factory().create(alloc, .{ .provider = provider, .model = "test", .url = server.baseUrl() });
+        defer generator.deinit();
+        var failure: ?anyerror = null;
+        var group = std.Io.Group.init;
+        defer group.cancel(io);
+        try group.concurrent(io, Check.serve, .{ &server, &failure });
+        var result = try generator.generate(alloc, "test", &.{.{ .role = .user, .content = .{ .text = "hello" } }});
+        defer result.deinit();
+        try std.testing.expectEqualStrings("ok", result.content);
         try group.await(io);
         if (failure) |err| return err;
     }

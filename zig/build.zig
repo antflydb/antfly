@@ -3658,6 +3658,14 @@ pub fn build(b: *std.Build) void {
     const lib_preload_model_spec_test_step = b.step("lib-preload-model-spec-test", "Run preload model CLI parser tests");
     lib_preload_model_spec_test_step.dependOn(&run_lib_preload_model_spec_tests.step);
 
+    const provider_default_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{ "audio runtime", "bearer auth header cache provider defaults" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_provider_default_tests = addFilteredTestRunArtifact(b, provider_default_tests);
+    b.step("antfly-provider-defaults-test", "Verify provider endpoint and credential defaults").dependOn(&run_provider_default_tests.step);
+
     const lib_common_secrets_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{ "file secret store", "remote content runtime" },
@@ -8103,6 +8111,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_pdf_tests.step);
     unit_test_step.dependOn(&run_lib_scraping_tests.step);
     unit_test_step.dependOn(&run_lib_audio_tests.step);
+    unit_test_step.dependOn(&run_provider_default_tests.step);
     unit_test_step.dependOn(&run_hf_tokenizer_tests.step);
     unit_test_step.dependOn(delegated_inference_steps.inference_test);
     unit_test_step.dependOn(delegated_inference_steps.inference_finetune_test);

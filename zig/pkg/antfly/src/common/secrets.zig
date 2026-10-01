@@ -48,6 +48,8 @@ pub const SecretValue = union(enum) {
     literal: []u8,
     secret_ref: []u8,
     env_var: []u8,
+    /// Optional canonical provider key, resolved through the store and its environment policy.
+    provider_default: []u8,
 
     pub fn initConfig(alloc: std.mem.Allocator, configured_value: ?[]const u8) !?SecretValue {
         const value = configured_value orelse return null;
@@ -67,11 +69,17 @@ pub const SecretValue = union(enum) {
         return .{ .env_var = try alloc.dupe(u8, env_name) };
     }
 
+    pub fn initConfigOrProviderDefault(alloc: std.mem.Allocator, configured_value: ?[]const u8, env_name: []const u8) !SecretValue {
+        if (try initConfig(alloc, configured_value)) |value| return value;
+        const key = secretKeyForEnvVar(alloc, env_name) orelse return error.OutOfMemory;
+        return .{ .provider_default = key };
+    }
+
     pub fn deinit(self: *SecretValue, alloc: std.mem.Allocator) void {
         switch (self.*) {
             .literal => |value| alloc.free(value),
             .secret_ref => |value| alloc.free(value),
-            .env_var => |value| alloc.free(value),
+            .env_var, .provider_default => |value| alloc.free(value),
         }
         self.* = undefined;
     }
@@ -87,6 +95,12 @@ pub const SecretValue = union(enum) {
                 defer alloc.free(env_var);
                 break :blk envValueOwned(alloc, env_var) orelse return error.SecretNotFound;
             },
+            .provider_default => |key| blk: {
+                if (secret_store) |store| break :blk try store.getOwned(alloc, key);
+                const env_var = try envVarForKey(alloc, key);
+                defer alloc.free(env_var);
+                break :blk envValueOwned(alloc, env_var);
+            },
             .env_var => |env_var| envValueOwned(alloc, env_var),
         };
     }
@@ -98,7 +112,7 @@ pub const SecretValue = union(enum) {
                 .generation = 0,
                 .source = .literal,
             },
-            .secret_ref => |key| blk: {
+            .secret_ref, .provider_default => |key| blk: {
                 if (secret_store) |store| {
                     break :blk try store.getOwnedWithGeneration(alloc, key);
                 }
@@ -127,6 +141,7 @@ pub const SecretValue = union(enum) {
             .literal => |value| std.hash.Wyhash.hash(0, value),
             .secret_ref => |value| std.hash.Wyhash.hash(1, value),
             .env_var => |value| std.hash.Wyhash.hash(2, value),
+            .provider_default => |value| std.hash.Wyhash.hash(3, value),
         };
     }
 };
@@ -1634,4 +1649,50 @@ test "environment secret discovery maps API key env vars" {
     const key = secretKeyForEnvVar(alloc, "ANTHROPIC_API_KEY").?;
     defer alloc.free(key);
     try std.testing.expectEqualStrings("anthropic.api_key", key);
+}
+
+test "bearer auth header cache provider defaults use canonical secrets and observe rotation" {
+    const alloc = std.testing.allocator;
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/test-provider-defaults-{d}.json", .{nowNs()});
+    defer alloc.free(path);
+    defer deleteFile(path) catch {};
+    var store = try FileStore.init(alloc, path);
+    defer store.deinit();
+    inline for (.{ "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GEMINI_API_KEY", "COHERE_API_KEY", "ANTFLY_INFERENCE_API_KEY" }) |env_name| {
+        var value = try SecretValue.initConfigOrProviderDefault(alloc, null, env_name);
+        defer value.deinit(alloc);
+        const expected_env = envValueOwned(alloc, env_name);
+        defer if (expected_env) |env| alloc.free(env);
+        const without_store = try value.resolveOwned(alloc, null);
+        defer if (without_store) |env| alloc.free(env);
+        if (expected_env) |env| {
+            try std.testing.expectEqualStrings(env, without_store.?);
+        } else {
+            try std.testing.expectEqual(@as(?[]u8, null), without_store);
+        }
+        var entry = try store.put(alloc, value.provider_default, "first");
+        entry.deinit(alloc);
+        var cache = BearerAuthHeaderCache{};
+        defer cache.deinit(alloc);
+        const first = try cache.getOwned(alloc, alloc, &value, &store);
+        defer alloc.free(first);
+        try std.testing.expectEqualStrings("Bearer first", first);
+        var updated = try store.put(alloc, value.provider_default, "second");
+        updated.deinit(alloc);
+        const second = try cache.getOwned(alloc, alloc, &value, &store);
+        defer alloc.free(second);
+        try std.testing.expectEqualStrings("Bearer second", second);
+        var explicit = try SecretValue.initConfigOrProviderDefault(alloc, "explicit", env_name);
+        defer explicit.deinit(alloc);
+        const resolved = (try explicit.resolveOwned(alloc, &store)).?;
+        defer alloc.free(resolved);
+        try std.testing.expectEqualStrings("explicit", resolved);
+    }
+    var missing = try SecretValue.initConfigOrProviderDefault(alloc, null, "ANTFLY_TEST_MISSING_API_KEY");
+    defer missing.deinit(alloc);
+    try std.testing.expectEqual(@as(?[]u8, null), try missing.resolveOwned(alloc, &store));
+    try std.testing.expectError(error.SecretNotFound, missing.resolveOwnedWithGeneration(alloc, &store));
+    var explicit_missing = try SecretValue.initConfigOrProviderDefault(alloc, "${secret:antfly.test.missing.api_key}", "OPENAI_API_KEY");
+    defer explicit_missing.deinit(alloc);
+    try std.testing.expectError(error.SecretNotFound, explicit_missing.resolveOwned(alloc, &store));
 }

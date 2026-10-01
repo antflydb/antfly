@@ -3741,10 +3741,10 @@ fn buildManagedEmbeddingEntry(
     const truncate = if (embedder_cfg.truncate.len > 0) try alloc.dupe(u8, embedder_cfg.truncate) else @constCast("");
     errdefer if (truncate.len > 0) alloc.free(truncate);
     const api_key = switch (provider) {
-        .openai => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "OPENAI_API_KEY"),
-        .cohere => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "COHERE_API_KEY"),
-        .gemini => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "GEMINI_API_KEY"),
-        .antfly => try common_secrets.SecretValue.initConfigOrEnv(
+        .openai => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "OPENAI_API_KEY"),
+        .cohere => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "COHERE_API_KEY"),
+        .gemini => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "GEMINI_API_KEY"),
+        .antfly => try common_secrets.SecretValue.initConfigOrProviderDefault(
             alloc,
             embedder_cfg.api_key orelse options.inference_api_key,
             "ANTFLY_INFERENCE_API_KEY",
@@ -5288,7 +5288,7 @@ fn optionalBearerAuthHeaderOwned(
 ) !?[]u8 {
     return entry.auth_header_cache.getOwned(entry.alloc, alloc, api_key_ref, entry.secret_store) catch |err| switch (err) {
         error.SecretNotFound => switch (api_key_ref.*) {
-            .env_var => return null,
+            .env_var, .provider_default => return null,
             else => return err,
         },
         else => return err,
