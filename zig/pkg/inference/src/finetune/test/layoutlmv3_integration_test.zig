@@ -12,22 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// End-to-end BERT LoRA training integration test (level-3 pipeline).
+// LayoutLMv3 LoRA training pipeline integration test (level-3 pipeline).
 //
 // Validates the full pipeline:
-//   graph construction → LoRA injection → autodiff → execution → loss → optimizer step
+//   graph construction -> LoRA injection -> autodiff -> execution -> loss -> optimizer step
 //
 // After N training steps the loss must decrease, proving that:
-//   - bert_graph builds a valid forward graph
+//   - layoutlmv3_graph builds a valid forward graph (with 2D positional
+//     embeddings: word + position + token_type + x0 + y0 + x1 + y1 + h + w)
+//   - The token-classification head (classifier.weight + classifier.bias)
+//     is wired on top of the encoder output
 //   - LoRA injection finds and wraps query/value projections
-//   - autodiff produces real gradients through the full encoder
+//   - autodiff produces real gradients through the full encoder + head
 //   - the optimizer updates LoRA weights
 //   - subsequent forward passes reflect those weight changes
 //
-// NOTE: This test requires the full build module graph (`ml`, `inference_linalg`,
-// BLAS linkage). Run via `zig build test-bert-e2e` after adding a build step
-// in build.zig, or by referencing this file from an existing test root that
-// has the required imports.
+// NOTE: This test requires the full build module graph (`ml`, system BLAS linkage).
+// Run via `zig build test-layoutlmv3-e2e` after adding a build step in
+// build.zig, or by referencing this file from an existing test root that has
+// the required imports.
 
 const std = @import("std");
 const ml = @import("ml");
@@ -37,49 +40,55 @@ const Builder = ml.graph.Builder;
 const NodeId = ml.graph.NodeId;
 const Shape = ml.graph.Shape;
 
-const bert_graph = @import("../../architectures/bert_graph.zig");
+const layoutlmv3_graph = @import("../../architectures/layoutlmv3_graph.zig");
 const native_compute_mod = @import("../../ops/native_compute.zig");
 const NativeCompute = native_compute_mod.NativeCompute;
 const WeightStore = native_compute_mod.WeightStore;
 const ops_mod = @import("../../ops/ops.zig");
 
 const real_autodiff = @import("../real_autodiff_trainer.zig");
-const reranker_train = @import("../reranker_train.zig");
+const layoutlmv3_autodiff = @import("../layoutlmv3_real_autodiff.zig");
 const weight_source = @import("../../models/weight_source.zig");
 const LoadedWeight = weight_source.LoadedWeight;
 const Tensor = @import("../../backends/tensor.zig").Tensor;
 
-// ── BERT tiny config ────────────────────────────────────────────────────
+// ── Tiny LayoutLMv3 config ───────────────────────────────────────────
 
 const HIDDEN: u32 = 64;
 const NUM_LAYERS: u32 = 2;
 const NUM_HEADS: u32 = 4;
+const HEAD_DIM: u32 = 16;
 const INTERMEDIATE: u32 = 128;
 const VOCAB: u32 = 100;
 const MAX_POS: u32 = 32;
+const TYPE_VOCAB: u32 = 2;
+const MAX_2D: u32 = 32;
+const NUM_CLASSES: u32 = 5;
 
 const BATCH: u32 = 2;
 const SEQ_LEN: u32 = 8;
 
-const bert_config = bert_graph.Config{
+const layoutlmv3_config = layoutlmv3_graph.Config{
     .vocab_size = VOCAB,
     .hidden_size = HIDDEN,
     .num_hidden_layers = NUM_LAYERS,
     .num_attention_heads = NUM_HEADS,
+    .head_dim = HEAD_DIM,
     .intermediate_size = INTERMEDIATE,
     .max_position_embeddings = MAX_POS,
-    .use_token_type = true,
+    .type_vocab_size = TYPE_VOCAB,
+    .max_2d_position_embeddings = MAX_2D,
+    .layer_norm_eps = 1e-5,
 };
 
-// ── Weight population helpers ───────────────────────────────────────────
+// ── Weight population helpers ─────────────────────────────────────────
 
-/// Create a Tensor with random f32 data for the given shape and name.
+/// Create a LoadedWeight with random f32 data for the given shape and name.
 fn makeRandomWeight(allocator: std.mem.Allocator, name: []const u8, shape: []const i64, rng: std.Random) !LoadedWeight {
     var n_elems: usize = 1;
     for (shape) |d| n_elems *= @intCast(d);
 
     const data = try allocator.alloc(f32, n_elems);
-    // Small random values scaled by 1/sqrt(n) for reasonable initialisation.
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(@max(n_elems, 1))));
     for (data) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * scale;
 
@@ -98,37 +107,49 @@ fn putWeight(
     rng: std.Random,
 ) !void {
     var lw = try makeRandomWeight(allocator, name, shape, rng);
-    // The resident_weights map borrows the key from the tensor's own name
-    // allocation which lives as long as the LoadedWeight.
     store.resident_weights.putAssumeCapacity(lw.tensor.name, lw);
     _ = &lw;
 }
 
-/// Populate the WeightStore with every parameter BERT expects.
-fn populateBertWeights(allocator: std.mem.Allocator, store: *WeightStore, rng: std.Random) !void {
+/// Populate the WeightStore with every parameter LayoutLMv3 + classifier head expects.
+fn populateLayoutLMv3Weights(allocator: std.mem.Allocator, store: *WeightStore, rng: std.Random) !void {
     const H: i64 = HIDDEN;
     const I: i64 = INTERMEDIATE;
     const V: i64 = VOCAB;
     const P: i64 = MAX_POS;
+    const T: i64 = TYPE_VOCAB;
+    const D2: i64 = MAX_2D;
+    const C: i64 = NUM_CLASSES;
 
-    // Count total parameters to pre-size the hashmap.
-    // Embeddings: 5 params. Per layer: 16 params. Total = 5 + 16*NUM_LAYERS.
-    const total_params: u32 = 5 + 16 * NUM_LAYERS;
+    // Count total parameters.
+    // Embeddings: word (1) + pos (1) + token_type (1) + x_pos (1) + y_pos (1)
+    //           + h_pos (1) + w_pos (1) + LN w+b (2) = 9.
+    // Per layer: q/k/v w+b (6) + attn output dense w+b (2)
+    //          + attn output LN w+b (2) + intermediate dense w+b (2)
+    //          + output dense w+b (2) + output LN w+b (2) = 16.
+    // Classifier head: w + b = 2.
+    const total_params: u32 = 9 + 16 * NUM_LAYERS + 2;
     try store.resident_weights.ensureTotalCapacity(allocator, total_params);
 
     // ── Embeddings ──
     try putWeight(allocator, store, "embeddings.word_embeddings.weight", &.{ V, H }, rng);
     try putWeight(allocator, store, "embeddings.position_embeddings.weight", &.{ P, H }, rng);
-    try putWeight(allocator, store, "embeddings.token_type_embeddings.weight", &.{ 2, H }, rng);
+    try putWeight(allocator, store, "embeddings.token_type_embeddings.weight", &.{ T, H }, rng);
+    try putWeight(allocator, store, "embeddings.x_position_embeddings.weight", &.{ D2, H }, rng);
+    try putWeight(allocator, store, "embeddings.y_position_embeddings.weight", &.{ D2, H }, rng);
+    try putWeight(allocator, store, "embeddings.h_position_embeddings.weight", &.{ D2, H }, rng);
+    try putWeight(allocator, store, "embeddings.w_position_embeddings.weight", &.{ D2, H }, rng);
     try putWeight(allocator, store, "embeddings.LayerNorm.weight", &.{H}, rng);
     try putWeight(allocator, store, "embeddings.LayerNorm.bias", &.{H}, rng);
 
+    // ── Classifier head ──
+    try putWeight(allocator, store, "classifier.weight", &.{ C, H }, rng);
+    try putWeight(allocator, store, "classifier.bias", &.{C}, rng);
+
     // ── Encoder layers ──
-    var name_buf: [256]u8 = undefined;
     for (0..NUM_LAYERS) |layer| {
-        const pfx_len = std.fmt.count("encoder.layer.{d}.", .{layer});
-        const pfx = std.fmt.bufPrint(&name_buf, "encoder.layer.{d}.", .{layer}) catch unreachable;
-        _ = pfx_len;
+        var pfx_buf: [256]u8 = undefined;
+        const pfx = std.fmt.bufPrint(&pfx_buf, "encoder.layer.{d}.", .{layer}) catch unreachable;
 
         const suffixes_2d = [_]struct { name: []const u8, shape: [2]i64 }{
             .{ .name = "attention.self.query.weight", .shape = .{ H, H } },
@@ -166,18 +187,17 @@ fn populateBertWeights(allocator: std.mem.Allocator, store: *WeightStore, rng: s
     }
 }
 
-// ── The test ────────────────────────────────────────────────────────────
+// ── The test ──────────────────────────────────────────────────────────
 
-test "BERT e2e: loss decreases over training steps" {
+test "LayoutLMv3 integration: loss decreases over training steps" {
     const allocator = std.testing.allocator;
 
-    // 1. Populate weight store with random BERT parameters.
+    // 1. Populate weight store with random LayoutLMv3 + classifier parameters.
     var weight_store = WeightStore{
         .allocator = allocator,
         .resident_weights = .{},
         .lazy_weights = .{},
     };
-    // Cleanup: deinit every LoadedWeight we inserted.
     defer {
         var it = weight_store.resident_weights.iterator();
         while (it.next()) |entry| {
@@ -191,9 +211,9 @@ test "BERT e2e: loss decreases over training steps" {
         weight_store.resident_weights.deinit(allocator);
     }
 
-    var prng = std.Random.DefaultPrng.init(12345);
+    var prng = std.Random.DefaultPrng.init(99999);
     const rng = prng.random();
-    try populateBertWeights(allocator, &weight_store, rng);
+    try populateLayoutLMv3Weights(allocator, &weight_store, rng);
 
     // 2. Create compute backend.
     var native = NativeCompute.init(allocator, &weight_store, null);
@@ -221,40 +241,60 @@ test "BERT e2e: loss decreases over training steps" {
     defer trainer.deinit();
 
     // 4. Prepare synthetic training data.
-    var bert_ctx = reranker_train.BertAutodiffCtx{
-        .graph_config = bert_config,
-    };
+    var ctx = layoutlmv3_autodiff.LayoutLMv3AutodiffCtx.init(.{
+        .graph_config = layoutlmv3_config,
+        .task = .token_classification,
+        .num_classes = NUM_CLASSES,
+    });
+
+    const total = BATCH * SEQ_LEN;
 
     // Random token IDs in [0, VOCAB).
-    var input_ids: [BATCH * SEQ_LEN]i64 = undefined;
+    var input_ids: [total]i64 = undefined;
     for (&input_ids) |*id| id.* = @intCast(rng.intRangeAtMost(u32, 0, VOCAB - 1));
 
     // All-ones attention mask (no padding).
-    var attention_mask: [BATCH * SEQ_LEN]f32 = undefined;
+    var attention_mask: [total]f32 = undefined;
     @memset(&attention_mask, 1.0);
 
-    // Random regression targets: one scalar per token position.
-    const total = BATCH * SEQ_LEN;
-    var targets: [total * HIDDEN]f32 = undefined;
-    for (&targets) |*t| t.* = rng.float(f32) * 2.0 - 1.0;
+    // Random one-hot targets [B, S, num_classes] for token classification.
+    var targets: [BATCH * SEQ_LEN * NUM_CLASSES]f32 = undefined;
+    @memset(&targets, 0.0);
+    for (0..total) |t| {
+        const cls: u32 = rng.intRangeAtMost(u32, 0, NUM_CLASSES - 1);
+        targets[t * NUM_CLASSES + cls] = 1.0;
+    }
+    const targets_shape = layoutlmv3_autodiff.tokenTargetsShape(BATCH, SEQ_LEN, NUM_CLASSES);
 
-    const targets_shape = Shape.init(.f32, &.{ @intCast(total), @intCast(HIDDEN) });
+    // Random bbox data [B*S*4] with values in [0, MAX_2D - 1].
+    // Layout: (x0, y0, x1, y1) per token. Ensure x1 >= x0, y1 >= y0.
+    var bbox_data: [total * 4]i32 = undefined;
+    for (0..total) |t| {
+        const x0: i32 = @intCast(rng.intRangeAtMost(u32, 0, MAX_2D / 2));
+        const y0: i32 = @intCast(rng.intRangeAtMost(u32, 0, MAX_2D / 2));
+        const x1: i32 = x0 + @as(i32, @intCast(rng.intRangeAtMost(u32, 1, MAX_2D / 2 - 1)));
+        const y1: i32 = y0 + @as(i32, @intCast(rng.intRangeAtMost(u32, 1, MAX_2D / 2 - 1)));
+        bbox_data[t * 4 + 0] = x0;
+        bbox_data[t * 4 + 1] = y0;
+        bbox_data[t * 4 + 2] = x1;
+        bbox_data[t * 4 + 3] = y1;
+    }
 
     // 5. Run training steps and record losses.
     const num_steps: usize = 5;
     var losses: [num_steps]f32 = undefined;
 
     for (0..num_steps) |step_i| {
-        const trainer_input = reranker_train.bertTrainerInput(
-            &bert_ctx,
+        const trainer_input = layoutlmv3_autodiff.makeTrainerInput(
+            &ctx,
             &input_ids,
             &attention_mask,
             &targets,
             targets_shape,
             BATCH,
             SEQ_LEN,
+            &bbox_data,
         );
-
         const result = try trainer.step(trainer_input);
         losses[step_i] = result.loss;
     }
@@ -272,6 +312,24 @@ test "BERT e2e: loss decreases over training steps" {
         return error.LossDidNotDecrease;
     }
 
-    // Verify every step actually ran the optimizer (grad_accum_steps = 1).
-    // (If we got here without error, all 5 steps executed successfully.)
+    // 7. Stronger assertion: at least one LoRA B weight is non-zero after
+    //    training, proving the optimizer actually wrote back updates.
+    //    LoRA params are stored as [A, B, A, B, ...] pairs. B matrices are
+    //    at odd indices.
+    var found_nonzero_b = false;
+    for (trainer.lora_params.items, 0..) |slot, idx| {
+        if (idx % 2 == 1) { // B matrix
+            for (slot.weights) |w| {
+                if (w != 0.0) {
+                    found_nonzero_b = true;
+                    break;
+                }
+            }
+            if (found_nonzero_b) break;
+        }
+    }
+    if (!found_nonzero_b) {
+        std.debug.print("FAIL: all LoRA B weights are still zero after training\n", .{});
+        return error.LoraWeightsNotUpdated;
+    }
 }

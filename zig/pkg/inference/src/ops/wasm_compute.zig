@@ -5270,7 +5270,7 @@ pub const WasmCompute = struct {
 
 test {
     _ = @import("wasm_compute_test.zig");
-    _ = @import("wasm_e2e_test.zig");
+    _ = @import("wasm_integration_test.zig");
 }
 
 test "wasm_compute: acquired weights preserve independent identity and shared residency" {

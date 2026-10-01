@@ -12,23 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// End-to-end LayoutLMv3 LoRA training integration test (level-3 pipeline).
+// fused-chunker (ModernBERT) LoRA training pipeline integration test (level-3 pipeline).
 //
 // Validates the full pipeline:
 //   graph construction -> LoRA injection -> autodiff -> execution -> loss -> optimizer step
 //
 // After N training steps the loss must decrease, proving that:
-//   - layoutlmv3_graph builds a valid forward graph (with 2D positional
-//     embeddings: word + position + token_type + x0 + y0 + x1 + y1 + h + w)
-//   - The token-classification head (classifier.weight + classifier.bias)
+//   - modern_bert_graph builds a valid forward graph (with RoPE + GeGLU MLP)
+//   - The fused-chunker boundary-detection MLP head (boundary_head.w1/b1/w2/b2)
 //     is wired on top of the encoder output
-//   - LoRA injection finds and wraps query/value projections
+//   - LoRA injection finds and wraps query_proj/value_proj projections
 //   - autodiff produces real gradients through the full encoder + head
 //   - the optimizer updates LoRA weights
 //   - subsequent forward passes reflect those weight changes
 //
 // NOTE: This test requires the full build module graph (`ml`, system BLAS linkage).
-// Run via `zig build test-layoutlmv3-e2e` after adding a build step in
+// Run via `zig build test-fused-chunker-e2e` after adding a build step in
 // build.zig, or by referencing this file from an existing test root that has
 // the required imports.
 
@@ -40,35 +39,33 @@ const Builder = ml.graph.Builder;
 const NodeId = ml.graph.NodeId;
 const Shape = ml.graph.Shape;
 
-const layoutlmv3_graph = @import("../../architectures/layoutlmv3_graph.zig");
+const modern_bert_graph = @import("../../architectures/modern_bert_graph.zig");
 const native_compute_mod = @import("../../ops/native_compute.zig");
 const NativeCompute = native_compute_mod.NativeCompute;
 const WeightStore = native_compute_mod.WeightStore;
 const ops_mod = @import("../../ops/ops.zig");
 
 const real_autodiff = @import("../real_autodiff_trainer.zig");
-const layoutlmv3_autodiff = @import("../layoutlmv3_real_autodiff.zig");
+const fused_chunker_autodiff = @import("../fused_chunker_real_autodiff.zig");
 const weight_source = @import("../../models/weight_source.zig");
 const LoadedWeight = weight_source.LoadedWeight;
 const Tensor = @import("../../backends/tensor.zig").Tensor;
 
-// ── Tiny LayoutLMv3 config ───────────────────────────────────────────
+// ── Tiny ModernBERT config (for fused chunker backbone) ──────────────
 
-const HIDDEN: u32 = 64;
+const HIDDEN: u32 = 32;
 const NUM_LAYERS: u32 = 2;
 const NUM_HEADS: u32 = 4;
-const HEAD_DIM: u32 = 16;
-const INTERMEDIATE: u32 = 128;
-const VOCAB: u32 = 100;
+const HEAD_DIM: u32 = 8;
+const INTERMEDIATE: u32 = 64;
+const VOCAB: u32 = 64;
 const MAX_POS: u32 = 32;
-const TYPE_VOCAB: u32 = 2;
-const MAX_2D: u32 = 32;
-const NUM_CLASSES: u32 = 5;
+const HEAD_HIDDEN_DIM: u32 = 32;
 
 const BATCH: u32 = 2;
 const SEQ_LEN: u32 = 8;
 
-const layoutlmv3_config = layoutlmv3_graph.Config{
+const modern_bert_config = modern_bert_graph.Config{
     .vocab_size = VOCAB,
     .hidden_size = HIDDEN,
     .num_hidden_layers = NUM_LAYERS,
@@ -76,9 +73,8 @@ const layoutlmv3_config = layoutlmv3_graph.Config{
     .head_dim = HEAD_DIM,
     .intermediate_size = INTERMEDIATE,
     .max_position_embeddings = MAX_POS,
-    .type_vocab_size = TYPE_VOCAB,
-    .max_2d_position_embeddings = MAX_2D,
     .layer_norm_eps = 1e-5,
+    .rope_theta = 160000.0,
 };
 
 // ── Weight population helpers ─────────────────────────────────────────
@@ -111,65 +107,59 @@ fn putWeight(
     _ = &lw;
 }
 
-/// Populate the WeightStore with every parameter LayoutLMv3 + classifier head expects.
-fn populateLayoutLMv3Weights(allocator: std.mem.Allocator, store: *WeightStore, rng: std.Random) !void {
+/// Populate the WeightStore with every parameter ModernBERT + boundary head expects.
+fn populateFusedChunkerWeights(allocator: std.mem.Allocator, store: *WeightStore, rng: std.Random) !void {
     const H: i64 = HIDDEN;
     const I: i64 = INTERMEDIATE;
     const V: i64 = VOCAB;
-    const P: i64 = MAX_POS;
-    const T: i64 = TYPE_VOCAB;
-    const D2: i64 = MAX_2D;
-    const C: i64 = NUM_CLASSES;
+    const HH: i64 = HEAD_HIDDEN_DIM;
 
     // Count total parameters.
-    // Embeddings: word (1) + pos (1) + token_type (1) + x_pos (1) + y_pos (1)
-    //           + h_pos (1) + w_pos (1) + LN w+b (2) = 9.
-    // Per layer: q/k/v w+b (6) + attn output dense w+b (2)
-    //          + attn output LN w+b (2) + intermediate dense w+b (2)
-    //          + output dense w+b (2) + output LN w+b (2) = 16.
-    // Classifier head: w + b = 2.
-    const total_params: u32 = 9 + 16 * NUM_LAYERS + 2;
+    // Global: tok_emb (1) + emb norm w+b (2) + final_norm w+b (2) = 5.
+    // Per layer: attn_norm w+b (2) + q/k/v proj w+b (6) + Wo w+b (2)
+    //          + mlp_norm w+b (2) + gate_proj (1) + up_proj (1) + mlp.Wo (1) = 15.
+    // Boundary head: w1 + b1 + w2 + b2 = 4.
+    const total_params: u32 = 5 + 15 * NUM_LAYERS + 4;
     try store.resident_weights.ensureTotalCapacity(allocator, total_params);
 
     // ── Embeddings ──
-    try putWeight(allocator, store, "embeddings.word_embeddings.weight", &.{ V, H }, rng);
-    try putWeight(allocator, store, "embeddings.position_embeddings.weight", &.{ P, H }, rng);
-    try putWeight(allocator, store, "embeddings.token_type_embeddings.weight", &.{ T, H }, rng);
-    try putWeight(allocator, store, "embeddings.x_position_embeddings.weight", &.{ D2, H }, rng);
-    try putWeight(allocator, store, "embeddings.y_position_embeddings.weight", &.{ D2, H }, rng);
-    try putWeight(allocator, store, "embeddings.h_position_embeddings.weight", &.{ D2, H }, rng);
-    try putWeight(allocator, store, "embeddings.w_position_embeddings.weight", &.{ D2, H }, rng);
-    try putWeight(allocator, store, "embeddings.LayerNorm.weight", &.{H}, rng);
-    try putWeight(allocator, store, "embeddings.LayerNorm.bias", &.{H}, rng);
+    try putWeight(allocator, store, "model.embeddings.tok_embeddings.weight", &.{ V, H }, rng);
+    try putWeight(allocator, store, "model.embeddings.norm.weight", &.{H}, rng);
+    try putWeight(allocator, store, "model.embeddings.norm.bias", &.{H}, rng);
 
-    // ── Classifier head ──
-    try putWeight(allocator, store, "classifier.weight", &.{ C, H }, rng);
-    try putWeight(allocator, store, "classifier.bias", &.{C}, rng);
+    // ── Final norm ──
+    try putWeight(allocator, store, "model.final_norm.weight", &.{H}, rng);
+    try putWeight(allocator, store, "model.final_norm.bias", &.{H}, rng);
+
+    // ── Boundary head ──
+    try putWeight(allocator, store, "boundary_head.w1", &.{ HH, H }, rng);
+    try putWeight(allocator, store, "boundary_head.b1", &.{HH}, rng);
+    try putWeight(allocator, store, "boundary_head.w2", &.{ 2, HH }, rng);
+    try putWeight(allocator, store, "boundary_head.b2", &.{2}, rng);
 
     // ── Encoder layers ──
     for (0..NUM_LAYERS) |layer| {
         var pfx_buf: [256]u8 = undefined;
-        const pfx = std.fmt.bufPrint(&pfx_buf, "encoder.layer.{d}.", .{layer}) catch unreachable;
+        const pfx = std.fmt.bufPrint(&pfx_buf, "model.layers.{d}.", .{layer}) catch unreachable;
 
         const suffixes_2d = [_]struct { name: []const u8, shape: [2]i64 }{
-            .{ .name = "attention.self.query.weight", .shape = .{ H, H } },
-            .{ .name = "attention.self.key.weight", .shape = .{ H, H } },
-            .{ .name = "attention.self.value.weight", .shape = .{ H, H } },
-            .{ .name = "attention.output.dense.weight", .shape = .{ H, H } },
-            .{ .name = "intermediate.dense.weight", .shape = .{ I, H } },
-            .{ .name = "output.dense.weight", .shape = .{ H, I } },
+            .{ .name = "attn.query_proj.weight", .shape = .{ H, H } },
+            .{ .name = "attn.key_proj.weight", .shape = .{ H, H } },
+            .{ .name = "attn.value_proj.weight", .shape = .{ H, H } },
+            .{ .name = "attn.Wo.weight", .shape = .{ H, H } },
+            .{ .name = "mlp.gate_proj.weight", .shape = .{ I, H } },
+            .{ .name = "mlp.up_proj.weight", .shape = .{ I, H } },
+            .{ .name = "mlp.Wo.weight", .shape = .{ H, I } },
         };
         const suffixes_1d = [_]struct { name: []const u8, shape: [1]i64 }{
-            .{ .name = "attention.self.query.bias", .shape = .{H} },
-            .{ .name = "attention.self.key.bias", .shape = .{H} },
-            .{ .name = "attention.self.value.bias", .shape = .{H} },
-            .{ .name = "attention.output.dense.bias", .shape = .{H} },
-            .{ .name = "attention.output.LayerNorm.weight", .shape = .{H} },
-            .{ .name = "attention.output.LayerNorm.bias", .shape = .{H} },
-            .{ .name = "intermediate.dense.bias", .shape = .{I} },
-            .{ .name = "output.dense.bias", .shape = .{H} },
-            .{ .name = "output.LayerNorm.weight", .shape = .{H} },
-            .{ .name = "output.LayerNorm.bias", .shape = .{H} },
+            .{ .name = "attn_norm.weight", .shape = .{H} },
+            .{ .name = "attn_norm.bias", .shape = .{H} },
+            .{ .name = "attn.query_proj.bias", .shape = .{H} },
+            .{ .name = "attn.key_proj.bias", .shape = .{H} },
+            .{ .name = "attn.value_proj.bias", .shape = .{H} },
+            .{ .name = "attn.Wo.bias", .shape = .{H} },
+            .{ .name = "mlp_norm.weight", .shape = .{H} },
+            .{ .name = "mlp_norm.bias", .shape = .{H} },
         };
 
         for (suffixes_2d) |s| {
@@ -189,10 +179,10 @@ fn populateLayoutLMv3Weights(allocator: std.mem.Allocator, store: *WeightStore, 
 
 // ── The test ──────────────────────────────────────────────────────────
 
-test "LayoutLMv3 e2e: loss decreases over training steps" {
+test "Fused chunker integration: loss decreases over training steps" {
     const allocator = std.testing.allocator;
 
-    // 1. Populate weight store with random LayoutLMv3 + classifier parameters.
+    // 1. Populate weight store with random ModernBERT + boundary head parameters.
     var weight_store = WeightStore{
         .allocator = allocator,
         .resident_weights = .{},
@@ -203,7 +193,7 @@ test "LayoutLMv3 e2e: loss decreases over training steps" {
         while (it.next()) |entry| {
             var lw = entry.value_ptr.*;
             // Free names we heap-allocated for per-layer params.
-            if (std.mem.startsWith(u8, lw.tensor.name, "encoder.layer.")) {
+            if (std.mem.startsWith(u8, lw.tensor.name, "model.layers.")) {
                 allocator.free(lw.tensor.name);
             }
             lw.deinit();
@@ -211,17 +201,17 @@ test "LayoutLMv3 e2e: loss decreases over training steps" {
         weight_store.resident_weights.deinit(allocator);
     }
 
-    var prng = std.Random.DefaultPrng.init(99999);
+    var prng = std.Random.DefaultPrng.init(67890);
     const rng = prng.random();
-    try populateLayoutLMv3Weights(allocator, &weight_store, rng);
+    try populateFusedChunkerWeights(allocator, &weight_store, rng);
 
     // 2. Create compute backend.
     var native = NativeCompute.init(allocator, &weight_store, null);
     defer native.deinit();
     var cb = native.computeBackend();
 
-    // 3. Create the RealAutodiffTrainer with LoRA targeting query + value.
-    const lora_targets = [_][]const u8{ "query", "value" };
+    // 3. Create the RealAutodiffTrainer with LoRA targeting query_proj + value_proj.
+    const lora_targets = [_][]const u8{ "query_proj", "value_proj" };
     var trainer = try real_autodiff.RealAutodiffTrainer.init(
         allocator,
         &cb,
@@ -241,10 +231,9 @@ test "LayoutLMv3 e2e: loss decreases over training steps" {
     defer trainer.deinit();
 
     // 4. Prepare synthetic training data.
-    var ctx = layoutlmv3_autodiff.LayoutLMv3AutodiffCtx.init(.{
-        .graph_config = layoutlmv3_config,
-        .task = .token_classification,
-        .num_classes = NUM_CLASSES,
+    var ctx = fused_chunker_autodiff.FusedChunkerAutodiffCtx.init(.{
+        .graph_config = modern_bert_config,
+        .head_hidden_dim = HEAD_HIDDEN_DIM,
     });
 
     const total = BATCH * SEQ_LEN;
@@ -257,35 +246,21 @@ test "LayoutLMv3 e2e: loss decreases over training steps" {
     var attention_mask: [total]f32 = undefined;
     @memset(&attention_mask, 1.0);
 
-    // Random one-hot targets [B, S, num_classes] for token classification.
-    var targets: [BATCH * SEQ_LEN * NUM_CLASSES]f32 = undefined;
+    // Random boundary targets [B*S, 2] (one-hot for boundary/no-boundary).
+    var targets: [total * 2]f32 = undefined;
     @memset(&targets, 0.0);
     for (0..total) |t| {
-        const cls: u32 = rng.intRangeAtMost(u32, 0, NUM_CLASSES - 1);
-        targets[t * NUM_CLASSES + cls] = 1.0;
+        const cls: u32 = rng.intRangeAtMost(u32, 0, 1);
+        targets[t * 2 + cls] = 1.0;
     }
-    const targets_shape = layoutlmv3_autodiff.tokenTargetsShape(BATCH, SEQ_LEN, NUM_CLASSES);
-
-    // Random bbox data [B*S*4] with values in [0, MAX_2D - 1].
-    // Layout: (x0, y0, x1, y1) per token. Ensure x1 >= x0, y1 >= y0.
-    var bbox_data: [total * 4]i32 = undefined;
-    for (0..total) |t| {
-        const x0: i32 = @intCast(rng.intRangeAtMost(u32, 0, MAX_2D / 2));
-        const y0: i32 = @intCast(rng.intRangeAtMost(u32, 0, MAX_2D / 2));
-        const x1: i32 = x0 + @as(i32, @intCast(rng.intRangeAtMost(u32, 1, MAX_2D / 2 - 1)));
-        const y1: i32 = y0 + @as(i32, @intCast(rng.intRangeAtMost(u32, 1, MAX_2D / 2 - 1)));
-        bbox_data[t * 4 + 0] = x0;
-        bbox_data[t * 4 + 1] = y0;
-        bbox_data[t * 4 + 2] = x1;
-        bbox_data[t * 4 + 3] = y1;
-    }
+    const targets_shape = fused_chunker_autodiff.boundaryTargetsShape(BATCH, SEQ_LEN);
 
     // 5. Run training steps and record losses.
     const num_steps: usize = 5;
     var losses: [num_steps]f32 = undefined;
 
     for (0..num_steps) |step_i| {
-        const trainer_input = layoutlmv3_autodiff.makeTrainerInput(
+        const trainer_input = fused_chunker_autodiff.makeTrainerInput(
             &ctx,
             &input_ids,
             &attention_mask,
@@ -293,7 +268,6 @@ test "LayoutLMv3 e2e: loss decreases over training steps" {
             targets_shape,
             BATCH,
             SEQ_LEN,
-            &bbox_data,
         );
         const result = try trainer.step(trainer_input);
         losses[step_i] = result.loss;
