@@ -149,10 +149,10 @@ const Fixture = struct {
             try std.testing.expectError(error.RestoreStagingScopeChanged, self.destinationIndex(name, null, request.restore_staging_plan_id, command.fence.owner_group_id));
             try std.testing.expectError(error.RestoreStagingScopeChanged, self.destinationIndex(name, request.restore_staging_scope, @as([16]u8, @splat(0)), command.fence.owner_group_id));
             try std.testing.expectError(error.RestoreStagingScopeChanged, self.destinationIndex(name, request.restore_staging_scope, request.restore_staging_plan_id, 20 + i));
-            const donor_marker = try self.donors[i].raftAppliedEntry();
+            const donor_marker = try self.donors[i].orderedApplyReceipt();
             var apply: Apply = .{ .fixture = self, .index = i };
             try Apply.propose(&apply, request, .{});
-            try std.testing.expect(std.meta.eql(donor_marker, try self.donors[i].raftAppliedEntry()));
+            try std.testing.expect(std.meta.eql(donor_marker, try self.donors[i].orderedApplyReceipt()));
             var read = try self.donors[i].core.store.beginReadTxn();
             defer read.abort();
             try std.testing.expect((try @import("../storage/db/empty_generation_handoff.zig").loadInstallReceipt(&read)) == null);
@@ -690,8 +690,8 @@ fn runRewriteWithFailure(comptime Driver: type, invalid_tail: bool, non_raft: bo
     try std.testing.expectEqual(@as(usize, if (!unsupported_native_empty and !invalid_tail) 3 else 0), fixture.destination_handoff_writes);
     try std.testing.expectEqual(empty_generation or !invalid_tail, fixture.destination_handoff_identity_reads != 0);
     if (non_raft) {
-        for (fixture.donors) |donor| try std.testing.expect((try donor.raftAppliedEntry()) == null);
-        for (fixture.dbs, fixture.target_open) |target, opened| if (opened) try std.testing.expect((try target.raftAppliedEntry()) == null);
+        for (fixture.donors) |donor| try std.testing.expect((try donor.orderedApplyReceipt()) == null);
+        for (fixture.dbs, fixture.target_open) |target, opened| if (opened) try std.testing.expect((try target.orderedApplyReceipt()) == null);
     }
     var published = (try source.adminSnapshot()).?;
     defer source.freeAdminSnapshot(&published);

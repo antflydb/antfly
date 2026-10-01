@@ -1410,7 +1410,7 @@ test "relational integrity restore follower repairs projection and CHECK debt be
         const validate_index = index + 1;
         const validate: @import("types.zig").BatchRequest = .{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .validated } } };
         try std.testing.expectError(error.RestoreProjectionCatchUpPending, applyRestoreReplica(&target, validate, validate_index, ha));
-        if (ha) try std.testing.expectEqual(index, try target.replicationAppliedSequence()) else try std.testing.expectEqual(index, (try target.raftAppliedEntry()).?.index);
+        if (ha) try std.testing.expectEqual(index, try target.replicationAppliedSequence()) else try std.testing.expectEqual(index, (try target.orderedApplyReceipt()).?.index);
         try std.testing.expectError(error.RestoreStagingInProgress, target.lookup(alloc, "row-0000", .{}));
         var validated = false;
         // CHECK repair is time-sliced: a loaded runner can process only one

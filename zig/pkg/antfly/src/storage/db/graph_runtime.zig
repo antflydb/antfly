@@ -37,7 +37,7 @@ test "db graph runtime prepared ownership waits for authoritative range commit a
         graph_mod.test_abort_ownership_before_range_commit = true;
         defer graph_mod.test_abort_ownership_before_range_commit = false;
         try std.testing.expectError(error.TestInjectedBackfillFailure, @import("../server_db_adapter.zig").applyOrdered(&db, request, .{ .term = 1, .index = 1 }));
-        try std.testing.expect((try db.raftAppliedEntry()) == null);
+        try std.testing.expect((try db.orderedApplyReceipt()) == null);
         const index = &db.core.index_manager.graphIndex("g").?.index;
         try std.testing.expect(index.ownershipTransitionPending());
         try std.testing.expect(!index.ownershipCleanupPending());
@@ -90,7 +90,7 @@ test "db graph runtime expansion waits for retirement before range and merge rec
         try std.testing.expectError(error.GraphMaintenanceInProgress, db.core.updateRange(.{ .start = "", .end = "" }));
         try std.testing.expectError(error.RaftApplyWriterUnavailable, @import("../server_db_adapter.zig").applyOrdered(&db, merge, .{ .term = 1, .index = 2 }));
         try std.testing.expectEqualStrings("m", db.getRange().end);
-        try std.testing.expectEqual(@as(u64, 1), (try db.raftAppliedEntry()).?.index);
+        try std.testing.expectEqual(@as(u64, 1), (try db.orderedApplyReceipt()).?.index);
         const stats = try db.stats(a);
         defer types.freeDBStats(a, stats);
         try std.testing.expect(stats.indexes[0].graph_counts_pending);
@@ -109,7 +109,7 @@ test "db graph runtime expansion waits for retirement before range and merge rec
         try std.testing.expect(!index.ownershipTransitionPending());
         try @import("../server_db_adapter.zig").applyOrdered(&db, merge, .{ .term = 1, .index = 2 });
         try std.testing.expectEqualStrings("", db.getRange().end);
-        try std.testing.expectEqual(@as(u64, 2), (try db.raftAppliedEntry()).?.index);
+        try std.testing.expectEqual(@as(u64, 2), (try db.orderedApplyReceipt()).?.index);
         try db.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "z", .target = "b", .edge_type = "link", .weight = 1 }}, .sync_level = .full_index });
         const stats = try db.stats(a);
         defer types.freeDBStats(a, stats);
@@ -146,14 +146,14 @@ test "db graph runtime repeated split defers behind cleanup without advancing it
     try @import("../server_db_adapter.zig").applyOrdered(&db, first, .{ .term = 1, .index = 1 });
     try std.testing.expectError(error.RaftApplyWriterUnavailable, @import("../server_db_adapter.zig").applyOrdered(&db, second, .{ .term = 1, .index = 2 }));
     try std.testing.expectEqualStrings("m", db.getRange().end);
-    try std.testing.expectEqual(@as(u64, 1), (try db.raftAppliedEntry()).?.index);
+    try std.testing.expectEqual(@as(u64, 1), (try db.orderedApplyReceipt()).?.index);
     const index = &db.core.index_manager.graphIndex("g").?.index;
     try std.testing.expectEqual(@as(u64, 2), (try index.stats(a)).edge_count);
     // The normal metadata scheduler also services graph-only indexes.
     try db.runArtifactRepairMetadataMaintenanceUntilIdle();
     try @import("../server_db_adapter.zig").applyOrdered(&db, second, .{ .term = 1, .index = 2 });
     try std.testing.expectEqualStrings("h", db.getRange().end);
-    try std.testing.expectEqual(@as(u64, 2), (try db.raftAppliedEntry()).?.index);
+    try std.testing.expectEqual(@as(u64, 2), (try db.orderedApplyReceipt()).?.index);
     try std.testing.expectEqual(@as(u64, 1), (try index.stats(a)).edge_count);
     try db.runArtifactRepairMetadataMaintenanceUntilIdle();
     try std.testing.expectEqual(@as(u64, 1), index.edge_count);
@@ -183,7 +183,7 @@ test "db graph runtime replicated split fences topology before receipt and retir
             defer graph_mod.test_abort_prune_after_forward_commit = false;
             // No edge pruning occurs on the Raft apply path.
             try @import("../server_db_adapter.zig").applyOrdered(&db, request, .{ .term = 1, .index = 1 });
-            try std.testing.expectEqual(@as(u64, 1), (try db.raftAppliedEntry()).?.index);
+            try std.testing.expectEqual(@as(u64, 1), (try db.orderedApplyReceipt()).?.index);
             try std.testing.expect(index.ownershipCleanupPending());
             try std.testing.expectEqual(@as(u64, 2), index.edge_count);
             try std.testing.expectEqual(@as(u64, 1), (try index.stats(a)).edge_count);
@@ -191,7 +191,7 @@ test "db graph runtime replicated split fences topology before receipt and retir
             defer graph_mod.GraphIndex.freeEdges(a, hidden);
             try std.testing.expectEqual(@as(usize, 0), hidden.len);
             try std.testing.expectError(error.TestInjectedBackfillFailure, index.pruneOwnedRangePage());
-            try std.testing.expectEqual(@as(u64, 1), (try db.raftAppliedEntry()).?.index);
+            try std.testing.expectEqual(@as(u64, 1), (try db.orderedApplyReceipt()).?.index);
         }
     }
     {
@@ -224,7 +224,7 @@ test "db graph runtime replicated split fences topology before receipt and retir
     try std.testing.expectEqualStrings("m", reopened.getRange().end);
     try @import("../server_db_adapter.zig").applyOrdered(&reopened, request, .{ .term = 1, .index = 1 });
     try std.testing.expectEqual(epoch, reopened.core.index_manager.graphIndex("g").?.index.edge_generation);
-    try std.testing.expectEqual(@as(u64, 1), (try reopened.raftAppliedEntry()).?.index);
+    try std.testing.expectEqual(@as(u64, 1), (try reopened.orderedApplyReceipt()).?.index);
 }
 
 test "db graph runtime helpers expose edges neighbors and shortest path" {

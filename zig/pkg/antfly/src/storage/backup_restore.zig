@@ -279,7 +279,7 @@ fn repairPreparedRestoreUntilComplete(
     // that fence would make the first destination entry look conflicting (or
     // already applied). Clear it on the isolated candidate before either
     // portable deferred repair or native inline repair can publish the root.
-    try restored.clearRaftAppliedEntry();
+    try restored.clearOrderedApplyReceipt();
     // Legacy/portable repair may require table-managed provider wiring and is
     // completed by the provisioning restore job. Native selective repair is
     // self-contained and must finish before this lower-level bootstrap can

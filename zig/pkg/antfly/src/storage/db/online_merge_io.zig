@@ -313,7 +313,7 @@ test "relational index system online admission facts are unbound read only and r
     try std.testing.expect(!(try Fetch.run(&db, same_ordinary)).eligible);
     try std.testing.expectError(error.IntegrityTopologyBusy, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .artifact_catalog = artifact_command, .online_source = .{ .admit = .{ .scope = bound, .artifact_catalog = facts.artifact_catalog } } }, .{ .term = 2, .index = 1 }));
     try @import("../server_db_adapter.zig").applyOrdered(&db, .{}, .{ .term = 2, .index = 1 });
-    try std.testing.expectEqual(@as(u64, 1), (try db.raftAppliedEntry()).?.index);
+    try std.testing.expectEqual(@as(u64, 1), (try db.orderedApplyReceipt()).?.index);
     checkpoint.kind = .rollback;
     try db.batch(.{ .merge_checkpoint = checkpoint });
     const rolled_back_merge_raw = try db.core.store.get(alloc, @import("merge_state.zig").key);
@@ -323,7 +323,7 @@ test "relational index system online admission facts are unbound read only and r
     try std.testing.expectError(error.IntegrityTopologyBusy, Fetch.run(&db, request));
     try std.testing.expect(!(try Fetch.run(&db, same_ordinary)).eligible);
     try std.testing.expectError(error.IntegrityTopologyBusy, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .artifact_catalog = artifact_command, .online_source = .{ .admit = .{ .scope = bound, .artifact_catalog = facts.artifact_catalog } } }, .{ .term = 2, .index = 2 }));
-    try std.testing.expectEqual(@as(u64, 1), (try db.raftAppliedEntry()).?.index);
+    try std.testing.expectEqual(@as(u64, 1), (try db.orderedApplyReceipt()).?.index);
     {
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
@@ -370,7 +370,7 @@ test "relational index system online admission facts are unbound read only and r
     // Rejected commands cannot stall behind an active topology/source fence.
     // The empty exact-entry apply records no row effects or retained frame.
     try @import("../server_db_adapter.zig").applyOrdered(&db, .{}, .{ .term = 2, .index = 4 });
-    try std.testing.expectEqual(@as(u64, 4), (try db.raftAppliedEntry()).?.index);
+    try std.testing.expectEqual(@as(u64, 4), (try db.orderedApplyReceipt()).?.index);
     {
         var read = try db.core.store.beginReadTxn();
         defer read.abort();

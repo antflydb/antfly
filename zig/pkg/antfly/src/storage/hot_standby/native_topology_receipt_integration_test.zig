@@ -88,8 +88,8 @@ test "native topology receipts survive restart and exact standby replay without 
     try primary.batch(cancel);
     try std.testing.expect((try primary.relationalTopologyStatus()).fence == null);
     try std.testing.expect((try replica.relationalTopologyStatus()).fence == null);
-    try std.testing.expect((try primary.raftAppliedEntry()) == null);
-    try std.testing.expect((try replica.raftAppliedEntry()) == null);
+    try std.testing.expect((try primary.orderedApplyReceipt()) == null);
+    try std.testing.expect((try replica.orderedApplyReceipt()) == null);
     for ([_]*db_mod.DB{ &primary, &replica }) |owner| {
         var read = try owner.core.store.beginReadTxn();
         defer read.abort();

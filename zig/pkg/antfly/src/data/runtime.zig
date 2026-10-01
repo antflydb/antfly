@@ -48678,7 +48678,7 @@ fn implementationTests() type {
                 try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"acknowledged\"}" }} });
                 try @import("../storage/server_db_adapter.zig").applyOrdered(&db, finalize, split_entry);
                 try std.testing.expectEqualStrings("doc:k", db.getRange().end);
-                try std.testing.expectEqual(split_entry, (try db.raftAppliedEntry()).?);
+                try std.testing.expectEqual(split_entry, (try db.orderedApplyReceipt()).?);
             }
             {
                 var db = try antfly.db.DB.open(alloc, path, .{ .start_index_workers = false });
@@ -48687,7 +48687,7 @@ fn implementationTests() type {
                 var invalid = finalize;
                 invalid.split_transition.?.split_key = "doc:z";
                 try std.testing.expectError(error.InvalidSplitRange, @import("../storage/server_db_adapter.zig").applyOrdered(&db, invalid, merge_entry));
-                try std.testing.expectEqual(split_entry, (try db.raftAppliedEntry()).?);
+                try std.testing.expectEqual(split_entry, (try db.orderedApplyReceipt()).?);
                 try @import("../storage/server_db_adapter.zig").applyOrdered(&db, .{ .merge_checkpoint = .{
                     .kind = .accept,
                     .transition_id = 42,
@@ -48707,7 +48707,7 @@ fn implementationTests() type {
                 defer db.close();
                 try @import("../storage/server_db_adapter.zig").applyOrdered(&db, finalize, split_entry);
                 try std.testing.expectEqualStrings("", db.getRange().end);
-                try std.testing.expectEqual(merge_entry, (try db.raftAppliedEntry()).?);
+                try std.testing.expectEqual(merge_entry, (try db.orderedApplyReceipt()).?);
                 const value = (try db.get(alloc, "doc:a")) orelse return error.TestExpectedDocument;
                 defer alloc.free(value);
                 try std.testing.expectEqualStrings("{\"title\":\"acknowledged\"}", value);
@@ -48738,7 +48738,7 @@ fn implementationTests() type {
                 defer db.close();
                 try db.batch(.{ .writes = &.{.{ .key = "doc:counter", .value = "{\"count\":0}" }} });
                 try @import("../storage/server_db_adapter.zig").applyOrdered(&db, increment, first_entry);
-                try std.testing.expectEqual(first_entry, (try db.raftAppliedEntry()).?);
+                try std.testing.expectEqual(first_entry, (try db.orderedApplyReceipt()).?);
             }
 
             {
@@ -48761,15 +48761,15 @@ fn implementationTests() type {
 
                 const second_entry: antfly.db.types.RaftAppliedEntryIdentity = .{ .term = 5, .index = 12 };
                 try @import("../storage/server_db_adapter.zig").applyOrdered(&db, increment, second_entry);
-                try std.testing.expectEqual(second_entry, (try db.raftAppliedEntry()).?);
+                try std.testing.expectEqual(second_entry, (try db.orderedApplyReceipt()).?);
 
                 // Structural import into a new Raft history deliberately clears the
                 // group-local fence, allowing that history to begin at a lower index.
-                try db.clearRaftAppliedEntry();
-                try std.testing.expectEqual(null, try db.raftAppliedEntry());
+                try db.clearOrderedApplyReceipt();
+                try std.testing.expectEqual(null, try db.orderedApplyReceipt());
                 const imported_history_entry: antfly.db.types.RaftAppliedEntryIdentity = .{ .term = 1, .index = 1 };
                 try @import("../storage/server_db_adapter.zig").applyOrdered(&db, increment, imported_history_entry);
-                try std.testing.expectEqual(imported_history_entry, (try db.raftAppliedEntry()).?);
+                try std.testing.expectEqual(imported_history_entry, (try db.orderedApplyReceipt()).?);
                 const reset_raw = (try db.get(alloc, "doc:counter")) orelse return error.TestExpectedDocument;
                 defer alloc.free(reset_raw);
                 var reset_parsed = try std.json.parseFromSlice(std.json.Value, alloc, reset_raw, .{});

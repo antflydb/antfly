@@ -674,8 +674,8 @@ test "relational index system native rewrite authority clocks survive pin crash 
     const final = try primary.onlineSourceStatus(scope);
     try std.testing.expectEqual(@as(u64, 4), final.applied_index);
     try std.testing.expectEqualSlices(u8, &final.cut_digest, &(try replica.onlineSourceStatus(scope)).cut_digest);
-    try std.testing.expect((try primary.raftAppliedEntry()) == null);
-    try std.testing.expect((try replica.raftAppliedEntry()) == null);
+    try std.testing.expect((try primary.orderedApplyReceipt()) == null);
+    try std.testing.expect((try replica.orderedApplyReceipt()) == null);
     var forged = scope;
     forged.authority = .raft;
     forged.copy_attempt.donor_term = 1;

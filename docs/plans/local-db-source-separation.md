@@ -44,9 +44,10 @@ their existing store transactions and apply fences.
 Native Raft snapshot wire transport lives in `raft/storage/native_snapshot.zig`
 and runs in the server Raft storage test suite. The physical DB exposes
 `OrderedApplyReceipt`, ordered mutation admission, and local snapshot document
-replacement, staging, and repair primitives. Existing server names remain
-source aliases; durable term/index bytes, persisted keys, and error identities
-remain unchanged.
+replacement, staging, and repair primitives. Server callers use these generic
+primitives through the server adapter;
+compatibility method aliases have been removed. Durable term/index bytes,
+persisted keys, and error identities remain unchanged.
 
 `storage/db/replication_ingress.zig`
 owns envelope decoding and temporary payload allocation. Apply receipts remain
@@ -140,10 +141,13 @@ one-shot shortcut has been removed.
 Foreground writes and recovery share one heap-owned `LocalExecutionState` for
 admission, publication, mutable storage settings, visibility statistics, and
 synchronization. The stable recovery context retains explicit borrowed core,
-executor, runtime and immutable open resources. Each resolution constructs a
-synchronous execution view with private scratch state; it never copies the DB
-wrapper, caches, mutexes or atomics. Provider replacement is fenced while that
-view borrows providers, and the view cannot enqueue work retaining its address.
+executor, runtime and immutable open resources. Each resolution constructs a dedicated
+`LocalMutationExecution` receiver with private scratch state; it never creates
+a temporary DB wrapper. The receiver shares the local mutation implementation
+with foreground execution, fixes synchronization to `.propose`, and exposes no
+DB ownership or resident scheduling operations. Provider replacement is fenced
+while the receiver borrows providers. Resident retry scheduling remains with
+the serving owner.
 Recovery joins before shared publication caches or execution state are freed.
 Namespace and split shadow changes remain visible through their existing shared
 owners and apply fences.
@@ -161,7 +165,8 @@ builds. Local maintenance regressions remain owned by the storage engine shard;
 ## Remaining separation
 
 The physical DB and its complete local source closure must still move into
-`antfly-embedded`. The local source owner now uses shared APIs directly rather
+`antfly-embedded`. This physical move is deferred to keep this refactor from
+widening its merge-conflict surface. The local source owner now uses shared APIs directly rather
 than server facades. Public C API and private server operation ownership are now separate. Keep
 the isolated native/WASM checks passing throughout the physical package move.
 The licensing PR applies Apache classification to the local source closure;

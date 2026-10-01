@@ -3358,7 +3358,7 @@ test "db ordered artifact inventory reconciles committed receiver catalog before
             if (err != error.ArtifactCatalogDrift) return err;
             retries += 1;
             try std.testing.expect(retries <= 32);
-            try std.testing.expect((try follower.raftAppliedEntry()) == null);
+            try std.testing.expect((try follower.orderedApplyReceipt()) == null);
             try std.testing.expect((try follower.artifactInventoryStatus()).ordered == null);
             {
                 var read = try follower.core.store.beginReadTxn();
@@ -3453,7 +3453,7 @@ test "db ordered artifact inventory reconciles committed receiver catalog before
             return error.TestUnexpectedResult;
         }
     }
-    try std.testing.expectEqual(@as(u64, 1), (try follower.raftAppliedEntry()).?.index);
+    try std.testing.expectEqual(@as(u64, 1), (try follower.orderedApplyReceipt()).?.index);
     {
         var read = try follower.core.store.beginReadTxn();
         defer read.abort();

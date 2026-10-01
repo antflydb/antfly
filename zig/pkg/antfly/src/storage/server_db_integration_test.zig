@@ -1618,8 +1618,8 @@ test "db transaction recovery borrowed execution observes split shadow lifetime"
     const recovery_ctx = db.transaction_recovery_local_context orelse
         return error.TransactionRecoveryOwnerUnbound;
     try std.testing.expect(recovery_ctx.execution != null);
-    var recovery_view = engine.test_support.transactionRecoveryExecutionView(&db);
-    try std.testing.expect(activeSplitShadow(&recovery_view) == null);
+    var recovery_execution = engine.test_support.transactionRecoveryExecution(&db);
+    try std.testing.expect(activeSplitShadow(&recovery_execution) == null);
 
     try db.addIndex(.{
         .name = "ft_split_recovery",
@@ -1629,14 +1629,14 @@ test "db transaction recovery borrowed execution observes split shadow lifetime"
     try db.createShadowIndexManager("doc:m", "");
     try std.testing.expect(recovery_ctx.split_shadow != null);
     try std.testing.expect(recovery_ctx.split_shadow.?.manager == db.shadow.?.manager);
-    try std.testing.expect(activeSplitShadow(&recovery_view) == db.shadow.?);
+    try std.testing.expect(activeSplitShadow(&recovery_execution) == db.shadow.?);
     // Ticket counters and synchronization must have one address even though
     // the execution view was captured before the split began.
-    try std.testing.expect(&activeSplitShadow(&recovery_view).?.next_ticket == &db.shadow.?.next_ticket);
+    try std.testing.expect(&activeSplitShadow(&recovery_execution).?.next_ticket == &db.shadow.?.next_ticket);
 
     try db.closeShadowIndexManager();
     try std.testing.expect(recovery_ctx.split_shadow == null);
-    try std.testing.expect(activeSplitShadow(&recovery_view) == null);
+    try std.testing.expect(activeSplitShadow(&recovery_execution) == null);
 }
 
 test "db merge receiver fences stale copies and retains retired transitions across reopen" {

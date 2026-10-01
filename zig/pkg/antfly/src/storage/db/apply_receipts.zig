@@ -107,11 +107,3 @@ test "storage.hot_standby apply receipts reject conflicting identities without a
     try std.testing.expectError(error.InvalidRaftAppliedEntry, orderedApplyDisposition(current, .{ .term = 0, .index = 12 }));
     try std.testing.expectError(error.InvalidRaftAppliedEntry, orderedApplyDisposition(null, .{ .term = 3, .index = 0 }));
 }
-
-// Server source compatibility; storage keys, bytes and errors stay unchanged.
-pub const RaftAppliedEntryIdentity = OrderedApplyReceipt;
-pub const raft_applied_entry_value_len = ordered_apply_receipt_value_len;
-pub const raftAppliedEntryWrite = orderedApplyReceiptWrite;
-pub const readRaftAppliedEntry = readOrderedApplyReceipt;
-pub const RaftAppliedEntryDisposition = OrderedApplyDisposition;
-pub const raftAppliedEntryDisposition = orderedApplyDisposition;

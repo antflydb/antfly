@@ -98,7 +98,7 @@ fn sourceOutboxRecovery(native_authority: bool) !void {
             try std.testing.expectEqual(@as(?u64, 2), retry_decoded.value.online_source_applied_index);
             try std.testing.expectEqual(.native, retry_decoded.value.request.online_source.?.scope().authority);
             try std.testing.expectEqual(@as(u64, 1), (try db.onlineSourceStatus(scope)).admitted_applied_index);
-            try std.testing.expect((try db.raftAppliedEntry()) == null);
+            try std.testing.expect((try db.orderedApplyReceipt()) == null);
         }
     }
 }
