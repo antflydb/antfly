@@ -107,9 +107,12 @@ The borrowed replication interfaces, replay ingress, local snapshot hooks, and
 server runtime test fixtures are separated in #940. Runtime adapters use
 `hot_standby_*` names; local engine contracts use generic replication names.
 Existing durable keys, wire formats, error identities, and public C ABI symbols remain
-compatible. The authored production source audit follows 590 local sources
-without entering server coordination. The complete physical source move and
-private C API server-owner separation remain in progress.
+compatible. The authored production source audit follows 634 local sources
+without entering server coordination. Public C API and private storage-provider
+operations now have separate roots and profiles; the complete physical source
+move remains pending. Actual named module checks cover native C API and WASM,
+and full-suite CI compiles the Apache products with ELv2 implementations
+replaced by unconditional compile-time traps.
 
 Current implementation owners (still under `pkg/antfly` until their storage
 dependency layers move):
@@ -130,6 +133,15 @@ dependency layers move):
   reexports the same declarations so callbacks retain one type identity.
 - `storage/db/replication_effects.zig` owns portable mutation codecs. The hot standby
   effects adapter reexports those declarations and owns runtime log appends.
+- `storage/db/replicated_mutation.zig` owns the borrowed normalized batch and
+  tagged receipt. `replication_ingress.zig` decodes envelopes and interprets
+  provenance before DB execution.
+- `storage/server_db_adapter.zig` owns ordered replay policy and group/fence
+  snapshot adaptation. Local mutation/receipt transactions, pin recovery and
+  snapshot repair safety remain with DB.
+- `capi/db.zig`, `capi/handles.zig`, and `capi_embedded_root.zig` own the public
+  embedded API and shared local handle state. `capi/server_owner.zig` owns the
+  private server operations; integration tests live in `capi/db_test.zig`.
 - `storage/db/commit_integration.zig` owns local publication lock ordering,
   pending-record recovery sequencing, and final authority rechecks. Durability
   waits run after releasing local log and transition locks; acknowledgement
@@ -148,11 +160,13 @@ Apache headers are preserved on extracted code; this phase does not relicense
 server coordination. Portable codec and commit-ordering tests run alongside
 existing HA integration regressions.
 
-Remaining work includes replay and snapshot/seed adapters, moving server HA
-fixtures out of the physical DB source, and the final package source move.
-The physical DB still imports portable replication wire/receipt formats and
-contains replicated replay entry points; this phase does not claim that an
-Apache-only source build can yet omit the entire HA directory.
+Replay and snapshot/seed adapters and server integration fixtures are now
+outside the physical DB production closure. The remaining work is the physical
+move of the complete local source closure into `antfly-embedded`. Portable
+replication records, atomic receipt persistence and typed replay execution
+remain local engine responsibilities. The staged Apache build contains no
+hot standby or other ELv2 server implementations. Their earlier Apache-list
+entries are removed now that local contracts no longer depend on them.
 
 The intended dependency direction is server replication adapter -> embedded
 storage operations. The local DB must not import HA sessions, primary/standby
@@ -165,7 +179,7 @@ server orchestration ELv2.
 
 - One mutation executor serves native writes, committed replay, and restore
   import through distinct typed entry points. A trusted replay entry point
-  must not become a client-controlled `bypass_ha_write_gate` flag.
+  must not become a client-controlled `bypass_replication_write_gate` flag.
 - Storage owns atomic persistence of mutations, applied receipts, and pending
   replication effects. Extract codecs and storage operations for the existing
   durable outbox without changing its keys, framing, checksum, or legacy-record
@@ -190,13 +204,13 @@ server orchestration ELv2.
 Place the DB adapter with the existing server hot-standby implementation,
 rather than creating another engine package:
 
-- Move `HAPrimaryProgressSyncWait` and `HASessionSyncWait` out of DB; retain
-  primary progress evaluation, standby selection, bounded polling, and session
-  replication with the HA runtime.
-- Move `applyHAReplicationRecord` decoding and dispatch into the adapter. It
-  calls typed engine operations for batch/schema/policy/derived effects and
-  applied progress. Keep restore and online-source completion repair on an
-  already-applied retry before acknowledging it.
+- `HotStandbyPrimaryProgressSyncWait` and `HotStandbySessionSyncWait` live outside
+  DB. Primary progress evaluation, standby selection, bounded polling and
+  session replication stay with the hot standby runtime.
+- The runtime adapter uses `replication_ingress.applyRecord` to decode portable
+  records and call typed engine operations for batch/schema/policy/derived
+  effects and applied progress. Restore and online-source completion repair
+  remain part of an already-applied retry before acknowledgement.
 - The HA owner publishes pending effects into its replication log, matches
   previously appended records during recovery, and drives paged retries. The
   engine deletes an exact pending-effect key only after successful publication;

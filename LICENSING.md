@@ -28,9 +28,11 @@ text is in [`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt).
 ## Elastic License 2.0
 
 The [ELv2 license text](LICENSES/Elastic-2.0.txt) covers the standalone database
-server, database HTTP serving, distributed control,
-cluster metadata service, placement and replication orchestration, and
-serverless orchestration remain ELv2. They consume the Apache engine.
+server, database HTTP serving, distributed control, cluster metadata service,
+placement, hot standby and replication orchestration, and serverless
+orchestration. These server owners consume the Apache engine. Portable
+replication records, receipts, durable outboxes and borrowed commit interfaces
+remain Apache engine contracts.
 
 `lite serve` has been removed. Serve a Lite database with the ELv2 server:
 

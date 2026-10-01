@@ -309,7 +309,19 @@ SERVER_ENTRYPOINTS = (
     "standalone/runtime.zig",
     "metadata/reconciler.zig",
     "data/runtime.zig",
+    "capi/server_owner.zig",
+    "capi/db_test.zig",
+    "storage/server_db_adapter.zig",
+    "storage/db/native_raft_snapshot.zig",
+    "storage/metadata_hot_standby_port.zig",
 )
+
+
+def server_only_sources() -> set[str]:
+    owners = set(SERVER_ENTRYPOINTS)
+    directory = ROOT / SOURCE_ROOT / "storage/hot_standby"
+    owners.update(path.relative_to(ROOT / SOURCE_ROOT).as_posix() for path in directory.rglob("*.zig"))
+    return owners
 
 
 class ZigToken(NamedTuple):
@@ -497,10 +509,10 @@ def check_sources(root: Path = ROOT) -> tuple[set[str], list[str]]:
 def main() -> int:
     seen, errors = check_sources()
     errors.extend(check_asset_records())
-    for name in SERVER_ENTRYPOINTS:
+    for name in sorted(server_only_sources()):
         path = SOURCE_ROOT + name
         if group_for(path, "all") != "elv2":
-            errors.append(f"server entry point must remain ELv2: {path}")
+            errors.append(f"server owner must remain ELv2: {path}")
     apache_header = read_header("apache")
     for name in sorted(APACHE_FILES):
         path = ROOT / name

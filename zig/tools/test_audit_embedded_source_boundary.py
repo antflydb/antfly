@@ -143,13 +143,15 @@ fn lazy() void { _ = @import("local.zig"); }
     def test_named_module_cannot_hide_a_server_owner(self):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)
-            owner = project / "pkg/antfly/src/storage/server_db_adapter.zig"
-            owner.parent.mkdir(parents=True)
-            owner.write_text("")
             entry = project / "entry.zig"
             entry.write_text('const innocent_name = @import("contracts");')
-            with self.assertRaisesRegex(ValueError, "server coordination"):
-                audit_modules(project, {"entry": entry, "server": owner}, {("entry", "contracts"): "server"}, "entry")
+            for name in ("server_db_adapter.zig", "metadata_hot_standby_port.zig"):
+                with self.subTest(owner=name):
+                    owner = project / "pkg/antfly/src/storage" / name
+                    owner.parent.mkdir(parents=True, exist_ok=True)
+                    owner.write_text("")
+                    with self.assertRaisesRegex(ValueError, "server coordination"):
+                        audit_modules(project, {"entry": entry, "server": owner}, {("entry", "contracts"): "server"}, "entry")
 
 
 if __name__ == "__main__":

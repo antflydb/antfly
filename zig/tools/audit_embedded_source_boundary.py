@@ -182,7 +182,7 @@ def server_source(relative: str) -> bool:
                 or relative.startswith("metadata/storage/")
             )
         )
-        or relative in {"system_catalog/server_call.zig", "storage/server_db_adapter.zig", "tracing/server_raft_writer.zig", "tracing/raft_trace_logger.zig", "tracing/mod.zig", "storage/db/native_raft_snapshot.zig", "capi/server_owner.zig", "capi_root.zig", "capi_dependencies.zig"}
+        or relative in {"system_catalog/server_call.zig", "storage/server_db_adapter.zig", "storage/metadata_hot_standby_port.zig", "tracing/server_raft_writer.zig", "tracing/raft_trace_logger.zig", "tracing/mod.zig", "storage/db/native_raft_snapshot.zig", "capi/server_owner.zig", "capi_root.zig", "capi_dependencies.zig"}
     )
 
 

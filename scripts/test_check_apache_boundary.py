@@ -26,6 +26,14 @@ import check_apache_boundary as boundary
 
 
 class ApacheBoundaryTests(unittest.TestCase):
+    def test_server_hot_standby_owners_keep_elv2(self):
+        owners = boundary.server_only_sources()
+        self.assertIn("storage/hot_standby/primary.zig", owners)
+        self.assertIn("storage/metadata_hot_standby_port.zig", owners)
+        for owner in owners:
+            with self.subTest(owner=owner):
+                self.assertEqual("elv2", boundary.group_for(boundary.SOURCE_ROOT + owner, "all"))
+
     def test_production_closure_excludes_explicit_server_test_owners(self):
         _, errors = self.check_fixture('test "server integration" { _ = @import("main.zig"); }\n'
             'const fixture = if (builtin.is_test) @import("main.zig") else struct {};')
