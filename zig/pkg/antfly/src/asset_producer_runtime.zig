@@ -1,16 +1,17 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const platform = @import("antfly_platform");
@@ -5341,7 +5342,7 @@ test "asset producer runtime accepts an unrequested boundary-model schema_versio
 // `extractionResultJsonAlloc` path, whenever more than one document changes
 // in the same replay pass -- exactly what
 // TestLiteNativeGraphEdgesFromExtractionArtifactBoundaryV2
-// (go/pkg/lite/lite_cgo_test.go) exercises with its two documents.
+// (go/pkg/embedded/lite_cgo_test.go) exercises with its two documents.
 test "asset producer runtime batch path accepts an unrequested boundary-model schema_version upgrade" {
     const a = std.testing.allocator;
     const item_shape =

@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -139,9 +140,9 @@ const raft_mutation_forwarding = @import("raft_mutation_forwarding.zig");
 const metadata_server = @import("../metadata/server.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const query_embedding_cache = @import("antfly_inference_query_embedding_cache");
+const cache_budget = @import("antfly_cache_budget");
 const sql_plan_cache = @import("../sql/plan_cache.zig");
 const sql_schema_cache = @import("sql_schema_cache.zig");
-const cache_budget = @import("antfly_cache_budget");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
 const connections_api = @import("connections.zig");
 const common_config = @import("../common/config.zig");

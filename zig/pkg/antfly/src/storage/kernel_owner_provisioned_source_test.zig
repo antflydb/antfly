@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -17,8 +18,8 @@ const abi = @import("kernel_owner_abi");
 const kernel_owner_source = @import("../api/kernel_owner_source.zig");
 const backup_contract = @import("../api/backup_contract.zig");
 const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
-const distributed_graph = @import("../api/distributed_graph.zig");
-const indexes_api = @import("../api/indexes.zig");
+const distributed_graph = @import("../api/local_graph.zig");
+const indexes_api = @import("../api/local_indexes.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
@@ -255,7 +256,7 @@ test "hidden constrained lookup recovers cold compiled owner from exact plan aut
     const Source = kernel_owner_source.ProvisionedKernelOwnerSource;
     const staging = @import("db/restore_staging_contract.zig");
     const schema_json = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"unique_constraints\":[{\"name\":\"pk\",\"columns\":[\"id\"]}],\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}";
-    const tables = @import("../api/tables.zig");
+    const tables = @import("../api/local_tables.zig");
     var parsed = try tables.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
     const schema = try tables.deriveRuntimeTableSchema(alloc, parsed);

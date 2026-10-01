@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Tests for immutable release storage and the unified release ledger."""
 
 from __future__ import annotations
@@ -1345,6 +1360,12 @@ class ReleasePromotionTests(unittest.TestCase):
             extras.mkdir()
             source.mkdir()
             (archives / "antfly_0.2.1_Linux_x86_64_gnu.tar.gz").write_bytes(b"native")
+            (archives / "antfly-lite_0.2.1_Linux_x86_64_gnu.tar.gz").write_bytes(
+                b"lite"
+            )
+            (archives / "antfly-inference_0.2.1_Linux_x86_64_gnu.tar.gz").write_bytes(
+                b"inference"
+            )
             (extras / "antfly-cli-0.2.1.tgz").write_bytes(b"npm")
             (extras / "cli-snapshot.json").write_text(
                 json.dumps(
@@ -1443,6 +1464,24 @@ class ReleasePromotionTests(unittest.TestCase):
             )
             kinds = {artifact["kind"] for artifact in ledger["artifacts"]}
             self.assertIn("runtime-archive", kinds)
+            runtime_names = {
+                artifact["name"]
+                for artifact in ledger["artifacts"]
+                if artifact["kind"] == "runtime-archive"
+            }
+            self.assertEqual(
+                runtime_names,
+                {
+                    "antfly_0.2.1_Linux_x86_64_gnu.tar.gz",
+                    "antfly-lite_0.2.1_Linux_x86_64_gnu.tar.gz",
+                    "antfly-inference_0.2.1_Linux_x86_64_gnu.tar.gz",
+                },
+            )
+            checksums = (output / "antfly_zig_checksums.txt").read_text()
+            self.assertEqual(
+                {line.split("  ", 1)[1] for line in checksums.splitlines()},
+                runtime_names,
+            )
             self.assertIn("npm-package", kinds)
             self.assertIn("cli-manifest", kinds)
             self.assertIn("source-manifest", kinds)
@@ -1450,9 +1489,53 @@ class ReleasePromotionTests(unittest.TestCase):
             scopes = {artifact["scope"] for artifact in ledger["artifacts"]}
             self.assertEqual(scopes, {"runtime", "cli", "support"})
 
+            for product in ("antfly-lite", "antfly-inference"):
+                missing_archive = archives / f"{product}_0.2.1_Linux_x86_64_gnu.tar.gz"
+                contents = missing_archive.read_bytes()
+                missing_archive.unlink()
+                missing_archive_argv = argv.copy()
+                missing_archive_argv[missing_archive_argv.index(str(output))] = str(
+                    root / f"missing-{product}-output"
+                )
+                with (
+                    self.subTest(missing=product),
+                    mock.patch.object(sys, "argv", missing_archive_argv),
+                    self.assertRaisesRegex(SystemExit, f"missing matching {product}"),
+                ):
+                    payload.main()
+                missing_archive.write_bytes(contents)
+
             verifier = load_module(
                 "verify_release_ledger_test", "verify_release_ledger.py"
             )
+            runtime = root / "runtime"
+            runtime.mkdir()
+            for name in runtime_names:
+                (runtime / name).write_bytes((output / name).read_bytes())
+            runtime_argv = [
+                "verify_release_ledger.py",
+                "--ledger",
+                str(output / "artifacts.json"),
+                "--payload-dir",
+                str(runtime),
+                "--scope",
+                "runtime",
+                "--tag",
+                "v0.2.1",
+                "--commit",
+                COMMIT,
+                "--ledger-sha256",
+                verifier.sha256(output / "artifacts.json"),
+            ]
+            with mock.patch.object(sys, "argv", runtime_argv):
+                self.assertEqual(verifier.main(), 0)
+            (runtime / "antfly-lite_0.2.1_Linux_x86_64_gnu.tar.gz").unlink()
+            with (
+                mock.patch.object(sys, "argv", runtime_argv),
+                self.assertRaisesRegex(SystemExit, "release runtime scope mismatch"),
+            ):
+                verifier.main()
+
             promotion = root / "promotion"
             promotion.mkdir()
             promoted_package = promotion / "antfly-cli-0.2.1.tgz"

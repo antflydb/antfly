@@ -1,16 +1,17 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const AntflyRootImports = @import("imports.zig").AntflyRootImports;
@@ -536,7 +537,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     api_storage_authority_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const lib_api_storage_authority_tests = b.addTest(.{
         .root_module = api_storage_authority_test_mod,
-        .filters = &.{
+        .filters = selectTestFilters(b, &.{
+            "portable backup manifest rejects partial per-shard accepted generation proof",
             "public table backup and restore require named connections",
             "public table backup handler rejects an existing backup id",
             "public table backup handler exposes non-retryable fenced outcomes",
@@ -618,7 +620,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "remote backup staging keeps native filesystem io separate from repository transport",
             "owned restore verifies declared artifact identity instead of accepting staged bytes",
             "cluster restore repository errors preserve operational failure semantics",
-        },
+        }),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,

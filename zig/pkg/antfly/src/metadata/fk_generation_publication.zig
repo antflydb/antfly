@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! Durable child-FK schema publication. The owner request carries only a plan
 //! identity; a parent/child owner fetches this metadata record at read-index
 //! and verifies its own exact fenced descriptor before applying Raft control.
@@ -8,7 +21,7 @@ const records = @import("../common/topology_records.zig");
 const topology = @import("../storage/db/relational_integrity_topology_contract.zig");
 const integrity = @import("../storage/db/relational_integrity_contract.zig");
 const integrity_catalog = @import("../storage/db/relational_integrity_catalog.zig");
-const table_manager = @import("table_manager.zig");
+const table_manager = @import("local_catalog.zig");
 
 pub const Id = [16]u8;
 pub const Digest = [32]u8;
@@ -279,7 +292,7 @@ pub const Plan = struct {
         // Verify the entire successor index catalog against the deterministic
         // DDL derivation, rather than allowing unrelated index/runtime edits
         // to cross the child-source fence.
-        if (!try @import("../api/tables.zig").foreignKeyPublicationIndexesValid(
+        if (!try @import("../api/local_tables.zig").foreignKeyPublicationIndexesValid(
             alloc,
             self.child_before.name,
             self.child_before.indexes_json,
@@ -477,7 +490,7 @@ pub const Plan = struct {
 /// different index could satisfy readiness for this new version.
 fn supportIndexIncarnation(alloc: std.mem.Allocator, before: records.TableRecord, after: records.TableRecord) !?u64 {
     const coverage = @import("../api/coverage_policy.zig");
-    const tables = @import("../api/tables.zig");
+    const tables = @import("../api/local_tables.zig");
     if (after.indexes_json.len == 0) return null;
     var proposed = try std.json.parseFromSlice(std.json.Value, alloc, after.indexes_json, .{});
     defer proposed.deinit();
@@ -592,7 +605,7 @@ pub const InitialCreatePlan = struct {
                 const before = parent.support_before orelse return error.InvalidGenerationPublication;
                 const after = parent.support_after orelse return error.InvalidGenerationPublication;
                 const pinned_incarnation = try supportIndexIncarnation(alloc, before, after);
-                const expected = try @import("../api/tables.zig").applySchemaUpdateRecordWithIncarnation(
+                const expected = try @import("../api/local_tables.zig").applySchemaUpdateRecordWithIncarnation(
                     alloc,
                     &before,
                     support_json,
@@ -1798,10 +1811,10 @@ test "initial MATCH PARTIAL publication pins parent witness support" {
         .schema_json = parent_json,
         .indexes_json = "{}",
     };
-    const no_full_text_after = try @import("../api/tables.zig").applySchemaUpdateRecord(alloc, &no_full_text, supported);
+    const no_full_text_after = try @import("../api/local_tables.zig").applySchemaUpdateRecord(alloc, &no_full_text, supported);
     defer table_manager.freeTable(alloc, no_full_text_after);
     try std.testing.expect((try supportIndexIncarnation(alloc, no_full_text, no_full_text_after)) == null);
-    const recomputed = try @import("../api/tables.zig").applySchemaUpdateRecordWithIncarnation(alloc, &no_full_text, supported, 1);
+    const recomputed = try @import("../api/local_tables.zig").applySchemaUpdateRecordWithIncarnation(alloc, &no_full_text, supported, 1);
     defer table_manager.freeTable(alloc, recomputed);
     try std.testing.expect(table_manager.tableDefinitionsEqual(no_full_text_after, recomputed));
     try validateInitialPartialParent(alloc, child_json, fks, .{ .table_id = 201, .name = "parent", .schema_json = supported });

@@ -1,0 +1,102 @@
+name: Package Apache Lite and Inference
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      source_commit:
+        required: true
+        type: string
+      python_build:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  package:
+    name: Build Apache Lite wheels and npm packages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_commit }}
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: antfly-zig-*
+          merge-multiple: true
+          path: dist/release-archives
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ inputs.python_build }}
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: ts/package.json
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          package_json_file: ts/package.json
+
+      - name: Install locked TypeScript dependencies
+        working-directory: ts
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify Lite packaging contract
+        run: python -m unittest scripts.packaging.test_lite_packaging scripts.packaging.test_release_licenses
+
+      - name: Populate platform packages and wheels
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          python scripts/packaging/package_lite_release.py \
+            --version "$RELEASE_VERSION" \
+            --archive-dir dist/release-archives \
+            --out-dir dist/lite-packages
+
+      - name: Build and check TypeScript binding
+        working-directory: ts
+        run: |
+          pnpm --filter @antfly/embedded typecheck
+          pnpm --filter @antfly/embedded test
+          pnpm --filter @antfly/embedded build
+
+      - name: Pack Apache npm packages
+        run: |
+          set -euo pipefail
+          mkdir -p dist/lite-packages/npm
+          for name in embedded-darwin-arm64 embedded-linux-arm64 embedded-linux-x64 embedded; do
+            npm pack --pack-destination dist/lite-packages/npm "./ts/packages/$name"
+          done
+          python scripts/packaging/verify_lite_release.py \
+            --version "${{ inputs.version }}" \
+            --archive-dir dist/release-archives \
+            --wheel-dir dist/lite-packages/python \
+            --npm-dir dist/lite-packages/npm
+
+      - name: Seal immutable Lite package snapshot
+        run: |
+          python scripts/release/lite_snapshot.py build \
+            --version "${{ inputs.version }}" \
+            --commit "${{ inputs.source_commit }}" \
+            --npm-dir dist/lite-packages/npm \
+            --wheel-dir dist/lite-packages/python \
+            --out-dir dist/lite-snapshot
+          python scripts/release/lite_snapshot.py verify \
+            --snapshot-dir dist/lite-snapshot \
+            --version "${{ inputs.version }}" \
+            --commit "${{ inputs.source_commit }}"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: antfly-embedded-package-snapshot
+          path: dist/lite-snapshot/
+          if-no-files-found: error

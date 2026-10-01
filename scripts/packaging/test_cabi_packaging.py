@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Packaging regression tests for Antfly C ABI artifacts."""
 
 from __future__ import annotations
@@ -759,6 +774,10 @@ class CAbiPackagingTests(unittest.TestCase):
             (repo / "py" / "packages" / "cli" / "pyproject.toml").write_text(
                 '[project]\nname = "antfly-cli"\nrequires-python = ">=3.11"\n'
             )
+            licenses = repo / "py" / "packages" / "cli" / "LICENSES"
+            licenses.mkdir()
+            (licenses / "Elastic-2.0.txt").write_text("Elastic license\n")
+            (licenses / "Apache-2.0.txt").write_text("Apache license\n")
 
             package_cli_release.extract_archive(
                 archive_dir, "1.2.3", platform, extracted
@@ -785,6 +804,9 @@ class CAbiPackagingTests(unittest.TestCase):
             self.assertIn("antfly_cli/lib/libantfly.so", names)
             self.assertIn("antfly_cli/share/antfly/asset.txt", names)
             self.assertIn("Requires-Python: >=3.11", metadata)
+            self.assertIn("License-Expression: Elastic-2.0 AND Apache-2.0", metadata)
+            self.assertIn("antfly_cli-1.2.3.dist-info/licenses/LICENSES/Elastic-2.0.txt", names)
+            self.assertIn("antfly_cli-1.2.3.dist-info/licenses/LICENSES/Apache-2.0.txt", names)
 
     def test_homebrew_formula_installs_cabi_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -816,6 +838,7 @@ class CAbiPackagingTests(unittest.TestCase):
             rendered = formula.read_text()
             self.assertIn('version "1.2.3"', rendered)
             self.assertIn("version_scheme 1", rendered)
+            self.assertIn('license all_of: ["Elastic-2.0", "Apache-2.0"]', rendered)
             self.assertIn('system "./smoke"', rendered)
             self.assertIn("antfly_1.2.3_Darwin_arm64.tar.gz", rendered)
             self.assertIn("antfly_1.2.3_Linux_arm64_gnu.tar.gz", rendered)

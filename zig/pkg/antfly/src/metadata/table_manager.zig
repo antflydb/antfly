@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -42,23 +43,7 @@ pub const TableRecord = @import("local_catalog.zig").TableRecord;
 
 pub const TableDefinition = TableRecord;
 
-pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
-    return @import("../common/vector_migration.zig").admissionsEqual(lhs.storage_migration, rhs.storage_migration) and
-        lhs.storage.dense_embeddings == rhs.storage.dense_embeddings and
-        lhs.table_id == rhs.table_id and
-        std.mem.eql(u8, lhs.name, rhs.name) and
-        std.mem.eql(u8, lhs.description, rhs.description) and
-        std.mem.eql(u8, lhs.schema_json, rhs.schema_json) and
-        std.mem.eql(u8, lhs.read_schema_json, rhs.read_schema_json) and
-        std.mem.eql(u8, lhs.relational_retirement_json, rhs.relational_retirement_json) and
-        std.mem.eql(u8, lhs.indexes_json, rhs.indexes_json) and
-        std.mem.eql(u8, lhs.replication_sources_json, rhs.replication_sources_json) and
-        std.mem.eql(u8, lhs.placement_role, rhs.placement_role) and
-        std.mem.eql(u8, lhs.restore_backup_id, rhs.restore_backup_id) and
-        std.mem.eql(u8, lhs.restore_location, rhs.restore_location) and
-        lhs.desired_replica_count == rhs.desired_replica_count and
-        lhs.min_ranges == rhs.min_ranges;
-}
+pub const tableDefinitionsEqual = @import("local_catalog.zig").tableDefinitionsEqual;
 
 pub const TableDefinitionFingerprint = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 
@@ -321,31 +306,7 @@ pub fn clearOwnedRangeRestoreIntent(alloc: std.mem.Allocator, record: *RangeReco
     record.completed_restore_fingerprint = completed_restore_fingerprint;
 }
 
-pub fn rangeRecordsEqual(lhs: RangeRecord, rhs: RangeRecord) bool {
-    return lhs.group_id == rhs.group_id and
-        lhs.range_id == rhs.range_id and
-        lhs.table_id == rhs.table_id and
-        std.mem.eql(u8, lhs.start_key, rhs.start_key) and
-        ((lhs.end_key == null and rhs.end_key == null) or
-            (lhs.end_key != null and rhs.end_key != null and std.mem.eql(u8, lhs.end_key.?, rhs.end_key.?))) and
-        lhs.doc_identity_shard_id == rhs.doc_identity_shard_id and
-        lhs.doc_identity_range_id == rhs.doc_identity_range_id and
-        lhs.split_attempt_epoch == rhs.split_attempt_epoch and
-        std.mem.eql(u8, lhs.restore_backup_id, rhs.restore_backup_id) and
-        std.mem.eql(u8, lhs.restore_artifact_backup_id, rhs.restore_artifact_backup_id) and
-        std.mem.eql(u8, lhs.restore_location, rhs.restore_location) and
-        std.mem.eql(u8, lhs.restore_snapshot_path, rhs.restore_snapshot_path) and
-        std.mem.eql(u8, lhs.restore_connection, rhs.restore_connection) and
-        lhs.restore_artifact_size_bytes == rhs.restore_artifact_size_bytes and
-        std.mem.eql(u8, lhs.restore_artifact_sha256, rhs.restore_artifact_sha256) and
-        lhs.restore_native_manifest_size_bytes == rhs.restore_native_manifest_size_bytes and
-        std.mem.eql(u8, lhs.restore_native_manifest_sha256, rhs.restore_native_manifest_sha256) and
-        std.mem.eql(
-            u8,
-            &lhs.completed_restore_fingerprint,
-            &rhs.completed_restore_fingerprint,
-        );
-}
+pub const rangeRecordsEqual = @import("local_catalog.zig").rangeRecordsEqual;
 
 /// Restore publication is monotonic: immediately after the catalog publishes
 /// an active restore intent, a data node may complete it and clear the
@@ -2286,14 +2247,9 @@ pub fn cloneRoutingRange(alloc: std.mem.Allocator, record: RangeRecord) !RangeRe
     };
 }
 
-pub fn rangeDocIdentityShardId(record: RangeRecord) u64 {
-    return if (record.doc_identity_shard_id == 0) record.group_id else record.doc_identity_shard_id;
-}
+pub const rangeDocIdentityShardId = @import("local_catalog.zig").rangeDocIdentityShardId;
 
-pub fn rangeDocIdentityRangeId(record: RangeRecord) u64 {
-    if (record.doc_identity_range_id != 0) return record.doc_identity_range_id;
-    return if (record.range_id == 0) record.group_id else record.range_id;
-}
+pub const rangeDocIdentityRangeId = @import("local_catalog.zig").rangeDocIdentityRangeId;
 
 fn rangeMatchesTransitionIdentity(
     record: RangeRecord,

@@ -1,0 +1,62 @@
+{
+  "zig/lib/hash/src/sha256.zig": {
+    "file": "LICENSES/third-party/Zig-SHA256-MIT.txt"
+  },
+  "zig/lib/httpx/LICENSE": {
+    "file": "LICENSES/third-party/HTTPX-MIT.txt"
+  },
+  "zig/lib/httpx/src/tls/client_compat.zig": {
+    "file": "LICENSES/third-party/Zig-TLS-MIT.txt"
+  },
+  "zig/deps/lmdb/LICENSE": {
+    "file": "LICENSES/third-party/OpenLDAP-2.8.txt"
+  },
+  "zig/deps/lmdb/lmdb.h": {
+    "file": "LICENSES/third-party/LMDB-lmdb-h-notice.txt"
+  },
+  "zig/deps/lmdb/mdb.c": {
+    "file": "LICENSES/third-party/LMDB-mdb-c-notice.txt"
+  },
+  "zig/deps/lmdb/midl.c": {
+    "file": "LICENSES/third-party/LMDB-midl-c-notice.txt"
+  },
+  "zig/deps/lmdb/midl.h": {
+    "file": "LICENSES/third-party/LMDB-midl-h-notice.txt"
+  },
+  "zig/lib/pdf/fonts/roboto/COPYRIGHT.txt": {
+    "file": "LICENSES/third-party/Roboto-COPYRIGHT.txt"
+  },
+  "zig/lib/pdf/fonts/roboto/LICENSE": {
+    "file": "LICENSES/third-party/Roboto-Apache-2.0.txt"
+  },
+  "zig/lib/tokenizer/src/testdata/UNICODE-LICENSE.txt": {
+    "file": "LICENSES/third-party/Unicode-V3.txt"
+  },
+  "zig/lib/tokenizer/src/unicode_classes.zig": {
+    "file": "LICENSES/third-party/Unicode-V3.txt"
+  },
+  "zig/lib/tokenizer/src/unicode_nfc_data.zig": {
+    "file": "LICENSES/third-party/Unicode-V3.txt"
+  },
+  "zig/pkg/inference/licenses/scipy-rectangular-lsap.txt": {
+    "file": "LICENSES/third-party/SciPy-rectangular-lsap-BSD-3-Clause.txt"
+  },
+  "zig/pkg/inference/src/finetune/gliner2_unicode_tables.zig": {
+    "file": "LICENSES/third-party/Unicode-V3.txt"
+  },
+  "zig/pkg/inference/src/ops/cuda/artifacts/gliner25_training_math.cu": {
+    "file": "LICENSES/third-party/PyTorch-BSD-3-Clause.txt",
+    "required": [
+      "SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause"
+    ]
+  },
+  "zig/pkg/inference/src/pipelines/extraction_assignment.zig": {
+    "file": "LICENSES/third-party/SciPy-rectangular-lsap-BSD-3-Clause.txt",
+    "required": [
+      "SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause"
+    ]
+  },
+  "zig/pkg/inference/src/pipelines/extraction_casefold_data.zig": {
+    "file": "LICENSES/third-party/Unicode-V3.txt"
+  }
+}

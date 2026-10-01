@@ -1,16 +1,17 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 
@@ -1120,7 +1121,7 @@ test "lite restore staging expands a self-contained native AFB2 bundle" {
     try std.testing.expectEqual(backups_api.BackupFormat.native, target.format);
     try std.testing.expectEqualStrings("restored_docs", target.table_name);
     const restore_table = try backups_api.deriveRestoreTableRecord(allocator, "restored_docs", target_location, &target);
-    defer @import("../../metadata/table_manager.zig").freeTable(allocator, restore_table);
+    defer @import("../../metadata/local_catalog.zig").freeTable(allocator, restore_table);
     try std.testing.expectEqualStrings("restored_docs", restore_table.name);
     const restored_payload = try std.fmt.allocPrint(allocator, "{s}/{s}/primary.bin", .{ target_root, snapshot_path });
     defer allocator.free(restored_payload);

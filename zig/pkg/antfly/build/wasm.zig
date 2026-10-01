@@ -1,16 +1,17 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! The browser runtime owns one target/profile and never receives native modules.
 const std = @import("std");
@@ -438,6 +439,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         b.path("pkg/antfly-embedded/WASM.md"),
         "antfly-wasm/README.md",
     );
+    const install_licenses = @import("../../../lib/product_licenses/build.zig").installApache(b, b.path(".."), "antfly-wasm", "antfly-wasm");
 
     const install_antfly_wasm_webgpu_ops = b.addInstallFile(
         b.path("pkg/antfly-embedded/webgpu_ops.mjs"),
@@ -511,6 +513,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
                 &install_antfly_wasm_browser.step,
                 &install_antfly_wasm_index.step,
                 &install_antfly_wasm_readme.step,
+                install_licenses,
                 &install_antfly_wasm_webgpu_ops.step,
             },
             &install_shader_steps,

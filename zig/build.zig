@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -762,6 +763,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     synthesizing_mod.addImport("httpx", httpx_mod);
 
     const inference_workflow = @import("pkg/inference/build/context.zig").Context{
+        .install_apache_licenses = @import("lib/product_licenses/build.zig").installApache,
         .b = b,
         .target = target,
         .optimize = optimize,
@@ -1897,8 +1899,8 @@ pub fn create(b: *std.Build) ?Artifacts {
         .name = "antfly-lite",
         .root_module = lite_main_mod,
     });
-    // Lite administration shares storage; serving shares the server runtime.
-    for ([_]RuntimeLibraryUnit{ .storage_kernel, .distributed, .api_kernel, .enrichment_compute, .inference }) |unit| {
+    lite_main.root_module.linkLibrary(runtime.lite_storage);
+    for ([_]RuntimeLibraryUnit{ .enrichment_compute, .inference }) |unit| {
         lite_main.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(unit)].?);
     }
     const lite_cli_smoke = b.addExecutable(.{
@@ -1922,12 +1924,13 @@ pub fn create(b: *std.Build) ?Artifacts {
         },
     });
     const run_lite_main_tests = addFilteredTestRunArtifact(b, lite_main_tests);
-    const install_lite_main = b.addInstallArtifact(lite_main, .{ .dest_sub_path = antfly_bin_name });
+    const install_lite_main = b.addInstallArtifact(lite_main, .{ .dest_sub_path = "antfly-lite" });
 
     const lite_step = b.step("lite", "Build and install the Antfly Lite CLI and libantfly C ABI");
     lite_step.dependOn(&install_lite_main.step);
     lite_step.dependOn(&install_libantfly.step);
     lite_step.dependOn(&install_capi_header.step);
+    lite_step.dependOn(embedded.install_licenses);
 
     const lite_test_step = b.step("lite-test", "Run Lite backend, CLI, bindings, examples, and C ABI packaging checks");
     lite_test_step.dependOn(&run_antfly_main_tests.step);

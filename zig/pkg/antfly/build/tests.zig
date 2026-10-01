@@ -1,16 +1,17 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const api_tests = @import("api_tests.zig");
@@ -1585,6 +1586,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "distributed join finalizer refuses to replace an admitted split topology",
+        "distributed txn preparation pins one routing view and releases it",
+        "legacy graph hydrate wire omits metric fields in both directions",
+        "legacy graph expansion wire omits new controls and remains budget fenced",
+        "legacy graph edges request requires the full physical scan ceiling",
+        "legacy graph wire admits direct indexes and fences contributor indexes",
+        "graph hydrate incoming probe wire carries pinned clock and physical allowance",
+        "distributed graph metrics reject personalized reads before transport",
+        "usermgr openapi module generates extractor surface for routed endpoints",
+        "generated extractors: path param structs exist",
+        "generated extractors: route table covers public API",
         "unconfigured remote catalog authority skips background work without borrowing internal credentials",
         "usermgr openapi module generates extractor surface for routed endpoints",
         "generated extractors: path param structs exist",
@@ -4509,6 +4521,32 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_standalone_runtime_test_step = b.step("antfly-standalone-runtime-test", "Run focused standalone runtime tests");
     const run_lib_standalone_runtime_tests = addFilteredTestRunArtifact(b, lib_standalone_runtime_tests);
     lib_standalone_runtime_test_step.dependOn(&run_lib_standalone_runtime_tests.step);
+    inline for (.{
+        test_imports.runtime.inference_bridge,
+        test_imports.runtime.inference_provider_failure,
+        test_imports.runtime.inference_worker_wire,
+    }) |module| {
+        lib_standalone_runtime_test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module })).step);
+    }
+    const inference_host_tests = b.addTest(.{
+        .root_module = test_imports.runtime.inference_host,
+        .filters = &.{
+            "local generate message conversion preserves tool history and admission",
+            "inference worker",
+            "standalone numeric result ABI",
+            "standalone raster embedding control",
+            "encoded reader ABI enforces resolved model capabilities",
+            "linked generator validates concrete MIME and decoded pixels",
+            "standalone prompt cache detaches resource observer before owner teardown",
+            "standalone inference keep alive parses compound durations and zero",
+            "standalone preload bridge preserves A4B residency controls",
+            "standalone data directory does not change the default models directory",
+            "standalone linked inference ABI validates the supported function-table prefix",
+            "linked rerank documents become server content parts with attachment references",
+        },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
+    });
+    lib_standalone_runtime_test_step.dependOn(&b.addRunArtifact(inference_host_tests).step);
     // Real hidden-owner publication crosses the storage-kernel C ABI. Link
     // this one fixture separately rather than making every standalone
     // inference/runtime unit test carry the storage owner artifact.
@@ -4568,32 +4606,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 18 else 7) * 1024 * 1024 * 1024,
     });
-    inline for (.{
-        test_imports.runtime.inference_bridge,
-        test_imports.runtime.inference_provider_failure,
-        test_imports.runtime.inference_worker_wire,
-    }) |module| {
-        lib_standalone_runtime_test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module })).step);
-    }
-    const inference_host_tests = b.addTest(.{
-        .root_module = test_imports.runtime.inference_host,
-        .filters = &.{
-            "local generate message conversion preserves tool history and admission",
-            "inference worker",
-            "standalone numeric result ABI",
-            "standalone raster embedding control",
-            "encoded reader ABI enforces resolved model capabilities",
-            "linked generator validates concrete MIME and decoded pixels",
-            "standalone prompt cache detaches resource observer before owner teardown",
-            "standalone inference keep alive parses compound durations and zero",
-            "standalone preload bridge preserves A4B residency controls",
-            "standalone data directory does not change the default models directory",
-            "standalone linked inference ABI validates the supported function-table prefix",
-            "linked rerank documents become server content parts with attachment references",
-        },
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
-    });
-    lib_standalone_runtime_test_step.dependOn(&b.addRunArtifact(inference_host_tests).step);
     // Keep the complete API worker fixture out of the inference-heavy runtime
     // object. Compile this narrow integration slice independently so adding
     // restore coverage does not inflate every standalone runtime test build.

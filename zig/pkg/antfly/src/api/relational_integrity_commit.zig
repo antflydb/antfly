@@ -1,8 +1,17 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at https://www.antfly.io/licensing/ELv2-license.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Public mutation adapter. Read versions become durable 2PC predicates, and
 //! semantic claim/reference commands execute on their independently routed
@@ -1641,7 +1650,7 @@ test "distributed txn preparation pins one routing view and releases it" {
         acquisitions: usize = 0,
         lookups: usize = 0,
         releases: usize = 0,
-        fn acquire(ptr: *anyopaque, _: Allocator, budget: @import("table_router.zig").RouteBudget) !*reads.JoinReadView {
+        fn acquire(ptr: *anyopaque, _: Allocator, budget: @import("routing_budget.zig").RouteBudget) !*reads.JoinReadView {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try budget.check();
             self.acquisitions += 1;
@@ -1662,7 +1671,7 @@ test "distributed txn preparation pins one routing view and releases it" {
         }
     };
     var fixture: Fixture = .{};
-    fixture.view = .{ .session = undefined, .source = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = undefined, .query = undefined } }, .destroy = Fixture.destroy };
+    fixture.view = .{ .source = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = undefined, .query = undefined } }, .destroy = Fixture.destroy };
     var builder: Builder = .{ .alloc = std.testing.allocator, .metadata = &.{}, .source = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.original, .scan = undefined, .query = undefined, .acquire_join_view = Fixture.acquire } } };
     {
         defer builder.deinit();

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -141,7 +142,7 @@ check_sdk() {
 check_lite_bindings() {
   section "Checking the Go Lite binding"
   (
-    cd "$repo_root/go/pkg/lite"
+    cd "$repo_root/go/pkg/embedded"
     GOWORK=off go mod tidy
     git diff --exit-code -- go.mod
     CGO_ENABLED=1 GOWORK=off go vet ./...
@@ -150,7 +151,7 @@ check_lite_bindings() {
 
   section "Checking the Python Lite binding"
   (
-    cd "$repo_root/py/packages/lite"
+    cd "$repo_root/py/packages/embedded"
     uv run --locked ruff check .
     uv run --locked pyright
     ANTFLY_LIBRARY=/nonexistent uv run --locked pytest -q
@@ -159,7 +160,7 @@ check_lite_bindings() {
 
   section "Checking the Rust Lite binding"
   cargo test --locked --manifest-path "$repo_root/rs/Cargo.toml" \
-    --package antfly-lite --package antfly-lite-sys
+    --package antfly-embedded --package antfly-embedded-sys
 }
 
 check_release() {

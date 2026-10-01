@@ -1459,7 +1459,7 @@ previous commit already validated, and write AdamW out of place instead of
 snapshotting weights and moments first.
 
 Raw per-step logs and the investigation are in
-[`work-log/completed/inference/laya/2026-09-25-trainer-throughput.md`](../../../../../work-log/completed/inference/laya/2026-09-25-trainer-throughput.md).
+[`docs/design/inference/history/laya/2026-09-25-trainer-throughput.md`](../../../../../docs/design/inference/history/laya/2026-09-25-trainer-throughput.md).
 
 Segment attention in the training graph landed with step 2c (below). Batching still helps little, because cost is per token. LoRA is
 implemented ([LoRA](#lora)); its own step-time, memory, and accuracy numbers
@@ -1777,7 +1777,7 @@ that the fused resident kernels would compute the same way, so routing
 packed rows through them (step 1c) is not expected to pay off on Metal.
 
 The full raw output of every run is in
-[`work-log/completed/inference/laya/2026-09-24-tree-packing.md`](../../../../../work-log/completed/inference/laya/2026-09-24-tree-packing.md).
+[`docs/design/inference/history/laya/2026-09-24-tree-packing.md`](../../../../../docs/design/inference/history/laya/2026-09-24-tree-packing.md).
 
 ### Multi-row batching cost (step 1b′)
 

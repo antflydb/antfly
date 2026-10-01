@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -17,9 +18,9 @@
 const std = @import("std");
 const db = @import("db/mod.zig");
 const staging = @import("db/restore_staging.zig");
-const metadata_staging = @import("../metadata/restore_staging.zig");
+const metadata_staging = @import("../metadata/restore_provisioning_contract.zig");
 const generation = @import("db/generation_lifecycle.zig");
-const backups = @import("../api/backups.zig");
+const backups = @import("../api/local_backups.zig");
 const operation = @import("../api/operation.zig");
 const native_backup = @import("db/native_backup.zig");
 var test_fail_after_source_stage_rename = false;

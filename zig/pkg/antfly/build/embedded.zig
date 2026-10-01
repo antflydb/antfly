@@ -1,16 +1,17 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const AntflyRootImports = @import("imports.zig").AntflyRootImports;
@@ -102,6 +103,7 @@ pub const AddEmbeddedResult = struct {
     libantfly_link_mod: *std.Build.Module,
     install_libantfly: *std.Build.Step.InstallArtifact,
     install_capi_header: *std.Build.Step.InstallFile,
+    install_licenses: *std.Build.Step,
     run_capi_smoke: *std.Build.Step.Run,
     run_capi_conformance: *std.Build.Step.Run,
     run_lite_go_tests: *std.Build.Step.Run,
@@ -310,14 +312,9 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const capi_boundary = @import("embedded_boundary.zig").add(b, capi_mod);
     b.step("embedded-native-module-boundary-check", "Resolve the native public C API source and module boundary").dependOn(&capi_boundary.step);
 
-    // The public C ABI and executable reuse the distributed PIC storage
-    // archive, so production builds analyze and optimize that graph once.
-    // libantfly embeds the standalone inference runtime in-process, the same
-    // as the `antfly` executable (see link_anchor.zig and addRuntime's
-    // storage_kernel unit): this is a deliberate product decision
-    // (2026-09-17) so Lite hosts get local inference without a separate
-    // runtime, at the cost of a much larger shared library (see
-    // COMPILATION.md's "C API composition" section).
+    // The C ABI links the Apache Lite owner, enrichment and inference archives.
+    // The ELv2 executable has its own storage owner for server-only exports;
+    // both owners compile the same shared local engine implementation.
     const libantfly_link_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/capi/link_anchor.zig"),
         .target = target,
@@ -344,9 +341,11 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "antfly.h",
     );
 
+    const install_licenses = @import("../../../lib/product_licenses/build.zig").installApache(b, b.path(".."), "antfly-lite", "share/licenses/antfly-lite");
     const capi_step = b.step("capi", "Build the public libantfly C ABI shared library");
     capi_step.dependOn(&install_libantfly.step);
     capi_step.dependOn(&install_capi_header.step);
+    capi_step.dependOn(install_licenses);
 
     const capi_smoke_mod = b.createModule(.{
         .target = target,
@@ -399,7 +398,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "-count=1",
         "./...",
     });
-    run_lite_go_tests.setCwd(b.path("../go/pkg/lite"));
+    run_lite_go_tests.setCwd(b.path("../go/pkg/embedded"));
     run_lite_go_tests.step.dependOn(&install_libantfly.step);
     run_lite_go_tests.step.dependOn(&install_capi_header.step);
     const lite_go_test_step = b.step("lite-go-test", "Run Go Antfly Lite binding tests against libantfly");
@@ -419,7 +418,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "pytest",
         "-q",
     });
-    run_lite_py_tests.setCwd(b.path("../py/packages/lite"));
+    run_lite_py_tests.setCwd(b.path("../py/packages/embedded"));
     run_lite_py_tests.step.dependOn(&install_libantfly.step);
     const lite_py_test_step = b.step("lite-py-test", "Run Python Antfly Lite binding tests against libantfly");
     lite_py_test_step.dependOn(&run_lite_py_tests.step);
@@ -433,13 +432,13 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "--manifest-path",
         "../rs/Cargo.toml",
         "--package",
-        "antfly-lite",
+        "antfly-embedded",
         "--features",
         "libantfly",
     });
     run_lite_rs_tests.setCwd(b.path("."));
     run_lite_rs_tests.step.dependOn(&install_libantfly.step);
-    const lite_rs_test_step = b.step("lite-rs-test", "Run Rust Antfly Lite binding tests against libantfly");
+    const lite_rs_test_step = b.step("lite-rs-test", "Run Rust Antfly embedded binding tests against libantfly");
     lite_rs_test_step.dependOn(&run_lite_rs_tests.step);
 
     const run_lite_ts_tests = b.addSystemCommand(&.{
@@ -450,7 +449,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "run",
         "test",
     });
-    run_lite_ts_tests.setCwd(b.path("../ts/packages/lite"));
+    run_lite_ts_tests.setCwd(b.path("../ts/packages/embedded"));
     run_lite_ts_tests.step.dependOn(&install_libantfly.step);
     const lite_ts_test_step = b.step("lite-ts-test", "Run TypeScript Antfly Lite binding tests against libantfly (needs pnpm install in ts/)");
     lite_ts_test_step.dependOn(&run_lite_ts_tests.step);
@@ -572,6 +571,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .libantfly_link_mod = libantfly_link_mod,
         .install_libantfly = install_libantfly,
         .install_capi_header = install_capi_header,
+        .install_licenses = install_licenses,
         .run_capi_smoke = run_capi_smoke,
         .run_capi_conformance = run_capi_conformance,
         .run_lite_go_tests = run_lite_go_tests,

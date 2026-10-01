@@ -1,16 +1,17 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Public embedded DB C ABI.
 const handles = @import("handles.zig");
@@ -173,7 +174,7 @@ pub fn liteManagedEmbeddingIndexConfigJson(
 /// consumed by an embeddings index via `"sources":[{"artifact":...}]`) by
 /// nesting an `"enrichments"` array inside whichever index config
 /// authoritatively owns each producer, then harvesting every nested
-/// declaration across the whole table (`api/indexes.zig`'s
+/// declaration across the whole table (`api/local_indexes.zig`'s
 /// `collectArtifactEnrichmentsFromTableIndexesJsonWithOptions`, dependency
 /// sorted via `sortArtifactEnrichmentsByDependency`) and registering each one
 /// with `db.upsertEnrichment` *before* admitting the physical indexes
@@ -3821,7 +3822,7 @@ pub fn searchTextOwned(
     offset: u32,
 ) !DenseOwnedResult {
     // An empty index name aliases the default full-text index, matching the
-    // server's public-query resolution (see api/tables.zig). A name that
+    // server's public-query resolution (see api/local_tables.zig). A name that
     // does not resolve to an existing index still fails inside
     // executeLocalSearch below.
     const resolved_index_name = if (index_name.len == 0) tables_api.default_full_text_index_name else index_name;

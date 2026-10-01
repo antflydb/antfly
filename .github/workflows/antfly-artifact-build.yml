@@ -196,6 +196,28 @@ jobs:
             --out-dir dist/release-archives \
             --metal "${{ matrix.metal }}" \
             --system-blas "${{ matrix.system_blas }}"
+          lite_archive="antfly-lite_${version}_${{ matrix.archive_os }}_${{ matrix.archive_arch }}${{ matrix.archive_suffix }}.tar.gz"
+          scripts/packaging/build_zig_release_archive.sh \
+            --product lite \
+            --version "$version" \
+            --target "${{ matrix.zig_target }}" \
+            --optimize "${{ matrix.zig_optimize }}" \
+            "${jobs_arg[@]}" \
+            --archive-name "$lite_archive" \
+            --out-dir dist/release-archives \
+            --metal "${{ matrix.metal }}" \
+            --system-blas "${{ matrix.system_blas }}"
+          inference_archive="antfly-inference_${version}_${{ matrix.archive_os }}_${{ matrix.archive_arch }}${{ matrix.archive_suffix }}.tar.gz"
+          scripts/packaging/build_zig_release_archive.sh \
+            --product inference \
+            --version "$version" \
+            --target "${{ matrix.zig_target }}" \
+            --optimize "${{ matrix.zig_optimize }}" \
+            "${jobs_arg[@]}" \
+            --archive-name "$inference_archive" \
+            --out-dir dist/release-archives \
+            --metal "${{ matrix.metal }}" \
+            --system-blas "${{ matrix.system_blas }}"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -242,6 +264,17 @@ jobs:
       zig_version: ${{ needs.release-plan.outputs.zig_version }}
       zig_x86_64_linux_sha256: ${{ needs.release-plan.outputs.zig_x86_64_linux_sha256 }}
 
+  package-lite-artifacts:
+    name: Build Apache Lite and Inference packages
+    needs:
+      - release-plan
+      - build-zig-runtime-archives
+    uses: ./.github/workflows/lite-package.yml
+    with:
+      version: ${{ inputs.tag_name }}
+      source_commit: ${{ inputs.source_commit }}
+      python_build: ${{ needs.release-plan.outputs.python_build }}
+
   package-release-source:
     name: Stage commit-bound release support files
     needs: release-plan
@@ -269,6 +302,7 @@ jobs:
       - release-plan
       - build-zig-runtime-archives
       - package-cli-artifacts
+      - package-lite-artifacts
       - package-release-source
       - test-macos-homebrew
     runs-on: ubuntu-latest

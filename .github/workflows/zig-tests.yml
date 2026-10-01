@@ -536,7 +536,7 @@ jobs:
         with:
           node-version-file: ts/package.json
 
-      - name: Build and test WASM artifacts
+      - name: Build and test Apache WASM artifacts
         working-directory: zig
         run: |
           node pkg/antfly-embedded/wasm_client_test.mjs
@@ -1036,10 +1036,10 @@ jobs:
           fi
           exit "$status"
 
-      - name: Verify isolated embedded C API and WASM builds
+      - name: Verify Apache-only Lite, inference, C API, and WASM builds
         run: >-
           taskset -c ${{ steps.cpus.outputs.list }}
-          python3 zig/tools/check_embedded_isolated_build.py --
+          python3 scripts/ci/apache_source_build.py --
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
           --summary all

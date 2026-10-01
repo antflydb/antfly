@@ -542,7 +542,7 @@ the critical path because step 0 can score Decide in PyTorch.
 ### Step 0: baselines (done)
 
 Full tables, commands and pins:
-[work-log/completed/inference/antenna/2026-09-25-baselines.md](../../../../../work-log/completed/inference/antenna/2026-09-25-baselines.md).
+[docs/design/inference/history/antenna/2026-09-25-baselines.md](../../../../../docs/design/inference/history/antenna/2026-09-25-baselines.md).
 Seeded subsamples (500 classification records, 300 NER sentences per
 dataset) carry roughly ±2–4 points of noise. "In-domain" means the pilot's
 training datasets (Banking77, AG News, CrossNER AI/literature/music, MIT
@@ -596,7 +596,7 @@ different sizes; see the report for caveats).
   and 0.543 / 0.515). Task fine-tuning on the pilot rows then lifts it to
   0.742 / 0.345 and 0.675 / 0.477, past released gliner2.5-base in-domain.
   Details:
-  [work-log/completed/inference/antenna/2026-09-25-pilot.md](../../../../../work-log/completed/inference/antenna/2026-09-25-pilot.md).
+  [docs/design/inference/history/antenna/2026-09-25-pilot.md](../../../../../docs/design/inference/history/antenna/2026-09-25-pilot.md).
 - **Native (Zig):** the GLiNER neck (decision 9), feature-distillation jobs
   with a frozen DeBERTa teacher on the CPU, and a closed-form neck fit on the
   job's backend are implemented and tested. A resident Metal bug (transposed
@@ -605,7 +605,7 @@ different sizes; see the report for caveats).
   after the fix, native task fine-tuning matches upstream's trainer from the
   same checkpoint (0.743 / 0.345 and 0.684 / 0.511 against 0.741 / 0.353 and
   0.673 / 0.482). Details:
-  [work-log/completed/inference/antenna/2026-09-26-native-distillation.md](../../../../../work-log/completed/inference/antenna/2026-09-26-native-distillation.md).
+  [docs/design/inference/history/antenna/2026-09-26-native-distillation.md](../../../../../docs/design/inference/history/antenna/2026-09-26-native-distillation.md).
   `scripts/antenna/distill_pool.py --wikipedia` adds encyclopedic passages to
   the text pool for held-out breadth.
 

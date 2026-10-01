@@ -1,21 +1,23 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 pub const std = @import("std");
 
 pub const topology_records = @import("../common/topology_records.zig");
 pub const TableRecord = topology_records.TableRecord;
+pub const RangeRecord = topology_records.RangeRecord;
 
 // TableDefinition is the preferred product/control-plane name. TableRecord
 // remains as the current storage/runtime name during the migration.
@@ -97,4 +99,57 @@ pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
 
 pub fn freeTable(alloc: std.mem.Allocator, record: TableRecord) void {
     @import("restore_provisioning_contract.zig").freeTable(alloc, record);
+}
+
+pub fn rangeDocIdentityRangeId(record: RangeRecord) u64 {
+    if (record.doc_identity_range_id != 0) return record.doc_identity_range_id;
+    return if (record.range_id == 0) record.group_id else record.range_id;
+}
+
+pub fn rangeDocIdentityShardId(record: RangeRecord) u64 {
+    return if (record.doc_identity_shard_id == 0) record.group_id else record.doc_identity_shard_id;
+}
+
+pub fn rangeRecordsEqual(lhs: RangeRecord, rhs: RangeRecord) bool {
+    return lhs.group_id == rhs.group_id and
+        lhs.range_id == rhs.range_id and
+        lhs.table_id == rhs.table_id and
+        std.mem.eql(u8, lhs.start_key, rhs.start_key) and
+        ((lhs.end_key == null and rhs.end_key == null) or
+            (lhs.end_key != null and rhs.end_key != null and std.mem.eql(u8, lhs.end_key.?, rhs.end_key.?))) and
+        lhs.doc_identity_shard_id == rhs.doc_identity_shard_id and
+        lhs.doc_identity_range_id == rhs.doc_identity_range_id and
+        lhs.split_attempt_epoch == rhs.split_attempt_epoch and
+        std.mem.eql(u8, lhs.restore_backup_id, rhs.restore_backup_id) and
+        std.mem.eql(u8, lhs.restore_artifact_backup_id, rhs.restore_artifact_backup_id) and
+        std.mem.eql(u8, lhs.restore_location, rhs.restore_location) and
+        std.mem.eql(u8, lhs.restore_snapshot_path, rhs.restore_snapshot_path) and
+        std.mem.eql(u8, lhs.restore_connection, rhs.restore_connection) and
+        lhs.restore_artifact_size_bytes == rhs.restore_artifact_size_bytes and
+        std.mem.eql(u8, lhs.restore_artifact_sha256, rhs.restore_artifact_sha256) and
+        lhs.restore_native_manifest_size_bytes == rhs.restore_native_manifest_size_bytes and
+        std.mem.eql(u8, lhs.restore_native_manifest_sha256, rhs.restore_native_manifest_sha256) and
+        std.mem.eql(
+            u8,
+            &lhs.completed_restore_fingerprint,
+            &rhs.completed_restore_fingerprint,
+        );
+}
+
+pub fn tableDefinitionsEqual(lhs: TableRecord, rhs: TableRecord) bool {
+    return @import("../common/vector_migration.zig").admissionsEqual(lhs.storage_migration, rhs.storage_migration) and
+        lhs.storage.dense_embeddings == rhs.storage.dense_embeddings and
+        lhs.table_id == rhs.table_id and
+        std.mem.eql(u8, lhs.name, rhs.name) and
+        std.mem.eql(u8, lhs.description, rhs.description) and
+        std.mem.eql(u8, lhs.schema_json, rhs.schema_json) and
+        std.mem.eql(u8, lhs.read_schema_json, rhs.read_schema_json) and
+        std.mem.eql(u8, lhs.relational_retirement_json, rhs.relational_retirement_json) and
+        std.mem.eql(u8, lhs.indexes_json, rhs.indexes_json) and
+        std.mem.eql(u8, lhs.replication_sources_json, rhs.replication_sources_json) and
+        std.mem.eql(u8, lhs.placement_role, rhs.placement_role) and
+        std.mem.eql(u8, lhs.restore_backup_id, rhs.restore_backup_id) and
+        std.mem.eql(u8, lhs.restore_location, rhs.restore_location) and
+        lhs.desired_replica_count == rhs.desired_replica_count and
+        lhs.min_ranges == rhs.min_ranges;
 }

@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -13,6 +14,7 @@
 // limitations.
 
 test {
+    _ = @import("storage/portable_wal.zig");
     _ = @import("storage/lite/backend.zig");
     _ = @import("storage/lite/conformance_test.zig");
     _ = @import("storage/lite/docstore.zig");

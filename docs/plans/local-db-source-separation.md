@@ -164,8 +164,9 @@ The physical DB and its complete local source closure must still move into
 `antfly-embedded`. The local source owner now uses shared APIs directly rather
 than server facades. Public C API and private server operation ownership are now separate. Keep
 the isolated native/WASM checks passing throughout the physical package move.
-The licensing PR applies Apache classification to the local source closure;
-this structural PR preserves existing source licenses.
+The licensing PR applies Apache classification to the local source closure and
+extends the full-suite staged build to Lite, inference, public C API linkage,
+and WASM. This structural PR preserves existing source licenses.
 
 ## Review and merge order
 

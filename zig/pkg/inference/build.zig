@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -146,6 +147,8 @@ fn configureNativeTool(
 }
 
 pub fn build(b: *std.Build) void {
+    const product_licenses = b.lazyImport(@This(), "product_licenses") orelse return;
+    b.getInstallStep().dependOn(product_licenses.installApache(b, b.path("../../.."), "antfly-inference", "share/licenses/antfly-inference"));
     // On Linux, an implicit native target can cause Zig 0.16.0 to discover and
     // link against the host distro's crt startup objects. Newer glibc/binutils
     // builds may include .sframe sections with relocation types that Zig's
@@ -158,6 +161,7 @@ pub fn build(b: *std.Build) void {
         .{};
     const target = b.standardTargetOptions(.{ .default_target = default_target });
     const optimize = b.standardOptimizeOption(.{});
+    const strip = b.option(bool, "strip", "Omit debug information from release artifacts") orelse false;
     const shared_lib_root = resolveSharedLibRoot(b);
 
     // Backend options
@@ -281,6 +285,7 @@ pub fn build(b: *std.Build) void {
     const runtime_graph = runtime_build.create(runtime_config);
     const platform_build = b.lazyImport(@This(), "antfly_platform") orelse return;
     const workflow_ctx = @import("build/context.zig").Context{
+        .install_apache_licenses = product_licenses.installApache,
         .add_native_process_test = platform_build.addNativeProcessTest,
         .b = b,
         .target = target,
@@ -335,6 +340,7 @@ pub fn build(b: *std.Build) void {
     const inference_internal_mod = runtime_graph.inference_internal_mod;
 
     const exe = @import("build/commands.zig").addCommands(workflow_ctx, true);
+    exe.root_module.strip = strip;
     const kernel_jit_package_exe = b.addExecutable(.{
         .name = "antfly-kernel-jit-package",
         .root_module = b.createModule(.{

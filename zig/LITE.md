@@ -248,7 +248,6 @@ antfly lite import app.aflite --from app.afb
 antfly lite check app.aflite
 antfly lite compact app.aflite
 antfly lite vacuum app.aflite
-antfly lite serve app.aflite --addr 127.0.0.1:8080 --config production.json
 ```
 
 A Lite database is provisioned with the default `full_text_index_v0`
@@ -280,14 +279,16 @@ For native `.aflite`, the public status contract should report
 native index engine is being completed is an implementation detail and must not
 appear as the public index layout for native Lite files.
 
-`antfly lite serve` is an artifact-oriented convenience constructor for the
-full standalone runtime. It serves the normal `/db/v1` API and is equivalent to
-`antfly standalone --storage-engine lite --storage-path <file>`. Lite does not
-define a storage-specific HTTP namespace. The convenience command binds only
-to loopback hosts. It forwards the complete standalone option surface,
-including configuration, authentication, TLS, secrets, inference, and
-connections. It owns `--storage-engine`, `--storage-path`, `--host`, and
-`--port`; conflicting duplicates fail closed.
+The Apache Lite CLI and embedded engine provide local file and in-process
+operations. Database HTTP serving uses the ELv2 standalone binary:
+
+```sh
+antfly standalone --storage-engine lite --storage-path app.aflite --config production.json
+```
+
+Standalone exposes the normal `/db/v1` API, with its configuration,
+authentication, TLS, secrets, inference, and connection options. Lite does not
+define a storage-specific HTTP namespace.
 
 Network backup and restore always use named, capability-scoped `external_io`
 connections. This includes `file://`, whose URI path is logical and resolved
@@ -338,13 +339,12 @@ orphan its documents or indexes. Embedded root databases use the deterministic
 document-identity namespace of that future `default` table from creation, so
 adoption is O(1) rather than rewriting every live document; an identity mismatch
 fails closed. Subsequent standalone tables use isolated
-namespaces in the same artifact. This makes `lite batch` followed by `lite
-serve` a genuine interoperability path rather than two unrelated databases.
+namespaces in the same artifact. This allows a file populated by `lite batch` to be served by standalone.
 After that adoption, embedded data commands continue to address the `default`
 table through the persisted alias. A file created directly by standalone has
 no unambiguous root table, so root-oriented `lite batch`, query, schema, index,
 enrichment, import, promote, and compact operations fail closed and direct the
-user to `lite serve` plus `/db/v1`. Artifact `status` and the physical `check`,
+user to `standalone --storage-engine lite --storage-path` plus `/db/v1`. Artifact `status` and the physical `check`,
 `vacuum`, and `snapshot` operations remain available.
 
 The equivalent tagged configuration is:
@@ -815,7 +815,7 @@ Adding an `embeddings` index whose `embedder` (or chunker/extractor producer)
 uses `"provider": "antfly"` with no `api_url` runs against that embedded
 provider instead of failing or requiring a remote URL -- `antfly lite
 run-until-idle app.aflite` drains the resulting enrichment work locally, with
-no network calls. Application embedding (see `go/pkg/lite/README.md`
+no network calls. Application embedding (see `go/pkg/embedded/README.md`
 for the Go binding) gets the same embedded behavior automatically by linking
 the standard `libantfly` -- no separate library or extra link flags.
 
@@ -958,7 +958,6 @@ antfly lite vacuum
 antfly lite backup
 antfly lite restore
 antfly lite promote
-antfly lite serve
 ```
 
 The CLI should accept JSON request files that match the public API contracts.
@@ -1046,7 +1045,7 @@ query-visible results should match within documented index rebuild semantics.
 
 - Added the `antfly lite` command group and embedded database operations.
 - Added full standalone composition through `--storage-engine lite` and
-  `--storage-path`, with `lite serve` as an equivalent constructor.
+  `--storage-path`.
 - Added multi-table key/index namespaces and same-file metadata persistence.
 - Keep `~/.antfly/lite/` for CLI registry data, caches, temporary workspaces,
   and internal developer databases only.
@@ -1078,7 +1077,7 @@ query-visible results should match within documented index rebuild semantics.
 - Expose stable error-code names and descriptions for language bindings.
 - Provide a buffer free-and-zero helper for generated bindings while retaining
   the raw pointer/length free function.
-- Add Go as the first post-Zig/C binding in `go/pkg/lite`, backed by the
+- Add Go as the first post-Zig/C binding in `go/pkg/embedded`, backed by the
   stable C ABI and gated C-library smoke tests.
 - Freeze the Lite open options and capabilities response.
 

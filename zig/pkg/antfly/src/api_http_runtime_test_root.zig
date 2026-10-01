@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -46,6 +47,7 @@ test {
     _ = @import("api/distributed_entity_sink.zig");
     _ = @import("api/http_client.zig");
     _ = @import("api/distributed_join.zig");
+    _ = @import("api/relational_integrity_commit.zig");
     _ = @import("api/distributed_graph.zig");
     _ = @import("antfly_inference_query_embedding_cache");
     _ = @import("api/agent_tools.zig");

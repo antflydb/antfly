@@ -119,7 +119,7 @@ The synthetic fixture tests independent and reordered batches through the
 512-question pipeline limit. Released-checkpoint qualification additionally
 compares token IDs and probabilities against upstream PyTorch on labeled data,
 checks accuracy, and measures warm batches through 128 rows. See
-[qualification results and reproduction](../design/laya-qualification.md).
+[qualification results and reproduction](../design/inference/history/laya/qualification.md).
 
 These checks cover native CPU and Metal. CUDA has a separate
 [qualification script](../../scripts/laya_cuda_qualify.py) and

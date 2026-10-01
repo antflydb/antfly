@@ -1,16 +1,17 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const AntflyRootImports = @import("imports.zig").AntflyRootImports;
@@ -88,6 +89,7 @@ pub const AddRuntimeResult = struct {
     antfly_main: *std.Build.Step.Compile,
     run_linked_inference_abi_integration: *std.Build.Step.Run,
     runtime_library_artifacts: [std.meta.fields(RuntimeLibraryUnit).len]?*std.Build.Step.Compile,
+    lite_storage: *std.Build.Step.Compile,
 };
 
 pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
@@ -138,14 +140,16 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
 
     var runtime_library_artifacts: [std.meta.fields(RuntimeLibraryUnit).len]?*std.Build.Step.Compile = @splat(null);
     inline for (std.meta.tags(RuntimeLibraryUnit)) |unit| {
-        // The executable, C API, and focused artifacts reuse their owning
-        // runtime units instead of recompiling implementations in each root.
+        // Server and focused artifacts reuse their runtime owners. The Apache
+        // C API and Lite CLI use the separate local owner below.
         const role_mod = b.createModule(.{
             .root_source_file = b.path(b.fmt("pkg/antfly/src/runtime_{s}_root.zig", .{@tagName(unit)})),
             .target = target,
             .optimize = optimize,
             .sanitize_thread = sanitize_thread,
-            .pic = if (unit == .storage_kernel or unit == .enrichment_compute) true else null,
+            // These owners also link into the Apache libantfly shared ABI.
+            // Linux cannot relocate a non-PIC inference archive into it.
+            .pic = if (unit == .storage_kernel or unit == .enrichment_compute or unit == .inference) true else null,
         });
         var role_imports = production_antfly_imports;
         role_imports.boundary_profile = switch (unit) {
@@ -166,8 +170,8 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         if (unit == .storage_kernel) {
             const capi_options = b.addOptions();
             capi_options.addOption(bool, "linked_storage", true);
-            // This archive is shared by the default `libantfly` and by the
-            // `antfly` executable. Both link the inference runtime archive
+            // The server storage archive and separate Apache Lite owner both
+            // link the inference runtime archive
             // in-process (see `link_anchor.zig` and the `.inference` unit
             // linked into `libantfly_link_mod` below), so the
             // embedded-inference construction path is always available.
@@ -219,17 +223,51 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             role_artifact.link_data_sections = true;
         }
         // Zig's build runner uses these claims to run as many LLVM codegen
-        // steps concurrently as fit in available RAM. The storage archive
-        // is PIC and shared by the executable and C API final links.
-        if (unit == .storage_kernel) {
-            libantfly_link_mod.linkLibrary(role_artifact);
-        }
+        // steps concurrently as fit in available RAM. Server storage and Lite
+        // have separate owners over the shared engine implementation.
         if (strip) {
             var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
             defer visited.deinit();
             setStripRecursively(role_mod, &visited);
         }
     }
+
+    // Compile the Apache embedding surface independently of the ELv2 server
+    // owner exports. Both owners consume the same local engine implementation.
+    const lite_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/runtime_lite_kernel_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .pic = true,
+        .strip = strip,
+    });
+    production_antfly_imports.configureStorage(b, lite_mod, link_libc);
+    production_antfly_imports.storage_boundary.configureProfile(lite_mod, false, true, .all);
+    lite_mod.addImport("antfly_storage_root", lite_mod);
+    lite_mod.addImport("antfly-client", antfly_client_pkg_mod);
+    const lite_capi_options = b.addOptions();
+    lite_capi_options.addOption(bool, "linked_storage", true);
+    lite_capi_options.addOption(bool, "inference_enabled", true);
+    lite_mod.addOptions("capi_build_options", lite_capi_options);
+    production_antfly_imports.build_info.link(lite_mod);
+    addMacosSdkPaths(b, lite_mod, target);
+    const lite_storage = b.addLibrary(.{
+        .name = "antfly-lite-kernel",
+        .root_module = lite_mod,
+        .linkage = .static,
+        .max_rss = runtimeCompileMaxRss(.storage_kernel, .{
+            .host = b.graph.host.result,
+            .target = target.result,
+            .optimize = optimize,
+            .strip = strip,
+            .cpu_inference = options.cpu_inference,
+            .sanitize_thread = sanitize_thread,
+        }),
+    });
+    lite_storage.link_function_sections = true;
+    lite_storage.link_data_sections = true;
+    libantfly_link_mod.linkLibrary(lite_storage);
 
     libantfly_link_mod.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.enrichment_compute)].?);
     // libantfly embeds the standalone inference runtime in-process, the same
@@ -270,7 +308,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         role_options.addOption(RuntimeArtifactRole, "role", role);
 
         const role_mod = b.createModule(.{
-            .root_source_file = b.path("pkg/antfly/src/runtime_artifact_main.zig"),
+            .root_source_file = b.path(if (role == .inference) "pkg/antfly/src/runtime_inference_main.zig" else "pkg/antfly/src/runtime_artifact_main.zig"),
             .target = target,
             .optimize = optimize,
             .sanitize_thread = sanitize_thread,
@@ -319,6 +357,9 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         const install_role = b.addInstallArtifact(role_exe, .{});
         const role_step = b.step("runtime-artifact", "Build and install one focused server runtime artifact");
         role_step.dependOn(&install_role.step);
+        if (role == .inference) {
+            role_step.dependOn(@import("../../../lib/product_licenses/build.zig").installApache(b, b.path(".."), "antfly-inference", "share/licenses/antfly-inference"));
+        }
     }
     if (strip) {
         var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
@@ -331,5 +372,6 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         .antfly_main = antfly_main,
         .run_linked_inference_abi_integration = run_linked_inference_abi_integration,
         .runtime_library_artifacts = runtime_library_artifacts,
+        .lite_storage = lite_storage,
     };
 }

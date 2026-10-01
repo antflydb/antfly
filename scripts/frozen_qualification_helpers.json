@@ -1,0 +1,18 @@
+{
+  "scripts/frozen_generated_sources.json": {
+    "base": ".",
+    "key": "files"
+  },
+  "zig/pkg/inference/scripts/gliner25/trained_execution_contract_v1.json": {
+    "base": "zig/pkg/inference/scripts/gliner25",
+    "key": "frozen_helpers"
+  },
+  "zig/pkg/inference/scripts/gliner25/training_merge_contract.json": {
+    "base": "zig/pkg/inference/scripts/gliner25",
+    "key": "frozen_helpers"
+  },
+  "zig/pkg/inference/testdata/gliner25/reference_manifest.json": {
+    "base": "zig/pkg/inference/scripts/gliner25",
+    "key": "generators"
+  }
+}

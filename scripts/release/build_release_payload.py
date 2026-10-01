@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Build the Antfly release payload and manifest files."""
 
 from __future__ import annotations
@@ -38,7 +53,9 @@ def copy_payload_file(src: Path, out_dir: Path) -> Path:
 
 def artifact_kind(path: Path) -> str:
     name = path.name
-    if name.startswith("antfly_") and name.endswith(".tar.gz"):
+    if name.startswith(
+        ("antfly_", "antfly-lite_", "antfly-inference_")
+    ) and name.endswith(".tar.gz"):
         return "runtime-archive"
     if name.endswith("_checksums.txt"):
         return "checksums"
@@ -175,7 +192,7 @@ def main() -> int:
         "--archive-dir",
         type=Path,
         required=True,
-        help="directory containing antfly_*.tar.gz",
+        help="directory containing matching antfly_*, antfly-lite_*, and antfly-inference_* archives",
     )
     parser.add_argument(
         "--extra-dir",
@@ -215,9 +232,22 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     copied: list[Path] = []
-    archives = sorted(args.archive_dir.glob("antfly_*.tar.gz"))
-    if not archives:
+    server_archives = sorted(args.archive_dir.glob("antfly_*.tar.gz"))
+    if not server_archives:
         raise SystemExit(f"no antfly release archives found in {args.archive_dir}")
+    product_archives: list[Path] = []
+    for product in ("antfly-lite", "antfly-inference"):
+        matching = [
+            args.archive_dir / f"{product}_{archive.name.removeprefix('antfly_')}"
+            for archive in server_archives
+        ]
+        missing = [archive.name for archive in matching if not archive.is_file()]
+        if missing:
+            raise SystemExit(
+                f"missing matching {product} release archives: {', '.join(missing)}"
+            )
+        product_archives.extend(matching)
+    archives = sorted([*server_archives, *product_archives])
 
     for archive in archives:
         copied.append(copy_payload_file(archive, out_dir))

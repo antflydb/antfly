@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -36,9 +37,6 @@ pub const MetadataRaftVoterSetFingerprint = [table_manager.voter_set_fingerprint
 /// replaced metadata group from superseding current control-plane work.
 pub const CatalogMutationStamp = @import("catalog_mutation_stamp.zig").CatalogMutationStamp;
 
-/// Allocation-free subset of `/status` used by rolling-upgrade admission
-/// probes. Keeping this separate from MetadataStatus avoids parsing and
-/// retaining unrelated status strings on every table DDL operation.
 pub const TableTopologyProtocolStatus = struct {
     metadata_group_id: u64,
     table_topology_protocol_version: u16 = 0,

@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -11,6 +12,7 @@
 // WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
+
 const server_test_adapter = if (builtin.is_test) @import("../server_db_adapter.zig") else struct {};
 const builtin = @import("builtin");
 const hot_standby_publisher_adapter = @import("../hot_standby/db_commit.zig");

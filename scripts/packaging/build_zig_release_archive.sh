@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,21 +18,25 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-usage: build_zig_release_archive.sh --version VERSION --target TARGET --archive-name NAME --out-dir DIR [--metal true|false] [--system-blas true|false] [--optimize MODE] [--strip true|false] [--jobs N]
+usage: build_zig_release_archive.sh --version VERSION --target TARGET --archive-name NAME --out-dir DIR [--product server|lite|inference] [--metal true|false] [--system-blas true|false] [--optimize MODE] [--strip true|false] [--jobs N]
 
 Builds the native Antfly Zig runtime and writes a release archive whose root
 contains:
-  antfly
-  completions/
+  antfly (server), antfly-lite and antfly-inference-worker (Lite), or antfly-inference (Inference)
+  completions/ (server only)
   share/
-  lib/
-  include/
+  lib/ and include/ (server and Lite only)
   README.md
   LICENSE
   THIRD_PARTY_NOTICES.md
+  LICENSING.md (server only)
+  scripts/apache_engine_files.txt (server and Lite only)
+  LICENSES/Apache-2.0.txt
+  LICENSES/Elastic-2.0.txt (server only)
 EOF
 }
 
+product=server
 version=
 target=
 archive_name=
@@ -44,6 +49,10 @@ jobs=
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --product)
+      product="${2:?missing --product value}"
+      shift 2
+      ;;
     --version)
       version="${2:?missing --version value}"
       shift 2
@@ -92,6 +101,11 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+case "$product" in
+  server|lite|inference) ;;
+  *) echo "invalid --product: $product (expected server, lite, or inference)" >&2; exit 2 ;;
+esac
+
 if [ -z "$version" ] || [ -z "$target" ] || [ -z "$archive_name" ] || [ -z "$out_dir" ]; then
   usage
   exit 2
@@ -129,7 +143,7 @@ if ! [[ "$source_date_epoch" =~ ^[0-9]+$ ]]; then
 fi
 export SOURCE_DATE_EPOCH="$source_date_epoch"
 
-work_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/antfly-zig-release-${target}"
+work_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/antfly-zig-release-${product}-${target}"
 prefix="${work_root}/zig-out"
 stage="${work_root}/stage"
 local_cache="${work_root}/zig-cache"
@@ -185,6 +199,20 @@ zig_build_options=(
   -Dpjrt="$pjrt"
   -Dsystem-blas="$system_blas"
 )
+if [ "$product" = inference ]; then
+  zig_build_options=(
+    -Dtarget="$target"
+    -Doptimize="$optimize"
+    -Dstrip="$strip"
+    -Dcpu=baseline
+    -Dantfly-version="$version"
+    -Donnx=false
+    -Dmetal="$metal"
+    -Dcuda="$cuda"
+    -Dpjrt="$pjrt"
+    -Dsystem-blas="$system_blas"
+  )
+fi
 
 zig_install_args=(
   --prefix "$prefix"
@@ -252,44 +280,115 @@ run_zig_build_steps_with_retry() {
 }
 
 (
-  cd "$repo_root/zig"
+  if [ "$product" = inference ]; then
+    cd "$repo_root/zig/pkg/inference"
+  else
+    cd "$repo_root/zig"
+  fi
   # Runtime archives carry measured max-RSS admission claims. Independent units
   # can compile concurrently when they fit the release memory budget; there are
   # no artificial ordering dependencies between those compilations.
-  run_zig_build_steps_with_retry archive antfly capi
+  if [ "$product" = inference ]; then
+    run_zig_build_steps_with_retry archive
+  elif [ "$product" = lite ]; then
+    run_zig_build_steps_with_retry archive lite
+  else
+    run_zig_build_steps_with_retry archive antfly capi
+  fi
 )
 
-test -x "$prefix/bin/antfly"
-test -f "$prefix/include/antfly.h"
-if [ ! -f "$lite_lib_prefix_path" ]; then
-  echo "missing Antfly C ABI library: $lite_lib_prefix_path" >&2
-  find "$prefix" -maxdepth 3 -type f | sort >&2
-  exit 1
+if [ "$product" = lite ]; then
+  binary_name=antfly-lite
+elif [ "$product" = inference ]; then
+  binary_name=antfly-inference
+else
+  binary_name=antfly
 fi
-cp "$prefix/bin/antfly" "$stage/antfly"
+test -x "$prefix/bin/$binary_name"
+if [ "$product" != inference ]; then
+  test -f "$prefix/include/antfly.h"
+  if [ ! -f "$lite_lib_prefix_path" ]; then
+    echo "missing Antfly C ABI library: $lite_lib_prefix_path" >&2
+    find "$prefix" -maxdepth 3 -type f | sort >&2
+    exit 1
+  fi
+fi
+cp "$prefix/bin/$binary_name" "$stage/$binary_name"
+if [ "$product" = lite ]; then
+  # The Lite executable understands `inference _worker`. A second filename
+  # gives embedded hosts a dedicated Apache worker candidate without another
+  # native compile or a dependency on the ELv2 server executable.
+  cp "$prefix/bin/antfly-lite" "$stage/antfly-inference-worker"
+fi
 if [ -d "$prefix/share" ]; then
   cp -R "$prefix/share" "$stage/share"
 fi
-if [ -d "$prefix/lib" ]; then
+if [ "$product" != inference ] && [ -d "$prefix/lib" ]; then
   cp -R "$prefix/lib" "$stage/lib"
 fi
-if [ -d "$prefix/include" ]; then
+if [ "$product" != inference ] && [ -d "$prefix/include" ]; then
   cp -R "$prefix/include" "$stage/include"
 fi
-cp "$repo_root/README.md" "$stage/README.md"
-cp "$repo_root/LICENSE" "$stage/LICENSE"
+if [ "$product" = lite ]; then
+  cp "$repo_root/scripts/packaging/lite-release-README.md" "$stage/README.md"
+elif [ "$product" = inference ]; then
+  cp "$repo_root/scripts/packaging/inference-release-README.md" "$stage/README.md"
+else
+  cp "$repo_root/README.md" "$stage/README.md"
+  cp "$repo_root/LICENSING.md" "$stage/LICENSING.md"
+fi
+if [ "$product" != inference ]; then
+  mkdir -p "$stage/scripts"
+  cp "$repo_root/scripts/apache_engine_files.txt" "$stage/scripts/apache_engine_files.txt"
+  cp "$repo_root/scripts/embedded_asset_licenses.json" "$stage/scripts/embedded_asset_licenses.json"
+fi
+mkdir -p "$stage/LICENSES"
+cp "$repo_root/LICENSES/Apache-2.0.txt" "$stage/LICENSES/Apache-2.0.txt"
+if [ "$product" = server ]; then
+  cp "$repo_root/LICENSES/Elastic-2.0.txt" "$stage/LICENSES/Elastic-2.0.txt"
+fi
+cp -R "$repo_root/LICENSES/third-party" "$stage/LICENSES/third-party"
+if [ "$product" != server ]; then
+  cp "$repo_root/LICENSES/Apache-2.0.txt" "$stage/LICENSE"
+else
+  cp "$repo_root/LICENSE" "$stage/LICENSE"
+fi
 cp "$repo_root/THIRD_PARTY_NOTICES.md" "$stage/THIRD_PARTY_NOTICES.md"
-"$repo_root/scripts/completions.sh" "$stage/completions"
+if [ "$product" = server ]; then
+  "$repo_root/scripts/completions.sh" "$stage/completions"
+fi
 
 python3 "$repo_root/scripts/packaging/create_reproducible_tar.py" \
   --source "$stage" \
   --output "$out_dir/$archive_name" \
   --mtime "$source_date_epoch"
 tar -tzf "$out_dir/$archive_name" > "$work_root/archive-contents.txt"
-grep -Fx "./include/antfly.h" "$work_root/archive-contents.txt" >/dev/null
+grep -Fx "./$binary_name" "$work_root/archive-contents.txt" >/dev/null
+if [ "$product" = lite ]; then
+  grep -Fx "./antfly-inference-worker" "$work_root/archive-contents.txt" >/dev/null
+  if grep -Fx './antfly' "$work_root/archive-contents.txt" >/dev/null; then
+    echo "Lite archive unexpectedly includes the server executable" >&2
+    exit 1
+  fi
+fi
+if [ "$product" = inference ]; then
+  if grep -Eq '^\./(antfly|antfly-lite|antfly-inference-worker)$' "$work_root/archive-contents.txt"; then
+    echo "Inference archive unexpectedly includes database or worker executables" >&2
+    exit 1
+  fi
+else
+  grep -Fx "./include/antfly.h" "$work_root/archive-contents.txt" >/dev/null
+  grep -Fx "$lite_lib_archive_path" "$work_root/archive-contents.txt" >/dev/null
+  grep -Fx "./scripts/apache_engine_files.txt" "$work_root/archive-contents.txt" >/dev/null
+fi
 grep -Fx "./THIRD_PARTY_NOTICES.md" "$work_root/archive-contents.txt" >/dev/null
-grep -Fx "$lite_lib_archive_path" "$work_root/archive-contents.txt" >/dev/null
-grep -Fx "./completions/antfly.bash" "$work_root/archive-contents.txt" >/dev/null
-grep -Fx "./completions/antfly.zsh" "$work_root/archive-contents.txt" >/dev/null
-grep -Fx "./completions/antfly.fish" "$work_root/archive-contents.txt" >/dev/null
+if [ "$product" = server ]; then
+  grep -Fx "./completions/antfly.bash" "$work_root/archive-contents.txt" >/dev/null
+  grep -Fx "./completions/antfly.zsh" "$work_root/archive-contents.txt" >/dev/null
+  grep -Fx "./completions/antfly.fish" "$work_root/archive-contents.txt" >/dev/null
+fi
+if [ "$product" = server ]; then
+  grep -Fx "./LICENSES/Elastic-2.0.txt" "$work_root/archive-contents.txt" >/dev/null
+fi
+grep -Fx "./LICENSES/Apache-2.0.txt" "$work_root/archive-contents.txt" >/dev/null
 echo "wrote $out_dir/$archive_name"
