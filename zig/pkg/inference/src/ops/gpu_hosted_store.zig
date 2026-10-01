@@ -72,6 +72,9 @@ pub const LazyWeightEntry = struct {
         .spill_tier = .disk,
     },
     prefer_dense: bool = false,
+    /// Quantize the dense source to Q8_0 when it loads (Laya
+    /// `weight_quantization`). Reloads after eviction quantize again.
+    quantize_q8_0: bool = false,
     active_tier: ResidencyTier = .disk,
     last_access_epoch: u64 = 0,
 };
@@ -214,6 +217,12 @@ pub const WeightStore = struct {
     allow_direct_quant: bool = true,
     quant_execution_mode: QuantExecutionMode = .prefer_backend_dense,
     prefer_f32_dense_tensors: bool = false,
+    /// Constructor-only capability for immutable legacy GLiNER inference
+    /// sessions. A request may borrow an aligned F32 host payload while holding
+    /// its LazyWeightEntry pin. Generic and mutable training stores stay false;
+    /// this never authorizes borrowing mutable parameters or retaining a CT
+    /// beyond the request/backend lifetime.
+    allow_immutable_f32_weight_borrow: bool = false,
     mirror_kv_to_manager: bool = true,
     access_epoch: u64 = 1,
     packed_expert_views: std.StringHashMapUnmanaged(PackedExpertViewEntry) = .empty,
@@ -222,8 +231,21 @@ pub const WeightStore = struct {
         if (supports_native_metal_provider) null else {},
     shared_metal_native_provider_lock: if (supports_native_metal_provider) std.Io.Mutex else void =
         if (supports_native_metal_provider) .init else {},
+    /// Immutable physical FP32 weights/relative constants. Request ComputeBackend
+    /// wrappers borrow this owner; it is destroyed before the shared provider.
+    boundary_resident: ?*@import("gliner_boundary_resident.zig").Owner = null,
+    laya_resident: if (supports_native_metal_provider) ?*@import("laya_metal.zig").Owner else void = if (supports_native_metal_provider) null else {},
     jina_lora_adapter: ?*JinaLoraAdapter = null,
 };
+
+test "gpu hosted immutable F32 borrowing is disabled for ordinary stores" {
+    const store = WeightStore{
+        .allocator = std.testing.allocator,
+        .prefix = "",
+        .lazy_weights = .empty,
+    };
+    try std.testing.expect(!store.allow_immutable_f32_weight_borrow);
+}
 
 pub fn touchLazyWeight(data: *WeightStore, entry: *LazyWeightEntry) void {
     entry.last_access_epoch = data.access_epoch;
@@ -345,6 +367,23 @@ pub fn ensureHostLazyWeightLoadedSimple(data: *WeightStore, entry: *LazyWeightEn
     if (entry.quantized_storage != null and !entry.prefer_dense) return;
 
     const tensor_store = data.tensor_store orelse return error.MissingWeight;
+    if (entry.quantize_q8_0) {
+        var dense = try tensor_store.loadTensorRef(&entry.tensor_ref);
+        defer dense.deinit();
+        var storage = try @import("../models/weight_source.zig").quantizeDenseQ8_0(data.allocator, &dense.tensor);
+        errdefer storage.deinit();
+        const bytes = storage.raw_bytes.len;
+        if (data.tier_cache) |*tier_cache| {
+            tier_cache.reserve(.host, bytes) catch |err| {
+                tier_cache.noteDenied(.host, bytes);
+                return err;
+            };
+        }
+        entry.loaded_bytes = bytes;
+        entry.quantized_storage = storage;
+        entry.active_tier = .host;
+        return;
+    }
     if (data.allow_direct_quant and !entry.prefer_dense) {
         if (try tensor_store.loadQuantizedStorageRef(&entry.tensor_ref)) |storage_value| {
             var loaded_storage = storage_value;

@@ -336,6 +336,38 @@ pub const PinnedGeneratedArtifacts = struct {
     files: []PinnedArtifactFile,
     pin_present: bool = true,
 
+    pub fn walPrefixBytes(self: *const PinnedGeneratedArtifacts) !u64 {
+        var total: u64 = 0;
+        for (self.files) |file| switch (file.source) {
+            .leased_prefix => |prefix| total = std.math.add(u64, total, prefix.bytes) catch return error.FileTooBig,
+            else => {},
+        };
+        return total;
+    }
+
+    /// Converts descriptor-only WAL leases to bounded durable prefixes while
+    /// linking immutable files. The entire byte budget is admitted first.
+    pub fn seal(self: *PinnedGeneratedArtifacts, root: []const u8, cancellation: CancellationToken, wal_budget: u64) !u64 {
+        if (try self.walPrefixBytes() > wal_budget) return error.BackupSealWalBudgetExceeded;
+        var total: u64 = 0;
+        for (self.files) |*file| {
+            try cancellation.check();
+            const target = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ root, file.relative_path });
+            defer self.alloc.free(target);
+            const size = switch (file.source) {
+                .pinned_file => |source| blk: {
+                    const stat = try pinArtifactFile(self.io, source.path, target);
+                    if (stat.inode != source.stat.inode or stat.size != source.stat.size or !std.meta.eql(stat.mtime, source.stat.mtime)) return error.SourceFileChanged;
+                    break :blk stat.size;
+                },
+                .leased_prefix => |*prefix| try copyLeasedPrefixDurable(self.alloc, self.io, &prefix.reader, prefix.bytes, target, cancellation, null),
+            };
+            total = std.math.add(u64, total, size) catch return error.FileTooBig;
+        }
+        try fs_paths.syncDirPortable(self.io, root);
+        return total;
+    }
+
     pub fn deinit(self: *PinnedGeneratedArtifacts) void {
         if (self.pin_present) std.Io.Dir.cwd().deleteTree(self.io, self.pin_root) catch {};
         for (self.files) |*file| file.deinit(self.alloc);
@@ -1294,7 +1326,7 @@ fn copyFileDurableCancellable(
     return try copyFileDurableCancellableWithSink(io, source_path, destination_path, cancellation, null);
 }
 
-fn copyFileDurableCancellableWithSink(
+pub fn copyFileDurableCancellableWithSink(
     io: Io,
     source_path: []const u8,
     destination_path: []const u8,
@@ -1427,7 +1459,7 @@ fn pinArtifactFile(io: Io, source_path: []const u8, pinned_path: []const u8) !st
     return pinned;
 }
 
-fn statRegularFile(io: Io, path: []const u8) !std.Io.File.Stat {
+pub fn statRegularFile(io: Io, path: []const u8) !std.Io.File.Stat {
     var file = if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openFileAbsolute(io, path, .{})
     else
@@ -1478,7 +1510,7 @@ fn pathExists(io: Io, path: []const u8) !bool {
     return true;
 }
 
-fn readFileAlloc(alloc: Allocator, io: Io, path: []const u8, max_bytes: usize) ![]u8 {
+pub fn readFileAlloc(alloc: Allocator, io: Io, path: []const u8, max_bytes: usize) ![]u8 {
     var file = if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openFileAbsolute(io, path, .{})
     else
@@ -1489,7 +1521,7 @@ fn readFileAlloc(alloc: Allocator, io: Io, path: []const u8, max_bytes: usize) !
     return try reader.interface.allocRemaining(alloc, .limited(max_bytes));
 }
 
-fn writeFileDurable(io: Io, path: []const u8, body: []const u8) !u64 {
+pub fn writeFileDurable(io: Io, path: []const u8, body: []const u8) !u64 {
     var file = try fs_paths.createFilePortable(io, path, .{ .truncate = true });
     defer file.close(io);
     var buffer: [16 * 1024]u8 = undefined;
@@ -1542,6 +1574,11 @@ test "explicit native generation pin keeps immutable files and exact WAL prefix"
     }, .none);
     defer pinned.deinit();
 
+    const sealed = try std.fmt.allocPrint(alloc, "{s}/sealed", .{root});
+    defer alloc.free(sealed);
+    try std.testing.expectError(error.BackupSealWalBudgetExceeded, pinned.seal(sealed, .none, 0));
+    _ = try pinned.seal(sealed, .none, "committed".len);
+
     // Atomic generation replacement may unlink and recreate the live path;
     // both the hardlinked immutable pin and leased WAL descriptor must retain
     // the selected inode while corpus copying runs outside admission.
@@ -1561,6 +1598,11 @@ test "explicit native generation pin keeps immutable files and exact WAL prefix"
     defer alloc.free(wal_bytes);
     try std.testing.expectEqualStrings("immutable-generation", segment_bytes);
     try std.testing.expectEqualStrings("committed", wal_bytes);
+    const durable_wal = try std.fmt.allocPrint(alloc, "{s}/indexes/dense/posting-segments/wal-1.afpw", .{sealed});
+    defer alloc.free(durable_wal);
+    const durable_wal_bytes = try readFileAlloc(alloc, std.testing.io, durable_wal, 64);
+    defer alloc.free(durable_wal_bytes);
+    try std.testing.expectEqualStrings("committed", durable_wal_bytes);
 }
 
 test "shared vector acceleration corruption preserves native posting authority" {

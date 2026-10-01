@@ -1,7 +1,17 @@
 {
   "$schema": "https://biomejs.dev/schemas/2.4.14/schema.json",
   "vcs": { "enabled": true, "clientKind": "git", "useIgnoreFile": true },
-  "files": { "includes": ["**", "!!**/dist", "!!**/*.d.ts", "!!.next", "!!out", "!!build"] },
+  "files": {
+    "includes": [
+      "**",
+      "!!**/dist",
+      "!!**/*.d.ts",
+      "!!.next",
+      "!!out",
+      "!!build",
+      "!!apps/model-explorer/data/generated"
+    ]
+  },
   "formatter": {
     "enabled": true,
     "indentStyle": "space",

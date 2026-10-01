@@ -312,7 +312,7 @@ fn printKnownAliases() void {
     for (registry_mod.friendly_aliases) |entry| {
         print("  {s:<16} -> {s}\n", .{ entry.alias, entry.ref });
     }
-    print("or pass a HuggingFace reference (owner/name[:variant]) or a local model directory.\n", .{});
+    print("or pass a HuggingFace reference (owner/name[:variant][@revision]) or a local model directory.\n", .{});
 }
 
 /// Resolve the positional model argument to a local model directory, pulling
@@ -1146,7 +1146,7 @@ fn printUsage() void {
         \\usage: antfly inference chat <model> [options]
         \\
         \\<model> is a friendly alias (gemma4-e2b, gemma4-e4b), a HuggingFace
-        \\reference (owner/name[:variant]), or a local model directory. Known
+        \\reference (owner/name[:variant][@revision]), or a local model directory. Known
         \\models are pulled automatically on first use.
         \\
         \\options:

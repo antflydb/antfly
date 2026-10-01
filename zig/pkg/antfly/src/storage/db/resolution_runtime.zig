@@ -111,7 +111,7 @@ pub fn resolverForArtifactKind(
     return null;
 }
 
-fn resolverMatchesArtifact(cfg: *const ResolverConfig, source_artifact_kind: SourceArtifactKind, artifact_name: []const u8) bool {
+pub fn resolverMatchesArtifact(cfg: *const ResolverConfig, source_artifact_kind: SourceArtifactKind, artifact_name: []const u8) bool {
     return cfg.source_artifact_kind.matches(source_artifact_kind) and std.mem.eql(u8, cfg.source_artifact, artifact_name);
 }
 
@@ -119,13 +119,42 @@ fn resolverConsumesArtifact(resolvers: []const ResolverConfig, source_artifact_k
     return resolverForArtifactKind(resolvers, source_artifact_kind, artifact_name) != null;
 }
 
-const ParsedSourceArtifactKey = struct {
+/// Labels claimed by sibling resolvers on the same source artifact. A
+/// catch-all resolver (empty `labels`) must skip these so each mention is
+/// resolved exactly once while extraction labels stay open-vocabulary. Only
+/// the returned outer slice is allocated (label strings are borrowed from the
+/// sibling configs); free it with `gpa`. Labeled resolvers need no exclusions
+/// (admission keeps sibling label sets disjoint), so this returns empty for
+/// them without allocating.
+fn siblingClaimedLabelsAlloc(
+    gpa: std.mem.Allocator,
+    resolvers: []const ResolverConfig,
+    cfg: *const ResolverConfig,
+) ![]const []const u8 {
+    if (cfg.labels.len > 0) return &.{};
+    var claimed = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer claimed.deinit(gpa);
+    for (resolvers) |*sibling| {
+        if (sibling == cfg) continue;
+        if (!std.mem.eql(u8, sibling.source_artifact, cfg.source_artifact)) continue;
+        if (!sibling.source_artifact_kind.matches(cfg.source_artifact_kind) and
+            !cfg.source_artifact_kind.matches(sibling.source_artifact_kind)) continue;
+        for (sibling.labels) |label| try claimed.append(gpa, label);
+    }
+    return try claimed.toOwnedSlice(gpa);
+}
+
+fn freeSiblingClaimedLabels(gpa: std.mem.Allocator, labels: []const []const u8) void {
+    if (labels.len > 0) gpa.free(labels);
+}
+
+pub const ParsedSourceArtifactKey = struct {
     doc_key: []u8,
     artifact_name: []u8,
     source_artifact_kind: SourceArtifactKind,
     resolution_scope_key: []u8,
 
-    fn deinit(self: *ParsedSourceArtifactKey, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *ParsedSourceArtifactKey, alloc: std.mem.Allocator) void {
         alloc.free(self.doc_key);
         alloc.free(self.artifact_name);
         alloc.free(self.resolution_scope_key);
@@ -133,7 +162,7 @@ const ParsedSourceArtifactKey = struct {
     }
 };
 
-fn parseSourceArtifactKeyAlloc(alloc: std.mem.Allocator, key: []const u8) !?ParsedSourceArtifactKey {
+pub fn parseSourceArtifactKeyAlloc(alloc: std.mem.Allocator, key: []const u8) !?ParsedSourceArtifactKey {
     var artifact_ref = (artifact_ids.decodeArtifactRefAlloc(alloc, key) catch |err| switch (err) {
         error.InvalidInternalUserKey => return null,
         else => return err,
@@ -182,11 +211,14 @@ pub fn resolveExtraction(
     candidates: []const []const resolver_lib.Candidate,
 ) !?ResolutionOutput {
     const cfg = resolverForArtifact(resolvers, artifact_name) orelse return null;
+    const sibling_excludes = try siblingClaimedLabelsAlloc(gpa, resolvers, cfg);
+    defer freeSiblingClaimedLabels(gpa, sibling_excludes);
 
     var resolver = try resolver_lib.Resolver.initFromParts(
         gpa,
         cfg.table,
         cfg.key_template,
+        .{ .labels = cfg.labels, .exclude_labels = sibling_excludes, .min_confidence = cfg.min_confidence },
         cfg.type_must_match,
         cfg.scorer_json,
     );
@@ -194,6 +226,7 @@ pub fn resolveExtraction(
 
     var parsed = try resolver_lib.parseExtractionEntities(gpa, extraction_bytes);
     defer parsed.deinit();
+    parsed.entities = resolver.filterEntitiesByLabel(parsed.entities);
 
     var resolution = try resolver.resolve(gpa, cfg.config_generation, parsed.entities, candidates);
     defer resolution.deinit();
@@ -210,7 +243,7 @@ pub const ProcessOutcome = struct {
     resolution_value: ?[]u8 = null,
 };
 
-const PersistenceMode = enum { immediate, deferred };
+pub const PersistenceMode = enum { immediate, deferred };
 
 /// Process a changed extraction (asset) artifact key: look up the resolver that
 /// consumes it and run the resolution stage to idempotently (re)persist the
@@ -233,11 +266,59 @@ pub fn processChangedExtraction(
     defer parsed.deinit(gpa);
 
     const cfg = resolverForArtifactKind(resolvers, parsed.source_artifact_kind, parsed.artifact_name) orelse return null;
-    return try processChangedExtractionWithConfig(gpa, cfg, store, provider, changed_key, candidate_source, embedder, .immediate);
+    return try processChangedExtractionWithConfig(gpa, resolvers, cfg, store, provider, changed_key, candidate_source, embedder, .immediate, &.{});
 }
 
-fn processChangedExtractionWithConfig(
+/// Serialized `_entities`-shaped map (local id -> {"key","table"}) built from
+/// the canonical decisions of every OTHER resolver's resolution artifact over
+/// the same source artifact. Compositional event identity composes these
+/// canonical keys, so the event resolver must see the sibling entity
+/// resolutions. `pending_overlay` exposes resolution artifacts computed
+/// earlier in the same replay batch but not yet committed, keeping a
+/// catalog-ordered entity->event pair convergent within one pass.
+fn siblingResolutionsJsonAlloc(
     gpa: std.mem.Allocator,
+    resolvers: []const ResolverConfig,
+    cfg: *const ResolverConfig,
+    store: resolver_lib.ArtifactStore,
+    parsed: ParsedSourceArtifactKey,
+    pending_overlay: []const ArtifactWrite,
+) !?[]u8 {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var map: std.json.ObjectMap = .empty;
+    for (resolvers) |*sibling| {
+        if (sibling == cfg) continue;
+        if (!resolverMatchesArtifact(sibling, parsed.source_artifact_kind, parsed.artifact_name)) continue;
+        const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(a, parsed.resolution_scope_key, sibling.resolution_artifact);
+        const raw: ?[]const u8 = overlay: {
+            var i = pending_overlay.len;
+            while (i > 0) {
+                i -= 1;
+                if (std.mem.eql(u8, pending_overlay[i].key, resolution_key)) break :overlay pending_overlay[i].value;
+            }
+            break :overlay try store.get(a, resolution_key);
+        };
+        var resolution = resolver_lib.parseResolution(gpa, raw orelse continue) catch continue;
+        defer resolution.deinit();
+        for (resolution.entities) |entity| {
+            if (entity.decision == .review) continue;
+            if (entity.doc_ref.key.len == 0) continue;
+            var ref: std.json.ObjectMap = .empty;
+            try ref.put(a, "key", .{ .string = try a.dupe(u8, entity.doc_ref.key) });
+            try ref.put(a, "table", .{ .string = try a.dupe(u8, entity.doc_ref.table) });
+            try map.put(a, try a.dupe(u8, entity.local_id), .{ .object = ref });
+        }
+    }
+    if (map.count() == 0) return null;
+    return try std.json.Stringify.valueAlloc(gpa, std.json.Value{ .object = map }, .{});
+}
+
+pub fn processChangedExtractionWithConfig(
+    gpa: std.mem.Allocator,
+    resolvers: []const ResolverConfig,
     cfg: *const ResolverConfig,
     store: resolver_lib.ArtifactStore,
     provider: ?resolver_lib.CandidateProvider,
@@ -245,15 +326,23 @@ fn processChangedExtractionWithConfig(
     candidate_source: ?CandidateSource,
     embedder: ?embedder_mod.DenseEmbedder,
     persistence: PersistenceMode,
+    pending_overlay: []const ArtifactWrite,
 ) !?ProcessOutcome {
     var parsed = (try parseSourceArtifactKeyAlloc(gpa, changed_key)) orelse return null;
     defer parsed.deinit(gpa);
     if (!resolverMatchesArtifact(cfg, parsed.source_artifact_kind, parsed.artifact_name)) return null;
 
+    const candidate_batch = if (candidate_source) |source| try source.beginBatch(gpa, &.{cfg.table}) else null;
+    defer if (candidate_batch) |batch| batch.deinit(gpa);
+    const batch_source = if (candidate_batch) |batch| batch.source else null;
+
+    const sibling_excludes = try siblingClaimedLabelsAlloc(gpa, resolvers, cfg);
+    defer freeSiblingClaimedLabels(gpa, sibling_excludes);
     var resolver = try resolver_lib.Resolver.initFromParts(
         gpa,
         cfg.table,
         cfg.key_template,
+        .{ .labels = cfg.labels, .exclude_labels = sibling_excludes, .min_confidence = cfg.min_confidence },
         cfg.type_must_match,
         cfg.scorer_json,
     );
@@ -271,7 +360,7 @@ fn processChangedExtractionWithConfig(
     const effective_provider = provider orelse blk: {
         // A cross-shard source (injected by the api layer) wins over the local
         // in-store providers when the resolver declares a candidate search mode.
-        if (candidate_source) |src| {
+        if (batch_source) |src| {
             if (candidateModeFromConfig(cfg.candidate_search)) |mode| {
                 source_provider = .{
                     .source = src,
@@ -320,11 +409,23 @@ fn processChangedExtractionWithConfig(
     }
     defer if (stage_overrides != null) override_holder.deinit();
 
+    const sibling_resolutions = try siblingResolutionsJsonAlloc(gpa, resolvers, cfg, store, parsed, pending_overlay);
+    defer if (sibling_resolutions) |raw| gpa.free(raw);
+
     const stage = resolver_lib.ResolutionStage{
         .resolver = &resolver,
         .config_generation = cfg.config_generation,
         .embedder = stage_embedder,
         .overrides = stage_overrides,
+        .sibling_resolutions_json = sibling_resolutions,
+        .doc_ref_binding = if (batch_source) |source| .{
+            .ptr = source.ptr,
+            .bind = source.vtable.bound_table orelse struct {
+                fn none(_: *anyopaque, _: []const u8) anyerror!?[]const u8 {
+                    return null;
+                }
+            }.none,
+        } else null,
     };
     if (persistence == .immediate) {
         const result = try stage.run(gpa, store, effective_provider, changed_key, resolution_key);
@@ -382,7 +483,7 @@ fn processChangedExtractionForAllResolvers(
     var processed: usize = 0;
     for (resolvers) |*cfg| {
         if (!resolverMatchesArtifact(cfg, parsed.source_artifact_kind, parsed.artifact_name)) continue;
-        const outcome = (try processChangedExtractionWithConfig(gpa, cfg, store, provider, changed_key, candidate_source, embedder, .deferred)) orelse continue;
+        const outcome = (try processChangedExtractionWithConfig(gpa, resolvers, cfg, store, provider, changed_key, candidate_source, embedder, .deferred, pending.artifact_writes.items)) orelse continue;
         processed += 1;
         switch (outcome.result) {
             .written => {
@@ -705,7 +806,13 @@ fn appendEntityCandidateWithResolved(
         .doc_ref = .{ .table = try allocator.dupe(u8, table), .key = try allocator.dupe(u8, entity_key) },
         .label = label,
         .record = .{ .fields = try fields.toOwnedSlice(allocator) },
-        .resolved_doc_ref = if (resolved_key) |rk| .{ .table = try allocator.dupe(u8, table), .key = try allocator.dupe(u8, rk) } else null,
+        .resolved_doc_ref = if (resolved_key) |rk| .{
+            .table = try allocator.dupe(u8, if (parsed.value.object.get("merged_into_table")) |target|
+                if (target == .string and target.string.len != 0) target.string else table
+            else
+                table),
+            .key = try allocator.dupe(u8, rk),
+        } else null,
         .resolved_record = resolved_record,
     });
 }
@@ -743,7 +850,132 @@ const SourceCandidateProvider = struct {
     fn provider(self: *SourceCandidateProvider) resolver_lib.CandidateProvider {
         return .{ .ptr = self, .vtable = &vtable };
     }
-    const vtable = resolver_lib.CandidateProvider.VTable{ .candidates_for = candidatesFor };
+    const vtable = resolver_lib.CandidateProvider.VTable{ .candidates_for = candidatesFor, .candidates_for_batch = candidatesForBatch };
+
+    const BatchDocuments = struct {
+        alloc: std.mem.Allocator,
+        docs: std.StringHashMapUnmanaged([]const u8) = .empty,
+        keys: std.ArrayListUnmanaged([]const u8) = .empty,
+        limit: usize = 0,
+
+        fn consume(ctx: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.limit > 0 and self.keys.items.len >= self.limit) return error.CandidateLimitReached;
+            const owned_key = try self.alloc.dupe(u8, key);
+            try self.docs.put(self.alloc, owned_key, try self.alloc.dupe(u8, value));
+            try self.keys.append(self.alloc, owned_key);
+        }
+    };
+
+    const RedirectBatch = struct {
+        requested: std.StringArrayHashMapUnmanaged(void) = .empty,
+        found: BatchDocuments,
+    };
+
+    fn collectKeys(self: *SourceCandidateProvider, collected: *BatchDocuments, keys: []const []const u8) !void {
+        if (keys.len == 0) return;
+        if (self.source.vtable.get_many) |get_many| {
+            try get_many(self.source.ptr, collected.alloc, self.table, keys, collected, BatchDocuments.consume);
+        } else {
+            for (keys) |key| if (try self.source.get(collected.alloc, self.table, key)) |raw|
+                try BatchDocuments.consume(collected, key, raw);
+        }
+    }
+
+    fn candidatesForBatch(ptr: *anyopaque, alloc: std.mem.Allocator, entities: []const resolver_lib.ExtractedEntity, lists: [][]const resolver_lib.Candidate) anyerror!void {
+        const self: *SourceCandidateProvider = @ptrCast(@alignCast(ptr));
+        if (self.mode == .ann) {
+            for (entities, lists) |entity, *list| {
+                var candidates = std.ArrayListUnmanaged(resolver_lib.Candidate).empty;
+                try candidatesFor(ptr, alloc, entity, &candidates);
+                list.* = candidates.items;
+            }
+            return;
+        }
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const keys = try a.alloc([]const u8, entities.len);
+        var unique = std.StringArrayHashMapUnmanaged(void).empty;
+        for (entities, keys) |entity, *key| {
+            const rendered = try self.resolver.renderKeyAlloc(a, entity);
+            key.* = if (self.mode == .prefix) rendered[0..if (std.mem.indexOfScalar(u8, rendered, '/')) |i| i + 1 else rendered.len] else rendered;
+            try unique.put(a, key.*, {});
+        }
+        var collected = BatchDocuments{ .alloc = a };
+        var prefixes = std.StringHashMapUnmanaged([]const []const u8).empty;
+        if (self.mode == .exact_key) {
+            try self.collectKeys(&collected, unique.keys());
+        } else {
+            collected.limit = self.candidate_limit;
+            for (unique.keys()) |prefix| {
+                collected.keys = .empty;
+                self.source.scanPrefix(a, self.table, prefix, .{ .limit = self.candidate_limit }, &collected, BatchDocuments.consume) catch |err| switch (err) {
+                    error.ScanUnsupported, error.CandidateLimitReached => {},
+                    else => return err,
+                };
+                try prefixes.put(a, prefix, collected.keys.items);
+            }
+        }
+        // Hydrate distinct one-hop redirect destinations in a second bulk pass.
+        // An absent destination stays absent for this work unit, including when
+        // many mentions or aliases point at it.
+        var redirects = std.StringArrayHashMapUnmanaged(void).empty;
+        var external_redirects = std.StringArrayHashMapUnmanaged(RedirectBatch).empty;
+        var documents = collected.docs.valueIterator();
+        while (documents.next()) |raw| {
+            if (try jsonStringFieldAlloc(a, raw.*, "merged_into")) |key| {
+                const target_table = try jsonStringFieldAlloc(a, raw.*, "merged_into_table");
+                if ((target_table == null or std.mem.eql(u8, target_table.?, self.table)) and !collected.docs.contains(key)) {
+                    try redirects.put(a, key, {});
+                } else if (target_table) |table| {
+                    if (!std.mem.eql(u8, table, self.table)) {
+                        const batch = try external_redirects.getOrPut(a, table);
+                        if (!batch.found_existing) batch.value_ptr.* = .{ .found = .{ .alloc = a } };
+                        try batch.value_ptr.requested.put(a, key, {});
+                    }
+                }
+            }
+        }
+        collected.limit = 0;
+        collected.keys = .empty;
+        try self.collectKeys(&collected, redirects.keys());
+        // Fetch each external survivor once per work unit. Grouping by table
+        // keeps cross-table redirects on the bounded bulk read path too.
+        for (external_redirects.keys(), external_redirects.values()) |table, *batch| {
+            if (self.source.vtable.get_many) |get_many| {
+                try get_many(self.source.ptr, a, table, batch.requested.keys(), &batch.found, BatchDocuments.consume);
+            } else {
+                for (batch.requested.keys()) |key| {
+                    if (try self.source.get(a, table, key)) |raw|
+                        try BatchDocuments.consume(&batch.found, key, raw);
+                }
+            }
+        }
+        var prepared = std.StringHashMapUnmanaged([]const resolver_lib.Candidate).empty;
+        for (unique.keys()) |key| {
+            var candidates = std.ArrayListUnmanaged(resolver_lib.Candidate).empty;
+            const selected: []const []const u8 = if (self.mode == .exact_key) &.{key} else prefixes.get(key).?;
+            for (selected) |candidate_key| {
+                if (collected.docs.get(candidate_key)) |raw| {
+                    const resolved_key = try jsonStringFieldAlloc(a, raw, "merged_into");
+                    const target_table = try jsonStringFieldAlloc(a, raw, "merged_into_table");
+                    const resolved_raw = if (resolved_key) |rk|
+                        if (target_table) |target|
+                            if (!std.mem.eql(u8, target, self.table)) external_redirects.get(target).?.found.docs.get(rk) else collected.docs.get(rk)
+                        else
+                            collected.docs.get(rk)
+                    else
+                        null;
+                    try appendEntityCandidateWithResolved(alloc, self.table, candidate_key, raw, resolved_key, resolved_raw, &candidates);
+                }
+            }
+            try prepared.put(a, key, candidates.items);
+        }
+        // Candidate records are immutable; repeated mentions share decoding and
+        // allocation while the scorer still evaluates each mention separately.
+        for (keys, lists) |key, *list| list.* = prepared.get(key).?;
+    }
 
     const ScanCtx = struct {
         allocator: std.mem.Allocator,
@@ -757,7 +989,9 @@ const SourceCandidateProvider = struct {
             if (self.limit > 0 and self.seen >= self.limit) return error.CandidateLimitReached;
             const resolved_key = try jsonStringFieldAlloc(self.allocator, value, "merged_into");
             defer if (resolved_key) |rk| self.allocator.free(rk);
-            const resolved_raw = if (resolved_key) |rk| try self.source.get(self.allocator, self.table, rk) else null;
+            const target_table = try jsonStringFieldAlloc(self.allocator, value, "merged_into_table");
+            defer if (target_table) |name| self.allocator.free(name);
+            const resolved_raw = if (resolved_key) |rk| try self.source.get(self.allocator, target_table orelse self.table, rk) else null;
             defer if (resolved_raw) |raw| self.allocator.free(raw);
             try appendEntityCandidateWithResolved(self.allocator, self.table, entity_key, value, resolved_key, resolved_raw, self.out);
             self.seen += 1;
@@ -779,7 +1013,9 @@ const SourceCandidateProvider = struct {
                 defer allocator.free(raw);
                 const resolved_key = try jsonStringFieldAlloc(allocator, raw, "merged_into");
                 defer if (resolved_key) |rk| allocator.free(rk);
-                const resolved_raw = if (resolved_key) |rk| try self.source.get(allocator, self.table, rk) else null;
+                const target_table = try jsonStringFieldAlloc(allocator, raw, "merged_into_table");
+                defer if (target_table) |name| allocator.free(name);
+                const resolved_raw = if (resolved_key) |rk| try self.source.get(allocator, target_table orelse self.table, rk) else null;
                 defer if (resolved_raw) |rv| allocator.free(rv);
                 try appendEntityCandidateWithResolved(allocator, self.table, key, raw, resolved_key, resolved_raw, out);
             },
@@ -845,7 +1081,12 @@ const ExactKeyCandidateProvider = struct {
         defer allocator.free(raw);
         const resolved_key = try jsonStringFieldAlloc(allocator, raw, "merged_into");
         defer if (resolved_key) |rk| allocator.free(rk);
-        const resolved_raw = if (resolved_key) |rk| try entityRawFromStore(allocator, self.store, rk) else null;
+        const target_table = try jsonStringFieldAlloc(allocator, raw, "merged_into_table");
+        defer if (target_table) |name| allocator.free(name);
+        const resolved_raw = if (resolved_key) |rk|
+            if (target_table == null or std.mem.eql(u8, target_table.?, self.table)) try entityRawFromStore(allocator, self.store, rk) else null
+        else
+            null;
         defer if (resolved_raw) |rv| allocator.free(rv);
         try appendEntityCandidateWithResolved(allocator, self.table, key, raw, resolved_key, resolved_raw, out);
     }
@@ -883,7 +1124,12 @@ const PrefixCandidateProvider = struct {
             defer self.allocator.free(logical_value);
             const resolved_key = try jsonStringFieldAlloc(self.allocator, logical_value, "merged_into");
             defer if (resolved_key) |rk| self.allocator.free(rk);
-            const resolved_raw = if (resolved_key) |rk| try entityRawFromStore(self.allocator, self.store, rk) else null;
+            const target_table = try jsonStringFieldAlloc(self.allocator, logical_value, "merged_into_table");
+            defer if (target_table) |name| self.allocator.free(name);
+            const resolved_raw = if (resolved_key) |rk|
+                if (target_table == null or std.mem.eql(u8, target_table.?, self.table)) try entityRawFromStore(self.allocator, self.store, rk) else null
+            else
+                null;
             defer if (resolved_raw) |rv| self.allocator.free(rv);
             try appendEntityCandidateWithResolved(self.allocator, self.table, entity_key, logical_value, resolved_key, resolved_raw, self.out);
             self.seen += 1;
@@ -950,6 +1196,56 @@ pub fn processRecordKeys(
         _ = try processChangedExtractionForAllResolvers(gpa, resolvers, store, provider, key, candidate_source, embedder, &pending);
     }
 
+    // A changed RESOLUTION artifact re-drives its source extraction for every
+    // consuming resolver: compositional event identity composes sibling
+    // canonical keys (see siblingResolutionsJsonAlloc), so the event resolver
+    // must recompute once the entity resolution lands or merges. The chain
+    // terminates because recomputing the writer itself yields identical bytes
+    // with a proven handoff (`.unchanged`), which emits no resolution-hinted
+    // record.
+    var redrive_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (redrive_keys.items) |key| gpa.free(key);
+        redrive_keys.deinit(gpa);
+    }
+    for (changed_artifact_keys) |key| {
+        const source_key = (try sourceExtractionKeyForResolutionKeyAlloc(gpa, resolvers, key)) orelse continue;
+        // Only a LIVE resolution artifact re-drives. A deleted one is
+        // resolver retirement: recomputing would resurrect the artifacts the
+        // retirement fence just deleted and spin the catalog-removal gate on
+        // WriterLocked forever.
+        const live = blk: {
+            const bytes = (try store.get(gpa, key)) orelse break :blk false;
+            gpa.free(bytes);
+            break :blk true;
+        };
+        if (!live) {
+            gpa.free(source_key);
+            continue;
+        }
+        var duplicate = false;
+        for (changed_artifact_keys) |other| {
+            if (std.mem.eql(u8, other, source_key)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) for (redrive_keys.items) |other| {
+            if (std.mem.eql(u8, other, source_key)) {
+                duplicate = true;
+                break;
+            }
+        };
+        if (duplicate) {
+            gpa.free(source_key);
+            continue;
+        }
+        try redrive_keys.append(gpa, source_key);
+    }
+    for (redrive_keys.items) |key| {
+        _ = try processChangedExtractionForAllResolvers(gpa, resolvers, store, provider, key, candidate_source, embedder, &pending);
+    }
+
     if (pending.full_keys.items.len > 0) {
         _ = try write_fn(write_ctx, .{
             .batch = .{ .changed_artifact_keys = pending.full_keys.items },
@@ -964,6 +1260,30 @@ pub fn processRecordKeys(
             .target_hints = &.{.graph},
         });
     }
+}
+
+/// Map a changed resolution-artifact key back to the source extraction
+/// artifact it was resolved from, or null when the key is not a resolution
+/// artifact of any configured resolver. A chunk- or unit-scoped resolution
+/// embeds the full source artifact key as its scope; a document-scoped one
+/// rebuilds the asset key from the owning resolver's source artifact name.
+pub fn sourceExtractionKeyForResolutionKeyAlloc(
+    gpa: std.mem.Allocator,
+    resolvers: []const ResolverConfig,
+    changed_key: []const u8,
+) !?[]u8 {
+    const parsed = (try internal_keys.parseResolutionArtifactKeyAlloc(gpa, changed_key)) orelse return null;
+    defer {
+        gpa.free(parsed.doc_key);
+        gpa.free(parsed.artifact_name);
+    }
+    const cfg = resolverForResolutionArtifact(resolvers, parsed.artifact_name) orelse return null;
+    if (try parseSourceArtifactKeyAlloc(gpa, parsed.doc_key)) |scoped| {
+        var owned = scoped;
+        owned.deinit(gpa);
+        return try gpa.dupe(u8, parsed.doc_key);
+    }
+    return try internal_keys.artifactNamedPrefixAlloc(gpa, parsed.doc_key, "asset", cfg.source_artifact);
 }
 
 pub const ReresolveEnqueueResult = struct {
@@ -1420,6 +1740,14 @@ pub fn listPendingReviews(
 
 pub const default_max_records_per_window: usize = 1024;
 
+/// Optional ordered owner writer. False means no ordered producer authority
+/// exists and the native legacy path remains applicable. True means every
+/// required output has a durable local receipt, never merely queue admission.
+pub const OrderedWriter = struct {
+    ptr: *anyopaque,
+    process: *const fn (*anyopaque, Allocator, []const ResolverConfig, resolver_lib.ArtifactStore, ?resolver_lib.CandidateProvider, []const []const u8, ?CandidateSource, ?embedder_mod.DenseEmbedder) anyerror!bool,
+};
+
 /// Iterate replay records matching the resolution hint from `from_sequence`,
 /// resolve each record's changed extraction artifacts, and journal the
 /// resolution writes via `write_fn`. Returns the highest sequence processed, or
@@ -1438,6 +1766,23 @@ pub fn catchUpWindow(
     candidate_source: ?CandidateSource,
     embedder: ?embedder_mod.DenseEmbedder,
 ) !u64 {
+    return catchUpWindowWithOrdered(gpa, replay_source, resolvers, store, provider, from_sequence, max_records, write_ctx, write_fn, candidate_source, embedder, null);
+}
+
+fn catchUpWindowWithOrdered(
+    gpa: Allocator,
+    replay_source: replay_source_mod.Source,
+    resolvers: []const ResolverConfig,
+    store: resolver_lib.ArtifactStore,
+    provider: ?resolver_lib.CandidateProvider,
+    from_sequence: u64,
+    max_records: usize,
+    write_ctx: *anyopaque,
+    write_fn: DerivedRecordWriter,
+    candidate_source: ?CandidateSource,
+    embedder: ?embedder_mod.DenseEmbedder,
+    ordered: ?OrderedWriter,
+) !u64 {
     const Ctx = struct {
         gpa: Allocator,
         resolvers: []const ResolverConfig,
@@ -1447,6 +1792,7 @@ pub fn catchUpWindow(
         write_fn: DerivedRecordWriter,
         candidate_source: ?CandidateSource,
         embedder: ?embedder_mod.DenseEmbedder,
+        ordered: ?OrderedWriter,
         seen_sequences: *std.AutoHashMapUnmanaged(u64, void),
         max_seen: u64,
 
@@ -1456,6 +1802,12 @@ pub fn catchUpWindow(
             if (seen.found_existing) return;
             var decoded = try change_journal_mod.decodeRecord(self.gpa, payload);
             defer decoded.deinit();
+            if (self.ordered) |writer| {
+                if (try writer.process(writer.ptr, self.gpa, self.resolvers, self.store, self.provider, decoded.record.changed_artifact_keys, self.candidate_source, self.embedder)) {
+                    self.max_seen = @max(self.max_seen, sequence);
+                    return;
+                }
+            }
             try processRecordKeys(
                 self.gpa,
                 self.resolvers,
@@ -1480,6 +1832,7 @@ pub fn catchUpWindow(
         .write_fn = write_fn,
         .candidate_source = candidate_source,
         .embedder = embedder,
+        .ordered = ordered,
         .seen_sequences = undefined,
         // from_sequence is exclusive; with no records, return it unchanged.
         .max_seen = from_sequence,
@@ -1574,6 +1927,7 @@ pub const ResolutionRuntime = struct {
     index_manager: *index_manager_mod.IndexManager,
     write_ctx: *anyopaque,
     write_fn: DerivedRecordWriter,
+    ordered_writer: ?OrderedWriter = null,
     io: ?Io,
     /// Optional cross-shard candidate source injected by the api/serving layer;
     /// null means local-only blocking (the worker's own store). Must outlive the
@@ -1582,8 +1936,8 @@ pub const ResolutionRuntime = struct {
     /// Optional name embedder, injected by the db from the enrichment config;
     /// used to backfill mention name embeddings for cosine/ann blocking.
     embedder: ?embedder_mod.DenseEmbedder,
-    applied_sequence: std.atomic.Value(u64),
-    target_sequence: std.atomic.Value(u64),
+    applied_sequence: @import("antfly_platform").atomic.Value(u64),
+    target_sequence: @import("antfly_platform").atomic.Value(u64),
     shutdown_flag: std.atomic.Value(bool),
     catch_up_mutex: std.atomic.Mutex = .unlocked,
     /// The catalog transaction owns durability; this flag is only a wake hint.
@@ -1610,6 +1964,9 @@ pub const ResolutionRuntime = struct {
         var store_handle = try initRuntimeStore(alloc, store);
         errdefer store_handle.deinit();
         const applied = try enrichment_state.loadAppliedSequence(alloc, store_handle.store, scope_name);
+        // Notifications are volatile. Recover durable work even when the
+        // graph has caught up and no new write will wake this reopened owner.
+        const target = @max(applied, try replay_source.latestMatchingSequence(alloc, applied, .resolution));
         return .{
             .alloc = alloc,
             .store_handle = store_handle,
@@ -1622,7 +1979,7 @@ pub const ResolutionRuntime = struct {
             .candidate_source = candidate_source,
             .embedder = embedder,
             .applied_sequence = .init(applied),
-            .target_sequence = .init(applied),
+            .target_sequence = .init(target),
             .shutdown_flag = .init(false),
             .backfill_pending = .init((try hasReresolveCursor(&store_handle.store, resolver_catalog.reresolve_resume_key)) or
                 (try hasReresolveCursor(&store_handle.store, resolver_catalog.reresolve_repair_resume_key))),
@@ -1758,7 +2115,7 @@ pub const ResolutionRuntime = struct {
                 .store = &self.store_handle.store,
                 .index_manager = self.index_manager,
             };
-            const max_seen = try catchUpWindow(
+            const max_seen = try catchUpWindowWithOrdered(
                 self.alloc,
                 self.replay_source,
                 resolvers,
@@ -1772,6 +2129,7 @@ pub const ResolutionRuntime = struct {
                 self.write_fn,
                 self.candidate_source,
                 self.embedder,
+                self.ordered_writer,
             );
             if (max_seen <= applied) {
                 // No matching records in (applied, target]; advance to target.
@@ -2716,6 +3074,82 @@ test "processRecordKeys fans one source artifact out to all consuming resolvers"
     try testing.expectEqual(@as(u64, 1), writer.handoff_calls);
 }
 
+test "changed sibling resolution re-drives event identity onto canonical participant keys" {
+    const alloc = testing.allocator;
+    // Events resolver FIRST so the initial pass computes event identity
+    // before the entity resolution exists (raw mention slug), proving the
+    // re-drive — not catalog order — converges it onto the canonical key.
+    // The static entity key template stands in for a matcher-scorer merge:
+    // the canonical key's segment differs from the raw slug.
+    const resolvers = [_]ResolverConfig{
+        .{
+            .name = "events",
+            .table = "events",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "events_resolution_v1",
+            .key_template = "event/{{ hash _entity.event_identity }}",
+            .labels = &.{"event"},
+            .config_generation = 1,
+        },
+        .{
+            .name = "entities",
+            .table = "entities",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "entities_resolution_v1",
+            .key_template = "entity/merged_survivor",
+            .config_generation = 1,
+        },
+    };
+    const extraction =
+        \\{
+        \\  "entities": [
+        \\    {"id": "e0", "label": "person", "text": "A. Lovelace"},
+        \\    {"id": "v0", "label": "event", "text": "A. Lovelace spoke.", "predicate": "speak"}
+        \\  ],
+        \\  "relations": [{"type": "participates_in", "source": "e0", "target": "v0"}]
+        \\}
+    ;
+
+    var fake = FakeStore{ .alloc = alloc };
+    defer fake.deinit();
+    var das = DbArtifactStore(FakeStore){ .store = &fake };
+    const store = das.artifactStore();
+
+    const extraction_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:merge", "asset", "relations_v1");
+    defer alloc.free(extraction_key);
+    try store.put(extraction_key, extraction);
+
+    var writer = CaptureWriter{ .alloc = alloc, .store = store };
+    defer writer.deinit();
+
+    const changed = [_][]const u8{extraction_key};
+    try processRecordKeys(alloc, &resolvers, store, null, &changed, &writer, CaptureWriter.writeFn, null, null);
+    try testing.expectEqual(@as(u64, 1), writer.handoff_calls);
+
+    const events_resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:merge", "events_resolution_v1");
+    defer alloc.free(events_resolution_key);
+    const entities_resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:merge", "entities_resolution_v1");
+    defer alloc.free(entities_resolution_key);
+    const provisional = (try store.get(alloc, events_resolution_key)).?;
+    defer alloc.free(provisional);
+
+    // The committed entity resolution re-drives the source: the event
+    // resolution is rewritten with the canonical-key identity while the
+    // entity recompute is byte-stable (graph-only reconciliation).
+    const resolution_changed = [_][]const u8{entities_resolution_key};
+    try processRecordKeys(alloc, &resolvers, store, null, &resolution_changed, &writer, CaptureWriter.writeFn, null, null);
+    try testing.expectEqual(@as(u64, 2), writer.handoff_calls);
+    const canonical = (try store.get(alloc, events_resolution_key)).?;
+    defer alloc.free(canonical);
+    try testing.expect(!std.mem.eql(u8, provisional, canonical));
+
+    // The fan-back terminates: re-driving from the event resolution finds
+    // every recompute byte-stable and commits nothing new.
+    const settled = [_][]const u8{events_resolution_key};
+    try processRecordKeys(alloc, &resolvers, store, null, &settled, &writer, CaptureWriter.writeFn, null, null);
+    try testing.expectEqual(@as(u64, 2), writer.handoff_calls);
+}
+
 /// Minimal replay Source for tests: replays a fixed list of encoded records.
 const FakeSource = struct {
     const Rec = struct { sequence: u64, payload: []const u8 };
@@ -3603,6 +4037,112 @@ const FakeCandidateSource = struct {
     }
 };
 
+test "SourceCandidateProvider bulk exact keys retain duplicates missing candidates and merge destinations" {
+    const alloc = testing.allocator;
+    const Bulk = struct {
+        calls: usize = 0,
+        gets: usize = 0,
+        fn get(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, key: []const u8) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.gets += 1;
+            try testing.expectEqualStrings("person/canonical", key);
+            return try a.dupe(u8, "{\"canonical_name\":\"Canonical\",\"label\":\"person\"}");
+        }
+        fn getMany(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, keys: []const []const u8, ctx: *anyopaque, consume: CandidateSource.Consume) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls == 1) {
+                try testing.expectEqual(@as(usize, 2), keys.len);
+                try consume(ctx, "person/ada", "{\"canonical_name\":\"Ada\",\"label\":\"person\",\"merged_into\":\"person/canonical\"}");
+            } else {
+                try testing.expectEqual(@as(usize, 1), keys.len);
+                try testing.expectEqualStrings("person/canonical", keys[0]);
+                try consume(ctx, keys[0], "{\"canonical_name\":\"Canonical\",\"label\":\"person\"}");
+            }
+        }
+    };
+    var fake: Bulk = .{};
+    var resolver = try resolver_lib.Resolver.initFromParts(alloc, "entities", "{{ lower _entity.label }}/{{ slug _entity.text }}", .{}, false, "");
+    defer resolver.deinit();
+    var provider = SourceCandidateProvider{
+        .source = .{ .ptr = &fake, .vtable = &.{ .get = Bulk.get, .get_many = Bulk.getMany } },
+        .resolver = &resolver,
+        .table = "entities",
+        .mode = .exact_key,
+        .ann_index_name = "",
+        .candidate_limit = 25,
+    };
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const entities = [_]resolver_lib.ExtractedEntity{
+        .{ .local_id = "one", .label = "person", .text = "Ada" },
+        .{ .local_id = "two", .label = "person", .text = "Missing" },
+        .{ .local_id = "three", .label = "person", .text = "Ada" },
+    };
+    var lists: [3][]const resolver_lib.Candidate = undefined;
+    try provider.provider().candidatesForBatch(arena.allocator(), &entities, &lists);
+    try testing.expectEqual(@as(usize, 2), fake.calls);
+    try testing.expectEqual(@as(usize, 0), fake.gets);
+    try testing.expectEqual(@as(usize, 0), lists[1].len);
+    for ([_]usize{ 0, 2 }) |i| {
+        try testing.expectEqual(@as(usize, 1), lists[i].len);
+        try testing.expectEqualStrings("person/ada", lists[i][0].doc_ref.key);
+        try testing.expectEqualStrings("person/canonical", lists[i][0].resolved_doc_ref.?.key);
+    }
+}
+
+test "SourceCandidateProvider follows a redirect into another logical table" {
+    const alloc = testing.allocator;
+    const Source = struct {
+        people_reads: usize = 0,
+        curated_reads: usize = 0,
+        fn get(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!?[]u8 {
+            return error.UnexpectedSingleCandidateRead;
+        }
+        fn getMany(ptr: *anyopaque, _: std.mem.Allocator, table: []const u8, keys: []const []const u8, ctx: *anyopaque, consume: CandidateSource.Consume) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (std.mem.eql(u8, table, "people")) {
+                self.people_reads += 1;
+                try testing.expectEqual(@as(usize, 2), keys.len);
+                for (keys) |key| try consume(ctx, key, "{\"canonical_name\":\"Ada\",\"entity_type\":\"person\",\"merged_into\":\"person/ada\",\"merged_into_table\":\"curated\"}");
+            } else {
+                try testing.expectEqualStrings("curated", table);
+                self.curated_reads += 1;
+                try testing.expectEqual(@as(usize, 1), keys.len);
+                try testing.expectEqualStrings("person/ada", keys[0]);
+                try consume(ctx, keys[0], "{\"canonical_name\":\"Ada\",\"entity_type\":\"person\"}");
+            }
+        }
+    };
+    var source: Source = .{};
+    var resolver = try resolver_lib.Resolver.initFromParts(alloc, "people", "{{ lower _entity.label }}/{{ slug _entity.text }}", .{}, false, "");
+    defer resolver.deinit();
+    var provider = SourceCandidateProvider{
+        .source = .{ .ptr = &source, .vtable = &.{ .get = Source.get, .get_many = Source.getMany } },
+        .resolver = &resolver,
+        .table = "people",
+        .mode = .exact_key,
+        .ann_index_name = "",
+        .candidate_limit = 25,
+    };
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const entities = [_]resolver_lib.ExtractedEntity{
+        .{ .local_id = "e0", .label = "person", .text = "Ada" },
+        .{ .local_id = "e1", .label = "person", .text = "Ada Lovelace" },
+    };
+    var lists: [2][]const resolver_lib.Candidate = undefined;
+    try provider.provider().candidatesForBatch(arena.allocator(), &entities, &lists);
+    try testing.expectEqual(@as(usize, 1), source.people_reads);
+    try testing.expectEqual(@as(usize, 1), source.curated_reads);
+    for (lists) |list| {
+        try testing.expectEqual(@as(usize, 1), list.len);
+        try testing.expectEqualStrings("curated", list[0].resolved_doc_ref.?.table);
+        try testing.expectEqualStrings("person/ada", list[0].resolved_doc_ref.?.key);
+        try testing.expect(list[0].resolved_record != null);
+    }
+}
+
 test "SourceCandidateProvider links via an injected cross-shard exact_key source" {
     const alloc = testing.allocator;
     const resolvers = [_]ResolverConfig{.{
@@ -3758,4 +4298,46 @@ test "SourceCandidateProvider ann blocking links via cross-shard nearest neighbo
     // Linked by vector similarity across the shard boundary despite differing text.
     try testing.expectEqualStrings("match", ent.get("decision").?.string);
     try testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+}
+
+test "SourceCandidateProvider shares prefix scans and negatively caches redirect destinations across mentions" {
+    const alloc = testing.allocator;
+    const Fake = struct {
+        scans: usize = 0,
+        bulk_reads: usize = 0,
+        fn get(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!?[]u8 {
+            return error.UnexpectedPointRead;
+        }
+        fn scan(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, prefix: []const u8, opts: CandidateSource.ScanOptions, ctx: *anyopaque, consume: CandidateSource.Consume) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.scans += 1;
+            try testing.expectEqualStrings("person/", prefix);
+            try testing.expectEqual(@as(usize, 2), opts.limit);
+            try consume(ctx, "person/ada", "{\"canonical_name\":\"Ada\",\"label\":\"person\",\"merged_into\":\"person/missing\"}");
+            try consume(ctx, "person/grace", "{\"canonical_name\":\"Grace\",\"label\":\"person\",\"merged_into\":\"person/missing\"}");
+            // The provider enforces the limit even if a custom source does not.
+            try consume(ctx, "person/ignored", "{}");
+        }
+        fn getMany(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, keys: []const []const u8, _: *anyopaque, _: CandidateSource.Consume) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.bulk_reads += 1;
+            try testing.expectEqual(@as(usize, 1), keys.len);
+            try testing.expectEqualStrings("person/missing", keys[0]);
+        }
+    };
+    var fake = Fake{};
+    var resolver = try resolver_lib.Resolver.initFromParts(alloc, "entities", "{{ lower _entity.label }}/{{ slug _entity.text }}", .{}, false, "");
+    defer resolver.deinit();
+    var provider = SourceCandidateProvider{ .source = .{ .ptr = &fake, .vtable = &.{ .get = Fake.get, .get_many = Fake.getMany, .scan_prefix = Fake.scan } }, .resolver = &resolver, .table = "entities", .mode = .prefix, .ann_index_name = "", .candidate_limit = 2 };
+    const entities = [_]resolver_lib.ExtractedEntity{.{ .local_id = "one", .label = "person", .text = "Ada" }} ** 100;
+    var lists: [100][]const resolver_lib.Candidate = undefined;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    try provider.provider().candidatesForBatch(arena.allocator(), &entities, &lists);
+    try testing.expectEqual(@as(usize, 1), fake.scans);
+    try testing.expectEqual(@as(usize, 1), fake.bulk_reads);
+    for (lists) |list| {
+        try testing.expectEqual(@as(usize, 2), list.len);
+        for (list) |candidate| try testing.expect(candidate.resolved_record == null);
+    }
 }

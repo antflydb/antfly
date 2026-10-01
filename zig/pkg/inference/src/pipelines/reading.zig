@@ -253,19 +253,15 @@ pub const ReadingPipeline = struct {
                 logReadBatchMode("serial", image_datas, "configured_batch_size_one");
                 return .{ .results = try self.readBatchSerial(image_datas), .mode = .serial };
             }
-            const results = self.readBatchNativeFlorenceChunked(image_datas) catch |err| switch (err) {
-                error.UnsupportedShape,
-                error.UnsupportedOperation,
-                error.UnsupportedFlorence2ResidentMetal,
-                => {
-                    logReadBatchMode("serial_fallback", image_datas, @errorName(err));
-                    return .{
-                        .results = try self.readBatchSerial(image_datas),
-                        .mode = .fallback,
-                        .fallback_reason = @errorName(err),
-                    };
-                },
-                else => return err,
+            const backend = self.vision_encoder.backend();
+            const results = self.readBatchNativeFlorenceChunked(image_datas) catch |err| {
+                if (!shouldFallbackFlorenceBatchToSerial(backend, err)) return err;
+                logReadBatchMode("serial_fallback", image_datas, @errorName(err));
+                return .{
+                    .results = try self.readBatchSerial(image_datas),
+                    .mode = .fallback,
+                    .fallback_reason = @errorName(err),
+                };
             };
             return .{
                 .results = results,
@@ -322,19 +318,15 @@ pub const ReadingPipeline = struct {
                 .mode = .serial,
             };
         }
-        const results = self.readBorrowedRasterBatchNativeChunked(rasters) catch |err| switch (err) {
-            error.UnsupportedShape,
-            error.UnsupportedOperation,
-            error.UnsupportedFlorence2ResidentMetal,
-            => {
-                logBorrowedRasterBatchMode("serial_fallback", rasters, @errorName(err));
-                return .{
-                    .results = try self.readBorrowedRasterSerial(rasters),
-                    .mode = .fallback,
-                    .fallback_reason = @errorName(err),
-                };
-            },
-            else => return err,
+        const backend = self.vision_encoder.backend();
+        const results = self.readBorrowedRasterBatchNativeChunked(rasters) catch |err| {
+            if (!shouldFallbackFlorenceBatchToSerial(backend, err)) return err;
+            logBorrowedRasterBatchMode("serial_fallback", rasters, @errorName(err));
+            return .{
+                .results = try self.readBorrowedRasterSerial(rasters),
+                .mode = .fallback,
+                .fallback_reason = @errorName(err),
+            };
         };
         return .{
             .results = results,
@@ -596,13 +588,13 @@ pub const ReadingPipeline = struct {
 
         const decode_start = nowNs();
         const backend = self.vision_encoder.backend();
-        if ((backend == .cuda or backend == .metal) and !florenceKvCacheDisabled()) {
+        if ((backend == .native or backend == .cuda or backend == .metal) and !florenceKvCacheDisabled()) {
             last_read_telemetry.resident_decoder = true;
             last_read_telemetry.kv_cache = true;
             last_read_telemetry.cuda_graph_replay = false;
             last_read_telemetry.cuda_graph_fallback_reason = "batched_florence_kv_decode";
             const kv_result = self.decodeNativeFlorenceBatchIncrementalFromEncoder(cb, florence_cfg, encoder.hidden, batch, encoder.seq_len) catch |err| fallback: {
-                if (!shouldFallbackFlorenceIncremental(err)) return err;
+                if (!shouldFallbackFlorenceIncremental(backend, err)) return err;
                 markFlorenceIncrementalFallback();
                 break :fallback null;
             };
@@ -1230,7 +1222,7 @@ pub const ReadingPipeline = struct {
 
     fn readPixelValuesFlorenceResident(self: *ReadingPipeline, pixel_values: []const f32) !?ReadResult {
         const backend = self.vision_encoder.backend();
-        if (backend != .metal and backend != .cuda) return null;
+        if (backend != .native and backend != .metal and backend != .cuda) return null;
         if (self.vision_encoder.vtable != self.decoder.vtable or self.vision_encoder.ptr != self.decoder.ptr) return null;
 
         const florence_cfg = session_factory.getFlorenceConfig(self.vision_encoder) orelse return null;
@@ -1287,10 +1279,10 @@ pub const ReadingPipeline = struct {
             }
         }
 
-        // Incremental KV-cache decode is default-on for both device backends;
-        // ANTFLY_INFERENCE_FLORENCE_DISABLE_KV_CACHE is the kill switch.
-        const kv_cache_backend_ok = backend == .cuda or backend == .metal;
-        if (kv_cache_backend_ok and !florenceKvCacheDisabled()) {
+        // Incremental KV-cache decode is default-on for every native Florence
+        // compute backend; ANTFLY_INFERENCE_FLORENCE_DISABLE_KV_CACHE is the
+        // explicit full-prefix kill switch.
+        if (!florenceKvCacheDisabled()) {
             last_read_telemetry.kv_cache = true;
             last_read_telemetry.cuda_graph_replay = false;
             last_read_telemetry.cuda_graph_fallback_reason = if (florenceCudaGraphEnabled()) null else "florence_graph_disabled";
@@ -1303,7 +1295,7 @@ pub const ReadingPipeline = struct {
                 dec_ids,
                 dec_len,
             ) catch |err| fallback: {
-                if (!shouldFallbackFlorenceIncremental(err)) return err;
+                if (!shouldFallbackFlorenceIncremental(backend, err)) return err;
                 markFlorenceIncrementalFallback();
                 break :fallback null;
             };
@@ -1785,7 +1777,19 @@ pub fn nativeFlorenceReadBatchSize() usize {
     return reader_config.nativeBatchSize(platform.env.getenvUsize("ANTFLY_INFERENCE_READ_BATCH_SIZE"));
 }
 
-fn shouldFallbackFlorenceIncremental(err: anyerror) bool {
+fn shouldFallbackFlorenceBatchToSerial(backend: backends.BackendType, err: anyerror) bool {
+    return switch (err) {
+        error.UnsupportedOperation, error.UnsupportedShape => backend != .native,
+        error.UnsupportedFlorence2ResidentMetal => backend == .metal,
+        else => false,
+    };
+}
+
+fn shouldFallbackFlorenceIncremental(backend: backends.BackendType, err: anyerror) bool {
+    // Native CPU implements the portable incremental path. Do not conceal a
+    // missing CPU primitive or cache-shape bug behind quadratic full-prefix
+    // decoding; those failures must remain explicit.
+    if (backend == .native) return false;
     return switch (err) {
         error.InvalidInputShape, error.UnsupportedOperation, error.UnsupportedShape => true,
         else => false,
@@ -2347,8 +2351,8 @@ fn selectGreedyToken(logits: []const f32, prefix: []const i64, no_repeat_ngram_s
     var best_val: f32 = -std.math.inf(f32);
 
     for (0..logits.len) |i| {
-        if (no_repeat_ngram_size > 0 and wouldRepeatNgram(prefix, @intCast(i), no_repeat_ngram_size)) continue;
         if (logits[i] > best_val) {
+            if (no_repeat_ngram_size > 0 and wouldRepeatNgram(prefix, @intCast(i), no_repeat_ngram_size)) continue;
             best_val = logits[i];
             best_id = i;
         }
@@ -2573,11 +2577,18 @@ test "buildNoRepeatSuppressTokens deduplicates continuations" {
     try std.testing.expectEqualSlices(i32, &.{9}, suppress_tokens);
 }
 
-test "Florence incremental decode falls back only for unsupported paths" {
-    try std.testing.expect(shouldFallbackFlorenceIncremental(error.InvalidInputShape));
-    try std.testing.expect(shouldFallbackFlorenceIncremental(error.UnsupportedOperation));
-    try std.testing.expect(shouldFallbackFlorenceIncremental(error.UnsupportedShape));
-    try std.testing.expect(!shouldFallbackFlorenceIncremental(error.OutOfMemory));
+test "Florence fallback policy exposes unsupported native CPU paths" {
+    try std.testing.expect(!shouldFallbackFlorenceBatchToSerial(.native, error.InvalidInputShape));
+    try std.testing.expect(!shouldFallbackFlorenceBatchToSerial(.native, error.UnsupportedOperation));
+    try std.testing.expect(!shouldFallbackFlorenceBatchToSerial(.native, error.UnsupportedShape));
+    try std.testing.expect(shouldFallbackFlorenceBatchToSerial(.metal, error.UnsupportedShape));
+    try std.testing.expect(shouldFallbackFlorenceBatchToSerial(.metal, error.UnsupportedFlorence2ResidentMetal));
+    try std.testing.expect(shouldFallbackFlorenceIncremental(.metal, error.InvalidInputShape));
+    try std.testing.expect(shouldFallbackFlorenceIncremental(.cuda, error.UnsupportedOperation));
+    try std.testing.expect(shouldFallbackFlorenceIncremental(.metal, error.UnsupportedShape));
+    try std.testing.expect(!shouldFallbackFlorenceIncremental(.native, error.UnsupportedOperation));
+    try std.testing.expect(!shouldFallbackFlorenceIncremental(.native, error.UnsupportedShape));
+    try std.testing.expect(!shouldFallbackFlorenceIncremental(.cuda, error.OutOfMemory));
 
     last_read_telemetry = .{
         .resident_decoder = true,

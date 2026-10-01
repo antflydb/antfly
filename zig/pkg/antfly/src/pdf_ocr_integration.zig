@@ -32,7 +32,7 @@ pub fn main(init: std.process.Init) !void {
         return try runRealModelQualification(alloc, &client);
     }
 
-    const LocalFlorenceBoundary = struct {
+    const LocalReaderBoundary = struct {
         read_calls: usize = 0,
         generator_calls: usize = 0,
         embed_calls: usize = 0,
@@ -150,13 +150,13 @@ pub fn main(init: std.process.Init) !void {
         ) ![]readers.Result {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.read_calls += 1;
-            if (!std.mem.eql(u8, model, "florence2-integration"))
+            if (!std.mem.eql(u8, model, "multistage-integration"))
                 return error.InvalidIntegrationReaderModel;
             if (request.images.len == 0 or request.images.len > 8 or request.prompt == null or
                 !std.mem.eql(u8, request.prompt.?, "<OCR>"))
                 return error.InvalidIntegrationReaderBatch;
             for (request.images) |image| {
-                if (!std.mem.eql(u8, image.mime_type, "image/png") or image.bytes.len < 8 or
+                if (!std.mem.eql(u8, image.mime_type, "image/png") or image.bytes.len < 24 or
                     !std.mem.eql(u8, image.bytes[0..8], &.{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' }))
                     return error.InvalidIntegrationReaderImage;
             }
@@ -167,10 +167,44 @@ pub fn main(init: std.process.Init) !void {
                 result_alloc.free(results);
             }
             for (request.images, results) |image, *result| {
+                const width = (@as(u32, image.bytes[16]) << 24) |
+                    (@as(u32, image.bytes[17]) << 16) |
+                    (@as(u32, image.bytes[18]) << 8) |
+                    image.bytes[19];
+                const height = (@as(u32, image.bytes[20]) << 24) |
+                    (@as(u32, image.bytes[21]) << 16) |
+                    (@as(u32, image.bytes[22]) << 8) |
+                    image.bytes[23];
+                if (width < 20 or height < 20) return error.InvalidIntegrationReaderImage;
+                const text = try result_alloc.dupe(
+                    u8,
+                    "First line: native document reading.\nSecond line: invoice total 123.45.",
+                );
+                errdefer result_alloc.free(text);
+                const regions_json = try std.fmt.allocPrint(
+                    result_alloc,
+                    "[{{\"text\":\"First line: native document reading.\",\"bbox\":[{d},{d},{d},{d}],\"coordinate_space\":\"image_pixels_top_left\"}},{{\"text\":\"Second line: invoice total 123.45.\",\"bbox\":[{d},{d},{d},{d}],\"coordinate_space\":\"image_pixels_top_left\"}}]",
+                    .{
+                        width / 20,
+                        height / 10,
+                        width - width / 20,
+                        height / 5 * 2,
+                        width / 20,
+                        height - height / 5 * 2,
+                        width - width / 20,
+                        height - height / 10,
+                    },
+                );
+                errdefer result_alloc.free(regions_json);
+                const item_id = if (image.item_id.len > 0) try result_alloc.dupe(u8, image.item_id) else "";
+                errdefer if (item_id.len > 0) result_alloc.free(@constCast(item_id));
+                const source_fingerprint = if (image.source_fingerprint) |value| try result_alloc.dupe(u8, value) else null;
+                errdefer if (source_fingerprint) |value| result_alloc.free(value);
                 result.* = .{
-                    .text = try result_alloc.dupe(u8, "page OCR"),
-                    .item_id = if (image.item_id.len > 0) try result_alloc.dupe(u8, image.item_id) else "",
-                    .source_fingerprint = if (image.source_fingerprint) |value| try result_alloc.dupe(u8, value) else null,
+                    .text = text,
+                    .regions_json = regions_json,
+                    .item_id = item_id,
+                    .source_fingerprint = source_fingerprint,
                     .page_number = image.page_number,
                 };
                 initialized += 1;
@@ -206,7 +240,7 @@ pub fn main(init: std.process.Init) !void {
         }
     };
 
-    var local = LocalFlorenceBoundary{};
+    var local = LocalReaderBoundary{};
     var runtime = asset_producer_runtime.Runtime.initWithOptions(
         alloc,
         &client,
@@ -246,7 +280,7 @@ pub fn main(init: std.process.Init) !void {
         mixed_reader_media[i][0] = .{ .bytes = png.png, .mime_type = "image/png" };
         request.* = .{
             .producer_type = .reader,
-            .config_json = "{\"provider\":\"antfly\",\"model\":\"florence2-integration\"}",
+            .config_json = "{\"provider\":\"antfly\",\"model\":\"multistage-integration\"}",
             .source_text = "",
             .source_parts_json = "[{\"type\":\"text\",\"text\":\"<OCR>\"}]",
             .content_type = "text/plain",
@@ -313,6 +347,12 @@ pub fn main(init: std.process.Init) !void {
         if (page.failure != null or page.vector == null or page.page_number != expected_page)
             return error.InvalidIntegrationEmbeddingOutput;
     }
+    try enrichment_runtime.runNativePdfOcrGroundingIntegration(
+        alloc,
+        fixture.reader_two_lines_scanned_pdf,
+        producer,
+    );
+    if (local.read_calls != 4) return error.IntegrationGroundingReaderWasNotInvoked;
 }
 
 fn requiredEnv(name: [*:0]const u8) ![]const u8 {

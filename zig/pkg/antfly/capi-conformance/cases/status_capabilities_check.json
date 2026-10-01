@@ -1,0 +1,19 @@
+{
+  "name": "status_capabilities_check",
+  "description": "Stable Lite identity, threading, and capability fields, plus an integrity check of a live database.",
+  "open": {"create": true, "no_sync": true},
+  "steps": [
+    {"op": "status", "expect": {"json_subset": {"storage": {"format": "aflite", "engine": "native_single_file"}}}},
+    {"op": "capabilities", "expect": {"json_subset": {
+      "threading": "serialized",
+      "hosted_profile": false,
+      "text_search": true,
+      "dense_vector_search": true,
+      "raft_replication": false,
+      "distributed_shard_ownership": false
+    }}},
+    {"op": "batch", "timestamp": 1, "writes": [{"key": "doc:check", "value": {"title": "check me"}}]},
+    {"op": "check", "expect": {"json_subset": {"valid": true}}},
+    {"op": "pending_work_stats", "expect": {"contains": ["has_async_indexes"]}}
+  ]
+}

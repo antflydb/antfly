@@ -235,7 +235,7 @@ Neo4j also allows multiple same-type relationships between two nodes. Its [Cyphe
 
 Implicit relationships retain their existing keys. Explicit identities use a versioned key suffix, and replay records containing them use format v6; ordinary batches continue to use v5. New readers accept existing v2–v5 replay records. Upgrade every replica, coordinator, and backup/restore reader before creating explicit relationships or enabling `nodes.source`. An older reader cannot interpret the new relationship keys, so downgrade requires removing the new projections and rebuilding compatible indexes and replay state. This feature does not provide global UUID uniqueness or a cross-version rolling-upgrade negotiation protocol.
 
-Portable backups preserve each explicit relationship’s owner, logical endpoints, ID, weight, timestamps, and metadata in a dedicated relationship block. Such archives require AFB reader version 3 or later; older readers reject them before import. Backups containing only implicit relationships retain the legacy edge blocks and reader version 2 requirement.
+Portable backups preserve each explicit relationship’s owner, logical endpoints, ID, weight, timestamps, and metadata in a dedicated relationship block. Such archives require AFB reader version 6 or later; older readers reject them before import. Backups containing only implicit relationships retain the legacy edge blocks and reader version 2 requirement. Archives containing durable endpoint retirements require reader version 7. Explicit relationships use derived journal version 8 and data-Raft protocol version 18; existing owner and TTL journals remain readable.
 
 ## Readiness Is Two Flags, Not One
 

@@ -23,18 +23,53 @@ const raft_managed_host = @import("../raft/managed_host.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const table_catalog = @import("table_catalog.zig");
 
+/// A borrowed request budget, including its clock authority. Routers must keep
+/// admission, refresh and endpoint selection within this same budget.
+pub const RouteBudget = struct {
+    clock: table_catalog.RoutingBudget = .{},
+    cancellation: ?@import("../common/cancellation.zig").CancellationToken = null,
+
+    pub fn fromRequest(request: anytype) RouteBudget {
+        return .{
+            .clock = .{
+                .deadline_ns = request.execution_deadline_ns,
+                .io = if (@hasField(@TypeOf(request), "execution_io")) request.execution_io else null,
+            },
+            .cancellation = request.cancellation,
+        };
+    }
+
+    pub fn fromTimeoutMs(timeout_ms: ?u32) RouteBudget {
+        return .{ .clock = .{ .deadline_ns = if (timeout_ms) |ms| @import("antfly_platform").time.monotonicNs() +| @as(u64, ms) * std.time.ns_per_ms else null } };
+    }
+
+    pub fn remainingTimeoutMs(self: RouteBudget) !?u32 {
+        try self.check();
+        const deadline = self.clock.deadline_ns orelse return null;
+        const remaining = deadline -| self.clock.nowNs();
+        if (remaining == 0) return error.Timeout;
+        return @intCast(@min(std.math.maxInt(u32), (remaining +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms));
+    }
+
+    pub fn check(self: RouteBudget) !void {
+        if (self.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+        if (self.clock.deadline_ns) |deadline| if (self.clock.nowNs() >= deadline) return error.Timeout;
+    }
+};
+
 pub const HostedGroupRouter = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    budget: RouteBudget = .{},
 
     pub const VTable = struct {
         local_node_id: *const fn (ptr: *anyopaque) u64,
         local_status: *const fn (ptr: *anyopaque, group_id: u64) raft_host.HostedReplicaStatus,
         group_leader_node_id: ?*const fn (ptr: *anyopaque, group_id: u64) ?u64 = null,
-        group_node_ids: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) anyerror![]u64 = null,
+        group_node_ids: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, budget: RouteBudget) anyerror![]u64 = null,
         node_status: ?*const fn (ptr: *anyopaque, node_id: u64, group_id: u64) raft_host.HostedReplicaStatus = null,
         node_base_uri: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, node_id: u64) anyerror!?[]u8,
-        node_base_uri_for_group: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, node_id: u64) anyerror!?[]u8 = null,
+        node_base_uri_for_group: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, node_id: u64, budget: RouteBudget) anyerror!?[]u8 = null,
         /// Resolve a fanout from one routing snapshot. Metadata-backed routers
         /// use this to avoid copying and rescanning the full catalog once per
         /// shard; generic routers retain the scalar fallback below.
@@ -43,8 +78,15 @@ pub const HostedGroupRouter = struct {
             alloc: std.mem.Allocator,
             group_ids: []const u64,
             policy: RoutePolicy,
+            budget: RouteBudget,
         ) anyerror!?[]GroupRoute = null,
     };
+
+    pub fn withBudget(self: HostedGroupRouter, budget: RouteBudget) HostedGroupRouter {
+        var result = self;
+        result.budget = budget;
+        return result;
+    }
 
     pub fn localNodeId(self: HostedGroupRouter) u64 {
         return self.vtable.local_node_id(self.ptr);
@@ -61,7 +103,8 @@ pub const HostedGroupRouter = struct {
 
     pub fn groupNodeIds(self: HostedGroupRouter, alloc: std.mem.Allocator, group_id: u64) !?[]u64 {
         const fn_ptr = self.vtable.group_node_ids orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id);
+        try self.budget.check();
+        return try fn_ptr(self.ptr, alloc, group_id, self.budget);
     }
 
     pub fn nodeStatus(self: HostedGroupRouter, node_id: u64, group_id: u64) ?raft_host.HostedReplicaStatus {
@@ -74,7 +117,8 @@ pub const HostedGroupRouter = struct {
     }
 
     pub fn nodeBaseUriForGroup(self: HostedGroupRouter, alloc: std.mem.Allocator, group_id: u64, node_id: u64) !?[]u8 {
-        if (self.vtable.node_base_uri_for_group) |fn_ptr| return try fn_ptr(self.ptr, alloc, group_id, node_id);
+        try self.budget.check();
+        if (self.vtable.node_base_uri_for_group) |fn_ptr| return try fn_ptr(self.ptr, alloc, group_id, node_id, self.budget);
         return try self.nodeBaseUri(alloc, node_id);
     }
 
@@ -147,6 +191,16 @@ pub fn resolveGroupRoute(
     group_id: u64,
     policy: RoutePolicy,
 ) !?GroupRoute {
+    try router.budget.check();
+    if (router.vtable.resolve_group_routes) |resolve| {
+        const routes = (try resolve(router.ptr, alloc, &.{group_id}, policy, router.budget)) orelse return null;
+        if (routes.len != 1) {
+            freeGroupRoutes(alloc, routes);
+            return error.InvalidGroupRouteBatch;
+        }
+        defer alloc.free(routes);
+        return routes[0];
+    }
     const local_node_id = router.localNodeId();
     const local_status = router.localStatus(group_id);
     if (policy == .prefer_leader) {
@@ -204,8 +258,9 @@ pub fn resolveGroupRoutes(
     group_ids: []const u64,
     policy: RoutePolicy,
 ) !?[]GroupRoute {
+    try router.budget.check();
     if (router.vtable.resolve_group_routes) |resolve| {
-        const resolved = try resolve(router.ptr, alloc, group_ids, policy);
+        const resolved = try resolve(router.ptr, alloc, group_ids, policy, router.budget);
         const routes = resolved orelse return null;
         if (routes.len != group_ids.len) {
             freeGroupRoutes(alloc, routes);
@@ -256,12 +311,12 @@ fn managedHttpHostNodeBaseUri(ptr: *anyopaque, alloc: std.mem.Allocator, node_id
     const groups = try host.http_host.host.listGroupIds(alloc);
     defer alloc.free(groups);
     for (groups) |group_id| {
-        if (try managedHttpHostNodeBaseUriForGroup(ptr, alloc, group_id, node_id)) |base_uri| return base_uri;
+        if (try managedHttpHostNodeBaseUriForGroup(ptr, alloc, group_id, node_id, .{})) |base_uri| return base_uri;
     }
     return null;
 }
 
-fn managedHttpHostNodeBaseUriForGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, node_id: u64) !?[]u8 {
+fn managedHttpHostNodeBaseUriForGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, node_id: u64, _: RouteBudget) !?[]u8 {
     const host: *raft_managed_host.ManagedHttpHost = @ptrCast(@alignCast(ptr));
     const endpoints = host.view.peerResolver().resolveGroupPeer(alloc, group_id, node_id) catch |err| switch (err) {
         error.UnknownPeer => return null,
@@ -304,7 +359,7 @@ fn catalogBackedRouterGroupLeaderNodeId(ptr: *anyopaque, group_id: u64) ?u64 {
     return store.node_id;
 }
 
-fn catalogBackedRouterGroupNodeIds(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) ![]u64 {
+fn catalogBackedRouterGroupNodeIds(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, _: RouteBudget) ![]u64 {
     const router: *CatalogBackedGroupRouter = @ptrCast(@alignCast(ptr));
     var snapshot = try router.catalog.adminSnapshot();
     defer router.catalog.freeAdminSnapshot(&snapshot);
@@ -339,7 +394,7 @@ fn catalogBackedRouterNodeBaseUri(ptr: *anyopaque, alloc: std.mem.Allocator, nod
     return try alloc.dupe(u8, store.api_url);
 }
 
-fn catalogBackedRouterNodeBaseUriForGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, node_id: u64) !?[]u8 {
+fn catalogBackedRouterNodeBaseUriForGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, node_id: u64, _: RouteBudget) !?[]u8 {
     const router: *CatalogBackedGroupRouter = @ptrCast(@alignCast(ptr));
     var snapshot = try router.catalog.adminSnapshot();
     defer router.catalog.freeAdminSnapshot(&snapshot);
@@ -567,6 +622,7 @@ fn consumerTests() type {
                     alloc: std.mem.Allocator,
                     group_ids: []const u64,
                     policy: RoutePolicy,
+                    _: RouteBudget,
                 ) !?[]GroupRoute {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.batch_calls += 1;
@@ -613,12 +669,26 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u64, 107), routes[0].remote.node_id);
             try std.testing.expectEqualStrings("http://group-11", routes[2].remote.base_uri);
 
+            var single = (try resolveGroupRoute(std.testing.allocator, unused_catalog, router, 11, .prefer_leader)).?;
+            defer single.deinit(std.testing.allocator);
+            try std.testing.expectEqualStrings("http://group-11", single.remote.base_uri);
+            try std.testing.expectEqual(@as(usize, 2), state.batch_calls);
+            try std.testing.expectEqual(@as(usize, 0), state.scalar_calls);
+
             state.omit_last_route = true;
+            try std.testing.expectError(
+                error.InvalidGroupRouteBatch,
+                resolveGroupRoute(std.testing.allocator, unused_catalog, router, 11, .prefer_leader),
+            );
             try std.testing.expectError(
                 error.InvalidGroupRouteBatch,
                 resolveGroupRoutes(std.testing.allocator, unused_catalog, router, &.{ 7, 9, 11 }, .prefer_leader),
             );
-            try std.testing.expectEqual(@as(usize, 2), state.batch_calls);
+            try std.testing.expectEqual(@as(usize, 4), state.batch_calls);
+            try std.testing.expectError(error.Timeout, resolveGroupRoutes(std.testing.allocator, unused_catalog, router.withBudget(.{ .clock = .{ .deadline_ns = 0 } }), &.{7}, .prefer_leader));
+            var canceled = std.atomic.Value(bool).init(true);
+            try std.testing.expectError(error.Cancelled, resolveGroupRoute(std.testing.allocator, unused_catalog, router.withBudget(.{ .cancellation = @import("../common/cancellation.zig").CancellationToken.fromAtomic(&canceled) }), 7, .prefer_leader));
+            try std.testing.expectEqual(@as(usize, 4), state.batch_calls);
         }
 
         test "catalog backed router routes metadata-owned writes to placement leader api url" {

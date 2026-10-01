@@ -10,6 +10,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.execution_policy import ExecutionPolicy
+    from ..models.graph_artifact_producer_config_producer import GraphArtifactProducerConfigProducer
     from ..models.graph_artifact_producer_config_producer_json import GraphArtifactProducerConfigProducerJson
     from ..models.graph_artifact_producer_source_config import GraphArtifactProducerSourceConfig
 
@@ -29,6 +30,8 @@ class GraphArtifactProducerConfig:
         content_type (str | Unset):
         execution (ExecutionPolicy | Unset): Non-semantic execution policy for one producer or index maintenance
             operation. These fields tune how work is batched and do not change generated artifact identity.
+        producer (GraphArtifactProducerConfigProducer | Unset): Write-only producer configuration. Cannot be combined
+            with producer_json.
         producer_json (GraphArtifactProducerConfigProducerJson | Unset): Write-only producer configuration; it may
             contain credentials and is never returned.
     """
@@ -38,6 +41,7 @@ class GraphArtifactProducerConfig:
     source: GraphArtifactProducerSourceConfig
     content_type: str | Unset = UNSET
     execution: ExecutionPolicy | Unset = UNSET
+    producer: GraphArtifactProducerConfigProducer | Unset = UNSET
     producer_json: GraphArtifactProducerConfigProducerJson | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
@@ -52,6 +56,10 @@ class GraphArtifactProducerConfig:
         execution: dict[str, Any] | Unset = UNSET
         if not isinstance(self.execution, Unset):
             execution = self.execution.to_dict()
+
+        producer: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.producer, Unset):
+            producer = self.producer.to_dict()
 
         producer_json: dict[str, Any] | Unset = UNSET
         if not isinstance(self.producer_json, Unset):
@@ -70,6 +78,8 @@ class GraphArtifactProducerConfig:
             field_dict["content_type"] = content_type
         if execution is not UNSET:
             field_dict["execution"] = execution
+        if producer is not UNSET:
+            field_dict["producer"] = producer
         if producer_json is not UNSET:
             field_dict["producer_json"] = producer_json
 
@@ -78,6 +88,7 @@ class GraphArtifactProducerConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.execution_policy import ExecutionPolicy
+        from ..models.graph_artifact_producer_config_producer import GraphArtifactProducerConfigProducer
         from ..models.graph_artifact_producer_config_producer_json import GraphArtifactProducerConfigProducerJson
         from ..models.graph_artifact_producer_source_config import GraphArtifactProducerSourceConfig
 
@@ -97,6 +108,13 @@ class GraphArtifactProducerConfig:
         else:
             execution = ExecutionPolicy.from_dict(_execution)
 
+        _producer = d.pop("producer", UNSET)
+        producer: GraphArtifactProducerConfigProducer | Unset
+        if isinstance(_producer, Unset):
+            producer = UNSET
+        else:
+            producer = GraphArtifactProducerConfigProducer.from_dict(_producer)
+
         _producer_json = d.pop("producer_json", UNSET)
         producer_json: GraphArtifactProducerConfigProducerJson | Unset
         if isinstance(_producer_json, Unset):
@@ -110,6 +128,7 @@ class GraphArtifactProducerConfig:
             source=source,
             content_type=content_type,
             execution=execution,
+            producer=producer,
             producer_json=producer_json,
         )
 

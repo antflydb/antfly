@@ -159,7 +159,13 @@ pub fn modelRuntimeForSessionExecutor(
 ) !*model_runtime.ModelRuntime {
     if (cache.getSessionCompiledModelRuntime(backend_kind, attachment_target)) |runtime_value| return runtime_value;
 
-    var runtime_value = try model_executor.createRuntime(allocator);
+    // The runtime is cached on the session for the model's lifetime, so it
+    // must allocate from the cache's allocator. Callers often pass a
+    // request-scoped wrapper (the direct generation path's synchronized
+    // allocator lives on the request's stack), and a runtime retaining that
+    // would dereference a dead frame from the next request.
+    _ = allocator;
+    var runtime_value = try model_executor.createRuntime(cache.allocator);
     errdefer runtime_value.deinit();
     cache.putSessionCompiledModelRuntime(backend_kind, attachment_target, runtime_value);
     return cache.getSessionCompiledModelRuntime(backend_kind, attachment_target) orelse error.MissingCompiledModelRuntime;
@@ -176,7 +182,9 @@ pub fn modelRuntimeForExecutor(
     if (entry.compiled_model_runtime) |*runtime_value| return runtime_value;
     if (cache.getSessionCompiledModelRuntime(backend_kind, attachment_target)) |runtime_value| return runtime_value;
 
-    var runtime_value = try model_executor.createRuntime(allocator);
+    // Cached for the entry's lifetime: allocate from the cache, not the request.
+    _ = allocator;
+    var runtime_value = try model_executor.createRuntime(cache.allocator);
     errdefer runtime_value.deinit();
     const caps = runtime_value.capabilities();
     if (caps.state_ownership == .host_assisted_inputs) {
@@ -380,6 +388,8 @@ const RuntimeCachingMock = struct {
     created: usize = 0,
     runtime_deinits: usize = 0,
     executor_deinits: usize = 0,
+    /// Allocator handed to the most recent `createRuntime` call.
+    created_with: ?*anyopaque = null,
 
     const runtime_vtable = model_runtime.ModelRuntime.VTable{
         .capabilities = runtimeCapabilities,
@@ -414,9 +424,10 @@ const RuntimeCachingMock = struct {
         self.runtime_deinits += 1;
     }
 
-    fn createRuntime(ctx: *anyopaque, _: std.mem.Allocator) !model_runtime.ModelRuntime {
+    fn createRuntime(ctx: *anyopaque, allocator: std.mem.Allocator) !model_runtime.ModelRuntime {
         const self: *RuntimeCachingMock = @ptrCast(@alignCast(ctx));
         self.created += 1;
+        self.created_with = allocator.ptr;
         return .{ .ptr = self, .vtable = &runtime_vtable };
     }
 
@@ -437,6 +448,33 @@ fn testCacheEntry(key_seed: u64) cache_mod.CacheEntry {
         .graph = undefined,
         .last_used = 0,
     };
+}
+
+test "cached model runtimes allocate from the cache, not the requesting allocator" {
+    // A request may hand in a stack-scoped allocator wrapper (the direct
+    // generation path's synchronized allocator). A runtime cached for the
+    // session or entry lifetime must never retain it.
+    var cache = cache_mod.GraphCache.init(std.testing.allocator);
+    defer cache.deinit();
+    var scratch: [64]u8 = undefined;
+    var request_scoped = std.heap.FixedBufferAllocator.init(&scratch);
+    const request_allocator = request_scoped.allocator();
+    try std.testing.expect(request_allocator.ptr != cache.allocator.ptr);
+
+    var mock = RuntimeCachingMock{ .ownership = .backend_owned };
+    var executor = mock.executor();
+    defer executor.deinit();
+    _ = try modelRuntimeForSessionExecutor(request_allocator, &cache, .metal, .whole_model, &executor);
+    try std.testing.expectEqual(@as(usize, 1), mock.created);
+    try std.testing.expect(mock.created_with.? == cache.allocator.ptr);
+
+    var entry = testCacheEntry(7);
+    defer if (entry.compiled_model_runtime) |*runtime| runtime.deinit();
+    var entry_mock = RuntimeCachingMock{ .ownership = .host_assisted_inputs };
+    var entry_executor = entry_mock.executor();
+    defer entry_executor.deinit();
+    _ = try modelRuntimeForExecutor(request_allocator, &cache, &entry, .pjrt, .whole_model, &entry_executor);
+    try std.testing.expect(entry_mock.created_with.? == cache.allocator.ptr);
 }
 
 test "modelRuntimeForExecutor keeps host-assisted runtimes entry scoped" {

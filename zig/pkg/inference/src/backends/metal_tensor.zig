@@ -37,6 +37,21 @@ pub const StorageMode = enum(c_int) {
 
 pub const DType = enum(u8) {
     f32 = 0,
+    i32 = 1,
+    i64 = 2,
+    i8 = 3,
+    i16 = 4,
+    u8 = 5,
+    bool_ = 6,
+
+    pub fn byteSize(self: DType) usize {
+        return switch (self) {
+            .f32, .i32 => 4,
+            .i64 => 8,
+            .i16 => 2,
+            .i8, .u8, .bool_ => 1,
+        };
+    }
 };
 
 const DeviceBufferRef = struct {
@@ -46,6 +61,9 @@ const DeviceBufferRef = struct {
     ref_count: usize,
     released: bool,
     release_on_drop: bool,
+    /// Legacy wrappers retain the C allocator. Strict bounded callers may
+    /// supply an owner that outlives every retained view of this buffer.
+    allocator: std.mem.Allocator = std.heap.c_allocator,
 };
 
 pub const MemoryStats = struct {
@@ -76,6 +94,25 @@ pub const MemoryStats = struct {
     to_host_calls: u64 = 0,
     to_host_device_calls: u64 = 0,
 };
+
+/// Request-thread transfer audit. GPU execution is asynchronous, but all
+/// host copies/accesses enter these synchronous APIs on the dispatch thread.
+/// Independent sessions on other threads cannot contaminate these counters.
+pub const TransferAudit = struct {
+    upload_bytes: u64 = 0,
+    download_bytes: u64 = 0,
+    host_accesses: u64 = 0,
+    upload_calls: u64 = 0,
+    download_calls: u64 = 0,
+};
+threadlocal var transfer_audit: ?*TransferAudit = null;
+pub fn beginTransferAudit(audit: *TransferAudit) !void {
+    if (transfer_audit != null) return error.MetalTransferAuditAlreadyActive;
+    transfer_audit = audit;
+}
+pub fn endTransferAudit() void {
+    transfer_audit = null;
+}
 
 var memory_stats = MemoryStats{};
 var to_host_trace_count: usize = 0;
@@ -560,7 +597,7 @@ pub const MetalTensor = struct {
             noteDeviceOwnedRelease(ref.handle, ref.byte_len);
         }
         if (ref.ref_count == 0) {
-            std.heap.c_allocator.destroy(ref);
+            ref.allocator.destroy(ref);
         }
     }
 
@@ -589,6 +626,87 @@ pub const MetalTensor = struct {
         return deviceAllocateImpl(runtime, byte_len, mode, dims, true);
     }
 
+    /// Reuse-eligible strict allocation. Ownership metadata is allocated from
+    /// the caller's owner before Metal is entered, including pool reuse hits.
+    pub fn deviceAllocateWithAllocator(
+        allocator: std.mem.Allocator,
+        runtime: *anyopaque,
+        byte_len: usize,
+        mode: StorageMode,
+        dims: []const i32,
+    ) !MetalTensor {
+        return deviceAllocateChecked(allocator, runtime, byte_len, mode, dims, false, .f32);
+    }
+
+    /// Strict allocation variant: admit and allocate the ownership record
+    /// before calling Metal. Every failure is typed, and the last retained
+    /// view releases metadata through this exact allocator. Existing callers
+    /// of deviceAllocate/deviceOwned keep their historical allocator behavior.
+    pub fn deviceAllocateFreshWithAllocator(
+        allocator: std.mem.Allocator,
+        runtime: *anyopaque,
+        byte_len: usize,
+        mode: StorageMode,
+        dims: []const i32,
+    ) !MetalTensor {
+        return deviceAllocateChecked(allocator, runtime, byte_len, mode, dims, true, .f32);
+    }
+
+    /// Allocate physical storage without converting or narrowing the dtype.
+    pub fn deviceAllocateTyped(allocator: std.mem.Allocator, runtime: *anyopaque, dtype: DType, mode: StorageMode, dims: []const i32) !MetalTensor {
+        var count: usize = 1;
+        for (dims) |extent| {
+            if (extent < 0) return error.InvalidTensorShape;
+            count = try std.math.mul(usize, count, @intCast(extent));
+        }
+        return deviceAllocateChecked(allocator, runtime, try std.math.mul(usize, count, dtype.byteSize()), mode, dims, false, dtype);
+    }
+
+    fn deviceAllocateChecked(
+        allocator: std.mem.Allocator,
+        runtime: *anyopaque,
+        byte_len: usize,
+        mode: StorageMode,
+        dims: []const i32,
+        fresh: bool,
+        dtype: DType,
+    ) !MetalTensor {
+        if (dims.len > max_dims) return error.InvalidTensorShape;
+        var elements: usize = 1;
+        for (dims) |axis_dim| {
+            if (axis_dim < 0) return error.InvalidTensorShape;
+            elements = std.math.mul(usize, elements, @intCast(axis_dim)) catch return error.InvalidTensorShape;
+        }
+        if ((std.math.mul(usize, elements, dtype.byteSize()) catch return error.InvalidTensorShape) != byte_len)
+            return error.InvalidTensorShape;
+        const ref = try allocator.create(DeviceBufferRef);
+        if (comptime !@import("build_options").enable_metal) {
+            allocator.destroy(ref);
+            return error.MetalUnavailable;
+        }
+        const handle = (if (fresh)
+            termite_metal_buffer_alloc_fresh(runtime, @max(byte_len, 1), @intFromEnum(mode))
+        else
+            termite_metal_buffer_alloc(runtime, @max(byte_len, 1), @intFromEnum(mode))) orelse {
+            allocator.destroy(ref);
+            return error.MetalBufferAllocFailed;
+        };
+        ref.* = .{
+            .handle = handle,
+            .runtime = runtime,
+            .byte_len = byte_len,
+            .ref_count = 1,
+            .released = false,
+            .release_on_drop = true,
+            .allocator = allocator,
+        };
+        var result = deviceView(ref, 0, byte_len, dims, dtype);
+        noteDeviceOwnedCreate(handle, byte_len, dims);
+        errdefer result.deinit();
+        try result.retainForActiveFrame();
+        return result;
+    }
+
     fn deviceAllocateImpl(
         runtime: *anyopaque,
         byte_len: usize,
@@ -609,8 +727,9 @@ pub const MetalTensor = struct {
 
     pub fn retainedCopy(self: *const MetalTensor) !MetalTensor {
         if (self.device) |d| {
-            return deviceView(try retainDeviceBuffer(d.ref), d.byte_offset, d.byte_len, self.shape());
+            return deviceView(try retainDeviceBuffer(d.ref), d.byte_offset, d.byte_len, self.shape(), self.dtype);
         }
+        if (self.dtype != .f32) return error.UnsupportedTensorType;
         return ownedCloneFrom(self.data[0..self.len], self.shape());
     }
 
@@ -619,9 +738,11 @@ pub const MetalTensor = struct {
         byte_offset: usize,
         byte_len: usize,
         dims: []const i32,
+        dtype: DType,
     ) MetalTensor {
         std.debug.assert(dims.len <= max_dims);
         var t = MetalTensor{
+            .dtype = dtype,
             .shape_len = @intCast(dims.len),
             .data = @ptrFromInt(@alignOf(f32)),
             .len = 0,
@@ -644,8 +765,9 @@ pub const MetalTensor = struct {
     ) !MetalTensor {
         if (self.device) |d| {
             if (byte_offset_delta + byte_len > d.byte_len) return error.InvalidTensorShape;
-            return deviceView(try retainDeviceBuffer(d.ref), d.byte_offset + byte_offset_delta, byte_len, dims);
+            return deviceView(try retainDeviceBuffer(d.ref), d.byte_offset + byte_offset_delta, byte_len, dims, self.dtype);
         }
+        if (self.dtype != .f32) return error.UnsupportedTensorType;
         const start = byte_offset_delta / @sizeOf(f32);
         const count = byte_len / @sizeOf(f32);
         if (start + count > self.len) return error.InvalidTensorShape;
@@ -660,7 +782,7 @@ pub const MetalTensor = struct {
     ) !MetalTensor {
         if (self.device) |d| {
             if (byte_offset_delta + byte_len > d.ref.byte_len - d.byte_offset) return error.InvalidTensorShape;
-            return deviceView(try retainDeviceBuffer(d.ref), d.byte_offset + byte_offset_delta, byte_len, dims);
+            return deviceView(try retainDeviceBuffer(d.ref), d.byte_offset + byte_offset_delta, byte_len, dims, self.dtype);
         }
         return self.retainedView(byte_offset_delta, byte_len, dims);
     }
@@ -679,8 +801,11 @@ pub const MetalTensor = struct {
             if (termite_metal_buffer_copy(d.ref.runtime, d.ref.handle, d.byte_offset + byte_offset_delta, copied, 0, byte_len) != 0) {
                 return error.MetalBufferCopyFailed;
             }
-            return deviceOwned(d.ref.runtime, copied, 0, byte_len, dims);
+            var result = deviceOwned(d.ref.runtime, copied, 0, byte_len, dims);
+            result.dtype = self.dtype;
+            return result;
         }
+        if (self.dtype != .f32) return error.UnsupportedTensorType;
         const start = byte_offset_delta / @sizeOf(f32);
         const count = byte_len / @sizeOf(f32);
         if (start + count > self.len) return error.InvalidTensorShape;
@@ -713,10 +838,9 @@ pub const MetalTensor = struct {
         return self.shape_len;
     }
 
-    /// Element count (f32 slots). For device-only tensors this reports the
-    /// device byte length in f32 units even before a host mirror exists.
+    /// Logical element count, using the physical dtype width for device storage.
     pub fn elemCount(self: *const MetalTensor) usize {
-        if (self.device) |d| return d.byte_len / @sizeOf(f32);
+        if (self.device) |d| return d.byte_len / self.dtype.byteSize();
         return self.len;
     }
 
@@ -777,6 +901,7 @@ pub const MetalTensor = struct {
     }
 
     pub fn copyInto(self: *const MetalTensor, dst: *MetalTensor) !void {
+        if (self.dtype != dst.dtype) return error.UnsupportedTensorType;
         const dst_dev = dst.device orelse return error.UnsupportedTensorType;
         if (dst_dev.ref.released or dst_dev.ref.ref_count == 0) return error.ReleasedDeviceBuffer;
         const byte_len = self.deviceByteLen();
@@ -807,6 +932,45 @@ pub const MetalTensor = struct {
             byte_len,
         );
         if (rc != 0) return error.MetalBufferUploadFailed;
+        if (transfer_audit) |audit| {
+            audit.upload_bytes += byte_len;
+            audit.upload_calls += 1;
+        }
+    }
+
+    /// Explicit bounded readback into caller-owned memory. No persistent host
+    /// mirror is allocated and no tensor storage/metadata is mutated.
+    pub fn downloadF32Into(self: *const MetalTensor, output: []f32) !void {
+        if (self.dtype != .f32) return error.UnsupportedTensorType;
+        return self.downloadBytesInto(std.mem.sliceAsBytes(output));
+    }
+
+    /// Explicit raw-byte transfer; preserves physical integer values without
+    /// passing through an f32 host mirror or mutating resident storage.
+    pub fn downloadBytesInto(self: *const MetalTensor, output: []u8) !void {
+        const dev = self.device orelse return error.UnsupportedTensorType;
+        if (dev.ref.released or dev.ref.ref_count == 0) return error.ReleasedDeviceBuffer;
+        if (output.len != dev.byte_len) return error.InvalidTensorShape;
+        if (termite_metal_decode_runtime_flush_active_frame(dev.ref.runtime) != 0) return error.MetalFrameSyncFailed;
+        if (termite_metal_buffer_download(dev.ref.runtime, dev.ref.handle, dev.byte_offset, @ptrCast(output.ptr), dev.byte_len) != 0)
+            return error.MetalBufferDownloadFailed;
+        if (transfer_audit) |audit| {
+            audit.download_bytes += output.len;
+            audit.download_calls += 1;
+        }
+    }
+
+    pub fn uploadBytes(self: *MetalTensor, input: []const u8) !void {
+        const dev = self.device orelse return error.UnsupportedTensorType;
+        if (dev.ref.released or dev.ref.ref_count == 0) return error.ReleasedDeviceBuffer;
+        if (input.len != dev.byte_len) return error.InvalidTensorShape;
+        self.invalidateHostMirror();
+        if (termite_metal_buffer_upload(dev.ref.runtime, dev.ref.handle, dev.byte_offset, input.ptr, input.len) != 0)
+            return error.MetalBufferUploadFailed;
+        if (transfer_audit) |audit| {
+            audit.upload_bytes += input.len;
+            audit.upload_calls += 1;
+        }
     }
 
     /// Return a host-backed `[]f32` view. For pure host tensors this is
@@ -814,6 +978,10 @@ pub const MetalTensor = struct {
     /// if present, otherwise aliases the Shared-storage contents pointer
     /// when available, or allocates + downloads from Private storage.
     pub fn toHostSlice(self: *MetalTensor) ![]f32 {
+        if (self.isDevice()) if (transfer_audit) |audit| {
+            audit.host_accesses += 1;
+        };
+        if (self.dtype != .f32) return error.UnsupportedTensorType;
         memory_stats.to_host_calls += 1;
         if (self.device == null) return self.data[0..self.len];
         memory_stats.to_host_device_calls += 1;
@@ -995,6 +1163,7 @@ pub const MetalTensor = struct {
 };
 
 test "MetalTensor borrowed does not free" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const buf = try allocator.alloc(f32, 4);
     defer allocator.free(buf);
@@ -1008,6 +1177,7 @@ test "MetalTensor borrowed does not free" {
 }
 
 test "MetalTensor owned frees its buffer" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
     const shape_arr = [_]i32{4};
     var t = try MetalTensor.ownedCloneFrom(&[_]f32{ 1, 2, 3, 4 }, &shape_arr);
     try std.testing.expect(t.owned_by_c_allocator);
@@ -1016,6 +1186,7 @@ test "MetalTensor owned frees its buffer" {
 }
 
 test "MetalTensor retainedCopy reports stale device refs without aborting" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
     const ref = try std.heap.c_allocator.create(DeviceBufferRef);
     defer std.heap.c_allocator.destroy(ref);
     ref.* = .{
@@ -1027,7 +1198,7 @@ test "MetalTensor retainedCopy reports stale device refs without aborting" {
         .release_on_drop = true,
     };
     const shape_arr = [_]i32{4};
-    var stale = MetalTensor.deviceView(ref, 0, 4 * @sizeOf(f32), &shape_arr);
+    var stale = MetalTensor.deviceView(ref, 0, 4 * @sizeOf(f32), &shape_arr, .f32);
     defer stale.deinit();
 
     try std.testing.expectError(error.ReleasedDeviceBuffer, stale.retainedCopy());

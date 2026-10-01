@@ -876,6 +876,22 @@ pub const H2Connection = struct {
                     stream_mod.freeDecodedHeaders(self.allocator, stream.request_headers);
                     stream.request_headers = dec.headers;
 
+                    if (!self.is_server) {
+                        if (stream.max_error_data_size) |limit| error_limit: {
+                            var status: ?u16 = null;
+                            for (dec.headers) |h| {
+                                if (!std.mem.eql(u8, h.name, ":status")) continue;
+                                if (status != null) break :error_limit;
+                                if (h.value.len != 3 or !std.ascii.isDigit(h.value[0]) or
+                                    !std.ascii.isDigit(h.value[1]) or !std.ascii.isDigit(h.value[2])) break :error_limit;
+                                status = std.fmt.parseInt(u16, h.value, 10) catch break :error_limit;
+                            }
+                            if (status) |code| {
+                                if (code >= 400 and code < 600) stream.max_data_size = limit;
+                            }
+                        }
+                    }
+
                     // Transition idle → open (RFC 7540 §5.1).
                     if (stream.state == .idle) stream.state = .open;
                     stream.got_headers = true;
@@ -3462,4 +3478,57 @@ test "processOneFrameLocked sends RST_STREAM on stream_error after DATA delivery
         pos += 9 + flen;
     }
     try std.testing.expect(found_rst);
+}
+
+test "H2 error envelopes select their bounded limit before DATA allocation" {
+    const allocator = std.testing.allocator;
+    const Case = struct {
+        encoded_status: []const u8,
+        body_bytes: usize,
+        accepted: bool,
+        error_limit: ?usize = 4096,
+    };
+    const cases = [_]Case{
+        .{ .encoded_status = "\x8d", .body_bytes = 352, .accepted = true },
+        .{ .encoded_status = "\x8d", .body_bytes = 4097, .accepted = false },
+        .{ .encoded_status = "\x88", .body_bytes = 257, .accepted = false },
+        .{ .encoded_status = "\x8a", .body_bytes = 257, .accepted = false },
+        .{ .encoded_status = "\x8a", .body_bytes = 256, .accepted = true },
+        .{ .encoded_status = "\x8d", .body_bytes = 256, .accepted = true, .error_limit = null },
+        .{ .encoded_status = "\x8d", .body_bytes = 257, .accepted = false, .error_limit = null },
+        .{ .encoded_status = "\x8d", .body_bytes = 1, .accepted = false, .error_limit = 0 },
+        .{ .encoded_status = "\x8d", .body_bytes = 128, .accepted = true, .error_limit = 128 },
+        .{ .encoded_status = "\x8d", .body_bytes = 129, .accepted = false, .error_limit = 128 },
+        .{ .encoded_status = "\x08\x040404", .body_bytes = 257, .accepted = false },
+        .{ .encoded_status = "\x08\x04+404", .body_bytes = 257, .accepted = false },
+        .{ .encoded_status = "\x08\x044_04", .body_bytes = 257, .accepted = false },
+        .{ .encoded_status = "\x8d\x88", .body_bytes = 257, .accepted = false },
+        .{ .encoded_status = "\x88\x8d", .body_bytes = 257, .accepted = false },
+    };
+    for (cases) |case| {
+        var client = H2Connection.initClient(allocator, std.testing.io);
+        defer client.deinit();
+        const stream = try client.stream_manager.createStream();
+        stream.state = .open;
+        stream.max_data_size = 256;
+        stream.max_error_data_size = case.error_limit;
+        var headers = Frame{
+            .header = .{ .length = @intCast(case.encoded_status.len), .frame_type = .headers, .flags = H2Connection.FLAG_END_HEADERS, .stream_id = stream.id },
+            .payload = @constCast(case.encoded_status),
+        };
+        try client.deliverToMailbox(&headers);
+        const payload = [_]u8{'e'} ** 4097;
+        var data = Frame{
+            .header = .{ .length = @intCast(case.body_bytes), .frame_type = .data, .flags = H2Connection.FLAG_END_STREAM, .stream_id = stream.id },
+            .payload = @constCast(payload[0..case.body_bytes]),
+        };
+        try client.deliverToMailbox(&data);
+        if (case.accepted) {
+            try std.testing.expect(stream.stream_error == null);
+            try std.testing.expectEqual(case.body_bytes, stream.data_buf.items.len);
+        } else {
+            try std.testing.expectEqual(error.StreamDataOverflow, stream.stream_error.?);
+            try std.testing.expectEqual(@as(usize, 0), stream.data_buf.items.len);
+        }
+    }
 }

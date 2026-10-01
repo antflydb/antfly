@@ -26,6 +26,7 @@ const multipart_upload_min_part_bytes: u64 = 16 * 1024 * 1024;
 const multipart_upload_max_part_bytes: u64 = 512 * 1024 * 1024;
 const multipart_upload_part_alignment: u64 = 1024 * 1024;
 const max_multipart_parts: u64 = 10_000;
+const max_error_response_bytes: usize = 4 * 1024;
 pub const Scheme = s3_compat.Scheme;
 pub const AddressingStyle = s3_compat.AddressingStyle;
 pub const Credentials = s3_compat.Credentials;
@@ -200,6 +201,7 @@ const HttpxTransport = struct {
         // replay it through redirects or ambient cookie state.
         client_config.redirect_policy = .noFollow();
         client_config.cookies_enabled = false;
+        client_config.max_error_response_size = max_error_response_bytes;
         client_config.address_filter = address_filter;
         return .{
             .alloc = alloc,
@@ -241,9 +243,14 @@ const ContextHttpxTransport = struct {
     started_at: std.Io.Timestamp,
 
     fn init(alloc: Allocator, context: HttpContext) ContextHttpxTransport {
+        var client_config = context.client_config;
+        client_config.max_error_response_size = @min(
+            client_config.max_error_response_size orelse max_error_response_bytes,
+            max_error_response_bytes,
+        );
         return .{
             .io = context.io,
-            .client = httpx.Client.initWithConfig(alloc, context.io, context.client_config),
+            .client = httpx.Client.initWithConfig(alloc, context.io, client_config),
             .timeout_ms = context.timeout_ms,
             .started_at = std.Io.Timestamp.now(context.io, .awake),
         };
@@ -3305,4 +3312,34 @@ test "s3 client round-trips against env-configured endpoint" {
     try std.testing.expect(found);
 
     try client.deleteObject(bucket, key, .{});
+}
+
+test "s3 error envelope caps preserve owned and context transport settings" {
+    const allocator = std.testing.allocator;
+    var owned = try HttpxTransport.init(allocator, 1234, std.testing.io, null);
+    defer owned.deinit();
+    try std.testing.expectEqual(@as(?usize, 4096), owned.client.config.max_error_response_size);
+    try std.testing.expectEqual(@as(u64, 1234), owned.client.config.timeouts.request_ms);
+    try std.testing.expect(!owned.client.config.cookies_enabled);
+
+    for ([_]?usize{ null, 0, 128, 4096, 8192 }) |requested| {
+        var context = ContextHttpxTransport.init(allocator, .{
+            .io = std.testing.io,
+            .timeout_ms = 4567,
+            .client_config = .{
+                .max_error_response_size = requested,
+                .max_response_size = 512,
+                .force_http2 = true,
+                .verify_ssl = false,
+                .timeouts = .{ .request_ms = 789 },
+            },
+        });
+        defer context.deinit();
+        try std.testing.expectEqual(@as(?usize, @min(requested orelse 4096, 4096)), context.client.config.max_error_response_size);
+        try std.testing.expectEqual(@as(usize, 512), context.client.config.max_response_size);
+        try std.testing.expectEqual(@as(u64, 789), context.client.config.timeouts.request_ms);
+        try std.testing.expectEqual(@as(?u64, 4567), context.timeout_ms);
+        try std.testing.expect(context.client.config.force_http2);
+        try std.testing.expect(!context.client.config.verify_ssl);
+    }
 }

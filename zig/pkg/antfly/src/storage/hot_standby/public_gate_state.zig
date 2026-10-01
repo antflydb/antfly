@@ -40,14 +40,14 @@ pub const Role = enum(u8) {
 
 pub const State = struct {
     role: std.atomic.Value(u8) = .init(@intFromEnum(Role.disabled)),
-    generation: std.atomic.Value(u64) = .init(1),
-    progress_sequence: std.atomic.Value(u64) = .init(0),
-    received_lsn: std.atomic.Value(u64) = .init(0),
-    applied_lsn: std.atomic.Value(u64) = .init(0),
-    safe_read_lsn: std.atomic.Value(u64) = .init(0),
+    generation: @import("antfly_platform").atomic.Value(u64) = .init(1),
+    progress_sequence: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    received_lsn: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    applied_lsn: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    safe_read_lsn: @import("antfly_platform").atomic.Value(u64) = .init(0),
     external_authority_required: std.atomic.Value(bool) = .init(false),
     external_authority_granted: std.atomic.Value(bool) = .init(false),
-    external_authority_deadline_ns: std.atomic.Value(u64) = .init(0),
+    external_authority_deadline_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
     primary: ?*const primary_mod.Primary = null,
     monotonic_now_fn: *const fn () u64 = platform_time.authorityNs,
 

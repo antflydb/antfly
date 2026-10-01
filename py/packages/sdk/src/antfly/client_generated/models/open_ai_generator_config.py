@@ -7,6 +7,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.open_ai_generator_config_provider import OpenAIGeneratorConfigProvider
+from ..models.open_ai_reasoning_effort import OpenAIReasoningEffort
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="OpenAIGeneratorConfig")
@@ -23,6 +24,10 @@ class OpenAIGeneratorConfig:
         api_key (str | Unset): The OpenAI API key.
         temperature (float | Unset): Controls randomness in generation (0.0-2.0).
         max_tokens (int | Unset): Maximum number of tokens to generate.
+        max_completion_tokens (int | Unset): OpenAI completion budget, including visible output and reasoning tokens.
+            Use for reasoning models instead of max_tokens; the two are mutually exclusive.
+        reasoning_effort (OpenAIReasoningEffort | Unset): OpenAI reasoning effort; model support varies. Omit to use the
+            model default.
         top_p (float | Unset): Nucleus sampling parameter.
         frequency_penalty (float | Unset): Penalty for token frequency (-2.0 to 2.0).
         presence_penalty (float | Unset): Penalty for token presence (-2.0 to 2.0).
@@ -34,6 +39,8 @@ class OpenAIGeneratorConfig:
     api_key: str | Unset = UNSET
     temperature: float | Unset = UNSET
     max_tokens: int | Unset = UNSET
+    max_completion_tokens: int | Unset = UNSET
+    reasoning_effort: OpenAIReasoningEffort | Unset = UNSET
     top_p: float | Unset = UNSET
     frequency_penalty: float | Unset = UNSET
     presence_penalty: float | Unset = UNSET
@@ -51,6 +58,12 @@ class OpenAIGeneratorConfig:
         temperature = self.temperature
 
         max_tokens = self.max_tokens
+
+        max_completion_tokens = self.max_completion_tokens
+
+        reasoning_effort: str | Unset = UNSET
+        if not isinstance(self.reasoning_effort, Unset):
+            reasoning_effort = self.reasoning_effort.value
 
         top_p = self.top_p
 
@@ -74,6 +87,10 @@ class OpenAIGeneratorConfig:
             field_dict["temperature"] = temperature
         if max_tokens is not UNSET:
             field_dict["max_tokens"] = max_tokens
+        if max_completion_tokens is not UNSET:
+            field_dict["max_completion_tokens"] = max_completion_tokens
+        if reasoning_effort is not UNSET:
+            field_dict["reasoning_effort"] = reasoning_effort
         if top_p is not UNSET:
             field_dict["top_p"] = top_p
         if frequency_penalty is not UNSET:
@@ -98,6 +115,15 @@ class OpenAIGeneratorConfig:
 
         max_tokens = d.pop("max_tokens", UNSET)
 
+        max_completion_tokens = d.pop("max_completion_tokens", UNSET)
+
+        _reasoning_effort = d.pop("reasoning_effort", UNSET)
+        reasoning_effort: OpenAIReasoningEffort | Unset
+        if isinstance(_reasoning_effort, Unset):
+            reasoning_effort = UNSET
+        else:
+            reasoning_effort = OpenAIReasoningEffort(_reasoning_effort)
+
         top_p = d.pop("top_p", UNSET)
 
         frequency_penalty = d.pop("frequency_penalty", UNSET)
@@ -111,6 +137,8 @@ class OpenAIGeneratorConfig:
             api_key=api_key,
             temperature=temperature,
             max_tokens=max_tokens,
+            max_completion_tokens=max_completion_tokens,
+            reasoning_effort=reasoning_effort,
             top_p=top_p,
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,

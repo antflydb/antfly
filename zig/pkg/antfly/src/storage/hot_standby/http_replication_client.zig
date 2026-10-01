@@ -748,12 +748,12 @@ fn verifyStandbyStatusUpdateResponse(
     if (safe_read_lsn > applied_lsn) return error.ReplicationStatusAckMismatch;
 }
 
-fn uint64FromJson(value: i64) !u64 {
+fn uint64FromJson(value: anytype) !u64 {
     if (value < 0) return error.InvalidInternalReplicationResponse;
     return @intCast(value);
 }
 
-fn positiveUint64FromJson(value: i64) !u64 {
+fn positiveUint64FromJson(value: anytype) !u64 {
     if (value <= 0) return error.InvalidInternalReplicationResponse;
     return @intCast(value);
 }
@@ -1336,7 +1336,7 @@ test "storage.hot_standby http replication client falls back to the legacy route
 
     try std.testing.expectEqual(PathStyle.unknown, client.path_style);
     const identified = try client.identifySystem("http://primary.internal.test");
-    try std.testing.expectEqual(@as(i64, @intCast(identity.cluster_id)), identified.identity.cluster_id);
+    try std.testing.expectEqual(identity.cluster_id, identified.identity.cluster_id);
     try std.testing.expectEqual(PathStyle.legacy, client.path_style);
     try std.testing.expectEqual(@as(usize, 1), legacy_only.canonical_attempts);
 
@@ -1376,8 +1376,8 @@ test "storage.hot_standby http replication client pulls applies and acknowledges
     var client = Client.init(alloc, server.executor());
 
     const identified = try client.identifySystem("http://primary.internal.test");
-    try std.testing.expectEqual(@as(i64, 100), identified.identity.cluster_id);
-    try std.testing.expectEqual(@as(i64, 1), identified.record_format_version);
+    try std.testing.expectEqual(100, identified.identity.cluster_id);
+    try std.testing.expectEqual(1, identified.record_format_version);
 
     try client.createReplicationSlotForStandby("http://primary.internal.test", "standby-a", 0, &standby);
     _ = try primary.append(.{ .payload = "one" });

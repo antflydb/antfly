@@ -19,6 +19,8 @@ class OpenRouterEmbedderConfig:
     OpenRouter provides a unified API for multiple embedding models from different providers.
     API key via `api_key` field or `OPENROUTER_API_KEY` environment variable.
 
+    Antfly currently supports dense text embeddings through this provider.
+
     **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large,
     google/gemini-embedding-001, qwen/qwen3-embedding-8b
 
@@ -31,12 +33,14 @@ class OpenRouterEmbedderConfig:
             provider (OpenRouterEmbedderConfigProvider):
             model (str): The OpenRouter model identifier (e.g., 'openai/text-embedding-3-small', 'google/gemini-
                 embedding-001'). Default: 'openai/text-embedding-3-small'. Example: openai/text-embedding-3-small.
+            url (str | Unset): The OpenRouter API base URL. Defaults to OPENROUTER_BASE_URL or https://openrouter.ai/api/v1.
             api_key (str | Unset): The OpenRouter API key. Can also be set via OPENROUTER_API_KEY environment variable.
             dimensions (int | Unset): Output dimension for the embedding (if supported by the model).
     """
 
     provider: OpenRouterEmbedderConfigProvider
     model: str = "openai/text-embedding-3-small"
+    url: str | Unset = UNSET
     api_key: str | Unset = UNSET
     dimensions: int | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -45,6 +49,8 @@ class OpenRouterEmbedderConfig:
         provider = self.provider.value
 
         model = self.model
+
+        url = self.url
 
         api_key = self.api_key
 
@@ -58,6 +64,8 @@ class OpenRouterEmbedderConfig:
                 "model": model,
             }
         )
+        if url is not UNSET:
+            field_dict["url"] = url
         if api_key is not UNSET:
             field_dict["api_key"] = api_key
         if dimensions is not UNSET:
@@ -72,6 +80,8 @@ class OpenRouterEmbedderConfig:
 
         model = d.pop("model")
 
+        url = d.pop("url", UNSET)
+
         api_key = d.pop("api_key", UNSET)
 
         dimensions = d.pop("dimensions", UNSET)
@@ -79,6 +89,7 @@ class OpenRouterEmbedderConfig:
         open_router_embedder_config = cls(
             provider=provider,
             model=model,
+            url=url,
             api_key=api_key,
             dimensions=dimensions,
         )

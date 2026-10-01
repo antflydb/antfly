@@ -51,6 +51,10 @@ const TrackTables = struct {
     movie_timescale: u32 = 0,
     media_timescale: u32 = 0,
     edit_entries: std.ArrayListUnmanaged(EditListEntry) = .empty,
+    /// Encoder delay and valid sample count from an `iTunSMPB` item
+    /// (Apple encoders write this instead of an edit list).
+    itunsmpb_priming: ?u64 = null,
+    itunsmpb_valid_frames: ?u64 = null,
     total_sample_duration: u64 = 0,
     sample_description_index: ?u32 = null,
     chunk_offsets: std.ArrayListUnmanaged(u64) = .empty,
@@ -125,6 +129,7 @@ fn parseMoov(
         const box = try readBox(payload, cursor);
         switch (box.typ) {
             fourcc("mvhd") => tables.movie_timescale = try parseMvhdTimescale(box.payload),
+            fourcc("udta") => parseUdtaItunSmpb(box.payload, tables) catch {},
             fourcc("trak") => if (tables.codec == null) {
                 var candidate = TrackTables{ .movie_timescale = tables.movie_timescale };
                 parseTrak(allocator, box.payload, &candidate) catch |err| switch (err) {
@@ -589,8 +594,66 @@ const EditListTrim = struct {
     playable_frames: ?u64 = null,
 };
 
+/// Walks `udta/meta/ilst` for the `----`/`iTunSMPB` gapless item:
+/// " 00000000 <priming> <padding> <valid samples> ..." as hex fields.
+fn parseUdtaItunSmpb(payload: []const u8, tables: *TrackTables) !void {
+    var cursor: usize = 0;
+    while (cursor < payload.len) {
+        const box = try readBox(payload, cursor);
+        if (box.typ == fourcc("meta")) {
+            // `meta` is a full box: version and flags precede its children.
+            if (box.payload.len < 4) return error.UnsupportedAudioFormat;
+            var meta_cursor: usize = 4;
+            while (meta_cursor < box.payload.len) {
+                const child = try readBox(box.payload, meta_cursor);
+                if (child.typ == fourcc("ilst")) try parseIlstItunSmpb(child.payload, tables);
+                meta_cursor = child.end;
+            }
+        }
+        cursor = box.end;
+    }
+}
+
+fn parseIlstItunSmpb(payload: []const u8, tables: *TrackTables) !void {
+    var cursor: usize = 0;
+    while (cursor < payload.len) {
+        const item = try readBox(payload, cursor);
+        cursor = item.end;
+        if (item.typ != fourcc("----")) continue;
+        var is_smpb = false;
+        var data: ?[]const u8 = null;
+        var item_cursor: usize = 0;
+        while (item_cursor < item.payload.len) {
+            const field = try readBox(item.payload, item_cursor);
+            item_cursor = field.end;
+            if (field.typ == fourcc("name") and field.payload.len >= 4) {
+                is_smpb = std.mem.eql(u8, field.payload[4..], "iTunSMPB");
+            } else if (field.typ == fourcc("data") and field.payload.len >= 8) {
+                data = field.payload[8..];
+            }
+        }
+        if (!is_smpb) continue;
+        const text = data orelse continue;
+        var fields = std.mem.tokenizeScalar(u8, text, ' ');
+        _ = fields.next() orelse continue;
+        const priming_text = fields.next() orelse continue;
+        _ = fields.next() orelse continue;
+        const valid_text = fields.next() orelse continue;
+        const priming = std.fmt.parseInt(u64, priming_text, 16) catch continue;
+        const valid = std.fmt.parseInt(u64, valid_text, 16) catch continue;
+        tables.itunsmpb_priming = priming;
+        tables.itunsmpb_valid_frames = valid;
+        return;
+    }
+}
+
 fn resolveEditListTrim(tables: TrackTables) !EditListTrim {
-    if (tables.edit_entries.items.len == 0) return .{};
+    if (tables.edit_entries.items.len == 0) {
+        if (tables.itunsmpb_priming) |priming| {
+            return .{ .trim_start_frames = priming, .playable_frames = tables.itunsmpb_valid_frames };
+        }
+        return .{};
+    }
     if (tables.movie_timescale == 0 or tables.media_timescale == 0) return error.UnsupportedAudioFormat;
 
     var trim_start_frames: ?u64 = null;

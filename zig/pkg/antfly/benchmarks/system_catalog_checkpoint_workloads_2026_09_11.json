@@ -1,0 +1,456 @@
+{
+  "date": "2026-09-11",
+  "sources": {
+    "baseline": "9f828fc4d33cd062a906540c62a576cf7973d049",
+    "final_production": "052c79c4a7d51becbf3dd78f04337be16e909cc3",
+    "main": "2bd96e33e1c7e12c98b376dd317537601868251d",
+    "final_debug_binary_sha256": "7dc98e2246ac2b83dbe12f2360a39d5f6e83ee70efd35e67bf60da5a685c240e"
+  },
+  "method": {
+    "host": "macOS ARM64 shared development host",
+    "component": "ReleaseFast, c_allocator, seven samples. Times SnapshotBuilder.applyBatch: command decode, applied checkpoint, projections and local transaction commit. Fixture and committed-entry wire encoding are outside timing. Baseline uses the identical final benchmark harness with unchanged baseline production code.",
+    "placement": "Seven samples of 100 independent read transactions each. Reported p50 is the median sample duration divided by 100, including transaction open/close.",
+    "execution": "Baseline, intermediate digest prototype and final component runs sequential, without this task's builds/tests overlapping measurement.",
+    "output": "Harness-emitted medians and WAL observations; individual timing samples are not retained.",
+    "live": "Final Debug binary; three metadata and three data nodes on one host; 30 unrelated tables, 200 schema fields, 25-row pages, ten samples after three warmups. Setup/readiness outside request timings. Sequential after tests/component benchmarks."
+  },
+  "limitations": [
+    "Uncontrolled shared-host load and low disk headroom; development observations, not production capacity claims.",
+    "No Raft replication, network transport or registered service callback fanout in the component interval. Wire StoreRecord bytes are unchanged.",
+    "Cached heartbeat updates available capacity on every apply; only the fresh-clock scenario advances report clocks.",
+    "The prior report artifact timed only the inner projection and omitted the full-batch watermark write. Its 184-byte result is not full local apply.",
+    "Full-store read code is unchanged in this follow-up; variation in its timing is not attributed to checkpoint changes.",
+    "The intermediate 58-byte SHA-256 checkpoint is not shipped: its diagnostic digest was unused by recovery and unnecessarily scanned the input. Final checkpoint is 26 bytes and stores index, version, kind and byte count.",
+    "Final clustered discovery is an unpaired application validation run. It does not establish a causal cluster-wide latency improvement or resolve earlier larger-cluster failures."
+  ],
+  "full_local_apply": {
+    "baseline": [
+      {
+        "groups": 100,
+        "scenario": "cached_heartbeat",
+        "apply_p50_ms": 0.289,
+        "wal_bytes_per_apply": 81581,
+        "full_record_bytes": 81291
+      },
+      {
+        "groups": 100,
+        "scenario": "fresh_clocks",
+        "apply_p50_ms": 0.258,
+        "wal_bytes_per_apply": 92437,
+        "full_record_bytes": 81291
+      },
+      {
+        "groups": 100,
+        "scenario": "one_group_change",
+        "apply_p50_ms": 0.272,
+        "wal_bytes_per_apply": 148040,
+        "full_record_bytes": 81291
+      },
+      {
+        "groups": 100,
+        "scenario": "all_groups_change",
+        "apply_p50_ms": 0.331,
+        "wal_bytes_per_apply": 181141,
+        "full_record_bytes": 81291
+      },
+      {
+        "groups": 100,
+        "full_store_read_p50_ms": 0.038
+      },
+      {
+        "groups": 100,
+        "placement_drain_read_p50_ms": 0.03691
+      },
+      {
+        "groups": 1000,
+        "scenario": "cached_heartbeat",
+        "apply_p50_ms": 1.354,
+        "wal_bytes_per_apply": 812381,
+        "full_record_bytes": 812091
+      },
+      {
+        "groups": 1000,
+        "scenario": "fresh_clocks",
+        "apply_p50_ms": 1.414,
+        "wal_bytes_per_apply": 917917,
+        "full_record_bytes": 812091
+      },
+      {
+        "groups": 1000,
+        "scenario": "one_group_change",
+        "apply_p50_ms": 1.382,
+        "wal_bytes_per_apply": 950840,
+        "full_record_bytes": 812091
+      },
+      {
+        "groups": 1000,
+        "scenario": "all_groups_change",
+        "apply_p50_ms": 2.238,
+        "wal_bytes_per_apply": 1804949,
+        "full_record_bytes": 812091
+      },
+      {
+        "groups": 1000,
+        "full_store_read_p50_ms": 0.323
+      },
+      {
+        "groups": 1000,
+        "placement_drain_read_p50_ms": 0.32934
+      },
+      {
+        "groups": 10000,
+        "scenario": "cached_heartbeat",
+        "apply_p50_ms": 15.0,
+        "wal_bytes_per_apply": 8120381,
+        "full_record_bytes": 8120091
+      },
+      {
+        "groups": 10000,
+        "scenario": "fresh_clocks",
+        "apply_p50_ms": 24.547,
+        "wal_bytes_per_apply": 9173446,
+        "full_record_bytes": 8120091
+      },
+      {
+        "groups": 10000,
+        "scenario": "one_group_change",
+        "apply_p50_ms": 15.391,
+        "wal_bytes_per_apply": 8978840,
+        "full_record_bytes": 8120091
+      },
+      {
+        "groups": 10000,
+        "scenario": "all_groups_change",
+        "apply_p50_ms": 41.055,
+        "wal_bytes_per_apply": 18043760,
+        "full_record_bytes": 8120091
+      },
+      {
+        "groups": 10000,
+        "full_store_read_p50_ms": 3.954
+      },
+      {
+        "groups": 10000,
+        "placement_drain_read_p50_ms": 3.88202
+      }
+    ],
+    "final": [
+      {
+        "groups": 100,
+        "scenario": "cached_heartbeat",
+        "apply_p50_ms": 0.205,
+        "wal_bytes_per_apply": 277,
+        "full_record_bytes": 81291
+      },
+      {
+        "groups": 100,
+        "scenario": "fresh_clocks",
+        "apply_p50_ms": 0.233,
+        "wal_bytes_per_apply": 11133,
+        "full_record_bytes": 81291
+      },
+      {
+        "groups": 100,
+        "scenario": "one_group_change",
+        "apply_p50_ms": 0.241,
+        "wal_bytes_per_apply": 66736,
+        "full_record_bytes": 81291
+      },
+      {
+        "groups": 100,
+        "scenario": "all_groups_change",
+        "apply_p50_ms": 0.282,
+        "wal_bytes_per_apply": 99837,
+        "full_record_bytes": 81291
+      },
+      {
+        "groups": 100,
+        "full_store_read_p50_ms": 0.033
+      },
+      {
+        "groups": 100,
+        "placement_drain_read_p50_ms": 0.00364
+      },
+      {
+        "groups": 1000,
+        "scenario": "cached_heartbeat",
+        "apply_p50_ms": 1.046,
+        "wal_bytes_per_apply": 277,
+        "full_record_bytes": 812091
+      },
+      {
+        "groups": 1000,
+        "scenario": "fresh_clocks",
+        "apply_p50_ms": 1.024,
+        "wal_bytes_per_apply": 105813,
+        "full_record_bytes": 812091
+      },
+      {
+        "groups": 1000,
+        "scenario": "one_group_change",
+        "apply_p50_ms": 0.988,
+        "wal_bytes_per_apply": 138736,
+        "full_record_bytes": 812091
+      },
+      {
+        "groups": 1000,
+        "scenario": "all_groups_change",
+        "apply_p50_ms": 1.808,
+        "wal_bytes_per_apply": 992845,
+        "full_record_bytes": 812091
+      },
+      {
+        "groups": 1000,
+        "full_store_read_p50_ms": 0.28
+      },
+      {
+        "groups": 1000,
+        "placement_drain_read_p50_ms": 0.00533
+      },
+      {
+        "groups": 10000,
+        "scenario": "cached_heartbeat",
+        "apply_p50_ms": 11.226,
+        "wal_bytes_per_apply": 277,
+        "full_record_bytes": 8120091
+      },
+      {
+        "groups": 10000,
+        "scenario": "fresh_clocks",
+        "apply_p50_ms": 16.674,
+        "wal_bytes_per_apply": 1053342,
+        "full_record_bytes": 8120091
+      },
+      {
+        "groups": 10000,
+        "scenario": "one_group_change",
+        "apply_p50_ms": 11.45,
+        "wal_bytes_per_apply": 858736,
+        "full_record_bytes": 8120091
+      },
+      {
+        "groups": 10000,
+        "scenario": "all_groups_change",
+        "apply_p50_ms": 31.197,
+        "wal_bytes_per_apply": 9923656,
+        "full_record_bytes": 8120091
+      },
+      {
+        "groups": 10000,
+        "full_store_read_p50_ms": 3.575
+      },
+      {
+        "groups": 10000,
+        "placement_drain_read_p50_ms": 0.03145
+      }
+    ],
+    "unshipped_digest_prototype": [
+      {
+        "groups": 100,
+        "scenario": "cached_heartbeat",
+        "apply_p50_ms": 0.244,
+        "wal_bytes_per_apply": 309,
+        "full_record_bytes": 81291
+      },
+      {
+        "groups": 100,
+        "scenario": "fresh_clocks",
+        "apply_p50_ms": 0.285,
+        "wal_bytes_per_apply": 11165,
+        "full_record_bytes": 81291
+      },
+      {
+        "groups": 100,
+        "scenario": "one_group_change",
+        "apply_p50_ms": 0.317,
+        "wal_bytes_per_apply": 66768,
+        "full_record_bytes": 81291
+      },
+      {
+        "groups": 100,
+        "scenario": "all_groups_change",
+        "apply_p50_ms": 0.349,
+        "wal_bytes_per_apply": 99869,
+        "full_record_bytes": 81291
+      },
+      {
+        "groups": 100,
+        "full_store_read_p50_ms": 0.037
+      },
+      {
+        "groups": 100,
+        "placement_drain_read_p50_ms": 0.00436
+      },
+      {
+        "groups": 1000,
+        "scenario": "cached_heartbeat",
+        "apply_p50_ms": 1.481,
+        "wal_bytes_per_apply": 309,
+        "full_record_bytes": 812091
+      },
+      {
+        "groups": 1000,
+        "scenario": "fresh_clocks",
+        "apply_p50_ms": 1.465,
+        "wal_bytes_per_apply": 105845,
+        "full_record_bytes": 812091
+      },
+      {
+        "groups": 1000,
+        "scenario": "one_group_change",
+        "apply_p50_ms": 1.468,
+        "wal_bytes_per_apply": 138768,
+        "full_record_bytes": 812091
+      },
+      {
+        "groups": 1000,
+        "scenario": "all_groups_change",
+        "apply_p50_ms": 2.391,
+        "wal_bytes_per_apply": 992877,
+        "full_record_bytes": 812091
+      },
+      {
+        "groups": 1000,
+        "full_store_read_p50_ms": 0.318
+      },
+      {
+        "groups": 1000,
+        "placement_drain_read_p50_ms": 0.00598
+      },
+      {
+        "groups": 10000,
+        "scenario": "cached_heartbeat",
+        "apply_p50_ms": 16.276,
+        "wal_bytes_per_apply": 309,
+        "full_record_bytes": 8120091
+      },
+      {
+        "groups": 10000,
+        "scenario": "fresh_clocks",
+        "apply_p50_ms": 22.374,
+        "wal_bytes_per_apply": 1053374,
+        "full_record_bytes": 8120091
+      },
+      {
+        "groups": 10000,
+        "scenario": "one_group_change",
+        "apply_p50_ms": 17.017,
+        "wal_bytes_per_apply": 858768,
+        "full_record_bytes": 8120091
+      },
+      {
+        "groups": 10000,
+        "scenario": "all_groups_change",
+        "apply_p50_ms": 40.41,
+        "wal_bytes_per_apply": 9923688,
+        "full_record_bytes": 8120091
+      },
+      {
+        "groups": 10000,
+        "full_store_read_p50_ms": 4.396
+      },
+      {
+        "groups": 10000,
+        "placement_drain_read_p50_ms": 0.0338
+      }
+    ]
+  },
+  "validation": {
+    "zig": "Full Antfly build and 134 focused tests passed (66 metadata storage, 57 API, 11 managed-host).",
+    "e2e": "21 catalog, schema-migration, exact-sort and scoped-auth cases passed in 78.27 seconds on the final binary.",
+    "sdk": "282 TypeScript tests passed, 1 skipped; SDK build/typecheck and Antfarm typecheck passed; Go oapi tests passed; Python generated check and public/Zig OpenAPI generation/check passed.",
+    "format": "Changed Zig formatting, TypeScript Biome and Python Ruff checks passed.",
+    "environment": "Initial E2E attempt hit the fixture disk-headroom safeguard. Removed only obsolete build artifacts, then all 21 passed with the safeguard unchanged."
+  },
+  "clustered_discovery_final": {
+    "binary": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+    "binary_sha256": "7dc98e2246ac2b83dbe12f2360a39d5f6e83ee70efd35e67bf60da5a685c240e",
+    "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+    "settings": {
+      "binary": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+      "scenario": "listing",
+      "deployment": "cluster",
+      "restart_after_ddl": false,
+      "listing_distinct_schemas": false,
+      "listing_page_size": 25,
+      "listing_concurrent": false,
+      "listing_reader_rate": 0,
+      "table_counts": [
+        30
+      ],
+      "resolution_workload": "exact",
+      "schema_fields": 200,
+      "tenant_counts": [
+        10,
+        100
+      ],
+      "entity_shards": 1,
+      "entity_key_layout": "clustered",
+      "mentions": [
+        10,
+        100
+      ],
+      "documents": 5,
+      "concurrency": 8,
+      "samples": 10,
+      "warmup": 3,
+      "ndjson_lines": 20,
+      "poll_ms": 20,
+      "readiness_timeout": 115,
+      "output": "/private/tmp/catalog-round8-cluster.json"
+    },
+    "scenarios": {
+      "listing": {
+        "deployment": "cluster",
+        "startup_ms": 3823.7127917818725,
+        "checkpoints": [
+          {
+            "unrelated_tables": 30,
+            "small_namespace": {
+              "samples": 10,
+              "p50_ms": 27.835604,
+              "p95_ms": 214.648791,
+              "max_ms": 214.648791
+            },
+            "selective_prefix": {
+              "samples": 10,
+              "p50_ms": 20.1914375,
+              "p95_ms": 220.996875,
+              "max_ms": 220.996875
+            },
+            "large_namespace": {
+              "samples": 10,
+              "p50_ms": 81.465896,
+              "p95_ms": 283.404459,
+              "max_ms": 283.404459
+            },
+            "single_table_status": {
+              "samples": 10,
+              "p50_ms": 27.034604,
+              "p95_ms": 197.666042,
+              "max_ms": 197.666042
+            },
+            "empty_default_namespace": {
+              "samples": 10,
+              "p50_ms": 12.785667,
+              "p95_ms": 23.545333,
+              "max_ms": 23.545333
+            },
+            "first_page": {
+              "samples": 10,
+              "p50_ms": 68.904167,
+              "p95_ms": 206.459333,
+              "max_ms": 206.459333
+            },
+            "paged_inventory": {
+              "samples": 10,
+              "p50_ms": 102.7773125,
+              "p95_ms": 312.5325,
+              "max_ms": 312.5325
+            }
+          }
+        ]
+      }
+    }
+  }
+}

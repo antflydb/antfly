@@ -220,29 +220,66 @@ class ParserAndMetricTests(unittest.TestCase):
         self.assertEqual(7 * 16384, qualify.parse_vm_stat_swapout_bytes(output))
 
     def test_resource_violation_retains_measured_execution(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            with (
-                mock.patch.object(qualify, "swapout_bytes", return_value=0),
-                mock.patch.object(qualify, "memory_free_percent", return_value=90),
-                mock.patch.object(qualify, "process_rss_mib", return_value=1.0),
-            ):
-                with self.assertRaises(qualify.ResourceViolation) as raised:
-                    qualify.run_resource_monitored(
-                        ["/bin/sleep", "1"],
-                        root / "stdout.log",
-                        root / "stderr.log",
-                        timeout_seconds=0.01,
-                        max_rss_mib=10.0,
-                        min_free_percent=10,
-                        max_swap_growth_mib=0.0,
-                        sample_interval_seconds=0.01,
-                        label="test process",
-                    )
-            self.assertIn("timeout", str(raised.exception))
-            self.assertGreaterEqual(
-                raised.exception.execution["resources"]["sample_count"], 1
-            )
+        # Startup is included in the deadline. Drive the clock and process
+        # explicitly so neither case depends on OS scheduling or real sleeps.
+        for phase, times, expected_samples in (
+            ("after sampling", [0.0, 0.0, 0.02, 0.02], 1),
+            ("during startup", [0.0, 0.02, 0.02], 0),
+        ):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                process = mock.Mock(
+                    pid=123, **{"poll.return_value": None, "wait.return_value": -15}
+                )
+                clock = SimpleNamespace(
+                    monotonic=mock.Mock(side_effect=times), sleep=mock.Mock()
+                )
+
+                def start_process(*args, **kwargs):
+                    kwargs["stdout"].write(b"partial output")
+                    kwargs["stderr"].write(b"partial diagnostics")
+                    return process
+
+                with (
+                    mock.patch.object(qualify, "time", clock),
+                    mock.patch.object(
+                        qualify.subprocess, "Popen", side_effect=start_process
+                    ),
+                    mock.patch.object(qualify, "terminate_process_group") as terminate,
+                    mock.patch.object(qualify, "swapout_bytes", return_value=0),
+                    mock.patch.object(qualify, "memory_free_percent", return_value=90),
+                    mock.patch.object(
+                        qualify, "process_rss_mib", return_value=1.0
+                    ) as rss,
+                ):
+                    with self.assertRaises(qualify.ResourceViolation) as raised:
+                        qualify.run_resource_monitored(
+                            ["test-process"],
+                            root / "stdout.log",
+                            root / "stderr.log",
+                            timeout_seconds=0.01,
+                            max_rss_mib=10.0,
+                            min_free_percent=10,
+                            max_swap_growth_mib=0.0,
+                            sample_interval_seconds=0.01,
+                            label="test process",
+                        )
+                self.assertIn("timeout", str(raised.exception))
+                execution = raised.exception.execution
+                self.assertEqual(
+                    expected_samples, execution["resources"]["sample_count"]
+                )
+                self.assertEqual(
+                    float(expected_samples), execution["resources"]["max_rss_mib"]
+                )
+                self.assertEqual(0.02, execution["resources"]["elapsed_seconds"])
+                self.assertEqual(expected_samples, rss.call_count)
+                self.assertEqual(expected_samples, clock.sleep.call_count)
+                self.assertEqual(-15, execution["returncode"])
+                self.assertEqual("partial output", execution["stdout"])
+                self.assertEqual("partial diagnostics", execution["stderr"])
+                terminate.assert_called_once_with(process)
+                process.wait.assert_called_once_with(timeout=5)
 
     def test_final_swap_snapshot_is_a_hard_gate(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

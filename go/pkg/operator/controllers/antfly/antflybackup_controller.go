@@ -2,7 +2,10 @@ package controllers
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"time"
 
@@ -32,6 +35,7 @@ type AntflyBackupReconciler struct {
 	Scheme        *runtime.Scheme
 	Recorder      events.EventRecorder
 	ClusterDomain string
+	HTTPClient    *http.Client
 }
 
 //+kubebuilder:rbac:groups=antfly.io,resources=antflybackups,verbs=get;list;watch;create;update;patch;delete
@@ -96,11 +100,36 @@ func (r *AntflyBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
+	// Desired scheduling intent survives an empty or temporarily unavailable
+	// catalog. Suspend execution rather than producing failed/phantom backups.
+	waiting := false
+	var catalogErr error
+	if !backup.Spec.Suspend {
+		waiting, catalogErr = r.backupCatalogEmpty(ctx, backup, cluster)
+	}
+	effective := backup.DeepCopy()
+	effective.Spec.Suspend = backup.Spec.Suspend || waiting || catalogErr != nil
+
 	// Reconcile the CronJob
-	if err := r.reconcileCronJob(ctx, backup, cluster); err != nil {
+	if err := r.reconcileCronJob(ctx, effective, cluster); err != nil {
 		log.Error(err, "Failed to reconcile CronJob")
 		r.updateStatusWithError(ctx, backup, antflyv1.BackupPhaseFailed, antflyv1.TypeBackupScheduleReady, antflyv1.ReasonCronJobFailed, err.Error())
 		return ctrl.Result{}, err
+	}
+
+	if waiting || catalogErr != nil {
+		// An already-running backup may finish after the catalog becomes empty.
+		// Preserve that real execution history while new runs remain suspended.
+		if err := r.updateBackupHistory(ctx, backup); err != nil {
+			return ctrl.Result{}, err
+		}
+		reason, message := "WaitingForTables", "Schedule configured; waiting for a table before starting backups"
+		if catalogErr != nil {
+			reason, message = "CatalogUnavailable", "Cannot observe the table catalog; backup scheduling is paused"
+			log.Error(catalogErr, "Failed to observe backup catalog")
+		}
+		r.updateStatusWithError(ctx, backup, antflyv1.BackupPhasePending, antflyv1.TypeBackupScheduleReady, reason, message)
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
 	// Update status
@@ -109,7 +138,62 @@ func (r *AntflyBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+}
+
+// backupCatalogEmpty uses the same public endpoint and bearer token as the
+// scheduled CLI. Errors are never interpreted as an empty catalog.
+func (r *AntflyBackupReconciler) backupCatalogEmpty(ctx context.Context, backup *antflyv1.AntflyBackup, cluster *antflyv1.AntflyCluster) (bool, error) {
+	namespace := backup.Spec.ClusterRef.Namespace
+	if namespace == "" {
+		namespace = backup.Namespace
+	}
+	url := "http://" + serviceDNSName(cluster.Name+"-public-api", namespace, r.ClusterDomain) + "/db/v1/tables"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return false, err
+	}
+	if ref := backup.Spec.Destination.CredentialsSecret; ref != nil {
+		var secret corev1.Secret
+		if err := r.Get(ctx, types.NamespacedName{Namespace: backup.Namespace, Name: ref.Name}, &secret); err != nil {
+			return false, err
+		}
+		if token := strings.TrimSpace(string(secret.Data["ANTFLY_TOKEN"])); token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+	}
+	httpClient := r.HTTPClient
+	if httpClient == nil {
+		httpClient = defaultOperatorHTTPClient
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("catalog returned HTTP %d", resp.StatusCode)
+	}
+	var tables []struct {
+		Name string `json:"name"`
+	}
+	decoder := json.NewDecoder(io.LimitReader(resp.Body, 16<<20))
+	if err := decoder.Decode(&tables); err != nil {
+		return false, err
+	}
+	if tables == nil {
+		return false, fmt.Errorf("catalog returned null instead of a table list")
+	}
+	for _, table := range tables {
+		if strings.TrimSpace(table.Name) == "" {
+			return false, fmt.Errorf("catalog returned a table without a name")
+		}
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return false, fmt.Errorf("catalog returned trailing data")
+	}
+	return len(tables) == 0, nil
 }
 
 // suspendCronJobForConnectionMigration preserves the CronJob and its history

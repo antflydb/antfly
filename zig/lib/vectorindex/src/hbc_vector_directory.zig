@@ -314,9 +314,9 @@ pub const Reader = struct {
     root_offset: usize,
     block_count: usize,
     entry_count: usize,
-    verified_indexes: []std.atomic.Value(u64),
-    verified_leaf_data: []std.atomic.Value(u64),
-    verified_metadata_data: []std.atomic.Value(u64),
+    verified_indexes: []@import("antfly_platform").atomic.Value(u64),
+    verified_leaf_data: []@import("antfly_platform").atomic.Value(u64),
+    verified_metadata_data: []@import("antfly_platform").atomic.Value(u64),
 
     pub fn init(alloc: Allocator, data: []const u8) !Reader {
         if (data.len < header_size + footer_size or !std.mem.eql(u8, data[0..4], &magic)) return error.CorruptedVectorDirectory;
@@ -331,15 +331,15 @@ pub const Reader = struct {
         const block_count = std.math.cast(usize, readU64(footer, 8)) orelse return error.CorruptedVectorDirectory;
         const verification_words = std.math.divCeil(usize, block_count, @bitSizeOf(u64)) catch
             return error.CorruptedVectorDirectory;
-        const verified_indexes = try alloc.alloc(std.atomic.Value(u64), verification_words);
+        const verified_indexes = try alloc.alloc(@import("antfly_platform").atomic.Value(u64), verification_words);
         errdefer alloc.free(verified_indexes);
-        const verified_leaf_data = try alloc.alloc(std.atomic.Value(u64), verification_words);
+        const verified_leaf_data = try alloc.alloc(@import("antfly_platform").atomic.Value(u64), verification_words);
         errdefer alloc.free(verified_leaf_data);
-        const verified_metadata_data = try alloc.alloc(std.atomic.Value(u64), verification_words);
+        const verified_metadata_data = try alloc.alloc(@import("antfly_platform").atomic.Value(u64), verification_words);
         errdefer alloc.free(verified_metadata_data);
-        for (verified_indexes) |*word| word.* = std.atomic.Value(u64).init(0);
-        for (verified_leaf_data) |*word| word.* = std.atomic.Value(u64).init(0);
-        for (verified_metadata_data) |*word| word.* = std.atomic.Value(u64).init(0);
+        for (verified_indexes) |*word| word.* = @import("antfly_platform").atomic.Value(u64).init(0);
+        for (verified_leaf_data) |*word| word.* = @import("antfly_platform").atomic.Value(u64).init(0);
+        for (verified_metadata_data) |*word| word.* = @import("antfly_platform").atomic.Value(u64).init(0);
         var reader: Reader = .{
             .alloc = alloc,
             .data = data,
@@ -366,6 +366,27 @@ pub const Reader = struct {
         const row = (try self.findRow(descriptor_value, id)) orelse return null;
         return try self.valueAt(descriptor_value, kind, row);
     }
+    /// Resolve a sorted batch with one descriptor/verification per touched
+    /// block. Views borrow this immutable reader; absent rows stay absent.
+    pub fn getManySorted(self: Reader, kind: Kind, ids: []const u64, values: []?[]const u8) !void {
+        if (ids.len != values.len) return error.InvalidArgument;
+        for (ids, 0..) |id, i| if (i != 0 and ids[i - 1] > id) return error.InvalidArgument;
+        @memset(values, null);
+        var position: usize = 0;
+        while (position < ids.len) {
+            const block = self.findBlock(ids[position]) orelse {
+                position += 1;
+                continue;
+            };
+            const descriptor_value = try self.descriptor(block);
+            try self.validateBlock(block, descriptor_value, kind);
+            while (position < ids.len and ids[position] <= descriptor_value.last_id) : (position += 1) {
+                const row = (try self.findRow(descriptor_value, ids[position])) orelse continue;
+                values[position] = try self.valueAt(descriptor_value, kind, row);
+            }
+        }
+    }
+
     pub fn contains(self: Reader, kind: Kind, id: u64) !bool {
         const block_index = self.findBlock(id) orelse return false;
         const descriptor_value = try self.descriptor(block_index);
@@ -726,13 +747,13 @@ fn countPresence(bitmap: []const u8, count: usize) usize {
     return total;
 }
 
-fn isVerified(words: []std.atomic.Value(u64), block_index: usize) bool {
+fn isVerified(words: []@import("antfly_platform").atomic.Value(u64), block_index: usize) bool {
     const word = block_index / @bitSizeOf(u64);
     const mask = @as(u64, 1) << @intCast(block_index % @bitSizeOf(u64));
     return words[word].load(.acquire) & mask != 0;
 }
 
-fn markVerified(words: []std.atomic.Value(u64), block_index: usize) void {
+fn markVerified(words: []@import("antfly_platform").atomic.Value(u64), block_index: usize) void {
     const word = block_index / @bitSizeOf(u64);
     const mask = @as(u64, 1) << @intCast(block_index % @bitSizeOf(u64));
     _ = words[word].fetchOr(mask, .release);
@@ -1061,4 +1082,30 @@ test "HBC vector directory rejects unchecksummed bytes before root" {
     writeU32(footer, 32, Crc32.hash(footer[0..32]));
 
     try std.testing.expectError(error.CorruptedVectorDirectory, Reader.init(alloc, bytes));
+}
+
+test "HBC vector directory sorted batch preserves missing rows boundaries and checksums" {
+    const alloc = std.testing.allocator;
+    var writer = try Writer.init(alloc);
+    defer writer.deinit();
+    for (1..700) |id| try writer.appendRow(id * 3, "leaf-001", if (id % 5 == 0) null else "document");
+    const bytes = try writer.build();
+    defer alloc.free(bytes);
+    var reader = try Reader.init(alloc, bytes);
+    defer reader.deinit();
+    const ids = [_]u64{ 0, 3, 3, 4, 15, 765, 768, 771, 1536, 2097, 3000 };
+    var results: [ids.len]?[]const u8 = undefined;
+    inline for (.{ Kind.leaf, Kind.metadata }) |kind| {
+        try reader.getManySorted(kind, &ids, &results);
+        for (ids, results) |id, result| {
+            const expected = try reader.get(kind, id);
+            if (expected) |value| try std.testing.expectEqualStrings(value, result.?) else try std.testing.expect(result == null);
+        }
+    }
+    try std.testing.expectError(error.InvalidArgument, reader.getManySorted(.metadata, &.{ 9, 3 }, results[0..2]));
+    const descriptor = try reader.descriptor(0);
+    bytes[descriptor.data_offset + reader.leafDataBytes(descriptor).len] ^= 1;
+    var corrupt = try Reader.init(alloc, bytes);
+    defer corrupt.deinit();
+    try std.testing.expectError(error.VectorDirectoryChecksumMismatch, corrupt.getManySorted(.metadata, &.{3}, results[0..1]));
 }

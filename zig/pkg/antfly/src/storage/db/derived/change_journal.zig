@@ -243,9 +243,14 @@ pub fn recordFromDerivedBatch(alloc: Allocator, batch: derived_types.DerivedBatc
             // The resolution stage journals its output; wake the graph
             // materializer for doc->entity provenance edges and the promoter so
             // it upserts the canonical entity documents for the resolved
-            // mentions.
+            // mentions. The resolution stage itself also re-consumes the key:
+            // compositional event identity composes sibling canonical keys, so
+            // a committed resolution re-drives the OTHER resolvers over the
+            // same source artifact (byte-stable recomputes publish no new
+            // resolution record, so the fan-back terminates).
             try appendUniqueHintAlloc(alloc, &target_hints, .graph);
             try appendUniqueHintAlloc(alloc, &target_hints, .promotion);
+            try appendUniqueHintAlloc(alloc, &target_hints, .resolution);
         } else if (internal_keys.isEmbeddingArtifactKey(key) or internal_keys.isDerivedEmbeddingArtifactKey(key)) {
             try appendUniqueHintAlloc(alloc, &target_hints, .dense_vector);
             try appendUniqueHintAlloc(alloc, &target_hints, .sparse_vector);
@@ -266,18 +271,18 @@ pub fn recordFromDerivedBatch(alloc: Allocator, batch: derived_types.DerivedBatc
         try appendUniqueHintAlloc(alloc, &target_hints, .graph);
     }
     for (batch.graph_doc_clears) |clear| try appendUniqueString(alloc, &changed_doc_keys, clear.key);
-    for (batch.graph_writes) |write| try appendUniqueString(alloc, &changed_doc_keys, write.source);
+    for (batch.graph_writes) |write| try appendUniqueString(alloc, &changed_doc_keys, if (write.owner_document.len > 0) write.owner_document else if (write.owner.len > 0) write.owner else write.source);
     // Edge deletes preserve the source document. Recording the source as
     // deleted makes graph replay clear its complete adjacency instead of only
     // applying the target-specific artifact deletion.
-    for (batch.graph_deletes) |delete| try appendUniqueString(alloc, &changed_doc_keys, delete.source);
+    for (batch.graph_deletes) |delete| try appendUniqueString(alloc, &changed_doc_keys, if (delete.owner_document.len > 0) delete.owner_document else if (delete.owner.len > 0) delete.owner else delete.source);
     for (batch.graph_writes) |write| {
-        const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);
+        const artifact_key = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, if (write.owner_document.len > 0) write.owner_document else if (write.owner.len > 0) write.owner else write.source, write.index_name, write.edge_type, write.target, write.source, write.edge_id);
         defer alloc.free(artifact_key);
         try appendUniqueString(alloc, &changed_artifact_keys, artifact_key);
     }
     for (batch.graph_deletes) |delete| {
-        const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, delete.source, delete.index_name, delete.edge_type, delete.target);
+        const artifact_key = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, if (delete.owner_document.len > 0) delete.owner_document else if (delete.owner.len > 0) delete.owner else delete.source, delete.index_name, delete.edge_type, delete.target, delete.source, delete.edge_id);
         defer alloc.free(artifact_key);
         try appendUniqueString(alloc, &changed_artifact_keys, artifact_key);
     }
@@ -360,6 +365,30 @@ pub fn decodeRecord(alloc: Allocator, raw: []const u8) !DecodedRecord {
         .record = parsed.value,
         .parsed = parsed,
     };
+}
+
+/// Finalize an exclusively owned record prepared by encodeRecord(sequence=0).
+/// Key-list allocation/encoding can precede the serialized commit section;
+/// the reservation is assigned once, immediately before atomic persistence.
+pub fn finalizePreparedRecordSequence(raw: []u8, sequence: u64) !void {
+    const offset = binary_magic.len + @sizeOf(u16);
+    if (sequence == 0 or raw.len < offset + @sizeOf(u64) + 2 or
+        !std.mem.eql(u8, raw[0..binary_magic.len], binary_magic) or
+        std.mem.readInt(u16, raw[binary_magic.len..][0..2], .little) != 1 or
+        std.mem.readInt(u64, raw[offset..][0..8], .little) != 0) return error.InvalidBatchRequest;
+    std.mem.writeInt(u64, raw[offset..][0..8], sequence, .little);
+}
+
+test "ordered artifact inventory prepared replay assigns sequence exactly once" {
+    const alloc = std.testing.allocator;
+    const raw = try encodeRecord(alloc, .{ .changed_artifact_keys = &.{"binary\xffkey"}, .target_hints = &.{.dense_vector} });
+    defer alloc.free(raw);
+    try finalizePreparedRecordSequence(raw, 9);
+    var decoded = try decodeRecord(alloc, raw);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u64, 9), decoded.record.sequence);
+    try std.testing.expectEqualStrings("binary\xffkey", decoded.record.changed_artifact_keys[0]);
+    try std.testing.expectError(error.InvalidBatchRequest, finalizePreparedRecordSequence(raw, 10));
 }
 
 fn looksLikeEncodedRecord(raw: []const u8) bool {

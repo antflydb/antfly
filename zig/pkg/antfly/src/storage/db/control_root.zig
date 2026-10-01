@@ -26,6 +26,7 @@ const ha_primary = @import("../hot_standby/primary.zig");
 const platform_time = @import("antfly_platform").time;
 
 pub const types = @import("types.zig");
+pub const coordinated_ttl = @import("../coordinated_ttl.zig");
 pub const RaftAppliedEntryIdentity = types.RaftAppliedEntryIdentity;
 pub const aggregations = @import("aggregations_contract.zig");
 pub const algebraic = @import("algebraic/control_root.zig");

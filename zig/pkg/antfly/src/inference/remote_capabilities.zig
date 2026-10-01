@@ -632,7 +632,6 @@ fn trimOperationSuffix(value: []const u8) []const u8 {
     for ([_][]const u8{
         "/chat/completions",
         "/generate/batch",
-        "/rerank_multimodal",
         "/embeddings",
     }) |suffix| {
         if (std.mem.endsWith(u8, out, suffix)) {
@@ -780,6 +779,7 @@ const ExactWireCapabilities = struct {
     borrowed_attachments: bool,
     framed_attachments: bool,
     numeric_responses_v1: bool,
+    rerank_documents_v1: bool,
     image_transform: ?work.ImageTransform = null,
     task_limits: work.TaskResourceLimits = .{},
 };
@@ -940,6 +940,10 @@ fn parseExactWireCapabilities(object: std.json.ObjectMap, version: usize) !Exact
         if (value != .bool) return error.InvalidInferenceCapabilities;
         break :blk value.bool;
     } else false;
+    const rerank_documents_v1 = if (object.get("rerank_documents_v1")) |value| blk: {
+        if (value != .bool) return error.InvalidInferenceCapabilities;
+        break :blk value.bool;
+    } else false;
     return .{
         .modalities = .{
             .text = hasString(modality_values, "text"),
@@ -955,6 +959,7 @@ fn parseExactWireCapabilities(object: std.json.ObjectMap, version: usize) !Exact
         .borrowed_attachments = borrowed_value.bool,
         .framed_attachments = framed_attachments,
         .numeric_responses_v1 = numeric_responses_v1,
+        .rerank_documents_v1 = rerank_documents_v1,
         .image_transform = try parseImageTransform(object),
         .task_limits = if (version >= 4) try parseTaskResourceLimits(object) else .{},
     };
@@ -1035,6 +1040,7 @@ pub fn parseModelCapabilities(
         .borrowed_attachments = false,
         .framed_attachments = if (exact) |value| value.framed_attachments else false,
         .numeric_responses_v1 = if (exact) |value| value.numeric_responses_v1 else false,
+        .rerank_documents_v1 = if (exact) |value| value.rerank_documents_v1 else false,
     };
     if (resolved == null) if (capability_values) |values| {
         for (values.items) |value| {
@@ -1295,7 +1301,6 @@ test "remote Antfly model catalog URL normalizes service and operation URLs" {
         "embeddings",
         "chunk",
         "rerank",
-        "rerank_multimodal",
         "extract",
         "generate",
         "generate/batch",
@@ -1400,6 +1405,23 @@ test "remote Antfly capability v4 negotiates framed attachment transport" {
     const malformed = try std.mem.replaceOwned(u8, std.testing.allocator, numeric_payload, "\"numeric_responses_v1\":true", "\"numeric_responses_v1\":1");
     defer std.testing.allocator.free(malformed);
     try std.testing.expectError(error.InvalidInferenceCapabilities, parseModelCapabilities(std.testing.allocator, malformed, "clipclap", .embed));
+}
+
+test "remote Antfly capability v4 negotiates rerank documents" {
+    const payload =
+        \\{"rerankers":{"colqwen":{"inputs":["text","image"],"inference_capabilities":{"version":4,"task":"rerank","input_modalities":["text","image"],"accepted_mime_types":["text/plain","image/png"],"input_granularity":"item","output":"ranked_items","result_cardinality":"one_per_request","prompt_policy":"explicit","borrowed_attachments":false,"framed_attachments":true,"numeric_responses_v1":true,"task_limits":{"max_text_bytes_per_item":null,"max_input_tokens_per_item":null,"max_output_tokens_per_item":null,"max_candidates_per_request":null,"max_schema_bytes":null},"batch":{"mode":"native","preferred_items":8,"max_items":64,"max_encoded_media_bytes":1048576,"max_decoded_pixels":16777216,"max_media_parts_per_item":4,"per_item_failures":false}}}}}
+    ;
+    // A pre-`documents` server omits the flag, which must read as false.
+    const legacy = (try parseModelCapabilities(std.testing.allocator, payload, "colqwen", .rerank)).?;
+    try std.testing.expect(!legacy.rerank_documents_v1);
+    try std.testing.expect(legacy.input_modalities.image);
+    const current_payload = try std.mem.replaceOwned(u8, std.testing.allocator, payload, "\"numeric_responses_v1\":true", "\"numeric_responses_v1\":true,\"rerank_documents_v1\":true");
+    defer std.testing.allocator.free(current_payload);
+    const current = (try parseModelCapabilities(std.testing.allocator, current_payload, "colqwen", .rerank)).?;
+    try std.testing.expect(current.rerank_documents_v1);
+    const malformed = try std.mem.replaceOwned(u8, std.testing.allocator, current_payload, "\"rerank_documents_v1\":true", "\"rerank_documents_v1\":\"yes\"");
+    defer std.testing.allocator.free(malformed);
+    try std.testing.expectError(error.InvalidInferenceCapabilities, parseModelCapabilities(std.testing.allocator, malformed, "colqwen", .rerank));
 }
 
 test "remote Antfly exact capabilities reject image MIME unsupported by local codec" {

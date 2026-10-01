@@ -125,10 +125,20 @@ const (
 	antflyRuntimeUID int64 = 10001
 	antflyRuntimeGID int64 = 10001
 
-	antflySecretStoreVolumeName                   = "secret-store"
-	antflySecretStoreDefaultKey                   = "secrets.json"
-	antflySecretStoreDefaultPath                  = "/run/antfly/secrets/secrets.json" // #nosec G101 -- file path, not a credential
-	antflyExtensionPackageStoreEnvVar             = "ANTFLY_EXTENSION_PACKAGE_STORE"
+	antflySecretStoreVolumeName       = "secret-store"
+	antflySecretStoreDefaultKey       = "secrets.json"
+	antflySecretStoreDefaultPath      = "/run/antfly/secrets/secrets.json" // #nosec G101 -- file path, not a credential
+	antflyExtensionPackageStoreEnvVar = "ANTFLY_EXTENSION_PACKAGE_STORE"
+	// antflyProcessMemoryBudgetEnvVar tells the Antfly/inference runtime its
+	// process memory envelope in MiB. It matters for Burstable pods whose
+	// request is below the container's memory limit: Kubernetes still sets
+	// the cgroup hard limit to that (finite) Limits value, but does not
+	// otherwise expose the intended operating envelope, and a container with
+	// only a Requests value (no Limits) gets an unbounded ("max") cgroup. See
+	// zig/MANAGERS.md "Budget derivation". The operator sets this only when
+	// the pod has an explicit memory limit, to a value safely below it so the
+	// process throttles itself before the kernel OOM-kills the container.
+	antflyProcessMemoryBudgetEnvVar               = "ANTFLY_PROCESS_MEMORY_BUDGET_MB" // #nosec G101 -- environment variable name, not a credential
 	antflyStandaloneExtensionPackageStore         = "/antflydb/extensions"
 	antflyInternalServiceSecretEnvVar             = "ANTFLY_INTERNAL_SERVICE_SECRET"              // #nosec G101 -- environment variable name, not a credential
 	antflyInternalServiceVerificationSecretEnvVar = "ANTFLY_INTERNAL_SERVICE_VERIFICATION_SECRET" // #nosec G101 -- environment variable name, not a credential
@@ -181,6 +191,7 @@ const (
 	haStartupGateReceiptHashAnnotation = "antfly.io/ha-startup-receipt-hash"
 	haSeedRoleAnnotation               = "antfly.io/ha-seed-role"
 	haTopologyIDAnnotation             = "antfly.io/ha-topology-id"
+	haCatalogReplicationAnnotation     = "antfly.io/ha-catalog-replication"
 	haTopologyGenerationAnnotation     = "antfly.io/ha-topology-generation"
 	haNodeIDAnnotation                 = "antfly.io/ha-node-id"
 	haSlotNameAnnotation               = "antfly.io/ha-slot-name"
@@ -782,7 +793,7 @@ func haDefaultDataLayoutPaths(layout antflyv1.HADataLayout) haDataLayoutPaths {
 	}
 }
 
-func standaloneHAArgs(ha *antflyv1.HighAvailabilitySpec, startupGeneration string, layout antflyv1.HADataLayout) string {
+func standaloneHAArgs(ha *antflyv1.HighAvailabilitySpec, startupGeneration string, layout antflyv1.HADataLayout, catalogReplication bool) string {
 	if ha == nil || ha.Mode == antflyv1.HAModeDisabled || ha.Runtime == nil || ha.Identity == nil {
 		return ""
 	}
@@ -894,10 +905,12 @@ func standaloneHAArgs(ha *antflyv1.HighAvailabilitySpec, startupGeneration strin
 	}
 	appendHAArg("--ha-seed-capture-root", seedCaptureRoot)
 	appendHAUint("--ha-cluster-id", identity.ClusterID)
-	if identity.ShardID != 0 {
+	// Persisted zero-valued identities predate catalog replication. Preserve
+	// their omitted CLI flags unless the cluster explicitly opts into 0/0.
+	if catalogReplication || identity.ShardID != 0 {
 		appendHAUint("--ha-shard-id", identity.ShardID)
 	}
-	if identity.TableID != 0 {
+	if catalogReplication || identity.TableID != 0 {
 		appendHAUint("--ha-table-id", identity.TableID)
 	}
 	appendHAUint("--ha-timeline-id", identity.TimelineID)
@@ -1923,12 +1936,16 @@ func (r *AntflyClusterReconciler) applyDefaults(cluster *antflyv1.AntflyCluster)
 			cluster.Spec.Standalone.Health.Port = 4200
 		}
 		if cluster.Spec.Standalone.Inference == nil {
+			// Leave APIURL unset: standalone runs its embedded, in-process
+			// inference provider by default. In the Zig runtime, a set
+			// inference.api_url is a hard isolation contract that disables the
+			// embedded provider, preloads, and /ai/v1 routes, so the operator
+			// must never invent one. Only an explicit user-supplied APIURL (or
+			// a value already present in spec.config) should point standalone
+			// at an external/shared inference endpoint.
 			cluster.Spec.Standalone.Inference = &antflyv1.StandaloneInferenceSpec{
 				Enabled: true,
-				APIURL:  "http://0.0.0.0:11433",
 			}
-		} else if cluster.Spec.Standalone.Inference.APIURL == "" {
-			cluster.Spec.Standalone.Inference.APIURL = "http://0.0.0.0:11433"
 		}
 	}
 
@@ -4344,9 +4361,16 @@ func (r *AntflyClusterReconciler) generateStandaloneConfig(cluster *antflyv1.Ant
 		return "", fmt.Errorf("spec.standalone is required when spec.mode=Standalone")
 	}
 	inferenceEnabled := standalone.Inference == nil || standalone.Inference.Enabled
-	inferenceAPIURL := "http://0.0.0.0:11433"
-	if standalone.Inference != nil && standalone.Inference.APIURL != "" {
-		inferenceAPIURL = standalone.Inference.APIURL
+	// An explicit inference.apiURL is a hard isolation contract in the Zig
+	// runtime: when set, standalone disables its embedded, in-process
+	// inference provider (preloads and /ai/v1 routes included) and expects a
+	// real listener at that address. Only emit api_url when the user actually
+	// pinned one (spec.standalone.inference.apiURL) — never invent a value
+	// such as the old http://0.0.0.0:11433 default, which nothing listens on
+	// and which silently broke embedded inference.
+	inferenceAPIURL := ""
+	if standalone.Inference != nil {
+		inferenceAPIURL = strings.TrimSpace(standalone.Inference.APIURL)
 	}
 
 	// Parse user-provided configuration
@@ -4390,8 +4414,17 @@ func (r *AntflyClusterReconciler) generateStandaloneConfig(cluster *antflyv1.Ant
 		if userInference, ok := userConfig["inference"].(map[string]any); ok {
 			maps.Copy(inferenceConfig, userInference)
 		}
-		inferenceConfig["api_url"] = inferenceAPIURL
-		completeConfig["inference"] = inferenceConfig
+		if inferenceAPIURL != "" {
+			// spec.standalone.inference.apiURL always wins: it is the explicit,
+			// user-pinned external/shared endpoint.
+			inferenceConfig["api_url"] = inferenceAPIURL
+		}
+		// Otherwise leave api_url exactly as the user's raw spec.config set it
+		// (including unset), so embedded inference stays enabled unless the
+		// user explicitly opted out of it.
+		if len(inferenceConfig) > 0 {
+			completeConfig["inference"] = inferenceConfig
+		}
 	}
 
 	completeConfig["storage"] = standaloneRuntimeStorageConfig(cluster)
@@ -4940,6 +4973,17 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 				},
 			)
 		}
+		standaloneResources := r.buildResourceRequirements(standalone.Resources)
+		standaloneEnv := append(
+			append(append(haRuntimeAdminTokenEnv(cluster.Spec.HighAvailability), haPodUIDEnv()...), haRuntimeLeaseEnv(cluster)...),
+			corev1.EnvVar{
+				Name:  antflyExtensionPackageStoreEnvVar,
+				Value: antflyStandaloneExtensionPackageStore,
+			},
+		)
+		if budgetEnv := processMemoryBudgetEnvVar(standaloneResources.Limits); budgetEnv != nil {
+			standaloneEnv = append(standaloneEnv, *budgetEnv)
+		}
 		statefulSet.Spec.Template = corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
 				Labels:      podLabels(cluster, component),
@@ -4957,13 +5001,7 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 						Image:           cluster.Spec.Image,
 						ImagePullPolicy: corev1.PullPolicy(cluster.Spec.ImagePullPolicy),
 						EnvFrom:         envFromSources,
-						Env: append(
-							append(append(haRuntimeAdminTokenEnv(cluster.Spec.HighAvailability), haPodUIDEnv()...), haRuntimeLeaseEnv(cluster)...),
-							corev1.EnvVar{
-								Name:  antflyExtensionPackageStoreEnvVar,
-								Value: antflyStandaloneExtensionPackageStore,
-							},
-						),
+						Env:             standaloneEnv,
 						Ports: []corev1.ContainerPort{
 							{
 								Name:          "metadata-api",
@@ -5004,11 +5042,11 @@ exec /antfly standalone --id %d --config /config/config.json \
 								standalone.MetadataAPI.Port,
 								standalone.Health.Port,
 								secretStoreArg(cluster.Spec.SecretStore),
-								standaloneHAArgs(cluster.Spec.HighAvailability, standaloneHAStartupGeneration(cluster), haDataLayout),
+								standaloneHAArgs(cluster.Spec.HighAvailability, standaloneHAStartupGeneration(cluster), haDataLayout, cluster.Annotations[haCatalogReplicationAnnotation] == "true"),
 								standaloneHAStartupArgs(cluster),
 							),
 						},
-						Resources:    r.buildResourceRequirements(standalone.Resources),
+						Resources:    standaloneResources,
 						StartupProbe: buildHTTPStartupProbe(standalone.Health.Port, standalone.StartupProbe),
 						LivenessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{
@@ -5708,6 +5746,44 @@ func (r *AntflyClusterReconciler) buildResourceRequirements(resourceSpec antflyv
 	}
 
 	return requirements
+}
+
+// processMemoryBudgetMB derives the ANTFLY_PROCESS_MEMORY_BUDGET_MB value
+// from a container's memory limit, leaving 10% headroom below the cgroup hard
+// limit so the runtime throttles/rejects before the kernel OOM-kills the
+// container. It returns ok=false when no memory limit is set, since an
+// unbounded ("max") cgroup gives no safe envelope to derive from.
+func processMemoryBudgetMB(limits corev1.ResourceList) (int64, bool) {
+	if limits == nil {
+		return 0, false
+	}
+	qty, ok := limits[corev1.ResourceMemory]
+	if !ok {
+		return 0, false
+	}
+	limitBytes := qty.Value()
+	if limitBytes <= 0 {
+		return 0, false
+	}
+	const mib = 1024 * 1024
+	budget := (limitBytes * 9 / 10) / mib
+	if budget < 1 {
+		budget = 1
+	}
+	return budget, true
+}
+
+// processMemoryBudgetEnvVar builds the ANTFLY_PROCESS_MEMORY_BUDGET_MB
+// EnvVar for a container's resource limits, or nil when no budget applies.
+func processMemoryBudgetEnvVar(limits corev1.ResourceList) *corev1.EnvVar {
+	budgetMB, ok := processMemoryBudgetMB(limits)
+	if !ok {
+		return nil
+	}
+	return &corev1.EnvVar{
+		Name:  antflyProcessMemoryBudgetEnvVar,
+		Value: strconv.FormatInt(budgetMB, 10),
+	}
 }
 
 func buildHTTPStartupProbe(port int32, cfg *antflyv1.ProbeConfig) *corev1.Probe {
@@ -6410,6 +6486,24 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 				return err
 			}
 			return nil
+		}
+		// Retry receipt collection before checking target identity. A completed job
+		// with unreadable output is missing evidence, not a stale activation: do
+		// not reset its attempt and rerun activation while logs can be recovered.
+		if action.AdminJobPhase == haAdminJobPhaseSucceeded &&
+			haActionRequiresSeedArtifactReceipt(haActionKind(action.Kind)) && action.SeedArtifactReceipt == nil {
+			// Older operators may already have armed TTL before collecting a
+			// receipt. Disarm it before reading or checkpointing recovered logs.
+			if err := r.ensureHAAdminJobTTLAfterCheckpoint(ctx, cluster, ha.Admin, action); err != nil {
+				return err
+			}
+			r.updateHAAdminActionResultFromJobLogs(ctx, cluster, action)
+			if action.SeedArtifactReceipt == nil {
+				continue
+			}
+			// Checkpoint recovered evidence before dependencies execute or TTL
+			// cleanup can remove its only durable source.
+			return errHAPlanNeedsPersistence
 		}
 		if haActionKind(action.Kind) == haActionActivateSeedArtifact && action.AdminJobPhase == haAdminJobPhaseSucceeded {
 			current, err := r.haActivationReceiptMatchesCurrentTarget(ctx, cluster, *action)
@@ -9291,7 +9385,25 @@ func (r *AntflyClusterReconciler) updateHAAdminActionResultFromJobLogs(ctx conte
 	action.AdminResult = result
 }
 
+// haSeedArtifactReceiptBody accepts observed CLI output with zero
+// or more complete warning: diagnostic lines, then exactly one JSON document.
+// Only leading diagnostics are stripped. The receipt decoder still rejects
+// unknown fields, multiple documents, and any content after the receipt. Never
+// search for braces or choose a matching object from an arbitrary log stream.
+func haSeedArtifactReceiptBody(body string) string {
+	body = strings.TrimSpace(body)
+	for strings.HasPrefix(body, "warning: ") {
+		_, rest, found := strings.Cut(body, "\n")
+		if !found {
+			return ""
+		}
+		body = strings.TrimSpace(rest)
+	}
+	return body
+}
+
 func parseHASeedArtifactReceipt(body string, action antflyv1.HAPlannedActionStatus) *antflyv1.HASeedArtifactReceiptStatus {
+	body = haSeedArtifactReceiptBody(body)
 	type chunkReceipt struct {
 		Index     uint64 `json:"index"`
 		SizeBytes uint64 `json:"size_bytes"`
@@ -11086,6 +11198,7 @@ func (r *AntflyClusterReconciler) observeHAPrimaryAdminStatus(ctx context.Contex
 			haStatus.PrimaryAdminConsecutiveFailures++
 		}
 		haStatus.PrimaryAdminReachable = false
+		haStatus.CatalogObserved = false
 		haStatus.PrimaryAdminLastError = err.Error()
 		if statusCode, ok := adminsdk.HAStatusCode(err); ok {
 			haStatus.PrimaryAdminStatusCode = statusCode
@@ -11107,6 +11220,11 @@ func (r *AntflyClusterReconciler) observeHAPrimaryAdminStatus(ctx context.Contex
 	cluster.Status.HAStatus.PrimaryAdminUnreachableSince = nil
 	cluster.Status.HAStatus.PrimaryAdminFailureThresholdMet = false
 	cluster.Status.HAStatus.PrimaryLSN = status.PrimaryLSN
+	if (status.WaitingForTables != nil && !*status.WaitingForTables) || haActivationHasStarted(cluster.Status.HAStatus) || len(status.Standbys) > 0 {
+		cluster.Status.HAStatus.ActivationStarted = true
+	}
+	cluster.Status.HAStatus.CatalogObserved = status.WaitingForTables != nil
+	cluster.Status.HAStatus.WaitingForTables = status.WaitingForTables != nil && *status.WaitingForTables && !cluster.Status.HAStatus.ActivationStarted
 	cluster.Status.HAStatus.Retention = status.Retention
 	if status.WatchdogProof != nil {
 		cluster.Status.HAStatus.PrimaryWatchdogProof = status.WatchdogProof.DeepCopy()
@@ -11288,6 +11406,7 @@ func haAdminSyncFailureParam(policy antflyv1.HAFailurePolicy) adminsdk.HAPrimary
 }
 
 type haObservedPrimaryStatus struct {
+	WaitingForTables *bool
 	NodeID           string
 	PrimaryLSN       uint64
 	Retention        antflyv1.HARetentionStatus
@@ -11332,9 +11451,10 @@ func parseHAPrimaryStatusJSON(raw []byte) (haObservedPrimaryStatus, error) {
 func haObservedPrimaryStatusFromAdminSDK(parsed adminsdk.ParsedHAPrimaryStatus) haObservedPrimaryStatus {
 	snapshot := parsed.Response.Snapshot
 	status := haObservedPrimaryStatus{
-		NodeID:     strings.TrimSpace(snapshot.NodeId),
-		Identity:   haObservedIdentityFromAdminSDK(snapshot.Identity),
-		PrimaryLSN: snapshot.CurrentLsn,
+		NodeID:           strings.TrimSpace(snapshot.NodeId),
+		WaitingForTables: snapshot.WaitingForTables,
+		Identity:         haObservedIdentityFromAdminSDK(snapshot.Identity),
+		PrimaryLSN:       snapshot.CurrentLsn,
 		Retention: antflyv1.HARetentionStatus{
 			OldestRestartLSN:  snapshot.Retention.OldestRestartLsn,
 			RetainedLSNCount:  snapshot.Retention.RetainedLsnCount,
@@ -13072,6 +13192,20 @@ func (r *AntflyClusterReconciler) ensureHAAdminJobTTLAfterCheckpoint(ctx context
 		}
 		return fmt.Errorf("get terminal HA admin Job %s before enabling TTL: %w", action.AdminJobName, err)
 	}
+	// A terminal phase alone does not checkpoint machine-readable evidence.
+	// Keep the original pod/logs available for recovery until it is validated.
+	if action.AdminJobPhase == haAdminJobPhaseSucceeded &&
+		haActionRequiresSeedArtifactReceipt(haActionKind(action.Kind)) && !haAdminActionSucceededWithEvidence(*action) {
+		if job.Spec.TTLSecondsAfterFinished == nil {
+			return nil
+		}
+		patch := client.MergeFrom(job.DeepCopy())
+		job.Spec.TTLSecondsAfterFinished = nil
+		if err := r.Patch(ctx, job, patch); err != nil {
+			return fmt.Errorf("disable TTL cleanup for HA admin Job %s missing receipt evidence: %w", action.AdminJobName, err)
+		}
+		return nil
+	}
 	desired := haAdminJobTTLSecondsAfterFinished(admin)
 	if job.Spec.TTLSecondsAfterFinished != nil && *job.Spec.TTLSecondsAfterFinished == desired {
 		return nil
@@ -13263,16 +13397,16 @@ func haSeedArtifactPVCStorage(name string, pvc *antflyv1.HASeedArtifactPVCSpec, 
 		return nil, nil
 	}
 	return []corev1.VolumeMount{{
-			Name:      name,
-			MountPath: pvc.MountPath,
+		Name:      name,
+		MountPath: pvc.MountPath,
+		ReadOnly:  readOnly,
+	}}, []corev1.Volume{{
+		Name: name,
+		VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+			ClaimName: pvc.ClaimName,
 			ReadOnly:  readOnly,
-		}}, []corev1.Volume{{
-			Name: name,
-			VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-				ClaimName: pvc.ClaimName,
-				ReadOnly:  readOnly,
-			}},
-		}}
+		}},
+	}}
 }
 
 func haSeedArtifactForAction(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) *antflyv1.HASeedArtifactSpec {

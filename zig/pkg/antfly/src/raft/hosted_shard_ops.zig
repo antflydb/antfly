@@ -867,7 +867,7 @@ test "hosted shard operation adapter rediscovers leader across placed replicas" 
             return 1;
         }
 
-        fn groupNodeIds(_: *anyopaque, alloc: std.mem.Allocator, _: u64) ![]u64 {
+        fn groupNodeIds(_: *anyopaque, alloc: std.mem.Allocator, _: u64, _: api_table_router.RouteBudget) ![]u64 {
             return try alloc.dupe(u64, &.{ 1, 2, 3 });
         }
 
@@ -1189,7 +1189,7 @@ test "hosted shard db adapter rediscovers median key after stale leader route" {
             return 1;
         }
 
-        fn groupNodeIds(_: *anyopaque, alloc: std.mem.Allocator, _: u64) ![]u64 {
+        fn groupNodeIds(_: *anyopaque, alloc: std.mem.Allocator, _: u64, _: api_table_router.RouteBudget) ![]u64 {
             return try alloc.dupe(u64, &.{ 1, 2, 3 });
         }
 

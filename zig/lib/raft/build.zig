@@ -31,6 +31,29 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(lib);
 
+    const heartbeat_bench = b.addExecutable(.{
+        .name = "raft-heartbeat-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/heartbeats.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "raft", .module = lib_mod }},
+        }),
+    });
+    b.step("heartbeat-bench", "Compare per-group and bounded peer heartbeat encoding").dependOn(&b.addRunArtifact(heartbeat_bench).step);
+
+    const retry_bench = b.addExecutable(.{
+        .name = "raft-retry-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/retries.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "raft", .module = lib_mod }},
+        }),
+    });
+    b.step("retry-bench", "Measure bounded retry draining after a node reconnects").dependOn(&b.addRunArtifact(retry_bench).step);
+
     const lib_unit_tests = b.addTest(.{
         .root_module = lib_mod,
     });

@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+pub const coordinated_ttl = @import("../coordinated_ttl.zig");
 const query_search = @import("query/search_exec.zig");
 const distributed_stats = @import("../../search/distributed_stats.zig");
 const planning_adapter = @import("planning_adapter.zig");
@@ -25,6 +26,7 @@ const query_graph = @import("query/graph_exec.zig");
 const query_result_shape = @import("query/result_shape.zig");
 
 pub const types = @import("types.zig");
+pub const ArtifactPublicationDispatcher = @import("artifact_publication.zig").Dispatcher;
 pub const merge_state = @import("merge_state.zig");
 pub const docstore = @import("../docstore.zig");
 pub const lease = @import("lease.zig");
@@ -87,6 +89,7 @@ pub const EntitySink = promotion_runtime.EntitySink;
 pub const EntityUpsert = promotion_runtime.EntityUpsert;
 pub const PromotionOwner = promotion_runtime.PromotionOwner;
 pub const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
+pub const SearchWithDenseProfileResult = @import("antfly_source_root").antfly_sources.physical_db.SearchWithDenseProfileResult;
 pub const RaftAppliedEntryIdentity = @import("antfly_source_root").antfly_sources.physical_db.RaftAppliedEntryIdentity;
 pub const LsmOwnerKind = DB.LsmOwnerKind;
 pub const LsmOwnerStats = DB.LsmOwnerStats;
@@ -194,6 +197,9 @@ pub const testing = if (builtin.is_test) struct {
 } else struct {};
 
 test {
+    _ = @import("artifact_publication_transport.zig");
+    _ = @import("artifact_publication_transport_codec.zig");
+    _ = @import("root_signing_identity.zig");
     _ = types;
     _ = merge_state;
     _ = docstore;

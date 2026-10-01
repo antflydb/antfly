@@ -34,6 +34,7 @@ pub const QueryResponse = query_contract.QueryResponse;
 pub const QueryResponseMeta = query_contract.QueryResponseMeta;
 pub const OwnedQueryRequest = query_contract.OwnedQueryRequest;
 pub const PublicFilterQueryErrorKind = query_contract.PublicFilterQueryErrorKind;
+pub const SemanticResolver = query_contract.SemanticResolver;
 
 pub const parseQueryRequest = query_contract.parseQueryRequest;
 pub const parseGraphMetricRequestsAlloc = query_contract.parseGraphMetricRequestsAlloc;
@@ -1766,9 +1767,14 @@ fn validateRequestedGraphMetricFanIn(
                 if (!std.mem.eql(u8, metric_result.index_name, query.query.index_name)) return error.UnsupportedQueryRequest;
                 if (!std.mem.eql(u8, metric_result.metric_name, query.query.metric_name)) return error.UnsupportedQueryRequest;
                 if (!std.mem.eql(u8, metric_result.status.name, query.query.metric_name)) return error.UnsupportedQueryRequest;
-                if (metric_result.status.published_generation == 0) return error.UnsupportedQueryRequest;
-                try validateGraphMetricPublishedStatus(metric_result.status);
-                try validateGraphMetricFreshness(query.query.freshness, metric_result.status);
+                // Seeded rankings are computed fresh from the shard's edge
+                // snapshot rather than read from a published generation, so
+                // their publication state carries no fan-in requirement.
+                if (query.query.seed_nodes.len == 0) {
+                    if (metric_result.status.published_generation == 0) return error.UnsupportedQueryRequest;
+                    try validateGraphMetricPublishedStatus(metric_result.status);
+                    try validateGraphMetricFreshness(query.query.freshness, metric_result.status);
+                }
             }
             if (!found) return error.UnsupportedQueryRequest;
         }
@@ -1948,9 +1954,13 @@ fn mergeGraphMetricRerankStatus(
     for (results) |result| {
         const status = result.graph_metric_rerank_status orelse return error.UnsupportedQueryRequest;
         if (!std.mem.eql(u8, status.name, rerank.metric_name)) return error.UnsupportedQueryRequest;
-        if (status.published_generation == 0) return error.UnsupportedQueryRequest;
-        try validateGraphMetricPublishedStatus(status);
-        try validateGraphMetricFreshness(rerank.freshness, status);
+        // Seeded rerank scores are computed fresh at query time; their
+        // publication state carries no fan-in requirement.
+        if (rerank.seed_nodes.len == 0) {
+            if (status.published_generation == 0) return error.UnsupportedQueryRequest;
+            try validateGraphMetricPublishedStatus(status);
+            try validateGraphMetricFreshness(rerank.freshness, status);
+        }
         if (merged) |*existing| {
             if (existing.published_generation != status.published_generation) return error.UnsupportedQueryRequest;
             try validateGraphMetricStatusCompatible(existing.*, status);

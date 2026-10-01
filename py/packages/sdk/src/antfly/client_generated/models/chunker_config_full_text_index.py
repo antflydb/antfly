@@ -11,9 +11,11 @@ T = TypeVar("T", bound="ChunkerConfigFullTextIndex")
 
 @_attrs_define
 class ChunkerConfigFullTextIndex:
-    """Configuration for full-text indexing of chunks in Bleve.
-    When present (even if empty), chunks will be stored with :cft: suffix and indexed in Bleve's _chunks field.
-    When absent, chunks use :c: suffix and are only used for vector embeddings.
+    """Configuration for full-text indexing of chunks.
+    When present (even if empty), chunk artifacts are persisted and indexed in Antfly's native full-text index,
+    queryable and projectable via the document's `_chunks` field.
+    When absent, chunks are generated only to drive vector embeddings and are not indexed for full-text search (unless
+    `store_chunks` is also set).
 
     """
 

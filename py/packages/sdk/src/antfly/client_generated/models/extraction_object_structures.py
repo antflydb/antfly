@@ -11,7 +11,10 @@ T = TypeVar("T", bound="ExtractionObjectStructures")
 
 @_attrs_define
 class ExtractionObjectStructures:
-    """ """
+    """Structure name to record array. Each record maps field names to value objects or arrays of value objects; v2 value
+    objects follow ExtractionFieldValue.
+
+    """
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 

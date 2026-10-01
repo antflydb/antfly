@@ -1,0 +1,20 @@
+{
+  "name": "open_modes",
+  "description": "Writer, read-only, and status-only opens; one writer per file; busy timeout; opening a missing file.",
+  "open": {"create": true, "no_sync": true},
+  "steps": [
+    {"op": "batch", "timestamp": 1, "writes": [{"key": "doc:mode", "value": {"title": "open modes"}}]},
+    {"op": "open_second", "mode": "writer", "expect": {"error": "ANTFLY_BUSY"}},
+    {"op": "open_second", "mode": "writer", "busy_timeout_ms": 50, "expect": {"error": "ANTFLY_BUSY"}},
+    {"op": "open_second", "mode": "readonly"},
+    {"op": "open_second", "path": "missing.aflite", "expect": {"error": "ANTFLY_NOT_FOUND"}},
+    {"op": "reopen", "mode": "readonly"},
+    {"op": "lookup", "key": "doc:mode", "expect": {"json_subset": {"title": "open modes"}}},
+    {"op": "batch", "timestamp": 2, "writes": [{"key": "doc:blocked", "value": {"title": "no"}}], "expect": {"error": "ANTFLY_INVALID_ARGUMENT"}},
+    {"op": "reopen", "mode": "status_only"},
+    {"op": "status", "expect": {"json_subset": {"storage": {"format": "aflite"}}}},
+    {"op": "reopen", "mode": "writer", "no_sync": true},
+    {"op": "batch", "timestamp": 3, "writes": [{"key": "doc:after", "value": {"title": "writer again"}}]},
+    {"op": "lookup", "key": "doc:after", "expect": {"json_subset": {"title": "writer again"}}}
+  ]
+}

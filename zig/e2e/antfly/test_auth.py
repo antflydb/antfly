@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 import signal
 import subprocess
@@ -27,12 +28,12 @@ from pathlib import Path
 
 import pytest
 import requests
-
 from conftest import (
+    AUTH_BOOTSTRAP_PASSWORD,
     DEFAULT_ANTFLY_BIN,
     StatefulAntflyServer,
-    _standalone_stateful_command,
     _read_log_tail,
+    _standalone_stateful_command,
     antfly_public_api_url,
     lookup_key_path,
     maybe_preserve_tempdir,
@@ -49,7 +50,7 @@ AUTH_SETUP_RETRY_TIMEOUT_SECONDS = 30.0
 
 
 def _basic_auth(username: str, password: str) -> str:
-    raw = f"{username}:{password}".encode("utf-8")
+    raw = f"{username}:{password}".encode()
     return "Basic " + base64.b64encode(raw).decode("ascii")
 
 
@@ -72,7 +73,7 @@ def _wait_for_admin_auth(
     deadline = time.monotonic() + timeout
     session = requests.Session()
     session.headers["Connection"] = "close"
-    session.headers["Authorization"] = _basic_auth("admin", "admin")
+    session.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
     while time.monotonic() < deadline:
         try:
             request_timeout = max(0.1, min(2.0, deadline - time.monotonic()))
@@ -98,7 +99,7 @@ def _wait_until(predicate, timeout: float = 30.0, interval: float = 0.25):
     return None
 
 
-def _try_lookup(api: "AuthApi", table_name: str, key: str):
+def _try_lookup(api: AuthApi, table_name: str, key: str):
     try:
         return api.lookup_key(table_name, key)
     except requests.HTTPError as err:
@@ -111,7 +112,7 @@ def _try_lookup(api: "AuthApi", table_name: str, key: str):
 
 class AuthApi:
     def __init__(
-        self, base_url: str, server_ref: "StandaloneAuthServer | SplitAuthServer"
+        self, base_url: str, server_ref: StandaloneAuthServer | SplitAuthServer
     ):
         self.url = base_url.rstrip("/")
         self.auth_url = self._auth_url_from_db_url(self.url)
@@ -264,6 +265,10 @@ class StandaloneAuthServer:
                 (port,),
                 lambda: subprocess.Popen(
                     command,
+                    env={
+                        **os.environ,
+                        "ANTFLY_BOOTSTRAP_ADMIN_PASSWORD": AUTH_BOOTSTRAP_PASSWORD,
+                    },
                     stdout=self.log_file,
                     stderr=subprocess.STDOUT,
                     cwd=root,
@@ -272,7 +277,9 @@ class StandaloneAuthServer:
         except BaseException:
             self.stop()
             raise
-        if not wait_for_server(self.api_url, allow_unauthorized=True):
+        if not wait_for_server(
+            self.api_url, allow_unauthorized=True, processes=[("server", self.proc)]
+        ):
             self.stop()
             out = _read_log_tail(self.log_path)
             raise RuntimeError(
@@ -367,11 +374,17 @@ def stateful_auth_api():
         server.stop()
 
 
-def test_standalone_auth_defaults_to_local_admin_user(auth_api: AuthApi):
+def test_standalone_auth_uses_configured_admin_password(auth_api: AuthApi):
+    rejected = auth_api.s.get(
+        f"{auth_api.auth_url}/me",
+        headers={"Authorization": _basic_auth("admin", "admin")},
+        timeout=30,
+    )
+    assert rejected.status_code == 401
     response = auth_api.s.get(f"{auth_api.url}/status", timeout=30)
     assert response.status_code == 401
 
-    auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    auth_api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
     me = auth_api.get("/auth/v1/me")
     assert me["username"] == "admin"
     assert any(
@@ -383,7 +396,7 @@ def test_standalone_auth_defaults_to_local_admin_user(auth_api: AuthApi):
 
 
 def test_standalone_auth_user_and_api_key_flow(auth_api: AuthApi):
-    auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    auth_api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
 
     created = auth_api.post(
         "/auth/v1/users/alice",
@@ -429,7 +442,7 @@ def test_standalone_auth_user_and_api_key_flow(auth_api: AuthApi):
 
 
 def test_standalone_auth_api_keys_follow_owner_permissions(auth_api: AuthApi):
-    auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    auth_api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
     auth_api.create_table("docs")
     auth_api.batch_write(
         "docs",
@@ -473,7 +486,7 @@ def test_standalone_auth_api_keys_follow_owner_permissions(auth_api: AuthApi):
     tables = auth_api.get("/tables")
     assert any(table["name"] == "docs" for table in tables)
 
-    auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    auth_api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
     read_only_key = auth_api.post(
         "/auth/v1/users/alice/api-keys",
         {
@@ -503,9 +516,10 @@ def test_standalone_auth_api_keys_follow_owner_permissions(auth_api: AuthApi):
     assert write_resp.status_code == 403
 
     tables_resp = auth_api.s.get(f"{auth_api.url}/tables", timeout=30)
-    assert tables_resp.status_code == 403
+    assert tables_resp.status_code == 200
+    assert [table["name"] for table in tables_resp.json()] == ["docs"]
 
-    auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    auth_api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
     escalated = auth_api.s.post(
         f"{auth_api.auth_url}/users/alice/api-keys",
         json={
@@ -527,7 +541,7 @@ def test_standalone_auth_api_keys_follow_owner_permissions(auth_api: AuthApi):
     invalid = auth_api.s.get(f"{auth_api.url}/status", timeout=30)
     assert invalid.status_code == 401
 
-    auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    auth_api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
     keys = auth_api.get("/auth/v1/users/alice/api-keys")
     assert len(keys) == 2
     auth_api.delete(f"/auth/v1/users/alice/api-keys/{full_key['key_id']}")
@@ -539,14 +553,14 @@ def test_standalone_auth_api_keys_follow_owner_permissions(auth_api: AuthApi):
     auth_api.s.headers["Authorization"] = f"ApiKey {read_only_key['encoded']}"
     assert auth_api.get("/status")["auth_enabled"] is True
 
-    auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    auth_api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
     remaining = auth_api.get("/auth/v1/users/alice/api-keys")
     assert len(remaining) == 1
     assert remaining[0]["key_id"] == read_only_key["key_id"]
 
 
 def test_standalone_auth_enforces_row_filters_on_lookup_and_scan(auth_api: AuthApi):
-    auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    auth_api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
     auth_api.create_table("docs")
     auth_api.batch_write(
         "docs",
@@ -608,11 +622,13 @@ def test_standalone_auth_enforces_row_filters_on_lookup_and_scan(auth_api: AuthA
     assert scan_result[0]["title"] == "gold doc"
 
 
-def test_stateful_auth_defaults_to_local_admin_user(stateful_auth_api: AuthApi):
+def test_stateful_auth_uses_configured_admin_password(stateful_auth_api: AuthApi):
     response = stateful_auth_api.s.get(f"{stateful_auth_api.url}/status", timeout=30)
     assert response.status_code == 401
 
-    stateful_auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    stateful_auth_api.s.headers["Authorization"] = _basic_auth(
+        "admin", AUTH_BOOTSTRAP_PASSWORD
+    )
     me = stateful_auth_api.get("/auth/v1/me")
     assert me["username"] == "admin"
     assert any(
@@ -624,7 +640,9 @@ def test_stateful_auth_defaults_to_local_admin_user(stateful_auth_api: AuthApi):
 
 
 def test_stateful_auth_enforces_table_permissions(stateful_auth_api: AuthApi):
-    stateful_auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    stateful_auth_api.s.headers["Authorization"] = _basic_auth(
+        "admin", AUTH_BOOTSTRAP_PASSWORD
+    )
     stateful_auth_api.create_table("docs")
     stateful_auth_api.batch_write(
         "docs",
@@ -666,7 +684,8 @@ def test_stateful_auth_enforces_table_permissions(stateful_auth_api: AuthApi):
     assert write_resp.status_code == 403
 
     tables_resp = stateful_auth_api.request_raw("GET", "/tables", timeout=30)
-    assert tables_resp.status_code == 403
+    assert tables_resp.status_code == 200
+    assert [table["name"] for table in tables_resp.json()] == ["docs"]
 
     admin_resp = stateful_auth_api.request_raw("GET", "/auth/v1/users", timeout=30)
     assert admin_resp.status_code == 403
@@ -675,7 +694,9 @@ def test_stateful_auth_enforces_table_permissions(stateful_auth_api: AuthApi):
 def test_stateful_auth_enforces_row_filters_on_lookup_and_scan(
     stateful_auth_api: AuthApi,
 ):
-    stateful_auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    stateful_auth_api.s.headers["Authorization"] = _basic_auth(
+        "admin", AUTH_BOOTSTRAP_PASSWORD
+    )
     stateful_auth_api.create_table("docs")
     stateful_auth_api.batch_write(
         "docs",
@@ -739,3 +760,213 @@ def test_stateful_auth_enforces_row_filters_on_lookup_and_scan(
     assert [entry["_id"] for entry in scan_result] == ["doc:gold"]
     assert scan_result[0]["tier"] == "gold"
     assert scan_result[0]["title"] == "gold doc"
+
+
+@pytest.mark.e2e_resource("antfly_process")
+@pytest.mark.parametrize("fixture_name", ["auth_api", "stateful_auth_api"])
+def test_system_catalog_scoped_permissions_and_row_filters(request, fixture_name):
+    api = request.getfixturevalue(fixture_name)
+    api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
+    api.post("/databases/tenant", {})
+    for namespace in ("allowed", "secret"):
+        api.post(f"/databases/tenant/namespaces/{namespace}", {})
+        path = f"/databases/tenant/namespaces/{namespace}/tables/events"
+        api.post(path, {"num_shards": 1})
+        api.post(
+            path + "/batch",
+            {
+                "inserts": {"gold": {"tier": "gold"}, "silver": {"tier": "silver"}},
+                "sync_level": "full_index",
+            },
+        )
+    api.post(
+        "/auth/v1/users/reader",
+        {
+            "password": "reader",
+            "initial_policies": [
+                {
+                    "table_target": {
+                        "database": "tenant",
+                        "namespace": "allowed",
+                        "table": "events",
+                    },
+                    "resource_type": "table",
+                    "type": "read",
+                }
+            ],
+        },
+    )
+    api.put(
+        "/auth/v1/users/reader/row-filters/events?database=tenant&namespace=allowed",
+        {"term": {"tier": "gold"}},
+    )
+    api.s.headers["Authorization"] = _basic_auth("reader", "reader")
+    for path in ("/databases/tenant/namespaces/allowed/tables/events",):
+        assert api.get(path + "/documents/gold") == {"tier": "gold"}
+        hidden = api.s.get(api.url + path + "/documents/silver", timeout=30)
+        assert hidden.status_code == 404, hidden.text
+        result = api.post(
+            path + "/query", {"full_text_search": {"match_all": {}}, "limit": 10}
+        )
+        response = result["responses"][0]
+        assert response["table"] == "tenant.allowed.events"
+        assert response["hits"]["total"]["value"] == 1
+        assert [hit["_id"] for hit in response["hits"]["hits"]] == ["gold"]
+        joined = api.post(
+            path + "/query",
+            {
+                "full_text_search": {"match_all": {}},
+                "join": {
+                    "right_target": {
+                        "database": "tenant",
+                        "namespace": "allowed",
+                        "table": "events",
+                    },
+                    "on": {"left_field": "tier", "right_field": "tier"},
+                    "right_fields": ["tier"],
+                },
+                "limit": 10,
+            },
+        )["responses"][0]
+        assert len(joined["hits"]["hits"]) == 1, joined
+        assert (
+            joined["hits"]["hits"][0]["_source"]["tenant.allowed.events.tier"] == "gold"
+        )
+        forbidden = api.s.post(
+            api.url + path + "/batch", json={"inserts": {"bad": {}}}, timeout=30
+        )
+        assert forbidden.status_code == 403, forbidden.text
+        forbidden = api.s.post(
+            api.url + path + "/indexes/graph_idx/graph-metrics/rank:pause",
+            json={},
+            timeout=30,
+        )
+        assert forbidden.status_code == 403, forbidden.text
+    for path in ("/databases/tenant/namespaces/secret/tables/events",):
+        forbidden = api.s.get(api.url + path + "/documents/gold", timeout=30)
+        assert forbidden.status_code == 403, forbidden.text
+    line = {
+        "table_target": {
+            "database": "tenant",
+            "namespace": "allowed",
+            "table": "events",
+        },
+        "full_text_search": {"match_all": {}},
+        "limit": 10,
+    }
+    allowed = api.s.post(
+        api.url + "/query",
+        data=json.dumps(line) + "\n",
+        headers={"Content-Type": "application/x-ndjson"},
+        timeout=30,
+    )
+    assert allowed.status_code == 200, allowed.text
+    assert allowed.json()["responses"][0]["table"] == "tenant.allowed.events"
+    assert allowed.json()["responses"][0]["hits"]["total"]["value"] == 1
+    denied = api.s.post(
+        api.url + "/query",
+        data=json.dumps(line)
+        + "\n"
+        + json.dumps(
+            {
+                **line,
+                "table_target": {
+                    "database": "tenant",
+                    "namespace": "secret",
+                    "table": "events",
+                },
+            }
+        )
+        + "\n",
+        headers={"Content-Type": "application/x-ndjson"},
+        timeout=30,
+    )
+    assert denied.status_code == 403, denied.text
+    api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
+    original = api.get("/databases/tenant/namespaces/allowed/tables/events")["table_id"]
+    api.post("/databases/tenant/namespaces/allowed/rename", {"name": "moved"})
+    assert (
+        api.get("/databases/tenant/namespaces/moved/tables/events")["table_id"]
+        == original
+    )
+    missing = api.s.get(
+        api.url + "/databases/tenant/namespaces/allowed/tables/events", timeout=30
+    )
+    assert missing.status_code == 404, missing.text
+    api.s.headers["Authorization"] = _basic_auth("reader", "reader")
+    denied = api.s.get(
+        api.url + "/databases/tenant/namespaces/moved/tables/events/documents/gold",
+        timeout=30,
+    )
+    assert denied.status_code == 403, denied.text
+    api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
+    api.delete("/databases/tenant/namespaces/moved/tables/events")
+    api.delete("/databases/tenant/namespaces/secret/tables/events")
+    api.delete("/databases/tenant")
+
+
+def test_system_catalog_exact_star_grant_is_not_global(auth_api):
+    api = auth_api
+    api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
+    api.post("/tables/%21", {"num_shards": 1})
+    for name in ("%2A", "other"):
+        api.post("/tables/" + name, {"num_shards": 1})
+        api.post(
+            "/tables/" + name + "/batch",
+            {
+                "inserts": {"gold": {"tier": "gold"}, "silver": {"tier": "silver"}},
+                "sync_level": "full_index",
+            },
+        )
+    api.post(
+        "/auth/v1/users/star_reader",
+        {
+            "password": "reader",
+            "initial_policies": [
+                {
+                    "resource_type": "table",
+                    "table_target": {"table": "*"},
+                    "type": "read",
+                }
+            ],
+        },
+    )
+    api.put(
+        "/auth/v1/users/star_reader/row-filters/%2A?database=default&namespace=public",
+        {"term": {"tier": "gold"}},
+    )
+    api.s.headers["Authorization"] = _basic_auth("star_reader", "reader")
+    assert api.get("/tables/%2A/documents/gold") == {"tier": "gold"}
+    assert (
+        api.s.get(api.url + "/tables/%2A/documents/silver", timeout=30).status_code
+        == 404
+    )
+    assert (
+        api.s.get(api.url + "/tables/other/documents/gold", timeout=30).status_code
+        == 403
+    )
+    assert api.get("/tables/%2A")["name"] == "*"
+    assert api.s.get(api.url + "/tables/other", timeout=30).status_code == 403
+    assert [table["name"] for table in api.get("/tables")] == ["*"]
+    # A bounded page can contain only denied rows. Its cursor must advance
+    # without exposing private names or granting access on the next request.
+    response = api.s.get(api.url + "/tables", params={"limit": 1}, timeout=30)
+    assert response.status_code == 200, response.text
+    assert response.json() == []
+    cursor = response.headers["X-Antfly-Next-Cursor"]
+    response = api.s.get(
+        api.url + "/tables", params={"limit": 1, "cursor": cursor}, timeout=30
+    )
+    assert response.status_code == 200, response.text
+    assert [table["name"] for table in response.json()] == ["*"]
+    cursor = response.headers["X-Antfly-Next-Cursor"]
+    response = api.s.get(
+        api.url + "/tables", params={"limit": 1, "cursor": cursor}, timeout=30
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == []
+    assert "X-Antfly-Next-Cursor" not in response.headers
+    api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
+    api.delete("/tables/%2A")
+    api.delete("/tables/other")
+    api.delete("/tables/%21")

@@ -84,7 +84,8 @@ def sync_detailed(
 
     Args:
         user_name (str):  Example: johndoe.
-        body (Permission):
+        body (Permission): Specify exactly one of a legacy literal resource or a structured
+            table_target; table_target requires resource_type table.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -118,7 +119,8 @@ def sync(
 
     Args:
         user_name (str):  Example: johndoe.
-        body (Permission):
+        body (Permission): Specify exactly one of a legacy literal resource or a structured
+            table_target; table_target requires resource_type table.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -147,7 +149,8 @@ async def asyncio_detailed(
 
     Args:
         user_name (str):  Example: johndoe.
-        body (Permission):
+        body (Permission): Specify exactly one of a legacy literal resource or a structured
+            table_target; table_target requires resource_type table.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -179,7 +182,8 @@ async def asyncio(
 
     Args:
         user_name (str):  Example: johndoe.
-        body (Permission):
+        body (Permission): Specify exactly one of a legacy literal resource or a structured
+            table_target; table_target requires resource_type table.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

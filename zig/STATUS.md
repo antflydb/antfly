@@ -80,33 +80,17 @@ request-path-repair rule remain live constraints.
 
 ### Dated E2E Observations
 
-Observed on 2026-05-01:
+Known live gap: split-process heartbeat propagation is not yet proven in a
+real E2E run (an API-only process can still report synthetic status instead of
+the data owner's published runtime status); see TODO.md/FLAKES.md. Managed
+embedding lifecycle, schema-migration full-text rebuild readiness, and CDC
+status-summary counters have also shown status-plane publisher gaps in E2E
+runs rather than proven runtime-status contract bugs.
 
-- `e2e/antfly/test_distributed_status.py::test_non_host_api_reports_remote_index_status_from_metadata_heartbeat`
-  is the clearest status-subsystem failure. The data owner publishes runtime
-  status into metadata heartbeat, but the API-only process still reports
-  `runtime_source = "synthetic_config"` with `expected_groups = 0` and
-  `reported_groups = 0`. That means the in-process/unit-level distributed
-  status contract is not yet proven in the real split-process heartbeat path.
-- Managed embedding index lifecycle failures are status-plane publisher
-  failures until proven otherwise. The indexes can often answer queries or make
-  progress, but index detail readiness does not reliably reflect that progress
-  after rate-limit recovery, provider pacing, delete/recreate, or artifact
-  corruption recovery.
-- The schema migration full-text rebuild failure has the same status-plane
-  shape: `full_text_index_v1` is created, but readiness does not reach the
-  expected state in the public status path before timeout. The next diagnostic
-  step is to determine whether rebuild work is missing, stuck, or complete but
-  unpublished.
-- CDC failures are metadata status-summary failures, not table runtime-status
-  failures. Snapshot import and streaming changes succeed, but `/status`
-  counters such as `projected_replication_source_statuses_streaming` and
-  `projected_replication_source_statuses_terminal_failed` do not match the
-  projected replication source records exposed elsewhere.
-- `test_occ_conflict_detection` returned HTTP 500 on the first stateless commit
-  in the full E2E run, but focused transaction reruns now pass. If it recurs,
-  it belongs to transaction correctness/error mapping, not runtime status
-  publishing.
+> **Relocated:** The dated 2026-05-01 E2E observation notes (30 lines,
+> including specific failing test names and counters) that previously lived
+> here are preserved verbatim in
+> [work-log/completed/status/dated-e2e-observations-2026-05.md](../work-log/completed/status/dated-e2e-observations-2026-05.md).
 
 ### Missing Shards Are Not First-Class
 
@@ -636,8 +620,7 @@ status into the metadata heartbeat.
   orchestration is stable: owner process stopped, stale heartbeat, table
   placement moved, and API-only node with no local shard. These should assert
   explicit missing or stale status, not readiness.
-- Diagnose the dated E2E gaps recorded under Dated E2E Observations above
-  (observed 2026-05-01, not yet confirmed resolved).
+- Diagnose the live gaps recorded under Dated E2E Observations above.
 
 ## Non-Goals
 

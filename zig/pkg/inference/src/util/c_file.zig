@@ -134,6 +134,13 @@ pub const MmapRegion = struct {
 
     /// Memory-map an entire file read-only. Returns borrowed bytes backed by the OS page cache.
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !MmapRegion {
+        return initLimited(allocator, path, std.math.maxInt(usize));
+    }
+
+    /// Enforce admission on the opened descriptor before mapping its bytes.
+    /// Checking the same descriptor avoids a stat/open substitution window.
+    pub fn initLimited(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) !MmapRegion {
+        if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
         const path_z = try allocator.dupeZ(u8, path);
         defer allocator.free(path_z);
 
@@ -144,6 +151,7 @@ pub const MmapRegion = struct {
         if (size == 0) {
             return error.EmptyFile;
         }
+        if (size > max_bytes) return error.FileTooLarge;
 
         const mapped = try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, 0);
         return .{ .data = mapped, .fd = fd };
@@ -205,6 +213,10 @@ pub const MmapRegion = struct {
     }
 
     pub fn deinit(self: *MmapRegion) void {
+        if (comptime builtin.os.tag == .freestanding) {
+            self.* = undefined;
+            return;
+        }
         const mapped_len = self.data.len;
         const fd = self.fd;
         // Model eviction must release both the process mapping and its clean
@@ -265,8 +277,9 @@ pub fn mmapTempCopy(allocator: std.mem.Allocator, prefix: []const u8, bytes: []c
 
 /// Read an entire file into an allocated buffer.
 /// Max size is configurable (default 100MB for SafeTensors weights).
+pub const default_read_file_max_bytes: usize = 100 * 1024 * 1024;
 pub fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    return readFileMax(allocator, path, 100 * 1024 * 1024);
+    return readFileMax(allocator, path, default_read_file_max_bytes);
 }
 
 /// Read an entire file with a custom max size limit.
@@ -315,6 +328,15 @@ pub const FileIdentity = struct {
     quick_fingerprint_sha256: [32]u8,
 };
 
+/// A read-only mapping and the identity computed from the same open file
+/// description. Callers that validate deployment artifacts use this instead
+/// of identifying one pathname open and mapping a later one, which would let
+/// a concurrent rename substitute different bytes between the two operations.
+pub const MmapRegionWithIdentity = struct {
+    region: MmapRegion,
+    identity: FileIdentity,
+};
+
 const file_identity_sample_bytes: u64 = 64 * 1024;
 const file_identity_sample_points: u64 = 16;
 
@@ -344,6 +366,11 @@ pub fn fileIdentity(allocator: std.mem.Allocator, path: []const u8) !FileIdentit
     defer allocator.free(path_z);
     const fd = try openReadOnlyZ(path_z);
     defer closeFd(fd);
+    return fileIdentityFromFd(allocator, fd);
+}
+
+fn fileIdentityFromFd(allocator: std.mem.Allocator, fd: std.posix.fd_t) !FileIdentity {
+    if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
     const linux = std.os.linux;
     var statx = std.mem.zeroes(linux.Statx);
     while (true) {
@@ -390,6 +417,24 @@ pub fn fileIdentity(allocator: std.mem.Allocator, path: []const u8) !FileIdentit
         .device_major = statx.dev_major,
         .device_minor = statx.dev_minor,
         .quick_fingerprint_sha256 = quick_fingerprint,
+    };
+}
+
+/// Open, identify, and mmap a file through one descriptor. The returned region
+/// owns the descriptor and releases it from `MmapRegion.deinit`.
+pub fn mmapFileWithIdentity(allocator: std.mem.Allocator, path: []const u8) !MmapRegionWithIdentity {
+    if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const fd = try openReadOnlyZ(path_z);
+    errdefer closeFd(fd);
+    const identity = try fileIdentityFromFd(allocator, fd);
+    if (identity.size == 0) return error.EmptyFile;
+    const size = std.math.cast(usize, identity.size) orelse return error.FileTooLarge;
+    const mapped = try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, 0);
+    return .{
+        .region = .{ .data = mapped, .fd = fd },
+        .identity = identity,
     };
 }
 
@@ -653,6 +698,7 @@ fn openReadOnlyZ(path_z: [:0]const u8) !std.posix.fd_t {
 }
 
 fn closeFd(fd: std.posix.fd_t) void {
+    if (comptime builtin.os.tag == .freestanding) return;
     if (comptime builtin.link_libc) {
         _ = c.close(fd);
     } else {

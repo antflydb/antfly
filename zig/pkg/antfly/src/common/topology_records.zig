@@ -11,7 +11,10 @@
 const std = @import("std");
 
 pub const TableRecord = struct {
+    /// Internal metadata lifecycle intent; never accepted as public schema.
+    relational_retirement_json: []const u8 = "",
     storage: @import("table_storage.zig").Settings = .{},
+    storage_migration: ?@import("vector_migration.zig").Admission = null,
     table_id: u64,
     name: []const u8,
     description: []const u8 = "",
@@ -24,6 +27,12 @@ pub const TableRecord = struct {
     restore_location: []const u8 = "",
     desired_replica_count: u16 = 3,
     min_ranges: u32 = 1,
+
+    /// Default legacy tables retain their exact durable record bytes. Storage
+    /// ownership or an admitted migration requires the versioned extension.
+    pub fn requiresStorageMetadataExtension(self: TableRecord) bool {
+        return self.storage.dense_embeddings != .primary_lsm or self.storage_migration != null;
+    }
 
     pub fn migrationState(self: *const TableRecord) TableMigrationState {
         return .{

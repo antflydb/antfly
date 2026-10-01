@@ -1,0 +1,71 @@
+{
+  "source_commit": "f75443eb1d9e97321838696eb215f4d86de3af65",
+  "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+  "optimization": "Debug",
+  "command": "ANTFLY_CATALOG_REPORT_BENCH=1 zig test -lc pkg/antfly/src/data/schema_repair_schedule.zig",
+  "source_sha256": "2467223df794dd883c81ecc1bb5e90430799d050ceeefb294c92c9ddff21ed1e",
+  "workloads": [
+    {
+      "scenario": "schema_repair_completed_prefix",
+      "groups": 1000,
+      "queued": false,
+      "owner_inspections": 500500,
+      "warmups": 1,
+      "samples_ns": [
+        639875,
+        591542,
+        575750,
+        584000,
+        576834
+      ]
+    },
+    {
+      "scenario": "schema_repair_completed_prefix",
+      "groups": 1000,
+      "queued": true,
+      "owner_inspections": 1000,
+      "warmups": 1,
+      "samples_ns": [
+        1850666,
+        1805750,
+        1802542,
+        1771708,
+        1787666
+      ]
+    },
+    {
+      "scenario": "schema_repair_completed_prefix",
+      "groups": 10000,
+      "queued": false,
+      "owner_inspections": 50005000,
+      "warmups": 1,
+      "samples_ns": [
+        57161042,
+        57411500,
+        57166708,
+        57762458,
+        57618667
+      ]
+    },
+    {
+      "scenario": "schema_repair_completed_prefix",
+      "groups": 10000,
+      "queued": true,
+      "owner_inspections": 10000,
+      "warmups": 1,
+      "samples_ns": [
+        18384833,
+        17709000,
+        17877500,
+        17552791,
+        18121875
+      ]
+    }
+  ],
+  "limitations": [
+    "Reference models completed-prefix selection with a boolean array; queued path uses the production Schedule.",
+    "Includes allocation and destruction. Excludes physical owner calls, route discovery, HTTP, Raft, storage and scheduling intervals.",
+    "Owner inspections are modeled counts; CPU timings are not end-to-end migration speedups.",
+    "One warmup and five measured samples per size and path. No compiler jobs observed at measurement start."
+  ]
+}

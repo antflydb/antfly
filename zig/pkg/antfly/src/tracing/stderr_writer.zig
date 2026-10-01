@@ -13,13 +13,15 @@
 // limitations.
 
 const std = @import("std");
+const trace_file = @import("trace_file.zig");
 const raft_engine = @import("raft_engine");
 const antfly_trace_writer = @import("antfly_trace_writer.zig");
 const raft_trace_logger = @import("raft_trace_logger.zig");
 
 /// A std.Io.Writer backed by libc write(2) to a trace output fd.
 ///
-/// When `ANTFLY_TRACE_FILE` is set, output goes to that file (truncated on
+/// `ANTFLY_TRACE_DIR` selects an exclusive file per producer process.
+/// Otherwise, when `ANTFLY_TRACE_FILE` is set, output goes to that file (truncated on
 /// first open). Otherwise output goes to stderr (fd 2). The Zig test runner
 /// reserves stdout for `--listen` IPC, so direct fd-level writes are used.
 const trace_vtable: std.Io.Writer.VTable = .{
@@ -35,9 +37,18 @@ var trace_writer_instance: std.Io.Writer = .{
 };
 
 var trace_fd: std.c.fd_t = -1;
+var trace_mutex: std.atomic.Mutex = .unlocked;
 
 fn getTraceFd() std.c.fd_t {
     if (trace_fd >= 0) return trace_fd;
+
+    // A build target may run several test executables concurrently. Never
+    // share a truncating descriptor between those producer processes.
+    if (std.c.getenv("ANTFLY_TRACE_DIR")) |directory| {
+        trace_fd = trace_file.openProcessFile(std.mem.span(directory), std.c.getpid()) catch
+            @panic("cannot create process-owned trace file in ANTFLY_TRACE_DIR");
+        return trace_fd;
+    }
 
     // Check ANTFLY_TRACE_FILE environment variable
     const path = std.c.getenv("ANTFLY_TRACE_FILE");
@@ -98,7 +109,7 @@ fn writeAllFd(data: []const u8) void {
 /// Module-level singleton trace writer for Antfly transaction events.
 pub fn stderrAntflyTraceWriter() antfly_trace_writer.AntflyTraceWriter {
     const S = struct {
-        var ndjson_writer: antfly_trace_writer.AntflyNdjsonTraceWriter = .{ .writer = &trace_writer_instance };
+        var ndjson_writer: antfly_trace_writer.AntflyNdjsonTraceWriter = .{ .writer = &trace_writer_instance, .shared_mutex = &trace_mutex };
     };
     return S.ndjson_writer.traceWriter();
 }
@@ -106,7 +117,7 @@ pub fn stderrAntflyTraceWriter() antfly_trace_writer.AntflyTraceWriter {
 /// Module-level singleton trace logger for Raft events.
 pub fn stderrRaftTraceLogger() raft_engine.core.TraceLogger {
     const S = struct {
-        var ndjson_logger: raft_trace_logger.RaftNdjsonTraceLogger = .{ .writer = &trace_writer_instance };
+        var ndjson_logger: raft_trace_logger.RaftNdjsonTraceLogger = .{ .writer = &trace_writer_instance, .shared_mutex = &trace_mutex };
     };
     return S.ndjson_logger.traceLogger();
 }

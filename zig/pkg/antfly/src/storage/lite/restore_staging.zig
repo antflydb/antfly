@@ -31,6 +31,7 @@ const query_api = @import("../../api/query.zig");
 const tables_api = @import("../../api/tables.zig");
 const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 const fs_paths = @import("../../common/fs_paths.zig");
+const full_text_index_defaults = @import("../../common/full_text_index_defaults.zig");
 
 pub const max_afb_file_bytes: usize = 16 * 1024 * 1024 * 1024;
 
@@ -71,19 +72,29 @@ pub fn isImportTargetEmpty(allocator: Allocator, db: *db_mod.DB) !bool {
 }
 
 pub fn finalizeRestoredLiteDb(allocator: Allocator, db: *db_mod.DB) !void {
+    var profile = RestoreWorkProfile.init();
     _ = try db.rebuildDenseIndexesForTargetCoverage(allocator);
+    profile.mark(db, "rebuildDenseIndexesForTargetCoverage");
     _ = try db.rebuildSparseIndexesForTargetCoverage(allocator);
+    profile.mark(db, "rebuildSparseIndexesForTargetCoverage");
     try db.rebuildGraphIndexesForTargetCoverage(allocator);
+    profile.mark(db, "rebuildGraphIndexesForTargetCoverage");
     _ = try db.replayGeneratedEnrichmentsFromStoredDocs(allocator);
+    profile.mark(db, "replayGeneratedEnrichmentsFromStoredDocs");
     try db.runUntilIdle();
+    profile.mark(db, "runUntilIdle");
     try db.sync(true);
+    profile.mark(db, "sync");
     try db.syncIndexes(true);
+    profile.mark(db, "syncIndexes");
 }
 
 /// Populates a disposable Lite generation. All archive writes are bounded by
 /// portable block size; callers must delete the file if this returns an error.
 pub fn populateUnpublishedLiteDb(allocator: Allocator, db: *db_mod.DB, backup: []const u8) !void {
+    var profile = RestoreWorkProfile.init();
     try db.importPortableIntoUnpublishedEmpty(allocator, backup, connection.embeddedRootIdentity());
+    profile.mark(db, "import");
     try finalizeRestoredLiteDb(allocator, db);
 }
 
@@ -839,6 +850,17 @@ fn freeBackupShards(allocator: Allocator, shards: []const backups_api.ShardSnaps
     allocator.free(@constCast(shards));
 }
 
+/// Finds an index by name in a `listIndexes` result, order-independent. Every
+/// fresh Lite database now also carries the default full-text index (see
+/// `full_text_index_defaults.zig`), so tests assert specific names are
+/// present instead of relying on a fixed slice order.
+fn indexNamed(indexes: []const db_types.IndexConfig, name: []const u8) ?db_types.IndexConfig {
+    for (indexes) |index| {
+        if (std.mem.eql(u8, index.name, name)) return index;
+    }
+    return null;
+}
+
 test "lite restore staging writer close syncs unsynced batch before readonly reopen" {
     const allocator = std.testing.allocator;
 
@@ -971,8 +993,12 @@ test "lite portable publication never reports a retryable failure after adoption
     try std.testing.expectEqual(@as(u64, 2), recovered_runtime.portable_runtime_activation_attempts);
     const indexes = try target.db.listIndexes(allocator);
     defer db_types.freeIndexConfigs(allocator, indexes);
-    try std.testing.expectEqual(@as(usize, 1), indexes.len);
-    try std.testing.expectEqualStrings("published_ft", indexes[0].name);
+    // The import wholesale-replaces target's catalog with source's, which
+    // carries both source's explicit index and the default full-text index
+    // `LiteDb.create` provisions on every fresh Lite database.
+    try std.testing.expectEqual(@as(usize, 2), indexes.len);
+    try std.testing.expect(indexNamed(indexes, "published_ft") != null);
+    try std.testing.expect(indexNamed(indexes, full_text_index_defaults.default_full_text_index_name) != null);
 
     var restored = (try target.db.lookup(allocator, "doc:published", .{})) orelse return error.MissingPublishedDocument;
     defer restored.deinit(allocator);
@@ -1029,8 +1055,12 @@ test "lite portable publication reports durability unknown after adopting runtim
     defer restored.deinit(allocator);
     const indexes = try target.db.listIndexes(allocator);
     defer db_types.freeIndexConfigs(allocator, indexes);
-    try std.testing.expectEqual(@as(usize, 1), indexes.len);
-    try std.testing.expectEqualStrings("durable_ft", indexes[0].name);
+    // See the comment in the sibling test above: import replaces target's
+    // catalog wholesale with source's, which includes source's own default
+    // full-text index alongside its explicit one.
+    try std.testing.expectEqual(@as(usize, 2), indexes.len);
+    try std.testing.expect(indexNamed(indexes, "durable_ft") != null);
+    try std.testing.expect(indexNamed(indexes, full_text_index_defaults.default_full_text_index_name) != null);
 }
 
 test "lite portable import emptiness rejects tombstones and durable transactions" {
@@ -1285,7 +1315,12 @@ test "lite restore staging expands a self-contained native AFB2 bundle" {
 }
 
 test "lite restore staging accepts aflite input for normal restore" {
-    const allocator = std.testing.allocator;
+    // Keep leak/safety checks without capturing every allocation/free stack.
+    // Opt into tracing when diagnosing a failure.
+    var no_stack_allocator: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(no_stack_allocator.deinit() == .ok);
+    const allocator = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else no_stack_allocator.allocator();
+    var work_profile = RestoreWorkProfile.init();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1338,6 +1373,7 @@ test "lite restore staging accepts aflite input for normal restore" {
             try source.db.addIndex(index.value);
         }
 
+        work_profile.mark(&source.db, "source-index-initialization");
         try source.db.batch(.{
             .writes = &.{
                 .{
@@ -1355,11 +1391,16 @@ test "lite restore staging accepts aflite input for normal restore" {
             },
             .sync_level = .full_index,
         });
+        work_profile.mark(&source.db, "source-batch");
         try source.db.runUntilIdle();
+        work_profile.mark(&source.db, "source-idle");
+        try expectIdleMaintenanceDoesNotPublish(&source.db);
     }
 
+    work_profile.markTime("source-close");
     var staged = try stageInputRestoreBackup(allocator, src_path, "docs", default_backup_id, location);
     defer staged.deinit(allocator);
+    work_profile.markTime("export");
 
     try std.testing.expectEqualStrings(default_backup_id, staged.backup_id);
     try std.testing.expectEqualStrings(location, staged.location);
@@ -1394,6 +1435,7 @@ test "lite restore staging accepts aflite input for normal restore" {
         var restored = try LiteDb.create(allocator, restored_path, true);
         defer restored.close();
         try populateUnpublishedLiteDb(allocator, &restored.db, portable);
+        try expectIdleMaintenanceDoesNotPublish(&restored.db);
 
         const dense = try searchJson(
             allocator,
@@ -1494,7 +1536,12 @@ test "lite restore staging exports stable aflite data while writer has open tran
 }
 
 test "lite portable backup roundtrips through normal table backup APIs" {
-    const allocator = std.testing.allocator;
+    // Keep leak/safety checks without capturing every allocation/free stack.
+    // Opt into tracing when diagnosing a failure.
+    var no_stack_allocator: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(no_stack_allocator.deinit() == .ok);
+    const allocator = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else no_stack_allocator.allocator();
+    var work_profile = RestoreWorkProfile.init();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1547,6 +1594,7 @@ test "lite portable backup roundtrips through normal table backup APIs" {
             try source.db.addIndex(index.value);
         }
 
+        work_profile.mark(&source.db, "source-index-initialization");
         try source.db.batch(.{
             .writes = &.{
                 .{
@@ -1564,11 +1612,16 @@ test "lite portable backup roundtrips through normal table backup APIs" {
             },
             .sync_level = .full_index,
         });
+        work_profile.mark(&source.db, "source-batch");
         try source.db.runUntilIdle();
+        work_profile.mark(&source.db, "source-idle");
+        try expectIdleMaintenanceDoesNotPublish(&source.db);
     }
 
+    work_profile.markTime("source-close");
     var staged = try stageInputRestoreBackup(allocator, src_path, "docs", "lite-normal-lite-in", location);
     defer staged.deinit(allocator);
+    work_profile.markTime("export");
 
     var backup_location = try backups_api.openBackupLocation(allocator, location);
     defer backup_location.deinit(allocator);
@@ -1644,7 +1697,11 @@ test "lite portable backup roundtrips through normal table backup APIs" {
 
         const indexes = try restored.db.listIndexes(allocator);
         defer db_types.freeIndexConfigs(allocator, indexes);
-        try std.testing.expectEqual(@as(usize, 4), indexes.len);
+        // `restored` starts with the default full-text index from
+        // `LiteDb.create`, and `populateUnpublishedLiteDb` additively layers
+        // the portable backup's 4 indexes on top of it.
+        try std.testing.expectEqual(@as(usize, 5), indexes.len);
+        try std.testing.expect(indexNamed(indexes, full_text_index_defaults.default_full_text_index_name) != null);
 
         const enrichments = try restored.db.listEnrichments(allocator);
         defer db_types.freeEnrichmentConfigs(allocator, enrichments);
@@ -1683,4 +1740,35 @@ test "lite portable backup roundtrips through normal table backup APIs" {
         defer allocator.free(hybrid);
         try std.testing.expect(std.mem.indexOf(u8, hybrid, "\"doc:roundtrip:a\"") != null);
     }
+}
+
+// Optional test diagnostics; the production build has no profiling work.
+const RestoreWorkProfile = struct {
+    started: u64,
+    fn init() RestoreWorkProfile {
+        return .{ .started = if (builtin.is_test and @import("antfly_platform").env.getenvBool("ANTFLY_TEST_WORK_PROFILE")) platform_time.monotonicNs() else 0 };
+    }
+    fn markTime(self: *RestoreWorkProfile, label: []const u8) void {
+        if (self.started == 0) return;
+        const now = platform_time.monotonicNs();
+        std.debug.print("\nWORK restore {s} ns={d}\n", .{ label, now - self.started });
+        self.started = now;
+    }
+
+    fn mark(self: *RestoreWorkProfile, db: *db_mod.DB, label: []const u8) void {
+        if (self.started == 0) return;
+        const now = platform_time.monotonicNs();
+        const stats = db.core.index_manager.snapshotLsmWriteStats();
+        std.debug.print("\nWORK restore {s} ns={d} manifest_writes={d} manifest_bytes={d} wal_resets={d}\n", .{ label, now - self.started, stats.manifest_writes, stats.manifest_bytes, stats.wal_resets });
+        self.started = now;
+    }
+};
+
+fn expectIdleMaintenanceDoesNotPublish(db: *db_mod.DB) !void {
+    const before = db.core.index_manager.snapshotLsmWriteStats();
+    // One probe must report quiescence; do not hide extra work in another drain.
+    try std.testing.expect(!try db.runLsmMaintenanceStep());
+    const after = db.core.index_manager.snapshotLsmWriteStats();
+    try std.testing.expectEqual(before.manifest_writes, after.manifest_writes);
+    try std.testing.expectEqual(before.manifest_bytes, after.manifest_bytes);
 }

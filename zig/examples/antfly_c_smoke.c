@@ -58,7 +58,75 @@ static int fail_with_buffer(const char *message, antfly_buffer *buffer) {
     return 1;
 }
 
+/* Runs the inference runtime without a database. Skipped when this build or
+ * host cannot start it (ANTFLY_UNSUPPORTED). */
+static int run_inference_smoke(void) {
+    antfly_inference_options options;
+    if (expect_ok(antfly_inference_options_init(&options), "inference options init") != 0) {
+        return 1;
+    }
+    if (options.abi_size != antfly_inference_options_size()) {
+        fprintf(stderr, "inference options abi_size does not match the library\n");
+        return 1;
+    }
+    antfly_inference *inference = NULL;
+    antfly_error_code code = antfly_inference_open(&options, &inference);
+    if (code == ANTFLY_UNSUPPORTED) {
+        fprintf(stderr, "inference smoke skipped: %s\n", antfly_error_code_name(code));
+        return 0;
+    }
+    if (expect_ok(code, "inference open") != 0) {
+        return 1;
+    }
+
+    antfly_buffer chunks = {0};
+    if (expect_ok(antfly_inference_chunk_json(
+            inference,
+            slice_from_cstr("{\"input\":\"Ants live in colonies. Workers gather food.\"}"),
+            &chunks
+        ), "inference chunk") != 0) {
+        fprintf(stderr, "%.*s\n", (int)chunks.len, chunks.ptr ? (const char *)chunks.ptr : "");
+        antfly_buffer_free(&chunks);
+        antfly_inference_close(inference);
+        return 1;
+    }
+    if (!buffer_contains(chunks, "\"data\"")) {
+        antfly_inference_close(inference);
+        return fail_with_buffer("inference chunk json did not include data", &chunks);
+    }
+    antfly_buffer_free(&chunks);
+
+    antfly_buffer models = {0};
+    if (expect_ok(antfly_inference_list_models_json(inference, &models), "inference list models") != 0) {
+        antfly_buffer_free(&models);
+        antfly_inference_close(inference);
+        return 1;
+    }
+    antfly_buffer_free(&models);
+
+    antfly_buffer pull = {0};
+    if (antfly_inference_pull_json(inference, slice_from_cstr("{}"), NULL, NULL, &pull) != ANTFLY_INVALID_ARGUMENT ||
+        !buffer_contains(pull, "\"error\"")) {
+        antfly_inference_close(inference);
+        return fail_with_buffer("an invalid pull request was not rejected with a JSON error", &pull);
+    }
+    antfly_buffer_free(&pull);
+
+    antfly_inference_close(inference);
+    antfly_inference_close(inference);
+    antfly_buffer after_close = {0};
+    if (antfly_inference_list_models_json(inference, &after_close) != ANTFLY_INVALID_ARGUMENT) {
+        antfly_buffer_free(&after_close);
+        fprintf(stderr, "a closed inference handle was not rejected\n");
+        return 1;
+    }
+    return 0;
+}
+
 int main(void) {
+    if (run_inference_smoke() != 0) {
+        return 1;
+    }
     const char *path = "/tmp/antfly-c-smoke.aflite";
     const char *restored_path = "/tmp/antfly-c-smoke-restored.aflite";
     const char *snapshot_path = "/tmp/antfly-c-smoke-snapshot.aflite";
@@ -70,34 +138,35 @@ int main(void) {
     (void)remove(missing_path);
     (void)remove(bad_path);
 
-    if (antfly_abi_version() != 1) {
+    if (antfly_abi_version() != 2) {
         fprintf(stderr, "unexpected Antfly ABI version: %u\n", antfly_abi_version());
         return 1;
     }
-    if (antfly_lite_open_options_size() != sizeof(antfly_lite_open_options)) {
+    if (antfly_open_options_size() != sizeof(antfly_open_options)) {
         fprintf(
             stderr,
             "Lite open options size mismatch: runtime=%u header=%zu\n",
-            antfly_lite_open_options_size(),
-            sizeof(antfly_lite_open_options)
+            antfly_open_options_size(),
+            sizeof(antfly_open_options)
         );
         return 1;
     }
 
-    antfly_lite_open_options options;
-    if (expect_ok(antfly_lite_open_options_init(&options), "initialize open options") != 0) {
+    antfly_open_options options;
+    if (expect_ok(antfly_open_options_init(&options), "initialize open options") != 0) {
         return 1;
     }
-    if (options.abi_size != sizeof(antfly_lite_open_options)) {
+    if (options.abi_size != sizeof(antfly_open_options)) {
         fprintf(stderr, "initialized open options ABI size did not match public header\n");
         return 1;
     }
-    options.open_mode = ANTFLY_LITE_OPEN_MODE_WRITER;
-    options.profile = ANTFLY_LITE_PROFILE_NATIVE;
-    options.flags = ANTFLY_LITE_OPEN_FLAG_NO_SYNC;
+    options.storage_kind = ANTFLY_STORAGE_KIND_LITE;
+    options.open_mode = ANTFLY_OPEN_MODE_WRITER;
+    options.profile = ANTFLY_PROFILE_NATIVE;
+    options.flags = ANTFLY_OPEN_FLAG_NO_SYNC;
 
     int missing_sentinel = 0;
-    void *missing_handle = &missing_sentinel;
+    antfly_db *missing_handle = (antfly_db *)&missing_sentinel;
     antfly_error_code missing_code = antfly_lite_open(missing_path, &missing_handle);
     if (missing_code != ANTFLY_NOT_FOUND || missing_handle != NULL) {
         fprintf(
@@ -177,8 +246,8 @@ int main(void) {
     antfly_buffer_free(&check_file);
     (void)remove(bad_path);
 
-    void *handle = NULL;
-    if (expect_ok(antfly_lite_create_with_options(path, &options, &handle), "create lite database") != 0) {
+    antfly_db *handle = NULL;
+    if (expect_ok(antfly_db_create_with_options(path, &options, &handle), "create lite database") != 0) {
         (void)remove(path);
         (void)remove(restored_path);
         (void)remove(snapshot_path);
@@ -201,7 +270,7 @@ int main(void) {
     }
 
     antfly_buffer exported_backup = {0};
-    if (expect_ok(antfly_lite_export(handle, &exported_backup), "export lite database") != 0) {
+    if (expect_ok(antfly_db_backup(handle, &exported_backup), "back up lite database") != 0) {
         antfly_db_close(handle);
         (void)remove(path);
         (void)remove(restored_path);
@@ -220,7 +289,7 @@ int main(void) {
     exported_slice.ptr = exported_backup.ptr;
     exported_slice.len = exported_backup.len;
     antfly_buffer restore_report = {0};
-    if (expect_ok(antfly_lite_restore_json(restored_path, exported_slice, false, &restore_report), "restore lite database") != 0) {
+    if (expect_ok(antfly_restore_backup_json(restored_path, &options, exported_slice, false, &restore_report), "restore lite database") != 0) {
         antfly_buffer_free(&exported_backup);
         antfly_db_close(handle);
         (void)remove(path);
@@ -297,7 +366,7 @@ int main(void) {
         return 1;
     }
 
-    void *snapshot_handle = NULL;
+    antfly_db *snapshot_handle = NULL;
     if (expect_ok(antfly_lite_open_readonly(snapshot_path, &snapshot_handle), "open snapshot readonly") != 0) {
         antfly_db_close(handle);
         (void)remove(path);
@@ -348,7 +417,7 @@ int main(void) {
     antfly_buffer_free(&compact);
 
     antfly_buffer status = {0};
-    if (expect_ok(antfly_lite_status_json(handle, &status), "status json") != 0) {
+    if (expect_ok(antfly_db_status_json(handle, &status), "status json") != 0) {
         antfly_db_close(handle);
         (void)remove(path);
         (void)remove(restored_path);
@@ -364,9 +433,9 @@ int main(void) {
         (void)remove(bad_path);
         return fail_with_buffer("status json did not describe native aflite storage", &status);
     }
-    if (!buffer_contains(status, ANTFLY_LITE_INFERENCE_MODE_CALLER_SUPPLIED_OR_DISABLED) ||
-        !buffer_contains(status, ANTFLY_LITE_INFERENCE_MODE_CALLER_SUPPLIED_ARTIFACTS) ||
-        !buffer_contains(status, ANTFLY_LITE_INFERENCE_MODE_DISABLED_DEFERRED)) {
+    if (!buffer_contains(status, ANTFLY_INFERENCE_MODE_CALLER_SUPPLIED_OR_DISABLED) ||
+        !buffer_contains(status, ANTFLY_INFERENCE_MODE_CALLER_SUPPLIED_ARTIFACTS) ||
+        !buffer_contains(status, ANTFLY_INFERENCE_MODE_DISABLED_DEFERRED)) {
         antfly_db_close(handle);
         (void)remove(path);
         (void)remove(restored_path);
@@ -374,7 +443,7 @@ int main(void) {
         (void)remove(bad_path);
         return fail_with_buffer("status json did not expose expected Lite inference modes", &status);
     }
-    antfly_db_buffer_free_zero(&status);
+    antfly_buffer_free_zero(&status);
 
     antfly_db_close(handle);
     (void)remove(path);

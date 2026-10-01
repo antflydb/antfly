@@ -33,6 +33,7 @@ const portable_backup = antfly.portable_backup;
 const lite_paths = antfly.lite.paths;
 const lite_restore_staging = antfly.lite.restore_staging;
 const LiteDb = antfly.lite.connection.Connection;
+const full_text_index_defaults = @import("../common/full_text_index_defaults.zig");
 
 const CompactReport = struct {
     compacted: bool,
@@ -606,6 +607,12 @@ fn importPortableIntoExistingLite(
         var lite = try LiteDb.open(allocator, target_path, .status_only);
         defer lite.close();
         try ensureOfflineRootOnlyOperationSupported(&lite);
+        // Offline publication renames the staged file directly, bypassing the
+        // live-handle generation guard. The target writer lock stays held from
+        // this check through publication so secret state cannot be lost.
+        if (try lite.backend.native_docstore.?.file.hasSecretState()) {
+            return error.LiteImportTargetNotEmpty;
+        }
         if (!(try lite_restore_staging.isImportTargetEmpty(allocator, &lite.db))) {
             return error.LiteImportTargetNotEmpty;
         }
@@ -1279,6 +1286,17 @@ fn writeFileAtomically(allocator: Allocator, io: std.Io, path: []const u8, conte
     };
 }
 
+/// Finds an index by name in a `listIndexes` result, order-independent.
+/// Every freshly created Lite database now also carries the default
+/// full-text index (see `full_text_index_defaults.zig`), so tests assert
+/// specific names are present instead of relying on a fixed slice order.
+fn indexNamed(indexes: []const db_types.IndexConfig, name: []const u8) ?db_types.IndexConfig {
+    for (indexes) |index| {
+        if (std.mem.eql(u8, index.name, name)) return index;
+    }
+    return null;
+}
+
 fn restoreTempPathAlloc(allocator: Allocator, out_path: []const u8) ![]u8 {
     return try std.fmt.allocPrint(allocator, "{s}.restore-tmp.aflite", .{out_path});
 }
@@ -1609,8 +1627,11 @@ test "lite schema index and enrichment commands round trip catalogs" {
 
         const indexes = try lite.db.listIndexes(allocator);
         defer db_types.freeIndexConfigs(allocator, indexes);
-        try std.testing.expectEqual(@as(usize, 1), indexes.len);
-        try std.testing.expectEqualStrings("cmd_ft_body", indexes[0].name);
+        // `init` also provisions the default full-text index alongside the
+        // one explicitly created by `lite index create` above.
+        try std.testing.expectEqual(@as(usize, 2), indexes.len);
+        try std.testing.expect(indexNamed(indexes, "cmd_ft_body") != null);
+        try std.testing.expect(indexNamed(indexes, full_text_index_defaults.default_full_text_index_name) != null);
 
         const enrichments = try lite.db.listEnrichments(allocator);
         defer db_types.freeEnrichmentConfigs(allocator, enrichments);
@@ -1634,9 +1655,12 @@ test "lite schema index and enrichment commands round trip catalogs" {
         var lite = try LiteDb.open(allocator, path, .status_only);
         defer lite.close();
 
+        // Dropping the explicitly created index must not touch the default
+        // full-text index `init` provisioned.
         const indexes = try lite.db.listIndexes(allocator);
         defer db_types.freeIndexConfigs(allocator, indexes);
-        try std.testing.expectEqual(@as(usize, 0), indexes.len);
+        try std.testing.expectEqual(@as(usize, 1), indexes.len);
+        try std.testing.expectEqualStrings(full_text_index_defaults.default_full_text_index_name, indexes[0].name);
 
         const enrichments = try lite.db.listEnrichments(allocator);
         defer db_types.freeEnrichmentConfigs(allocator, enrichments);
@@ -2091,11 +2115,15 @@ test "lite backup output restores schema indexes enrichments and documents" {
 
         const indexes = try restored.db.listIndexes(allocator);
         defer db_types.freeIndexConfigs(allocator, indexes);
-        try std.testing.expectEqual(@as(usize, 4), indexes.len);
+        // `source` also carries the default full-text index `LiteDb.create`
+        // provisions, alongside its 4 explicit indexes; both travel through
+        // the backup/restore round trip.
+        try std.testing.expectEqual(@as(usize, 5), indexes.len);
         var saw_direct_index = false;
         var saw_dense_index = false;
         var saw_sparse_index = false;
         var saw_graph_index = false;
+        var saw_default_index = false;
         for (indexes) |index| {
             if (std.mem.eql(u8, index.name, "ft_direct_v1")) {
                 saw_direct_index = true;
@@ -2109,12 +2137,15 @@ test "lite backup output restores schema indexes enrichments and documents" {
             } else if (std.mem.eql(u8, index.name, "graph_links_v1")) {
                 saw_graph_index = true;
                 try std.testing.expectEqual(db_types.IndexKind.graph, index.kind);
+            } else if (std.mem.eql(u8, index.name, full_text_index_defaults.default_full_text_index_name)) {
+                saw_default_index = true;
             }
         }
         try std.testing.expect(saw_direct_index);
         try std.testing.expect(saw_dense_index);
         try std.testing.expect(saw_sparse_index);
         try std.testing.expect(saw_graph_index);
+        try std.testing.expect(saw_default_index);
 
         const enrichments = try restored.db.listEnrichments(allocator);
         defer db_types.freeEnrichmentConfigs(allocator, enrichments);
@@ -2180,7 +2211,10 @@ test "lite backup output restores schema indexes enrichments and documents" {
 
         const indexes = try imported.db.listIndexes(allocator);
         defer db_types.freeIndexConfigs(allocator, indexes);
-        try std.testing.expectEqual(@as(usize, 4), indexes.len);
+        // The import replaces the target's catalog wholesale with source's,
+        // which includes source's own default full-text index.
+        try std.testing.expectEqual(@as(usize, 5), indexes.len);
+        try std.testing.expect(indexNamed(indexes, full_text_index_defaults.default_full_text_index_name) != null);
 
         const enrichments = try imported.db.listEnrichments(allocator);
         defer db_types.freeEnrichmentConfigs(allocator, enrichments);
@@ -2514,8 +2548,10 @@ test "lite status json includes pending work" {
     var lite = try LiteDb.create(allocator, path, true);
     defer lite.close();
 
+    // `create` already provisions the default full-text index, so this uses
+    // a distinct name to add a second one and exercise pending-work status.
     const index_json =
-        \\{"name":"full_text_index_v0","kind":"full_text","config_json":"{}"}
+        \\{"name":"status_pending_ft_v1","kind":"full_text","config_json":"{}"}
     ;
     var parsed = try std.json.parseFromSlice(db_types.IndexConfig, allocator, index_json, .{
         .ignore_unknown_fields = true,
@@ -2716,13 +2752,23 @@ test "lite snapshot copies stable aflite prefix without source tail" {
     const snapshot_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/snapshot-copy.aflite", .{tmp.sub_path});
     defer allocator.free(snapshot_path);
 
-    const source_size = blk: {
+    {
         var source = try LiteDb.create(allocator, src_path, true);
-        defer source.close();
         const json = try batchJson(allocator, &source.db, "{\"inserts\":{\"doc:lite-snapshot\":{\"title\":\"stable snapshot\"}}}");
         defer allocator.free(json);
         try std.testing.expect(std.mem.indexOf(u8, json, "\"inserted\":1") != null);
-        break :blk (try source.backend.native_docstore.?.file.file.stat(source.backend.native_docstore.?.file.io_impl.io())).size;
+        // Close (and sync) before measuring the file so the default
+        // full-text index's own indexing work for this insert -- which
+        // `close` flushes -- is already durable. Otherwise the size
+        // captured here undercounts the final checkpoint's prefix and the
+        // "tail" bytes appended below land on live pages instead of past
+        // them, corrupting the file instead of appending harmless tail data.
+        source.close();
+    }
+    const source_size = blk: {
+        var source_file = try std.Io.Dir.cwd().openFile(io, src_path, .{ .mode = .read_only });
+        defer source_file.close(io);
+        break :blk (try source_file.stat(io)).size;
     };
 
     {
@@ -2904,4 +2950,105 @@ test "lite promote helper stages backup then submits normal restore request" {
     defer manifest.deinit(allocator);
     try std.testing.expectEqualStrings("docs", manifest.table_name);
     try std.testing.expectEqualStrings(staged.snapshot_path, manifest.shards[0].snapshot_path);
+}
+
+// Test-only authenticated key wrapping; never a production provider.
+const TestSecretKeyProvider = struct {
+    const Record = antfly.common.secret_record;
+    const DataKey = Record.DataKey;
+    const Identity = Record.Identity;
+    const KeyProvider = Record.KeyProvider;
+    const WrappedKey = Record.WrappedKey;
+    const Aead = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
+
+    key: DataKey = [_]u8{7} ** 32,
+    unavailable: bool = false,
+    unwrap_calls: usize = 0,
+    fn provider(self: *@This()) KeyProvider {
+        return .{ .ptr = self, .vtable = &.{ .wrap = wrap, .unwrap = unwrap } };
+    }
+    fn wrap(ptr: *anyopaque, alloc: std.mem.Allocator, identity: Identity, key: *const DataKey) !WrappedKey {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.unavailable) return error.Unavailable;
+        const id = try alloc.dupe(u8, "test-key-1");
+        errdefer alloc.free(id);
+        const bytes = try alloc.alloc(u8, 24 + 32 + 16);
+        errdefer alloc.free(bytes);
+        try std.Options.debug_io.randomSecure(bytes[0..24]);
+        var tag: [16]u8 = undefined;
+        Aead.encrypt(bytes[24..56], &tag, key, identity.scope, bytes[0..24].*, self.key);
+        @memcpy(bytes[56..72], &tag);
+        return .{ .key_id = id, .bytes = bytes };
+    }
+    fn unwrap(ptr: *anyopaque, identity: Identity, key_id: []const u8, bytes: []const u8, key: *DataKey) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.unwrap_calls += 1;
+        if (self.unavailable) return error.Unavailable;
+        if (!std.mem.eql(u8, key_id, "test-key-1") or bytes.len != 72) return error.CorruptInput;
+        Aead.decrypt(key, bytes[24..56], bytes[56..72].*, identity.scope, bytes[0..24].*, self.key) catch return error.CorruptInput;
+    }
+};
+
+test "lite import without replace preserves live secrets and deleted scope revisions" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/secret-source.aflite", .{tmp.sub_path});
+    defer alloc.free(source_path);
+    const backup_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/secret-backup.afb", .{tmp.sub_path});
+    defer alloc.free(backup_path);
+    var portable: std.ArrayList(u8) = .empty;
+    defer portable.deinit(alloc);
+    {
+        var source = try LiteDb.create(alloc, source_path, true);
+        defer source.close();
+        try source.db.batch(.{ .writes = &.{.{ .key = "document", .value = "{}" }} });
+        try portable_backup.exportPortable(alloc, source.db.core.store, &portable);
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = backup_path, .data = portable.items });
+    for ([_]bool{ false, true }) |deleted| {
+        const target_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/secret-target-{s}.aflite", .{ tmp.sub_path, if (deleted) "deleted" else "live" });
+        defer alloc.free(target_path);
+        var provider = TestSecretKeyProvider{};
+        const expected_revision: u64 = if (deleted) 2 else 1;
+        {
+            var target = try LiteDb.create(alloc, target_path, true);
+            defer target.close();
+            var secrets = try target.backend.secretStore(alloc, "scope", provider.provider());
+            defer secrets.deinit();
+            const writer = secrets.nativeStore().?.writer;
+            _ = try writer.put("scope", "token", "credential", .absent);
+            if (deleted) _ = try writer.removeOverride("scope", "token", .{ .exact = 1 });
+        }
+        // CLI dispatch, explicitly without --replace, must reject before staging.
+        try std.testing.expectError(error.LiteImportTargetNotEmpty, importFromSourceFile(alloc, io, backup_path, target_path, false));
+        const staged = try restoreTempPathAlloc(alloc, target_path);
+        defer alloc.free(staged);
+        try std.testing.expect(!pathExists(io, staged));
+        {
+            var target = try LiteDb.open(alloc, target_path, .status_only);
+            defer target.close();
+            var secrets = try target.backend.secretStore(alloc, "scope", provider.provider());
+            defer secrets.deinit();
+            var found = try secrets.source().resolve(alloc, "scope", "token", .{});
+            defer found.deinit(alloc);
+            try std.testing.expectEqual(expected_revision, found.revision);
+            if (deleted) {
+                try std.testing.expect(found.value == null);
+            } else {
+                try std.testing.expectEqualStrings("credential", found.value.?.secret.bytes);
+            }
+            try std.testing.expect((try target.db.lookup(alloc, "document", .{})) == null);
+        }
+        // Deliberate whole-file replacement retains its existing CLI semantics.
+        try importFromSourceFile(alloc, io, backup_path, target_path, true);
+        var replaced = try LiteDb.open(alloc, target_path, .status_only);
+        defer replaced.close();
+        try std.testing.expect(!try replaced.backend.native_docstore.?.file.hasSecretState());
+        var document = (try replaced.db.lookup(alloc, "document", .{})).?;
+        defer document.deinit(alloc);
+    }
 }

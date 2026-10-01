@@ -45,12 +45,15 @@ import { useApiConfig } from "../hooks/use-api-config";
 interface SecretEntry {
   key: string;
   status: "configured_file" | "configured_env" | "configured_both";
+  source?: string;
+  managed?: boolean;
   env_var?: string;
   created_at?: string;
   updated_at?: string;
 }
 
 interface SecretList {
+  writable?: boolean;
   secrets: SecretEntry[];
 }
 
@@ -65,7 +68,7 @@ const COMMON_SECRETS = [
 function statusBadge(status: SecretEntry["status"]) {
   switch (status) {
     case "configured_file":
-      return <Badge className="af-status-badge-success">Keystore</Badge>;
+      return <Badge className="af-status-badge-success">File</Badge>;
     case "configured_env":
       return <Badge className="af-status-badge-info">Env Var</Badge>;
     case "configured_both":
@@ -78,7 +81,7 @@ export function SecretsPage() {
   const [secrets, setSecrets] = useState<SecretEntry[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState("");
-  const [standaloneMode, setStandaloneMode] = useState(false);
+  const [writable, setWritable] = useState(false);
 
   // Add secret dialog state
   const [addDialogOpen, setAddDialogOpen] = useState(false);
@@ -107,22 +110,6 @@ export function SecretsPage() {
     return headers;
   }, []);
 
-  // Check standalone mode from status endpoint
-  useEffect(() => {
-    const checkMode = async () => {
-      try {
-        const response = await fetch(`${apiUrl}/status`, { headers: authHeaders });
-        if (response.ok) {
-          const data = await response.json();
-          setStandaloneMode(data.deployment_mode === "standalone");
-        }
-      } catch {
-        // ignore
-      }
-    };
-    checkMode();
-  }, [apiUrl, authHeaders]);
-
   // Fetch secrets list
   const fetchSecrets = useCallback(async () => {
     try {
@@ -134,6 +121,7 @@ export function SecretsPage() {
       }
       const data = (await response.json()) as SecretList;
       setSecrets(data.secrets || []);
+      setWritable(data.writable === true);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load secrets");
     } finally {
@@ -239,6 +227,11 @@ export function SecretsPage() {
         ),
       },
       {
+        id: "source",
+        header: "Source",
+        cell: ({ row }) => row.original.source || "—",
+      },
+      {
         id: "updated",
         header: "Updated",
         cell: ({ row }) => (
@@ -248,16 +241,17 @@ export function SecretsPage() {
         ),
       },
     ];
-    if (standaloneMode) {
+    if (writable) {
       cols.push({
         id: "actions",
         header: "",
         cell: ({ row }) =>
-          row.original.status === "configured_file" || row.original.status === "configured_both" ? (
+          row.original.managed ? (
             <div className="text-right">
               <Button
                 variant="ghost"
                 size="sm"
+                aria-label={`Delete native override for ${row.original.key}`}
                 onClick={() => handleDeleteSecret(row.original.key)}
                 className="text-muted-foreground hover:text-destructive"
               >
@@ -268,7 +262,7 @@ export function SecretsPage() {
       });
     }
     return cols;
-  }, [standaloneMode, handleDeleteSecret]);
+  }, [writable, handleDeleteSecret]);
 
   const isHttpNonLocal =
     typeof window !== "undefined" &&
@@ -285,7 +279,7 @@ export function SecretsPage() {
           </DashboardPageDescription>
         </div>
         <DashboardPageActions>
-          {standaloneMode && (
+          {writable && (
             <Dialog open={addDialogOpen} onOpenChange={setAddDialogOpen}>
               <DialogTrigger asChild>
                 <Button>
@@ -297,8 +291,8 @@ export function SecretsPage() {
                 <DialogHeader>
                   <DialogTitle>Add Secret</DialogTitle>
                   <DialogDescription>
-                    Store an API key or credential. Values are encrypted at rest and never returned
-                    by the API.
+                    Store an API key or credential in the native store. This overrides external
+                    sources for the same key. Values are never returned by the API.
                   </DialogDescription>
                 </DialogHeader>
                 <div className="space-y-4">
@@ -382,13 +376,12 @@ export function SecretsPage() {
         </DashboardPageActions>
       </DashboardPageHeader>
 
-      {!standaloneMode && (
+      {!writable && (
         <Alert>
           <AlertTriangle className="size-4" />
           <p className="text-sm">
-            Secret management via the dashboard is only available in single-node (standalone) mode.
-            In multi-node deployments, configure secrets using environment variables, Kubernetes
-            secrets, or the <code>antfly keystore add</code> CLI on each node.
+            This server has no writable native secret store. Configure secrets in the external
+            sources, or enable a native store to create overrides.
           </p>
         </Alert>
       )}
@@ -426,7 +419,7 @@ export function SecretsPage() {
         </CardContent>
       </Card>
 
-      {standaloneMode && (
+      {writable && (
         <Card>
           <CardHeader>
             <CardTitle className="text-sm font-medium">Quick Add</CardTitle>
@@ -467,8 +460,8 @@ export function SecretsPage() {
           <AlertDialogHeader>
             <AlertDialogTitle>Delete Secret</AlertDialogTitle>
             <AlertDialogDescription>
-              Are you sure you want to delete secret "{secretToDelete}" from the keystore? This
-              action cannot be undone.
+              Delete the native override for "{secretToDelete}"? A value from an external source or
+              the environment may become active again.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

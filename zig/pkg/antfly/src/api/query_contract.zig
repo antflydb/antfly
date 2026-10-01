@@ -409,6 +409,25 @@ pub const QueryResponseMeta = struct {
         hbc_rerank_vector_physical_reads: u64 = 0,
         hbc_rerank_vector_physical_bytes: u64 = 0,
         hbc_rerank_vector_location_reuses: u64 = 0,
+        hbc_rerank_member_binding_hits: u64 = 0,
+        hbc_rerank_member_binding_batches: u64 = 0,
+        hbc_rerank_member_binding_mixed_batches: u64 = 0,
+        hbc_rerank_member_binding_bytes: u64 = 0,
+        hbc_rerank_read_batches: u64 = 0,
+        hbc_rerank_read_requests: u64 = 0,
+        hbc_rerank_read_helpers: u64 = 0,
+        hbc_rerank_read_denied: u64 = 0,
+        hbc_rerank_read_dispatch_ns: u64 = 0,
+        hbc_rerank_read_caller_ns: u64 = 0,
+        hbc_rerank_read_join_ns: u64 = 0,
+        hbc_rerank_read_worker_wall_ns: u64 = 0,
+        hbc_rerank_read_adaptive_inline_batches: u64 = 0,
+        hbc_rerank_read_adaptive_wide_batches: u64 = 0,
+        hbc_rerank_read_adaptive_probe_ns: u64 = 0,
+        hbc_rerank_read_worker_start_delay_ns: u64 = 0,
+        hbc_rerank_read_mapped_requests: u64 = 0,
+        hbc_rerank_read_mapped_bytes: u64 = 0,
+        hbc_rerank_member_binding_misses: u64 = 0,
         hbc_rerank_vector_block_misses: u64 = 0,
         hbc_rerank_vector_block_fallbacks: u64 = 0,
         hbc_rerank_artifact_cache_hits: u64 = 0,
@@ -2180,6 +2199,9 @@ fn applyCommonSearchRequestOptions(
     if (request.aggregations) |aggregations| {
         req.aggregations_json = try jsonStringifyAlloc(alloc, aggregations);
     }
+    if (comptime @hasField(@TypeOf(request), "highlight")) {
+        if (request.highlight) |highlight| req.highlight = try parseHighlightRequest(alloc, highlight);
+    }
     if (request.filter_prefix) |filter_prefix| req.filter_prefix = try alloc.dupe(u8, filter_prefix);
     if (request.distance_over) |distance_over| req.distance_over = distance_over;
     if (request.distance_under) |distance_under| req.distance_under = distance_under;
@@ -2734,11 +2756,12 @@ pub fn parseQueryRequestWithDeadline(
         req.dense_queries = vector_queries.dense;
         req.sparse_queries = vector_queries.sparse;
     }
+    try normalizeVectorMatchAllComponent(alloc, request, &req);
     if (contract_fields.has_embedding_limits)
         try applyInternalEmbeddingLimits(alloc, effective_body, &req);
     req.graph_queries = try buildGraphQueries(alloc, request);
     req.graph_metric_queries = try parseGraphMetricQueriesAlloc(alloc, effective_body);
-    req.graph_metric_rerank = try parseGraphMetricRerankAlloc(alloc, request.graph_metric_rerank);
+    req.graph_metric_rerank = try parseGraphMetricRerankAlloc(alloc, request.graph_metric_rerank, effective_body);
     if (req.graph_metric_rerank) |rerank| {
         try db_mod.types.validateGraphMetricRerankWindow(rerank, req.offset, req.limit);
     }
@@ -3152,6 +3175,7 @@ fn buildPreflightSearchRequestAlloc(
     errdefer vector_queries.deinit(alloc);
     req.dense_queries = vector_queries.dense;
     req.sparse_queries = vector_queries.sparse;
+    try normalizeVectorMatchAllComponent(alloc, request, &req);
     req.graph_queries = try buildGraphQueries(alloc, request);
     if (comptime @hasField(@TypeOf(request), "expand_strategy")) {
         if (request.expand_strategy) |expand_strategy| {
@@ -3166,11 +3190,29 @@ fn buildPreflightSearchRequestAlloc(
     };
 }
 
+/// A vector request may carry match-all solely to execute filters. It is not a
+/// third retrieval source. Keep an explicitly requested match-all as a text
+/// component, wrapped so aggregation planning can distinguish the two cases.
+fn normalizeVectorMatchAllComponent(alloc: std.mem.Allocator, request: anytype, req: *db_mod.types.SearchRequest) !void {
+    if (req.dense_queries.len == 0 and req.sparse_queries.len == 0) return;
+    const text = req.full_text orelse return;
+    if (text != .match_all) return;
+    const explicit_query_match_all = if (request.query) |query|
+        query == .object and query.object.get("match_all") != null
+    else
+        false;
+    if (request.full_text_search == null and !explicit_query_match_all) {
+        req.full_text = null;
+        return;
+    }
+    const must = try alloc.alloc(db_mod.types.TextQuery, 1);
+    must[0] = text;
+    req.full_text = .{ .bool_query = .{ .must = must } };
+}
+
 fn preflightRequestHasFullTextResults(req: db_mod.types.SearchRequest) bool {
     if (req.full_text != null) return true;
-    if (req.full_text_queries.len > 0) return true;
-    if (req.filter_text != null or req.exclusion_text != null) return true;
-    return req.filter_query_json.len > 0 or req.exclusion_query_json.len > 0;
+    return req.full_text_queries.len > 0;
 }
 
 fn preflightBaseResultSetCount(req: db_mod.types.SearchRequest) u32 {
@@ -3511,7 +3553,7 @@ pub fn encodeQueryResponses(
                 .profile = profile,
                 .took = meta.took_ms,
                 .status = 200,
-                .table = table_name,
+                .table = req.response_table_name orelse table_name,
             };
             break :blk try std.json.Stringify.valueAlloc(
                 alloc,
@@ -3541,7 +3583,7 @@ pub fn encodeQueryResponses(
                 .profile = profile,
                 .took = meta.took_ms,
                 .status = 200,
-                .table = table_name,
+                .table = req.response_table_name orelse table_name,
             };
             break :blk try std.json.Stringify.valueAlloc(
                 alloc,
@@ -3587,6 +3629,7 @@ fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: 
         else
             null,
         .hierarchy = try searchHitHierarchyOpenApiValue(alloc, req, hit),
+        ._highlights = try highlightsJsonValue(alloc, hit.highlights),
     };
 }
 
@@ -6013,6 +6056,49 @@ fn buildRerankerQueryTextFromValue(alloc: std.mem.Allocator, input: anytype) ![]
     return try jsonStringifyAlloc(alloc, value);
 }
 
+fn parseHighlightRequest(alloc: std.mem.Allocator, value: anytype) !db_mod.types.HighlightRequest {
+    var out: db_mod.types.HighlightRequest = .{};
+    if (value.fields) |fields| out.fields = try cloneFields(alloc, fields);
+    errdefer freeHighlightRequest(alloc, out);
+    if (value.fragment_size) |size| {
+        if (size < 16 or size > 4096) return error.InvalidQueryRequest;
+        out.fragment_size = @intCast(size);
+    }
+    if (value.max_fragments) |count| {
+        if (count < 1 or count > 20) return error.InvalidQueryRequest;
+        out.max_fragments = @intCast(count);
+    }
+    return out;
+}
+
+fn freeHighlightRequest(alloc: std.mem.Allocator, value: db_mod.types.HighlightRequest) void {
+    for (value.fields) |field| alloc.free(field);
+    if (value.fields.len > 0) alloc.free(value.fields);
+}
+
+fn highlightsJsonValue(
+    alloc: std.mem.Allocator,
+    items: []const db_mod.types.HighlightedField,
+) !?std.json.ArrayHashMap([]const metadata_openapi.HighlightFragment) {
+    if (items.len == 0) return null;
+    var out = std.json.ArrayHashMap([]const metadata_openapi.HighlightFragment){};
+    for (items) |item| {
+        const fragments = try alloc.alloc(metadata_openapi.HighlightFragment, item.fragments.len);
+        for (item.fragments, fragments) |fragment, *dst| {
+            const spans = try alloc.alloc(metadata_openapi.HighlightSpan, fragment.spans.len);
+            for (fragment.spans, spans) |span, *span_dst| span_dst.* = .{ .start = span.start, .end = span.end };
+            dst.* = .{
+                .text = fragment.text,
+                .offset = fragment.offset,
+                .item = if (fragment.item) |index| @as(i64, index) else null,
+                .spans = spans,
+            };
+        }
+        try out.map.put(alloc, item.field, fragments);
+    }
+    return out;
+}
+
 fn cloneFields(alloc: std.mem.Allocator, value: []const []const u8) ![][]const u8 {
     const fields = try alloc.alloc([]const u8, value.len);
     var initialized: usize = 0;
@@ -6266,7 +6352,23 @@ fn buildTextFilterQueryAlloc(
     } };
 }
 
+/// Public `filter_query` / `exclusion_query` entry point. The whole value is
+/// checked against the traversal budget once here; the recursive walk below
+/// only ever sees a tree that is already known to be bounded, so nested
+/// arrays and bool wrappers cannot exhaust the stack before a leaf clause
+/// reaches its own bounded parser.
 fn appendPublicFilterOrTextClausesAlloc(
+    alloc: std.mem.Allocator,
+    structured: *std.ArrayListUnmanaged([]u8),
+    text: *std.ArrayListUnmanaged(db_mod.types.TextQuery),
+    query_or_queries: std.json.Value,
+    limit: u32,
+) !void {
+    try validatePublicQueryTraversalBudgetAlloc(alloc, query_or_queries);
+    return appendPublicFilterOrTextClausesBoundedAlloc(alloc, structured, text, query_or_queries, limit);
+}
+
+fn appendPublicFilterOrTextClausesBoundedAlloc(
     alloc: std.mem.Allocator,
     structured: *std.ArrayListUnmanaged([]u8),
     text: *std.ArrayListUnmanaged(db_mod.types.TextQuery),
@@ -6276,12 +6378,12 @@ fn appendPublicFilterOrTextClausesAlloc(
     if (query_or_queries == .array) {
         if (query_or_queries.array.items.len == 0) return error.InvalidQueryRequest;
         for (query_or_queries.array.items) |item| {
-            try appendPublicFilterOrTextClausesAlloc(alloc, structured, text, item, limit);
+            try appendPublicFilterOrTextClausesBoundedAlloc(alloc, structured, text, item, limit);
         }
         return;
     }
     if (nonScoringBoolFilterValue(query_or_queries)) |filter| {
-        try appendPublicFilterOrTextClausesAlloc(alloc, structured, text, filter, limit);
+        try appendPublicFilterOrTextClausesBoundedAlloc(alloc, structured, text, filter, limit);
         return;
     }
     if (try appendPositiveMixedFilterConjunctionAlloc(
@@ -6324,7 +6426,7 @@ fn appendPositiveMixedFilterConjunctionAlloc(
         if (value.object.get("boost") != null) recognized += 1;
         if (recognized != value.object.count()) return false;
         _ = try parseCanonicalBoolBoost(value.object.get("boost"));
-        try appendPublicFilterOrTextClausesAlloc(
+        try appendPublicFilterOrTextClausesBoundedAlloc(
             alloc,
             &mixed_structured,
             &mixed_text,
@@ -6350,7 +6452,7 @@ fn appendPositiveMixedFilterConjunctionAlloc(
         if (must == null and filter == null) return false;
         _ = try parseCanonicalBoolBoost(bool_value.object.get("boost"));
         if (must) |children| {
-            try appendPublicFilterOrTextClausesAlloc(
+            try appendPublicFilterOrTextClausesBoundedAlloc(
                 alloc,
                 &mixed_structured,
                 &mixed_text,
@@ -6359,7 +6461,7 @@ fn appendPositiveMixedFilterConjunctionAlloc(
             );
         }
         if (filter) |children| {
-            try appendPublicFilterOrTextClausesAlloc(
+            try appendPublicFilterOrTextClausesBoundedAlloc(
                 alloc,
                 &mixed_structured,
                 &mixed_text,
@@ -6392,7 +6494,7 @@ fn validatePublicFilterOrTextQueryAlloc(
     defer deinitOwnedStringArrayList(alloc, &structured);
     var text = std.ArrayListUnmanaged(db_mod.types.TextQuery).empty;
     defer deinitTextQueryArrayList(alloc, &text);
-    try appendPublicFilterOrTextClausesAlloc(
+    try appendPublicFilterOrTextClausesBoundedAlloc(
         alloc,
         &structured,
         &text,
@@ -6450,7 +6552,7 @@ fn appendCanonicalPublicQueryAlloc(
                 );
             }
             if (bool_value.object.get("filter")) |filter_value| {
-                try appendPublicFilterOrTextClausesAlloc(
+                try appendPublicFilterOrTextClausesBoundedAlloc(
                     alloc,
                     filter_clauses,
                     filter_text_queries,
@@ -6459,7 +6561,7 @@ fn appendCanonicalPublicQueryAlloc(
                 );
             }
             if (bool_value.object.get("must_not")) |must_not_value| {
-                try appendPublicFilterOrTextClausesAlloc(
+                try appendPublicFilterOrTextClausesBoundedAlloc(
                     alloc,
                     exclusion_clauses,
                     exclusion_text_queries,
@@ -8767,6 +8869,7 @@ fn parseGraphMetricQueriesAlloc(
                 alloc.free(item.name);
                 alloc.free(item.query.index_name);
                 alloc.free(item.query.metric_name);
+                freeOwnedStringSlice(alloc, item.query.seed_nodes);
             }
             alloc.free(items);
         }
@@ -8786,6 +8889,8 @@ fn parseGraphMetricQueriesAlloc(
                 try parseGraphMetricFreshness(raw)
             else
                 db_mod.types.GraphMetricFreshness.published;
+            const personalization = try parseGraphMetricPersonalizationAlloc(alloc, value.object, freshness);
+            errdefer freeOwnedStringSlice(alloc, personalization.seed_nodes);
             const owned_name = try alloc.dupe(u8, result_name);
             errdefer alloc.free(owned_name);
             const owned_index_name = try alloc.dupe(u8, index_name);
@@ -8799,6 +8904,8 @@ fn parseGraphMetricQueriesAlloc(
                     .metric_name = owned_metric_name,
                     .top_k = top_k,
                     .freshness = freshness,
+                    .seed_nodes = personalization.seed_nodes,
+                    .damping = personalization.damping,
                 },
             };
             initialized += 1;
@@ -8824,6 +8931,8 @@ fn parseGraphMetricQueriesAlloc(
         try parseGraphMetricFreshness(value)
     else
         db_mod.types.GraphMetricFreshness.published;
+    const personalization = try parseGraphMetricPersonalizationAlloc(alloc, metric_value.object, freshness);
+    errdefer freeOwnedStringSlice(alloc, personalization.seed_nodes);
     const items = try alloc.alloc(db_mod.types.NamedGraphMetricQuery, 1);
     errdefer alloc.free(items);
     const owned_name = try alloc.dupe(u8, result_name);
@@ -8839,14 +8948,71 @@ fn parseGraphMetricQueriesAlloc(
             .metric_name = owned_metric_name,
             .top_k = top_k,
             .freshness = freshness,
+            .seed_nodes = personalization.seed_nodes,
+            .damping = personalization.damping,
         },
     };
     return items;
 }
 
+const ParsedGraphMetricPersonalization = struct {
+    seed_nodes: []const []const u8 = &.{},
+    damping: ?f64 = null,
+};
+
+/// Shared seed_nodes/damping admission for the hand-parsed graph_metric and
+/// graph_metric_rerank wire objects. Enforces the same shape rules as
+/// graph/query.zig: bounded non-empty seed keys, damping only with seeds and
+/// strictly inside (0, 1), and fresh-only personalization because published
+/// generations are global-only.
+fn parseGraphMetricPersonalizationAlloc(
+    alloc: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    freshness: db_mod.types.GraphMetricFreshness,
+) !ParsedGraphMetricPersonalization {
+    const seeds_value = object.get("seed_nodes");
+    const damping_value = object.get("damping");
+    if (seeds_value == null and damping_value == null) return .{};
+
+    var parsed = ParsedGraphMetricPersonalization{};
+    errdefer freeOwnedStringSlice(alloc, parsed.seed_nodes);
+    if (seeds_value) |value| {
+        if (value != .array) return error.InvalidQueryRequest;
+        if (value.array.items.len > graph_query_mod.graph_metric_seed_limit) return error.InvalidQueryRequest;
+        const seeds = try alloc.alloc([]const u8, value.array.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (seeds[0..initialized]) |seed| alloc.free(seed);
+            alloc.free(seeds);
+        }
+        for (value.array.items, seeds) |item, *out| {
+            if (item != .string or item.string.len == 0) return error.InvalidQueryRequest;
+            out.* = try alloc.dupe(u8, item.string);
+            initialized += 1;
+        }
+        parsed.seed_nodes = seeds;
+    }
+    if (damping_value) |value| {
+        const damping: f64 = switch (value) {
+            .float => |float| float,
+            .integer => |integer| @floatFromInt(integer),
+            else => return error.InvalidQueryRequest,
+        };
+        if (parsed.seed_nodes.len == 0 or !std.math.isFinite(damping) or damping <= 0 or damping >= 1)
+            return error.InvalidQueryRequest;
+        parsed.damping = damping;
+    }
+    // Published generations are global-only; a seeded read against one would
+    // silently return unpersonalized scores. Fail closed instead.
+    if (parsed.seed_nodes.len != 0 and freshness != .fresh)
+        return error.GraphMetricPersonalizationRequiresFresh;
+    return parsed;
+}
+
 fn parseGraphMetricRerankAlloc(
     alloc: std.mem.Allocator,
     maybe_rerank: ?indexes_openapi.GraphMetricRerank,
+    body: []const u8,
 ) !?db_mod.types.GraphMetricRerank {
     const rerank = maybe_rerank orelse return null;
     if (rerank.index.len == 0 or rerank.metric.len == 0) return error.InvalidQueryRequest;
@@ -8854,11 +9020,13 @@ fn parseGraphMetricRerankAlloc(
     const weight = rerank.weight orelse 1.0;
     const missing_score = rerank.missing_score orelse 0.0;
     if (!std.math.isFinite(base_weight) or !std.math.isFinite(weight) or !std.math.isFinite(missing_score)) return error.InvalidQueryRequest;
+    const freshness = if (rerank.metric_freshness) |value| try parseGraphMetricFreshnessStringForRequest(value) else .published;
+    const personalization = try parseGraphMetricRerankPersonalizationAlloc(alloc, body, freshness);
+    errdefer freeOwnedStringSlice(alloc, personalization.seed_nodes);
     const index_name = try alloc.dupe(u8, rerank.index);
     errdefer alloc.free(index_name);
     const metric_name = try alloc.dupe(u8, rerank.metric);
     errdefer alloc.free(metric_name);
-    const freshness = if (rerank.metric_freshness) |value| try parseGraphMetricFreshnessStringForRequest(value) else .published;
     return .{
         .index_name = index_name,
         .metric_name = metric_name,
@@ -8870,7 +9038,26 @@ fn parseGraphMetricRerankAlloc(
         .base_weight = base_weight,
         .weight = weight,
         .missing_score = missing_score,
+        .seed_nodes = personalization.seed_nodes,
+        .damping = personalization.damping,
     };
+}
+
+/// The generated GraphMetricRerank wire type predates seed personalization,
+/// so its personalization fields are admitted from the raw request object,
+/// mirroring the hand-parsed graph_metric extension.
+fn parseGraphMetricRerankPersonalizationAlloc(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    freshness: db_mod.types.GraphMetricFreshness,
+) !ParsedGraphMetricPersonalization {
+    if (body.len == 0) return .{};
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
+    const rerank_value = parsed.value.object.get("graph_metric_rerank") orelse return .{};
+    if (rerank_value != .object) return .{};
+    return try parseGraphMetricPersonalizationAlloc(alloc, rerank_value.object, freshness);
 }
 
 /// Parse only graph-metric extensions without invoking semantic embedding or
@@ -8885,6 +9072,7 @@ pub const OwnedGraphMetricRequests = struct {
         if (self.rerank) |rerank| {
             alloc.free(@constCast(rerank.index_name));
             alloc.free(@constCast(rerank.metric_name));
+            freeOwnedStringSlice(alloc, rerank.seed_nodes);
         }
         self.* = undefined;
     }
@@ -8901,7 +9089,7 @@ pub fn parseGraphMetricRequestsAlloc(alloc: std.mem.Allocator, body: []const u8)
     errdefer freeNamedGraphMetricQueries(alloc, queries);
     return .{
         .queries = queries,
-        .rerank = try parseGraphMetricRerankAlloc(alloc, parsed.value.graph_metric_rerank),
+        .rerank = try parseGraphMetricRerankAlloc(alloc, parsed.value.graph_metric_rerank, body),
     };
 }
 
@@ -10090,6 +10278,7 @@ fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest)
     if (req.primary_text_index_name) |index_name| alloc.free(index_name);
     if (req.aggregations_json.len > 0) alloc.free(req.aggregations_json);
     if (req.filter_prefix.len > 0) alloc.free(req.filter_prefix);
+    if (req.highlight) |highlight| freeHighlightRequest(alloc, highlight);
     if (req.reranker) |*reranker| reranker.deinit(alloc);
     if (req.reranker_query_text.len > 0) alloc.free(req.reranker_query_text);
     if (req.merge_config) |merge_config| {
@@ -10126,6 +10315,7 @@ fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest)
     if (req.graph_metric_rerank) |rerank| {
         alloc.free(@constCast(rerank.index_name));
         alloc.free(@constCast(rerank.metric_name));
+        freeOwnedStringSlice(alloc, rerank.seed_nodes);
     }
     if (req.graph_query_transport) |*transport| transport.deinit(alloc);
     freeNamedDocFilterBindings(alloc, req.doc_filter_bindings);
@@ -12028,6 +12218,7 @@ fn freeNamedGraphMetricQueries(alloc: std.mem.Allocator, items: []const db_mod.t
         alloc.free(item.name);
         alloc.free(item.query.index_name);
         alloc.free(item.query.metric_name);
+        freeOwnedStringSlice(alloc, item.query.seed_nodes);
     }
     if (items.len > 0) alloc.free(items);
 }
@@ -13148,7 +13339,7 @@ fn consumerTests() type {
             const count = aggregates.map.get("count") orelse return error.TestUnexpectedResult;
             try std.testing.expectEqualStrings("9384729384729384", count.value);
             try std.testing.expect(count.exact);
-            try std.testing.expectEqual(@as(i64, 1), aggregate_result.stats.returned_items);
+            try std.testing.expectEqual(@as(u64, 1), aggregate_result.stats.returned_items);
         }
 
         test "graph aggregate response fails closed on missing or inexact results" {
@@ -13940,6 +14131,55 @@ fn consumerTests() type {
             try std.testing.expect((try parseDateTimeOptionalToNs("2026-02-29T00:00:00Z")) == null);
             try std.testing.expect((try parseDateTimeOptionalToNs("2026-04-31")) == null);
             try std.testing.expect((try parseRfc3339ToNs("2026-08-24")) == null);
+        }
+
+        test "query request highlight option parses with bounds and renders on hits" {
+            const alloc = std.testing.allocator;
+            var owned = try parseQueryRequest(alloc, null, "docs",
+                \\{"full_text_search":{"match":"hello","field":"body"},"highlight":{"fields":["body"],"fragment_size":32,"max_fragments":1}}
+            );
+            defer owned.deinit(alloc);
+            const highlight = owned.req.highlight orelse return error.TestExpectedEqual;
+            try std.testing.expectEqual(@as(usize, 1), highlight.fields.len);
+            try std.testing.expectEqualStrings("body", highlight.fields[0]);
+            try std.testing.expectEqual(@as(u32, 32), highlight.fragment_size);
+            try std.testing.expectEqual(@as(u32, 1), highlight.max_fragments);
+
+            var defaults = try parseQueryRequest(alloc, null, "docs",
+                \\{"full_text_search":{"match":"hello","field":"body"},"highlight":{}}
+            );
+            defer defaults.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 150), defaults.req.highlight.?.fragment_size);
+            try std.testing.expectEqual(@as(u32, 3), defaults.req.highlight.?.max_fragments);
+            try std.testing.expectEqual(@as(usize, 0), defaults.req.highlight.?.fields.len);
+
+            var plain = try parseQueryRequest(alloc, null, "docs",
+                \\{"full_text_search":{"match":"hello","field":"body"}}
+            );
+            defer plain.deinit(alloc);
+            try std.testing.expect(plain.req.highlight == null);
+
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
+                \\{"full_text_search":{"match":"hello","field":"body"},"highlight":{"fragment_size":4}}
+            ));
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
+                \\{"full_text_search":{"match":"hello","field":"body"},"highlight":{"max_fragments":0}}
+            ));
+
+            // Hits render highlights under `_highlights` and omit the key otherwise.
+            var spans = [_]db_mod.types.HighlightSpan{.{ .start = 4, .end = 9 }};
+            var fragments = [_]db_mod.types.HighlightFragment{.{ .text = try alloc.dupe(u8, "say hello there"), .offset = 0, .spans = &spans }};
+            defer alloc.free(fragments[0].text);
+            var highlighted = [_]db_mod.types.HighlightedField{.{ .field = try alloc.dupe(u8, "body"), .fragments = &fragments }};
+            defer alloc.free(highlighted[0].field);
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const hit = try toOpenApiHit(arena.allocator(), .{}, .{ .id = @constCast("doc:1"), .score = 1.0, .highlights = &highlighted });
+            const rendered = try std.json.Stringify.valueAlloc(arena.allocator(), hit, .{ .emit_null_optional_fields = false });
+            try std.testing.expect(std.mem.indexOf(u8, rendered, "\"_highlights\":{\"body\":[{\"text\":\"say hello there\",\"offset\":0,\"spans\":[{\"start\":4,\"end\":9}]}]}") != null);
+            const bare = try toOpenApiHit(arena.allocator(), .{}, .{ .id = @constCast("doc:2"), .score = 1.0 });
+            const bare_rendered = try std.json.Stringify.valueAlloc(arena.allocator(), bare, .{ .emit_null_optional_fields = false });
+            try std.testing.expect(std.mem.indexOf(u8, bare_rendered, "_highlights") == null);
         }
 
         test "canonical graph date filters are operation keyed and require a bound" {
@@ -14852,7 +15092,9 @@ fn consumerTests() type {
             ;
             var projected_matches = try parseQueryRequest(alloc, null, "docs", projected_matches_body);
             defer projected_matches.deinit(alloc);
-            try std.testing.expectEqual(db_mod.types.ReturnMode.chunk, projected_matches.req.return_mode);
+            // Canonical `ancestors` without `group_by` selects direct member hits;
+            // the legacy `return_level: chunk` spelling above is what maps to `.chunk`.
+            try std.testing.expectEqual(db_mod.types.ReturnMode.member, projected_matches.req.return_mode);
             try std.testing.expect(projected_matches.req.hierarchy_include_source);
             try std.testing.expect(projected_matches.req.hierarchy_include_unit);
             try std.testing.expect(!projected_matches.req.hierarchy_source_include_all_fields);
@@ -15024,6 +15266,12 @@ fn consumerTests() type {
             try std.testing.expectEqual(db_mod.types.ReturnMode.unit, children.req.return_mode);
             try std.testing.expectEqualStrings("doc:a", children.req.hierarchy_children.?.parent_id);
             try std.testing.expectEqualStrings("_hierarchy.position", children.req.order_by[0].field);
+
+            const children_with_highlight =
+                \\{"fields":[],"hierarchy":{"children":{"parent":{"level":"source","id":"doc:a"},"level":"unit"}},"order_by":[{"field":"_hierarchy.position"}],"highlight":{}}
+            ;
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", children_with_highlight));
+            try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(alloc, null, "docs", children_with_highlight));
 
             const internal_children_body =
                 \\{
@@ -16152,6 +16400,29 @@ fn consumerTests() type {
                 error.InvalidFilterQueryRequest,
                 parsePublicQueryRequest(alloc, null, "files", body.items),
             );
+
+            var exclusion_body = std.ArrayListUnmanaged(u8).empty;
+            defer exclusion_body.deinit(alloc);
+            try exclusion_body.appendSlice(alloc, "{\"exclusion_query\":");
+            for (0..public_query_max_tree_depth + 1) |_| try exclusion_body.append(alloc, '[');
+            try exclusion_body.appendSlice(alloc, "{\"match_all\":{}}");
+            for (0..public_query_max_tree_depth + 1) |_| try exclusion_body.append(alloc, ']');
+            try exclusion_body.append(alloc, '}');
+            try std.testing.expectError(
+                error.InvalidExclusionQueryRequest,
+                parsePublicQueryRequest(alloc, null, "files", exclusion_body.items),
+            );
+
+            // The same nesting one level shallower stays inside the budget.
+            var within_body = std.ArrayListUnmanaged(u8).empty;
+            defer within_body.deinit(alloc);
+            try within_body.appendSlice(alloc, "{\"filter_query\":");
+            for (0..public_query_max_tree_depth - 2) |_| try within_body.append(alloc, '[');
+            try within_body.appendSlice(alloc, "{\"match_all\":{}}");
+            for (0..public_query_max_tree_depth - 2) |_| try within_body.append(alloc, ']');
+            try within_body.append(alloc, '}');
+            var within = try parsePublicQueryRequest(alloc, null, "files", within_body.items);
+            defer within.deinit(alloc);
         }
 
         test "api query contract preserves canonical structured compounds without speculative parsing" {
@@ -16969,6 +17240,31 @@ fn consumerTests() type {
             try std.testing.expect(parsed.req.full_text != null);
             try std.testing.expect(parsed.req.filter_query_json.len > 0);
             try std.testing.expect(parsed.req.exclusion_query_json.len > 0);
+        }
+
+        test "api query contract keeps filter carriers out of vector fusion" {
+            const alloc = std.testing.allocator;
+            inline for (.{
+                \\{"embeddings":{"a":[1,0],"b":[0,1]},"indexes":["a","b"],"limit":10}
+                ,
+                \\{"embeddings":{"a":[1,0],"b":[0,1]},"indexes":["a","b"],"filter_query":{"term":{"path":"/status","value":"active"}},"limit":10}
+                ,
+                \\{"embeddings":{"a":[1,0],"b":[0,1]},"indexes":["a","b"],"fields":["key"],"aggregations":{"keys":{"type":"terms","field":"key","size":100}},"limit":10}
+                ,
+            }) |body| {
+                var parsed = try parseQueryRequest(alloc, null, "docs", body);
+                defer parsed.deinit(alloc);
+                try std.testing.expectEqual(@as(usize, 2), parsed.req.dense_queries.len);
+                try std.testing.expect(parsed.req.full_text == null);
+                try std.testing.expectEqual(@as(usize, 0), parsed.req.full_text_queries.len);
+            }
+
+            var explicit = try parseQueryRequest(alloc, null, "docs",
+                \\{"embeddings":{"a":[1,0],"b":[0,1]},"indexes":["a","b"],"full_text_search":{"match_all":{}},"limit":10}
+            );
+            defer explicit.deinit(alloc);
+            try std.testing.expect(explicit.req.full_text.? == .bool_query);
+            try std.testing.expect(explicit.req.full_text.?.bool_query.must[0] == .match_all);
         }
 
         test "api query contract parses packed sparse embeddings via antfly-json" {
@@ -17851,6 +18147,61 @@ fn consumerTests() type {
             try std.testing.expectError(error.InvalidQueryRequest, parseGraphMetricQueriesAlloc(alloc,
                 \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","top_k":10001}}
             ));
+        }
+
+        test "api query contract admits personalized graph metric seed fields" {
+            const alloc = std.testing.allocator;
+            const accepted = try parseGraphMetricQueriesAlloc(alloc,
+                \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","metric_freshness":"fresh","seed_nodes":["doc:a","doc:b"],"damping":0.9}}
+            );
+            defer freeNamedGraphMetricQueries(alloc, accepted);
+            try std.testing.expectEqual(@as(usize, 1), accepted.len);
+            try std.testing.expectEqual(db_mod.types.GraphMetricFreshness.fresh, accepted[0].query.freshness);
+            try std.testing.expectEqual(@as(usize, 2), accepted[0].query.seed_nodes.len);
+            try std.testing.expectEqualStrings("doc:a", accepted[0].query.seed_nodes[0]);
+            try std.testing.expectEqualStrings("doc:b", accepted[0].query.seed_nodes[1]);
+            try std.testing.expectEqual(@as(?f64, 0.9), accepted[0].query.damping);
+
+            var rerank_requests = try parseGraphMetricRequestsAlloc(alloc,
+                \\{"graph_metric_rerank":{"index":"graph_idx","metric":"pagerank","metric_freshness":"fresh","seed_nodes":["doc:a"],"damping":0.9}}
+            );
+            defer rerank_requests.deinit(alloc);
+            const rerank = rerank_requests.rerank orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(usize, 1), rerank.seed_nodes.len);
+            try std.testing.expectEqualStrings("doc:a", rerank.seed_nodes[0]);
+            try std.testing.expectEqual(@as(?f64, 0.9), rerank.damping);
+            try std.testing.expectEqual(db_mod.types.GraphMetricFreshness.fresh, rerank.freshness);
+        }
+
+        test "api query contract rejects malformed personalized graph metric shapes" {
+            const alloc = std.testing.allocator;
+            // Published generations are global-only; seeded reads against
+            // them fail closed with the dedicated personalization error.
+            try std.testing.expectError(error.GraphMetricPersonalizationRequiresFresh, parseGraphMetricQueriesAlloc(alloc,
+                \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","seed_nodes":["doc:a"]}}
+            ));
+            try std.testing.expectError(error.GraphMetricPersonalizationRequiresFresh, parseGraphMetricRequestsAlloc(alloc,
+                \\{"graph_metric_rerank":{"index":"graph_idx","metric":"pagerank","seed_nodes":["doc:a"]}}
+            ));
+            try std.testing.expectError(error.InvalidQueryRequest, parseGraphMetricQueriesAlloc(alloc,
+                \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","metric_freshness":"fresh","seed_nodes":[""]}}
+            ));
+            try std.testing.expectError(error.InvalidQueryRequest, parseGraphMetricQueriesAlloc(alloc,
+                \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","metric_freshness":"fresh","damping":0.9}}
+            ));
+            try std.testing.expectError(error.InvalidQueryRequest, parseGraphMetricQueriesAlloc(alloc,
+                \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","metric_freshness":"fresh","seed_nodes":["doc:a"],"damping":1.0}}
+            ));
+
+            var oversized_body = std.ArrayListUnmanaged(u8).empty;
+            defer oversized_body.deinit(alloc);
+            try oversized_body.appendSlice(alloc, "{\"graph_metric\":{\"index\":\"graph_idx\",\"metric\":\"pagerank\",\"metric_freshness\":\"fresh\",\"seed_nodes\":[");
+            for (0..graph_query_mod.graph_metric_seed_limit + 1) |i| {
+                if (i > 0) try oversized_body.appendSlice(alloc, ",");
+                try oversized_body.appendSlice(alloc, "\"doc:a\"");
+            }
+            try oversized_body.appendSlice(alloc, "]}}");
+            try std.testing.expectError(error.InvalidQueryRequest, parseGraphMetricQueriesAlloc(alloc, oversized_body.items));
         }
 
         test "api query contract uses portable graph metric filter operators" {

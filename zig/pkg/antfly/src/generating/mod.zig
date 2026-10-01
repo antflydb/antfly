@@ -200,7 +200,7 @@ const BackendState = struct {
         state.execution = execution;
         state.request_context = request_context;
         state.provider = switch (cfg.provider) {
-            .openai, .ollama => blk: {
+            .openai, .openrouter, .ollama => blk: {
                 const provider = openai_provider.Provider.init(alloc, http, cfg.url);
                 break :blk .{ .openai = provider };
             },
@@ -352,6 +352,7 @@ const BackendState = struct {
                 }
                 provider.setToolOptions(self.cfg.tools_json, self.cfg.tool_choice_json);
                 provider.setMaxTokens(self.cfg.max_tokens);
+                if (self.cfg.provider == .openai) provider.setCompletionOptions(self.cfg.max_completion_tokens, if (self.cfg.reasoning_effort) |effort| @tagName(effort) else null);
                 provider.setMaxResponseBytes(self.max_response_bytes);
                 provider.setSamplingOptions(self.cfg.temperature, self.cfg.top_p, self.cfg.top_k, self.cfg.frequency_penalty, self.cfg.presence_penalty);
                 break :blk try provider.generator().generate(alloc, model, messages);
@@ -379,19 +380,27 @@ const BackendState = struct {
                 break :blk try provider.generator().generate(alloc, model, messages);
             },
             .vertex => |*provider| blk: {
+                provider.setToolOptions(self.cfg.tools_json, self.cfg.tool_choice_json);
                 provider.setMaxTokens(self.cfg.max_tokens);
                 provider.setMaxResponseBytes(self.max_response_bytes);
                 provider.setSamplingOptions(self.cfg.temperature, self.cfg.top_p, self.cfg.top_k);
                 break :blk try provider.generator().generate(alloc, model, messages);
             },
             .gemini => |*provider| blk: {
+                provider.setToolOptions(self.cfg.tools_json, self.cfg.tool_choice_json);
                 provider.setMaxTokens(self.cfg.max_tokens);
                 provider.setMaxResponseBytes(self.max_response_bytes);
                 provider.setSamplingOptions(self.cfg.temperature, self.cfg.top_p, self.cfg.top_k);
                 break :blk try provider.generator().generate(alloc, model, messages);
             },
             .embedded_antfly => |local| blk: {
-                if (local.generate_json != null and (self.cfg.tools_json != null or self.cfg.tool_choice_json != null)) {
+                // A terminal agent turn may omit tool definitions while still
+                // carrying tool calls/results. Keep that conversation on the
+                // JSON path, including for providers with only generate_json.
+                const has_tool_history = for (messages) |message| {
+                    if (message.tool_calls != null or message.tool_call_id != null or message.role == .tool) break true;
+                } else false;
+                if (local.generate_json != null and (self.cfg.tools_json != null or self.cfg.tool_choice_json != null or has_tool_history)) {
                     const body = try inference.types.chatRequestJsonWithOptionsAlloc(alloc, model, messages, .termite_native, .{
                         .tools_json = self.cfg.tools_json,
                         .tool_choice_json = self.cfg.tool_choice_json,
@@ -403,7 +412,7 @@ const BackendState = struct {
                         .presence_penalty = self.cfg.presence_penalty,
                         // Agent tool turns spend the bounded output budget on
                         // calls and answers, not optional private reasoning.
-                        .enable_thinking = if (self.cfg.tools_json != null) false else null,
+                        .enable_thinking = if (self.cfg.tools_json != null or has_tool_history) false else null,
                     });
                     defer alloc.free(body);
                     const response = try local.generateJson(alloc, body, self.request_context);
@@ -475,9 +484,17 @@ const BackendState = struct {
         defer result.deinit();
         if (self.request_context) |context| try context.check();
 
+        const content = try alloc.dupe(u8, result.content);
+        errdefer alloc.free(content);
+        const calls = try cloneToolCalls(alloc, result.tool_calls);
+        errdefer {
+            for (calls) |*call| call.deinit(alloc);
+            if (calls.len > 0) alloc.free(calls);
+        }
         return .{
-            .content = try alloc.dupe(u8, result.content),
-            .tool_calls = try cloneToolCalls(alloc, result.tool_calls),
+            .content = content,
+            .tool_calls = calls,
+            .google_parts_json = if (result.google_parts_json) |parts| try alloc.dupe(u8, parts) else null,
             .allocator = alloc,
         };
     }
@@ -1137,8 +1154,8 @@ test "generating backend batch shares single-request quotas and credentials" {
 
 fn generationOutputBudget(cfg: GeneratorConfig, count: usize) !u64 {
     const policy = try provider_limits.Policy.fromConfig(cfg.rate_limit);
-    if (policy.tokens_per_minute != 0 and cfg.max_tokens <= 0) return error.InvalidRateLimitPolicy;
-    return std.math.mul(u64, @intCast(@max(0, cfg.max_tokens)), @intCast(count)) catch error.ProviderTokenBudgetExceeded;
+    if (policy.tokens_per_minute != 0 and cfg.outputTokenBudget() <= 0) return error.InvalidRateLimitPolicy;
+    return std.math.mul(u64, @intCast(@max(0, cfg.outputTokenBudget())), @intCast(count)) catch error.ProviderTokenBudgetExceeded;
 }
 
 fn antflyGenerateBatchRequestJsonAlloc(
@@ -1185,4 +1202,186 @@ fn appendBatchFloatField(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(
     const fragment = try std.fmt.allocPrint(alloc, ",\"{s}\":{f}", .{ name, std.json.fmt(value, .{}) });
     defer alloc.free(fragment);
     try out.appendSlice(alloc, fragment);
+}
+
+test "generating backend sends OpenAI completion options and preserves compatible providers" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const Check = struct {
+        fn modern(req: httpx.testing_mod.RequestInfo) !void {
+            const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.body, .{});
+            defer parsed.deinit();
+            const obj = parsed.value.object;
+            try std.testing.expectEqual(@as(i64, 1024), obj.get("max_completion_tokens").?.integer);
+            try std.testing.expectEqualStrings("none", obj.get("reasoning_effort").?.string);
+            try std.testing.expect(!obj.contains("max_tokens"));
+            try std.testing.expect(!obj.contains("temperature"));
+            try std.testing.expect(obj.contains("tools"));
+            try std.testing.expectEqual(@as(usize, 4), obj.get("messages").?.array.items.len);
+            try std.testing.expectEqualStrings("call-1", obj.get("messages").?.array.items[2].object.get("tool_call_id").?.string);
+        }
+        fn legacy(req: httpx.testing_mod.RequestInfo) !void {
+            const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.body, .{});
+            defer parsed.deinit();
+            const obj = parsed.value.object;
+            try std.testing.expectEqual(@as(i64, 128), obj.get("max_tokens").?.integer);
+            try std.testing.expect(!obj.contains("max_completion_tokens"));
+            try std.testing.expect(!obj.contains("reasoning_effort"));
+        }
+        fn compatible(req: httpx.testing_mod.RequestInfo) !void {
+            try legacy(req);
+            const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(i64, 40), parsed.value.object.get("top_k").?.integer);
+        }
+    };
+    var server = try httpx.TestServer.start(alloc, io, &.{
+        .{ .method = .POST, .path = "/modern/chat/completions", .assert_request = Check.modern, .respond = .{ .body = "{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}" } },
+        .{ .method = .POST, .path = "/legacy/chat/completions", .assert_request = Check.legacy, .respond = .{ .body = "{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}" } },
+        .{ .method = .POST, .path = "/compatible/chat/completions", .assert_request = Check.compatible, .respond = .{ .body = "{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}" } },
+    });
+    defer server.deinit();
+    const cases = [_]struct { path: []const u8, provider: []const u8, options: []const u8 }{
+        .{ .path = "modern", .provider = "openai", .options = "\"max_completion_tokens\":1024,\"reasoning_effort\":\"none\"" },
+        .{ .path = "legacy", .provider = "openai", .options = "\"max_tokens\":128" },
+        .{ .path = "compatible", .provider = "ollama", .options = "\"max_tokens\":128,\"top_k\":40" },
+    };
+    for (cases) |case| {
+        const raw = try std.fmt.allocPrint(alloc, "{{\"provider\":\"{s}\",\"model\":\"m\",\"url\":\"{s}/{s}\",{s}}}", .{ case.provider, server.baseUrl(), case.path, case.options });
+        defer alloc.free(raw);
+        var cfg = try parseConfigFromSlice(alloc, raw);
+        defer cfg.deinit(alloc);
+        cfg.tools_json = try alloc.dupe(u8, "[{\"type\":\"function\",\"function\":{\"name\":\"search\",\"parameters\":{\"type\":\"object\"}}}]");
+        var failure: ?anyerror = null;
+        const Run = struct {
+            fn serve(srv: *httpx.TestServer, err: *?anyerror) void {
+                srv.handleOne() catch |e| {
+                    err.* = e;
+                };
+            }
+            fn execute(a: std.mem.Allocator, test_io: std.Io, config: GeneratorConfig) !void {
+                var client = httpx.Client.initWithConfig(a, test_io, .{ .keep_alive = false });
+                defer client.deinit();
+                var factory = BackendFactory.init(a, &client);
+                var generator = try factory.factory().create(a, config);
+                defer generator.deinit();
+                var result = try generator.generate(
+                    a,
+                    "m",
+                    &.{ .{ .role = .user, .content = .{ .text = "search" } }, .{ .role = .assistant, .tool_calls = &.{.{ .id = "call-1", .name = "search", .arguments = "{}" }} }, .{ .role = .tool, .content = .{ .text = "evidence" }, .tool_call_id = "call-1" }, .{ .role = .user, .content = .{ .parts = &.{.{ .text = "finish" }} } } },
+                );
+                defer result.deinit();
+                try std.testing.expectEqualStrings("ok", result.content);
+            }
+        };
+        var group = std.Io.Group.init;
+        defer group.cancel(io);
+        try group.concurrent(io, Run.serve, .{ &server, &failure });
+        try Run.execute(alloc, io, cfg);
+        try group.await(io);
+        if (failure) |err| return err;
+    }
+}
+
+test "generating backend quota charges the completion budget including reasoning" {
+    var cfg = GeneratorConfig.fromOpenAI(.{ .model = "m" });
+    cfg.max_completion_tokens = 1024;
+    cfg.rate_limit = .{ .tokens_per_minute = 4096 };
+    try std.testing.expectEqual(@as(u64, 2048), try generationOutputBudget(cfg, 2));
+}
+
+test "generating backend tools complete agent conversations across all remote adapters" {
+    const agent_tools = @import("../api/agent_tools.zig");
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const Check = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.body, .{});
+            defer parsed.deinit();
+            const root = parsed.value.object;
+            if (root.get("contents")) |contents| {
+                const declaration = root.get("tools").?.array.items[0].object.get("functionDeclarations").?.array.items[0].object;
+                try std.testing.expectEqualStrings("search", declaration.get("name").?.string);
+                try std.testing.expectEqualStrings("AUTO", root.get("toolConfig").?.object.get("functionCallingConfig").?.object.get("mode").?.string);
+                if (contents.array.items.len > 1) {
+                    const assistant = contents.array.items[1].object.get("parts").?.array.items;
+                    try std.testing.expectEqualStrings("opaque-signature", assistant[0].object.get("thoughtSignature").?.string);
+                    const response = contents.array.items[2].object.get("parts").?.array.items[0].object.get("functionResponse").?.object;
+                    try std.testing.expectEqualStrings("search", response.get("name").?.string);
+                    try std.testing.expectEqualStrings("found", response.get("response").?.object.get("result").?.string);
+                }
+            } else {
+                try std.testing.expectEqualStrings("search", root.get("tools").?.array.items[0].object.get("function").?.object.get("name").?.string);
+                try std.testing.expectEqualStrings("auto", root.get("tool_choice").?.string);
+                const messages = root.get("messages").?.array.items;
+                if (messages.len > 1) {
+                    try std.testing.expectEqualStrings("call-1", messages[1].object.get("tool_calls").?.array.items[0].object.get("id").?.string);
+                    try std.testing.expectEqualStrings("call-1", messages[2].object.get("tool_call_id").?.string);
+                    try std.testing.expectEqualStrings("found", messages[2].object.get("content").?.string);
+                }
+            }
+        }
+        fn serve(server: *httpx.TestServer, failure: *?anyerror) void {
+            for (0..2) |_| server.handleOne() catch |err| {
+                failure.* = err;
+                return;
+            };
+        }
+    };
+    for ([_]Provider{ .openai, .openrouter, .ollama, .antfly, .gemini, .vertex }) |provider| {
+        const google = provider == .gemini or provider == .vertex;
+        const path: []const u8 = switch (provider) {
+            .gemini => "/models/m:generateContent",
+            .vertex => "/projects/test/locations/us-central1/publishers/google/models/m:generateContent",
+            .antfly => "/generate",
+            else => "/chat/completions",
+        };
+        const call_response = if (google)
+            "{\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"search\",\"args\":{}},\"thoughtSignature\":\"opaque-signature\"}]}}]}"
+        else
+            "{\"choices\":[{\"message\":{\"content\":null,\"tool_calls\":[{\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"search\",\"arguments\":\"{}\"}}]}}]}";
+        const final_response = if (google)
+            "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"done\"}]}}]}"
+        else
+            "{\"choices\":[{\"message\":{\"content\":\"done\"}}]}";
+        var server = try httpx.TestServer.start(alloc, io, &.{
+            .{ .method = .POST, .path = path, .assert_request = Check.request, .respond = .{ .body = call_response }, .max_uses = 1 },
+            .{ .method = .POST, .path = path, .assert_request = Check.request, .respond = .{ .body = final_response } },
+        });
+        defer server.deinit();
+        var failure: ?anyerror = null;
+        var group = std.Io.Group.init;
+        defer group.cancel(io);
+        try group.concurrent(io, Check.serve, .{ &server, &failure });
+        var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+        defer client.deinit();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const chain = try agent_tools.withTools(arena.allocator(), &.{.{ .generator = .{
+            .provider = provider,
+            .model = "m",
+            .url = server.baseUrl(),
+            .api_key = "test-key",
+            .project_id = "test",
+        } }}, "[{\"type\":\"function\",\"function\":{\"name\":\"search\",\"parameters\":{\"type\":\"object\"}}}]");
+        var factory = BackendFactory.init(alloc, &client);
+        var generator = try factory.factory().create(alloc, chain[0].generator);
+        defer generator.deinit();
+        var history = agent_tools.Conversation{ .alloc = arena.allocator() };
+        try history.append(.user, "search", null);
+        {
+            var result = try generator.generate(alloc, "m", history.messages.items);
+            defer result.deinit();
+            const calls = try history.accept(result, 1);
+            try std.testing.expectEqual(@as(usize, 1), calls.len);
+            try std.testing.expectEqualStrings("search", calls[0].name);
+            try history.append(.tool, "found", calls[0].id);
+        }
+        var final = try generator.generate(alloc, "m", history.messages.items);
+        defer final.deinit();
+        try std.testing.expectEqualStrings("done", final.content);
+        try std.testing.expectEqual(@as(usize, 0), final.tool_calls.len);
+        try group.await(io);
+        if (failure) |err| return err;
+    }
 }

@@ -123,7 +123,7 @@ else
         }
     };
 
-var file_pin_release_epoch: std.atomic.Value(u64) = .init(0);
+var file_pin_release_epoch: @import("antfly_platform").atomic.Value(u64) = .init(0);
 
 const ObsoletePathRefRegistry = struct {
     mutex: std.atomic.Mutex = .unlocked,
@@ -1836,10 +1836,10 @@ pub const Backend = struct {
     /// allocating, including when the originating request was cancelled.
     fn drainOutputCleanupSliceLocked(self: *Backend) !bool {
         const queue = self.options.unpublished_outputs orelse return false;
-        const deadline = self.coordinationNowNs() +| 2 * std.time.ns_per_ms;
+        const deadline = runtime_mod.workNowNs(self) +| 2 * std.time.ns_per_ms;
         var progressed = false;
         for (0..64) |_| {
-            if (self.coordinationNowNs() >= deadline) break;
+            if (runtime_mod.workNowNs(self) >= deadline) break;
             const ticket = queue.pop() orelse break;
             errdefer {
                 queue.append(ticket);
@@ -1973,20 +1973,22 @@ pub const Backend = struct {
     }
 
     pub fn prepareWalOperationLockFile(self: *Backend) !void {
-        if (!self.options.wal_enabled or self.root_dir == null or !self.storage.?.supportsNativePathLocks()) return;
-        if (self.wal_operation_lock_file != null) return;
+        if (comptime builtin.os.tag != .freestanding) {
+            if (!self.options.wal_enabled or self.root_dir == null or !self.storage.?.supportsNativePathLocks()) return;
+            if (self.wal_operation_lock_file != null) return;
 
-        const lock_path = try walOperationLockPathAlloc(self.allocator, self.root_dir.?);
-        defer self.allocator.free(lock_path);
-        self.wal_operation_lock_file = storage_io.openNativePathLockFileWithPool(
-            self.allocator,
-            lock_path,
-            .{ .create_if_missing = true },
-            self.options.native_storage_pool,
-        ) catch |err| switch (err) {
-            error.FileNotFound => if (self.options.backend.read_only) return else return err,
-            else => return err,
-        };
+            const lock_path = try walOperationLockPathAlloc(self.allocator, self.root_dir.?);
+            defer self.allocator.free(lock_path);
+            self.wal_operation_lock_file = storage_io.openNativePathLockFileWithPool(
+                self.allocator,
+                lock_path,
+                .{ .create_if_missing = true },
+                self.options.native_storage_pool,
+            ) catch |err| switch (err) {
+                error.FileNotFound => if (self.options.backend.read_only) return else return err,
+                else => return err,
+            };
+        }
     }
 
     pub fn closeWalOperationLockFile(self: *Backend) void {
@@ -2083,6 +2085,67 @@ pub const Backend = struct {
         try self.finalizeDeferredStorageWorkLocked();
     }
 
+    /// Request reclamation of superseded values in the current persisted runs.
+    /// The caller flushes replacement values first. Only metadata is prepared
+    /// here; the regular admitted, streaming GC jobs rewrite overlap closures.
+    /// The manifest intent survives restart, partial compaction and old readers.
+    pub fn requestValueReclamation(self: *Backend) !void {
+        const locked = runtime_mod.lockBackend(Backend, self);
+        defer runtime_mod.unlockBackend(Backend, self, locked);
+        if (self.options.backend.read_only) return error.ReadOnly;
+        const current = try self.planningDirectory();
+        var wire: u64 = 128;
+        var scratch: u64 = 8192;
+        const height: u64 = if (current.tree.root) |root| root.height else 1;
+        var cursor = self.runs.cursor();
+        while (cursor.next()) |run| {
+            if (run.gc_requested) continue;
+            const names = run.smallest_key.len + run.largest_key.len +
+                (if (run.path) |path| path.len else 0) +
+                (if (run.smallest_namespace_name) |name| name.len else 0) +
+                (if (run.largest_namespace_name) |name| name.len else 0);
+            wire +|= 192 +| names;
+            // Bound the administrative metadata clones before allocation.
+            scratch +|= (height + 1) * 16384 +| names * 2 +|
+                (if (run.state) |*state| state.estimatedMemoryBytes() else 0);
+        }
+        var reservation: ?resource_manager_mod.Reservation = null;
+        defer if (reservation) |*lease| lease.release();
+        if (self.options.resource_manager) |manager|
+            reservation = try manager.reserve(.lsm_table_builder_working_set, scratch);
+        var credit = try self.admitCompactionMetadataBytes(wire);
+        defer credit.release();
+        const directory = try current.fork(self.allocator);
+        var directory_owned = true;
+        defer if (directory_owned) directory.destroy(self.allocator);
+        const store = try self.allocator.create(RunStore);
+        store.* = self.runs.fork();
+        defer self.retireRunStore(store);
+        cursor = self.runs.cursor();
+        while (cursor.next()) |run| {
+            if (run.gc_requested) continue;
+            var revision = RunStore.revision(run, run.*);
+            revision.gc_requested = true;
+            try store.stageRevision(self.allocator, revision);
+            store.adopt(&revision);
+            try directory.put(self, revision);
+        }
+        std.mem.swap(RunStore, &self.runs, store);
+        self.invalidateReadVersion();
+        self.publishRunDirectory(directory);
+        directory_owned = false;
+        credit.commit();
+        self.markManifestDirty();
+        try self.persistManifestLocked();
+        self.notePotentialMaintenanceDebtLocked();
+    }
+
+    pub fn hasValueReclamationRequests(self: *Backend) !bool {
+        const locked = runtime_mod.lockBackend(Backend, self);
+        defer runtime_mod.unlockBackend(Backend, self, locked);
+        return (try self.planningDirectory()).hasGcRequest();
+    }
+
     pub fn syncReplayState(self: *Backend) !void {
         _ = try self.syncReplayStateWithStats();
     }
@@ -2106,6 +2169,33 @@ pub const Backend = struct {
         manifest_bytes: []u8,
         run_ids: []u64,
         run_paths: [][]u8,
+
+        /// Persist the retained generation using immutable file links. Unlike
+        /// process-local run refs, this tree survives owner restart and GC.
+        pub fn seal(self: *const NativeCheckpoint, io: std.Io, destination_root: []const u8, cancellation: CancellationToken) !u64 {
+            if (!self.storage.supportsHostPathGenerationPublication()) return error.NativeBackupStorageBackendUnsupported;
+            try fs_paths.createDirPathPortable(io, destination_root);
+            const manifest = try std.fmt.allocPrint(self.allocator, "{s}/manifest.bin", .{destination_root});
+            defer self.allocator.free(manifest);
+            var total = try writeCheckpointBytes(io, manifest, self.manifest_bytes, null);
+            const runs = try std.fmt.allocPrint(self.allocator, "{s}/runs", .{destination_root});
+            defer self.allocator.free(runs);
+            try fs_paths.createDirPathPortable(io, runs);
+            for (self.run_paths, self.run_ids) |source, id| {
+                try cancellation.check();
+                const target = try std.fmt.allocPrint(self.allocator, "{s}/{d}.tbl", .{ runs, id });
+                defer self.allocator.free(target);
+                try std.Io.Dir.hardLink(.cwd(), source, .cwd(), target, io, .{});
+                var file = try std.Io.Dir.cwd().openFile(io, target, .{});
+                defer file.close(io);
+                const stat = try file.stat(io);
+                if (stat.kind != .file) return error.UnsupportedFileType;
+                total = std.math.add(u64, total, stat.size) catch return error.FileTooBig;
+            }
+            try fs_paths.syncDirPortable(io, runs);
+            try fs_paths.syncDirPortable(io, destination_root);
+            return total;
+        }
 
         pub fn deinit(self: *NativeCheckpoint) void {
             for (self.run_paths) |path| {
@@ -2177,7 +2267,7 @@ pub const Backend = struct {
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
 
-        try self.flushMutable();
+        try self.flushCheckpointCutLocked();
         if (self.manifest_dirty or self.obsolete_manifest_dirty or self.manifest_backing == null) {
             try self.writeManifestSnapshotLocked(root_dir, self.writeStatsNowNs());
         }
@@ -3104,13 +3194,22 @@ pub const Backend = struct {
     pub fn runMaintenanceStep(self: *Backend) !bool {
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
-        return try self.runMaintenanceStepLocked();
+        return try self.runMaintenanceStepLocked(false);
+    }
+
+    /// An explicitly requested rewrite must make progress under sustained
+    /// query traffic. It still uses ordinary I/O/memory admission and yields
+    /// inside streaming work; only the optional idle-grace deferral is bypassed.
+    pub fn runValueReclamationStep(self: *Backend) !bool {
+        const locked = runtime_mod.lockBackend(Backend, self);
+        defer runtime_mod.unlockBackend(Backend, self, locked);
+        return try self.runMaintenanceStepLocked(true);
     }
 
     pub fn runMaintenanceStepBestEffort(self: *Backend) !bool {
         if (!self.mu.tryLock()) return false;
         defer self.unlockWithReclamation();
-        return try self.runMaintenanceStepLocked();
+        return try self.runMaintenanceStepLocked(false);
     }
 
     pub fn makeWalCheckpointRetryDueForTest(self: *Backend) void {
@@ -3121,7 +3220,7 @@ pub const Backend = struct {
         self.last_wal_retention_enforce_ns = 0;
     }
 
-    fn runMaintenanceStepLocked(self: *Backend) !bool {
+    fn runMaintenanceStepLocked(self: *Backend, required_gc: bool) !bool {
         // Cleanup is safe even after a durability fence or under pressure.
         // The unlock path executes one bounded FIFO reclamation turn.
         if (self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) return true;
@@ -3226,10 +3325,10 @@ pub const Backend = struct {
             // pressure selection, so a 3.2x L0 backlog rewrote an 8.5x-overfull
             // L1 before L1 could be promoted. Use the soft L0 bound as the
             // pressure denominator while retaining overlap-triggered L0 work.
-            const defer_soft_compaction = self.optionalMaintenanceDeferredLocked();
+            const defer_soft_compaction = !required_gc and self.optionalMaintenanceDeferredLocked();
             if (!defer_soft_compaction) {
                 self.gc_maintenance_turn +%= 1;
-                var compacted = self.pending_directory_closure == null and self.pending_l0_directory_closure == null and self.gc_maintenance_turn % 8 == 0 and (compaction_mod.nextTombstoneGcDelay(self) orelse 1) == 0 and
+                var compacted = self.pending_directory_closure == null and self.pending_l0_directory_closure == null and (required_gc or self.gc_maintenance_turn % 8 == 0) and (compaction_mod.nextTombstoneGcDelay(self) orelse 1) == 0 and
                     try compaction_mod.compactTombstonesScheduled(Backend, self, score);
                 if (!compacted) {
                     compacted = if (self.l0SoftPressureLocked() and self.options.bulk_ingest_tiered_l0_fan_in >= 2)
@@ -3767,8 +3866,8 @@ pub const Backend = struct {
         self.directory_reclaim_in_flight = true;
         defer self.directory_reclaim_in_flight = false;
         var credits: usize = 2048;
-        const deadline = self.coordinationNowNs() +| 2 * std.time.ns_per_ms;
-        while (credits != 0 and self.coordinationNowNs() < deadline) {
+        const deadline = runtime_mod.workNowNs(self) +| 2 * std.time.ns_per_ms;
+        while (credits != 0 and runtime_mod.workNowNs(self) < deadline) {
             if (self.directory_reclaimer == null) {
                 const directory = self.retired_run_directories orelse break;
                 self.retired_run_directories = directory.retired_next;
@@ -3801,8 +3900,8 @@ pub const Backend = struct {
         self.store_reclaim_in_flight = true;
         defer self.store_reclaim_in_flight = false;
         var credits: usize = 2048;
-        const deadline = self.coordinationNowNs() +| 2 * std.time.ns_per_ms;
-        while (credits != 0 and self.coordinationNowNs() < deadline) {
+        const deadline = runtime_mod.workNowNs(self) +| 2 * std.time.ns_per_ms;
+        while (credits != 0 and runtime_mod.workNowNs(self) < deadline) {
             if (self.store_reclaimer == null) {
                 const store = self.retired_run_stores orelse break;
                 self.retired_run_stores = store.retired_next;
@@ -3842,8 +3941,8 @@ pub const Backend = struct {
         self.mu.unlock();
         var credits: usize = 2048;
         var done = false;
-        const deadline = self.coordinationNowNs() +| 2 * std.time.ns_per_ms;
-        while (credits != 0 and self.coordinationNowNs() < deadline) {
+        const deadline = runtime_mod.workNowNs(self) +| 2 * std.time.ns_per_ms;
+        while (credits != 0 and runtime_mod.workNowNs(self) < deadline) {
             var quantum: usize = @min(credits, 64);
             const before = quantum;
             done = pending.cleanupStep(self.allocator, &quantum);
@@ -3886,8 +3985,8 @@ pub const Backend = struct {
         self.mu.unlock();
         var credits: usize = 2048;
         var done = false;
-        const deadline = self.coordinationNowNs() +| 2 * std.time.ns_per_ms;
-        while (credits != 0 and self.coordinationNowNs() < deadline) {
+        const deadline = runtime_mod.workNowNs(self) +| 2 * std.time.ns_per_ms;
+        while (credits != 0 and runtime_mod.workNowNs(self) < deadline) {
             var quantum: usize = @min(credits, 64);
             const before = quantum;
             done = pending.cleanupStep(self.allocator, &quantum);
@@ -3913,8 +4012,8 @@ pub const Backend = struct {
         self.mu.unlock();
         var credits: usize = 2048;
         var done = false;
-        const deadline = self.coordinationNowNs() +| 2 * std.time.ns_per_ms;
-        while (credits != 0 and self.coordinationNowNs() < deadline) {
+        const deadline = runtime_mod.workNowNs(self) +| 2 * std.time.ns_per_ms;
+        while (credits != 0 and runtime_mod.workNowNs(self) < deadline) {
             var quantum: usize = @min(credits, 64);
             const before = quantum;
             done = pending.cleanupStep(self.allocator, &quantum);
@@ -3946,8 +4045,8 @@ pub const Backend = struct {
         self.mu.unlock();
         var credits: usize = 2048;
         var done = false;
-        const deadline = self.coordinationNowNs() +| 2 * std.time.ns_per_ms;
-        while (credits != 0 and self.coordinationNowNs() < deadline) {
+        const deadline = runtime_mod.workNowNs(self) +| 2 * std.time.ns_per_ms;
+        while (credits != 0 and runtime_mod.workNowNs(self) < deadline) {
             var quantum: usize = @min(credits, 64);
             const before = quantum;
             done = pending.cleanupStep(self.allocator, &quantum);
@@ -4659,6 +4758,27 @@ pub const Backend = struct {
         try self.flushAllImmutableMemtables();
     }
 
+    /// Unlike a maintenance step, a self-contained checkpoint cannot yield
+    /// with committed data still in a memtable. An unlocked background build
+    /// temporarily owns the oldest epoch; wait for its publication, then drain
+    /// the remaining epochs and any mutable tail added while the lock was
+    /// released. Never certify a manifest-only image of a partial cut.
+    fn flushCheckpointCutLocked(self: *Backend) !void {
+        while (true) {
+            if (self.closing.load(.acquire)) return error.BackendClosing;
+            if (self.mutable.entryCount() > 0) try self.rotateMutableToImmutable();
+            if (self.activeImmutableMemtableCount() == 0) return;
+            if (self.immutable_flush_build_in_flight) {
+                if (!self.waitForImmutableFlushBuildLocked()) return error.WouldBlock;
+                continue;
+            }
+            // Explicit checkpoint work is outside background admission. Pass
+            // that distinction down rather than overriding the shared budget
+            // across an unlocked build, where maintenance can run concurrently.
+            _ = try self.flushImmutableMemtableWindowWithAdmission(true, false);
+        }
+    }
+
     fn directIngestMutableAtBulkFinishIfPossible(self: *Backend) !bool {
         if (!self.options.direct_bulk_ingest) return false;
         if (self.mutable.entryCount() == 0) return false;
@@ -4878,6 +4998,10 @@ pub const Backend = struct {
     }
 
     fn flushImmutableMemtableWindow(self: *Backend, force: bool) !bool {
+        return self.flushImmutableMemtableWindowWithAdmission(force, true);
+    }
+
+    fn flushImmutableMemtableWindowWithAdmission(self: *Backend, force: bool, charge_maintenance: bool) !bool {
         const window_count = self.immutableFlushWindowCount(force);
         if (window_count == 0) return false;
         const state = self.immutable_memtables.items[self.immutable_head];
@@ -4885,7 +5009,7 @@ pub const Backend = struct {
         for (self.activeImmutableMemtables()[0..window_count]) |window_state| {
             estimated_io_bytes +|= estimatedFlushIoBytes(window_state);
         }
-        if (!self.tryReserveMaintenanceIoBudget(estimated_io_bytes)) return false;
+        if (charge_maintenance and !self.tryReserveMaintenanceIoBudget(estimated_io_bytes)) return false;
         if (self.root_dir != null and self.storage != null) {
             return try self.flushOldestImmutableMemtableUnlockedBuild(window_count);
         }
@@ -5632,7 +5756,7 @@ pub const Backend = struct {
         return live.tree.root == durable.tree.root;
     }
 
-    fn writeRunSetManifestSnapshotLocked(self: *Backend, root_dir: []const u8, runs: []const Run, start_ns: u64, live: bool) !usize {
+    fn writeRunSetManifestSnapshotLocked(self: *Backend, root_dir: []const u8, runs: []const Run, start_ns: u64, live: bool) !u64 {
         if (self.manifest_recovery_required) return error.RecoveryRequired;
         var turn = try self.beginManifestTurn();
         defer turn.deinit();
@@ -5641,7 +5765,7 @@ pub const Backend = struct {
 
     /// Caller owns the publication lane and backend lock. Administrative callers
     /// acquire that lane before constructing their prospective ownership graph.
-    fn writeRunSetManifestSnapshotInTurnLocked(self: *Backend, root_dir: []const u8, runs: []const Run, start_ns: u64, live: bool, waited: bool) !usize {
+    fn writeRunSetManifestSnapshotInTurnLocked(self: *Backend, root_dir: []const u8, runs: []const Run, start_ns: u64, live: bool, waited: bool) !u64 {
         std.debug.assert(self.manifest_publish_in_flight);
         if (self.manifest_recovery_required) return error.RecoveryRequired;
         self.manifest_publish_allow_concurrency = live;
@@ -8039,22 +8163,18 @@ pub const Backend = struct {
         const runs_dir = try std.fs.path.join(self.allocator, &.{ root_dir, "runs" });
         defer self.allocator.free(runs_dir);
 
-        var io_impl = std.Io.Threaded.init(self.allocator, .{});
-        defer io_impl.deinit();
-
-        var dir = std.Io.Dir.cwd().openDir(io_impl.io(), runs_dir, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => return .{},
+        const storage = self.storage.?;
+        const names = storage.listFileNamesAlloc(self.allocator, runs_dir) catch |err| switch (err) {
+            error.FileNotFound, error.DirectoryListingUnsupported => return .{},
             else => return err,
         };
-        defer dir.close(io_impl.io());
+        defer storage_io.Storage.freeFileNames(self.allocator, names);
 
         var stats = RecoveredRunFileCleanupStats{};
-        var it = dir.iterate();
-        while (try it.next(io_impl.io())) |entry| {
-            if (entry.kind != .file) continue;
-            _ = parseRunIdFromRecoveredTableTempFileName(entry.name) orelse continue;
+        for (names) |name| {
+            _ = parseRunIdFromRecoveredTableTempFileName(name) orelse continue;
 
-            const path = try std.fs.path.join(self.allocator, &.{ runs_dir, entry.name });
+            const path = try std.fs.path.join(self.allocator, &.{ runs_dir, name });
             defer self.allocator.free(path);
             const size = self.storage.?.fileSize(path) catch 0;
             repository_mod.deleteFileAbsoluteWithStorage(self.storage.?, path) catch |err| switch (err) {
@@ -8075,23 +8195,19 @@ pub const Backend = struct {
         const runs_dir = try std.fs.path.join(self.allocator, &.{ root_dir, "runs" });
         defer self.allocator.free(runs_dir);
 
-        var io_impl = std.Io.Threaded.init(self.allocator, .{});
-        defer io_impl.deinit();
-
-        var dir = std.Io.Dir.cwd().openDir(io_impl.io(), runs_dir, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => return .{},
+        const storage = self.storage.?;
+        const names = storage.listFileNamesAlloc(self.allocator, runs_dir) catch |err| switch (err) {
+            error.FileNotFound, error.DirectoryListingUnsupported => return .{},
             else => return err,
         };
-        defer dir.close(io_impl.io());
+        defer storage_io.Storage.freeFileNames(self.allocator, names);
 
         var stats: RecoveredRunFileCleanupStats = .{};
-        var it = dir.iterate();
-        while (try it.next(io_impl.io())) |entry| {
-            if (entry.kind != .file) continue;
-            const run_id = parseRunIdFromTableFileName(entry.name) orelse continue;
+        for (names) |name| {
+            const run_id = parseRunIdFromTableFileName(name) orelse continue;
             if (self.runIdTrackedByManifestLocked(run_id)) continue;
 
-            const path = try std.fs.path.join(self.allocator, &.{ runs_dir, entry.name });
+            const path = try std.fs.path.join(self.allocator, &.{ runs_dir, name });
             defer self.allocator.free(path);
             if (self.pathTrackedByManifestLocked(path) or self.obsoletePathPinnedByOpenVersion(path)) continue;
 
@@ -8103,9 +8219,14 @@ pub const Backend = struct {
             stats.files_deleted +|= 1;
             stats.bytes_deleted +|= size;
         }
-        const manifest_stats = try self.cleanupOrphanedManifestFilesForSet(io_impl.io());
-        stats.files_deleted +|= manifest_stats.files_deleted;
-        stats.bytes_deleted +|= manifest_stats.bytes_deleted;
+        // Manifest-set inventory requires the native exclusive writer lease.
+        if (builtin.os.tag != .freestanding) {
+            var io_impl = std.Io.Threaded.init(self.allocator, .{});
+            defer io_impl.deinit();
+            const manifest_stats = try self.cleanupOrphanedManifestFilesForSet(io_impl.io());
+            stats.files_deleted +|= manifest_stats.files_deleted;
+            stats.bytes_deleted +|= manifest_stats.bytes_deleted;
+        }
         return stats;
     }
 
@@ -8140,13 +8261,13 @@ pub const Backend = struct {
         if (self.obsolete_reclaim_in_flight) return;
         self.obsolete_reclaim_in_flight = true;
         defer self.obsolete_reclaim_in_flight = false;
-        const deadline = self.coordinationNowNs() +| 2 * std.time.ns_per_ms;
+        const deadline = runtime_mod.workNowNs(self) +| 2 * std.time.ns_per_ms;
         const now_ns = self.nowNs();
         // Bound each maintenance turn, including already-due pinned files.
         // Resume by path against the current root so churn cannot invalidate
         // a borrowed cursor or force a restart from the first pinned file.
         for (0..128) |_| {
-            if (self.coordinationNowNs() >= deadline) return;
+            if (runtime_mod.workNowNs(self) >= deadline) return;
             const obsolete = self.obsolete_paths.nextDueAfter(now_ns, self.obsolete_reclaim_after) orelse {
                 if (self.obsolete_reclaim_after) |path| self.allocator.free(path);
                 self.obsolete_reclaim_after = null;
@@ -21967,6 +22088,83 @@ fn implementationTests() type {
             try std.testing.expectEqual(deadline, backend.tombstone_gc_retry_after_ns);
         }
 
+        test "lsm value reclamation survives partial progress restart and old readers without tombstones" {
+            const alloc = std.testing.allocator;
+            var storage = storage_io.MemoryStorage.init(alloc);
+            defer storage.deinit();
+            const root = "/value-reclamation";
+            const options: Options = .{
+                .storage = storage.storage(),
+                .compact_threshold_runs = 1000,
+                .l0_overlap_compact_threshold_runs = 0,
+                .level_target_bytes_base = 1024 * 1024,
+                .tombstone_gc_max_age_ns = 0,
+                .tombstone_gc_max_input_bytes = 24 * 1024,
+                .max_compaction_input_bytes = 24 * 1024,
+                .obsolete_retention_ns = 0,
+            };
+            var backend = try Backend.open(alloc, root, options);
+            var open = true;
+            defer if (open) backend.close();
+            var bytes: [16 * 1024]u8 = undefined;
+            var random = std.Random.DefaultPrng.init(42);
+            random.random().bytes(&bytes);
+            for (0..3) |i| {
+                var state: State = .{};
+                errdefer state.deinit(alloc);
+                try state.upsert(alloc, .{}, "key", &bytes, false);
+                const run = try compaction_mod.makeRunAtLevel(Backend, &backend, state, @intCast(3 - i));
+                state = .{};
+                try backend.runs.append(alloc, run);
+            }
+            try backend.runs.reindexForTest(alloc);
+            try backend.persistManifest();
+            {
+                var old = try backend.beginRead();
+                defer old.abort();
+                try std.testing.expectEqualSlices(u8, &bytes, try old.get(.{}, "key"));
+                var state: State = .{};
+                errdefer state.deinit(alloc);
+                try state.upsert(alloc, .{}, "key", "reference", false);
+                const run = try compaction_mod.makeRunAtLevel(Backend, &backend, state, 0);
+                state = .{};
+                backend.invalidateReadVersion();
+                try backend.runs.append(alloc, run);
+                try backend.runs.reindexForTest(alloc);
+                try backend.persistManifest();
+                try backend.requestValueReclamation();
+                try std.testing.expect(try backend.hasValueReclamationRequests());
+                try std.testing.expectEqual(@as(usize, 0), (try backend.planningDirectory()).tombstoneRunCount());
+                // Stop after one bounded rewrite, before the closure is done.
+                for (0..64) |_| {
+                    const before = backend.compaction_stats.input_bytes;
+                    _ = try backend.runMaintenanceStep();
+                    try std.testing.expect(backend.compaction_stats.input_bytes - before <= options.tombstone_gc_max_input_bytes);
+                    if (backend.compaction_stats.input_bytes != 0) break;
+                }
+                try std.testing.expect(backend.compaction_stats.input_bytes != 0);
+                try std.testing.expect(try backend.hasValueReclamationRequests());
+                try std.testing.expectEqualSlices(u8, &bytes, try old.get(.{}, "key"));
+            }
+            backend.close();
+            open = false;
+            backend = try Backend.open(alloc, root, options);
+            open = true;
+            try std.testing.expect(try backend.hasValueReclamationRequests());
+            for (0..256) |_| {
+                const before = backend.compaction_stats.input_bytes;
+                _ = try backend.runMaintenanceStep();
+                try std.testing.expect(backend.compaction_stats.input_bytes - before <= options.tombstone_gc_max_input_bytes);
+                if (!try backend.hasValueReclamationRequests()) break;
+            }
+            try std.testing.expect(!try backend.hasValueReclamationRequests());
+            try std.testing.expectEqualSlices(u8, "reference", try backend.getMergedWithMutable(&backend.mutable, .{}, "key"));
+            var physical: u64 = 0;
+            var runs = backend.runs.cursor();
+            while (runs.next()) |run| physical += run.size_bytes;
+            try std.testing.expect(physical < bytes.len);
+        }
+
         test "lsm GC checkpoints bounded level progress while preserving old readers" {
             var storage = storage_io.MemoryStorage.init(std.testing.allocator);
             defer storage.deinit();
@@ -22439,6 +22637,68 @@ fn implementationTests() type {
             }
         }
 
+        test "lsm monotone prefix seeks retain unaffected sources after churn" {
+            const alloc = std.testing.allocator;
+            for ([_]usize{ 0, 8, 32 }) |companions| {
+                var backing = storage_io.MemoryStorage.init(alloc);
+                defer backing.deinit();
+                var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+                defer cache.deinit();
+                var backend = try Backend.open(alloc, "/lsm-monotone-prefix", .{ .storage = backing.storage(), .cache = &cache, .compact_threshold_runs = 10000 });
+                defer backend.close();
+                // One cold level plus 32 overlapping update runs. Each prefix
+                // skip should reposition only the level and affected L0 run.
+                for (0..33) |run_number| {
+                    var state: State = .{};
+                    errdefer state.deinit(alloc);
+                    for (0..512) |row| {
+                        if (run_number != 0 and row % 32 != run_number - 1) continue;
+                        var key_buf: [64]u8 = undefined;
+                        const key = try std.fmt.bufPrint(&key_buf, "doc:{d:0>5}:0", .{row});
+                        try state.upsert(alloc, .{ .name = "docs" }, key, if (run_number == 0) "old" else "new", false);
+                        if (run_number != 0) for (0..companions) |companion| {
+                            const child = try std.fmt.bufPrint(&key_buf, "doc:{d:0>5}:1:{d:0>3}", .{ row, companion });
+                            try state.upsert(alloc, .{ .name = "docs" }, child, "index", false);
+                        };
+                    }
+                    var run = try compaction_mod.makeRunAtLevel(Backend, &backend, state, if (run_number == 0) 1 else 0);
+                    state = .{};
+                    errdefer run.deinit(alloc);
+                    try backend.runs.append(alloc, run);
+                }
+                try backend.runs.reindexForTest(alloc);
+                try backend.persistManifest();
+                var read = try backend.beginRead();
+                defer read.abort();
+                var counts: [2]usize = undefined;
+                var elapsed: [2]u64 = undefined;
+                for ([_]bool{ true, false }, 0..) |restart, mode| {
+                    var cursor = try read.openCursor(.{ .name = "docs" });
+                    defer cursor.close();
+                    cursor.test_full_forward_seek = restart;
+                    const started = @import("antfly_platform").time.monotonicNs();
+                    for (0..512) |row| {
+                        var key_buf: [64]u8 = undefined;
+                        const key = try std.fmt.bufPrint(&key_buf, "doc:{d:0>5}:0", .{row});
+                        const entry = (try cursor.seekAtOrAfter(key)) orelse return error.TestUnexpectedResult;
+                        try std.testing.expectEqualStrings(key, entry.key);
+                        try std.testing.expectEqualStrings("new", entry.value);
+                    }
+                    elapsed[mode] = @intCast(@import("antfly_platform").time.monotonicNs() - started);
+                    counts[mode] = cursor.test_seek_sources;
+                    // Equal borrowed-key seeks, reverse movement, exhaustion,
+                    // and reseeking after exhaustion retain public semantics.
+                    const borrowed = cursor.current_key.?;
+                    try std.testing.expectEqualStrings(borrowed, (try cursor.seekAtOrAfter(borrowed)).?.key);
+                    try std.testing.expectEqualStrings("doc:00000:0", (try cursor.seekAtOrAfter("doc:00000:0")).?.key);
+                    try std.testing.expect((try cursor.seekAtOrAfter("z")) == null);
+                    try std.testing.expectEqualStrings("doc:00000:0", (try cursor.seekAtOrAfter("doc:00000:0")).?.key);
+                }
+                try std.testing.expect(counts[1] * 8 < counts[0]);
+                std.debug.print("lsm-prefix-seek companions={d} rows=512 full_sources={d} incremental_sources={d} full_ns={d} incremental_ns={d}\n", .{ companions, counts[0], counts[1], elapsed[0], elapsed[1] });
+            }
+        }
+
         test "lsm lazy level cursor bounds sources and IO across forward reverse and namespace boundaries" {
             const alloc = std.testing.allocator;
             var backing = storage_io.MemoryStorage.init(alloc);
@@ -22748,6 +23008,87 @@ fn implementationTests() type {
                 try std.testing.expectEqualStrings("old", batch_values[0][0].?);
                 try std.testing.expectEqualStrings("old", batch_values[1][0].?);
             }
+        }
+
+        test "lsm native checkpoint waits for in-flight immutable publication and includes the mutable tail" {
+            if (!supports_waitable_immutable_flush or builtin.single_threaded) return;
+            const alloc = std.testing.allocator;
+            var storage = storage_io.MemoryStorage.init(alloc);
+            defer storage.deinit();
+            var backend = try Backend.open(alloc, "/checkpoint-inflight-cut", .{
+                .storage = storage.storage(),
+                .flush_threshold = 1024 * 1024,
+                .compact_threshold_runs = 10000,
+            });
+            defer backend.close();
+            {
+                var write = try backend.beginWrite();
+                errdefer write.abort();
+                try write.put(.{}, "older", "immutable");
+                try write.commit();
+            }
+            {
+                const locked = runtime_mod.lockBackend(Backend, &backend);
+                defer runtime_mod.unlockBackend(Backend, &backend, locked);
+                try backend.rotateMutableToImmutable();
+            }
+            {
+                var write = try backend.beginWrite();
+                errdefer write.abort();
+                try write.put(.{}, "retention", "committed-tail");
+                try write.commit();
+            }
+            // Model the exclusive oldest-epoch build owner. Completion waits
+            // for the checkpoint to rotate the committed tail, so this tests
+            // the contested cut deterministically, not a scheduling race.
+            backend.immutable_flush_build_in_flight = true;
+            backend.maintenance_io_budget_remaining = 11;
+            const Builder = struct {
+                fn complete(target: *Backend) !void {
+                    const deadline = platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
+                    while (true) {
+                        const locked = runtime_mod.lockBackend(Backend, target);
+                        const ready = target.activeImmutableMemtableCount() >= 2;
+                        const expired = platform_time.monotonicNs() >= deadline;
+                        if (ready or expired) {
+                            target.maintenance_io_budget_remaining = 23;
+                            target.finishImmutableFlushBuildLocked();
+                        }
+                        runtime_mod.unlockBackend(Backend, target, locked);
+                        if (ready) return;
+                        if (expired) return error.TestCheckpointDidNotRotateTail;
+                        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                    }
+                }
+            };
+            var completion = std.testing.io.concurrent(Builder.complete, .{&backend}) catch |err| {
+                backend.finishImmutableFlushBuildLocked();
+                return err;
+            };
+            var completion_awaited = false;
+            defer if (!completion_awaited) {
+                completion.await(std.testing.io) catch {};
+            };
+            var checkpoint = try backend.pinNativeCheckpoint();
+            defer checkpoint.deinit();
+            const completed = completion.await(std.testing.io);
+            completion_awaited = true;
+            try completed;
+            try std.testing.expectEqual(@as(?u64, 23), backend.maintenance_io_budget_remaining);
+            try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+            try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
+            try std.testing.expect(checkpoint.run_ids.len > 0);
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const restored_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/checkpoint", .{tmp.sub_path});
+            defer alloc.free(restored_path);
+            _ = try checkpoint.materialize(std.testing.io, restored_path, .none);
+            var restored = try Backend.open(alloc, restored_path, .{ .backend = .{ .read_only = true } });
+            defer restored.close();
+            var read = try Backend.BoundReadTxn.open(&restored, .{});
+            defer read.abort();
+            try std.testing.expectEqualStrings("immutable", try read.get("older"));
+            try std.testing.expectEqualStrings("committed-tail", try read.get("retention"));
         }
 
         test "lsm journal checkpoints bound replay and backups export standalone manifests" {
@@ -24444,6 +24785,73 @@ fn implementationTests() type {
             try std.testing.expect(written[1] * 4 < written[0]);
         }
 
+        test "lsm backend metadata updates bound snapshot memory across WAL reopen" {
+            var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+            defer storage.deinit();
+
+            const root_dir = "/lsm-metadata-churn-reopen";
+            const options = Options{
+                .flush_threshold = 64,
+                .storage = storage.storage(),
+            };
+            const keys = [_][]const u8{ "node:1", "node:2" };
+            var expected: [2][4097]u8 = undefined;
+            var lengths: [2]usize = undefined;
+            var peak_live_bytes: u64 = 0;
+            var peak_immutable_bytes: u64 = 0;
+            {
+                var backend = try Backend.open(std.testing.allocator, root_dir, options);
+                defer backend.close();
+                for (0..512) |round| {
+                    {
+                        var write = try backend.beginWrite();
+                        defer write.abort();
+                        for (keys, 0..) |key, slot| {
+                            lengths[slot] = 4096 + (round + slot) % 2;
+                            const value = expected[slot][0..lengths[slot]];
+                            @memset(value, @truncate(round + slot));
+                            std.mem.writeInt(u64, expected[slot][0..8], @intCast(round), .little);
+                            try write.put(.{ .name = "metadata-apply" }, key, value);
+                        }
+                        try write.commit();
+                    }
+                    {
+                        var read = try backend.beginRead();
+                        defer read.abort();
+                        for (keys, 0..) |key, slot|
+                            try std.testing.expectEqualSlices(u8, expected[slot][0..lengths[slot]], try read.get(.{ .name = "metadata-apply" }, key));
+                    }
+                    const stats = backend.snapshotMaintenanceStats();
+                    peak_live_bytes = @max(peak_live_bytes, stats.mutable_bytes + stats.immutable_bytes + stats.retired_immutable_bytes);
+                    peak_immutable_bytes = @max(peak_immutable_bytes, stats.immutable_bytes);
+                }
+                backend.options.backend.read_only = true;
+            }
+
+            var reopened = try Backend.open(std.testing.allocator, root_dir, options);
+            defer reopened.close();
+            const open_stats = reopened.snapshotOpenStats();
+            try std.testing.expect(open_stats.wal_replay_records >= 512);
+            try std.testing.expect(open_stats.wal_replay_entries >= 1024);
+            const before_read = reopened.snapshotMaintenanceStats();
+            {
+                var read = try reopened.beginRead();
+                defer read.abort();
+                for (keys, 0..) |key, slot|
+                    try std.testing.expectEqualSlices(u8, expected[slot][0..lengths[slot]], try read.get(.{ .name = "metadata-apply" }, key));
+            }
+            const after_read = reopened.snapshotMaintenanceStats();
+            const replay_bytes = before_read.mutable_bytes + before_read.immutable_bytes + before_read.retired_immutable_bytes;
+            const reopened_bytes = after_read.mutable_bytes + after_read.immutable_bytes + after_read.retired_immutable_bytes;
+            std.debug.print("METADATA_CHURN live_peak={d} immutable_peak={d} replay_bytes={d} reopened_bytes={d}\n", .{
+                peak_live_bytes, peak_immutable_bytes, replay_bytes, reopened_bytes,
+            });
+            try std.testing.expect(peak_live_bytes < 512 * 1024);
+            try std.testing.expect(peak_immutable_bytes < 512 * 1024);
+            try std.testing.expect(replay_bytes < 512 * 1024);
+            try std.testing.expect(reopened_bytes < 512 * 1024);
+        }
+
         test "lsm backend recovery replay stores snapshot-shareable mutable entries" {
             var memory_storage = storage_io.MemoryStorage.init(std.testing.allocator);
             defer memory_storage.deinit();
@@ -24577,4 +24985,99 @@ fn writeUnknownTombstoneFixture(allocator: Allocator, storage: Storage, root: []
     const path = try std.fmt.allocPrint(allocator, "{s}/manifest.bin", .{root});
     defer allocator.free(path);
     try storage.writeFileAbsolute(path, manifest);
+}
+
+test "lsm backend source vector payloads write batches pipeline reads with overlay precedence and owned values" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+
+    const root_dir = "/lsm-write-async-sparse-point-batch";
+    const count = 256;
+    const large_value = try alloc.alloc(u8, 8 * 1024);
+    defer alloc.free(large_value);
+    @memset(large_value, 'v');
+    {
+        var backend = try Backend.open(alloc, root_dir, .{
+            .storage = backing.storage(),
+            .flush_threshold = count + 1,
+            .table_block_compression = .snappy_adaptive,
+        });
+        defer backend.close();
+        var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+
+        {
+            var txn = try runtime.beginWrite();
+            var key_buf: [64]u8 = undefined;
+            for (0..count) |i| {
+                const key = try std.fmt.bufPrint(&key_buf, "artifact:{d:0>8}:dense", .{i});
+                try txn.put(key, large_value);
+            }
+            try txn.commit();
+            try backend.sync(true);
+        }
+        {
+            var txn = try runtime.beginWrite();
+            try txn.delete("artifact:00000010:dense");
+            try txn.put("artifact:00000011:dense", "newest");
+            try txn.commit();
+            try backend.sync(true);
+        }
+    }
+
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = backing.storage(),
+        .flush_threshold = count + 1,
+        .table_block_compression = .snappy_adaptive,
+        .cache = &cache,
+        .max_concurrent_point_block_reads = 4,
+    });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    var key_storage: [count][64]u8 = undefined;
+    var keys: [count][]const u8 = undefined;
+    var values: [count]?[]const u8 = [_]?[]const u8{null} ** count;
+    for (&keys, 0..) |*key, i| {
+        key.* = try std.fmt.bufPrint(&key_storage[i], "artifact:{d:0>8}:dense", .{i});
+    }
+
+    // A concurrent committed mutable entry plus this transaction's own
+    // overwrite and tombstone must win over pinned immutable runs.
+    var committed = try runtime.beginWrite();
+    try committed.put(keys[12], "committed");
+    try committed.commit();
+    var writer = try runtime.beginWrite();
+    defer writer.abort();
+    try writer.put(keys[13], "overlay");
+    try writer.delete(keys[14]);
+    try writer.getManySorted(&keys, &values);
+    try std.testing.expectEqualStrings("committed", values[12].?);
+    try std.testing.expectEqualStrings("overlay", values[13].?);
+    try std.testing.expect(values[14] == null);
+    try std.testing.expectEqualSlices(u8, large_value, values[0].?);
+    try std.testing.expectEqual(@as(?[]const u8, null), values[10]);
+    try std.testing.expectEqualStrings("newest", values[11].?);
+    try std.testing.expectEqualSlices(u8, large_value, values[count - 1].?);
+
+    const stats = backend.snapshotReadStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.get_many_sorted_plan_point);
+    try std.testing.expectEqual(@as(u64, count - 2), stats.get_many_sorted_hits);
+    try std.testing.expectEqual(@as(u64, 2), stats.get_many_sorted_misses);
+    try std.testing.expect(stats.point_run_async_batches > 0);
+    try std.testing.expect(stats.point_run_async_reads_issued >= 2);
+    // Returning from getManySorted has released its temporary probe. Values
+    // must still survive another writer's overwrite and flush/publication.
+    var replacement = try runtime.beginWrite();
+    try replacement.put(keys[0], "replacement");
+    try replacement.put(keys[12], "replacement");
+    try replacement.commit();
+    try backend.sync(true);
+    try std.testing.expectEqualSlices(u8, large_value, values[0].?);
+    try std.testing.expectEqualStrings("committed", values[12].?);
+    try std.testing.expectEqualStrings("overlay", values[13].?);
 }

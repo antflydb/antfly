@@ -33,10 +33,12 @@ import { renderNumeric, renderStars, renderThumbsUpDown } from "./feedback-rende
 import { useAnswerStream } from "./hooks/useAnswerStream";
 import { useChatStream } from "./hooks/useChatStream";
 import { useCitations } from "./hooks/useCitations";
+import { useResearchStream } from "./hooks/useResearchStream";
 import { useSearchHistory } from "./hooks/useSearchHistory";
 import Listener from "./Listener";
 import Pagination from "./Pagination";
 import QueryBox from "./QueryBox";
+import ResearchReport, { evidenceLabel } from "./ResearchReport";
 import Results from "./Results";
 import {
   fromUrlQueryString,
@@ -44,11 +46,14 @@ import {
   initializeAntflyClient,
   multiquery,
   streamAnswer,
+  streamResearch,
   toUrlQueryString,
 } from "./utils";
 
 export type {
   GeneratorConfig,
+  ResearchAgentRequest,
+  ResearchAgentResult,
   RetrievalAgentRequest,
   RetrievalAgentResult,
 } from "@antfly/sdk";
@@ -80,6 +85,7 @@ export type { Citation, CitationRenderOptions } from "./citations";
 export type { FacetProps } from "./Facet";
 export type { QueryClassification } from "./hooks/useAnswerStream";
 export type { ChatConfig, ChatTurn } from "./hooks/useChatStream";
+export type { ResearchStreamState, ResearchStreamStatus } from "./hooks/useResearchStream";
 export type {
   CitationMetadata,
   SearchHistory,
@@ -87,9 +93,10 @@ export type {
 } from "./hooks/useSearchHistory";
 export type { PaginationProps } from "./Pagination";
 export type { CustomInputProps, QueryBoxProps } from "./QueryBox";
+export type { ResearchReportProps, ResearchReportResult } from "./ResearchReport";
 export type { ResultsProps } from "./Results";
 export type { SharedAction, SharedState, Widget } from "./SharedContext";
-export type { AnswerCallbacks, MultiqueryRequest } from "./utils";
+export type { AnswerCallbacks, MultiqueryRequest, ResearchCallbacks } from "./utils";
 export {
   ActiveFilters,
   AnswerFeedback,
@@ -104,6 +111,7 @@ export {
   CustomWidget,
   confidenceLabel,
   createAIElementsRenderers,
+  evidenceLabel,
   Facet,
   fromUrlQueryString,
   getAntflyClient,
@@ -116,6 +124,7 @@ export {
   Pagination,
   parseCitations,
   QueryBox,
+  ResearchReport,
   Results,
   renderAsMarkdownLinks,
   renderAsSequentialLinks,
@@ -124,6 +133,7 @@ export {
   renderThumbsUpDown,
   replaceCitations,
   streamAnswer,
+  streamResearch,
   toUrlQueryString,
   turnToStatus,
   useAnswerResultsContext,
@@ -132,5 +142,6 @@ export {
   useChatContext,
   useChatStream,
   useCitations,
+  useResearchStream,
   useSearchHistory,
 };

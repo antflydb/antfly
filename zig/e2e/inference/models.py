@@ -226,6 +226,14 @@ READER_MODELS = [
     ),
 ]
 
+SPEAKER_MODEL = ModelSpec(
+    name="speaker-embedding",
+    repo="csukuangfj/speaker-embedding-models",
+    task="transcribers",
+    variant="3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx",
+    extra_files=("3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx",),
+)
+
 TRANSCRIBER_MODELS = [
     ModelSpec(
         name="whisper-tiny",
@@ -293,6 +301,8 @@ DEFAULT_MODEL_BY_PATH = {
     "/ai/v1/extract": (DEFAULT_EXTRACTOR_MODEL, "extractors"),
     "/ai/v1/read": ("antflydb/florence-2-base", "readers"),
     "/ai/v1/transcribe": ("openai/whisper-tiny", "transcribers"),
+    "/ai/v1/dictate": ("openai/whisper-tiny", "transcribers"),
+    "/ai/v1/transcription/sessions": ("openai/whisper-tiny", "transcribers"),
 }
 
 TASK_NAME_BY_DIR = {
@@ -947,13 +957,29 @@ def response_indicates_missing_model(response) -> bool:
 def maybe_pull_missing_model(path: str, payload: dict | None, response) -> bool:
     if not inference_download_enabled():
         return False
-    if not response_indicates_missing_model(response):
+    diarization = path == "/ai/v1/transcribe" and bool(
+        payload and payload.get("diarization")
+    )
+    missing_speaker = False
+    if diarization and response.status_code == 422:
+        try:
+            missing_speaker = (
+                response.json().get("error") == "SPEAKER_MODEL_UNAVAILABLE"
+            )
+        except ValueError:
+            pass
+    if not missing_speaker and not response_indicates_missing_model(response):
         return False
 
     model_name, task_hint = request_model_name(path, payload)
     if not model_name or not task_hint:
         return False
     try:
+        # Fetch both dependencies before the harness's single missing-model retry.
+        if diarization:
+            ensure_model(SPEAKER_MODEL)
+        if missing_speaker:
+            return True
         return ensure_model_by_name(model_name, task_hint) is not None
     except subprocess.CalledProcessError:
         return False

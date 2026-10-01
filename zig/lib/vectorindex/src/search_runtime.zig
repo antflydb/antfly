@@ -36,6 +36,9 @@ pub const CoverageMember = struct {
 };
 
 pub const SearchScratch = struct {
+    // Bound only while a request owns this scratch; never retained in the pool.
+    admission: ?struct { context: *anyopaque, reserve: *const fn (*anyopaque, u64) anyerror!void } = null,
+
     global_subgroups: @import("global_subgroup_plan.zig").Plan = .{},
     dims: usize,
     estimate: quantizer.RaBitQuantizer.EstimateScratch,
@@ -60,6 +63,13 @@ pub const SearchScratch = struct {
     flat_probe_merge: []search_types.FlatCentroidProbe,
     coverage_members: []CoverageMember,
     coverage_visited_words: []usize,
+
+    fn grow(self: *SearchScratch, alloc: Allocator, comptime T: type, values: *[]T, needed: usize) !void {
+        if (values.len >= needed) return;
+        const target = try addSliceGrowthBytes(T, self.bytes(), values.len, needed);
+        if (self.admission) |admission| try admission.reserve(admission.context, target);
+        values.* = try alloc.realloc(values.*, needed);
+    }
 
     /// Exact logical payload allocated by `init`. Resource-governed adapters
     /// use this before touching the allocator, so a concurrent fanout cannot
@@ -169,9 +179,9 @@ pub const SearchScratch = struct {
     }
 
     pub fn ensureLookupCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
-        if (self.lookups.len < needed) self.lookups = try alloc.realloc(self.lookups, needed);
-        if (self.key_views.len < needed) self.key_views = try alloc.realloc(self.key_views, needed);
-        if (self.values.len < needed) self.values = try alloc.realloc(self.values, needed);
+        try self.grow(alloc, std.meta.Child(@TypeOf(self.lookups)), &self.lookups, needed);
+        try self.grow(alloc, std.meta.Child(@TypeOf(self.key_views)), &self.key_views, needed);
+        try self.grow(alloc, std.meta.Child(@TypeOf(self.values)), &self.values, needed);
     }
 
     pub fn ensureVectorFetchCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
@@ -185,21 +195,21 @@ pub const SearchScratch = struct {
     /// Selection may span the complete candidate shell without decoding it.
     /// Keep its scalar/identity storage independent of the wide float32 plane.
     fn ensureVectorFetchMetadataCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
-        if (self.positions.len < needed) self.positions = try alloc.realloc(self.positions, needed);
-        if (self.vector_ids.len < needed) self.vector_ids = try alloc.realloc(self.vector_ids, needed);
-        if (self.metadata.len < needed) self.metadata = try alloc.realloc(self.metadata, needed);
+        try self.grow(alloc, std.meta.Child(@TypeOf(self.positions)), &self.positions, needed);
+        try self.grow(alloc, std.meta.Child(@TypeOf(self.vector_ids)), &self.vector_ids, needed);
+        try self.grow(alloc, std.meta.Child(@TypeOf(self.metadata)), &self.metadata, needed);
         try self.ensureLookupCapacity(alloc, needed);
-        if (self.vector_views.len < needed) self.vector_views = try alloc.realloc(self.vector_views, needed);
-        if (self.bounded_projections.len < needed) self.bounded_projections = try alloc.realloc(self.bounded_projections, needed);
-        if (self.distances.len < needed) self.distances = try alloc.realloc(self.distances, needed);
-        if (self.error_bounds.len < needed) self.error_bounds = try alloc.realloc(self.error_bounds, needed);
+        try self.grow(alloc, std.meta.Child(@TypeOf(self.vector_views)), &self.vector_views, needed);
+        try self.grow(alloc, std.meta.Child(@TypeOf(self.bounded_projections)), &self.bounded_projections, needed);
+        try self.grow(alloc, std.meta.Child(@TypeOf(self.distances)), &self.distances, needed);
+        try self.grow(alloc, std.meta.Child(@TypeOf(self.error_bounds)), &self.error_bounds, needed);
         const score_scratch_needed = std.math.mul(usize, needed, 2) catch return error.OutOfMemory;
-        if (self.score_bounds.len < score_scratch_needed) self.score_bounds = try alloc.realloc(self.score_bounds, score_scratch_needed);
+        try self.grow(alloc, std.meta.Child(@TypeOf(self.score_bounds)), &self.score_bounds, score_scratch_needed);
     }
 
     pub fn ensureVectorDecodeCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
         const vector_value_count = std.math.mul(usize, self.dims, needed) catch return error.OutOfMemory;
-        if (self.vector_batch.len < vector_value_count) self.vector_batch = try alloc.realloc(self.vector_batch, vector_value_count);
+        try self.grow(alloc, std.meta.Child(@TypeOf(self.vector_batch)), &self.vector_batch, vector_value_count);
     }
 
     /// Flat-directory routing scores one centroid block at a time. It needs
@@ -214,31 +224,31 @@ pub const SearchScratch = struct {
     /// Scanning a native candidate plane needs scalar outputs, not a decoded
     /// float32 matrix or metadata fetch workspace proportional to leaf size.
     pub fn ensureScoreCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
-        if (self.distances.len < needed) self.distances = try alloc.realloc(self.distances, needed);
-        if (self.error_bounds.len < needed) self.error_bounds = try alloc.realloc(self.error_bounds, needed);
+        try self.grow(alloc, std.meta.Child(@TypeOf(self.distances)), &self.distances, needed);
+        try self.grow(alloc, std.meta.Child(@TypeOf(self.error_bounds)), &self.error_bounds, needed);
     }
 
     pub fn ensureRerankCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
-        if (self.flags.len < needed) self.flags = try alloc.realloc(self.flags, needed);
+        try self.grow(alloc, std.meta.Child(@TypeOf(self.flags)), &self.flags, needed);
         try self.ensureVectorFetchMetadataCapacity(alloc, needed);
     }
 
     pub fn ensureMemberIdCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
-        if (self.member_ids.len < needed) self.member_ids = try alloc.realloc(self.member_ids, needed);
+        try self.grow(alloc, std.meta.Child(@TypeOf(self.member_ids)), &self.member_ids, needed);
     }
 
     pub fn ensureVectorIdCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
-        if (self.vector_ids.len < needed) self.vector_ids = try alloc.realloc(self.vector_ids, needed);
+        try self.grow(alloc, std.meta.Child(@TypeOf(self.vector_ids)), &self.vector_ids, needed);
     }
 
     pub fn ensureCoverageMemberCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
-        if (self.coverage_members.len < needed) self.coverage_members = try alloc.realloc(self.coverage_members, needed);
+        try self.grow(alloc, std.meta.Child(@TypeOf(self.coverage_members)), &self.coverage_members, needed);
     }
 
     pub fn ensureFlatProbeCapacity(self: *SearchScratch, alloc: Allocator, needed: usize, needs_merge: bool) !void {
-        if (self.flat_probes.len < needed) self.flat_probes = try alloc.realloc(self.flat_probes, needed);
+        try self.grow(alloc, std.meta.Child(@TypeOf(self.flat_probes)), &self.flat_probes, needed);
         if (needs_merge and self.flat_probe_merge.len < needed) {
-            self.flat_probe_merge = try alloc.realloc(self.flat_probe_merge, needed);
+            try self.grow(alloc, std.meta.Child(@TypeOf(self.flat_probe_merge)), &self.flat_probe_merge, needed);
         }
     }
 
@@ -351,7 +361,7 @@ pub const SearchScratch = struct {
         const words_u64 = std.math.divCeil(u64, node_count, word_bits) catch return error.OutOfMemory;
         const words = std.math.cast(usize, words_u64) orelse return error.OutOfMemory;
         if (self.coverage_visited_words.len < words) {
-            self.coverage_visited_words = try alloc.realloc(self.coverage_visited_words, words);
+            try self.grow(alloc, std.meta.Child(@TypeOf(self.coverage_visited_words)), &self.coverage_visited_words, words);
         }
         @memset(self.coverage_visited_words[0..words], 0);
     }
@@ -750,4 +760,31 @@ test "cancellable exact distances stop at a mid-batch checkpoint" {
     for (distances[exact_distance_cancellation_stride..]) |distance| {
         try std.testing.expect(std.math.isNan(distance));
     }
+}
+
+test "SearchScratch ordinary growth is rejected before allocating or retaining a decode matrix" {
+    const Gate = struct {
+        limit: u64,
+        admitted: u64 = 0,
+        fn reserve(ctx: *anyopaque, bytes: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (bytes > self.limit) return error.ResourceBudgetExceeded;
+            self.admitted = bytes;
+        }
+    };
+    const a = std.testing.allocator;
+    var scratch = try SearchScratch.init(a, 1536, 16, 64);
+    defer scratch.deinit(a);
+    const before = scratch.bytes();
+    var gate = Gate{ .limit = before + 1024 };
+    scratch.admission = .{ .context = &gate, .reserve = Gate.reserve };
+    const original = scratch.vector_batch.ptr;
+    try std.testing.expectError(error.ResourceBudgetExceeded, scratch.ensureVectorDecodeCapacity(a, 1000));
+    try std.testing.expectEqual(before, scratch.bytes());
+    try std.testing.expectEqual(original, scratch.vector_batch.ptr);
+    try scratch.ensureScoreCapacity(a, 100);
+    try std.testing.expectEqual(gate.admitted, scratch.bytes());
+    gate.limit += 1536 * 128 * 4;
+    try scratch.ensureVectorDecodeCapacity(a, 128);
+    try std.testing.expectEqual(gate.admitted, scratch.bytes());
 }

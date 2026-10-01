@@ -26,7 +26,7 @@ func TestStandaloneHAArgsRendersLegacyDefaultsForLegacyLayout(t *testing.T) {
 		},
 		Runtime: &antflyv1.HARuntimeSpec{Role: antflyv1.HARuntimeRolePrimary, NodeID: "primary-a"},
 	}
-	args := standaloneHAArgs(ha, "", antflyv1.HADataLayoutLegacy)
+	args := standaloneHAArgs(ha, "", antflyv1.HADataLayoutLegacy, false)
 	g.Expect(args).To(ContainSubstring(`--ha-primary-log '/antflydb/ha/primary.wal'`))
 	g.Expect(args).To(ContainSubstring(`--ha-primary-slots '/antflydb/ha/slots'`))
 	g.Expect(args).To(ContainSubstring(`--ha-seed-capture-root '/antflydb/ha/seed-captures'`))
@@ -37,11 +37,11 @@ func TestStandaloneHAArgsRendersLegacyDefaultsForLegacyLayout(t *testing.T) {
 		Role: antflyv1.HARuntimeRoleStandby, NodeID: "standby-a",
 		Standby: &antflyv1.HAStandbyRuntimeSpec{UpstreamURL: "http://primary:8080", SlotName: "standby-a"},
 	}
-	args = standaloneHAArgs(ha, "", antflyv1.HADataLayoutLegacy)
+	args = standaloneHAArgs(ha, "", antflyv1.HADataLayoutLegacy, false)
 	g.Expect(args).To(ContainSubstring(`--ha-standby-log '/antflydb/ha/standby.wal'`))
 	g.Expect(args).To(ContainSubstring(`--ha-standby-progress '/antflydb/ha/standby-progress.wal'`))
 
-	args = standaloneHAArgs(ha, "gen-1", antflyv1.HADataLayoutLegacy)
+	args = standaloneHAArgs(ha, "gen-1", antflyv1.HADataLayoutLegacy, false)
 	g.Expect(args).To(ContainSubstring(`--ha-standby-log '/antflydb/ha/standby-generations/gen-1/receive.wal'`))
 	g.Expect(args).To(ContainSubstring(`--ha-standby-progress '/antflydb/ha/standby-generations/gen-1/progress.wal'`))
 }
@@ -55,7 +55,7 @@ func TestStandaloneHAArgsRendersStandbyDefaultsForStandbyLayout(t *testing.T) {
 		},
 		Runtime: &antflyv1.HARuntimeSpec{Role: antflyv1.HARuntimeRolePrimary, NodeID: "primary-a"},
 	}
-	args := standaloneHAArgs(ha, "", antflyv1.HADataLayoutStandby)
+	args := standaloneHAArgs(ha, "", antflyv1.HADataLayoutStandby, false)
 	g.Expect(args).To(ContainSubstring(`--ha-primary-log '/antflydb/standby/primary.wal'`))
 	g.Expect(args).To(ContainSubstring(`--ha-primary-slots '/antflydb/standby/slots'`))
 	g.Expect(args).To(ContainSubstring(`--ha-seed-capture-root '/antflydb/standby/seed-captures'`))
@@ -68,11 +68,11 @@ func TestStandaloneHAArgsRendersStandbyDefaultsForStandbyLayout(t *testing.T) {
 		Role: antflyv1.HARuntimeRoleStandby, NodeID: "standby-a",
 		Standby: &antflyv1.HAStandbyRuntimeSpec{UpstreamURL: "http://primary:8080", SlotName: "standby-a"},
 	}
-	args = standaloneHAArgs(ha, "", antflyv1.HADataLayoutStandby)
+	args = standaloneHAArgs(ha, "", antflyv1.HADataLayoutStandby, false)
 	g.Expect(args).To(ContainSubstring(`--ha-standby-log '/antflydb/standby/log.wal'`))
 	g.Expect(args).To(ContainSubstring(`--ha-standby-progress '/antflydb/standby/progress.wal'`))
 
-	args = standaloneHAArgs(ha, "gen-1", antflyv1.HADataLayoutStandby)
+	args = standaloneHAArgs(ha, "gen-1", antflyv1.HADataLayoutStandby, false)
 	g.Expect(args).To(ContainSubstring(`--ha-standby-log '/antflydb/standby/standby-generations/gen-1/receive.wal'`))
 	g.Expect(args).To(ContainSubstring(`--ha-standby-progress '/antflydb/standby/standby-generations/gen-1/progress.wal'`))
 }
@@ -95,7 +95,7 @@ func TestStandaloneHAArgsExplicitOverridesWinRegardlessOfLayout(t *testing.T) {
 		},
 	}
 	for _, layout := range []antflyv1.HADataLayout{antflyv1.HADataLayoutLegacy, antflyv1.HADataLayoutStandby, ""} {
-		args := standaloneHAArgs(ha, "", layout)
+		args := standaloneHAArgs(ha, "", layout, false)
 		g.Expect(args).To(ContainSubstring(`--ha-primary-log '/antflydb/custom/primary.wal'`), "layout=%q", layout)
 		g.Expect(args).To(ContainSubstring(`--ha-primary-slots '/antflydb/custom/slots'`), "layout=%q", layout)
 		g.Expect(args).To(ContainSubstring(`--ha-seed-capture-root '/antflydb/custom/seed-captures'`), "layout=%q", layout)

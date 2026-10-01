@@ -1,0 +1,39 @@
+{
+  "record_type": "failed_workload_observation_recovered_from_log",
+  "binary": "/private/tmp/antfly-catalog-round5-baseline",
+  "binary_sha256": "7b3d7930389c89a8b573d549a8acbcacd5cea386fa81a5634dea4d15f392944f",
+  "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+  "settings": {
+    "scenario": "catalog",
+    "deployment": "cluster",
+    "table_counts": [
+      10,
+      100
+    ],
+    "schema_fields": 32,
+    "samples": 20,
+    "warmup": 2
+  },
+  "failure": {
+    "scenario": "catalog",
+    "table_count": 100,
+    "operation": "qualified_batch_validation",
+    "message": "POST /databases/benchmark/namespaces/serving/tables/events_99/batch: 409 write outcome unknown"
+  },
+  "completed_checkpoints": [
+    10
+  ],
+  "successful_latency_samples": null,
+  "notes": [
+    "The pre-change binary failed during the 100-table measured write phase. All 10-table operations completed; their timings were not retained by the harness on exception.",
+    "Recovered from the retained log; not a successful latency result. The harness now writes explicit failure artifacts automatically.",
+    "An earlier setup attempt rejected the harness undeclared customer_id field; the measured workload declares that field on both binaries."
+  ],
+  "log": "/private/tmp/catalog-round5-validation-baseline.log",
+  "diagnostics": [
+    "warning: internal group batch transport lost outcome group_id=1729387245818345972 delivery=may_have_been_sent timeout_ms=5000 err=Timeout",
+    "warning: data raft batch forward outcome unknown group_id=1729387245818345972 source_node_id=101 target_node_id=102 route=placement_fallback err=RaftBatchWriteTransportOutcomeUnknown",
+    "warning: public table batch outcome unknown table=table:5c13e7c2696280f90c5a1de14db44bd3 err=RaftBatchWriteOutcomeUnknown",
+    "RuntimeError: POST /databases/benchmark/namespaces/serving/tables/events_99/batch: 409 write outcome unknown"
+  ]
+}

@@ -3,6 +3,8 @@ const embedded_db = @import("antfly_embedded_db");
 const embedded_api = @import("antfly_embedded_api");
 const termite = @import("inference_runtime");
 
+pub const std_options_debug_io: std.Io = .failing;
+
 comptime {
     _ = termite; // force termite export fn declarations into the binary
 }

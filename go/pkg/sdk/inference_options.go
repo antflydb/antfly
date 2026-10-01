@@ -30,6 +30,18 @@ import (
 const (
 	maxInferenceJSONResponseBytes   int64 = 16 << 20
 	maxInferenceBinaryResponseBytes int64 = 64 << 20
+	// The numeric frame carries its own 4 MiB ceiling in the protocol, so the
+	// client holds the server to it rather than to the generic binary limit.
+	maxInferenceNumericResponseBytes int64 = 4 << 20
+)
+
+const (
+	// numericResponseMediaType names the packed f32 frame the inference server
+	// returns for dense values when a request asks for it.
+	numericResponseMediaType = "application/vnd.antfly.numeric.v1"
+	// numericResponseAccept takes that frame but settles for the JSON body,
+	// which is what an older server, or a sparse model, answers with.
+	numericResponseAccept = numericResponseMediaType + ", application/json"
 )
 
 type inferenceResponseLimitDoer struct {
@@ -73,7 +85,9 @@ func inferenceResponseLimit(req *http.Request, resp *http.Response) int64 {
 			return 0
 		}
 		return maxInferenceJSONResponseBytes
-	case "application/octet-stream", "application/x-sparse-vectors":
+	case numericResponseMediaType:
+		return maxInferenceNumericResponseBytes
+	case "application/octet-stream":
 		return maxInferenceBinaryResponseBytes
 	default:
 		return maxInferenceJSONResponseBytes

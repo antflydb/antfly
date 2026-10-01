@@ -21,6 +21,7 @@ components:
         - embeddings
         - graph
         - algebraic
+        - relational
       description: "The type of the index."
     IndexConfig:
       type: object
@@ -30,6 +31,7 @@ components:
         - $ref: "#/components/schemas/EmbeddingsIndexConfig"
         - $ref: "#/components/schemas/GraphIndexConfig"
         - $ref: "#/components/schemas/AlgebraicIndexConfig"
+        - $ref: "#/components/schemas/RelationalIndexConfig"
       required:
         - name
         - type
@@ -184,10 +186,17 @@ components:
         source: { $ref: "#/components/schemas/GraphArtifactProducerSourceConfig" }
         content_type: { type: string }
         execution: { $ref: "#/components/schemas/ExecutionPolicy" }
+        producer:
+          type: object
+          additionalProperties: true
+          writeOnly: true
+          description: "Write-only producer configuration. Cannot be combined with producer_json."
         producer_json:
           type: object
           additionalProperties: true
           writeOnly: true
+          deprecated: true
+          x-deprecated-reason: "Use the producer field."
           description: "Write-only producer configuration; it may contain credentials and is never returned."
     GraphTemplateValue:
       description: "A literal string or finite numeric value, or a Handlebars template evaluated for each materialized graph item."
@@ -290,8 +299,25 @@ components:
           default: asset
         resolution_artifact: { type: string }
         key_template: { type: string }
+        labels:
+          type: array
+          items: { type: string }
+          description: >-
+            Mention labels this resolver consumes; empty consumes every label
+            (catch-all). Labeled resolvers sharing a source artifact must claim
+            disjoint label sets, and every catch-all on that artifact skips the
+            labels claimed by labeled siblings, so extraction labels stay
+            open-vocabulary while each mention routes to exactly one labeled
+            resolver (label-routed tables, e.g. event mentions to an events
+            table).
         type_must_match: { type: boolean, default: true }
-        scorer_json: { type: string }
+        scorer:
+          $ref: "#/components/schemas/GraphResolverScorerConfig"
+          description: "Typed matcher scorer. Cannot be combined with scorer_json."
+        scorer_json:
+          type: string
+          deprecated: true
+          x-deprecated-reason: "Use the scorer field."
         candidate_search:
           type: string
           enum: ["", exact_key, prefix, ann]
@@ -305,7 +331,60 @@ components:
         fusion_trust: { type: number, format: double, minimum: 0, maximum: 1 }
         fusion_prior: { type: number, format: double, minimum: 0, maximum: 1 }
         fusion_prior_weight: { type: number, format: double, minimum: 0 }
+        min_confidence:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+          description: >-
+            Mention admission floor: mentions whose extractor-asserted
+            confidence is below this are never resolved — no canonical entity
+            key, no mention edge, and relation endpoints referencing them are
+            withheld. The cheap post-extraction junk filter for
+            score-carrying extractors; 0 (the default) admits everything.
         config_generation: { type: integer, format: uint64, minimum: 0 }
+    GraphResolverScorerConfig:
+      type: object
+      required: [comparisons]
+      additionalProperties: false
+      properties:
+        comparisons:
+          type: array
+          items: { $ref: "#/components/schemas/GraphResolverScorerComparison" }
+        combine:
+          type: object
+          additionalProperties: false
+          properties:
+            bias: { type: number, format: double }
+        decision:
+          type: object
+          additionalProperties: false
+          properties:
+            match: { type: number, format: double }
+            review: { type: number, format: double }
+    GraphResolverScorerComparison:
+      type: object
+      required: [name, left, right, levels]
+      additionalProperties: false
+      properties:
+        name: { type: string }
+        left: { type: string }
+        right: { type: string }
+        levels:
+          type: array
+          items: { $ref: "#/components/schemas/GraphResolverScorerLevel" }
+    GraphResolverScorerLevel:
+      type: object
+      required: [weight]
+      additionalProperties: false
+      properties:
+        when:
+          type: string
+          description: "Matcher condition, such as 'exact' or 'jaro_winkler >= 0.9'."
+        else:
+          type: boolean
+          description: "Catch-all level when no previous condition matched."
+        weight: { type: number, format: double }
     CreateAlgebraicIndexRequest:
       description: "Create a schema-derived algebraic index."
       allOf:
@@ -317,6 +396,56 @@ components:
             type:
               type: string
               enum: [algebraic]
+    RelationalIndexConfig:
+      type: object
+      required: [keys]
+      description: >
+        Schema-bound composite ordered index on a relational table. Keys use
+        stable typed comparison semantics and independent direction, null
+        placement, and string collation. Existing rows build asynchronously;
+        indexed queries require complete owner coverage. The table schema is
+        the single durable authority for these definitions.
+      properties:
+        keys:
+          type: array
+          minItems: 1
+          maxItems: 32
+          items:
+            $ref: "schema.yaml#/components/schemas/RelationalIndexKey"
+        include_columns:
+          type: array
+          maxItems: 256
+          uniqueItems: true
+          description: Non-key columns stored for index-only projection; distinct from keys.
+          items:
+            type: string
+            minLength: 1
+        where:
+          type: array
+          maxItems: 256
+          description: Optional conjunction selecting index members. Queries must explicitly include all typed conjuncts.
+          items:
+            $ref: "schema.yaml#/components/schemas/RelationalIndexPredicate"
+    CreateRelationalIndexRequest:
+      description: Create a composite ordered index through the shared index resource.
+      allOf:
+        - $ref: "#/components/schemas/RelationalIndexConfig"
+        - type: object
+          required: [type]
+          properties:
+            description:
+              type: string
+              description: Optional description of the index and its purpose.
+            version:
+              type: integer
+              default: 0
+              minimum: 0
+              maximum: 0
+              x-go-type-skip-optional-pointer: true
+              description: Index implementation version. Only zero is supported; the schema epoch is managed by the server.
+            type:
+              type: string
+              enum: [relational]
     CreateIndexRequest:
       description: "Type-safe configuration for a new index. The index name is owned by the request path."
       x-antfly-sdk-alternative:
@@ -328,6 +457,7 @@ components:
         - $ref: "#/components/schemas/CreateEmbeddingsIndexRequest"
         - $ref: "#/components/schemas/CreateGraphIndexRequest"
         - $ref: "#/components/schemas/CreateAlgebraicIndexRequest"
+        - $ref: "#/components/schemas/CreateRelationalIndexRequest"
       discriminator:
         propertyName: type
         mapping:
@@ -335,6 +465,7 @@ components:
           embeddings: "#/components/schemas/CreateEmbeddingsIndexRequest"
           graph: "#/components/schemas/CreateGraphIndexRequest"
           algebraic: "#/components/schemas/CreateAlgebraicIndexRequest"
+          relational: "#/components/schemas/CreateRelationalIndexRequest"
     IndexMutationConflictError:
       type: object
       additionalProperties: false
@@ -422,9 +553,14 @@ components:
           description: "Optional stable model/token-space identifier asserted for this embedding artifact."
         chunk_size: { type: integer, minimum: 0 }
         chunk_overlap: { type: integer, minimum: 0 }
-        chunker_json: { type: string }
+        chunker: { $ref: "chunking.yaml#/components/schemas/ChunkerConfig" }
+        chunker_json:
+          type: string
+          deprecated: true
+          x-deprecated-reason: "Use the typed chunker field."
         full_text_index: { type: boolean, default: false }
         content_type: { type: string }
+        neighbor_context: { $ref: "#/components/schemas/EnrichmentNeighborContextConfig" }
         execution: { $ref: "#/components/schemas/ExecutionPolicy" }
     CreatedEmbeddingsIndexConfig:
       type: object
@@ -474,6 +610,7 @@ components:
           items: { $ref: "#/components/schemas/FullTextArtifactIndexSource" }
         mem_only: { type: boolean }
         field: { type: string }
+        analysis_config: { $ref: "#/components/schemas/TextAnalysisConfig" }
     CreatedGraphIndexConfig:
       type: object
       description: "Credential-free normalized graph configuration returned after creation."
@@ -546,6 +683,17 @@ components:
             type:
               type: string
               enum: [algebraic]
+    CreatedRelationalIndex:
+      description: Effective schema-bound composite index configuration.
+      allOf:
+        - $ref: "#/components/schemas/CreatedIndexCommon"
+        - $ref: "#/components/schemas/RelationalIndexConfig"
+        - type: object
+          required: [type]
+          properties:
+            type:
+              type: string
+              enum: [relational]
     CreatedIndex:
       description: "Discriminated normalized configuration returned after an index is created."
       oneOf:
@@ -553,6 +701,7 @@ components:
         - $ref: "#/components/schemas/CreatedEmbeddingsIndex"
         - $ref: "#/components/schemas/CreatedGraphIndex"
         - $ref: "#/components/schemas/CreatedAlgebraicIndex"
+        - $ref: "#/components/schemas/CreatedRelationalIndex"
       discriminator:
         propertyName: type
         mapping:
@@ -560,6 +709,7 @@ components:
           embeddings: "#/components/schemas/CreatedEmbeddingsIndex"
           graph: "#/components/schemas/CreatedGraphIndex"
           algebraic: "#/components/schemas/CreatedAlgebraicIndex"
+          relational: "#/components/schemas/CreatedRelationalIndex"
     EnrichmentKind:
       type: string
       enum:
@@ -623,7 +773,7 @@ components:
         source_artifact_name:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: "Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts."
+          description: "Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts; asset enrichments may consume other asset artifacts (the upstream asset's produced bytes become this producer's source, so field and template must be omitted and the producer must consume text: copy, generator, or extractor)."
         expected_dims:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -644,10 +794,15 @@ components:
           type: integer
           minimum: 0
           description: "Chunk overlap for chunk enrichments."
+        chunker:
+          $ref: "chunking.yaml#/components/schemas/ChunkerConfig"
+          description: "Chunker configuration for chunk enrichments. Cannot be combined with chunker_json."
         chunker_json:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: "Serialized chunker configuration for chunk enrichments."
+          deprecated: true
+          x-deprecated-reason: "Use the typed chunker field."
+          description: "Legacy serialized chunker configuration for chunk enrichments. Cannot be combined with chunker."
         full_text_index:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -657,14 +812,133 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
           description: "Produced asset content type for asset enrichments."
+        producer:
+          type: object
+          additionalProperties: true
+          writeOnly: true
+          description: "Write-only producer configuration. Cannot be combined with producer_json or transcriber."
         producer_json:
           x-go-type-skip-optional-pointer: true
           type: string
           writeOnly: true
+          deprecated: true
+          x-deprecated-reason: "Use the producer field."
           description: "Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded."
+        neighbor_context:
+          $ref: "#/components/schemas/EnrichmentNeighborContextConfig"
+          description: "Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator or extractor); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission."
         execution:
           $ref: "#/components/schemas/ExecutionPolicy"
           description: "Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity."
+        transcriber:
+          $ref: "#/components/schemas/TranscriberEnrichmentConfig"
+          description: "Typed shorthand for a transcription asset enrichment. Only valid with kind=asset and without producer_json; Antfly expands it into a document_extraction producer whose audio route transcribes each recording with this speech-to-text provider. The produced units carry the transcript text, provider confidence, and per-phrase time offsets, and chunk enrichments that consume them emit _start_time_ms/_end_time_ms on every chunk. With diarization: true the phrases also carry who spoke them, and a chunk that does not straddle a turn emits _speaker. content_type defaults to application/json."
+    EnrichmentNeighborContextConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - graph_index
+      description: "Bounded sample of the document's same-shard graph neighbors appended to an asset producer's rendered input as a compact JSON block ({\"neighbors\":[{\"edge_type\":...,\"direction\":...,\"target\":...,\"weight\":...}]}), ordered by edge type then target key. A conceptualizer enrichment on an entities table can thereby ground its abstractions in adjacent facts (\"started_by -> John Andrew Rice\"). The sampled block participates in the producer's skip state, so a changed adjacency re-runs the producer."
+      properties:
+        graph_index:
+          type: string
+          minLength: 1
+          description: "Name of a graph index on the same table whose local state is sampled. Validated at admission; cross-shard neighbors are not sampled."
+        edge_types:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+            minLength: 1
+          description: "Edge types to sample. Empty admits every edge type."
+        direction:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          enum: [out, in, both]
+          default: both
+          description: "Adjacency orientation to sample relative to the document."
+        limit:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 64
+          default: 8
+          description: "Maximum neighbors rendered into the producer input, applied after deterministic ordering."
+    TranscriberEnrichmentConfig:
+      description: |-
+        Speech-to-text provider for the `transcriber` enrichment shorthand.
+
+        Carries the provider's STT configuration (`provider`, `model`, `api_url`, `api_key`, ...) plus the transcription options below. The fields are declared inline rather than composed from `STTConfig` so that a generated client can leave an option out: a composed schema makes a typed client serialize every field, and a `max_download_bytes` of zero would reject every recording.
+
+        **Example:**
+        ```yaml
+        name: call_transcripts
+        kind: asset
+        field: recording_url
+        transcriber:
+          provider: antfly
+          model: openai/whisper-base
+          language_code: en
+          timestamps: true
+        ```
+      type: object
+      required:
+        - provider
+      properties:
+        provider:
+          $ref: "audio.yaml#/components/schemas/STTProvider"
+        model:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Model name, as the provider names it (e.g. 'openai/whisper-base' for antfly, 'whisper-1' for openai)."
+        api_url:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          format: uri
+          description: "Antfly inference API URL. Falls back to ANTFLY_INFERENCE_URL."
+        base_url:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          format: uri
+          description: "OpenAI API base URL. Falls back to OPENAI_BASE_URL."
+        api_key:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Provider API key. Falls back to the provider's environment variable."
+        project_id:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Google Cloud project ID for the vertex provider. Falls back to GOOGLE_CLOUD_PROJECT."
+        location:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Google Cloud location for the vertex provider."
+        credentials_path:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Path to an ADC credential JSON file for the vertex provider. Falls back to the default ADC chain."
+        language_code:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Spoken language hint (ISO 639-1, e.g. 'en'). Omit for automatic detection where the provider supports it."
+        timestamps:
+          # Pointer, not a bare bool: this defaults to true, so a client that
+          # cannot tell "false" from "unset" can never turn timing off.
+          x-go-type-skip-optional-pointer: false
+          type: boolean
+          default: true
+          description: "Request timestamped transcript segments so chunks carry recording offsets. Providers without segment timing return plain text."
+        diarization:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          default: false
+          description: "Request speaker labels on transcript segments where the provider supports them."
+        max_download_bytes:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 1
+          description: "Largest recording fetched from a URL, in bytes. Defaults to 128 MiB, which covers a one hour voice memo or podcast."
     FullTextIndexConfig:
       type: object
       x-antfly-mutually-exclusive:
@@ -693,6 +967,87 @@ components:
           type: string
           minLength: 1
           description: "Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments."
+        analysis_config:
+          $ref: "#/components/schemas/TextAnalysisConfig"
+    TextAnalysisConfig:
+      type: object
+      description: |
+        Custom text analysis for a full-text index. Component maps are keyed
+        by the name that analyzers and `field_analyzers` reference. Built-in
+        analyzers (`standard`, `simple`, `keyword`, `html`, `search_as_you_type`,
+        `substring`, and the language analyzers such as `german`) are always
+        available without declaring them.
+
+        Example: split camelCase identifiers and match them as substrings.
+
+        ```json
+        {
+          "analysis_config": {
+            "field_analyzers": {"symbol": "code"},
+            "token_filters": {
+              "tails": {"type": "suffix", "config": {"min": 3, "max": 24}}
+            },
+            "analyzers": {
+              "code": {
+                "type": "custom",
+                "config": {
+                  "tokenizer": "whitespace",
+                  "token_filters": ["camel_case", "unique", "tails"]
+                }
+              }
+            }
+          }
+        }
+        ```
+      properties:
+        field_analyzers:
+          type: object
+          additionalProperties:
+            type: string
+          description: "Map of indexed field name to analyzer name. Overrides the analyzer derived from the table schema for that field."
+        char_filters:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/TextAnalysisComponent"
+          description: "Named character filters. Types: `html_strip` (alias `html`), `ascii_fold`, `zero_width_non_joiner`."
+        tokenizers:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/TextAnalysisComponent"
+          description: "Named tokenizers. Types: `unicode` (alias `unicode_words`), `whitespace`, `keyword`, `character`, `ngram` (`config.min`, `config.max`), `edge_ngram` (`config.min`, `config.max`, `config.side` of `front` or `back`)."
+        token_filters:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/TextAnalysisComponent"
+          description: "Named token filters. Types: `lowercase` (alias `to_lower`), `stop_words` (alias `stop`; optional `config.language`), `stemmer` (optional `config.language`), `ngram` and `edge_ngram` (`config.min`, `config.max`), `shingle` (`config.min`, `config.max`, `config.separator` of `space` or `none`), `suffix` (`config.min`, `config.max`; emits every suffix of each token so prefix queries answer containment), `length` (`config.min`, `config.max`), `truncate` (`config.length`), `camel_case`, `unique`, `reverse`, `elision`, `apostrophe`. Languages: english, german, french, spanish, italian, portuguese, dutch, swedish, norwegian, danish, finnish."
+        analyzers:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/TextAnalysisComponent"
+          description: "Named analyzers of type `custom`. `config.tokenizer` names a built-in or declared tokenizer; `config.char_filters` and `config.token_filters` list built-in or declared component names in application order. Configuration-free filters (`lowercase`, `stop_words`, `stemmer`, `camel_case`, `unique`, `reverse`, `elision`, `apostrophe`, `suffix`) can be listed by name without declaring them."
+        default_datetime_parser:
+          type: string
+          description: "Name of the date-time parser applied to datetime fields without a field-specific parser."
+        field_date_time_parsers:
+          type: object
+          additionalProperties:
+            type: string
+          description: "Map of field name to date-time parser name."
+        date_time_parsers:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/TextAnalysisComponent"
+          description: "Named date-time parsers. Type `sanitizedgo` accepts `config.layouts`, a list of Go reference-time layouts tried in order."
+    TextAnalysisComponent:
+      type: object
+      required: [type]
+      description: "One named analysis component: its type and type-specific configuration."
+      properties:
+        type:
+          type: string
+        config:
+          type: object
+          additionalProperties: true
     AlgebraicIndexConfig:
       type: object
       description: "Schema-derived algebraic sidecar configuration. Public requests may opt into schema derivation, while materializations remain engine-owned."
@@ -1530,6 +1885,7 @@ components:
         fatal_error_count:
           type: integer
           format: uint64
+          description: "Durable count of enrichment requests parked with a non-retryable (terminal) disposition, plus fatal worker failures. A terminally failed request never returns to pending; per-document terminal state is reported by the owning index's coverage counters (terminal_failed), and per-document diagnostics by the artifact repair issue listing."
         consecutive_retry_count:
           type: integer
           format: uint32
@@ -1934,11 +2290,152 @@ components:
           embeddings: "indexes.yaml#/components/schemas/EmbeddingsIndexStats"
           graph: "indexes.yaml#/components/schemas/GraphIndexStats"
           algebraic: "indexes.yaml#/components/schemas/AlgebraicIndexStats"
+          relational: "indexes.yaml#/components/schemas/RelationalIndexStats"
       oneOf:
         - $ref: "#/components/schemas/FullTextIndexStats"
         - $ref: "#/components/schemas/EmbeddingsIndexStats"
         - $ref: "#/components/schemas/GraphIndexStats"
         - $ref: "#/components/schemas/AlgebraicIndexStats"
+        - $ref: "#/components/schemas/RelationalIndexStats"
+    RelationalIndexStats:
+      type: object
+      required: [index_type, milestones, relational_index]
+      properties:
+        index_type:
+          type: string
+          enum: [relational]
+        milestones:
+          $ref: "#/components/schemas/IndexMilestones"
+        relational_index:
+          $ref: "#/components/schemas/RelationalIndexStatus"
+    RelationalIndexBuildState:
+      type: string
+      enum: [building, ready, failed]
+    RelationalIndexBuildFailure:
+      type: string
+      enum: [incompatible_schema, invalid_row, key_too_large]
+    RelationalIndexRangeStatus:
+      type: object
+      required: [group_id, generation, slot, owner, comparison, progress_digest, maintenance_epoch, state, rows_scanned]
+      properties:
+        group_id:
+          type: string
+          pattern: "^[0-9]+$"
+        generation:
+          type: string
+          pattern: "^[0-9]+$"
+          description: Exact uint64 generation encoded as decimal, never a floating-point number.
+        slot:
+          type: integer
+          format: uint32
+        owner:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: Namespace and owned-range fingerprint.
+        comparison:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: Executable tuple comparison fingerprint.
+        progress_digest:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: Exact durable progress observation for generation-fenced maintenance.
+        maintenance_epoch:
+          type: string
+          pattern: "^[0-9]+$"
+          description: Replicated desired maintenance ticket, separate from replica-local progress.
+        last_maintenance_request:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: Most recently accepted maintenance command proof for exact retry acknowledgement.
+        state:
+          $ref: "#/components/schemas/RelationalIndexBuildState"
+        rows_scanned:
+          type: string
+          pattern: "^[0-9]+$"
+        failure:
+          $ref: "#/components/schemas/RelationalIndexBuildFailure"
+    RelationalIndexStatus:
+      type: object
+      required: [table_id, schema_version, index_name, state, ranges]
+      properties:
+        table_id:
+          type: string
+          pattern: "^[0-9]+$"
+        schema_version:
+          type: integer
+          format: uint32
+        index_name:
+          type: string
+        state:
+          $ref: "#/components/schemas/RelationalIndexBuildState"
+        ranges:
+          type: array
+          maxItems: 4096
+          items:
+            $ref: "#/components/schemas/RelationalIndexRangeStatus"
+    IndexMaintenanceAction:
+      type: string
+      enum: [retry, repair]
+    IndexMaintenanceOwnerProof:
+      type: object
+      additionalProperties: false
+      required: [group_id, generation, slot, owner, comparison, progress_digest, maintenance_epoch]
+      properties:
+        group_id:
+          type: string
+          pattern: "^[0-9]+$"
+        generation:
+          type: string
+          pattern: "^[0-9]+$"
+        slot:
+          type: integer
+          format: uint32
+        owner:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        comparison:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        progress_digest:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        maintenance_epoch:
+          type: string
+          pattern: "^[0-9]+$"
+    IndexMaintenanceRequest:
+      type: object
+      additionalProperties: false
+      required: [table_id, schema_version, owners]
+      description: >-
+        Exact observations from index status. Each selected owner is admitted atomically
+        through the replicated transaction journal; the selection is not one global
+        transaction. Cancellation, conflicts, or a lost acknowledgement may leave some
+        owners admitted. Resubmit the identical request to resume safely; do not replace
+        its observations with newer progress unless starting a new maintenance attempt.
+      properties:
+        table_id:
+          type: string
+          pattern: "^[0-9]+$"
+        schema_version:
+          type: integer
+          format: uint32
+        owners:
+          type: array
+          minItems: 1
+          maxItems: 128
+          items:
+            $ref: "#/components/schemas/IndexMaintenanceOwnerProof"
+    IndexMaintenanceResponse:
+      type: object
+      required: [acknowledged_groups]
+      properties:
+        acknowledged_groups:
+          type: array
+          maxItems: 128
+          items:
+            type: string
+            pattern: "^[0-9]+$"
     AlgebraicIndexStats:
       type: object
       description: "Compact public statistics for an algebraic sidecar index. Detailed runtime, adaptive, and materialization records remain internal diagnostics."
@@ -2343,6 +2840,7 @@ components:
       type: string
       enum:
         - search_as_you_type
+        - substring
         - keyword
         - text
         - html
@@ -2359,7 +2857,14 @@ components:
       description: "Configuration for graph index type"
       x-antfly-mutually-exclusive:
         - [sources, source]
+        - [ttl, ttl_duration]
       properties:
+        ttl:
+          $ref: "#/components/schemas/GraphTtlConfig"
+          description: "Creation-based edge expiration for this graph index. The duration is immutable within an index incarnation."
+        ttl_duration:
+          type: string
+          description: "Compatibility alias for ttl.duration. Do not specify together with ttl."
         metrics:
           type: object
           description: "Named published graph metrics. Serverless supports background refresh only and limits configurations to 16 metrics per graph, 64 total per publication, 64 types per filter, and 128 UTF-8 bytes per metric name."
@@ -2407,6 +2912,14 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/GraphResolverConfig"
+    GraphTtlConfig:
+      type: object
+      additionalProperties: false
+      required: [duration]
+      properties:
+        duration:
+          type: string
+          description: "Expiration duration using Antfly's integer-component duration format (ns, us, ms, s, m, h, d)."
     GraphMetricConfig:
       type: object
       additionalProperties: false
@@ -5103,6 +5616,32 @@ components:
             - fresh
           default: published
           description: Whether the latest published generation may be stale or must match the graph edge generation.
+        seed_nodes:
+          type: array
+          maxItems: 128
+          items:
+            type: string
+            minLength: 1
+          description: >-
+            Node keys receiving all teleport mass for query-seeded personalized
+            PageRank (HippoRAG-style retrieval). Only valid for pagerank
+            metrics and requires metric_freshness=fresh: personalized scores
+            are computed at query time from the current edge snapshot, while
+            published generations are global-only, so seeded reads against
+            published freshness are rejected. Seed keys absent from the graph
+            are skipped; if none resolve, ranking degenerates to global
+            PageRank.
+        damping:
+          type: number
+          format: double
+          minimum: 0
+          exclusiveMinimum: true
+          maximum: 1
+          exclusiveMaximum: true
+          description: >-
+            Damping override for query-seeded personalized PageRank (typical
+            HippoRAG-style retrieval uses 0.9). Only valid together with
+            seed_nodes; omitted reads keep the metric's configured damping.
     GraphMetricRerank:
       type: object
       description: >-
@@ -5150,6 +5689,42 @@ components:
             - fresh
           default: published
           description: Whether stale published generations are acceptable or the metric must be fresh.
+        seed_nodes:
+          type: array
+          maxItems: 128
+          items:
+            type: string
+            minLength: 1
+          description: >-
+            Node keys receiving all teleport mass for a query-seeded
+            personalized PageRank blend (HippoRAG-style retrieval). Only valid
+            for pagerank metrics and requires metric_freshness=fresh: the
+            blended feature scores are computed at query time from the current
+            edge snapshot, while published generations are global-only, so
+            seeded blends against published freshness are rejected. Seed keys
+            absent from the graph are skipped; if none resolve, the blend
+            degenerates to global PageRank.
+        damping:
+          type: number
+          format: double
+          minimum: 0
+          exclusiveMinimum: true
+          maximum: 1
+          exclusiveMaximum: true
+          description: >-
+            Damping override for the query-seeded personalized PageRank blend.
+            Only valid together with seed_nodes; omitted blends keep the
+            metric's configured damping.
+        auto_seed:
+          type: boolean
+          default: false
+          description: >-
+            Seed the personalized PageRank blend from the query's literal
+            graph-search start keys; only valid for pagerank metrics with
+            metric_freshness=fresh. Honored by retrieval-agent queries:
+            caller-supplied seed_nodes always take precedence and are never
+            overwritten, and queries without literal graph-search start keys
+            keep their unseeded (global) blend.
     GraphMetricResult:
       type: object
       required:

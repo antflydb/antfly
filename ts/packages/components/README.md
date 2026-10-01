@@ -148,7 +148,7 @@ antfly table create --table example \
   }'
 ```
 
-The schema is defined in [`storybook-schema.json`](./storybook-schema.json).
+The schema is defined in [`storybook-schema.json`](storybook-schema.json).
 
 This creates a table with:
 - **x-antfly-include-in-all**: Enables the `_all` field for cross-field search across TICO, AUTR, and DESC

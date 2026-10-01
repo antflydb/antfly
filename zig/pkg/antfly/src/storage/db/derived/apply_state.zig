@@ -121,6 +121,77 @@ pub const ProjectionCheckpoint = struct {
     format_version: u32 = projection_checkpoint_format_version,
 };
 
+/// A coherent receiver-local projection checkpoint cut. The file lock remains
+/// held until deinit, including while a caller publishes evidence into primary
+/// metadata. Acquiring an epoch before/after an unguarded file read is NOT
+/// equivalent: a writer revokes first and then replaces the file.
+///
+/// Lock order is checkpoint file -> primary transaction, matching publishers.
+/// Acquire before opening a primary write transaction. This lease proves a
+/// checkpoint cut only; the caller must independently validate the physical
+/// index generation before treating a clean watermark as completion evidence.
+pub const ProjectionSnapshot = struct {
+    alloc: Allocator,
+    guard: CheckpointWriteGuard,
+    checkpoint: CheckpointMap,
+    authority: @import("../artifact_publication.zig").Authority,
+    epoch: u64,
+
+    pub fn deinit(self: *@This()) void {
+        self.checkpoint.deinit(self.alloc);
+        self.guard.release();
+        self.* = undefined;
+    }
+
+    /// Absence is not a clean zero-watermark certificate.
+    pub fn get(self: *const @This(), index_name: []const u8) ?ProjectionCheckpoint {
+        return self.checkpoint.map.get(index_name);
+    }
+
+    /// Recheck in the evidence publication transaction. Raw physical resets,
+    /// authority switches and reopen can revoke independently of this lock.
+    pub fn requireCurrent(self: *const @This(), txn: anytype) !void {
+        const current = (try @import("../artifact_publication.zig").authority(txn)) orelse return error.ArtifactCatalogDrift;
+        if (!std.meta.eql(self.authority, current)) return error.ArtifactCatalogDrift;
+        try @import("../artifact_projection_epoch.zig").requireCurrent(txn, self.epoch);
+    }
+};
+
+/// Read and decode the sidecar once for a batch of index evidence publications,
+/// not once per document/requirement. A busy publisher yields no snapshot rather
+/// than blocking the completion driver behind index I/O. Missing or scalar-only
+/// checkpoints likewise cannot certify physical generations.
+pub fn tryAcquireProjectionSnapshot(
+    alloc: Allocator,
+    io: std.Io,
+    store: anytype,
+    checkpoint_path: ?[]const u8,
+) !?ProjectionSnapshot {
+    if (comptime builtin.os.tag == .freestanding) return null;
+    const path = checkpoint_path orelse return null;
+    const lock = try retainCheckpointFileLock(path);
+    if (!lock.mutex.tryLock()) {
+        releaseCheckpointFileLock(lock);
+        return null;
+    }
+    var guard: CheckpointWriteGuard = .{ .lock = lock };
+    var owned = true;
+    defer if (owned) guard.release();
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginProbe();
+    defer txn.abort();
+    const authority = (try @import("../artifact_publication.zig").authority(&txn)) orelse return null;
+    const epoch = try @import("../artifact_projection_epoch.zig").load(&txn);
+    var checkpoint = loadCheckpoint(alloc, io, path) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    errdefer checkpoint.deinit(alloc);
+    owned = false;
+    return .{ .alloc = alloc, .guard = guard, .checkpoint = checkpoint, .authority = authority, .epoch = epoch };
+}
+
 pub const AppliedSequenceUpdate = struct {
     index_name: []const u8,
     sequence: u64,
@@ -213,6 +284,11 @@ pub fn saveAppliedSequenceTxn(txn: anytype, index_name: []const u8, sequence: u6
 
     var key_buf: [256]u8 = undefined;
     const key = try std.fmt.bufPrint(&key_buf, "{s}{s}", .{ metadata_prefix, index_name });
+    const previous = mutable_txn.get(key) catch |err| if (err == error.NotFound) null else return err;
+    if (previous) |raw| {
+        if (raw.len != 8) return error.InvalidDerivedApplyState;
+        if (sequence < std.mem.readInt(u64, raw[0..8], .little)) try @import("../artifact_projection_epoch.zig").revoke(mutable_txn);
+    } else try @import("../artifact_projection_epoch.zig").revoke(mutable_txn);
     try mutable_txn.put(key, &buf);
 }
 
@@ -239,7 +315,7 @@ pub fn saveAppliedSequenceWithCheckpoint(
 ) !void {
     if (comptime builtin.os.tag == .freestanding) return try saveAppliedSequence(store, index_name, sequence);
     if (checkpoint_path) |path| {
-        try setAppliedSequencesCheckpoint(alloc, io, path, &[_]AppliedSequenceUpdate{.{
+        try setAppliedSequencesCheckpoint(alloc, io, path, store, &[_]AppliedSequenceUpdate{.{
             .index_name = index_name,
             .sequence = sequence,
         }});
@@ -255,11 +331,15 @@ pub fn saveAppliedSequenceUpdateWithCheckpoint(
     checkpoint_path: ?[]const u8,
     update: AppliedSequenceUpdate,
 ) !void {
-    if (comptime builtin.os.tag == .freestanding) return try saveAppliedSequence(store, update.index_name, update.sequence);
+    if (comptime builtin.os.tag == .freestanding) {
+        if (update.status != .clean or update.generation != 0) try revokeCompletion(alloc, store);
+        return try saveAppliedSequence(store, update.index_name, update.sequence);
+    }
     if (checkpoint_path) |path| {
-        try setAppliedSequencesCheckpoint(alloc, io, path, &[_]AppliedSequenceUpdate{update});
+        try setAppliedSequencesCheckpoint(alloc, io, path, store, &[_]AppliedSequenceUpdate{update});
         return;
     }
+    if (update.status != .clean or update.generation != 0) try revokeCompletion(alloc, store);
     try saveAppliedSequence(store, update.index_name, update.sequence);
 }
 
@@ -271,9 +351,12 @@ pub fn saveProjectionCheckpointWithSidecar(
     index_name: []const u8,
     checkpoint: ProjectionCheckpoint,
 ) !void {
-    if (comptime builtin.os.tag == .freestanding) return try saveAppliedSequence(store, index_name, checkpoint.applied_sequence);
+    if (comptime builtin.os.tag == .freestanding) {
+        try revokeCompletion(alloc, store);
+        return try saveAppliedSequence(store, index_name, checkpoint.applied_sequence);
+    }
     if (checkpoint_path) |path| {
-        try setProjectionCheckpoints(alloc, io, path, &[_]AppliedSequenceUpdate{.{
+        try setProjectionCheckpoints(alloc, io, path, store, &[_]AppliedSequenceUpdate{.{
             .index_name = index_name,
             .sequence = checkpoint.applied_sequence,
             .status = checkpoint.status,
@@ -283,6 +366,10 @@ pub fn saveProjectionCheckpointWithSidecar(
         }});
         return;
     }
+    // Metadata-only stores cannot compare lifecycle identities in the legacy
+    // scalar watermark. Explicit checkpoint replacement must revoke; ordinary
+    // forward sequence updates retain their cheaper monotonic path.
+    try revokeCompletion(alloc, store);
     try saveAppliedSequence(store, index_name, checkpoint.applied_sequence);
 }
 
@@ -296,7 +383,7 @@ pub fn saveAppliedSequencesWithCheckpoint(
     if (updates.len == 0) return;
     if (comptime builtin.os.tag == .freestanding) return try saveAppliedSequences(store, updates);
     if (checkpoint_path) |path| {
-        try saveAppliedSequencesCheckpoint(alloc, io, path, updates);
+        try saveAppliedSequencesCheckpoint(alloc, io, path, store, updates);
         return;
     }
     try saveAppliedSequences(store, updates);
@@ -320,7 +407,7 @@ pub fn clearAppliedSequenceWithCheckpoint(
 ) !void {
     if (comptime builtin.os.tag == .freestanding) return try clearAppliedSequence(store, index_name);
     if (checkpoint_path) |path| {
-        try clearAppliedSequenceCheckpoint(alloc, io, path, index_name);
+        try clearAppliedSequenceCheckpoint(alloc, io, path, store, index_name);
         return;
     }
     try clearAppliedSequence(store, index_name);
@@ -328,6 +415,7 @@ pub fn clearAppliedSequenceWithCheckpoint(
 
 pub fn clearAppliedSequenceTxn(txn: anytype, index_name: []const u8) !void {
     var mutable_txn = txn;
+    try @import("../artifact_projection_epoch.zig").revoke(mutable_txn);
     var key_buf: [256]u8 = undefined;
     const key = try std.fmt.bufPrint(&key_buf, "{s}{s}", .{ metadata_prefix, index_name });
     mutable_txn.delete(key) catch |err| switch (err) {
@@ -507,7 +595,179 @@ fn loadProjectionCheckpoint(alloc: Allocator, io: std.Io, path: []const u8, inde
     return checkpoint.map.get(index_name);
 }
 
-fn saveAppliedSequencesCheckpoint(alloc: Allocator, io: std.Io, path: []const u8, updates: []const AppliedSequenceUpdate) !void {
+test "ordered artifact inventory projection snapshot owns a coherent checkpoint and publication fence" {
+    const alloc = std.testing.allocator;
+    const db_mod = @import("../db.zig");
+    const publication = @import("../artifact_publication.zig");
+    const epoch = @import("../artifact_projection_epoch.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/projection-snapshot", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try db_mod.DB.open(alloc, path, .{ .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    const sidecar = try checkpointPathAlloc(alloc, path);
+    defer alloc.free(sidecar);
+    try std.testing.expect(try tryAcquireProjectionSnapshot(alloc, std.testing.io, db.core.store, sidecar) == null);
+    var activation: publication.Command = .{ .mode = .activate, .namespace = @splat(1), .authority_epoch = 1, .catalog_digest = @splat(2), .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try publication.stageAuthority(&txn, activation);
+        try txn.commit();
+    }
+    try std.testing.expect(try tryAcquireProjectionSnapshot(alloc, std.testing.io, db.core.store, sidecar) == null);
+    try std.testing.expect(try tryAcquireProjectionSnapshot(alloc, std.testing.io, db.core.store, null) == null);
+    try saveProjectionCheckpointWithSidecar(alloc, std.testing.io, db.core.store, sidecar, "text", .{ .applied_sequence = 11, .generation = 2, .config_hash = 7 });
+    const Check = struct {
+        fn run(a: Allocator, store: *docstore_mod.DocStore, location: []const u8) !void {
+            var snapshot = (try tryAcquireProjectionSnapshot(a, std.testing.io, store, location)).?;
+            defer snapshot.deinit();
+            try std.testing.expectEqual(@as(u64, 11), snapshot.get("text").?.applied_sequence);
+            try std.testing.expect(snapshot.get("missing") == null);
+            // This is the same lock used by every sidecar publication. It is
+            // still held after file decoding, not just during readFileAlloc.
+            const unexpectedly_unlocked = snapshot.guard.lock.mutex.tryLock();
+            if (unexpectedly_unlocked) snapshot.guard.lock.mutex.unlock();
+            try std.testing.expect(!unexpectedly_unlocked);
+            var txn = try store.beginReadTxn();
+            defer txn.abort();
+            try snapshot.requireCurrent(&txn);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ db.core.store, sidecar });
+    var snapshot = (try tryAcquireProjectionSnapshot(alloc, std.testing.io, db.core.store, sidecar)).?;
+    defer snapshot.deinit();
+    try std.testing.expect(try tryAcquireProjectionSnapshot(alloc, std.testing.io, db.core.store, sidecar) == null);
+    // Physical reset/open revocation need not replace a sidecar. A held file
+    // lock therefore cannot replace the primary transaction's final CAS.
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try epoch.revoke(&txn);
+        try std.testing.expectError(error.EnrichmentSourceChanged, snapshot.requireCurrent(&txn));
+        try txn.commit();
+    }
+    {
+        var txn = try db.core.store.beginReadTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.EnrichmentSourceChanged, snapshot.requireCurrent(&txn));
+    }
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        activation.authority_epoch += 1;
+        try publication.stageAuthority(&txn, activation);
+        try std.testing.expectError(error.ArtifactCatalogDrift, snapshot.requireCurrent(&txn));
+        try txn.commit();
+    }
+}
+
+test "ordered artifact inventory projection sidecar transitions revoke completion before publication" {
+    const alloc = std.testing.allocator;
+    const db_mod = @import("../db.zig");
+    const publication = @import("../artifact_publication.zig");
+    const epoch = @import("../artifact_projection_epoch.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/projection-epoch", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchemaJson(alloc, "{}");
+    var catalog = try db.artifactInventoryCommand(alloc);
+    defer catalog.catalogs.deinit(alloc);
+    catalog.binding.effect_protocol = 15;
+    try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 1 });
+    var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
+    activation.publication_digest = activation.digest();
+    try db.batchRaftReplicatedApply(.{ .artifact_publication = activation }, .{ .term = 1, .index = 2 });
+    const sidecar = try checkpointPathAlloc(alloc, path);
+    defer alloc.free(sidecar);
+    const Probe = struct {
+        fn current(store: *docstore_mod.DocStore) !u64 {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            return epoch.load(&read);
+        }
+    };
+    try std.testing.expectEqual(@as(u64, 0), try Probe.current(db.core.store));
+    try saveProjectionCheckpointWithSidecar(alloc, std.testing.io, db.core.store, sidecar, "text", .{ .applied_sequence = 10, .generation = 1, .config_hash = 7 });
+    const first = try Probe.current(db.core.store);
+    try std.testing.expectEqual(@as(u64, 1), first);
+    try saveAppliedSequencesWithCheckpoint(alloc, std.testing.io, db.core.store, sidecar, &.{.{ .index_name = "text", .sequence = 11, .config_hash = 7 }});
+    try std.testing.expectEqual(first, try Probe.current(db.core.store));
+    try saveAppliedSequenceUpdateWithCheckpoint(alloc, std.testing.io, db.core.store, sidecar, .{ .index_name = "text", .sequence = 12, .config_hash = 7 });
+    try std.testing.expectEqual(first, try Probe.current(db.core.store));
+    // Rebuilding, even at the same source cut, invalidates prior completion.
+    try saveProjectionCheckpointWithSidecar(alloc, std.testing.io, db.core.store, sidecar, "text", .{ .applied_sequence = 12, .status = .rebuilding, .generation = 2, .config_hash = 7 });
+    try std.testing.expectEqual(first + 1, try Probe.current(db.core.store));
+    // Recovery may deliberately lower a watermark; it cannot retain a prefix
+    // captured from the old physical projection.
+    try saveAppliedSequenceWithCheckpoint(alloc, std.testing.io, db.core.store, sidecar, "text", 3);
+    try std.testing.expectEqual(first + 2, try Probe.current(db.core.store));
+    try clearAppliedSequenceWithCheckpoint(alloc, std.testing.io, db.core.store, sidecar, "text");
+    try std.testing.expectEqual(first + 3, try Probe.current(db.core.store));
+    // A failed sidecar replacement is permitted to leave an extra revocation.
+    // The reverse ordering would leave stale evidence after a crash.
+    var failed_after_revoke = false;
+    for (0..256) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
+        saveProjectionCheckpointWithSidecar(failing.allocator(), std.testing.io, db.core.store, sidecar, "text", .{ .applied_sequence = 20, .generation = 3, .config_hash = 7 }) catch |err| {
+            if (err != error.OutOfMemory) return err;
+            if (try Probe.current(db.core.store) > first + 3) {
+                failed_after_revoke = true;
+                try std.testing.expectEqual(@as(u64, 0), try loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, db.core.store, sidecar, "text"));
+                break;
+            }
+            continue;
+        };
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(failed_after_revoke);
+    try std.testing.expectEqual(first + 4, try Probe.current(db.core.store));
+    // The metadata-only backend path revokes in the same transaction as reset.
+    try saveAppliedSequence(db.core.store, "text", 20);
+    const metadata_epoch = try Probe.current(db.core.store);
+    try saveAppliedSequence(db.core.store, "text", 21);
+    try std.testing.expectEqual(metadata_epoch, try Probe.current(db.core.store));
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        defer txn.abort();
+        try clearAppliedSequenceTxn(&txn, "text");
+        try std.testing.expectEqual(metadata_epoch + 1, try epoch.load(&txn));
+    }
+    try std.testing.expectEqual(metadata_epoch, try Probe.current(db.core.store));
+    try saveAppliedSequence(db.core.store, "text", 2);
+    try std.testing.expectEqual(metadata_epoch + 1, try Probe.current(db.core.store));
+}
+
+fn invalidatesCompletion(previous: ?ProjectionCheckpoint, next: ProjectionCheckpoint) bool {
+    const old = previous orelse return true;
+    return old.status != next.status or old.generation != next.generation or
+        old.config_hash != next.config_hash or next.applied_sequence < old.applied_sequence or
+        (next.applied_sequence == old.applied_sequence and old.published_count != null and !std.meta.eql(old.published_count, next.published_count));
+}
+
+fn revokeCompletion(alloc: Allocator, store: anytype) !void {
+    // Pure sidecar codec/concurrency tests have no physical owner. Production
+    // wrappers always supply the store whose projections are being changed.
+    if (comptime @TypeOf(store) == @TypeOf(null)) return;
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginWrite();
+    errdefer txn.abort();
+    try @import("../artifact_projection_epoch.zig").revoke(&txn);
+    try txn.commit();
+}
+
+/// Live physical resets must revoke completion before touching their files,
+/// even when they do not otherwise replace an applied-sequence sidecar.
+pub fn invalidateProjectionCompletion(alloc: Allocator, store: anytype) !void {
+    try revokeCompletion(alloc, store);
+}
+
+fn saveAppliedSequencesCheckpoint(alloc: Allocator, io: std.Io, path: []const u8, store: anytype, updates: []const AppliedSequenceUpdate) !void {
     var guard = try acquireCheckpointFileLock(path);
     defer guard.release();
 
@@ -517,7 +777,13 @@ fn saveAppliedSequencesCheckpoint(alloc: Allocator, io: std.Io, path: []const u8
     };
     defer checkpoint.deinit(alloc);
 
-    for (updates) |update| try checkpoint.putMaxSequenceUpdate(alloc, update);
+    var revoke = false;
+    for (updates) |update| {
+        const previous = checkpoint.map.get(update.index_name);
+        try checkpoint.putMaxSequenceUpdate(alloc, update);
+        revoke = revoke or invalidatesCompletion(previous, checkpoint.map.get(update.index_name).?);
+    }
+    if (revoke) try revokeCompletion(alloc, store);
     try writeCheckpointAtomically(alloc, io, path, &checkpoint);
 }
 
@@ -537,7 +803,7 @@ fn saveProjectionCheckpoints(alloc: Allocator, io: std.Io, path: []const u8, upd
     try writeCheckpointAtomically(alloc, io, path, &checkpoint);
 }
 
-fn setAppliedSequencesCheckpoint(alloc: Allocator, io: std.Io, path: []const u8, updates: []const AppliedSequenceUpdate) !void {
+fn setAppliedSequencesCheckpoint(alloc: Allocator, io: std.Io, path: []const u8, store: anytype, updates: []const AppliedSequenceUpdate) !void {
     var guard = try acquireCheckpointFileLock(path);
     defer guard.release();
 
@@ -547,30 +813,43 @@ fn setAppliedSequencesCheckpoint(alloc: Allocator, io: std.Io, path: []const u8,
     };
     defer checkpoint.deinit(alloc);
 
-    for (updates) |update| try checkpoint.putSequenceUpdate(alloc, update);
-    try writeCheckpointAtomically(alloc, io, path, &checkpoint);
-}
-
-fn setProjectionCheckpoints(alloc: Allocator, io: std.Io, path: []const u8, updates: []const AppliedSequenceUpdate) !void {
-    var guard = try acquireCheckpointFileLock(path);
-    defer guard.release();
-
-    var checkpoint = loadCheckpoint(alloc, io, path) catch |err| switch (err) {
-        error.FileNotFound => CheckpointMap{},
-        else => return err,
-    };
-    defer checkpoint.deinit(alloc);
-
+    var revoke = false;
     for (updates) |update| {
-        try checkpoint.put(alloc, update.index_name, update.checkpoint());
+        const previous = checkpoint.map.get(update.index_name);
+        try checkpoint.putSequenceUpdate(alloc, update);
+        revoke = revoke or invalidatesCompletion(previous, checkpoint.map.get(update.index_name).?);
     }
+    if (revoke) try revokeCompletion(alloc, store);
     try writeCheckpointAtomically(alloc, io, path, &checkpoint);
 }
 
-fn clearAppliedSequenceCheckpoint(alloc: Allocator, io: std.Io, path: []const u8, index_name: []const u8) !void {
+fn setProjectionCheckpoints(alloc: Allocator, io: std.Io, path: []const u8, store: anytype, updates: []const AppliedSequenceUpdate) !void {
     var guard = try acquireCheckpointFileLock(path);
     defer guard.release();
 
+    var checkpoint = loadCheckpoint(alloc, io, path) catch |err| switch (err) {
+        error.FileNotFound => CheckpointMap{},
+        else => return err,
+    };
+    defer checkpoint.deinit(alloc);
+
+    var revoke = false;
+    for (updates) |update| {
+        const previous = checkpoint.map.get(update.index_name);
+        try checkpoint.put(alloc, update.index_name, update.checkpoint());
+        revoke = revoke or invalidatesCompletion(previous, checkpoint.map.get(update.index_name).?);
+    }
+    if (revoke) try revokeCompletion(alloc, store);
+    try writeCheckpointAtomically(alloc, io, path, &checkpoint);
+}
+
+fn clearAppliedSequenceCheckpoint(alloc: Allocator, io: std.Io, path: []const u8, store: anytype, index_name: []const u8) !void {
+    var guard = try acquireCheckpointFileLock(path);
+    defer guard.release();
+
+    // Revoke even when the sidecar is already missing. Absence cannot retain
+    // a completion prefix captured before a crash or interrupted replacement.
+    try revokeCompletion(alloc, store);
     var checkpoint = loadCheckpoint(alloc, io, path) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
@@ -771,12 +1050,16 @@ test "derived apply state lsm point load does not clone mutable snapshot" {
 }
 
 test "derived apply state keeps latest lsm value across many flushed overwrites" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    // Preserve leak checks; allocation backtraces are opt-in for diagnostics.
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    var tmp = @import("../../../common/test_directory.zig").fastTmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const path = path_buf[0..path_len];
 
     {
         var backend = try lsm_backend.Backend.open(alloc, path, .{
@@ -797,6 +1080,11 @@ test "derived apply state keeps latest lsm value across many flushed overwrites"
             try saveAppliedSequence(runtime, "idx", sequence);
         }
         try std.testing.expectEqual(@as(u64, 1024), try loadAppliedSequence(alloc, runtime, "idx"));
+        const work = backend.snapshotWriteStats();
+        try std.testing.expectEqual(@as(u64, 1025), work.flushes);
+        try std.testing.expect(work.manifest_writes <= 2 * work.flushes);
+        if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_WORK_PROFILE"))
+            std.debug.print("\nWORK flushed-overwrites flushes={d} compactions={d} manifests={d}\n", .{ work.flushes, work.compactions, work.manifest_writes });
     }
 
     {
@@ -1010,7 +1298,7 @@ test "projection checkpoint rejects plausible cursor corruption" {
     );
     try std.testing.expectError(
         error.InvalidDerivedApplyState,
-        setProjectionCheckpoints(alloc, std.testing.io, checkpoint_path, &.{.{
+        setProjectionCheckpoints(alloc, std.testing.io, checkpoint_path, null, &.{.{
             .index_name = "other_idx",
             .sequence = 99,
         }}),
@@ -1182,7 +1470,7 @@ test "derived apply checkpoint serializes concurrent sidecar writers" {
 
         fn run(self: *@This()) void {
             self.barrier.wait(worker_count);
-            saveAppliedSequencesCheckpoint(self.alloc, self.io, self.path, &[_]AppliedSequenceUpdate{.{
+            saveAppliedSequencesCheckpoint(self.alloc, self.io, self.path, null, &[_]AppliedSequenceUpdate{.{
                 .index_name = self.name,
                 .sequence = self.sequence,
             }}) catch |err| {

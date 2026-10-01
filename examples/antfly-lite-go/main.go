@@ -1,10 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package main
 
@@ -15,7 +21,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/antflydb/antfly/go/pkg/antflylite"
+	"github.com/antflydb/antfly/go/pkg/lite"
 )
 
 type document struct {
@@ -52,7 +58,7 @@ func main() {
 		log.Fatalf("marshal document: %v", err)
 	}
 
-	if err := db.Batch([]antflylite.WriteIntent{{
+	if err := db.Batch([]lite.WriteIntent{{
 		Key:   "doc:lite-go",
 		Value: body,
 	}}, 1); err != nil {
@@ -86,18 +92,18 @@ func main() {
 	}
 	fmt.Printf("wrote portable backup: %s\n", *backupPath)
 
-	check, err := antflylite.CheckFile(*dbPath)
+	check, err := lite.CheckFile(*dbPath)
 	if err != nil {
 		log.Fatalf("check Lite file: %v", err)
 	}
 	fmt.Printf("check: valid=%t size=%d compact_size=%d\n", check.Valid, check.FileSize, check.CompactSize)
 }
 
-func openOrCreateLite(path string) (*antflylite.DB, error) {
+func openOrCreateLite(path string) (*lite.DB, error) {
 	if _, err := os.Stat(path); err == nil {
-		return antflylite.Open(path)
+		return lite.Open(path)
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
-	return antflylite.Create(path)
+	return lite.Create(path)
 }

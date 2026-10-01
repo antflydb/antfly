@@ -13,30 +13,36 @@ T = TypeVar("T", bound="ClusterBackupRequest")
 
 @_attrs_define
 class ClusterBackupRequest:
-    """
-    Attributes:
-        backup_id (str): Unique identifier for this backup. Used to reference the backup for restore operations.
-            Choose a meaningful name that includes date/version information.
-             Example: cluster-backup-2025-01-15.
-        location (str): Storage location for the backup. Supports multiple backends:
-            - Scoped filesystem connection: `file:///logical/path`
-            - Amazon S3: `s3://bucket-name/path/to/backup`
-            - Google Cloud Storage: `gs://bucket-name/path/to/backup`
+    """Native cluster backups pin a common transaction cut across a dependency-complete
+    table set. Restart-stable LSM seals are journaled before releasing write fences;
+    artifact upload uses those immutable seals without holding the write pause.
+    Native cohorts support at most 4096 tables and 4096 ranges and require the
+    filesystem-managed LSM backend. Portable backups do not support coordinated
+    UNIQUE/FK constraints or promise a common cross-table transaction cut.
 
-            The backup includes all table data, indexes, and metadata.
-             Example: s3://mybucket/antfly-backups/cluster/2025-01-15.
-        connection (str): Required configured `external_io` connection with the `backup.write` capability.
-        format_ (ClusterBackupRequestFormat | Unset): Backup format to use:
-            - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only)
-            - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be
-            restored by any Antfly backend)
+        Attributes:
+            backup_id (str): Unique identifier for this backup. Used to reference the backup for restore operations.
+                Choose a meaningful name that includes date/version information.
+                 Example: cluster-backup-2025-01-15.
+            location (str): Storage location for the backup. Supports multiple backends:
+                - Scoped filesystem connection: `file:///logical/path`
+                - Amazon S3: `s3://bucket-name/path/to/backup`
+                - Google Cloud Storage: `gs://bucket-name/path/to/backup`
 
-            On restore, the format is auto-detected from file magic bytes.
-             Default: ClusterBackupRequestFormat.PORTABLE. Example: portable.
-        table_names (list[str] | Unset): Optional list of tables to backup. If omitted, all tables are backed up,
-            up to the cluster backup limit of 4096 tables. Requests above that limit
-            fail before any table backup is created.
-             Example: ['users', 'products'].
+                The backup includes all table data, indexes, and metadata.
+                 Example: s3://mybucket/antfly-backups/cluster/2025-01-15.
+            connection (str): Required configured `external_io` connection with the `backup.write` capability.
+            format_ (ClusterBackupRequestFormat | Unset): Backup format to use:
+                - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only)
+                - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be
+                restored by any Antfly backend)
+
+                On restore, the format is auto-detected from file magic bytes.
+                 Default: ClusterBackupRequestFormat.PORTABLE. Example: portable.
+            table_names (list[str] | Unset): Optional list of tables to backup. If omitted, all tables are backed up,
+                up to the cluster backup limit of 4096 tables. Requests above that limit
+                fail before any table backup is created.
+                 Example: ['users', 'products'].
     """
 
     backup_id: str

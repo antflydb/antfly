@@ -30,7 +30,8 @@ const (
 	WorkloadTypeGeneral    WorkloadType = "general"
 )
 
-// ModelPriority defines the priority of a model for loading/eviction
+// ModelPriority controls the order eager models are warmed at pool startup.
+// It does not affect runtime eviction order for lazy/bounded strategies.
 type ModelPriority string
 
 const (
@@ -197,7 +198,13 @@ type ModelSpec struct {
 	// +optional
 	Capabilities []string `json:"capabilities,omitempty"`
 
-	// Priority determines loading order and eviction priority
+	// Priority determines the order this model is warmed relative to other
+	// eager-loaded models in the pool: high loads before medium, which loads
+	// before low. Ties keep the spec.models.preload declaration order. The
+	// operator emits config.preload in this order and the runtime warms it
+	// sequentially, so higher-priority models finish loading, and become
+	// servable, first. Priority does not affect runtime eviction order for
+	// lazy or bounded loading strategies.
 	// +kubebuilder:validation:Enum=high;medium;low
 	// +kubebuilder:default=medium
 	Priority ModelPriority `json:"priority,omitempty"`

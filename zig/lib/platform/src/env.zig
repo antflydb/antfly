@@ -56,3 +56,9 @@ pub fn truthy(value: []const u8) bool {
         std.ascii.eqlIgnoreCase(value, "yes") or
         std.ascii.eqlIgnoreCase(value, "on");
 }
+
+/// Parse byte budgets without truncating them to the host pointer width.
+pub fn getenvU64(name: [*:0]const u8) ?u64 {
+    const value = getenv(name) orelse return null;
+    return std.fmt.parseUnsigned(u64, value, 10) catch null;
+}

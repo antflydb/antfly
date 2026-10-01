@@ -161,6 +161,13 @@ pub const Handle = struct {
     root_namespace_alias: ?[]u8 = null,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager = null,
 
+    /// Scope is a trusted authorization boundary chosen by the embedding host.
+    /// The returned adapter borrows this handle and the key provider.
+    pub fn secretStore(self: *Handle, allocator: Allocator, scope: []const u8, provider: @import("../../common/secret_record.zig").KeyProvider) !@import("secret_store.zig").Store {
+        const docs = self.native_docstore orelse return error.UnsupportedOperation;
+        return @import("secret_store.zig").Store.init(allocator, docs, scope, provider);
+    }
+
     pub fn open(allocator: Allocator, path: []const u8, opts: OpenOptions) !Handle {
         if (!isAflitePath(path)) return error.InvalidArgument;
 
@@ -206,10 +213,14 @@ pub const Handle = struct {
     pub fn deinit(self: *Handle) void {
         switch (self.engine) {
             .bridge_lsm_container => {
-                if (self.bridge_storage) |storage| {
-                    storage.deinit();
-                    self.allocator.destroy(storage);
-                    self.bridge_storage = null;
+                if (comptime builtin.os.tag == .freestanding) {
+                    unreachable;
+                } else {
+                    if (self.bridge_storage) |storage| {
+                        storage.deinit();
+                        self.allocator.destroy(storage);
+                        self.bridge_storage = null;
+                    }
                 }
             },
             .native_single_file => {
@@ -417,12 +428,7 @@ pub const Handle = struct {
 
     pub fn embeddedRootHasUserDocuments(self: *Handle) !bool {
         if (self.engine != .native_single_file) return false;
-        const docs = try self.native_docstore.?.file.snapshotDocumentsAlloc(self.allocator);
-        defer native.NativeFile.freeSnapshotDocuments(self.allocator, docs);
-        for (docs) |doc| {
-            if (!std.mem.startsWith(u8, doc.key, "\x02db/")) return true;
-        }
-        return false;
+        return try self.native_docstore.?.hasLiveDocumentOutsidePrefix("\x02db/");
     }
 
     pub fn markEmbeddedArtifact(self: *Handle) !void {
@@ -544,12 +550,7 @@ pub const Handle = struct {
                 if (cancel) |token| try token.check();
                 break :blk toCheckReport(report);
             },
-            .native_single_file => blk: {
-                const store = self.native_docstore.?;
-                platform_sync.lockYielding(&store.mutex);
-                defer store.mutex.unlock();
-                break :blk try store.file.checkWithCancel(cancel);
-            },
+            .native_single_file => try self.native_docstore.?.checkWithCancel(cancel),
         };
     }
 
@@ -566,10 +567,9 @@ pub const Handle = struct {
             .engine = "lite",
             .format = status.format,
             .fsync = status.fsync,
-            // Native maintenance takes the file's exclusive maintenance gate.
-            // It is callable through the asynchronous admin surface, but is
-            // deliberately not advertised as availability-preserving.
-            .maintenance = .{ .check = true, .compact = true, .vacuum = true, .online = false },
+            // Native checks pin a snapshot; compaction copies outside the
+            // foreground gate and reserves writers only for publication.
+            .maintenance = .{ .check = true, .compact = true, .vacuum = true, .online = self.engine == .native_single_file },
         };
     }
 
@@ -590,12 +590,14 @@ pub const Handle = struct {
                 };
             },
             .compact => blk: {
-                platform_sync.lockYielding(&self.namespace_mutex);
-                defer self.namespace_mutex.unlock();
-                var runtimes = self.namespace_runtimes.valueIterator();
-                while (runtimes.next()) |runtime| {
-                    try cancel.check();
-                    try runtime.runtime_store.sync(true);
+                {
+                    platform_sync.lockYielding(&self.namespace_mutex);
+                    defer self.namespace_mutex.unlock();
+                    var runtimes = self.namespace_runtimes.valueIterator();
+                    while (runtimes.next()) |runtime| {
+                        try cancel.check();
+                        try runtime.runtime_store.sync(true);
+                    }
                 }
                 const report = try self.vacuumWithCancel(cancel);
                 break :blk vacuumMaintenanceResult(report);
@@ -887,6 +889,7 @@ test "lite backend capabilities distinguish native and hosted profiles" {
 test "lite backend capabilities contract is stable" {
     const expected_fields = [_][]const u8{
         "freestanding_build",
+        "threading",
         "hosted_profile",
         "manual_maintenance",
         "background_enrichment_runtime",
@@ -941,7 +944,7 @@ test "lite backend capabilities contract is stable" {
             "[\"caller_supplied_artifacts\",\"remote_provider\",\"disabled_deferred\"]";
     const supported_modes_json = "[\"caller_supplied_artifacts\",\"remote_provider\",\"local_embedded\",\"manual_maintenance\",\"disabled_deferred\"]";
     const native_local_runtime_available = capabilitiesForProfile(.native).local_inference_runtime;
-    const expected_native = try std.fmt.allocPrint(allocator, "{{\"freestanding_build\":{},\"hosted_profile\":false,\"manual_maintenance\":false,\"background_enrichment_runtime\":{},\"ttl_cleanup_runtime\":{},\"transaction_recovery_runtime\":{},\"local_template_rendering\":true,\"remote_template_rendering\":{},\"remote_template_host_callbacks\":{},\"inference_mode\":\"caller_supplied_or_disabled\",\"supported_inference_modes\":{s},\"available_inference_modes\":{s},\"inference_required\":false,\"no_inference_configured_ok\":true,\"caller_supplied_artifacts\":true,\"caller_supplied_embeddings\":true,\"remote_inference_providers\":{},\"local_inference_runtime\":{},\"generated_enrichment_planning\":true,\"text_search\":true,\"dense_vector_search\":true,\"sparse_vector_search\":true,\"hybrid_search\":true,\"graph_search\":true,\"distributed_shard_ownership\":false,\"raft_replication\":false,\"cluster_placement\":false,\"cross_node_joins\":false,\"remote_shard_fanout\":false,\"distributed_transaction_coordination\":false,\"cluster_heartbeat_status_aggregation\":false,\"server_side_autoscaling\":false,\"kubernetes_operator\":false,\"object_storage_primary\":false}}", .{
+    const expected_native = try std.fmt.allocPrint(allocator, "{{\"freestanding_build\":{},\"threading\":\"serialized\",\"hosted_profile\":false,\"manual_maintenance\":false,\"background_enrichment_runtime\":{},\"ttl_cleanup_runtime\":{},\"transaction_recovery_runtime\":{},\"local_template_rendering\":true,\"remote_template_rendering\":{},\"remote_template_host_callbacks\":{},\"inference_mode\":\"caller_supplied_or_disabled\",\"supported_inference_modes\":{s},\"available_inference_modes\":{s},\"inference_required\":false,\"no_inference_configured_ok\":true,\"caller_supplied_artifacts\":true,\"caller_supplied_embeddings\":true,\"remote_inference_providers\":{},\"local_inference_runtime\":{},\"generated_enrichment_planning\":true,\"text_search\":true,\"dense_vector_search\":true,\"sparse_vector_search\":true,\"hybrid_search\":true,\"graph_search\":true,\"distributed_shard_ownership\":false,\"raft_replication\":false,\"cluster_placement\":false,\"cross_node_joins\":false,\"remote_shard_fanout\":false,\"distributed_transaction_coordination\":false,\"cluster_heartbeat_status_aggregation\":false,\"server_side_autoscaling\":false,\"kubernetes_operator\":false,\"object_storage_primary\":false}}", .{
         freestanding,
         !freestanding,
         !freestanding,
@@ -966,7 +969,7 @@ test "lite backend capabilities contract is stable" {
         else
             "[\"caller_supplied_artifacts\",\"remote_provider\",\"manual_maintenance\",\"disabled_deferred\"]";
     const hosted_local_runtime_available = capabilitiesForProfile(.hosted).local_inference_runtime;
-    const expected_hosted = try std.fmt.allocPrint(allocator, "{{\"freestanding_build\":{},\"hosted_profile\":true,\"manual_maintenance\":true,\"background_enrichment_runtime\":false,\"ttl_cleanup_runtime\":false,\"transaction_recovery_runtime\":false,\"local_template_rendering\":true,\"remote_template_rendering\":{},\"remote_template_host_callbacks\":{},\"inference_mode\":\"caller_supplied_or_disabled\",\"supported_inference_modes\":{s},\"available_inference_modes\":{s},\"inference_required\":false,\"no_inference_configured_ok\":true,\"caller_supplied_artifacts\":true,\"caller_supplied_embeddings\":true,\"remote_inference_providers\":{},\"local_inference_runtime\":{},\"generated_enrichment_planning\":true,\"text_search\":true,\"dense_vector_search\":true,\"sparse_vector_search\":true,\"hybrid_search\":true,\"graph_search\":true,\"distributed_shard_ownership\":false,\"raft_replication\":false,\"cluster_placement\":false,\"cross_node_joins\":false,\"remote_shard_fanout\":false,\"distributed_transaction_coordination\":false,\"cluster_heartbeat_status_aggregation\":false,\"server_side_autoscaling\":false,\"kubernetes_operator\":false,\"object_storage_primary\":false}}", .{
+    const expected_hosted = try std.fmt.allocPrint(allocator, "{{\"freestanding_build\":{},\"threading\":\"serialized\",\"hosted_profile\":true,\"manual_maintenance\":true,\"background_enrichment_runtime\":false,\"ttl_cleanup_runtime\":false,\"transaction_recovery_runtime\":false,\"local_template_rendering\":true,\"remote_template_rendering\":{},\"remote_template_host_callbacks\":{},\"inference_mode\":\"caller_supplied_or_disabled\",\"supported_inference_modes\":{s},\"available_inference_modes\":{s},\"inference_required\":false,\"no_inference_configured_ok\":true,\"caller_supplied_artifacts\":true,\"caller_supplied_embeddings\":true,\"remote_inference_providers\":{},\"local_inference_runtime\":{},\"generated_enrichment_planning\":true,\"text_search\":true,\"dense_vector_search\":true,\"sparse_vector_search\":true,\"hybrid_search\":true,\"graph_search\":true,\"distributed_shard_ownership\":false,\"raft_replication\":false,\"cluster_placement\":false,\"cross_node_joins\":false,\"remote_shard_fanout\":false,\"distributed_transaction_coordination\":false,\"cluster_heartbeat_status_aggregation\":false,\"server_side_autoscaling\":false,\"kubernetes_operator\":false,\"object_storage_primary\":false}}", .{
         freestanding,
         !freestanding,
         freestanding,
@@ -989,6 +992,14 @@ test "lite backend inference status reports disabled as clean state" {
         "local_runtime_available",
         "caller_supplied_artifacts",
         "no_inference_configured_ok",
+        "host_budget_mb",
+        "backend_budget_mb",
+        "combined_budget_mb",
+        "kv_budget_mb",
+        "scratch_budget_mb",
+        "process_memory_budget_mb",
+        "process_memory_limit_bytes",
+        "process_memory_limit_source",
     };
 
     const fields = @typeInfo(InferenceStatus).@"struct".fields;
@@ -1056,6 +1067,9 @@ test "lite backend native engine creates and checks aflite file" {
     defer handle.deinit();
 
     try handle.native_docstore.?.file.putDocument("doc:1", "value");
+    try std.testing.expect(handle.maintenanceSource().status().maintenance.online);
+    var cancel = maintenance.CancelToken{};
+    try std.testing.expect((try handle.maintenanceSource().run(.check, &cancel)).valid.?);
 
     const report = try handle.check();
     try std.testing.expect(report.valid);
@@ -1406,6 +1420,47 @@ test "lite backend native engine can back db primary documents" {
     }
 }
 
+test "lite vector storage isolates containers with the same logical namespace" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path_a = try testPath(allocator, tmp, "vectors-a.aflite");
+    defer allocator.free(path_a);
+    const path_b = try testPath(allocator, tmp, "vectors-b.aflite");
+    defer allocator.free(path_b);
+    var handle_a = try Handle.create(allocator, path_a, true);
+    defer handle_a.deinit();
+    var handle_b = try Handle.create(allocator, path_b, true);
+    defer handle_b.deinit();
+
+    for ([_]?[]const u8{ null, "table/a" }) |namespace| {
+        var opts_a = db_mod.OpenOptions{ .open_mode = .writer_no_replay, .start_index_workers = false, .start_optional_runtimes = false };
+        var opts_b = opts_a;
+        if (namespace) |name| {
+            try handle_a.configureDbOpenOptionsForNamespace(&opts_a, name);
+            try handle_b.configureDbOpenOptionsForNamespace(&opts_b, name);
+        } else {
+            try handle_a.configureDbOpenOptions(&opts_a);
+            try handle_b.configureDbOpenOptions(&opts_b);
+        }
+        var db_a = try db_mod.DB.open(allocator, path_a, opts_a);
+        defer db_a.close();
+        var db_b = try db_mod.DB.open(allocator, path_b, opts_b);
+        defer db_b.close();
+        const storage_a = db_a.core.index_manager.vector_block_storage.?;
+        const storage_b = db_b.core.index_manager.vector_block_storage.?;
+        const probe_path = try std.fs.path.join(allocator, &.{ opts_a.index_base_path.?, "vector-blocks", "isolation-probe" });
+        defer allocator.free(probe_path);
+        try storage_a.createDirPath(std.fs.path.dirname(probe_path).?);
+        try storage_a.writeFileAbsolute(probe_path, "container a");
+        defer storage_a.deleteFileAbsolute(probe_path) catch {};
+        try std.testing.expectError(error.FileNotFound, storage_b.fileSize(probe_path));
+        const value = try handle_a.native_index_storage.?.storage().readFileAlloc(allocator, probe_path, 64);
+        defer allocator.free(value);
+        try std.testing.expectEqualStrings("container a", value);
+    }
+}
+
 test "lite backend namespaced db options isolate tables in one file" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1469,6 +1524,7 @@ test "lite backend adopts embedded root into a move-stable standalone namespace"
         var handle = try Handle.open(allocator, path, .{});
         defer handle.deinit();
         try std.testing.expect(try handle.isEmbeddedArtifact());
+        try std.testing.expect(try handle.embeddedRootHasUserDocuments());
         try handle.adoptEmbeddedRootAsNamespace("/var/lib/antfly/group-42/table-db");
         var opts = db_mod.OpenOptions{ .open_mode = .writer_no_replay, .start_index_workers = false, .start_optional_runtimes = false };
         try handle.configureDbOpenOptionsForNamespace(&opts, "/different/root/group-42/table-db");
@@ -1486,6 +1542,7 @@ test "lite backend adopts embedded root into a move-stable standalone namespace"
         var handle = try Handle.open(allocator, path, .{ .read_only = true });
         defer handle.deinit();
         try std.testing.expect(handle.hasStandaloneRootAdoption());
+        try std.testing.expect(try handle.embeddedRootHasUserDocuments());
         var opts = db_mod.OpenOptions{ .open_mode = .query_readonly, .start_index_workers = false, .start_optional_runtimes = false };
         try handle.configureDbOpenOptionsForNamespace(&opts, "/mnt/restored/group-42/table-db");
         var db = try db_mod.DB.open(allocator, logical_path, opts);

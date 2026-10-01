@@ -1338,7 +1338,9 @@ const RuntimeContext = struct {
         kv_dtype_override: ?runtime.kv.pool.KvDType,
         shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache,
     ) !*RuntimeContext {
-        const cb = try session_factory.getComputeBackend(session, allocator);
+        // The runtime outlives the request that creates it and is cached on
+        // the loaded model, so it must not hold the per-request Metal lease.
+        const cb = try session_factory.getComputeBackendBorrowingSharedProvider(session, allocator);
         errdefer {
             var cb_mut = cb;
             cb_mut.deinit();

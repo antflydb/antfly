@@ -26,6 +26,10 @@ pub const Chunk = struct {
     end_offset: ?u32 = null,
     start_time_ms: ?f32 = null,
     end_time_ms: ?f32 = null,
+    /// Which speaker this chunk's audio belongs to, when the transcript was
+    /// diarized and the chunk does not straddle a turn. Stored as the index
+    /// the unit's transcript spans carry; the document field is its label.
+    speaker_index: ?u8 = null,
     frame_index: ?u32 = null,
     frame_delay_ms: ?u32 = null,
 
@@ -116,6 +120,11 @@ pub fn appendArtifactFieldsWithProvenance(
     if (chunk.end_offset) |value| try obj.put(alloc, try alloc.dupe(u8, "_end_offset"), .{ .integer = value });
     if (chunk.start_time_ms) |value| try obj.put(alloc, try alloc.dupe(u8, "_start_time_ms"), .{ .float = value });
     if (chunk.end_time_ms) |value| try obj.put(alloc, try alloc.dupe(u8, "_end_time_ms"), .{ .float = value });
+    if (chunk.speaker_index) |index| {
+        var label_buf: [16]u8 = undefined;
+        const label = std.fmt.bufPrint(&label_buf, "SPEAKER_{d:0>2}", .{index}) catch unreachable;
+        try obj.put(alloc, try alloc.dupe(u8, "_speaker"), .{ .string = try alloc.dupe(u8, label) });
+    }
     if (chunk.frame_index) |value| try obj.put(alloc, try alloc.dupe(u8, "_frame_index"), .{ .integer = value });
     if (chunk.frame_delay_ms) |value| try obj.put(alloc, try alloc.dupe(u8, "_frame_delay_ms"), .{ .integer = value });
     try appendProvenanceFields(alloc, obj, source_field, chunk, provenance);

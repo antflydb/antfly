@@ -1401,13 +1401,25 @@ fn catchUpWorker(runtime: *DerivedRuntime, worker: *Worker) !derived_worker.Catc
         if (runtime.force_catch_up_sequence >= worker.target_sequence) break :blk 0;
         break :blk policy.max_windows_per_publish;
     };
+    const ApplySession = struct {
+        runtime: *DerivedRuntime,
+        worker: *Worker,
+
+        fn apply(ptr: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) anyerror!bool {
+            const session: *@This() = @ptrCast(@alignCast(ptr));
+            // Deferred capture can open during collection. Read the token at
+            // callback time, after beginCollectedWindowCapture has installed it.
+            return session.runtime.apply_fn(session.runtime.ctx, batch, index_ref, session.worker.catch_up_token);
+        }
+    };
+    var session = ApplySession{ .runtime = runtime, .worker = worker };
     const capture_before_collection = worker.catch_up_open;
     const stats = try derived_worker.catchUpIndexFromMatchingCursor(
         runtime.alloc,
         &worker.replay_cursor.?,
         worker.kind,
-        runtime.ctx,
-        runtime.apply_fn,
+        &session,
+        ApplySession.apply,
         .{
             .resource_manager = runtime.backlog.resource_manager,
             .window_ctx = worker,
@@ -1450,19 +1462,19 @@ fn stopAndJoinWorker(runtime: *DerivedRuntime, worker: *Worker, io: Io) void {
 const TestThreadedRuntimeCapture = struct {
     require_capture_worker: ?*Worker = null,
     fail_next_begin: bool = false,
-    empty_coverage_checks: std.atomic.Value(u64) = .init(0),
+    empty_coverage_checks: @import("antfly_platform").atomic.Value(u64) = .init(0),
     runtime: ?*DerivedRuntime = null,
-    apply_calls: std.atomic.Value(u64) = .init(0),
-    begin_calls: std.atomic.Value(u64) = .init(0),
-    finish_calls: std.atomic.Value(u64) = .init(0),
-    publish_failures: std.atomic.Value(u64) = .init(0),
-    apply_not_found_failures: std.atomic.Value(u64) = .init(0),
-    resource_budget_failures: std.atomic.Value(u64) = .init(0),
-    persisted_sequence: std.atomic.Value(u64) = .init(0),
-    truncate_calls: std.atomic.Value(u64) = .init(0),
-    truncated_sequence: std.atomic.Value(u64) = .init(0),
-    advanced_sequence: std.atomic.Value(u64) = .init(0),
-    callback_observed_applied_sequence: std.atomic.Value(u64) = .init(0),
+    apply_calls: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    begin_calls: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    finish_calls: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    publish_failures: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    apply_not_found_failures: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    resource_budget_failures: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    persisted_sequence: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    truncate_calls: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    truncated_sequence: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    advanced_sequence: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    callback_observed_applied_sequence: @import("antfly_platform").atomic.Value(u64) = .init(0),
     fail_next_forced_persist: std.atomic.Value(bool) = .init(false),
     fail_next_dense_apply_not_found: std.atomic.Value(bool) = .init(false),
     fail_next_apply_resource_budget: std.atomic.Value(bool) = .init(false),
@@ -1480,12 +1492,13 @@ fn testThreadedRuntimeAppliedSequenceAdvanced(ctx: *anyopaque, index_name: []con
     capture.callback_observed_applied_sequence.store(runtime.appliedSequence(index_name) orelse 0, .release);
 }
 
-fn testThreadedRuntimeApply(ctx: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) !bool {
+fn testThreadedRuntimeApply(ctx: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef, token: CatchUpSessionToken) !bool {
     _ = batch;
     const capture: *TestThreadedRuntimeCapture = @ptrCast(@alignCast(ctx));
     if (capture.require_capture_worker) |worker| {
         try std.testing.expect(worker.catch_up_open);
         try std.testing.expect(!worker.catch_up_token.isNone());
+        try std.testing.expectEqual(worker.catch_up_token, token);
         try std.testing.expect(worker.replay_cursor != null);
     }
     _ = capture.apply_calls.fetchAdd(1, .monotonic);

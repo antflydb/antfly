@@ -14,6 +14,8 @@ def _get_kwargs(
     *,
     prefix: str | Unset = UNSET,
     pattern: str | Unset = UNSET,
+    limit: int | Unset = UNSET,
+    cursor: str | Unset = UNSET,
 ) -> dict[str, Any]:
 
     params: dict[str, Any] = {}
@@ -21,6 +23,10 @@ def _get_kwargs(
     params["prefix"] = prefix
 
     params["pattern"] = pattern
+
+    params["limit"] = limit
+
+    params["cursor"] = cursor
 
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 
@@ -51,6 +57,11 @@ def _parse_response(
 
         return response_400
 
+    if response.status_code == 409:
+        response_409 = Error.from_dict(response.json())
+
+        return response_409
+
     if response.status_code == 500:
         response_500 = Error.from_dict(response.json())
 
@@ -78,12 +89,16 @@ def sync_detailed(
     client: AuthenticatedClient,
     prefix: str | Unset = UNSET,
     pattern: str | Unset = UNSET,
+    limit: int | Unset = UNSET,
+    cursor: str | Unset = UNSET,
 ) -> Response[Error | list[TableStatus]]:
     """List all tables
 
     Args:
         prefix (str | Unset):
         pattern (str | Unset):
+        limit (int | Unset):
+        cursor (str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -96,6 +111,8 @@ def sync_detailed(
     kwargs = _get_kwargs(
         prefix=prefix,
         pattern=pattern,
+        limit=limit,
+        cursor=cursor,
     )
 
     response = client.get_httpx_client().request(
@@ -110,12 +127,16 @@ def sync(
     client: AuthenticatedClient,
     prefix: str | Unset = UNSET,
     pattern: str | Unset = UNSET,
+    limit: int | Unset = UNSET,
+    cursor: str | Unset = UNSET,
 ) -> Error | list[TableStatus] | None:
     """List all tables
 
     Args:
         prefix (str | Unset):
         pattern (str | Unset):
+        limit (int | Unset):
+        cursor (str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -129,6 +150,8 @@ def sync(
         client=client,
         prefix=prefix,
         pattern=pattern,
+        limit=limit,
+        cursor=cursor,
     ).parsed
 
 
@@ -137,12 +160,16 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     prefix: str | Unset = UNSET,
     pattern: str | Unset = UNSET,
+    limit: int | Unset = UNSET,
+    cursor: str | Unset = UNSET,
 ) -> Response[Error | list[TableStatus]]:
     """List all tables
 
     Args:
         prefix (str | Unset):
         pattern (str | Unset):
+        limit (int | Unset):
+        cursor (str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -155,6 +182,8 @@ async def asyncio_detailed(
     kwargs = _get_kwargs(
         prefix=prefix,
         pattern=pattern,
+        limit=limit,
+        cursor=cursor,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -167,12 +196,16 @@ async def asyncio(
     client: AuthenticatedClient,
     prefix: str | Unset = UNSET,
     pattern: str | Unset = UNSET,
+    limit: int | Unset = UNSET,
+    cursor: str | Unset = UNSET,
 ) -> Error | list[TableStatus] | None:
     """List all tables
 
     Args:
         prefix (str | Unset):
         pattern (str | Unset):
+        limit (int | Unset):
+        cursor (str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -187,5 +220,7 @@ async def asyncio(
             client=client,
             prefix=prefix,
             pattern=pattern,
+            limit=limit,
+            cursor=cursor,
         )
     ).parsed

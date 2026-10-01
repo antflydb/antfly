@@ -12,11 +12,10 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! RaBitQ Vector Index Section - zapx-compatible segment format.
+//! RaBitQ Vector Index Section.
 //!
-//! Replaces FAISS with RaBitQ quantization for the vector index section.
-//! Binary layout matches zapx's section framework so Go code can read
-//! segments written by Zig and vice versa.
+//! Uses RaBitQ quantization for the vector index section of a segment.
+//! Binary layout follows the shared segment section framework.
 //!
 //! On-disk format per field:
 //!   [docvalue marker 1]     uvarint = 0xFFFFFFFFFFFFFFFF (fieldNotUninverted)
@@ -46,7 +45,6 @@ const quantizer_mod = @import("antfly_vector").quantizer;
 const proto = @import("antfly_vector").proto;
 
 /// Sentinel value for "field not uninverted" (no doc values).
-/// Matches zapx's fieldNotUninverted = math.MaxUint64.
 const field_not_uninverted: u64 = 0xFFFFFFFFFFFFFFFF;
 
 /// Index type identifiers (written as uvarint in section header).
@@ -139,7 +137,7 @@ pub const VectorIndexContent = struct {
 // Section Writer
 // ============================================================================
 
-/// Writes a RaBitQ vector index section in zapx-compatible format.
+/// Writes a RaBitQ vector index section.
 pub fn writeVectorSection(
     alloc: Allocator,
     content: *const VectorIndexContent,
@@ -150,7 +148,7 @@ pub fn writeVectorSection(
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(alloc);
 
-    // --- Section header (zapx-compatible) ---
+    // --- Section header ---
 
     // Doc value markers (fieldNotUninverted × 2)
     writeUvarint(&buf, alloc, field_not_uninverted);

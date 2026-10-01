@@ -949,6 +949,7 @@ fn formatName(format: inference_audio.EncodedFormat) []const u8 {
         .aiff => "aiff",
         .caf => "caf",
         .au => "au",
+        .webm => "webm",
     };
 }
 

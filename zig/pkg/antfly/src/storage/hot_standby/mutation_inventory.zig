@@ -45,12 +45,14 @@ pub const Surface = enum {
     table_catalog,
     table_schema,
     table_index,
+    index_maintenance,
     artifact_enrichment,
     extension_catalog,
     cluster_restore,
     table_restore,
     transaction_session,
     artifact_repair,
+    storage_migration,
     artifact_reprocess,
     backup,
     read_like_post,
@@ -58,6 +60,7 @@ pub const Surface = enum {
     storage_maintenance,
     protocol_action,
     restore_job,
+    research_job,
     internal_mutation,
     unclassified_non_get,
     default_admin_seed,
@@ -87,6 +90,7 @@ const post_delete = &[_]http_common.Method{ .POST, .DELETE };
 const post_put_delete = &[_]http_common.Method{ .POST, .PUT, .DELETE };
 
 pub const entries = [_]Entry{
+    .{ .surface = .index_maintenance, .disposition = .remote_apply, .path_pattern = "/tables/{table}/indexes/{index}/{retry|repair}", .methods = post, .reason = "generation-fenced desired maintenance tickets enter the synchronous transaction mutation mirror" },
     .{ .surface = .document_batch, .disposition = .remote_apply, .path_pattern = "/tables/{table}/batch", .methods = post, .reason = "logical batch records enter the synchronous HA mutation mirror before local acknowledgement" },
     .{ .surface = .document_merge, .disposition = .remote_apply, .path_pattern = "/tables/{table}/merge", .methods = post, .reason = "merge writes use the same synchronous HA mutation mirror as batch writes" },
     .{ .surface = .auth_user, .disposition = .reject, .path_pattern = "/auth/v1/users/{user}", .methods = post_delete, .reason = "the live user store is not part of continuous replication" },
@@ -96,7 +100,7 @@ pub const entries = [_]Entry{
     .{ .surface = .auth_row_filter, .disposition = .reject, .path_pattern = "/auth/v1/{users|subjects}/{subject}/row-filters/{table}", .methods = put_delete, .reason = "authorization filters are not continuously replicated" },
     .{ .surface = .auth_api_key, .disposition = .reject, .path_pattern = "/auth/v1/users/{user}/api-keys[/{key}]", .methods = post_delete, .reason = "API key creation and revocation are not continuously replicated" },
     .{ .surface = .secret, .disposition = .reject, .path_pattern = "/secrets/{key}", .methods = put_delete, .reason = "the node-local secret store is not part of the HA seed or continuous stream" },
-    .{ .surface = .table_catalog, .disposition = .reject, .path_pattern = "/tables/{table}", .methods = post_delete, .reason = "standalone catalog topology is not continuously replicated" },
+    .{ .surface = .table_catalog, .disposition = .reject, .path_pattern = "/tables/{table}", .methods = post_delete, .reason = "table-scoped streams reject catalog changes; whole-instance catalog replication admits table creation only" },
     .{ .surface = .table_schema, .disposition = .reject, .path_pattern = "/tables/{table}/schema", .methods = &.{.PUT}, .reason = "schema catalog generations are not continuously replicated" },
     .{ .surface = .table_index, .disposition = .reject, .path_pattern = "/tables/{table}/indexes/{index}", .methods = post_delete, .reason = "index definitions live in the non-replicated standalone catalog" },
     .{ .surface = .artifact_enrichment, .disposition = .reject, .path_pattern = "/tables/{table}/artifacts/{artifact}/enrichment", .methods = put_delete, .reason = "enrichment definitions live in the non-replicated standalone catalog" },
@@ -104,14 +108,17 @@ pub const entries = [_]Entry{
     .{ .surface = .cluster_restore, .disposition = .reject, .path_pattern = "/restore", .methods = post, .reason = "restore activation replaces local generation state outside the continuous stream" },
     .{ .surface = .table_restore, .disposition = .reject, .path_pattern = "/tables/{table}/restore", .methods = post, .reason = "table restore mutates both catalog and data outside one RemoteApply acknowledgement" },
     .{ .surface = .transaction_session, .disposition = .reject, .path_pattern = "/transactions[/... mutating operation]", .methods = post_put_delete, .reason = "durable transaction session state and savepoints are primary-local" },
+    .{ .surface = .storage_migration, .disposition = .reject, .path_pattern = "/tables/{table}/storage/migrations", .methods = post_delete, .reason = "source ownership migration is qualified only for unreplicated local tables" },
+    .{ .surface = .storage_migration, .disposition = .reject, .path_pattern = "/tables/{table}/storage/migrations/{job}", .methods = post_delete, .reason = "source ownership migration is qualified only for unreplicated local tables" },
     .{ .surface = .artifact_repair, .disposition = .reject, .path_pattern = "/tables/{table}/repair/{run|control-jobs|jobs/...}", .methods = post_delete, .reason = "repair job checkpoints and direct repair effects do not share one replicated acknowledgement" },
     .{ .surface = .artifact_reprocess, .disposition = .reject, .path_pattern = "/tables/{table}/.../reprocess[-jobs]", .methods = post_delete, .reason = "reprocess job checkpoints and derived effects do not share one replicated acknowledgement" },
-    .{ .surface = .backup, .disposition = .reject, .path_pattern = "/backup | /tables/{table}/backup", .methods = post, .reason = "backup publication has an external side effect but no final HA authority recheck spanning snapshot and manifest publication" },
-    .{ .surface = .read_like_post, .disposition = .read_only, .path_pattern = "/query | /tables/{table}/{query|documents|repair/issues} | /eval | /agents/{query-builder|retrieval} | /ard/v1/{search|explore}", .methods = post, .reason = "these POST requests only compute or inspect state" },
+    .{ .surface = .backup, .disposition = .reject, .path_pattern = "/backup | /tables/{table}/backup", .methods = post, .reason = "requires the shared durable cohort driver with primary-epoch authority, replicated write fences, immutable seals, and fenced repository publication" },
+    .{ .surface = .read_like_post, .disposition = .read_only, .path_pattern = "/query | /tables/{table}/{query|documents|repair/issues} | /eval | /agents/{query-builder|retrieval|research} | /ard/v1/{search|explore}", .methods = post, .reason = "these POST requests only compute or inspect state" },
     .{ .surface = .ha_control, .disposition = .local_operational, .path_pattern = "/admin/v1/standby/... | /admin/v1/ha/... | /internal/v1/standby/replication/... | /internal/v1/ha/replication/...", .methods = post_put_delete, .reason = "authenticated HA control and replication endpoints implement the topology protocol itself" },
     .{ .surface = .storage_maintenance, .disposition = .local_operational, .path_pattern = "/admin/v1/maintenance/...", .methods = post_delete, .reason = "maintenance rewrites physical local representation without changing logical promoted state" },
     .{ .surface = .protocol_action, .disposition = .reject, .path_pattern = "/mcp/v1/... | /a2a | /agents/v1/extensions/...", .methods = post_delete, .reason = "protocol tool calls are payload-dispatched and cannot prove every invoked mutation enters RemoteApply" },
     .{ .surface = .restore_job, .disposition = .reject, .path_pattern = "/restore/jobs/{id}", .methods = &.{.DELETE}, .reason = "restore workflow cancellation mutates primary-local durable job state" },
+    .{ .surface = .research_job, .disposition = .reject, .path_pattern = "/agents/research/jobs[/{id}/{advance|cancel}]", .methods = post, .reason = "research job checkpoints mutate primary-local durable job state" },
     .{ .surface = .internal_mutation, .disposition = .reject, .path_pattern = "/internal/v1/{groups|tables}/...", .methods = post_put_delete, .reason = "standalone public ingress must not bypass the HA mirror through internal mutation routes" },
     .{ .surface = .unclassified_non_get, .disposition = .reject, .path_pattern = "*", .methods = post_put_delete, .reason = "new non-GET routes fail closed until their HA durability disposition is inventoried" },
     .{ .surface = .default_admin_seed, .disposition = .reject, .path_pattern = "background:startup/default-admin", .methods = &.{}, .reason = "hot-standby startup requires auth restored from the portable seed and never creates primary-local credentials" },
@@ -153,6 +160,7 @@ pub fn classify(method: http_common.Method, path: []const u8) ?Classification {
             std.mem.eql(u8, path, routes.Routes.eval) or
             std.mem.eql(u8, path, routes.Routes.agents_query_builder) or
             std.mem.eql(u8, path, routes.Routes.agents_retrieval) or
+            std.mem.eql(u8, path, routes.Routes.agents_research) or
             std.mem.eql(u8, path, routes.Routes.ard_v1_search) or
             std.mem.eql(u8, path, routes.Routes.ard_v1_explore)))
         return classified(.read_like_post, .read_only);
@@ -183,12 +191,14 @@ pub fn classify(method: http_common.Method, path: []const u8) ?Classification {
     if (method == .POST and std.mem.eql(u8, path, routes.Routes.restore)) return rejected(.cluster_restore);
     if (method == .POST and routes.Routes.matchTableRestore(path) != null) return rejected(.table_restore);
     if (method == .DELETE and std.mem.startsWith(u8, path, "/restore/jobs/")) return rejected(.restore_job);
+    if (std.mem.eql(u8, path, routes.Routes.agents_research_jobs) or std.mem.startsWith(u8, path, routes.Routes.agents_research_jobs ++ "/")) return rejected(.research_job);
     if (std.mem.eql(u8, path, routes.Routes.transactions_begin) or
         std.mem.eql(u8, path, routes.Routes.transactions_commit) or
         std.mem.eql(u8, path, routes.Routes.transactions_cleanup) or
         std.mem.startsWith(u8, path, routes.Routes.transactions_prefix))
         return rejected(.transaction_session);
 
+    if (routes.Routes.matchTableStorageMigration(path) != null or routes.Routes.matchTableStorageMigrationJob(path) != null) return rejected(.storage_migration);
     if (routes.Routes.matchTableArtifactRepairRun(path) != null or
         routes.Routes.matchTableRepairJobs(path) != null or
         routes.Routes.matchTableRepairControlJobs(path) != null or
@@ -205,6 +215,7 @@ pub fn classify(method: http_common.Method, path: []const u8) ?Classification {
     if (routes.Routes.matchTableArtifactEnrichment(path) != null) return rejected(.artifact_enrichment);
     if (routes.Routes.matchTableSchema(path) != null) return rejected(.table_schema);
     if (routes.Routes.matchTableIndex(path) != null) return rejected(.table_index);
+    if (method == .POST and routes.Routes.matchTableIndexMaintenance(path) != null) return classified(.index_maintenance, .remote_apply);
     if (routes.Routes.matchTablePath(path) != null) return rejected(.table_catalog);
     if (std.mem.eql(u8, path, routes.Routes.mcp_v1) or
         std.mem.startsWith(u8, path, routes.Routes.mcp_v1_prefix) or
@@ -265,6 +276,8 @@ test "hot-standby mutation classifier covers acknowledged security catalog and w
         .{ .method = .POST, .path = "/tables/docs/restore", .surface = .table_restore },
         .{ .method = .POST, .path = "/transactions/begin", .surface = .transaction_session },
         .{ .method = .POST, .path = "/tables/docs/repair/run", .surface = .artifact_repair },
+        .{ .method = .POST, .path = "/tables/docs/storage/migrations", .surface = .storage_migration },
+        .{ .method = .POST, .path = "/tables/docs/storage/migrations/job", .surface = .storage_migration },
         .{ .method = .POST, .path = "/tables/docs/artifacts/summary/reprocess", .surface = .artifact_reprocess },
     };
     for (cases) |case| {
@@ -272,6 +285,16 @@ test "hot-standby mutation classifier covers acknowledged security catalog and w
         try std.testing.expectEqual(case.surface, actual.surface);
         try std.testing.expectEqual(Disposition.reject, actual.disposition);
     }
+}
+
+test "index maintenance desired tickets require RemoteApply and unsupported verbs fail closed" {
+    for ([_][]const u8{ "/tables/docs/indexes/by_id/retry", "/tables/docs/indexes/by_id/repair" }) |path| {
+        const actual = classify(.POST, path).?;
+        try std.testing.expectEqual(Surface.index_maintenance, actual.surface);
+        try std.testing.expectEqual(Disposition.remote_apply, actual.disposition);
+        try std.testing.expectEqual(Disposition.reject, classify(.DELETE, path).?.disposition);
+    }
+    try std.testing.expectEqual(Disposition.reject, classify(.POST, "/tables/docs/indexes/by_id/retry/extra").?.disposition);
 }
 
 test "hot-standby background producer inventory freezes local state and mirrors logical DB effects" {
@@ -336,6 +359,10 @@ test "hot-standby public non-GET route matrix has an explicit durability disposi
         .{ .method = .POST, .path = "/eval", .surface = .read_like_post, .disposition = .read_only },
         .{ .method = .POST, .path = "/agents/query-builder", .surface = .read_like_post, .disposition = .read_only },
         .{ .method = .POST, .path = "/agents/retrieval", .surface = .read_like_post, .disposition = .read_only },
+        .{ .method = .POST, .path = "/agents/research", .surface = .read_like_post, .disposition = .read_only },
+        .{ .method = .POST, .path = "/agents/research/jobs", .surface = .research_job, .disposition = .reject },
+        .{ .method = .POST, .path = "/agents/research/jobs/rsj_0/advance", .surface = .research_job, .disposition = .reject },
+        .{ .method = .POST, .path = "/agents/research/jobs/rsj_0/cancel", .surface = .research_job, .disposition = .reject },
         .{ .method = .POST, .path = "/ard/v1/search", .surface = .read_like_post, .disposition = .read_only },
         .{ .method = .POST, .path = "/ard/v1/explore", .surface = .read_like_post, .disposition = .read_only },
         .{ .method = .POST, .path = "/tables/docs/query", .surface = .read_like_post, .disposition = .read_only },

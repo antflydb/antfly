@@ -152,7 +152,7 @@ Drop `<AnswerBox />` beside `<Results>` and the page is done. The answer streams
 `searchBoxId` must match the `id` of the `QueryBox` driving it: `"ask"` here, `"search"` on `<Results>`. A mismatch throws nothing and logs nothing. `AnswerResults` never fires, and a mismatched semantic `Results` contributes no query at all, which stalls the whole batched request and leaves the facets empty too. When a page goes silent, check these two strings first.
 </Callout>
 
-The retrieval agent accepts `gemini`, `vertex`, `openai`, `ollama`, and `antfly` as generator providers. Other values parse and then fail the request with a 400.
+The retrieval agent accepts `gemini`, `vertex`, `openai`, `openrouter`, `ollama`, and `antfly` as generator providers. Other values parse and then fail the request with a 400.
 
 ### 4. Run It
 

@@ -153,11 +153,50 @@ export interface WriteOptions {
   signal?: AbortSignal;
 }
 
+// SQL types. Integer result values are exact decimal strings.
+export type SQLRequest = components["schemas"]["SQLRequest"];
+export type SQLConnectionOpenRequest = components["schemas"]["SQLConnectionOpenRequest"];
+export type SQLConnectionResponse = components["schemas"]["SQLConnectionResponse"];
+export type SQLPrepareRequest = components["schemas"]["SQLPrepareRequest"];
+export type SQLPreparedExecutionRequest = components["schemas"]["SQLPreparedExecutionRequest"];
+export type SQLPreparedResponse = components["schemas"]["SQLPreparedResponse"];
+export type SQLResponse = components["schemas"]["SQLResponse"];
+export type SQLColumn = components["schemas"]["SQLColumn"];
+export type SQLColumnType = components["schemas"]["SQLColumnType"];
+export type SQLDiagnostic = components["schemas"]["SQLDiagnostic"];
+export type SQLMutationOutcome = components["schemas"]["SQLMutationOutcome"];
+
 // Table types
 export type Table = components["schemas"]["Table"];
 export type CommittedMutationOutcome = components["schemas"]["CommittedMutationOutcome"];
 export type CreateTableRequest = components["schemas"]["CreateTableRequest"];
 export type TableSchema = components["schemas"]["TableSchema"];
+export type RelationalUniqueConstraint = components["schemas"]["RelationalUniqueConstraint"];
+export type RelationalForeignKeyConstraint =
+  components["schemas"]["RelationalForeignKeyConstraint"];
+export type RelationalRow = components["schemas"]["RelationalRow"];
+export type RelationalIndexPredicate = components["schemas"]["RelationalIndexPredicate"];
+export type RelationalScalarExpression = components["schemas"]["RelationalScalarExpression"];
+export type RelationalColumnExpression = components["schemas"]["RelationalColumnExpression"];
+export type RelationalExpressionOp = components["schemas"]["RelationalExpressionOp"];
+export type RelationalExpressionType = components["schemas"]["RelationalExpressionType"];
+export type RelationalRowCondition = components["schemas"]["RelationalRowCondition"];
+export type RelationalRowQueryRequest = components["schemas"]["RelationalRowQueryRequest"];
+export type RelationalRowMutation = components["schemas"]["RelationalRowMutation"];
+export type RelationalRowMutationRequest = components["schemas"]["RelationalRowMutationRequest"];
+export type RelationalConstraintStatus = components["schemas"]["RelationalConstraintStatus"];
+export type RelationalConstraintRetryRequest =
+  components["schemas"]["RelationalConstraintRetryRequest"];
+export type RelationalConstraintRetirementRequest =
+  components["schemas"]["RelationalConstraintRetirementRequest"];
+export type RelationalConstraintRetirementStatus =
+  components["schemas"]["RelationalConstraintRetirementStatus"];
+export type RelationalConstraintRetryResponse =
+  components["schemas"]["RelationalConstraintRetryResponse"];
+export type RelationalConstraintRangeStatus =
+  components["schemas"]["RelationalConstraintRangeStatus"];
+export type RelationalConstraintConflictReason =
+  components["schemas"]["RelationalConstraintConflictReason"];
 export type TableMigration = components["schemas"]["TableMigration"];
 export type TableStatus = components["schemas"]["TableStatus"];
 
@@ -191,6 +230,18 @@ export type CreateFullTextIndexRequest = components["schemas"]["CreateFullTextIn
 export type CreateEmbeddingsIndexRequest = components["schemas"]["CreateEmbeddingsIndexRequest"];
 export type CreateGraphIndexRequest = components["schemas"]["CreateGraphIndexRequest"];
 export type CreateAlgebraicIndexRequest = components["schemas"]["CreateAlgebraicIndexRequest"];
+export type CreateRelationalIndexRequest = components["schemas"]["CreateRelationalIndexRequest"];
+export type CreatedRelationalIndex = components["schemas"]["CreatedRelationalIndex"];
+export type RelationalIndexConfig = components["schemas"]["RelationalIndexConfig"];
+export type RelationalIndexStats = components["schemas"]["RelationalIndexStats"];
+export type RelationalIndexStatus = components["schemas"]["RelationalIndexStatus"];
+export type RelationalIndexRangeStatus = components["schemas"]["RelationalIndexRangeStatus"];
+export type RelationalIndexBuildState = components["schemas"]["RelationalIndexBuildState"];
+export type RelationalIndexBuildFailure = components["schemas"]["RelationalIndexBuildFailure"];
+export type IndexMaintenanceRequest = components["schemas"]["IndexMaintenanceRequest"];
+export type IndexMaintenanceResponse = components["schemas"]["IndexMaintenanceResponse"];
+export type IndexMaintenanceOwnerProof = components["schemas"]["IndexMaintenanceOwnerProof"];
+export type RelationalRowIndexBound = components["schemas"]["RelationalRowIndexBound"];
 export type CreatedIndex = components["schemas"]["CreatedIndex"];
 export type IndexType = components["schemas"]["IndexType"];
 export type IndexStatus = components["schemas"]["IndexStatus"];
@@ -366,7 +417,7 @@ export const embedderProviderCapabilities = {
   gemini: { index: false },
   ollama: { index: true },
   openai: { index: true },
-  openrouter: { index: false },
+  openrouter: { index: true },
   vertex: { index: false },
 } as const satisfies Record<EmbedderProvider, { index: boolean }>;
 export const embedderProviders = Object.keys(embedderProviderCapabilities) as EmbedderProvider[];
@@ -379,6 +430,7 @@ export const generatorProviderCapabilities = {
   gemini: {},
   ollama: {},
   openai: {},
+  openrouter: {},
   vertex: {},
 } as const satisfies Record<GeneratorProvider, object>;
 export const generatorProviders = Object.keys(generatorProviderCapabilities) as GeneratorProvider[];
@@ -417,6 +469,8 @@ export type AgentStep = components["schemas"]["AgentStep"];
 export type AgentStepKind = components["schemas"]["AgentStepKind"];
 export type AgentStepStatus = components["schemas"]["AgentStepStatus"];
 export type WebSearchConfig = components["schemas"]["WebSearchConfig"];
+export type WebSearchProviderConfig = components["schemas"]["WebSearchProviderConfig"];
+export type ExaSearchConfig = components["schemas"]["ExaSearchConfig"];
 export type FetchConfig = components["schemas"]["FetchConfig"];
 
 // Eval types
@@ -471,6 +525,7 @@ export interface AntflyConfig {
 }
 
 // Retrieval Agent types
+export type RetrievalNavigationConfig = components["schemas"]["RetrievalNavigationConfig"];
 export type RetrievalAgentRequest = components["schemas"]["RetrievalAgentRequest"];
 export type RetrievalAgentResult = components["schemas"]["RetrievalAgentResult"];
 export type RetrievalAgentSteps = components["schemas"]["RetrievalAgentSteps"];
@@ -495,6 +550,78 @@ export interface RetrievalAgentStreamCallbacks {
   onErrorDetail?: (error: Error) => void;
   /** Legacy message callback; use onErrorDetail for structured retry handling. */
   onError?: (error: string) => void;
+}
+
+// Research Agent types
+export type ResearchPhase = components["schemas"]["ResearchPhase"];
+export type ResearchBudget = components["schemas"]["ResearchBudget"];
+export type ResearchStepConfig = components["schemas"]["ResearchStepConfig"];
+export type ResearchRetrievalStepConfig = components["schemas"]["ResearchRetrievalStepConfig"];
+export type ResearchWriteStepConfig = components["schemas"]["ResearchWriteStepConfig"];
+export type ResearchAgentSteps = components["schemas"]["ResearchAgentSteps"];
+export type ResearchSubQuestion = components["schemas"]["ResearchSubQuestion"];
+export type ResearchPlan = components["schemas"]["ResearchPlan"];
+export type ResearchClaim = components["schemas"]["ResearchClaim"];
+export type ResearchFinding = components["schemas"]["ResearchFinding"];
+export type ResearchEvidence = components["schemas"]["ResearchEvidence"];
+export type ResearchReflection = components["schemas"]["ResearchReflection"];
+export type ResearchReportSection = components["schemas"]["ResearchReportSection"];
+export type ResearchReport = components["schemas"]["ResearchReport"];
+export type ResearchCitation = components["schemas"]["ResearchCitation"];
+export type ResearchUnsupportedClaim = components["schemas"]["ResearchUnsupportedClaim"];
+export type ResearchVerification = components["schemas"]["ResearchVerification"];
+export type ResearchUsage = components["schemas"]["ResearchUsage"];
+export type ResearchState = components["schemas"]["ResearchState"];
+export type ResearchIncompleteDetails = components["schemas"]["ResearchIncompleteDetails"];
+export type ResearchAgentRequest = components["schemas"]["ResearchAgentRequest"];
+export type ResearchAgentResult = components["schemas"]["ResearchAgentResult"];
+export type ResearchJobState = components["schemas"]["ResearchJobState"];
+export type ResearchJobStartRequest = components["schemas"]["ResearchJobStartRequest"];
+export type ResearchJobAdvanceRequest = components["schemas"]["ResearchJobAdvanceRequest"];
+export type ResearchJob = components["schemas"]["ResearchJob"];
+
+/** `step_progress` payload for phase `plan`: the brief and initial sub-questions. */
+export type ResearchPlanProgress = ResearchPlan;
+
+/** `step_progress` payload for phase `sub_question_started`. */
+export interface ResearchSubQuestionStartedProgress {
+  sub_question_id: string;
+  question: string;
+  round?: number;
+}
+
+/** `step_progress` payload for phase `section`: one report section as it is written. */
+export interface ResearchSectionProgress {
+  index: number;
+  heading: string;
+}
+
+// Research Agent streaming callbacks for structured SSE events
+export interface ResearchAgentStreamCallbacks {
+  onStepStarted?: (step: SSEStepStarted) => void;
+  onPlan?: (plan: ResearchPlanProgress) => void;
+  onSubQuestionStarted?: (event: ResearchSubQuestionStartedProgress) => void;
+  onFinding?: (finding: ResearchFinding) => void;
+  onReflection?: (reflection: ResearchReflection) => void;
+  onSection?: (section: ResearchSectionProgress) => void;
+  onVerification?: (verification: ResearchVerification) => void;
+  onGeneration?: (chunk: string) => void;
+  onStepCompleted?: (step: AgentStep) => void;
+  onDone?: (data: ResearchAgentResult) => void;
+  /** Receives typed failures, including InferenceCapacityError with retryAfterMs. */
+  onErrorDetail?: (error: Error) => void;
+  /** Legacy message callback; use onErrorDetail for structured retry handling. */
+  onError?: (error: string) => void;
+}
+
+/** Options for AntflyClient.runResearchJob. */
+export interface RunResearchJobOptions {
+  /** Maximum phases to run per advance call (server default 1, max 10). */
+  maxPhasesPerAdvance?: number;
+  /** Called with the latest job snapshot after start and after every advance or poll. */
+  onJob?: (job: ResearchJob) => void;
+  /** Aborts the polling loop. Does not cancel the durable job itself. */
+  signal?: AbortSignal;
 }
 
 // Chat Agent convenience types for multi-turn conversation
@@ -557,3 +684,11 @@ export interface QueryOptions {
 
 export type GraphRelationshipFilter = components["schemas"]["GraphRelationshipFilter"];
 export type GraphRelationshipPropertyPredicate = components["schemas"]["GraphRelationshipPropertyPredicate"];
+// System catalog resources and lifecycle requests.
+export type DatabaseCatalogRecord = components["schemas"]["DatabaseCatalogRecord"];
+export type NamespaceCatalogRecord = components["schemas"]["NamespaceCatalogRecord"];
+export type TablespaceCatalogRecord = components["schemas"]["TablespaceCatalogRecord"];
+export type CreateTablespaceRequest = components["schemas"]["CreateTablespaceRequest"];
+export type CatalogTablespaceBindingRequest =
+  components["schemas"]["CatalogTablespaceBindingRequest"];
+export type RenameCatalogResourceRequest = components["schemas"]["RenameCatalogResourceRequest"];

@@ -56,6 +56,34 @@ function generatedSortProfileDeclaration(): string {
 }
 
 describe("Antfly Query Type Integration", () => {
+  it("preserves the relational storage profile in create and status schemas", () => {
+    type Schema = components["schemas"]["TableSchema"];
+    expectTypeOf<Schema["storage_mode"]>().toEqualTypeOf<"document" | "relational" | undefined>();
+    const schema: Schema = {
+      storage_mode: "relational",
+      checks: [{ name: "positive", column: "id", op: "gt", value: "9007199254740992" }],
+      relational_indexes: [
+        {
+          name: "tenant_id",
+          keys: [
+            { column: "tenant", collation: "ci" },
+            { column: "id", direction: "desc", nulls: "last" },
+          ],
+        },
+      ],
+    };
+    const request: components["schemas"]["CreateTableRequest"] = { schema };
+    expect(JSON.parse(JSON.stringify(request)).schema.storage_mode).toBe("relational");
+    expect(JSON.parse(JSON.stringify(request)).schema.checks[0].value).toBe("9007199254740992");
+    expect(JSON.parse(JSON.stringify(request)).schema.relational_indexes[0].keys[1].direction).toBe(
+      "desc"
+    );
+    const dropped: Schema = { relational_indexes: [] };
+    expect(JSON.parse(JSON.stringify(dropped)).relational_indexes).toEqual([]);
+    expectTypeOf<components["schemas"]["TableStatus"]["schema"]>().toEqualTypeOf<
+      Schema | undefined
+    >();
+  });
   it("accepts summary graph metric build pages", () => {
     const page: GraphMetricBuildPageStatus = {
       phase: "reduce_ranks",

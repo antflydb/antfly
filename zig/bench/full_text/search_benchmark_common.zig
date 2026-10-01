@@ -245,7 +245,7 @@ pub const benchmark_schema_version: u16 = 1;
 pub const result_schema_version: u16 = 1;
 
 /// Parse the correctness-gated benchmark grammar documented in
-/// FULL_TEXT_PERFORMANCE.md:
+/// bench/full_text/BENCHMARK.md:
 ///
 ///   V1 TERM <field> <term>
 ///   V1 UNION <field> <term>...

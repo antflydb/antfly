@@ -1,0 +1,4 @@
+# Optional candidate, evaluated separately without changing frozen oracle pins.
+-r requirements-cuda.txt
+flashdeberta==0.0.7
+einops==0.8.1

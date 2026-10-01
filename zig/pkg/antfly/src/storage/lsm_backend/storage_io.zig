@@ -254,6 +254,10 @@ pub const RangeReadFuture = struct {
 
 pub const ReadRuntime = if (builtin.os.tag == .freestanding)
     struct {
+        pub fn getIo(_: *const ReadRuntime) ?std.Io {
+            return null;
+        }
+
         pub fn init(_: anytype) ReadRuntime {
             return .{};
         }
@@ -261,6 +265,10 @@ pub const ReadRuntime = if (builtin.os.tag == .freestanding)
 else
     struct {
         io: std.Io,
+
+        pub fn getIo(self: *const ReadRuntime) ?std.Io {
+            return self.io;
+        }
 
         pub fn init(io: std.Io) ReadRuntime {
             return .{ .io = io };
@@ -331,42 +339,54 @@ pub const NativePathLockFileOptions = struct {
 };
 
 pub const NativePathLockFile = struct {
-    io_impl: std.Io.Threaded,
+    io_impl: if (supports_native_storage) std.Io.Threaded else void,
     file: std.Io.File,
     fd_cache: *FdCache,
     locked: bool = false,
 
     pub fn lock(self: *NativePathLockFile, mode: NativePathLockMode) !void {
-        std.debug.assert(!self.locked);
-        try self.file.lock(self.io_impl.io(), switch (mode) {
-            .shared => .shared,
-            .exclusive => .exclusive,
-        });
-        self.locked = true;
+        if (comptime !supports_native_storage) {
+            return error.UnsupportedPlatform;
+        } else {
+            std.debug.assert(!self.locked);
+            try self.file.lock(self.io_impl.io(), switch (mode) {
+                .shared => .shared,
+                .exclusive => .exclusive,
+            });
+            self.locked = true;
+        }
     }
 
     pub fn tryLock(self: *NativePathLockFile, mode: NativePathLockMode) !bool {
-        std.debug.assert(!self.locked);
-        const locked = try self.file.tryLock(self.io_impl.io(), switch (mode) {
-            .shared => .shared,
-            .exclusive => .exclusive,
-        });
-        self.locked = locked;
-        return locked;
+        if (comptime !supports_native_storage) {
+            return error.UnsupportedPlatform;
+        } else {
+            std.debug.assert(!self.locked);
+            const locked = try self.file.tryLock(self.io_impl.io(), switch (mode) {
+                .shared => .shared,
+                .exclusive => .exclusive,
+            });
+            self.locked = locked;
+            return locked;
+        }
     }
 
     pub fn unlock(self: *NativePathLockFile) void {
-        if (!self.locked) return;
-        self.file.unlock(self.io_impl.io());
-        self.locked = false;
+        if (comptime supports_native_storage) {
+            if (!self.locked) return;
+            self.file.unlock(self.io_impl.io());
+            self.locked = false;
+        }
     }
 
     pub fn close(self: *NativePathLockFile) void {
-        self.unlock();
-        self.file.close(self.io_impl.io());
-        self.fd_cache.releasePersistentDescriptors(self.io_impl.io(), 1);
-        self.io_impl.deinit();
-        self.* = undefined;
+        if (comptime supports_native_storage) {
+            self.unlock();
+            self.file.close(self.io_impl.io());
+            self.fd_cache.releasePersistentDescriptors(self.io_impl.io(), 1);
+            self.io_impl.deinit();
+            self.* = undefined;
+        }
     }
 };
 
@@ -436,34 +456,38 @@ fn openNativePathLockFileWithCache(
     options: NativePathLockFileOptions,
     fd_cache: *FdCache,
 ) !NativePathLockFile {
-    var io_impl = threaded_io_limits.initService(allocator);
-    errdefer io_impl.deinit();
+    if (comptime !supports_native_storage) {
+        return error.UnsupportedPlatform;
+    } else {
+        var io_impl = threaded_io_limits.initService(allocator);
+        errdefer io_impl.deinit();
 
-    const open_descriptor_count = createPathDescriptorCount(path);
-    // Path locks live for the backend lifetime. They share the process budget,
-    // but must never queue behind other lifetime descriptors: once that class
-    // fills the budget, no waiter can make progress until a backend closes.
-    // Reserved headroom protects opens from transient load; true persistent
-    // exhaustion is reported instead of hanging startup or restore.
-    try fd_cache.reservePersistentDescriptors(io_impl.io(), open_descriptor_count);
-    var reserved_descriptor_count = open_descriptor_count;
-    errdefer fd_cache.releasePersistentDescriptors(io_impl.io(), reserved_descriptor_count);
+        const open_descriptor_count = createPathDescriptorCount(path);
+        // Path locks live for the backend lifetime. They share the process budget,
+        // but must never queue behind other lifetime descriptors: once that class
+        // fills the budget, no waiter can make progress until a backend closes.
+        // Reserved headroom protects opens from transient load; true persistent
+        // exhaustion is reported instead of hanging startup or restore.
+        try fd_cache.reservePersistentDescriptors(io_impl.io(), open_descriptor_count);
+        var reserved_descriptor_count = open_descriptor_count;
+        errdefer fd_cache.releasePersistentDescriptors(io_impl.io(), reserved_descriptor_count);
 
-    const file = if (options.create_if_missing)
-        try fs_paths.createFilePortable(io_impl.io(), path, .{ .read = true, .truncate = false })
-    else
-        try openNativePathFile(io_impl.io(), path);
-    errdefer file.close(io_impl.io());
-    if (reserved_descriptor_count > 1) {
-        fd_cache.releasePersistentDescriptors(io_impl.io(), reserved_descriptor_count - 1);
-        reserved_descriptor_count = 1;
+        const file = if (options.create_if_missing)
+            try fs_paths.createFilePortable(io_impl.io(), path, .{ .read = true, .truncate = false })
+        else
+            try openNativePathFile(io_impl.io(), path);
+        errdefer file.close(io_impl.io());
+        if (reserved_descriptor_count > 1) {
+            fd_cache.releasePersistentDescriptors(io_impl.io(), reserved_descriptor_count - 1);
+            reserved_descriptor_count = 1;
+        }
+
+        return .{
+            .io_impl = io_impl,
+            .file = file,
+            .fd_cache = fd_cache,
+        };
     }
-
-    return .{
-        .io_impl = io_impl,
-        .file = file,
-        .fd_cache = fd_cache,
-    };
 }
 
 fn createPathDescriptorCount(path: []const u8) usize {
@@ -1393,6 +1417,20 @@ else
         fn retain(self: *FdCache, namespace: u64, io: std.Io, path: []const u8) !*Entry {
             const path_hash = namespacedPathHash(namespace, path);
             const shard = self.shardForHash(path_hash);
+            // Cache hits already own a stable filename and descriptor. Avoid
+            // allocating a transient pathname (mmap/munmap in the process-wide
+            // page-allocated pool) on every point read. Misses still allocate
+            // outside the mutex and recheck both the entry and mutation epoch.
+            {
+                const locked = lockAtomic(&shard.mutex);
+                defer if (locked) shard.mutex.unlock();
+                if (self.findEntryLocked(shard, namespace, path_hash, path)) |existing| {
+                    existing.ref_count += 1;
+                    existing.last_access = self.nextAccessLocked();
+                    self.touchEntryLocked(shard, existing);
+                    return existing;
+                }
+            }
             const owned_path = try self.allocator.dupeZ(u8, path);
             var owned_path_active = true;
             errdefer if (owned_path_active) self.allocator.free(owned_path);
@@ -1781,7 +1819,7 @@ else
 
 var process_native_storage_pool_mutex: std.atomic.Mutex = .unlocked;
 var process_native_fd_cache: ?*FdCache = null;
-var native_storage_cache_namespace: std.atomic.Value(u64) = .init(1);
+var native_storage_cache_namespace: @import("antfly_platform").atomic.Value(u64) = .init(1);
 
 fn processNativeFdCache() *FdCache {
     const locked = lockAtomic(&process_native_storage_pool_mutex);
@@ -2064,7 +2102,10 @@ else
                 .len = len,
                 .io = read_runtime.io,
             };
-            self.future = try read_runtime.io.concurrent(run, .{self});
+            // Parallelism is optional for a range read. At the runtime's
+            // worker limit, async runs on the caller instead of turning
+            // temporary saturation into a failed query or indexing worker.
+            self.future = read_runtime.io.async(run, .{self});
             return .{
                 .ptr = self,
                 .vtable = &vtable,
@@ -4314,6 +4355,33 @@ test "storage range read future fallback waits and cancels" {
     canceled.cancel();
 }
 
+test "native range reads progress without concurrency capacity" {
+    if (!supports_native_storage) return error.SkipZigTest;
+    var native = try NativeStorage.init(std.testing.allocator, .threaded);
+    defer native.deinit();
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .nothing,
+    });
+    defer io_impl.deinit();
+    const runtime = ReadRuntime.init(io_impl.io());
+    var test_tmp = try TestDirectory.init("range-read-saturation");
+    defer test_tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}-payload", .{test_tmp.path()});
+    defer native.storage().deleteFileAbsolute(path) catch {};
+    try native.storage().writeFileAbsolute(path, "hello");
+
+    var future = try NativeRangeReadFuture.create(runtime, native.state, std.testing.allocator, path, 1, 3);
+    const bytes = try future.wait();
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("ell", bytes);
+    var canceled = try NativeRangeReadFuture.create(runtime, native.state, std.testing.allocator, path, 0, 5);
+    canceled.cancel();
+    var missing = try NativeRangeReadFuture.create(runtime, native.state, std.testing.allocator, "/nonexistent/antfly-range-read-saturation", 0, 1);
+    try std.testing.expectError(error.FileNotFound, missing.wait());
+}
+
 test "cold sequential reader is isolated from foreground descriptor cache" {
     if (!supports_posix_fd_cache) return error.SkipZigTest;
 
@@ -4520,6 +4588,36 @@ test "native storage retained runtime has a finite worker ceiling" {
         std.Io.Limit.limited(threaded_io_limits.service),
         native.state.threaded.concurrent_limit,
     );
+}
+
+test "native fd cache hits reuse their path without allocation" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+    var test_tmp = try TestDirectory.init("fd-hit");
+    defer test_tmp.cleanup();
+    var native = try NativeStorage.init(std.testing.allocator, .threaded);
+    defer native.deinit();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}-cached-file", .{test_tmp.path()});
+    defer native.storage().deleteFileAbsolute(path) catch {};
+    try native.storage().writeFileAbsolute(path, "value");
+    // The process-wide FD pool uses the page allocator. Exercise that shape,
+    // and reject any allocation after the descriptor has been populated.
+    var failing = std.testing.FailingAllocator.init(std.heap.page_allocator, .{});
+    var cache = FdCache.init(failing.allocator(), 8);
+    defer cache.deinit();
+    const first = try cache.retain(1, std.testing.io, path);
+    cache.release(std.testing.io, first);
+    const before = failing.alloc_index;
+    const started = @import("antfly_platform").time.monotonicNs();
+    for (0..20000) |_| {
+        const entry = try cache.retain(1, std.testing.io, path);
+        cache.release(std.testing.io, entry);
+    }
+    std.debug.print("fd cache 20000 hits: {d} ns, {d} allocations\n", .{ @import("antfly_platform").time.monotonicNs() - started, failing.alloc_index - before });
+    failing.fail_index = failing.alloc_index;
+    const hit = try cache.retain(1, std.testing.io, path);
+    cache.release(std.testing.io, hit);
+    try std.testing.expectEqual(before, failing.alloc_index);
 }
 
 test "native fd cache retries an open that straddles a mutation fence" {

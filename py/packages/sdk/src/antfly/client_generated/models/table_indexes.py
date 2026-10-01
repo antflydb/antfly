@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from ..models.created_embeddings_index import CreatedEmbeddingsIndex
     from ..models.created_full_text_index import CreatedFullTextIndex
     from ..models.created_graph_index import CreatedGraphIndex
+    from ..models.created_relational_index import CreatedRelationalIndex
 
 
 T = TypeVar("T", bound="TableIndexes")
@@ -21,10 +22,16 @@ class TableIndexes:
     """ """
 
     additional_properties: dict[
-        str, CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex
+        str,
+        CreatedAlgebraicIndex
+        | CreatedEmbeddingsIndex
+        | CreatedFullTextIndex
+        | CreatedGraphIndex
+        | CreatedRelationalIndex,
     ] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.created_algebraic_index import CreatedAlgebraicIndex
         from ..models.created_embeddings_index import CreatedEmbeddingsIndex
         from ..models.created_full_text_index import CreatedFullTextIndex
         from ..models.created_graph_index import CreatedGraphIndex
@@ -37,6 +44,8 @@ class TableIndexes:
                 field_dict[prop_name] = prop.to_dict()
             elif isinstance(prop, CreatedGraphIndex):
                 field_dict[prop_name] = prop.to_dict()
+            elif isinstance(prop, CreatedAlgebraicIndex):
+                field_dict[prop_name] = prop.to_dict()
             else:
                 field_dict[prop_name] = prop.to_dict()
 
@@ -48,6 +57,7 @@ class TableIndexes:
         from ..models.created_embeddings_index import CreatedEmbeddingsIndex
         from ..models.created_full_text_index import CreatedFullTextIndex
         from ..models.created_graph_index import CreatedGraphIndex
+        from ..models.created_relational_index import CreatedRelationalIndex
 
         d = dict(src_dict)
         table_indexes = cls()
@@ -57,7 +67,13 @@ class TableIndexes:
 
             def _parse_additional_property(
                 data: object,
-            ) -> CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex:
+            ) -> (
+                CreatedAlgebraicIndex
+                | CreatedEmbeddingsIndex
+                | CreatedFullTextIndex
+                | CreatedGraphIndex
+                | CreatedRelationalIndex
+            ):
                 try:
                     if not isinstance(data, dict):
                         raise TypeError()
@@ -82,11 +98,19 @@ class TableIndexes:
                     return componentsschemas_created_index_type_2
                 except (TypeError, ValueError, AttributeError, KeyError):
                     pass
+                try:
+                    if not isinstance(data, dict):
+                        raise TypeError()
+                    componentsschemas_created_index_type_3 = CreatedAlgebraicIndex.from_dict(data)
+
+                    return componentsschemas_created_index_type_3
+                except (TypeError, ValueError, AttributeError, KeyError):
+                    pass
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_created_index_type_3 = CreatedAlgebraicIndex.from_dict(data)
+                componentsschemas_created_index_type_4 = CreatedRelationalIndex.from_dict(data)
 
-                return componentsschemas_created_index_type_3
+                return componentsschemas_created_index_type_4
 
             additional_property = _parse_additional_property(prop_dict)
 
@@ -101,11 +125,23 @@ class TableIndexes:
 
     def __getitem__(
         self, key: str
-    ) -> CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex:
+    ) -> (
+        CreatedAlgebraicIndex
+        | CreatedEmbeddingsIndex
+        | CreatedFullTextIndex
+        | CreatedGraphIndex
+        | CreatedRelationalIndex
+    ):
         return self.additional_properties[key]
 
     def __setitem__(
-        self, key: str, value: CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex
+        self,
+        key: str,
+        value: CreatedAlgebraicIndex
+        | CreatedEmbeddingsIndex
+        | CreatedFullTextIndex
+        | CreatedGraphIndex
+        | CreatedRelationalIndex,
     ) -> None:
         self.additional_properties[key] = value
 

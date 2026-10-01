@@ -128,7 +128,13 @@ def sync_detailed(
     ```
 
     Args:
-        body (ClusterBackupRequest):
+        body (ClusterBackupRequest): Native cluster backups pin a common transaction cut across a
+            dependency-complete
+            table set. Restart-stable LSM seals are journaled before releasing write fences;
+            artifact upload uses those immutable seals without holding the write pause.
+            Native cohorts support at most 4096 tables and 4096 ranges and require the
+            filesystem-managed LSM backend. Portable backups do not support coordinated
+            UNIQUE/FK constraints or promise a common cross-table transaction cut.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -182,7 +188,13 @@ def sync(
     ```
 
     Args:
-        body (ClusterBackupRequest):
+        body (ClusterBackupRequest): Native cluster backups pin a common transaction cut across a
+            dependency-complete
+            table set. Restart-stable LSM seals are journaled before releasing write fences;
+            artifact upload uses those immutable seals without holding the write pause.
+            Native cohorts support at most 4096 tables and 4096 ranges and require the
+            filesystem-managed LSM backend. Portable backups do not support coordinated
+            UNIQUE/FK constraints or promise a common cross-table transaction cut.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -231,7 +243,13 @@ async def asyncio_detailed(
     ```
 
     Args:
-        body (ClusterBackupRequest):
+        body (ClusterBackupRequest): Native cluster backups pin a common transaction cut across a
+            dependency-complete
+            table set. Restart-stable LSM seals are journaled before releasing write fences;
+            artifact upload uses those immutable seals without holding the write pause.
+            Native cohorts support at most 4096 tables and 4096 ranges and require the
+            filesystem-managed LSM backend. Portable backups do not support coordinated
+            UNIQUE/FK constraints or promise a common cross-table transaction cut.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -283,7 +301,13 @@ async def asyncio(
     ```
 
     Args:
-        body (ClusterBackupRequest):
+        body (ClusterBackupRequest): Native cluster backups pin a common transaction cut across a
+            dependency-complete
+            table set. Restart-stable LSM seals are journaled before releasing write fences;
+            artifact upload uses those immutable seals without holding the write pause.
+            Native cohorts support at most 4096 tables and 4096 ranges and require the
+            filesystem-managed LSM backend. Portable backups do not support coordinated
+            UNIQUE/FK constraints or promise a common cross-table transaction cut.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

@@ -6,9 +6,9 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.serper_search_config_provider import SerperSearchConfigProvider
 from ..models.serper_search_config_search_type import SerperSearchConfigSearchType
 from ..models.serper_search_config_time_period import SerperSearchConfigTimePeriod
-from ..models.web_search_provider import WebSearchProvider
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="SerperSearchConfig")
@@ -28,7 +28,7 @@ class SerperSearchConfig:
     **Docs:** https://serper.dev/docs
 
         Attributes:
-            provider (WebSearchProvider): The web search provider to use.
+            provider (SerperSearchConfigProvider): The web search provider to use.
 
                 - **exa**: Exa neural/semantic web search API
                 - **serper**: Serper.dev Google Search API (simpler setup)
@@ -47,20 +47,18 @@ class SerperSearchConfig:
             serving_config (str | Unset): Agent Search serving config ID for provider vertex. Defaults to default_config.
             credentials_path (str | Unset): Service account JSON path for provider vertex. Shared Vertex credential field;
                 see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
-            max_results (int | Unset): Maximum number of search results to return Default: 5.
-            timeout_ms (int | Unset): Request timeout in milliseconds Default: 10000.
-            safe_search (bool | Unset): Enable safe search filtering Default: True.
+            max_results (int | Unset): Maximum number of search results to return
+            timeout_ms (int | Unset): Request timeout in milliseconds
+            safe_search (bool | Unset): Enable safe search filtering
             language (str | Unset): Preferred language for results (e.g., 'en', 'es', 'fr') Example: en.
             region (str | Unset): Preferred region for results (e.g., 'us', 'uk', 'de') Example: us.
-            include_content (bool | Unset): Ask the provider to return extracted page content when supported Default: False.
-            include_highlights (bool | Unset): Ask the provider to return highlighted passages when supported Default:
-                False.
-            search_type (SerperSearchConfigSearchType | Unset): Type of search to perform Default:
-                SerperSearchConfigSearchType.SEARCH.
+            include_content (bool | Unset): Ask the provider to return extracted page content when supported
+            include_highlights (bool | Unset): Ask the provider to return highlighted passages when supported
+            search_type (SerperSearchConfigSearchType | Unset): Type of search to perform
             time_period (SerperSearchConfigTimePeriod | Unset): Time period filter: d=day, w=week, m=month, y=year
     """
 
-    provider: WebSearchProvider
+    provider: SerperSearchConfigProvider
     api_key: str | Unset = UNSET
     endpoint: str | Unset = UNSET
     project_id: str | Unset = UNSET
@@ -68,14 +66,14 @@ class SerperSearchConfig:
     data_store: str | Unset = UNSET
     serving_config: str | Unset = UNSET
     credentials_path: str | Unset = UNSET
-    max_results: int | Unset = 5
-    timeout_ms: int | Unset = 10000
-    safe_search: bool | Unset = True
+    max_results: int | Unset = UNSET
+    timeout_ms: int | Unset = UNSET
+    safe_search: bool | Unset = UNSET
     language: str | Unset = UNSET
     region: str | Unset = UNSET
-    include_content: bool | Unset = False
-    include_highlights: bool | Unset = False
-    search_type: SerperSearchConfigSearchType | Unset = SerperSearchConfigSearchType.SEARCH
+    include_content: bool | Unset = UNSET
+    include_highlights: bool | Unset = UNSET
+    search_type: SerperSearchConfigSearchType | Unset = UNSET
     time_period: SerperSearchConfigTimePeriod | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -163,7 +161,7 @@ class SerperSearchConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        provider = WebSearchProvider(d.pop("provider"))
+        provider = SerperSearchConfigProvider(d.pop("provider"))
 
         api_key = d.pop("api_key", UNSET)
 

@@ -218,6 +218,13 @@ pub const Options = struct {
     initial_scores: ?[]const f64 = null,
     initial_authorities: ?[]const f64 = null,
     initial_hubs: ?[]const f64 = null,
+    /// PageRank-only personalized teleport vector, ordinal-aligned with the
+    /// topology. Null keeps global PageRank's uniform teleport. Entries must
+    /// be finite and non-negative with positive total mass; the kernel
+    /// normalizes to one, so callers may pass unnormalized seed masses.
+    /// Mutually exclusive with initial_scores: a publication warm start is
+    /// global by construction and would bias the personalized fixed point.
+    teleport: ?[]const f64 = null,
 };
 
 const parallel_edge_threshold: usize = 128 * 1024;
@@ -544,7 +551,32 @@ pub fn pageRankTopologyAlloc(alloc: Allocator, topology: Topology, options: Opti
         scale.* = if (out_degree == 0) 0 else options.damping / @as(f64, @floatFromInt(out_degree));
     }
     const count: f64 = @floatFromInt(node_count);
-    if (options.initial_scores) |initial| {
+    // Personalized teleport: normalize once and reuse the same owned vector as
+    // both the restart distribution and the deterministic starting scores.
+    const teleport: ?[]f64 = if (options.teleport) |supplied| blk: {
+        if (options.initial_scores != null) return error.InvalidGraphMetricWarmStart;
+        if (supplied.len != node_count) return error.InvalidGraphMetricTeleport;
+        const owned = try alloc.alloc(f64, node_count);
+        errdefer alloc.free(owned);
+        var mass = warm_start.Mass{};
+        for (supplied, 0..) |value, i| {
+            if (i % 4096 == 0) try options.cancellation.check();
+            mass.add(value) catch return error.InvalidGraphMetricTeleport;
+        }
+        const total = mass.total() catch return error.InvalidGraphMetricTeleport;
+        // Unlike a zeroed warm start, zero teleport mass is not a cold start:
+        // the damped restart term vanishes and no fixed point exists.
+        if (total == 0) return error.InvalidGraphMetricTeleport;
+        for (supplied, owned, 0..) |value, *out, i| {
+            if (i % 4096 == 0) try options.cancellation.check();
+            out.* = value / total;
+        }
+        break :blk owned;
+    } else null;
+    defer if (teleport) |owned| alloc.free(owned);
+    if (teleport) |restart_mass| {
+        @memcpy(scores, restart_mass);
+    } else if (options.initial_scores) |initial| {
         try initializeProbabilityVector(scores, initial, options.cancellation);
     } else {
         @memset(scores, 1.0 / count);
@@ -556,8 +588,18 @@ pub fn pageRankTopologyAlloc(alloc: Allocator, topology: Topology, options: Opti
         try options.cancellation.check();
         iteration += 1;
         const sink_mass = try pageRankSinkMass(scores, source_scale, options);
-        const base = (1.0 - options.damping + options.damping * sink_mass) / count;
-        delta = try fillPageRankNext(topology, scores, source_scale, next, base, options);
+        if (teleport) |restart_mass| {
+            // Dangling mass restarts through the same personalized teleport
+            // distribution, keeping total probability mass at one. The fused
+            // per-row base of the uniform kernel cannot express a per-node
+            // restart, so add it in one serial pass that also owns the delta.
+            const restart = 1.0 - options.damping + options.damping * sink_mass;
+            _ = try fillPageRankNext(topology, scores, source_scale, next, 0, options);
+            delta = try addTeleportAndDelta(next, scores, restart_mass, restart, options.cancellation);
+        } else {
+            const base = (1.0 - options.damping + options.damping * sink_mass) / count;
+            delta = try fillPageRankNext(topology, scores, source_scale, next, base, options);
+        }
         const previous = scores;
         scores = next;
         next = previous;
@@ -565,6 +607,76 @@ pub fn pageRankTopologyAlloc(alloc: Allocator, topology: Topology, options: Opti
         if (delta <= options.tolerance) return .{ .scores = scores, .iterations_completed = iteration, .converged = true, .delta = delta };
     }
     return .{ .scores = scores, .iterations_completed = iteration, .converged = false, .delta = delta };
+}
+
+/// Query-seeded personalized PageRank: teleport mass restricted to
+/// `seed_ordinals`, uniform per unique seed (HippoRAG-style retrieval).
+/// An empty seed set degenerates to global PageRank's uniform teleport so
+/// callers whose query resolved no seeds keep a well-defined ranking.
+pub fn personalizedPageRankAlloc(
+    alloc: Allocator,
+    node_count: usize,
+    edges: []const Edge,
+    seed_ordinals: []const u32,
+    options: Options,
+) !Result {
+    try validateInputBoundsAndOptions(node_count, edges.len, options);
+    try admitWork(.pagerank, node_count, edges.len, options.max_iterations, options.max_work_items);
+    var topology = try Topology.initAllocFor(alloc, node_count, edges, .pagerank, options.cancellation);
+    defer topology.deinit(alloc);
+    return try personalizedPageRankTopologyAlloc(alloc, topology, seed_ordinals, options);
+}
+
+pub fn personalizedPageRankTopologyAlloc(
+    alloc: Allocator,
+    topology: Topology,
+    seed_ordinals: []const u32,
+    options: Options,
+) !Result {
+    // Seed ordinals and an explicit teleport vector are two spellings of the
+    // same personalization; accepting both would make one silently win.
+    if (options.teleport != null) return error.InvalidGraphMetricTeleport;
+    if (seed_ordinals.len == 0) return try pageRankTopologyAlloc(alloc, topology, options);
+    const node_count = topology.nodeCount();
+    const teleport = try alloc.alloc(f64, node_count);
+    defer alloc.free(teleport);
+    @memset(teleport, 0);
+    var unique_seeds: usize = 0;
+    for (seed_ordinals, 0..) |ordinal, i| {
+        if (i % 4096 == 0) try options.cancellation.check();
+        // Key-to-ordinal resolution (and skipping of unknown keys) belongs to
+        // the storage layer; an out-of-range ordinal here is caller error.
+        if (@as(usize, ordinal) >= node_count) return error.InvalidGraphMetricTeleport;
+        if (teleport[ordinal] == 0) unique_seeds += 1;
+        teleport[ordinal] = 1;
+    }
+    const share = 1.0 / @as(f64, @floatFromInt(unique_seeds));
+    for (teleport) |*mass| {
+        if (mass.* != 0) mass.* = share;
+    }
+    var seeded_options = options;
+    seeded_options.teleport = teleport;
+    return try pageRankTopologyAlloc(alloc, topology, seeded_options);
+}
+
+/// next[i] += restart * teleport[i], returning the L1 delta against the
+/// previous scores. Deliberately serial: the pass is O(N) beside O(E) edge
+/// work and staying single-threaded keeps personalized deltas bit-identical
+/// across executor widths, matching the uniform kernel's determinism contract.
+fn addTeleportAndDelta(
+    next: []f64,
+    previous: []const f64,
+    teleport: []const f64,
+    restart: f64,
+    cancellation: CancellationToken,
+) !f64 {
+    var delta: f64 = 0;
+    for (next, previous, teleport, 0..) |*value, prior, mass, i| {
+        if (i % 4096 == 0) try cancellation.check();
+        value.* += restart * mass;
+        delta += @abs(value.* - prior);
+    }
+    return delta;
 }
 
 pub fn eigenvectorAlloc(alloc: Allocator, node_count: usize, edges: []const Edge, options: Options) !Result {
@@ -577,6 +689,7 @@ pub fn eigenvectorAlloc(alloc: Allocator, node_count: usize, edges: []const Edge
 
 pub fn eigenvectorTopologyAlloc(alloc: Allocator, topology: Topology, options: Options) !Result {
     if (options.initial_scores != null) return error.InvalidGraphMetricWarmStart;
+    if (options.teleport != null) return error.InvalidGraphMetricTeleport;
     try validateTopology(topology, .eigenvector, options);
     try admitWork(.eigenvector, topology.nodeCount(), topology.edgeCount(), options.max_iterations, options.max_work_items);
     const node_count = topology.nodeCount();
@@ -609,6 +722,7 @@ pub fn hitsAlloc(alloc: Allocator, node_count: usize, edges: []const Edge, optio
 
 pub fn hitsTopologyAlloc(alloc: Allocator, topology: Topology, options: Options) !HitsResult {
     if (options.initial_authorities != null or options.initial_hubs != null) return error.InvalidGraphMetricWarmStart;
+    if (options.teleport != null) return error.InvalidGraphMetricTeleport;
     try validateTopology(topology, .hits, options);
     try admitWork(.hits, topology.nodeCount(), topology.edgeCount(), options.max_iterations, options.max_work_items);
     const node_count = topology.nodeCount();
@@ -1163,6 +1277,95 @@ test "serverless graph metric runtime fanout preserves deterministic target-owne
         try normalize(parallel_normalized, parallel_options);
         try std.testing.expectEqualSlices(f64, serial_normalized, parallel_normalized);
     }
+}
+
+// Fixed personalization fixture: a two-node seed cluster bridged to a global
+// hub that dominates uniform-teleport PageRank. Node 5 collects five inbound
+// edges and is a sink, so seeded runs also exercise the personalized
+// dangling-mass restart path.
+const personalized_fixture_edges = [_]Edge{
+    .{ .source = 0, .target = 1 }, .{ .source = 1, .target = 0 },
+    .{ .source = 1, .target = 2 }, .{ .source = 2, .target = 5 },
+    .{ .source = 3, .target = 5 }, .{ .source = 4, .target = 5 },
+    .{ .source = 6, .target = 5 }, .{ .source = 7, .target = 5 },
+};
+
+test "serverless graph metric personalized pagerank concentrates teleport mass on seed neighborhoods" {
+    const alloc = std.testing.allocator;
+    const options = Options{ .damping = 0.9, .tolerance = 1e-12, .max_iterations = 500 };
+    var global = try pageRankAlloc(alloc, 8, &personalized_fixture_edges, options);
+    defer global.deinit(alloc);
+    var seeded = try personalizedPageRankAlloc(alloc, 8, &personalized_fixture_edges, &.{0}, options);
+    defer seeded.deinit(alloc);
+    try std.testing.expect(global.converged and seeded.converged);
+    // Uniform teleport crowns the hub; seed-restricted teleport keeps the
+    // random walk near the seed and its one-hop neighbor instead.
+    try std.testing.expect(global.scores[5] > global.scores[0]);
+    try std.testing.expect(seeded.scores[0] > seeded.scores[5]);
+    try std.testing.expect(seeded.scores[1] > seeded.scores[5]);
+    for ([_]usize{ 4, 6, 7 }) |distant| {
+        try std.testing.expect(seeded.scores[0] > seeded.scores[distant]);
+        try std.testing.expect(seeded.scores[1] > seeded.scores[distant]);
+    }
+    // Duplicate seed ordinals collapse to one teleport share.
+    var duplicated = try personalizedPageRankAlloc(alloc, 8, &personalized_fixture_edges, &.{ 0, 0, 0 }, options);
+    defer duplicated.deinit(alloc);
+    try std.testing.expectEqualSlices(f64, seeded.scores, duplicated.scores);
+}
+
+test "serverless graph metric personalized pagerank with no seeds matches global pagerank" {
+    const alloc = std.testing.allocator;
+    const options = Options{ .damping = 0.9, .tolerance = 1e-12, .max_iterations = 500 };
+    var global = try pageRankAlloc(alloc, 8, &personalized_fixture_edges, options);
+    defer global.deinit(alloc);
+    var unseeded = try personalizedPageRankAlloc(alloc, 8, &personalized_fixture_edges, &.{}, options);
+    defer unseeded.deinit(alloc);
+    try std.testing.expectEqualSlices(f64, global.scores, unseeded.scores);
+    try std.testing.expectEqual(global.iterations_completed, unseeded.iterations_completed);
+}
+
+test "serverless graph metric personalized pagerank is deterministic and rejects malformed teleports" {
+    const alloc = std.testing.allocator;
+    const options = Options{ .damping = 0.9, .tolerance = 1e-12, .max_iterations = 500 };
+    var first = try personalizedPageRankAlloc(alloc, 8, &personalized_fixture_edges, &.{ 0, 3 }, options);
+    defer first.deinit(alloc);
+    var second = try personalizedPageRankAlloc(alloc, 8, &personalized_fixture_edges, &.{ 0, 3 }, options);
+    defer second.deinit(alloc);
+    try std.testing.expectEqualSlices(f64, first.scores, second.scores);
+    try std.testing.expectEqual(first.iterations_completed, second.iterations_completed);
+    try std.testing.expectEqual(first.delta, second.delta);
+
+    // Out-of-range seed ordinals are caller errors: key-level skipping of
+    // unknown seeds happens before ordinals reach the kernel.
+    try std.testing.expectError(error.InvalidGraphMetricTeleport, personalizedPageRankAlloc(alloc, 8, &personalized_fixture_edges, &.{8}, options));
+
+    var topology = try Topology.initAllocFor(alloc, 8, &personalized_fixture_edges, .pagerank, .none);
+    defer topology.deinit(alloc);
+    var bad_options = options;
+    bad_options.teleport = &.{ 1, 0 };
+    try std.testing.expectError(error.InvalidGraphMetricTeleport, pageRankTopologyAlloc(alloc, topology, bad_options));
+    const zero_mass = [_]f64{0} ** 8;
+    bad_options.teleport = &zero_mass;
+    try std.testing.expectError(error.InvalidGraphMetricTeleport, pageRankTopologyAlloc(alloc, topology, bad_options));
+    const negative_mass = [_]f64{ 1, -1, 0, 0, 0, 0, 0, 0 };
+    bad_options.teleport = &negative_mass;
+    try std.testing.expectError(error.InvalidGraphMetricTeleport, pageRankTopologyAlloc(alloc, topology, bad_options));
+    // A publication warm start is global by construction and cannot seed a
+    // personalized fixed point.
+    const uniform = [_]f64{0.125} ** 8;
+    var conflicting = options;
+    conflicting.teleport = &uniform;
+    conflicting.initial_scores = &uniform;
+    try std.testing.expectError(error.InvalidGraphMetricWarmStart, pageRankTopologyAlloc(alloc, topology, conflicting));
+}
+
+test "serverless graph metric spectral kernels reject personalized teleports" {
+    const alloc = std.testing.allocator;
+    const uniform = [_]f64{0.125} ** 8;
+    var options = Options{ .max_iterations = 3 };
+    options.teleport = &uniform;
+    try std.testing.expectError(error.InvalidGraphMetricTeleport, eigenvectorAlloc(alloc, 8, &personalized_fixture_edges, options));
+    try std.testing.expectError(error.InvalidGraphMetricTeleport, hitsAlloc(alloc, 8, &personalized_fixture_edges, options));
 }
 
 test "serverless graph metric edge tiles split hubs with deterministic bounded reductions" {

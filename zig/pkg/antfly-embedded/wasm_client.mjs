@@ -156,7 +156,7 @@ export function createGoParityRemoteTemplateRenderer(handlers = {}) {
     };
 }
 
-function createHostImports(options = {}) {
+function createHostImports(module, options = {}) {
     let exportsRef = null;
 
     function requireExports() {
@@ -187,51 +187,47 @@ function createHostImports(options = {}) {
         new DataView(exports.memory.buffer).setUint32(Number(ptr), Number(value), true);
     }
 
-    const noop = () => {};
-    const webgpuStubs = {
-        gpu_create_buffer: () => 0,
-        gpu_upload: noop,
-        gpu_matmul_transb_q4_0: noop,
-        gpu_matmul_transb_q4_1: noop,
-        gpu_matmul_transb_q5_0: noop,
-        gpu_matmul_transb_q5_1: noop,
-        gpu_matmul_transb_q8_0: noop,
-        gpu_matmul_transb_q8_1: noop,
-        gpu_matmul_transb_iq4_nl: noop,
-        gpu_matmul_transb_iq4_xs: noop,
-        gpu_matmul_transb_q2_k: noop,
-        gpu_matmul_transb_q3_k: noop,
-        gpu_matmul_transb_q4_k: noop,
-        gpu_matmul_transb_q5_k: noop,
-        gpu_matmul_transb_q6_k: noop,
-        gpu_matmul_transb_q8_k: noop,
-        gpu_download: noop,
-        gpu_free_buffer: noop,
-        gpu_layer_norm: noop,
-        gpu_rms_norm: noop,
-        gpu_attention: noop,
-        gpu_causal_attention: noop,
-        gpu_cross_attention: noop,
-        gpu_gqa_causal_attention: noop,
-        gpu_write_buffer_at_offset: noop,
-        gpu_gqa_cached_attention: noop,
-        gpu_matmul_transb: noop,
-        gpu_is_available: () => 0,
-    };
-
     // WebGPUOps.getImports(memory) needs WASM memory, which isn't available
     // until after instantiation. Use a lazy proxy that defers to exports.memory.
     let webgpuImports;
     if (options.webgpuOps && typeof options.webgpuOps.getImports === "function") {
         const lazyMemory = { get buffer() { return requireExports().memory.buffer; } };
-        webgpuImports = options.webgpuOps.getImports(lazyMemory);
+        webgpuImports = { gpu_is_available: () => 0, ...options.webgpuOps.getImports(lazyMemory) };
     } else {
-        webgpuImports = webgpuStubs;
+        webgpuImports = { gpu_is_available: () => 0 };
     }
+
+    // Resolve the optional GPU ABI from the module itself. CPU hosts report
+    // unavailable; an accidental dispatch must fail rather than corrupt output.
+    let incompleteGpu = false;
+    for (const entry of WebAssembly.Module.imports(module)) {
+        if (entry.module !== "webgpu" || entry.kind !== "function") continue;
+        if (typeof webgpuImports[entry.name] === "function") continue;
+        incompleteGpu = true;
+        webgpuImports[entry.name] = () => {
+            throw new Error(`WebGPU operation unavailable: ${entry.name}`);
+        };
+    }
+    if (incompleteGpu) webgpuImports.gpu_is_available = () => 0;
 
     return {
         imports: {
             env: {
+                antfly_platform_random_secure(ptr, len) {
+                    const crypto = globalThis.crypto;
+                    if (typeof crypto?.getRandomValues !== "function") return 1;
+                    try {
+                        const offset = typeof ptr === "bigint" ? Number(ptr) : ptr >>> 0;
+                        const length = typeof len === "bigint" ? Number(len) : len >>> 0;
+                        const buffer = new Uint8Array(requireExports().memory.buffer, offset, length);
+                        for (let offset = 0; offset < buffer.length; offset += 65536) {
+                            crypto.getRandomValues(buffer.subarray(offset, Math.min(offset + 65536, buffer.length)));
+                        }
+                        return 0;
+                    } catch {
+                        return 1;
+                    }
+                },
                 antfly_embedded_host_render_json_to_text(
                     templatePtr,
                     templateLen,
@@ -268,19 +264,21 @@ function createHostImports(options = {}) {
 }
 
 export async function instantiateAntflyEmbeddedApiFromUrl(wasmUrl, options = {}) {
-    const host = createHostImports(options);
     const response = await fetch(wasmUrl);
     if (!response.ok) {
         throw new Error(`failed to fetch wasm: ${response.status} ${response.statusText}`);
     }
-    const { instance } = await WebAssembly.instantiateStreaming(response, host.imports);
+    const module = await WebAssembly.compileStreaming(response);
+    const host = createHostImports(module, options);
+    const instance = await WebAssembly.instantiate(module, host.imports);
     host.setExports(instance.exports);
     return bindAntflyEmbeddedApi(instance.exports);
 }
 
 export async function instantiateAntflyEmbeddedApiFromBytes(wasmBytes, options = {}) {
-    const host = createHostImports(options);
-    const { instance } = await WebAssembly.instantiate(wasmBytes, host.imports);
+    const module = await WebAssembly.compile(wasmBytes);
+    const host = createHostImports(module, options);
+    const instance = await WebAssembly.instantiate(module, host.imports);
     host.setExports(instance.exports);
     return bindAntflyEmbeddedApi(instance.exports);
 }

@@ -17,10 +17,14 @@ const platform = @import("antfly_platform");
 const antfly_client = @import("antfly-client");
 const httpx = @import("httpx");
 
+pub const database_cmd = @import("database.zig");
+pub const namespace_cmd = @import("namespace.zig");
+pub const tablespace = @import("tablespace.zig");
 pub const table = @import("table.zig");
 pub const index = @import("index.zig");
 pub const artifact = @import("artifact.zig");
 pub const query = @import("query.zig");
+pub const sql = @import("sql.zig");
 pub const data = @import("data.zig");
 pub const backup = @import("backup.zig");
 pub const agents = @import("agents.zig");
@@ -35,11 +39,50 @@ pub const GlobalConfig = struct {
     output: OutputFormat = .json,
 };
 
+pub const CatalogFlags = struct {
+    database: ?[]const u8 = null,
+    namespace: ?[]const u8 = null,
+
+    pub const Explicit = struct {
+        database: []const u8,
+        namespace: []const u8,
+    };
+
+    pub fn defaultsFromEnv() CatalogFlags {
+        return .{
+            .database = @import("antfly_platform").env.getenv("ANTFLY_DATABASE"),
+            .namespace = @import("antfly_platform").env.getenv("ANTFLY_NAMESPACE"),
+        };
+    }
+
+    pub fn explicit(self: CatalogFlags) ?Explicit {
+        if (self.database == null and self.namespace == null) return null;
+        return .{
+            .database = self.database orelse fatal("--database is required when --namespace is set or ANTFLY_NAMESPACE is configured", .{}),
+            .namespace = self.namespace orelse fatal("--namespace is required when --database is set or ANTFLY_DATABASE is configured", .{}),
+        };
+    }
+
+    pub fn databaseOrFatal(self: CatalogFlags) []const u8 {
+        return self.database orelse fatal("--database is required or ANTFLY_DATABASE must be configured", .{});
+    }
+};
+
 pub fn isHelpArg(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "help");
 }
 
 pub fn commandUsage(command: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, command, "sql")) return
+    \\usage: antfly sql --statement '<SQL>' [--parameters '<JSON array>']
+    \\                  [--database <name>] [--namespace <name>] [--limit <1..4096>]
+    \\       antfly sql --interactive [--database <name>] [--namespace <name>]
+    \\  Interactive mode accepts one statement per line; \q rolls back and exits.
+    \\  Parameters bind as typed values; quote SQL to prevent shell expansion of $1.
+    \\  Limit is a result admission cap, not an implicit SQL LIMIT. No automatic retries.
+    \\  Scope defaults use ANTFLY_DATABASE / ANTFLY_NAMESPACE or default/public.
+    \\
+    ;
     if (std.mem.eql(u8, command, "query")) return
     \\usage: antfly query --table <table> [search options]
     \\
@@ -115,13 +158,19 @@ pub fn commandUsage(command: []const u8) ?[]const u8 {
     \\
     ;
     if (std.mem.eql(u8, command, "agents")) return
-    \\usage: antfly agents <retrieval|query-builder> [options]
+    \\usage: antfly agents <retrieval|research|query-builder> [options]
     \\
-    \\  agents retrieval --table <table> (--intent <text>|--semantic-search <text>|--full-text-search <query>) --generator <json> [options]
+    \\  agents retrieval [--table <table>] [--web-search-connection <name>] (--intent <text>|--semantic-search <text>|--full-text-search <query>) --generator <json> [options]
     \\  agents retrieval options: --indexes <names> --fields <names> --limit <n> --reranker <json> --pruner <json>
     \\                            --max-context-tokens <n> --streaming|--no-streaming
     \\                            --classify --reasoning --generate --followup --confidence
     \\                            --max-internal-iterations <0..20> (default: 8 for intent; 0 for explicit queries)
+    \\  agents research --query <text> --generator <json> (--table <table>|--web-search-connection <name>) [options]
+    \\  agents research options: --full-text-search <query> --semantic-search <text> --indexes <names> --fields <names> --limit <n>
+    \\                           --fetch-allowed-hosts <hosts> --agent-knowledge <text> --outline <headings> --instructions <text>
+    \\                           --max-rounds <1..5> --max-sub-questions <1..8> --max-parallel <1..4> --researcher-iterations <1..20>
+    \\                           --max-llm-calls <n> --deadline-ms <ms> --verify --streaming|--no-streaming
+    \\                           --job (durable job, advanced phase by phase) | --resume-job <id>
     \\  agents query-builder --intent <text> --generator <json> [--table <table>]
     \\                       [--fields <names>] [--mode <mode>] [--max-internal-iterations <0..20>]
     \\                       [--execute] [--streaming|--no-streaming] (delegate to the retrieval workflow)
@@ -130,13 +179,25 @@ pub fn commandUsage(command: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, command, "backup")) return "usage: antfly backup --table <table> --location <uri> [options]\n";
     if (std.mem.eql(u8, command, "restore")) return "usage: antfly restore --location <uri> [options]\n";
     if (std.mem.eql(u8, command, "auth")) return "usage: antfly auth <me|users|permissions|roles|row-filters|subjects|api-keys> [options]\n";
-    if (std.mem.eql(u8, command, "internal")) return "usage: antfly internal metadata status\n";
+    if (std.mem.eql(u8, command, "internal")) return
+    \\usage: antfly internal metadata status
+    \\       antfly internal store-root proof --replica-root-dir <dir> --metadata-incarnation <32-char lowercase hex> --node-id <id> --store-id <id>
+    \\       antfly internal store-root enroll --file <proof.json>
+    \\       antfly internal store-root status --file <proof.json>
+    \\Generate the proof on the data node, then enroll it with a cluster-admin token.
+    \\If enroll returns an ambiguous error, check status before any manual retry.
+    \\
+    ;
     return null;
 }
 
 pub fn printCommandUsage(command: []const u8) void {
     const usage = commandUsage(command) orelse return;
     std.debug.print("{s}", .{usage});
+    for ([_][]const u8{ "table", "index", "query", "lookup", "load", "insert", "delete", "backup", "restore" }) |name| if (std.mem.eql(u8, command, name)) {
+        std.debug.print("\nTable scope: --database NAME --namespace NAME (defaults: default/public).\nTable names are literal; dots do not select a namespace.\n", .{});
+        break;
+    };
 }
 
 pub fn takeUniqueValue(
@@ -240,6 +301,7 @@ test "cli mod compiles" {
     _ = index;
     _ = artifact;
     _ = query;
+    _ = sql;
     _ = data;
     _ = backup;
     _ = agents;

@@ -715,6 +715,13 @@ pub fn decodeBigValuePairsPartial(
 
     for (tasks) |task| {
         if (task.pair_count == 0) continue;
+        // A five-bit selector cannot name a table outside this set, but the
+        // plan is a plain struct: report the gap rather than indexing past the
+        // end of the table.
+        if (task.table_select >= huff_data.len) return .{
+            .pairs_decoded = written,
+            .unsupported_table = task.table_select,
+        };
         switch (huff_data[task.table_select].vlc_table) {
             0 => {
                 for (0..task.pair_count) |_| {
@@ -922,6 +929,7 @@ fn scalefactorBandLong(sample_rate: u32) []const usize {
         32000 => &.{ 0, 4, 8, 12, 16, 20, 24, 30, 36, 44, 54, 66, 82, 102, 126, 156, 194, 240, 296, 364, 448, 550, 576 },
         24000 => &.{ 0, 6, 12, 18, 24, 30, 36, 44, 54, 66, 80, 96, 114, 136, 162, 194, 232, 278, 330, 394, 464, 540, 576 },
         22050, 16000, 12000, 11025 => &.{ 0, 6, 12, 18, 24, 30, 36, 44, 54, 66, 80, 96, 116, 140, 168, 200, 238, 284, 336, 396, 464, 522, 576 },
+        8000 => &.{ 0, 12, 24, 36, 48, 60, 72, 88, 108, 132, 160, 192, 232, 280, 336, 400, 476, 566, 568, 570, 572, 574, 576 },
         else => &.{ 0, 4, 8, 12, 16, 20, 24, 30, 36, 42, 50, 60, 72, 88, 106, 128, 156, 190, 230, 276, 330, 384, 576 },
     };
 }
@@ -1038,20 +1046,29 @@ test "big value partial decode supports table zero" {
     try std.testing.expectEqual(@as(usize, 0), reader.bit_offset);
 }
 
-test "big value partial decode reports first unsupported table" {
+test "big value partial decode reports a table outside the codebook space" {
+    // Every table a five-bit selector can name is implemented, so the report
+    // only fires for a selector no stream can carry.
     const plan = RegionPlan{
         .big_values = 5,
         .big_value_samples = 10,
         .region_sample_bounds = .{ 4, 10, 10 },
         .region_pair_counts = .{ 2, 3, 0 },
-        .table_select = .{ 0, 27, 0 },
+        .table_select = .{ 0, 32, 0 },
         .count1_table_select = false,
     };
     var reader = BitSliceReader.init(&.{0}, 0, 8);
     var pairs = [_]DecodedPair{.{ .x = -1, .y = -1 }} ** 5;
     const progress = try decodeBigValuePairsPartial(&reader, plan, &pairs);
     try std.testing.expectEqual(@as(usize, 2), progress.pairs_decoded);
-    try std.testing.expectEqual(@as(?u8, 27), progress.unsupported_table);
+    try std.testing.expectEqual(@as(?u8, 32), progress.unsupported_table);
+
+    var every_table_plan = plan;
+    every_table_plan.table_select = .{ 0, 27, 0 };
+    var reader_supported = BitSliceReader.init(&.{ 0, 0, 0, 0 }, 0, 32);
+    var supported_pairs = [_]DecodedPair{.{ .x = -1, .y = -1 }} ** 5;
+    const supported = try decodeBigValuePairsPartial(&reader_supported, every_table_plan, &supported_pairs);
+    try std.testing.expectEqual(@as(?u8, null), supported.unsupported_table);
 }
 
 test "codebook24 family decodes zero pair without sign bits" {
@@ -1062,10 +1079,12 @@ test "codebook24 family decodes zero pair without sign bits" {
 }
 
 test "codebook24 family decodes linbits and sign bits" {
-    var reader = BitSliceReader.init(&.{ 0b00110010, 0b00011000 }, 0, 14);
+    // The escape value 15 in x takes four linbits, so x is 15 + 2, and only
+    // then comes its sign bit; y needs no escape.
+    var reader = BitSliceReader.init(&.{ 0b00100110, 0b01010000 }, 0, 13);
     const pair = try decodePair(&reader, 24);
-    try std.testing.expectEqual(DecodedPair{ .x = -17, .y = 16 }, pair);
-    try std.testing.expectEqual(@as(usize, 14), reader.bit_offset);
+    try std.testing.expectEqual(DecodedPair{ .x = -17, .y = 2 }, pair);
+    try std.testing.expectEqual(@as(usize, 13), reader.bit_offset);
 }
 
 test "table 15 codebook decodes zero pair without sign bits" {
@@ -1076,38 +1095,42 @@ test "table 15 codebook decodes zero pair without sign bits" {
 }
 
 test "table 15 codebook decodes signed pair" {
-    var reader = BitSliceReader.init(&.{0b11011100}, 0, 6);
+    var reader = BitSliceReader.init(&.{0b10000100}, 0, 7);
     const pair = try decodePair(&reader, 15);
-    try std.testing.expectEqual(DecodedPair{ .x = -1, .y = 1 }, pair);
-    try std.testing.expectEqual(@as(usize, 6), reader.bit_offset);
+    try std.testing.expectEqual(DecodedPair{ .x = -1, .y = 2 }, pair);
+    try std.testing.expectEqual(@as(usize, 7), reader.bit_offset);
 }
 
 test "table 2 codebook decodes signed pair" {
-    var reader = BitSliceReader.init(&.{0b10010000}, 0, 5);
+    var reader = BitSliceReader.init(&.{0b00001100}, 0, 7);
     const pair = try decodePair(&reader, 2);
-    try std.testing.expectEqual(DecodedPair{ .x = -1, .y = 1 }, pair);
-    try std.testing.expectEqual(@as(usize, 5), reader.bit_offset);
+    try std.testing.expectEqual(DecodedPair{ .x = -1, .y = 2 }, pair);
+    try std.testing.expectEqual(@as(usize, 7), reader.bit_offset);
 }
 
 test "table 1 codebook decodes signed pair" {
-    var reader = BitSliceReader.init(&.{0b01100000}, 0, 4);
+    // Codeword 000 is the (1,1) pair, followed by one sign bit per nonzero
+    // value, in x then y order.
+    var reader = BitSliceReader.init(&.{0b00001000}, 0, 5);
     const pair = try decodePair(&reader, 1);
     try std.testing.expectEqual(DecodedPair{ .x = 1, .y = -1 }, pair);
-    try std.testing.expectEqual(@as(usize, 4), reader.bit_offset);
+    try std.testing.expectEqual(@as(usize, 5), reader.bit_offset);
 }
 
 test "table 7 codebook decodes signed pair" {
-    var reader = BitSliceReader.init(&.{0b01011100}, 0, 6);
+    var reader = BitSliceReader.init(&.{0b00100100}, 0, 7);
     const pair = try decodePair(&reader, 7);
-    try std.testing.expectEqual(DecodedPair{ .x = -1, .y = 1 }, pair);
-    try std.testing.expectEqual(@as(usize, 6), reader.bit_offset);
+    try std.testing.expectEqual(DecodedPair{ .x = -2, .y = 1 }, pair);
+    try std.testing.expectEqual(@as(usize, 7), reader.bit_offset);
 }
 
 test "table 10 codebook decodes zero pair" {
-    var reader = BitSliceReader.init(&.{0b10000000}, 0, 1);
+    // Codebook 11 spells the zero pair as the two-bit codeword 0b11; reading it
+    // as one bit leaves the decoder short of a symbol.
+    var reader = BitSliceReader.init(&.{0b11000000}, 0, 2);
     const pair = try decodePair(&reader, 11);
     try std.testing.expectEqual(DecodedPair{ .x = 0, .y = 0 }, pair);
-    try std.testing.expectEqual(@as(usize, 1), reader.bit_offset);
+    try std.testing.expectEqual(@as(usize, 2), reader.bit_offset);
 }
 
 test "table 12 codebook decodes zero pair" {

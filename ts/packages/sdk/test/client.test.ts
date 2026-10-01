@@ -243,6 +243,28 @@ describe("AntflyClient", () => {
   });
 
   describe("tables", () => {
+    it("rejects bodyless listing failures instead of returning undefined", async () => {
+      mockGet.mockResolvedValueOnce({
+        data: undefined,
+        error: undefined,
+        response: new Response(null, { status: 409 }),
+      });
+      await expect(client.tables.list()).rejects.toThrow("HTTP 409");
+    });
+
+    it("preserves an empty successful table inventory", async () => {
+      mockGet.mockResolvedValueOnce({ data: [], response: new Response("[]") });
+      await expect(client.tables.list()).resolves.toEqual([]);
+    });
+
+    it("reports structured pagination conflicts", async () => {
+      mockGet.mockResolvedValueOnce({
+        error: { error: "catalog changed; restart pagination" },
+        response: new Response(null, { status: 409 }),
+      });
+      await expect(client.tables.list()).rejects.toThrow("catalog changed; restart pagination");
+    });
+
     it("should list tables", async () => {
       const mockTables: TableStatus[] = [
         {
@@ -363,6 +385,27 @@ describe("AntflyClient", () => {
         params: { path: { tableName: "products" } },
         body: { ttl: null },
         headers: { "If-Match": '"schema-5"' },
+      });
+    });
+
+    it("exposes durable schema rewrite admission without discarding its job", async () => {
+      const job = { job_id: "rewrite-1", phase: "queued", scope: "table" };
+      mockPatch.mockResolvedValueOnce({ data: job, error: undefined });
+      await expect(
+        client.tables.patchSchema(
+          "products",
+          { generated_columns: [] },
+          {
+            expectedVersion: 5,
+            rewrite: true,
+            idempotencyKey: "rewrite-products-v6",
+          }
+        )
+      ).resolves.toEqual(job);
+      expect(mockPatch).toHaveBeenCalledWith("/db/v1/tables/{tableName}/schema", {
+        params: { path: { tableName: "products" }, query: { rewrite: true } },
+        body: { generated_columns: [] },
+        headers: { "If-Match": '"schema-5"', "Idempotency-Key": "rewrite-products-v6" },
       });
     });
 

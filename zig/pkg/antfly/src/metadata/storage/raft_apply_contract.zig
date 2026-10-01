@@ -22,9 +22,19 @@ const metadata_incarnation = @import("../incarnation.zig");
 const metadata_table_manager = @import("../table_manager.zig");
 const topology_protocol = @import("../topology_protocol.zig");
 
-pub const AppliedMetadataBatch = struct {
+/// Result of an aborting owner-side initial-FK admission transaction. Keep
+/// expected CAS conflicts out of generic storage error statuses so the
+/// storage-free control process can return a definite non-admission result.
+pub const InitialFkPreflight = enum { ready, generation_changed, catalog_exists, table_transition_active };
+
+pub const AppliedMetadataCheckpoint = struct {
     commit_index: u64,
-    entries_bytes: []const u8,
+    input_kind: enum(u8) { committed_entries = 0, snapshot = 1 },
+    input_bytes: u64,
+
+    pub fn fromInput(commit_index: u64, kind: @FieldType(@This(), "input_kind"), bytes: []const u8) @This() {
+        return .{ .commit_index = commit_index, .input_kind = kind, .input_bytes = bytes.len };
+    }
 };
 
 pub const TableTransitionFence = struct {
@@ -72,6 +82,37 @@ pub const CatalogCursor = struct {
     revision: u64,
 };
 
+/// One local metadata transaction: physical topology, logical names, extension
+/// metadata, and the standby outbox share the same revision and durability fence.
+/// Replacement/import is reserved for bootstrap; normal DDL sends touched rows.
+pub const StandaloneCatalogUpdate = struct {
+    pub const TableReplacement = struct {
+        expected: metadata.TableRecord,
+        replacement: metadata.TableRecord,
+    };
+
+    replace: bool = false,
+    tables: []const metadata.TableRecord = &.{},
+    /// Explicit lifecycle CAS commands, not ordinary definition upserts.
+    table_replacements: []const TableReplacement = &.{},
+    ranges: []const metadata.RangeRecord = &.{},
+    remove_tables: []const u64 = &.{},
+    remove_ranges: []const u64 = &.{},
+    auxiliary_json: ?[]const u8 = null,
+    /// An exact physical-root proof for native schema finalization, or a
+    /// binding-only first registration before any FK publication begins.
+    native_owner: ?@import("../standalone_native_owner.zig").Binding = null,
+    import_catalog: ?@import("../../system_catalog/domain.zig").State = null,
+    /// Applied in the same local transaction as the standalone revision and
+    /// mirrored outbox. Mutually exclusive with an ordinary logical delta.
+    setting_command: ?@import("../../system_catalog/settings.zig").Command = null,
+    policy_command: ?@import("../../system_catalog/policies.zig").Command = null,
+    logical: ?struct {
+        previous_revision: u64,
+        delta: @import("../../system_catalog/domain.zig").Delta,
+    } = null,
+};
+
 pub const ProjectionSignalKind = enum {
     metadata_incarnation,
     table,
@@ -96,6 +137,12 @@ pub const ProjectionSignal = struct {
     group_id: u64 = 0,
     store_id: u64 = 0,
     node_id: u64 = 0,
+    /// False only when existing report payloads and observation clocks are unchanged.
+    store_reports_changed: bool = true,
+    /// Runtime references change group facts/clocks but retain runtime pages.
+    store_runtime_changed: bool = true,
+    /// Borrowed until the synchronous listener returns; null invalidates all groups.
+    store_group_ids: ?[]const u64 = null,
 };
 
 pub const ProjectionListener = struct {
@@ -156,3 +203,80 @@ pub const CommittedKeyListener = struct {
 
 /// Process-local token used to detach and drain one registered callback pair.
 pub const LifecycleListenerRegistration = struct { id: u64 };
+
+const system_catalog = @import("../../system_catalog/domain.zig");
+
+pub const TableTopologyMutation = union(enum) {
+    create: struct {
+        expected_transition_generation: u64,
+        table: metadata.TableRecord,
+        ranges: []const metadata.RangeRecord,
+    },
+    drop: struct {
+        table_id: u64,
+        expected_name: []const u8,
+        expected_transition_generation: u64,
+        range_contract: union(enum) {
+            /// Fixed-size membership proof used by topology protocol v2.
+            membership: topology_protocol.RangeMembership,
+            /// Decode-only compatibility for v1 entries already present in a
+            /// Raft log during a rolling binary upgrade.
+            legacy_group_ids: []const u64,
+        },
+    },
+};
+
+pub const SystemCatalogCommand = struct {
+    version: u16 = 1,
+    expected_revision: u64,
+    mutation: system_catalog.Mutation,
+    topology: ?TableTopologyMutation = null,
+    placement_update: ?struct { expected: metadata.TableRecord, replacement: metadata.TableRecord } = null,
+};
+
+pub const CatalogAdmission = struct { meta: system_catalog.Meta, placement_policy: system_catalog.PlacementPolicy = .{} };
+
+const store_report_update = @import("../store_report_update.zig");
+pub const CatalogProjectionRequest = union(enum) {
+    read_store: struct { store_id: u64, reports: bool },
+    read_store_group_facts: u64,
+    read_store_report_targets: struct { store_id: u64, group_ids: []const u64, full: bool, include_runtime: bool },
+    catalog_read: system_catalog.Read,
+    catalog_export: void,
+    catalog_list_tables: system_catalog.TableList,
+    catalog_meta: void,
+    catalog_admission: system_catalog.Mutation,
+    catalog_prepare: SystemCatalogCommand,
+    catalog_resolve_table: system_catalog.Target,
+    catalog_resolve_identity: system_catalog.Target,
+    catalog_resolve_many: system_catalog.ResolveMany,
+    catalog_query_definition: []const u8,
+    catalog_write_validation: []const u8,
+    catalog_write_validation_revision: void,
+    topology_activation: void,
+    report_cursor: u64,
+    read_control_stores: []const u64,
+    report_baseline_progress: @import("../store_report_baseline.zig").ProgressQuery,
+    report_baseline_fragment_admission: @import("../store_report_baseline.zig").Request,
+    catalog_snapshot: void,
+    sql_setting_snapshot: @import("../../system_catalog/settings.zig").Scope,
+    sql_policy_snapshot: struct { table_id: u64, principal: []const u8, database: []const u8, roles: []const []const u8 },
+    sql_policy_install_snapshot: @import("../../system_catalog/policies.zig").InstallRequest,
+    sql_policy_publication_status: u64,
+    sql_policy_publication_work: u64,
+    sql_policy_begin_command: @import("../../system_catalog/policies.zig").BeginRequest,
+    require_policy_index_mutation_allowed: u64,
+    require_policy_topology_mutation_allowed: u64,
+    fk_generation_publication_status: u64,
+    fk_generation_publication_work: u64,
+    fk_generation_publication_decision: @import("../fk_generation_publication.zig").DecisionRequest,
+    fk_generation_publication_source_decision: @import("../fk_generation_publication.zig").SourceDecisionRequest,
+    fk_initial_create_prepare: @import("../fk_generation_publication.zig").InitialCreatePrepareRequest,
+    fk_initial_child_decision: @import("../fk_generation_publication.zig").InitialChildDecisionRequest,
+    fk_initial_create_status: u64,
+    fk_generation_table_locked: u64,
+    fk_initial_create_work: u64,
+    fk_initial_retirement_page: @import("../fk_initial_retirement_wire.zig").PageRequest,
+    store_root_control: @import("../fk_initial_retirement_wire.zig").Control,
+    fk_initial_parent_decision: @import("../fk_generation_publication.zig").DecisionRequest,
+};

@@ -18,7 +18,11 @@ export type RerankRequest = components["schemas"]["InferenceRerankRequest"];
 export type RerankResponse = components["schemas"]["InferenceRerankResponse"];
 
 export type ExtractRequest = components["schemas"]["ExtractionRequest"];
+/** A strict mixed-task request; extractV2 supplies schema_version:2. */
+export type ExtractV2Request = Omit<ExtractRequest, "schema_version">;
 export type ExtractResponse = components["schemas"]["ExtractionResponse"];
+export type DecideRequest = components["schemas"]["InferenceDecideRequest"];
+export type DecideResponse = components["schemas"]["InferenceDecideResponse"];
 export type ExtractEntity = components["schemas"]["ExtractionEntity"];
 export type ExtractRelation = components["schemas"]["ExtractionRelation"];
 export type ExtractClassification = components["schemas"]["ExtractionClassification"];
@@ -93,6 +97,9 @@ export interface InferenceConfig {
 
 // Helper type for embedding input - supports all three formats
 export type EmbedInput = string | string[] | ContentPart[];
+
+// A document to rerank: text, or text and image content parts
+export type RerankDocument = string | ContentPart[];
 
 // Log level values for convenience
 export const logLevels: Level[] = ["debug", "info", "warn", "error"];

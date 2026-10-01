@@ -2554,10 +2554,7 @@ test "embedding text plans backend and fixed-shape batches" {
         .{ .name = "input_ids", .dtype = .i64, .shape = &.{ -1, 77 } },
     };
     try std.testing.expect(textSessionBatchPlanForRuntime(&dynamic_info, .native, true, 3) == null);
-    try std.testing.expectEqual(
-        TextSessionBatchPlan{ .batch_size = 1, .pad_final_batch = false },
-        textSessionBatchPlanForRuntime(&dynamic_info, .metal, true, 3).?,
-    );
+    try std.testing.expect(textSessionBatchPlanForRuntime(&dynamic_info, .metal, true, 3) == null);
 }
 
 fn sessionHasInput(session: backends.Session, name: []const u8) bool {
@@ -2608,7 +2605,7 @@ fn textSessionBatchPlanForRuntime(
     if (backend == .onnx) {
         return .{ .batch_size = 1, .pad_final_batch = false };
     }
-    if (imported and backend != .native) {
+    if (imported and backend != .native and backend != .metal) {
         return .{ .batch_size = 1, .pad_final_batch = false };
     }
     return null;

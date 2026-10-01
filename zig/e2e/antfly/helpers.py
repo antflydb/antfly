@@ -83,13 +83,15 @@ def wait_until(
     timeout_s: float,
     interval_s: float = 1.0,
     ready_when: Callable[[T | None], bool] | None = None,
+    retry_not_found: bool = False,
 ) -> T | None:
     """Poll until the result is ready, with an explicit predicate when needed.
 
     The default retains the historical truthiness contract. Callers whose
     domain includes valid falsey values (node index 0, empty collections, zero
     counters) must supply ``ready_when`` instead of encoding readiness into the
-    value.
+    value. ``retry_not_found`` is for resources published asynchronously after
+    a successful create request.
     """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -98,7 +100,9 @@ def wait_until(
             result = fn()
         except requests.HTTPError as err:
             response = err.response
-            retryable = False
+            retryable = bool(
+                retry_not_found and response is not None and response.status_code == 404
+            )
             if response is not None and response.status_code == 503:
                 try:
                     payload = response.json()

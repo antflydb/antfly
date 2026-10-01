@@ -520,8 +520,10 @@ tree path, and the shared bounded page cache serves index and document pages.
 Pinned reads use concurrent positional I/O rather than holding the store-wide
 mutation mutex. Index segment reads use the same checkpoint and generation
 fence, so concurrent queries do not serialize on the mutation mutex and vacuum
-cannot reclaim their pages. A `std.Io.RwLock` permits normal append-only commits
-while readers pin roots and makes vacuum/rewrite wait before reclaiming pages.
+cannot reclaim their pages. Document transactions retain their file generation
+across vacuum; a `std.Io.RwLock` fences short index reads during publication.
+Retired generations are reclaimed after their final reader closes. Vacuum copies
+and catches up outside foreground locks, and native maintenance stays online.
 A checkpointed namespace-head directory and per-namespace document links retain
 efficient table-history maintenance independently of the global ordered index.
 Recreating an existing Lite artifact publishes a complete new inode by atomic

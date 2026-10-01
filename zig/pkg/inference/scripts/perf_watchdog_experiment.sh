@@ -12,7 +12,7 @@
 #   scripts/perf_watchdog_experiment.sh concurrent-phaseA \
 #     ./zig-out/bin/antfly-inference generate <model> "prompt" --backend metal ...
 #
-# Rules (GEMMA4_PERF_PLAN.md M0.5):
+# Rules (GEMMA4.md "Metal Performance Plan" M0.5):
 #   - Dedicated M4 Pro / CI box ONLY. Never a fanless machine.
 #   - One watchdog-class experiment per boot.
 #   - The post-pass soak is mandatory; a pass followed by a reset within the

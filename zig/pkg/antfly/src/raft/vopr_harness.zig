@@ -389,6 +389,17 @@ pub const VirtualHttpNetwork = struct {
         gop.value_ptr.* = executor_;
     }
 
+    pub fn unregisterNode(self: *VirtualHttpNetwork, node_id: u64) void {
+        var keys = self.routes.keyIterator();
+        while (keys.next()) |key| {
+            const route = splitVirtualUri(key.*) orelse continue;
+            if (route.node_id != node_id) continue;
+            const removed = self.routes.fetchRemove(key.*).?;
+            self.alloc.free(@constCast(removed.key));
+            return;
+        }
+    }
+
     pub fn useQueuedDelivery(self: *VirtualHttpNetwork) void {
         self.delivery_mode = .queued;
     }
@@ -528,6 +539,11 @@ pub const VirtualHttpNetwork = struct {
 
     pub fn isLinkPartitioned(self: *const VirtualHttpNetwork, link: Link) bool {
         return self.partitioned_links.contains(link);
+    }
+
+    pub fn hasConnectivityFaults(self: *const VirtualHttpNetwork) bool {
+        return self.partitioned_nodes.count() != 0 or self.partitioned_links.count() != 0 or
+            self.unavailable_nodes.count() != 0;
     }
 
     pub fn dropNext(self: *VirtualHttpNetwork) void {
@@ -767,6 +783,10 @@ pub const VirtualHttpNetwork = struct {
                 .source_node_id = request.source_node_id,
                 .authorization = owned_authorization,
                 .content_type = owned_content_type,
+                // Delivery owns the copied request after the enqueue caller
+                // returns. Preserve its value budget, but do not retain the
+                // caller's borrowed cancellation or delivery-tracker pointers.
+                .timeout_ms = request.timeout_ms,
                 .body = owned_body,
             },
         });
@@ -1140,6 +1160,108 @@ test "virtual http network models route reset burst and queue capacity faults" {
     accepted_after_heal.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), try network.runUntilIdle());
     try std.testing.expectEqual(@as(usize, 3), target.count);
+}
+
+test "virtual http network bounds queued HTTP delivery and recovers its drain owner" {
+    const vopr = @import("vopr");
+    const io_http = @import("../common/http/io_http_executor.zig");
+    // Native stack unwinding cannot cross VoprIo's switched fiber stacks.
+    // Retain allocation/leak checking without collecting those stack traces.
+    var checked_allocator: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer std.debug.assert(checked_allocator.deinit() == .ok);
+    const alloc = checked_allocator.allocator();
+    var runtime = try vopr.vopr_io.VoprIo.init(.{});
+    defer runtime.deinit();
+    const io = runtime.io();
+    const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(31341) };
+    // A listening peer that never accepts or responds exercises the actual
+    // HTTP request watchdog, with every socket timeout disabled as in VOPR.
+    var listener = try address.listen(io, .{});
+    defer listener.deinit(io);
+    var client = io_http.IoHttpExecutor.init(alloc, io, .{
+        .connect_timeout_ms = 0,
+        .read_timeout_ms = 0,
+        .write_timeout_ms = 0,
+    });
+    defer client.deinit();
+    var wire = transport.httpx_runtime.AbsoluteExecutor{
+        .alloc = alloc,
+        .base_uri = "http://127.0.0.1:31341",
+        .inner = client.executor(),
+    };
+    var network = VirtualHttpNetwork.init(alloc);
+    defer network.deinit();
+    network.useQueuedDelivery();
+    network.useSerializedDrains();
+    try network.registerNode(7, wire.executor());
+    var accepted = try network.executor().execute(alloc, .{
+        .method = .POST,
+        .uri = "sim://raft-node/7/raft/v1/batch",
+        .timeout_ms = 5,
+        .body = "queued-frame",
+    });
+    accepted.deinit(alloc);
+    const Drain = struct {
+        network: *VirtualHttpNetwork,
+        done: bool = false,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            defer self.done = true;
+            _ = self.network.drainDue(null) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+    var drain = Drain{ .network = &network };
+    var future = io.async(Drain.run, .{&drain});
+    defer {
+        client.beginShutdown();
+        _ = runtime.cancelAndDrainTasksForTeardown(alloc, 10_000) catch @panic("queued HTTP test cleanup failed");
+        future.cancel(io);
+    }
+    var enabled: vopr.transition.List = .{};
+    defer enabled.deinit(alloc);
+    var events: vopr.event.Sink = .{};
+    defer events.deinit(alloc);
+    var choices = vopr.choice.PrefixedCooperativeSeeded.init(&.{}, 42);
+    for (0..512) |turn| {
+        if (drain.done) break;
+        enabled.items.clearRetainingCapacity();
+        try runtime.scheduler().enumerateReady(&enabled, alloc);
+        try enabled.canonicalize();
+        try std.testing.expect(enabled.items.items.len != 0);
+        const selected = try choices.source().choose(.{
+            .site_id = 1,
+            .site_name = "queued-http-deadline",
+            .occurrence = turn,
+            .enabled = enabled.items.items,
+        });
+        try runtime.scheduler().executeReady(selected, &events, alloc);
+    }
+    try std.testing.expect(drain.done);
+    try std.testing.expectEqual(error.Timeout, drain.failure.?);
+    try std.testing.expectEqual(@as(i96, 5 * std.time.ns_per_ms), std.Io.Clock.awake.now(io).nanoseconds);
+    try std.testing.expectEqual(@as(usize, 0), client.activeRequestCount());
+    try std.testing.expect(!network.drain_in_progress.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), network.queuedCount());
+
+    const Healthy = struct {
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: transport.HttpRequest) !transport.HttpResponse {
+            return .{ .status = 204 };
+        }
+    };
+    try network.registerNode(7, .{ .ptr = &network, .vtable = &.{ .execute = Healthy.execute } });
+    var retry = try network.executor().execute(alloc, .{
+        .method = .POST,
+        .uri = "sim://raft-node/7/raft/v1/batch",
+        .timeout_ms = 5,
+        .body = "recovered-frame",
+    });
+    retry.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), try network.drainDue(null));
+    try std.testing.expectEqual(@as(usize, 0), network.queuedCount());
+    try runtime.ensureNoCapabilityViolation();
 }
 
 test "virtual http network delivers queued GET requests synchronously" {
@@ -1661,6 +1783,7 @@ pub const ManagedHttpClusterSimulation = struct {
     configs: []ManagedHttpHostSimulationConfig,
     deps: []ManagedHttpHostSimulationDeps,
     nodes: []ManagedHttpHostSimulation,
+    node_live: []bool,
     started: bool = false,
 
     pub const Fault = union(enum) {
@@ -1709,6 +1832,9 @@ pub const ManagedHttpClusterSimulation = struct {
 
         const nodes = try alloc.alloc(ManagedHttpHostSimulation, configs.len);
         errdefer alloc.free(nodes);
+        const node_live = try alloc.alloc(bool, configs.len);
+        errdefer alloc.free(node_live);
+        @memset(node_live, false);
 
         var initialized: usize = 0;
         errdefer {
@@ -1722,6 +1848,7 @@ pub const ManagedHttpClusterSimulation = struct {
         for (owned_configs, owned_deps, 0..) |cfg, dep, i| {
             nodes[i] = try ManagedHttpHostSimulation.init(alloc, cfg, dep);
             initialized += 1;
+            node_live[i] = true;
             const node_id = cfg.host.http.host.local_node_id;
             try nodes[i].useVirtualBaseUri(node_id);
             try network.registerNode(node_id, nodes[i].serverRequestExecutor());
@@ -1733,12 +1860,14 @@ pub const ManagedHttpClusterSimulation = struct {
             .configs = owned_configs,
             .deps = owned_deps,
             .nodes = nodes,
+            .node_live = node_live,
         };
     }
 
     pub fn deinit(self: *ManagedHttpClusterSimulation) void {
-        for (self.nodes) |*sim| sim.deinit();
+        for (self.nodes, self.node_live) |*sim, live| if (live) sim.deinit();
         self.alloc.free(self.nodes);
+        self.alloc.free(self.node_live);
         self.alloc.free(self.configs);
         self.alloc.free(self.deps);
         self.network.deinit();
@@ -1756,7 +1885,8 @@ pub const ManagedHttpClusterSimulation = struct {
             }
         }
 
-        for (self.nodes) |*sim| {
+        for (self.nodes, self.node_live) |*sim, live| {
+            if (!live) return error.SimulationNodeUnavailable;
             try sim.start();
             started += 1;
         }
@@ -1764,17 +1894,20 @@ pub const ManagedHttpClusterSimulation = struct {
     }
 
     pub fn stopAll(self: *ManagedHttpClusterSimulation) void {
-        for (self.nodes) |*sim| sim.stop();
+        for (self.nodes, self.node_live) |*sim, live| if (live) sim.stop();
         self.started = false;
     }
 
     pub fn node(self: *ManagedHttpClusterSimulation, index: usize) *ManagedHttpHostSimulation {
+        std.debug.assert(self.node_live[index]);
         return &self.nodes[index];
     }
 
     pub fn stepAll(self: *ManagedHttpClusterSimulation) !void {
+        for (self.node_live) |live| if (!live) return error.SimulationNodeUnavailable;
         _ = try self.network.drainDue(null);
-        for (self.nodes) |*sim| {
+        for (self.nodes, self.node_live) |*sim, live| {
+            std.debug.assert(live);
             _ = try sim.stepOnce();
             _ = try self.network.drainDue(null);
         }
@@ -1851,12 +1984,23 @@ pub const ManagedHttpClusterSimulation = struct {
     }
 
     pub fn restartNode(self: *ManagedHttpClusterSimulation, index: usize) !void {
-        if (self.started) self.nodes[index].stop();
-        self.nodes[index].deinit();
+        if (index >= self.nodes.len) return error.InvalidNodeIndex;
+        const node_id = self.configs[index].host.http.host.local_node_id;
+        self.network.unregisterNode(node_id);
+        if (self.node_live[index]) {
+            if (self.started) self.nodes[index].stop();
+            self.nodes[index].deinit();
+            self.node_live[index] = false;
+        }
         var cfg = self.configs[index];
         cfg.async_transport = false;
         self.nodes[index] = try ManagedHttpHostSimulation.init(self.alloc, cfg, self.deps[index]);
-        const node_id = self.configs[index].host.http.host.local_node_id;
+        self.node_live[index] = true;
+        errdefer {
+            self.network.unregisterNode(node_id);
+            self.node_live[index] = false;
+            self.nodes[index].deinit();
+        }
         try self.nodes[index].useVirtualBaseUri(node_id);
         try self.network.registerNode(node_id, self.nodes[index].serverRequestExecutor());
         if (self.started) try self.nodes[index].start();
@@ -1869,7 +2013,8 @@ pub const ManagedHttpClusterSimulation = struct {
 
             fn done(cluster: *ManagedHttpClusterSimulation, ptr: *anyopaque) !bool {
                 const ctx: *@This() = @ptrCast(@alignCast(ptr));
-                for (cluster.nodes) |*sim| {
+                for (cluster.nodes, cluster.node_live) |*sim, live| {
+                    if (!live) continue;
                     if (sim.raftStatus(ctx.group_id)) |status| {
                         if (status.soft.role == .leader) {
                             ctx.leader_id = status.id;
@@ -1898,7 +2043,8 @@ pub const ManagedHttpClusterSimulation = struct {
 
             fn done(cluster: *ManagedHttpClusterSimulation, ptr: *anyopaque) !bool {
                 const ctx: *@This() = @ptrCast(@alignCast(ptr));
-                for (cluster.nodes) |*sim| {
+                for (cluster.nodes, cluster.node_live) |*sim, live| {
+                    if (!live) continue;
                     if (sim.raftStatus(ctx.group_id)) |status| {
                         if (status.soft.role == .leader and status.id == ctx.expected_leader_id) return true;
                     }

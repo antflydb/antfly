@@ -362,6 +362,7 @@ fn activateMaterializedWithOptions(alloc: Allocator, request: ActivateRequest, o
     var staged_receipt = std.json.parseFromSlice(seed_artifact.Receipt, alloc, staged_receipt_json, .{ .ignore_unknown_fields = false }) catch
         return error.InvalidArtifactReceipt;
     defer staged_receipt.deinit();
+    try @import("replay_floor.zig").requireSeed(alloc, io, request.target_root, request.expected.identity, staged_receipt.value.checkpoint_lsn);
     if (staged_receipt.value.format_version != seed_artifact.format_version or
         !isCanonicalSha256(staged_receipt.value.capture_receipt_sha256)) return error.CaptureReceiptAuthorityMissing;
 
@@ -546,6 +547,7 @@ fn activateMaterializedWithOptions(alloc: Allocator, request: ActivateRequest, o
         .target_pvc_uid = binding.target_pvc_uid,
     }, .{});
     errdefer alloc.free(activation_json);
+    if (staged_receipt.value.checkpoint_lsn != 0) try @import("replay_floor.zig").advance(alloc, io, request.target_root, .{ .cluster_id = request.expected.identity.cluster_id, .timeline_id = request.expected.identity.timeline_id, .epoch = request.expected.identity.epoch, .lsn = staged_receipt.value.checkpoint_lsn });
     const active_created = if (replace_active)
         try replaceActiveFile(io, alloc, active_path, activation_json, request)
     else
@@ -681,6 +683,7 @@ fn activateWithOptions(alloc: Allocator, request: ActivateRequest, options: Acti
     defer alloc.free(staged_receipt_json);
     var staged_receipt = std.json.parseFromSlice(seed_artifact.Receipt, alloc, staged_receipt_json, .{}) catch return error.InvalidArtifactReceipt;
     defer staged_receipt.deinit();
+    try @import("replay_floor.zig").requireSeed(alloc, io, request.target_root, request.expected.identity, staged_receipt.value.checkpoint_lsn);
 
     const staged_manifest_path = try std.fs.path.join(alloc, &.{ request.staging_root, seed_artifact.staged_manifest_name });
     defer alloc.free(staged_manifest_path);
@@ -816,6 +819,7 @@ fn activateWithOptions(alloc: Allocator, request: ActivateRequest, options: Acti
     }
 
     try failAt(options, .generation_published);
+    if (staged_receipt.value.checkpoint_lsn != 0) try @import("replay_floor.zig").advance(alloc, io, request.target_root, .{ .cluster_id = request.expected.identity.cluster_id, .timeline_id = request.expected.identity.timeline_id, .epoch = request.expected.identity.epoch, .lsn = staged_receipt.value.checkpoint_lsn });
     const active_created = try writeImmutableFile(io, alloc, active_path, activation_json, error.ActiveGenerationConflict);
     try failAt(options, .active_published);
     try recordLifecycleReceipt(alloc, request, activation_json);
@@ -894,6 +898,7 @@ fn inspectTargetRoot(io: std.Io, target_root: []const u8) !void {
         if (std.mem.eql(u8, entry.name, generations_dir_name) and entry.kind == .directory) continue;
         if (std.mem.eql(u8, entry.name, live_generations_dir_name) and entry.kind == .directory) continue;
         if (std.mem.eql(u8, entry.name, active_receipt_name) and entry.kind == .file) continue;
+        if ((std.mem.eql(u8, entry.name, @import("replay_floor.zig").anchor_name) or std.mem.eql(u8, entry.name, @import("replay_floor.zig").anchor_name ++ ".tmp")) and entry.kind == .file) continue;
         if (std.mem.eql(u8, entry.name, lifecycle_receipt_ledger.ledger_dir_name) and entry.kind == .directory) continue;
         return error.UnsafeActivationTarget;
     }
@@ -1414,6 +1419,12 @@ fn prepareMaterializedTestStaging(
     const topology_json = try std.json.Stringify.valueAlloc(alloc, seed_materialization.Topology{
         .generation = generation,
         .catalog = .{
+            .system_catalog = .{ .revision = 7, .next_id = 6, .resources = &.{
+                .{ .kind = .database, .id = 3, .name = "analytics", .tablespace_id = 5 },
+                .{ .kind = .namespace, .id = 4, .parent_id = 3, .name = "serving" },
+                .{ .kind = .tablespace, .id = 5, .name = "hot" },
+                .{ .kind = .table, .id = identity.table_id, .parent_id = 4, .name = "events", .storage_name = "docs" },
+            } },
             .epoch = 1,
             .tables = &.{.{
                 .table_id = identity.table_id,
@@ -1569,6 +1580,34 @@ test "storage.hot_standby seed activation publishes a verified immutable generat
     try std.testing.expect(retried.already_active);
     try std.testing.expectEqualStrings(activated.generation_path, retried.generation_path);
     try std.testing.expectEqualStrings(activated.active_receipt_json, retried.active_receipt_json);
+}
+
+test "storage.hot_standby seed activation rejects checkpoint below durable replay floor before publication" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const target = try std.fs.path.join(alloc, &.{ root, "floor-target" });
+    defer alloc.free(target);
+    const binding: ActivationBinding = .{ .topology_id = "topology-a", .topology_generation = 3, .node_id = "standby-a", .target_pvc_name = "standby-a-data", .target_pvc_uid = "pvc-uid-1" };
+    const prepared = try prepareMaterializedTestStaging(alloc, root, "old-seed", testIdentity(), binding);
+    defer alloc.free(prepared.root);
+    const identity = testIdentity();
+    try @import("replay_floor.zig").advance(alloc, std.testing.io, target, .{ .cluster_id = identity.cluster_id, .timeline_id = identity.timeline_id, .epoch = identity.epoch, .lsn = 100 });
+    try std.testing.expectError(error.SeedBelowHAReplayFloor, activate(alloc, .{
+        .staging_root = prepared.root,
+        .target_root = target,
+        .expected = .{ .generation = "old-seed", .slot_name = "standby-a", .identity = identity, .minimum_checkpoint_lsn = 11, .binding = binding, .capture_receipt_sha256 = &prepared.capture_receipt_sha256 },
+        .binding = binding,
+        .materialization = .{ .target_local_node_id = 7 },
+    }));
+    const active = try std.fs.path.join(alloc, &.{ target, active_receipt_name });
+    defer alloc.free(active);
+    try expectPathMissing(std.testing.io, active);
+    const generations = try std.fs.path.join(alloc, &.{ target, generations_dir_name });
+    defer alloc.free(generations);
+    try expectPathMissing(std.testing.io, generations);
 }
 
 test "storage.hot_standby seed activation gc requires the durable seeded-slot activation checkpoint" {
@@ -1940,6 +1979,19 @@ test "storage.hot_standby bound activation keeps immutable transport separate fr
     defer alloc.free(expected_live_path);
     try std.testing.expectEqualStrings(expected_live_path, activated.generation_path);
 
+    const logical_catalog_path = try std.fs.path.join(alloc, &.{ activated.generation_path, "metadata/local-metadata.json" });
+    defer alloc.free(logical_catalog_path);
+    const logical_json = try readFileAlloc(std.testing.io, alloc, logical_catalog_path, 64 * 1024);
+    defer alloc.free(logical_json);
+    var logical = try std.json.parseFromSlice(seed_materialization.LogicalCatalog, alloc, logical_json, .{});
+    defer logical.deinit();
+    const state = logical.value.system_catalog.?;
+    try std.testing.expectEqual(@as(u64, 7), state.revision);
+    try std.testing.expectEqual(@as(u64, 6), state.next_id);
+    try std.testing.expectEqual(@as(u64, 5), state.find(.database, 0, "analytics").?.tablespace_id);
+    const binding_row = state.find(.table, 4, "events").?;
+    try std.testing.expectEqual(testIdentity().table_id, binding_row.id);
+    try std.testing.expectEqualStrings("docs", binding_row.storage_name);
     const raw_catalog_path = try std.fs.path.join(alloc, &.{ raw_generation_path, seed_materialization.topology_name });
     defer alloc.free(raw_catalog_path);
     // The checksummed catalog envelope can exceed the legacy 1 KiB fixture

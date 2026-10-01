@@ -1,0 +1,36 @@
+{
+  "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+  "mode": "Debug",
+  "table_count": 1000,
+  "schema_bytes_per_table": 8192,
+  "warmup_pairs": 1,
+  "sample_pairs": 7,
+  "timed_scope": "Publication and result construction, including freeing retired views; excludes incoming construction and caller result destruction. std.testing.allocator is used.",
+  "samples_ns": {
+    "copied_ns": [
+      381075000,
+      375366000,
+      380178000,
+      381077000,
+      375624000,
+      375858000,
+      376946000
+    ],
+    "retained_ns": [
+      201539000,
+      200909000,
+      200707000,
+      201520000,
+      200896000,
+      199533000,
+      200135000
+    ]
+  },
+  "median_ms": {
+    "copied_ns": 376.946,
+    "retained_ns": 200.896
+  },
+  "raw_output": "1/1 data.runtime.consumerTests.Suite.test.system catalog peer publication avoids schema copies workload...READ_PEER_PUBLICATION_BENCH tables=1000 schema_bytes=8192 copied_ns={ 381075000, 375366000, 380178000, 381077000, 375624000, 375858000, 376946000 } retained_ns={ 201539000, 200909000, 200707000, 201520000, 200896000, 199533000, 200135000 }\nOK\n1 passed; 0 skipped; 0 failed; 0 leaked.\n",
+  "median_reduction_percent": 46.70430247303328,
+  "source_commit": "e399de8b3"
+}

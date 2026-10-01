@@ -1,0 +1,207 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Free functions and `Database` methods that read or write Lite database
+//! files directly (backup to disk, restore, path-level integrity checks).
+//! Mirrors `go/pkg/lite/files.go` and the file-oriented helpers in
+//! `go/pkg/lite/maintenance.go`.
+
+use std::path::Path;
+
+use antfly_lite_sys::{self as sys, antfly_buffer};
+
+use crate::db::{Database, validate_abi};
+use crate::error::{Error, Result};
+use crate::ffi::{borrow_slice, check, path_has_suffix, path_to_cstring, take_buffer};
+use crate::options::{RestoreOptions, Storage};
+
+/// Runs Lite integrity checks for `path` without opening a database handle
+/// and returns the JSON result.
+pub fn check_file_json(path: impl AsRef<Path>) -> Result<Vec<u8>> {
+    validate_abi()?;
+    let c_path = path_to_cstring(path.as_ref())?;
+    let mut out = antfly_buffer::default();
+    check(unsafe { sys::antfly_lite_check_file_json(c_path.as_ptr(), &mut out) })?;
+    Ok(unsafe { take_buffer(out) })
+}
+
+/// Opens `src_path` read-only, copies a stable Lite snapshot to
+/// `dest_path`, and returns the JSON result. Neither path is required to
+/// end in `.aflite`; see [`crate::maintenance::copy_stable_snapshot_file`]
+/// for the suffix-checked, typed convenience.
+pub fn copy_stable_snapshot_file_json(
+    src_path: impl AsRef<Path>,
+    dest_path: impl AsRef<Path>,
+    replace: bool,
+) -> Result<Vec<u8>> {
+    validate_abi()?;
+    let c_src = path_to_cstring(src_path.as_ref())?;
+    let c_dest = path_to_cstring(dest_path.as_ref())?;
+    let mut out = antfly_buffer::default();
+    check(unsafe {
+        sys::antfly_lite_copy_stable_snapshot_file_json(
+            c_src.as_ptr(),
+            c_dest.as_ptr(),
+            replace,
+            &mut out,
+        )
+    })?;
+    Ok(unsafe { take_buffer(out) })
+}
+
+/// Builds an `antfly_open_options` with only `storage_kind` set from
+/// `storage`, matching the Go binding's `restoreCOptions`: the destination's
+/// storage kind is the only option restore needs from the caller, and the
+/// restored database is otherwise opened with defaults.
+fn restore_c_options(storage: Storage) -> Result<sys::antfly_open_options> {
+    let mut c_opts: sys::antfly_open_options = unsafe { std::mem::zeroed() };
+    check(unsafe { sys::antfly_open_options_init(&mut c_opts) })?;
+    c_opts.storage_kind = storage.as_u32();
+    Ok(c_opts)
+}
+
+fn restore_to_file(path: &Path, backup: &[u8], opts: &RestoreOptions) -> Result<()> {
+    let c_opts = restore_c_options(opts.storage)?;
+    let c_path = path_to_cstring(path)?;
+    let mut out = antfly_buffer::default();
+    check(unsafe {
+        sys::antfly_restore_backup_json(
+            c_path.as_ptr(),
+            &c_opts,
+            borrow_slice(backup),
+            opts.replace,
+            &mut out,
+        )
+    })?;
+    unsafe { sys::antfly_buffer_free(&mut out) };
+    Ok(())
+}
+
+fn restore_file_to_file(path: &Path, backup_path: &Path, opts: &RestoreOptions) -> Result<()> {
+    let c_opts = restore_c_options(opts.storage)?;
+    let c_path = path_to_cstring(path)?;
+    let c_backup_path = path_to_cstring(backup_path)?;
+    let mut out = antfly_buffer::default();
+    check(unsafe {
+        sys::antfly_restore_backup_file_json(
+            c_path.as_ptr(),
+            &c_opts,
+            c_backup_path.as_ptr(),
+            opts.replace,
+            &mut out,
+        )
+    })?;
+    unsafe { sys::antfly_buffer_free(&mut out) };
+    Ok(())
+}
+
+/// Creates a database at `path` from a portable Antfly backup archive, of
+/// the storage kind `opts.storage` selects. A backup of either kind
+/// restores into either kind. `path` must end in `.aflite` when
+/// `opts.storage` is [`Storage::Lite`] and `backup` must be non-empty.
+/// [`Error::OutcomeUnknown`] means the destination was published but crash
+/// durability could not be confirmed; inspect it and do not retry
+/// automatically.
+pub fn restore(path: impl AsRef<Path>, backup: &[u8], opts: &RestoreOptions) -> Result<()> {
+    let path = path.as_ref();
+    if backup.is_empty() || (opts.storage == Storage::Lite && !path_has_suffix(path, ".aflite")) {
+        return Err(Error::InvalidArgument);
+    }
+    restore_to_file(path, backup, opts)
+}
+
+/// [`restore`] reading the archive from `backup_path` (which must end in
+/// `.afb`). For `.aflite` destinations it streams with bounded memory use.
+/// [`Error::Busy`] means the source changed during streaming or the
+/// source/destination is concurrently locked; retry after the files are
+/// stable and no writer is active. [`Error::Unsupported`] means the source
+/// filesystem lacks required advisory locking; copy the archive to a
+/// supported local filesystem. [`Error::OutcomeUnknown`] means the
+/// destination was published but crash durability could not be confirmed;
+/// inspect it and do not retry automatically.
+pub fn restore_file(
+    path: impl AsRef<Path>,
+    backup_path: impl AsRef<Path>,
+    opts: &RestoreOptions,
+) -> Result<()> {
+    let path = path.as_ref();
+    let backup_path = backup_path.as_ref();
+    if !path_has_suffix(backup_path, ".afb")
+        || (opts.storage == Storage::Lite && !path_has_suffix(path, ".aflite"))
+    {
+        return Err(Error::InvalidArgument);
+    }
+    restore_file_to_file(path, backup_path, opts)
+}
+
+/// Writes `data` to `path` atomically: a temp file in the same directory is
+/// written, `fsync`'d, and renamed into place. I/O failures are reported as
+/// [`Error::Internal`] (they are not `antfly_error_code` values).
+fn write_file_atomically(path: &Path, data: &[u8]) -> Result<()> {
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or(Error::InvalidArgument)?;
+    let tmp_path = dir.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    ));
+
+    let write_result = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        file.write_all(data)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        file.sync_all()
+    })();
+
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(Error::Internal);
+    }
+
+    std::fs::rename(&tmp_path, path).map_err(|_| {
+        let _ = std::fs::remove_file(&tmp_path);
+        Error::Internal
+    })
+}
+
+impl Database {
+    /// Writes a portable Antfly backup archive for this database to `path`,
+    /// which must end in `.afb`.
+    pub fn backup_to_file(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        if !path_has_suffix(path, ".afb") {
+            return Err(Error::InvalidArgument);
+        }
+        let backup = self.backup()?;
+        write_file_atomically(path, &backup)
+    }
+}

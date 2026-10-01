@@ -175,7 +175,19 @@ pub const BackupRestoreBootstrapRecord = struct {
     native_manifest_size_bytes: u64 = 0,
     native_manifest_sha256: []const u8 = "",
 
+    /// Destination binding travels with bootstrap so the first staged import
+    /// uses the new incarnation, before any serving DB can be opened.
+    destination_table_name: []const u8 = "",
+    destination_table_id: u64 = 0,
+    destination_shard_id: u64 = 0,
+    destination_range_id: u64 = 0,
+
     pub fn validate(self: BackupRestoreBootstrapRecord) !void {
+        if (self.destination_table_name.len > 1024 or
+            ((self.destination_table_name.len == 0) != (self.destination_table_id == 0)) or
+            ((self.destination_table_name.len == 0) != (self.destination_shard_id == 0)) or
+            ((self.destination_table_name.len == 0) != (self.destination_range_id == 0))) return error.InvalidBackupRestoreBootstrap;
+        for (self.destination_table_name) |c| if (c < 0x20 or c == 0x7f) return error.InvalidBackupRestoreBootstrap;
         if (self.backup_id.len == 0 or
             self.backup_id.len > 128 or
             self.artifact_backup_id.len == 0 or
@@ -234,6 +246,9 @@ pub const BackupRestoreBootstrapRecord = struct {
 
     pub fn clone(self: BackupRestoreBootstrapRecord, alloc: std.mem.Allocator) !BackupRestoreBootstrapRecord {
         var cloned = BackupRestoreBootstrapRecord{
+            .destination_table_id = self.destination_table_id,
+            .destination_shard_id = self.destination_shard_id,
+            .destination_range_id = self.destination_range_id,
             .backup_id = "",
             .artifact_backup_id = "",
             .location = "",
@@ -257,10 +272,13 @@ pub const BackupRestoreBootstrapRecord = struct {
         cloned.artifact_sha256 = try alloc.dupe(u8, self.artifact_sha256);
         errdefer alloc.free(cloned.artifact_sha256);
         cloned.native_manifest_sha256 = try alloc.dupe(u8, self.native_manifest_sha256);
+        errdefer alloc.free(cloned.native_manifest_sha256);
+        cloned.destination_table_name = try alloc.dupe(u8, self.destination_table_name);
         return cloned;
     }
 
     pub fn deinit(self: *BackupRestoreBootstrapRecord, alloc: std.mem.Allocator) void {
+        alloc.free(self.destination_table_name);
         alloc.free(self.backup_id);
         alloc.free(self.artifact_backup_id);
         alloc.free(self.location);
@@ -285,6 +303,12 @@ pub const ReplicaRecord = struct {
     local_node_id: u64,
     bootstrap_mode: ReplicaBootstrapMode = .persisted,
     metadata_version: u64 = 0,
+    /// Metadata-issued physical admission generation for an unpublished
+    /// initial-FK child. Stable across placement refreshes, rotated when a
+    /// removed/replaced replica is admitted again, and persisted in this
+    /// local catalog before the owner is made live. Zero means this is not
+    /// such an owner; it is never by itself a cancellation/deletion proof.
+    initial_fk_root_generation: u64 = 0,
     snapshot_bootstrap: ?SnapshotBootstrapRecord = null,
     backup_restore_bootstrap: ?BackupRestoreBootstrapRecord = null,
 
@@ -326,6 +350,7 @@ pub fn eqlReplicaRecord(left: ReplicaRecord, right: ReplicaRecord) bool {
     if (left.local_node_id != right.local_node_id) return false;
     if (left.bootstrap_mode != right.bootstrap_mode) return false;
     if (left.metadata_version != right.metadata_version) return false;
+    if (left.initial_fk_root_generation != right.initial_fk_root_generation) return false;
     if ((left.snapshot_bootstrap == null) != (right.snapshot_bootstrap == null)) return false;
     if ((left.backup_restore_bootstrap == null) != (right.backup_restore_bootstrap == null)) return false;
     if (left.snapshot_bootstrap) |snapshot| {
@@ -347,6 +372,10 @@ pub fn eqlReplicaRecord(left: ReplicaRecord, right: ReplicaRecord) bool {
         if (!std.mem.eql(u8, backup.artifact_sha256, other.artifact_sha256)) return false;
         if (backup.native_manifest_size_bytes != other.native_manifest_size_bytes) return false;
         if (!std.mem.eql(u8, backup.native_manifest_sha256, other.native_manifest_sha256)) return false;
+        if (!std.mem.eql(u8, backup.destination_table_name, other.destination_table_name) or
+            backup.destination_table_id != other.destination_table_id or
+            backup.destination_shard_id != other.destination_shard_id or
+            backup.destination_range_id != other.destination_range_id) return false;
     }
     return true;
 }
@@ -389,6 +418,7 @@ pub const ReplicaCatalog = struct {
         contains_replica: *const fn (ptr: *anyopaque, group_id: u64) bool,
         list_replicas: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]ReplicaRecord,
         snapshot_replicas: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror!ReplicaCatalogSnapshot,
+        read_replica: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) anyerror!ReplicaCatalogPoint,
         revision: *const fn (ptr: *anyopaque) ReplicaCatalogToken,
         apply_batch: *const fn (
             ptr: *anyopaque,
@@ -427,6 +457,13 @@ pub const ReplicaCatalog = struct {
     /// pass the optimistic revision fence.
     pub fn snapshotReplicas(self: ReplicaCatalog, alloc: std.mem.Allocator) !ReplicaCatalogSnapshot {
         return try self.vtable.snapshot_replicas(self.ptr, alloc);
+    }
+
+    /// A bounded point read with the same revision fence as a full snapshot.
+    /// The record is cloned while holding the catalog mutex, so the caller
+    /// owns it even if another thread replaces or retires the catalog entry.
+    pub fn readReplica(self: ReplicaCatalog, alloc: std.mem.Allocator, group_id: u64) !ReplicaCatalogPoint {
+        return try self.vtable.read_replica(self.ptr, alloc, group_id);
     }
 
     pub fn token(self: ReplicaCatalog) ReplicaCatalogToken {
@@ -504,6 +541,16 @@ pub const ReplicaCatalogSnapshot = struct {
     }
 };
 
+pub const ReplicaCatalogPoint = struct {
+    token: ReplicaCatalogToken,
+    record: ?ReplicaRecord,
+
+    pub fn deinit(self: *ReplicaCatalogPoint, alloc: std.mem.Allocator) void {
+        if (self.record) |*record| record.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
 pub const MemoryReplicaCatalog = struct {
     alloc: std.mem.Allocator,
     mutex: std.atomic.Mutex = .unlocked,
@@ -531,6 +578,7 @@ pub const MemoryReplicaCatalog = struct {
                 .contains_replica = containsReplica,
                 .list_replicas = listReplicas,
                 .snapshot_replicas = snapshotReplicas,
+                .read_replica = readReplica,
                 .revision = revision,
                 .apply_batch = applyBatch,
                 .prepare_batch = prepareBatch,
@@ -595,6 +643,17 @@ pub const MemoryReplicaCatalog = struct {
         return .{
             .token = .{ .revision = self.current_revision },
             .records = try cloneReplicaRecordsFromMap(alloc, &self.records),
+        };
+    }
+
+    fn readReplica(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) !ReplicaCatalogPoint {
+        const self: *MemoryReplicaCatalog = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const record = self.records.get(group_id);
+        return .{
+            .token = .{ .revision = self.current_revision },
+            .record = if (record) |value| try value.clone(alloc) else null,
         };
     }
 
@@ -763,6 +822,7 @@ pub const FileReplicaCatalog = struct {
                 .contains_replica = containsReplica,
                 .list_replicas = listReplicas,
                 .snapshot_replicas = snapshotReplicas,
+                .read_replica = readReplica,
                 .revision = revision,
                 .apply_batch = applyBatch,
                 .prepare_batch = prepareBatch,
@@ -862,6 +922,17 @@ pub const FileReplicaCatalog = struct {
         return .{
             .token = .{ .revision = self.current_revision },
             .records = try cloneReplicaRecordsFromMap(alloc, &self.records),
+        };
+    }
+
+    fn readReplica(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) !ReplicaCatalogPoint {
+        const self: *FileReplicaCatalog = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const record = self.records.get(group_id);
+        return .{
+            .token = .{ .revision = self.current_revision },
+            .record = if (record) |value| try value.clone(alloc) else null,
         };
     }
 
@@ -1300,6 +1371,8 @@ fn replicaBatchClearlyNoOp(
 }
 
 fn validateReplicaRecord(record: ReplicaRecord) !void {
+    if (record.initial_fk_root_generation != 0 and record.metadata_version == 0)
+        return error.InvalidReplicaCatalog;
     if (record.snapshot_bootstrap != null and record.backup_restore_bootstrap != null)
         return error.InvalidReplicaCatalog;
     if (record.backup_restore_bootstrap) |restore| {
@@ -1553,6 +1626,42 @@ test "memory replica catalog stores and lists records" {
     try std.testing.expectEqual(@as(u64, 11), records[0].group_id);
 }
 
+test "memory replica catalog point read owns its record and revision" {
+    var backing = MemoryReplicaCatalog.init(std.testing.allocator);
+    defer backing.deinit();
+    const iface = backing.catalog();
+    try iface.upsertReplica(.{
+        .group_id = 11,
+        .replica_id = 2,
+        .local_node_id = 3,
+        .metadata_version = 7,
+        .initial_fk_root_generation = 7,
+        .snapshot_bootstrap = .{
+            .from_node_id = 3,
+            .term = 1,
+            .snapshot_id = "old-snapshot",
+            .uri = "http://localhost/old-snapshot",
+        },
+    });
+    var point = try iface.readReplica(std.testing.allocator, 11);
+    defer point.deinit(std.testing.allocator);
+    try std.testing.expectEqual(iface.token(), point.token);
+    try iface.upsertReplica(.{
+        .group_id = 11,
+        .replica_id = 2,
+        .local_node_id = 3,
+        .metadata_version = 8,
+        .initial_fk_root_generation = 8,
+    });
+    try std.testing.expectEqual(@as(u64, 7), point.record.?.initial_fk_root_generation);
+    try std.testing.expectEqualStrings("old-snapshot", point.record.?.snapshot_bootstrap.?.snapshot_id);
+    try std.testing.expect(point.token.revision < iface.revision());
+    var missing = try iface.readReplica(std.testing.allocator, 999);
+    defer missing.deinit(std.testing.allocator);
+    try std.testing.expect(missing.record == null);
+    try std.testing.expectEqual(iface.token(), missing.token);
+}
+
 test "memory replica catalog batch is revision fenced and publishes atomically" {
     var replica_catalog = MemoryReplicaCatalog.init(std.testing.allocator);
     defer replica_catalog.deinit();
@@ -1793,6 +1902,49 @@ test "file replica catalog persists records across reopen" {
             raft_engine.runtime.snapshot_transport_iface.SnapshotArtifactFormat.chunked_manifest_v2,
             records[0].snapshot_bootstrap.?.format,
         );
+    }
+}
+
+test "file replica catalog persists the metadata-issued initial FK root generation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/initial-fk-replica-catalog.json", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    {
+        var catalog = try FileReplicaCatalog.init(std.testing.allocator, path);
+        defer catalog.deinit();
+        try std.testing.expectError(error.InvalidReplicaCatalog, catalog.catalog().upsertReplica(.{
+            .group_id = 41,
+            .replica_id = 2,
+            .local_node_id = 3,
+            .initial_fk_root_generation = 7,
+        }));
+        try catalog.catalog().upsertReplica(.{
+            .group_id = 41,
+            .replica_id = 2,
+            .local_node_id = 3,
+            .metadata_version = 7,
+            .initial_fk_root_generation = 7,
+        });
+    }
+    {
+        var reopened = try FileReplicaCatalog.init(std.testing.allocator, path);
+        defer reopened.deinit();
+        var point = try reopened.catalog().readReplica(std.testing.allocator, 41);
+        defer point.deinit(std.testing.allocator);
+        try std.testing.expectEqual(reopened.catalog().token(), point.token);
+        try std.testing.expectEqual(@as(u64, 7), point.record.?.initial_fk_root_generation);
+        const records = try reopened.catalog().listReplicas(std.testing.allocator);
+        defer freeReplicaRecords(std.testing.allocator, records);
+        try std.testing.expectEqual(@as(usize, 1), records.len);
+        try std.testing.expectEqual(@as(u64, 7), records[0].initial_fk_root_generation);
+        try std.testing.expectEqual(@as(u64, 7), records[0].metadata_version);
+        try std.testing.expect(try reopened.catalog().removeReplica(41));
+        try std.testing.expectEqual(@as(u64, 7), point.record.?.initial_fk_root_generation);
+        var missing = try reopened.catalog().readReplica(std.testing.allocator, 41);
+        defer missing.deinit(std.testing.allocator);
+        try std.testing.expect(missing.record == null);
+        try std.testing.expectEqual(reopened.catalog().token(), missing.token);
     }
 }
 

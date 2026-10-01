@@ -178,7 +178,7 @@ const SchemaEditor: React.FC<SchemaEditorProps> = ({
               if (!prop?.name) return false;
               const types = prop["x-antfly-types"] || [];
               const hasTextTypes = types.some((t: string) =>
-                ["text", "html", "keyword", "search_as_you_type", "link"].includes(t)
+                ["text", "html", "keyword", "search_as_you_type", "substring", "link"].includes(t)
               );
               const isStringType = prop.type === "string" && types.length === 0;
               return hasTextTypes || isStringType;

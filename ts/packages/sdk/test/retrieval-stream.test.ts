@@ -156,3 +156,54 @@ describe("retrieval stream completion", () => {
     expect(onError).not.toHaveBeenCalled();
   });
 });
+
+it("sends graph navigation through the retrieval endpoint and preserves the agent result", async () => {
+  const result = {
+    created_at: 0,
+    status: "completed",
+    hits: [{ _id: "end", _score: 1 }],
+    generation: "Workflow complete",
+    steps: [
+      {
+        kind: "tool_call",
+        name: "graph_navigation",
+        action: "followed neighbor",
+        status: "success",
+      },
+    ],
+  };
+  const fetch = vi
+    .spyOn(globalThis, "fetch")
+    .mockResolvedValueOnce(
+      new Response(JSON.stringify(result), { headers: { "Content-Type": "application/json" } })
+    );
+  const client = new AntflyClient({ baseUrl: "http://localhost:8080/db/v1" });
+  const response = await client.retrievalAgent({
+    query: "Follow the workflow",
+    stream: false,
+    max_internal_iterations: 8,
+    generator: { provider: "antfly", model: "test" },
+    queries: [{ table: "runbooks" }],
+    steps: {
+      retrieval: {
+        navigation: {
+          query_index: 0,
+          strategy: "graph",
+          selection: "agentic",
+          index: "workflow",
+          start_key: "start",
+        },
+      },
+    },
+  });
+  expect(response).toEqual(result);
+  const [url, options] = fetch.mock.calls[0];
+  expect(String(url)).toContain("/agents/retrieval");
+  expect(JSON.parse(String(options?.body)).steps.retrieval.navigation).toEqual({
+    query_index: 0,
+    strategy: "graph",
+    selection: "agentic",
+    index: "workflow",
+    start_key: "start",
+  });
+});

@@ -42,6 +42,36 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
 
+    // Compile and execute freshly generated multi-status response parsers.
+    // A small owned response fixture exercises the real client wrapper without
+    // a network listener or a dependency on the application's HTTP runtime.
+    const generate_fixture = b.addRunArtifact(exe);
+    generate_fixture.addArgs(&.{ "--spec", "test/fixtures/multi-success.json", "--output" });
+    const fixture = generate_fixture.addOutputDirectoryArg("multi-success");
+    generate_fixture.addArgs(&.{ "--package", "multi_success", "--generate", "types,client" });
+    const http_fixture = b.createModule(.{
+        .root_source_file = b.path("test/multi_success_httpx.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const generated_client = b.createModule(.{
+        .root_source_file = fixture.path(b, "client.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    generated_client.addImport("httpx", http_fixture);
+    const response_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/multi_success_runtime.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    response_tests.root_module.addImport("client", generated_client);
+    response_tests.root_module.addImport("httpx", http_fixture);
+    const run_response_tests = b.addRunArtifact(response_tests);
+    test_step.dependOn(&run_response_tests.step);
+
     // E2E test for modular code generation
     const e2e_modular = b.addSystemCommand(&.{ "bash", "test/e2e_modular.sh" });
     e2e_modular.step.dependOn(b.getInstallStep());

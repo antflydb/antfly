@@ -84,6 +84,14 @@ const Plan = struct {
     }
 };
 
+/// Write a caller-validated tensor access into a private staging path. Atomic
+/// publication and source identity belong to the owning artifact exporter.
+pub fn exportAccessWithMetadata(allocator: std.mem.Allocator, metadata: tensor_access_mod.TensorAccess, values: tensor_access_mod.TensorAccess, output_path: []const u8, control: ?@import("execution_control.zig").InferenceExecutionControl) !void {
+    var plan = try buildPlan(allocator, metadata);
+    defer plan.deinit(allocator);
+    try writeSafetensorsControlled(allocator, values, plan, output_path, control);
+}
+
 fn buildPlan(allocator: std.mem.Allocator, access: tensor_access_mod.TensorAccess) !Plan {
     const names = try access.listNames(allocator);
     defer allocator.free(names);
@@ -109,8 +117,10 @@ fn buildPlan(allocator: std.mem.Allocator, access: tensor_access_mod.TensorAcces
         };
         const shape = try allocator.dupe(i64, record.descriptor.shape);
         errdefer allocator.free(shape);
+        const owned_name = try allocator.dupe(u8, record.descriptor.name);
+        errdefer allocator.free(owned_name);
         try tensors.append(allocator, .{
-            .name = try allocator.dupe(u8, record.descriptor.name),
+            .name = owned_name,
             .shape = shape,
             .dtype = dtype,
             .byte_len = record.descriptor.byte_len,
@@ -130,6 +140,10 @@ fn writeSafetensors(
     plan: Plan,
     output_path: []const u8,
 ) !void {
+    return writeSafetensorsControlled(allocator, access, plan, output_path, null);
+}
+
+fn writeSafetensorsControlled(allocator: std.mem.Allocator, access: tensor_access_mod.TensorAccess, plan: Plan, output_path: []const u8, control: ?@import("execution_control.zig").InferenceExecutionControl) !void {
     var header: std.Io.Writer.Allocating = .init(allocator);
     defer header.deinit();
     const writer = &header.writer;
@@ -168,8 +182,15 @@ fn writeSafetensors(
         var record = try access.getRecord(allocator, tensor.name);
         defer record.deinit();
         if (record.raw_bytes.len != tensor.byte_len) return error.InvalidTensorByteLength;
-        try file.writeStreamingAll(io, record.raw_bytes);
+        var write_offset: usize = 0;
+        while (write_offset < record.raw_bytes.len) {
+            if (control) |active| try active.check();
+            const end = @min(record.raw_bytes.len, write_offset +| (1024 * 1024));
+            try file.writeStreamingAll(io, record.raw_bytes[write_offset..end]);
+            write_offset = end;
+        }
     }
+    try file.sync(io);
 }
 
 fn writeJsonString(writer: *std.Io.Writer, value: []const u8) !void {

@@ -3,6 +3,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useApiConfig } from "@/hooks/use-api-config";
 
 const FETCH_TIMEOUT = 15000; // 15 seconds — model expansion fans out to providers
+// Bounds how stale a rendered model list can be. Remote provider listings are
+// additionally cached server-side for the same window (connections.zig); the
+// embedded inference listing is served live on every request.
+const CACHE_TTL_MS = 30_000;
+// Ticks more often than the TTL so a window that expires mid-tick is picked up
+// promptly; a tick whose cache entry is still fresh does no work.
+const REVALIDATE_TICK_MS = 10_000;
 const MAX_CACHE_ENTRIES = 16;
 
 export interface ConnectionsState {
@@ -24,36 +31,74 @@ export interface ConnectedModelsState {
 
 // Cache connection data per API endpoint + expansion so dashboards and
 // dropdowns share one fetch per session.
-type ConnectionsResult = { connections: Connection[]; supported: boolean };
+type ConnectionsPayload = { connections: Connection[]; supported: boolean };
+type ConnectionsResult = ConnectionsPayload & { capturedAtMs: number; forced: boolean };
+type CacheListener = (entry: ConnectionsResult) => void;
 
 const connectionsCache = new Map<string, ConnectionsResult>();
-const connectionsInFlight = new Map<string, Promise<ConnectionsResult>>();
+const connectionsInFlight = new Map<string, Promise<ConnectionsPayload>>();
+const cacheListeners = new Map<string, Set<CacheListener>>();
 
-function cacheConnections(key: string, result: ConnectionsResult) {
+function isFresh(entry: ConnectionsResult): boolean {
+  return Date.now() - entry.capturedAtMs < CACHE_TTL_MS;
+}
+
+/**
+ * Publish a payload to the cache and every mounted consumer of the key.
+ *
+ * A forced refresh bypasses the server's result cache and re-queries every
+ * provider, so it is authoritative but slow; an ordinary read is answered from
+ * that same cache and is stale by construction. The two settle in either
+ * order, so a plain read must not overwrite a still-fresh forced result —
+ * otherwise an explicit Retry visibly does nothing.
+ */
+function cacheConnections(
+  key: string,
+  payload: ConnectionsPayload,
+  forced: boolean
+): ConnectionsResult {
+  const existing = connectionsCache.get(key);
+  if (!forced && existing?.forced && isFresh(existing)) return existing;
+
+  const entry: ConnectionsResult = { ...payload, capturedAtMs: Date.now(), forced };
   connectionsCache.delete(key);
-  connectionsCache.set(key, result);
+  connectionsCache.set(key, entry);
   if (connectionsCache.size > MAX_CACHE_ENTRIES) {
     connectionsCache.delete(connectionsCache.keys().next().value as string);
   }
+  for (const listener of cacheListeners.get(key) ?? []) listener(entry);
+  return entry;
 }
 
 function useConnectionsInternal(includeModels: boolean): ConnectionsState {
   const { apiUrl, client } = useApiConfig();
   const cacheKey = `${apiUrl}|models=${includeModels}`;
+  // Seed from the cached payload however old it is. Showing the last known
+  // inventory while revalidating beats blanking the page back to a skeleton.
   const cached = connectionsCache.get(cacheKey) ?? null;
   const [connections, setConnections] = useState<Connection[]>(cached?.connections ?? []);
   const [supported, setSupported] = useState(cached?.supported ?? true);
-  const [loading, setLoading] = useState(!cached);
+  const [loading, setLoading] = useState(cached == null);
   const [error, setError] = useState<string | null>(null);
   const isMountedRef = useRef(true);
+  // Requests this consumer is itself waiting on, so a sibling's result cannot
+  // clear a skeleton that belongs to an outstanding foreground load.
+  const foregroundPendingRef = useRef(0);
 
   const fetchConnections = useCallback(
-    async (signal?: AbortSignal, options?: { refresh?: boolean }) => {
-      setLoading(true);
-      setError(null);
+    async (signal?: AbortSignal, options?: { refresh?: boolean; background?: boolean }) => {
+      // A background revalidation must never take the page back to its loading
+      // or error state: consumers treat both as full-page short-circuits.
+      const background = options?.background ?? false;
+      const refresh = Boolean(options?.refresh);
+      if (!background) {
+        foregroundPendingRef.current += 1;
+        setLoading(true);
+        setError(null);
+      }
 
       try {
-        const requestKey = `${cacheKey}|refresh=${Boolean(options?.refresh)}`;
+        const requestKey = `${cacheKey}|refresh=${refresh}`;
         let request = connectionsInFlight.get(requestKey);
         if (!request) {
           request = (async () => {
@@ -84,18 +129,25 @@ function useConnectionsInternal(includeModels: boolean): ConnectionsState {
         const result = await request;
 
         if (signal?.aborted || !isMountedRef.current) return;
-        cacheConnections(cacheKey, result);
+        const entry = cacheConnections(cacheKey, result, refresh);
 
-        setConnections(result.connections);
-        setSupported(result.supported);
+        setConnections(entry.connections);
+        setSupported(entry.supported);
+        setError(null);
         setLoading(false);
       } catch (err) {
         if (signal?.aborted) return;
         if (!isMountedRef.current) return;
 
+        // A failed revalidation keeps the last good inventory on screen; only a
+        // foreground load has nothing to fall back to.
+        if (background) return;
+
         const message = err instanceof Error ? err.message : "Failed to fetch connections";
         setError(message);
         setLoading(false);
+      } finally {
+        if (!background) foregroundPendingRef.current -= 1;
       }
     },
     [cacheKey, client, includeModels]
@@ -104,6 +156,30 @@ function useConnectionsInternal(includeModels: boolean): ConnectionsState {
   const retry = useCallback(() => {
     fetchConnections(undefined, { refresh: true });
   }, [fetchConnections]);
+
+  // Converge every consumer of the same key on one result, so a refresh driven
+  // by one mounted component does not leave its siblings disagreeing about
+  // which models exist.
+  useEffect(() => {
+    const listener: CacheListener = (entry) => {
+      setConnections(entry.connections);
+      setSupported(entry.supported);
+      // Recovered data must also retire this consumer's error, or a sibling
+      // stays on an error screen while rendering a healthy inventory.
+      setError(null);
+      if (foregroundPendingRef.current === 0) setLoading(false);
+    };
+    let listeners = cacheListeners.get(cacheKey);
+    if (!listeners) {
+      listeners = new Set();
+      cacheListeners.set(cacheKey, listeners);
+    }
+    listeners.add(listener);
+    return () => {
+      listeners.delete(listener);
+      if (listeners.size === 0) cacheListeners.delete(cacheKey);
+    };
+  }, [cacheKey]);
 
   useEffect(() => {
     isMountedRef.current = true;
@@ -114,19 +190,52 @@ function useConnectionsInternal(includeModels: boolean): ConnectionsState {
       setSupported(fromCache.supported);
       setLoading(false);
       setError(null);
-      return () => {
-        isMountedRef.current = false;
-      };
     }
 
     const controller = new AbortController();
-    void fetchConnections(controller.signal);
+    if (!fromCache || !isFresh(fromCache)) {
+      void fetchConnections(controller.signal, { background: fromCache != null });
+    }
 
     return () => {
       isMountedRef.current = false;
       controller.abort();
     };
   }, [cacheKey, fetchConnections]);
+
+  // Model files may be installed out of band by `antfly inference pull`, so the
+  // expanded inventory is revalidated while the model UI stays open. The fetch
+  // is not forced: forcing bypasses the server-side cache that keeps dashboards
+  // off remote provider listing APIs, and the embedded inference listing is
+  // served live either way.
+  useEffect(() => {
+    if (!includeModels) return;
+
+    // A poll belongs to this endpoint's effect lifetime. Without this signal,
+    // a response started for a previous endpoint can resolve after a switch
+    // and update the newly mounted consumer with the old inventory.
+    const controller = new AbortController();
+
+    const revalidate = () => {
+      if (document.visibilityState === "hidden") return;
+      const entry = connectionsCache.get(cacheKey);
+      // Another consumer of this key already refreshed inside the window.
+      if (entry && isFresh(entry)) return;
+      // A forced refresh is already fetching authoritative data for this key.
+      if (connectionsInFlight.has(`${cacheKey}|refresh=true`)) return;
+      void fetchConnections(controller.signal, { background: true });
+    };
+
+    const timer = window.setInterval(revalidate, REVALIDATE_TICK_MS);
+    // A backgrounded tab stops revalidating; catch it up as soon as it returns
+    // rather than leaving a stale list on screen for a further tick.
+    document.addEventListener("visibilitychange", revalidate);
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", revalidate);
+    };
+  }, [cacheKey, fetchConnections, includeModels]);
 
   return { connections, supported, loading, error, retry };
 }

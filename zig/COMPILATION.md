@@ -62,8 +62,9 @@ The work has two related objectives:
   independently testable commands or modes even when some are co-generated.
 - The public C API is the `capi` build target and `libantfly` shared library.
   It must not retain unrelated server or runtime roots.
-- LSM is the production backend. LMDB remains available only for tests,
-  fixtures, conversion, and legacy compatibility while needed.
+- LSM is the production backend. The public Zig package, embedded library,
+  WASM bundle, and linked runtime disable LMDB. The standalone Zig LMDB port
+  and vendored C oracle remain available to explicit test/benchmark fixtures.
 - Runtime boundaries are coarse. They never cross per record, posting, edge,
   LMDB operation, or vector candidate.
 - Allocation ownership, cancellation, deadlines, operation state, callbacks,
@@ -216,36 +217,17 @@ selects those sources without giving overlapping files a second Zig module
 identity. Some shared storage leaf files remain lexically reachable by control;
 the source-mutation matrix does not prove independence for every leaf file.
 
-### Cold x86_64 Linux release scheduling (2026-09-12)
+### Runtime compilation memory reservations
 
-Two fresh-cache builds used source `83cd076bf` on the same isolated build pod,
-with only runtime compilation reservations changed. The pod used the Actions
-runner image, an AMD EPYC 7B13 host, a 7.5 CPU request, a 24 GiB memory limit,
-and the normal 22 GiB Zig admission budget. Both builds used Zig 0.16.0,
-`-Dcpu=baseline -Doptimize=ReleaseFast -Dstrip=true -Dcuda=false
--Dcuda-artifacts=fatbin -Dantfly-version=release-measure -j8`, and built
-`antfly capi capi-smoke`. Local and global Zig caches were empty and separate
-for each run. This measures scheduling on one fixed source revision, not the
-cumulative effect of the PR's other changes.
+> **Relocated:** The 2026-09-12 cold x86_64 Linux release-scheduling comparison
+> and the boundary-runtime-cost sample that previously lived here are
+> preserved verbatim in
+> [COMPILATION_EXPERIMENTS.md](COMPILATION_EXPERIMENTS.md#2026-09-12-cold-x86_64-linux-release-scheduling-and-boundary-runtime-cost).
 
-| Measurement | Conservative reservations | Measured reservations |
-| --- | ---: | ---: |
-| Elapsed build time | 72m44s | 27m01s |
-| Process-tree CPU time | 87m52s | 78m15s |
-| Sampled peak process-tree RSS | 5.93 GiB | 13.08 GiB |
-| Storage compilation begins | 29m26s | 45s |
-| Inference compilation begins | 56m28s | 45s |
-| Antfly executable size | 115,997,560 bytes | 115,997,560 bytes |
-
-Both builds passed all 43 steps, including C API smoke execution, and produced
-the same executable SHA-256:
-`2d5b4d04edc973a7356863a657b46be1068816511d5c515a1572c1f882eee9fe`.
-The elapsed reduction was 62.9%. This is one paired measurement on a shared
-node; CPU frequency and other tenants were not controlled, and total CPU time
-also varied. The directly observed scheduling improvement is that storage and
-inference overlap instead of being serialized by a combined 36 GiB claim.
-RSS was sampled every 0.5 seconds by summing build descendants; shared pages
-can be counted more than once and this is not the cgroup's total memory use.
+These per-archive reservations, adopted from that measurement, apply only to
+native x86_64 Linux hosts building baseline x86_64 GNU, stripped ReleaseFast,
+with CPU inference and no thread sanitizer; other profiles keep their
+previous claims.
 
 | Runtime archive | Largest sampled compiler RSS across the pair | New claim |
 | --- | ---: | ---: |
@@ -257,53 +239,15 @@ can be counted more than once and this is not the cgroup's total memory use.
 | CLI | 1.25 GiB | 2 GiB |
 | Enrichment | 0.80 GiB | 2 GiB |
 
-These claims apply only to native x86_64 Linux hosts building baseline x86_64
-GNU, stripped ReleaseFast, with CPU inference and no thread sanitizer. Other
-profiles keep their previous claims. Reservations remain admission estimates,
-not hard per-process memory limits. After installing the final policy helper,
-a warm build reused every compiler output and reran the C API smoke test; the
-policy itself also passed its native Linux unit test.
-
-The Actions unit job at `8e67d155f` completed its build/test step in 34m38s
-([job 103640717903](https://github.com/antflydb/antfly/actions/runs/34726182022/job/103640717903)),
-after the previous run hit its 60-minute watchdog. That run failed in two
-obsolete restore fixture setups, so it is not a passing full-suite benchmark.
-Its build-tool tests took six seconds; the expensive cache matrix remains in
-`zig-full`. Test execution still contributes materially to the base job:
-`storage-support-tests` alone ran for approximately ten minutes.
-
-### Boundary runtime cost
-
-The existing `antfly-storage-bench` installs `storage_boundary_bench`. Run it
-with a new directory, which it creates and removes itself:
-
-```sh
-zig build antfly-storage-bench -Doptimize=Debug
-./zig-out/bin/storage_boundary_bench /tmp/antfly-boundary-benchmark-new
-```
-
-It compares the actual internal batch encoder/parser with the production
-owner's batch operation, and the typed query-result parser with the production
-owner's query operation. Document bodies are about 500 bytes. Each JSON line
-reports ten iterations, payload size, and separate timings.
-
-In the local Debug sample, a 1,000-document batch spent 8.9 ms per iteration
-encoding and parsing; the separately measured owner batch took 46.7 ms. A
-1,000-hit query took 20.9 ms in the owner, with another 11.2 ms for consumer
-decoding. These are separate measurements, not additive phases captured from
-one request or production throughput claims. JSON transport is a material
-remaining cost. This change removes a redundant owned query-response copy;
-it does not replace the internal JSON transport. A future compact or borrowed
-transport must preserve complete-operation calls, provider-owned result
-lifetimes, request validation, and exact error/cancellation semantics.
-
 ### C API composition
 
-`libantfly` links the sectioned PIC storage and enrichment artifacts. Function
-and data section GC retains public `antfly_db_*` and `antfly_lite_*` roots while
-discarding private executable entry points. The symbol audit rejects exported
-runtime, API-kernel, inference, storage-owner, snapshot, restore, and data-apply
-symbols.
+`libantfly` links the sectioned PIC storage and enrichment artifacts, plus the
+standalone inference runtime archive, the same as the `antfly` executable.
+Function and data section GC retains public `antfly_db_*` and `antfly_lite_*`
+roots while discarding private executable entry points. The symbol audit
+rejects exported runtime, API-kernel, storage-owner, snapshot, restore, and
+data-apply symbols; inference symbols stay hidden/non-exported even though the
+archive is now linked in-process (only the public C ABI is exported).
 
 There is one canonical Zig C API identity:
 
@@ -313,6 +257,20 @@ There is one canonical Zig C API identity:
 
 Historical references to two C API libraries in the experiment ledger predate
 this consolidation.
+
+#### Embedded inference
+
+As of 2026-09-17, `libantfly` always embeds the standalone inference runtime
+in-process (`link_anchor.zig` no longer traps
+`antfly_standalone_inference_get_function_table`; only the executable-only
+API-kernel entry point stays trapped). This is a deliberate product decision:
+it makes `libantfly`, and therefore Antfly Lite hosts (the Go/Zig `embedded`
+package and the C ABI), get local inference out of the box without building
+or shipping a separate runtime, at the cost of a much larger shared library --
+see the raised size gate below. Opening a Lite handle with the local-runtime-
+configured flag reports `inference_mode: "local_embedded"` and
+`local_inference_runtime: true` (see LITE.md's "Local Embedded Inference"
+section). There is no longer a smaller inference-free `libantfly` build.
 
 ## Why compiled boundaries are required
 
@@ -500,8 +458,10 @@ Phase 4y delta remains visible as architectural debt.
 
 For subsequent increments:
 
-- `libantfly` has a hard 20 MiB release gate and a working target at or below
-  approximately 19 MiB.
+- `libantfly` has a hard 60 MiB release gate (raised from 20 MiB on
+  2026-09-17 when the standalone inference runtime was embedded into
+  `libantfly` by default; measured stripped ReleaseFast size is
+  approximately 48 MiB, leaving headroom for other targets/platforms).
 - No single experiment should grow the executable more than approximately 5%
   without an explicit, measured critical-path benefit and approval of the
   cumulative tradeoff.
@@ -561,7 +521,8 @@ from local Apple-Silicon cross-builds.
 
 - One static `antfly` executable contains every required command and embedded
   standalone inference.
-- `libantfly` remains below 20 MiB and exposes only the public C API.
+- `libantfly` remains below 60 MiB (see the raised gate above) and exposes
+  only the public C API.
 - Production artifacts contain no LMDB implementation symbols or entry-point
   strings.
 - Executable size and emitted duplication remain within the budget above.

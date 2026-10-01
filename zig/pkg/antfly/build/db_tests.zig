@@ -30,6 +30,24 @@ pub const AddTestsResult = struct {
 pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
     const relationship_identity_filters = [_][]const u8{
+        "graph relationship integration",
+        "derived log record",
+        "derived log relationship identities",
+        "k shortest paths preserve",
+        "fact temporal predicates",
+        "exact two-edge pattern preserves",
+        "traversal selected fact",
+        "graph algebraic provenance",
+        "db graph ttl projects source contenders",
+        "db direct merge import preserves mixed graph ttl contributor precedence",
+        "db split preserves ttl graph source fallback",
+        "graph owner membership keeps",
+        "graph untimed contributor order",
+        "graph edge ttl",
+        "graph contribution deadline",
+        "graph maintenance prune retires private ttl state",
+        "graph split prune preserves a retained owner",
+        "graph document clear",
         "portable graph retirements are primary and require reader version four",
         "graph relationship bulk ingestion preserves direct append and retirement",
         "docstore relational bulk appends retain direct ingest and atomic dirty tokens",
@@ -63,7 +81,41 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_relationship_identity_tests = addCuratedTestRunArtifact(b, relationship_identity_tests, &relationship_identity_filters);
     b.step("antfly-storage-graph-identity-test", "Run relationship ownership, lifecycle, snapshot and replay regressions").dependOn(&run_relationship_identity_tests.step);
+    const direct_vector_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "online direct vector", "online graph snapshot", "retained transaction vector", "api module compiles", "metadata module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-online-direct-vector-test", "Run ordered direct vector snapshot, retention, and repair regressions")
+        .dependOn(&addFilteredTestRunArtifact(b, direct_vector_tests).step);
+    const retirement_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "db cold initial FK retirement", "api module compiles", "metadata module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-cold-fk-retirement-test", "Run terminal local publication cancellation durability tests")
+        .dependOn(&addFilteredTestRunArtifact(b, retirement_tests).step);
+    const ordered_artifact_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "ordered artifact inventory", "storage.db.derived.apply_state", "artifact footprint", "artifact publication upload", "artifact publication compact transport", "db derived coverage snapshot", "db dense target reads atomic outcome and source coverage snapshot", "online admission facts are unbound", "native source admission", "api module compiles", "metadata module compiles", "db lookup includes chunk artifacts", "db search includes chunk artifacts", "db scan includes chunk artifacts", "db lookup does not load chunks", "db lookup loads chunks" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-ordered-artifact-test", "Run ordered artifact inventory, wire, and durable owner regressions")
+        .dependOn(&addFilteredTestRunArtifact(b, ordered_artifact_tests).step);
+    const repair_activation_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{
+            "db repair activation",
+            "storage.db.derived.index_repair_state",
+            "db dense shadow activation rejects surplus candidate coverage",
+            "db paused dense repair resumes its durable candidate after restart",
+        },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-storage-repair-activation-test", "Run bounded index activation, coverage, and candidate-resume regressions")
+        .dependOn(&addFilteredTestRunArtifact(b, repair_activation_tests).step);
     const db_enrichment_filters: []const []const u8 = &.{
+        "db resolver workers recover pending journal targets after reopen without new writes",
         "db resolver worker resumes durable backfill after deferred activation and reopen",
         "db managed resolver changes fence in-flight replay and reset durable cursors",
         "storage.db.db.test.db batch marks generated enrichment replay",
@@ -85,8 +137,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.db.test.db enrichment retry makes monotonic progress across provider batches",
         "storage.db.db.test.db retryable chunked producer does not block independent dense publication",
         "storage.db.db.test.db retryable asset producer batches do not block independent dense publication",
+        "storage.db.db.test.db asset consumes another asset artifact and re-derives on upstream change",
+        "storage.db.db.test.db asset consuming asset validates upstream references at admission",
         "asset preparation is lazy and byte bounded across retryable provider batches",
         "asset planning groups interleaved providers",
+        "asset producer neighbor context samples local graph adjacency into the input and skip state",
+        "public enrichment validation bounds neighbor context to text-consuming asset producers",
+        "storage.db.enrichment.neighbor_context.test.neighbor context config round trips through canonical JSON",
+        "storage.db.enrichment.neighbor_context.test.neighbor context config enforces bounds and closed fields",
+        "storage.db.enrichment.neighbor_context.test.neighbor block renders deterministically and honors the limit",
         "shared PDF",
         "storage.db.db.test.db io_threaded executor processes indexed writes",
         "storage.db.db.test.db reopen replays pending derived embeddings",
@@ -108,6 +167,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "ordinary startup target preserves restored retry debt",
         "enrichment terminal failure envelope remains conservative across sparse durable debt",
         "enrichment terminal failure envelope uses exact durable lookup for sparse gaps",
+        "enrichment terminal failure envelope is preserved by unbounded drains",
         "isolated enrichment request error does not mark worker failed",
         "enrichment runtime status",
         "enrichment runtime restore",
@@ -154,6 +214,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "generated text provider config is validated while parsing extraction config",
         "PDF text regions use reconstructed output spans",
         "public enrichment validation rejects invalid execution and producer config",
+        "transcriber shorthand expands to a document extraction producer",
         "enrichment runtime document extraction manifest uses v2 range and merge shape",
         "enrichment runtime document extraction state parses byte-array keys",
         "enrichment runtime navigation cleanup removes superseded and deleted blocks",
@@ -162,10 +223,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "document unit fingerprint canonically separates variable field boundaries",
         "document unit fingerprint distinguishes absent and empty optional fields",
         "document unit fingerprint state version rejects legacy encodings",
+        "document unit fingerprint folds transcript spans in only when present",
+        "transcript spans locate provider segments inside the joined transcript",
+        "transcript timing stamps chunks with the phrases they overlap",
+        "diarized phrases carry their speaker into spans and chunks",
+        "an unlocatable phrase costs only its own timing",
+        "a repeated phrase after a mismatch stays untimed",
+        "speech no span claims blocks chunk attribution",
+        "whitespace between phrases does not block attribution",
+        "recordings in video containers take the transcription route",
+        "transcript spans split a timed phrase at sentence ends using its words",
         "db canonical hierarchy traversal rejects typed retrieval controls",
         "db document unit payload preserves pdf page provenance",
         "db document extraction asset materializes unit artifacts from data url",
         "db document extraction chunks units through source artifact enrichment",
+        "db document extraction completes audio transcription with transcriber producer",
+        "db document extraction transcript segments time chunk artifacts",
+        "db document extraction keeps diarized speakers through reopen",
         "db public artifact lookup strips private hierarchy metadata without changing internal records",
         "db hierarchy navigation seeks only the descriptor blocks needed by the page",
         "db hierarchy cursor binds every unit artifact revision under its source",
@@ -176,6 +250,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.catalog.enrichment_catalog.test.enrichment catalog round trip without source_template",
         "storage.db.catalog.index_manager.test.dense index manager accepts external embedding indexes without enrichments",
         "storage.db.catalog.index_manager.test.generated enrichment request identity includes source_template",
+        "storage.db.catalog.index_manager.test.dense index unions multiple embedding artifact sources without overwriting members",
         "storage.db.catalog.index_manager.test.graph config parses artifact source and shorthand asset enrichment",
         "storage.db.catalog.index_manager.test.remove drops generated embedding artifacts while retaining reusable chunk artifacts and shorthand enrichments",
         "storage.db.catalog.index_manager.test.shorthand chunk and embedding enrichment compatibility includes source_template",
@@ -216,6 +291,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.db.test.db managed dense enrichment delete recreate recovers after corrupt artifact",
         "storage.db.db.test.db managed dense enrichment delete recreate recovers after corrupt artifact across reopen",
         "storage.db.db.test.db managed dense enrichment remains searchable after transient rate limits",
+        "storage.db.db.test.db chunked dense retry preserves published vectors until replacements succeed",
+        "storage.db.db.test.db reopened chunked dense HBC deletes stale vectors through artifact loader",
+        "storage.db.db.test.db synchronous chunk replacement retires stale embeddings in the same commit",
+        "storage.db.db.test.db asynchronous empty inline chunks retire old embeddings",
+        "storage.db.db.test.pending chunk deletes index only new keys by document",
+        "storage.db.db.test.pending artifact writes index only new writes by document",
+        "storage.db.db.test.materialized preserved sources dedupe pending chunk keys",
+        "storage.db.db.test.db generated replay atomically promotes staged artifacts and deletes stale generation",
+        "storage.db.enrichment.enrichment_runtime.test.rejected chunk embedding publication records its request for stale cleanup",
+        "storage.db.enrichment.enrichment_runtime.test.empty chunk sources retain their own document revisions",
+        "storage.db.enrichment.enrichment_runtime.test.stale embedding cleanup guards each request in a shared window",
+        "storage.db.db.test.db cached chunk cleanup survives another failed shared batch request",
         "storage.db.db.test.db managed dense enrichment retries temporary model capacity without terminal coverage",
         "storage.db.db.test.db managed sparse enrichment retries temporary model capacity without terminal coverage",
         "storage.db.db.test.db managed vector admission durably seeds missing enrichment artifacts",
@@ -236,6 +323,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.db.test.storage.hot_standby db waits for remote apply before completing derived enrichment",
         "storage.db.db.test.storage.hot_standby seed snapshot predrains enrichment before exclusive capture",
         "storage.db.derived.io_threaded_runtime.test.derived enrichment visibility guard observes cancellation and deadline",
+        "storage.db.derived.runtime_types.test.derived visibility wait retains its deadline clock and cancellation",
         "storage.db.derived.replay_source.test.replay source primary store collects enrichment groups from hint lane",
         "storage.db.enrichment.chunker_stub.test.enrichment chunker stub configured chunking replaces invalid utf8 before dispatch",
         "storage.db.enrichment.chunker_stub.test.enrichment chunker stub makes progress when byte window is smaller than utf8 scalar",
@@ -256,6 +344,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.enrichment.enrichment_runtime.test.enrichment runtime graph materializer rejects non-finite mapped weights",
         "storage.db.enrichment.enrichment_runtime.test.enrichment worker chunk cache keys preserve embedded separators",
         "storage.db.enrichment.enrichment_runtime.test.enrichment worker retry delay is exponential and capped",
+        "enrichment inline backoff wakes for teardown before and during wait admission",
         "storage.db.enrichment.enrichment_runtime.test.foreground enrichment catch-up guard has a monotonic deadline",
         "storage.db.enrichment.enrichment_runtime.test.foreground enrichment catch-up treats cancellation as a waiter outcome",
         "storage.db.enrichment.enrichment_runtime.test.isolated enrichment request does not advance when durable parking fails",
@@ -297,6 +386,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.db.test.db enrichment retry makes monotonic progress across provider batches",
         "storage.db.db.test.db retryable chunked producer does not block independent dense publication",
         "storage.db.db.test.db retryable asset producer batches do not block independent dense publication",
+        "storage.db.db.test.db asset consumes another asset artifact and re-derives on upstream change",
+        "storage.db.db.test.db asset consuming asset validates upstream references at admission",
         "asset preparation is lazy and byte bounded across retryable provider batches",
         "storage.db.db.test.db io_threaded executor processes indexed writes",
         "storage.db.db.test.db reopen replays pending derived embeddings",
@@ -318,6 +409,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "ordinary startup target preserves restored retry debt",
         "enrichment terminal failure envelope remains conservative across sparse durable debt",
         "enrichment terminal failure envelope uses exact durable lookup for sparse gaps",
+        "enrichment terminal failure envelope is preserved by unbounded drains",
         "isolated enrichment request error does not mark worker failed",
         "enrichment runtime status",
         "enrichment runtime restore",
@@ -348,6 +440,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "generated text provider config is validated while parsing extraction config",
         "PDF text regions use reconstructed output spans",
         "public enrichment validation rejects invalid execution and producer config",
+        "transcriber shorthand expands to a document extraction producer",
         "enrichment runtime document extraction manifest uses v2 range and merge shape",
         "enrichment runtime document extraction state parses byte-array keys",
         "enrichment runtime navigation cleanup removes superseded and deleted blocks",
@@ -356,10 +449,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "document unit fingerprint canonically separates variable field boundaries",
         "document unit fingerprint distinguishes absent and empty optional fields",
         "document unit fingerprint state version rejects legacy encodings",
+        "document unit fingerprint folds transcript spans in only when present",
+        "transcript spans locate provider segments inside the joined transcript",
+        "transcript timing stamps chunks with the phrases they overlap",
+        "diarized phrases carry their speaker into spans and chunks",
+        "an unlocatable phrase costs only its own timing",
+        "a repeated phrase after a mismatch stays untimed",
+        "speech no span claims blocks chunk attribution",
+        "whitespace between phrases does not block attribution",
+        "recordings in video containers take the transcription route",
+        "transcript spans split a timed phrase at sentence ends using its words",
         "db canonical hierarchy traversal rejects typed retrieval controls",
         "db document unit payload preserves pdf page provenance",
         "db document extraction asset materializes unit artifacts from data url",
         "db document extraction chunks units through source artifact enrichment",
+        "db document extraction completes audio transcription with transcriber producer",
+        "db document extraction transcript segments time chunk artifacts",
+        "db document extraction keeps diarized speakers through reopen",
         "db public artifact lookup strips private hierarchy metadata without changing internal records",
         "db hierarchy navigation seeks only the descriptor blocks needed by the page",
         "db hierarchy cursor binds every unit artifact revision under its source",
@@ -368,6 +474,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.db.test.db split cutover preserves enrichment resume and fencing across reopen",
         "storage.db.db.test.db merge-style cutover fences enrichment to the merged receiver range",
         "storage.db.db.test.db merge-style cutover preserves enrichment resume and fencing across reopen",
+        "db blocked dense embedding lane does not force the independent asset lane to redo checkpointed work",
+        "cross-quantum lane pipelining publishes a fast dense quantum while a slower asset quantum is still in flight",
+        "cross-quantum dispatch clones queued requests so later caller reuse cannot corrupt an in-flight asset quantum",
+        "synchronous window checkpoints never advance the asset cursor past queued or in-flight extractor work",
+        "combined replay cursor gate requires every execution lane to cover a group",
+        "each execution lane persists and clears its own replay cursor scope",
+        "asset producer runtime accepts an unrequested boundary-model schema_version upgrade",
+        "asset producer runtime batch path accepts an unrequested boundary-model schema_version upgrade",
+        "db dense index consuming a chunk-then-embed source via plural sources config converges its target counter",
+        "runUntilIdle no-progress guard fails fast with a named stuck-index diagnostic",
+        "target advance stuck tracking records first-seen time and clears on success",
     };
     const lib_db_enrichment_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -379,6 +496,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const lib_db_query_default_filters = [_][]const u8{
         "composed fusion preserves the coordinator reranker window",
+        "composed vector component window matches component paging",
         "fuseNamedSets applies offset after fusion and pruning",
         "grouped candidate budget parses disabled and fallback values",
         "adaptive candidate window covers requested offset page and grows bounded",
@@ -423,10 +541,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "match_all sorted segment seek zero limit returns profile without scanning",
         "match_all sorted segment seek rejects cursor when segment bounds are unavailable",
         "match_all projected source load rejects expired deadline before batch load",
+        "projected source batches",
         "dense projected source load rejects expired deadline before load",
         "match_all unordered source loads selected hits through projected batch",
         "text field sort uses sorted segment membership path when index sort matches",
         "text projected source load rejects expired deadline before stored load",
+        "text projected source batch preserves selection and cleans up failed hydration",
         "native numeric sort rejects non-finite doc values",
         "native sort zero limit avoids generic collector decoration",
         "text doc values sort zero limit avoids budget and decoration",
@@ -462,6 +582,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "mixed numeric concrete sort keys share one cursor domain",
         "schema boolean doc values back native sort planner",
         "db exact sort resolves mapped geo metadata filters from typed doc values",
+        "highlight",
+        "attachHighlights",
+        "schema-driven dotted path ignores unindexed literal key",
+        "text analysis rejects invalid shingle bounds",
     };
     const lib_db_query_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -475,6 +599,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     addRuntimeTestFilters(b, run_lib_db_query_tests, &lib_db_query_default_filters);
     const lib_db_query_step = b.step("antfly-storage-db-query-test", "Run root-module DB query/indexing tests");
     lib_db_query_step.dependOn(&run_lib_db_query_tests.step);
+
+    const highlight_filters = [_][]const u8{
+        "highlight",
+        "attachHighlights",
+        "schema-driven dotted path ignores unindexed literal key",
+        "text analysis rejects invalid shingle bounds",
+        "document mapper emits mapped keyword subfield",
+    };
+    const highlight_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &highlight_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_highlight_tests = b.addRunArtifact(highlight_tests);
+    addRuntimeTestFilters(b, run_highlight_tests, &highlight_filters);
+    b.step("antfly-storage-highlight-test", "Run source mapping and highlight analysis regressions")
+        .dependOn(&run_highlight_tests.step);
 
     const lib_db_text_query_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -540,6 +681,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_test_mod,
         .filters = &.{
             "storage.db.db.test.db reopens persisted",
+            "storage.db.db.test.db owner open does not downgrade a newer durable schema for Raft catch-up",
             "storage.db.db.test.db split prepare and finalize work with durable lsm primary backend",
             "storage.db.db.test.db delete index persists",
             "storage.db.db.test.db indexed delete removes",
@@ -571,8 +713,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.db.test.db batch enforces optimistic version predicates",
             "coordinator recovery durably aborts a stale prepared transaction",
             "idempotent begin upgrades a legacy transaction coordinator role",
+            "transaction participant batch",
+            "transaction trace retains every key",
             "transaction recovery delegates stale coordinator abort to replicated resolver",
             "replicated recovery is coordinator-owned and acknowledges through hooks",
+            "replicated recovery batches proven followers preserves uncertain debt and retains self handoff",
+            "relational integrity ",
+            "distributed txn deferred reference handoff",
             "transaction recovery drains terminal HA outbox without remaining intents",
             "non-replicated transaction recovery honors the per-run page limit",
             "retained terminal transactions honor the extended retry cutoff",

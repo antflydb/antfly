@@ -1,3 +1,17 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 #![allow(clippy::all)]
 
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
@@ -29,9 +43,11 @@ async fn decode_mutation_response<T: serde::de::DeserializeOwned + std::fmt::Deb
                 empty.ok_or_else(|| Error::Custom("unexpected empty mutation response".into()))?;
             ResponseValue::empty(response).map(|()| MutationOutcome::Completed(value))
         }
-        reqwest::StatusCode::OK => ResponseValue::<T>::from_response(response)
-            .await?
-            .map(MutationOutcome::Completed),
+        reqwest::StatusCode::OK | reqwest::StatusCode::CREATED => {
+            ResponseValue::<T>::from_response(response)
+                .await?
+                .map(MutationOutcome::Completed)
+        }
         _ => Err(Error::UnexpectedResponse(response)),
     }
 }
@@ -52,12 +68,20 @@ fn mutation_success_decoding_preserves_status_and_etag() {
         ).await.unwrap();
         assert_eq!(completed.headers()["etag"], "\"schema-7\"");
         assert!(matches!(completed.into_inner(), MutationOutcome::Completed(table) if table.name == "items"));
+        let created = decode_mutation_response::<types::TableStatus>(
+            response(201, r#"{"name":"items","indexes":{},"shards":{},"storage_status":{}}"#), None,
+        ).await.unwrap();
+        assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+        assert_eq!(created.headers()["etag"], "\"schema-7\"");
+        assert!(matches!(created.into_inner(), MutationOutcome::Completed(table) if table.name == "items"));
         for status in ["committed_visibility_pending", "committed_superseded", "committed_repair_required", "committed_repair_unavailable"] {
             let json = format!(r#"{{"status":"{status}"}}"#);
             let accepted = decode_mutation_response::<types::Table>(response(202, &json), None).await.unwrap();
             assert_eq!(accepted.status(), reqwest::StatusCode::ACCEPTED);
             assert_eq!(accepted.headers()["etag"], "\"schema-7\"");
             assert!(matches!(accepted.into_inner(), MutationOutcome::Committed(_)));
+            let scoped = decode_mutation_response::<types::TableStatus>(response(202, &json), None).await.unwrap();
+            assert!(matches!(scoped.into_inner(), MutationOutcome::Committed(_)));
             let dropped = decode_mutation_response(response(202, &json), Some(())).await.unwrap();
             assert!(matches!(dropped.into_inner(), MutationOutcome::Committed(_)));
         }
@@ -674,6 +698,7 @@ pub fn antfly_embedder(model: impl Into<String>) -> types::IndexEmbedderConfig {
 impl Default for types::CreateFullTextIndexRequest {
     fn default() -> Self {
         Self {
+            analysis_config: None,
             artifact_name: None,
             description: None,
             enrichments: Vec::new(),

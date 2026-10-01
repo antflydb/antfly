@@ -11,6 +11,7 @@ from ..models.join_type import JoinType
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.catalog_table_target import CatalogTableTarget
     from ..models.join_condition import JoinCondition
     from ..models.join_filters import JoinFilters
 
@@ -24,8 +25,11 @@ class JoinClause:
     Supports inner, left, and right joins with automatic strategy selection.
 
         Attributes:
-            right_table (str): Name of the table to join with. Example: customers.
             on (JoinCondition): Condition for matching rows between tables.
+            right_target (CatalogTableTarget | Unset): An explicit native table target. Components are literal names; dots
+                do not qualify a string table name.
+            right_table (str | Unset): Literal native table name or declared foreign-source alias. Specify exactly one of
+                right_table or right_target. Example: customers.
             join_type (JoinType | Unset): Type of join to perform:
                 - `inner`: Only return rows with matches in both tables
                 - `left`: Return all rows from left table, NULL for non-matching right rows
@@ -46,8 +50,9 @@ class JoinClause:
                 Supports inner, left, and right joins with automatic strategy selection.
     """
 
-    right_table: str
     on: JoinCondition
+    right_target: CatalogTableTarget | Unset = UNSET
+    right_table: str | Unset = UNSET
     join_type: JoinType | Unset = UNSET
     right_filters: JoinFilters | Unset = UNSET
     right_fields: list[str] | Unset = UNSET
@@ -56,9 +61,13 @@ class JoinClause:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        right_table = self.right_table
-
         on = self.on.to_dict()
+
+        right_target: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.right_target, Unset):
+            right_target = self.right_target.to_dict()
+
+        right_table = self.right_table
 
         join_type: str | Unset = UNSET
         if not isinstance(self.join_type, Unset):
@@ -84,10 +93,13 @@ class JoinClause:
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
-                "right_table": right_table,
                 "on": on,
             }
         )
+        if right_target is not UNSET:
+            field_dict["right_target"] = right_target
+        if right_table is not UNSET:
+            field_dict["right_table"] = right_table
         if join_type is not UNSET:
             field_dict["join_type"] = join_type
         if right_filters is not UNSET:
@@ -103,13 +115,21 @@ class JoinClause:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.catalog_table_target import CatalogTableTarget
         from ..models.join_condition import JoinCondition
         from ..models.join_filters import JoinFilters
 
         d = dict(src_dict)
-        right_table = d.pop("right_table")
-
         on = JoinCondition.from_dict(d.pop("on"))
+
+        _right_target = d.pop("right_target", UNSET)
+        right_target: CatalogTableTarget | Unset
+        if isinstance(_right_target, Unset):
+            right_target = UNSET
+        else:
+            right_target = CatalogTableTarget.from_dict(_right_target)
+
+        right_table = d.pop("right_table", UNSET)
 
         _join_type = d.pop("join_type", UNSET)
         join_type: JoinType | Unset
@@ -142,8 +162,9 @@ class JoinClause:
             nested_join = JoinClause.from_dict(_nested_join)
 
         join_clause = cls(
-            right_table=right_table,
             on=on,
+            right_target=right_target,
+            right_table=right_table,
             join_type=join_type,
             right_filters=right_filters,
             right_fields=right_fields,

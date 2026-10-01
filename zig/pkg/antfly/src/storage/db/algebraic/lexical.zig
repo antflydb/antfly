@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const vellum = @import("antfly_vellum");
+const fst = @import("antfly_fst");
 const pathfact = @import("pathfact.zig");
 const token = @import("token.zig");
 
@@ -275,7 +275,7 @@ pub fn buildFstAlloc(alloc: std.mem.Allocator, labels: []const []const u8) ![]u8
         }
     }.lessThan);
 
-    var builder = try vellum.Builder.init(alloc, .{
+    var builder = try fst.Builder.init(alloc, .{
         .registry_table_size = std.math.clamp(labels.len, 64, 65_536),
     });
     defer builder.deinit();
@@ -292,15 +292,15 @@ pub fn buildFstAlloc(alloc: std.mem.Allocator, labels: []const []const u8) ![]u8
 
 pub fn fstContains(fst_bytes: []const u8, label: []const u8) !bool {
     if (fst_bytes.len == 0) return false;
-    const fst = try vellum.FST.load(fst_bytes);
-    return try fst.contains(label);
+    const dict = try fst.FST.load(fst_bytes);
+    return try dict.contains(label);
 }
 
 pub fn fstLabelsWithPrefixAlloc(alloc: std.mem.Allocator, fst_bytes: []const u8, prefix: []const u8) ![][]u8 {
     if (fst_bytes.len == 0) return try alloc.alloc([]u8, 0);
-    const fst = try vellum.FST.load(fst_bytes);
-    var starts = vellum.StartsWith{ .prefix = prefix };
-    var iter = try fst.search(alloc, starts.automaton(), prefix, null);
+    const dict = try fst.FST.load(fst_bytes);
+    var starts = fst.StartsWith{ .prefix = prefix };
+    var iter = try dict.search(alloc, starts.automaton(), prefix, null);
     defer iter.deinit();
     return try collectFstIteratorLabelsAlloc(alloc, &iter);
 }
@@ -314,8 +314,8 @@ pub fn fstLabelsInRangeAlloc(
     inclusive_max: bool,
 ) ![][]u8 {
     if (fst_bytes.len == 0) return try alloc.alloc([]u8, 0);
-    const fst = try vellum.FST.load(fst_bytes);
-    var iter = try fst.iterator(alloc, min, null);
+    const dict = try fst.FST.load(fst_bytes);
+    var iter = try dict.iterator(alloc, min, null);
     defer iter.deinit();
     var out = std.ArrayListUnmanaged([]u8).empty;
     errdefer {
@@ -339,17 +339,17 @@ pub fn fstLabelsInRangeAlloc(
 pub fn fstLabelsMatchingAutomatonAlloc(
     alloc: std.mem.Allocator,
     fst_bytes: []const u8,
-    automaton: vellum.Automaton,
+    automaton: fst.Automaton,
     start: ?[]const u8,
 ) ![][]u8 {
     if (fst_bytes.len == 0) return try alloc.alloc([]u8, 0);
-    const fst = try vellum.FST.load(fst_bytes);
-    var iter = try fst.search(alloc, automaton, start, null);
+    const dict = try fst.FST.load(fst_bytes);
+    var iter = try dict.search(alloc, automaton, start, null);
     defer iter.deinit();
     return try collectFstIteratorLabelsAlloc(alloc, &iter);
 }
 
-fn collectFstIteratorLabelsAlloc(alloc: std.mem.Allocator, iter: *vellum.FSTIterator) ![][]u8 {
+fn collectFstIteratorLabelsAlloc(alloc: std.mem.Allocator, iter: *fst.FSTIterator) ![][]u8 {
     var out = std.ArrayListUnmanaged([]u8).empty;
     errdefer {
         for (out.items) |label| alloc.free(label);
@@ -651,7 +651,7 @@ test "lexical FST artifact supports exact prefix range and automaton traversal" 
     }
     try std.testing.expectEqual(@as(usize, 2), ranged.len);
 
-    var starts = vellum.StartsWith{ .prefix = "br" };
+    var starts = fst.StartsWith{ .prefix = "br" };
     const matched = try fstLabelsMatchingAutomatonAlloc(alloc, fst_bytes, starts.automaton(), "br");
     defer {
         for (matched) |label| alloc.free(label);

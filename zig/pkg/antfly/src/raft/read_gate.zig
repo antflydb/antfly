@@ -106,12 +106,22 @@ pub const AppliedReadTracker = struct {
         return true;
     }
 
+    /// Retransmit only until one quorum proof arrives. Local apply can lag
+    /// independently; that must not keep issuing fresh ReadIndex requests.
+    pub fn needsReadIndex(self: *AppliedReadTracker, token: Token) bool {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        const waiter = self.waiters.get(token) orelse return false;
+        return waiter.target_index == null;
+    }
+
     pub fn noteApplied(self: *AppliedReadTracker, group_id: u64, applied_index: u64) !void {
         if (applied_index == 0) return;
         lock(&self.mutex);
         defer self.mutex.unlock();
         const entry = try self.applied_indexes.getOrPut(self.allocator, group_id);
-        if (!entry.found_existing or applied_index > entry.value_ptr.*) entry.value_ptr.* = applied_index;
+        if (entry.found_existing and applied_index <= entry.value_ptr.*) return;
+        entry.value_ptr.* = applied_index;
         const visible_index = entry.value_ptr.*;
         var waiters = self.waiters.iterator();
         while (waiters.next()) |waiter| {
@@ -119,6 +129,24 @@ pub const AppliedReadTracker = struct {
             const target_index = waiter.value_ptr.target_index orelse continue;
             if (visible_index >= target_index) waiter.value_ptr.complete = true;
         }
+    }
+
+    pub fn appliedIndex(self: *AppliedReadTracker, group_id: u64) u64 {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        return self.applied_indexes.get(group_id) orelse 0;
+    }
+
+    /// Consume the quorum proof independently of apply completion. Frozen
+    /// statement validation must reject a proof beyond its captured applied
+    /// index, not wait for the apply lock that the statement itself owns.
+    pub fn takeObservedIndex(self: *AppliedReadTracker, token: Token) ?u64 {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        const waiter = self.waiters.get(token) orelse return null;
+        const index = waiter.target_index orelse return null;
+        _ = self.waiters.remove(token);
+        return index;
     }
 
     pub fn observeReadStates(
@@ -143,6 +171,10 @@ pub const AppliedReadTracker = struct {
                 .group_id = group_id,
                 .request_id = request_id,
             }) orelse continue;
+            // A retransmission may return a later proof for this same logical
+            // read. Keep the first valid proof and never move its apply target
+            // or turn a completed waiter back into pending work.
+            if (waiter.target_index != null) continue;
             waiter.target_index = read_state.index;
             waiter.complete = applied_index >= read_state.index;
         }
@@ -219,12 +251,50 @@ pub const ReadSafetyBarrier = struct {
 
     pub const VTable = struct {
         wait_read_safe: *const fn (ptr: *anyopaque, group_id: u64, request_ctx: []const u8) anyerror!void,
+        capture_frozen: ?*const fn (*anyopaque, u64) anyerror!FrozenProof = null,
+        validate_frozen: ?*const fn (*anyopaque, u64, FrozenProof, ?u64, @import("../common/cancellation.zig").CancellationToken) anyerror!void = null,
+    };
+
+    pub const FrozenProof = struct {
+        incarnation: u128,
+        term: u64,
+        applied_index: u64,
+
+        pub fn validate(self: @This(), incarnation: u128, term: u64, is_leader: bool, quorum_index: u64) !void {
+            if (!is_leader or incarnation != self.incarnation or term != self.term) return error.NotLeader;
+            if (quorum_index > self.applied_index) return error.ReadUnavailable;
+        }
     };
 
     pub fn waitReadSafe(self: ReadSafetyBarrier, group_id: u64, request_ctx: []const u8) !void {
         try self.vtable.wait_read_safe(self.ptr, group_id, request_ctx);
     }
 };
+
+test "frozen read quorum proof is observable without falsely completing apply" {
+    var tracker = AppliedReadTracker.init(std.testing.allocator, 7);
+    defer tracker.deinit();
+    var first_buffer: [160]u8 = undefined;
+    var second_buffer: [160]u8 = undefined;
+    const frozen = try tracker.register(2, &first_buffer);
+    const ordinary = try tracker.register(2, &second_buffer);
+    try tracker.noteApplied(2, 10);
+    tracker.observeReadStates(2, &.{
+        .{ .index = 11, .request_ctx = @constCast(frozen.request_ctx) },
+        .{ .index = 11, .request_ctx = @constCast(ordinary.request_ctx) },
+    });
+    try std.testing.expect(!tracker.takeCompleted(ordinary.token));
+    try std.testing.expectEqual(@as(?u64, 11), tracker.takeObservedIndex(frozen.token));
+    try std.testing.expectEqual(@as(?u64, null), tracker.takeObservedIndex(frozen.token));
+    try tracker.noteApplied(2, 11);
+    try std.testing.expect(tracker.takeCompleted(ordinary.token));
+    const proof = ReadSafetyBarrier.FrozenProof{ .incarnation = 7, .term = 3, .applied_index = 10 };
+    try proof.validate(7, 3, true, 10);
+    try std.testing.expectError(error.ReadUnavailable, proof.validate(7, 3, true, 11));
+    try std.testing.expectError(error.NotLeader, proof.validate(7, 4, true, 10));
+    try std.testing.expectError(error.NotLeader, proof.validate(8, 3, true, 10));
+    try std.testing.expectError(error.NotLeader, proof.validate(7, 3, false, 10));
+}
 
 pub const ReadSafetyCallback = *const fn (ctx: ?*anyopaque, group_id: u64, request_ctx: []const u8) anyerror!void;
 
@@ -537,6 +607,25 @@ test "applied read tracker completes only after matching ReadState and applied i
     try std.testing.expect(!tracker.takeCompleted(second.token));
     try tracker.noteApplied(7001, 9);
     try std.testing.expect(tracker.takeCompleted(second.token));
+}
+
+test "applied read tracker retransmissions retain the first quorum proof" {
+    var tracker = AppliedReadTracker.init(std.testing.allocator, 7);
+    defer tracker.deinit();
+    var context: [96]u8 = undefined;
+    const read = try tracker.register(7001, &context);
+    try std.testing.expect(tracker.needsReadIndex(read.token));
+    tracker.observeReadStates(7001, &.{.{ .index = 9, .request_ctx = @constCast(read.request_ctx) }});
+    try std.testing.expect(!tracker.needsReadIndex(read.token));
+    try std.testing.expect(!tracker.takeCompleted(read.token));
+    tracker.observeReadStates(7001, &.{.{ .index = 20, .request_ctx = @constCast(read.request_ctx) }});
+    try tracker.noteApplied(7001, 9);
+    tracker.observeReadStates(7001, &.{.{ .index = 30, .request_ctx = @constCast(read.request_ctx) }});
+    try std.testing.expect(tracker.takeCompleted(read.token));
+    try std.testing.expect(!tracker.needsReadIndex(read.token));
+    const retired = try tracker.register(7001, &context);
+    tracker.retireGroup(7001);
+    try std.testing.expect(!tracker.needsReadIndex(retired.token));
 }
 
 test "applied read tracker rejects a delayed response from before restart" {

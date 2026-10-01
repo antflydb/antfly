@@ -19,7 +19,7 @@
 //! appends opaque byte entries. Usable for search persistence, Raft
 //! consensus log, KV storage, or any ordered-write-ahead pattern.
 //!
-//! Key encoding: LSN as u64 big-endian (LMDB sorts lexicographically).
+//! Key encoding: LSN as u64 big-endian for lexicographic ordering.
 //! Value format: [data_len: u32 LE][data: ...][CRC32: u32 LE]
 //! CRC covers data_len + data bytes.
 
@@ -34,52 +34,12 @@ const backend_erased = @import("backend_erased.zig");
 const backend_types = @import("backend_types.zig");
 const lsm_backend = @import("lsm_backend/mod.zig");
 const lsm_storage = @import("lsm_backend/storage_io.zig");
-const supports_lmdb = builtin.os.tag != .freestanding and build_options.lmdb_enabled;
-const lmdb = if (supports_lmdb) @import("lmdb.zig") else struct {
-    pub const CommitStats = struct {};
-    pub const CommitBackend = enum {
-        sync,
-        worker_thread,
-        async_io,
-        adaptive,
-    };
-    pub const CommitPublishPhase = enum {
-        before_publish,
-        after_data_sync,
-        after_meta_write,
-        after_meta_sync,
-    };
-    pub const Environment = struct {};
-};
-const lmdb_backend = if (supports_lmdb) @import("lmdb_backend.zig") else struct {
-    pub const Backend = struct {
-        env: lmdb.Environment = .{},
-
-        pub fn open(_: Allocator, _: [*:0]const u8, _: anytype) !@This() {
-            return error.UnsupportedPlatform;
-        }
-
-        pub fn close(_: *@This()) void {}
-
-        pub fn sync(_: *@This(), _: bool) !void {
-            return error.UnsupportedPlatform;
-        }
-
-        pub fn commitStatsSnapshot(_: *@This()) ?lmdb.CommitStats {
-            return null;
-        }
-
-        pub fn runtimeNamespaceStore(_: *@This(), _: Allocator) !backend_erased.NamespaceStore {
-            return error.UnsupportedPlatform;
-        }
-    };
-};
 const platform = @import("antfly_platform");
 const platform_time = @import("antfly_platform").time;
 const storage_sim = @import("sim_runtime.zig");
 const sim_fixture = @import("sim_fixture.zig");
 const wal_sim_fixture = @import("wal_sim_fixture.zig");
-const zig_lmdb = if (supports_lmdb or builtin.is_test) @import("lmdb_engine") else struct {
+const zig_lmdb = if (builtin.is_test) @import("lmdb_engine") else struct {
     pub const storage_sim_soak = false;
     pub const is_zig_backend = false;
 };
@@ -95,10 +55,9 @@ fn nextWalTmpNonce() u64 {
     return @atomicRmw(u64, &wal_tmp_nonce, .Add, 1, .seq_cst);
 }
 
-pub const CommitStats = lmdb.CommitStats;
-pub const CommitBackend = lmdb.CommitBackend;
+pub const CommitStats = struct {};
+pub const CommitBackend = enum { sync, worker_thread, async_io, adaptive };
 pub const StorageBackend = enum {
-    lmdb,
     lsm,
     lsm_memory,
 };
@@ -177,7 +136,7 @@ pub const WalStats = struct {
 
 pub const FullStats = struct {
     wal: WalStats,
-    commit: ?lmdb.CommitStats,
+    commit: ?CommitStats,
 };
 
 const CommitBatch = struct {
@@ -225,26 +184,17 @@ const DurabilitySyncStats = struct {
 const default_namespace: backend_types.Namespace = .{};
 
 const StoreOwner = union(enum) {
-    lmdb: *lmdb_backend.Backend,
     lsm: lsm_backend.BackendHandle,
 
-    fn close(self: *StoreOwner, alloc: Allocator) void {
+    fn close(self: *StoreOwner, _: Allocator) void {
         switch (self.*) {
-            .lmdb => |backend| {
-                backend.close();
-                alloc.destroy(backend);
-            },
             .lsm => |*handle| handle.close(),
         }
         self.* = undefined;
     }
 
-    fn abandonAfterCrash(self: *StoreOwner, alloc: Allocator) void {
+    fn abandonAfterCrash(self: *StoreOwner, _: Allocator) void {
         switch (self.*) {
-            .lmdb => |backend| {
-                backend.close();
-                alloc.destroy(backend);
-            },
             .lsm => |*handle| handle.abandonAfterCrash(),
         }
         self.* = undefined;
@@ -252,31 +202,24 @@ const StoreOwner = union(enum) {
 
     fn sync(self: *StoreOwner, force: bool) !void {
         switch (self.*) {
-            .lmdb => |backend| try backend.sync(force),
             .lsm => |*handle| try handle.backend.sync(force),
         }
     }
 
     fn checkpointLsmWalAfterDurableBoundary(self: *StoreOwner) !void {
         switch (self.*) {
-            .lmdb => {},
             .lsm => |*handle| try handle.backend.checkpointWalAfterDurableBoundary(),
         }
     }
 
     fn pinNativeCheckpoint(self: *StoreOwner) !lsm_backend.Backend.NativeCheckpoint {
         return switch (self.*) {
-            .lmdb => error.Unsupported,
             .lsm => |*handle| try handle.backend.pinNativeCheckpoint(),
         };
     }
 
     fn syncCommitDurability(self: *StoreOwner) !DurabilitySyncStats {
         return switch (self.*) {
-            .lmdb => |backend| blk: {
-                try backend.sync(true);
-                break :blk .{};
-            },
             // The LSM transaction has already appended and fsynced its replay
             // WAL. Sync that durable boundary without forcing an unrelated
             // memtable flush and compaction build on every outer WAL append.
@@ -292,36 +235,25 @@ const StoreOwner = union(enum) {
 
     fn commitProvidesDurability(self: *const StoreOwner) bool {
         return switch (self.*) {
-            .lmdb => true,
             .lsm => |*handle| handle.backend.commitProvidesDurability(),
         };
     }
 
     fn lsmWriteStatsSnapshot(self: *const StoreOwner) ?lsm_backend.Backend.WriteStats {
         return switch (self.*) {
-            .lmdb => null,
             .lsm => |*handle| handle.backend.snapshotWriteStats(),
         };
     }
 
-    fn commitStatsSnapshot(self: *StoreOwner) ?lmdb.CommitStats {
+    fn commitStatsSnapshot(self: *StoreOwner) ?CommitStats {
         return switch (self.*) {
-            .lmdb => |backend| backend.commitStatsSnapshot(),
             .lsm => null,
         };
     }
 
     fn runtimeNamespaceStore(self: StoreOwner, allocator: Allocator) !backend_erased.NamespaceStore {
         return switch (self) {
-            .lmdb => |backend| try backend.runtimeNamespaceStore(allocator),
             .lsm => |handle| try handle.backend.runtimeNamespaceStore(allocator),
-        };
-    }
-
-    fn lmdbEnv(self: *StoreOwner) ?*lmdb.Environment {
-        return switch (self.*) {
-            .lmdb => |backend| &backend.env,
-            .lsm => null,
         };
     }
 };
@@ -338,7 +270,10 @@ pub const WAL = struct {
     commit_scheduler: storage_sim.CompletionScheduler,
     // WAL's synchronous API has no scheduling dependency. This context parks
     // callers without starting executor workers; all condition users share it.
-    sync_io: std.Io = std.Io.Threaded.global_single_threaded.io(),
+    sync_io: std.Io = if (@import("builtin").os.tag == .freestanding)
+        .failing
+    else
+        std.Io.Threaded.global_single_threaded.io(),
     mutex: std.Io.Mutex = .init,
     completed: std.Io.Condition = .init,
     coordinator_active: bool = false,
@@ -451,18 +386,6 @@ pub const WAL = struct {
             .inner = .{
                 .write = try self.store.beginWrite(),
             },
-        };
-    }
-
-    fn beginLmdbFixtureTxn(self: *WAL) !FixtureTxn {
-        const env = self.store_owner.lmdbEnv() orelse return error.Unsupported;
-
-        var raw = try env.begin(.{});
-        errdefer raw.abort();
-        const dbi = try raw.openDb(null, .{ .create = true });
-        return .{
-            .raw = raw,
-            .dbi = dbi,
         };
     }
 
@@ -665,7 +588,7 @@ pub const WAL = struct {
         return self.stats;
     }
 
-    pub fn commitStatsSnapshot(self: *WAL) ?lmdb.CommitStats {
+    pub fn commitStatsSnapshot(self: *WAL) ?CommitStats {
         return self.store_owner.commitStatsSnapshot();
     }
 
@@ -854,7 +777,7 @@ pub const WAL = struct {
     pub const ScanAction = @import("docstore.zig").DocStore.ScanAction;
 
     /// Streaming callback-based iteration from a given LSN. Constant memory.
-    /// Callback receives entries with data pointing into LMDB mmap (valid only during call).
+    /// Callback receives borrowed entry data (valid only during the call).
     pub fn iterateFromStreaming(
         self: *WAL,
         from_lsn: u64,
@@ -1176,34 +1099,6 @@ pub const WAL = struct {
 
 fn openStoreOwner(alloc: Allocator, path: [*:0]const u8, opts: WalOptions) !StoreOwner {
     return switch (opts.resolvedBackend()) {
-        .lmdb => blk: {
-            if (!supports_lmdb) return error.UnsupportedPlatform;
-            if (!opts.read_only) {
-                var io_impl = std.Io.Threaded.init(alloc, .{});
-                defer io_impl.deinit();
-                try fs_paths.createDirPathPortable(io_impl.io(), std.mem.span(path));
-            }
-
-            const backend = try alloc.create(lmdb_backend.Backend);
-            errdefer alloc.destroy(backend);
-            backend.* = try lmdb_backend.Backend.open(alloc, path, .{
-                .backend = .{
-                    .read_only = opts.read_only,
-                    .durability = if (opts.no_sync) .none else .full,
-                    .create_if_missing = !opts.read_only,
-                },
-                .env = .{
-                    .max_dbs = 1,
-                    .map_size = opts.map_size,
-                    .no_sync = opts.no_sync,
-                    .read_only = opts.read_only,
-                    .artificial_sync_delay_ns = opts.artificial_sync_delay_ns,
-                    .commit_backend = opts.commit_backend,
-                },
-            });
-            errdefer backend.close();
-            break :blk .{ .lmdb = backend };
-        },
         .lsm => blk: {
             const path_slice = std.mem.span(path);
             const path_owned = try alloc.dupe(u8, path_slice);
@@ -1264,7 +1159,6 @@ fn openStoreOwner(alloc: Allocator, path: [*:0]const u8, opts: WalOptions) !Stor
 }
 
 fn resolvedCommitCompletionDelayNs(opts: WalOptions) u64 {
-    if (opts.resolvedBackend() == .lmdb) return 0;
     if (opts.artificial_sync_delay_ns > 0) return opts.artificial_sync_delay_ns;
     if (!opts.model_commit_backend_completions) return 0;
     return modeledCommitBackendCompletionNs(opts.commit_backend);
@@ -1278,37 +1172,6 @@ fn modeledCommitBackendCompletionNs(commit_backend: CommitBackend) u64 {
     };
 }
 
-const FixtureTxn = struct {
-    raw: lmdb.Transaction,
-    dbi: lmdb.Dbi,
-
-    fn abort(self: *FixtureTxn) void {
-        self.raw.abort();
-        self.* = undefined;
-    }
-
-    fn commit(self: *FixtureTxn) !void {
-        try self.raw.commit();
-        self.* = undefined;
-    }
-
-    fn publishCommitPhaseForTest(self: *FixtureTxn, phase: zig_lmdb.commit_support.CommitPublishPhase) !void {
-        try self.raw.publishCommitPhaseForTest(phase);
-    }
-
-    fn get(self: *FixtureTxn, key: []const u8) ![]const u8 {
-        return try self.raw.get(self.dbi, key);
-    }
-
-    fn put(self: *FixtureTxn, key: []const u8, value: []const u8) !void {
-        try self.raw.put(self.dbi, key, value, .{});
-    }
-
-    fn appendPut(self: *FixtureTxn, key: []const u8, value: []const u8) !void {
-        try self.raw.put(self.dbi, key, value, .{ .append = true });
-    }
-};
-
 fn requestOffsetInBatch(head: ?*AppendRequest, target: *AppendRequest) usize {
     var offset: usize = 0;
     var current = head;
@@ -1320,13 +1183,11 @@ fn requestOffsetInBatch(head: ?*AppendRequest, target: *AppendRequest) usize {
 }
 
 fn nowNs() u64 {
-    _ = builtin;
     return platform_time.monotonicNs();
 }
 
 fn elapsedSince(started: u64) u64 {
-    const now = nowNs();
-    return now - started;
+    return nowNs() - started;
 }
 
 fn sleepNs(ns: u64) void {
@@ -1355,11 +1216,6 @@ fn lockAtomic(mutex: *std.atomic.Mutex) void {
 }
 
 fn putWalValue(txn: anytype, key: []const u8, value: []const u8) !void {
-    if (comptime @TypeOf(txn.*) == FixtureTxn) {
-        try txn.appendPut(key, value);
-        return;
-    }
-
     txn.appendPut(key, value) catch |err| switch (err) {
         error.Unsupported => try txn.put(key, value),
         else => return err,
@@ -1577,21 +1433,6 @@ fn nextWalSimAction(
         } };
     }
     return .{ .verify_from = walSimVerifyFrom(random, runtime_next_lsn) };
-}
-
-fn nextWalCrashPreludeAction(random: std.Random, runtime_next_lsn: u64) WalSimAction {
-    const action = random.uintLessThanBiased(u8, 100);
-    if (action < 35 or runtime_next_lsn == 1) return .append;
-    if (action < 65) return .{ .append_batch = @intCast(2 + random.uintLessThanBiased(usize, 2)) };
-    if (action < 82) return .{ .reopen_and_verify_from = walSimVerifyFrom(random, runtime_next_lsn) };
-    return .{ .verify_from = walSimVerifyFrom(random, runtime_next_lsn) };
-}
-
-fn walCrashActionForCase(case_index: usize) WalSimAction {
-    return if ((case_index % 2) == 0)
-        .append
-    else
-        .{ .append_batch = 2 };
 }
 
 fn verifyWalSimState(
@@ -1885,150 +1726,6 @@ fn replayModeledWalSimActions(
     );
 }
 
-fn takeWalSnapshot(allocator: Allocator, path: [*:0]const u8, opts: WalOptions) ![]WalSimEntry {
-    var wal = try WAL.open(path, opts);
-    defer wal.close();
-
-    const entries = try wal.iterateFrom(allocator, 1);
-    defer allocator.free(entries);
-
-    const snapshot = try allocator.alloc(WalSimEntry, entries.len);
-    errdefer {
-        for (snapshot[0..entries.len]) |entry| allocator.free(entry.data);
-        allocator.free(snapshot);
-    }
-    for (entries, 0..) |entry, idx| {
-        snapshot[idx] = .{
-            .lsn = entry.lsn,
-            .data = @constCast(entry.data),
-        };
-    }
-    return snapshot;
-}
-
-fn freeWalSnapshot(allocator: Allocator, snapshot: []WalSimEntry) void {
-    for (snapshot) |entry| allocator.free(entry.data);
-    allocator.free(snapshot);
-}
-
-fn expectWalSnapshotsEqual(expected: []const WalSimEntry, actual: []const WalSimEntry) !void {
-    try std.testing.expectEqual(expected.len, actual.len);
-    for (expected, actual) |expected_entry, actual_entry| {
-        try std.testing.expectEqual(expected_entry.lsn, actual_entry.lsn);
-        try std.testing.expectEqualStrings(expected_entry.data, actual_entry.data);
-    }
-}
-
-fn walSnapshotsEqual(expected: []const WalSimEntry, actual: []const WalSimEntry) bool {
-    if (expected.len != actual.len) return false;
-    for (expected, actual) |expected_entry, actual_entry| {
-        if (expected_entry.lsn != actual_entry.lsn) return false;
-        if (!std.mem.eql(u8, expected_entry.data, actual_entry.data)) return false;
-    }
-    return true;
-}
-
-fn classifyWalCrashSnapshot(
-    before: []const WalSimEntry,
-    after: []const WalSimEntry,
-    actual: []const WalSimEntry,
-    phase: zig_lmdb.commit_support.CommitPublishPhase,
-) !WalCrashOutcome {
-    switch (phase) {
-        .before_data_sync, .after_data_sync_before_meta => {
-            try expectWalSnapshotsEqual(before, actual);
-            return .previous;
-        },
-        .after_meta_write_before_meta_sync => {
-            if (walSnapshotsEqual(before, actual)) return .previous_or_committed;
-            if (walSnapshotsEqual(after, actual)) return .previous_or_committed;
-            try expectWalSnapshotsEqual(after, actual);
-            return .previous_or_committed;
-        },
-        .fully_published => {
-            try expectWalSnapshotsEqual(after, actual);
-            return .committed;
-        },
-    }
-}
-
-fn applyWalCrashActionAtPath(
-    allocator: Allocator,
-    path: [*:0]const u8,
-    opts: WalOptions,
-    case_label: []const u8,
-    step: usize,
-    action: WalSimAction,
-    phase: lmdb.CommitPublishPhase,
-) !void {
-    var wal = try WAL.open(path, opts);
-    defer wal.close();
-
-    const next_lsn = wal.lastLsn() + 1;
-    var txn = try wal.beginLmdbFixtureTxn();
-    defer txn.abort();
-
-    switch (action) {
-        .append => {
-            const payload = try walSimPayload(allocator, case_label, step, 0);
-            defer allocator.free(payload);
-            try putEncodedEntry(&txn, next_lsn, payload);
-            try putNextLsnMeta(&txn, next_lsn + 1);
-        },
-        .append_batch => |count| {
-            var lsn = next_lsn;
-            for (0..count) |slot| {
-                const payload = try walSimPayload(allocator, case_label, step, slot);
-                defer allocator.free(payload);
-                try putEncodedEntry(&txn, lsn, payload);
-                lsn += 1;
-            }
-            try putNextLsnMeta(&txn, lsn);
-        },
-        else => return error.InvalidFixture,
-    }
-
-    try txn.publishCommitPhaseForTest(phase);
-}
-
-fn applyCommittedWalCrashActionAtPath(
-    allocator: Allocator,
-    path: [*:0]const u8,
-    opts: WalOptions,
-    case_label: []const u8,
-    step: usize,
-    action: WalSimAction,
-) !void {
-    var wal = try WAL.open(path, opts);
-    defer wal.close();
-
-    const next_lsn = wal.lastLsn() + 1;
-    var txn = try wal.beginLmdbFixtureTxn();
-    errdefer txn.abort();
-
-    switch (action) {
-        .append => {
-            const payload = try walSimPayload(allocator, case_label, step, 0);
-            defer allocator.free(payload);
-            try putEncodedEntry(&txn, next_lsn, payload);
-            try putNextLsnMeta(&txn, next_lsn + 1);
-        },
-        .append_batch => |count| {
-            var lsn = next_lsn;
-            for (0..count) |slot| {
-                const payload = try walSimPayload(allocator, case_label, step, slot);
-                defer allocator.free(payload);
-                try putEncodedEntry(&txn, lsn, payload);
-                lsn += 1;
-            }
-            try putNextLsnMeta(&txn, lsn);
-        },
-        else => return error.InvalidFixture,
-    }
-
-    try txn.commit();
-}
-
 fn applyPublicWalCrashAction(
     allocator: Allocator,
     wal: *WAL,
@@ -2237,61 +1934,6 @@ fn replayModeledWalCrashFixture(
     return outcome;
 }
 
-fn replayWalCrashWorkload(
-    allocator: Allocator,
-    opts: WalOptions,
-    case_label: []const u8,
-    prelude_actions: []const WalSimAction,
-    crash_action: WalSimAction,
-    phase: zig_lmdb.commit_support.CommitPublishPhase,
-) !WalCrashOutcome {
-    if (!zig_lmdb.is_zig_backend) return .previous_or_committed;
-    var fixture_opts = opts;
-    fixture_opts.backend = .lmdb;
-    fixture_opts.storage = null;
-    fixture_opts.lsm_options = .{};
-
-    var committed_path_buf: [256]u8 = undefined;
-    const committed_path = walTmpPathWithSuffix(&committed_path_buf, "crash-committed");
-    defer cleanupWalDir(committed_path);
-
-    var crash_path_buf: [256]u8 = undefined;
-    const crash_path = walTmpPathWithSuffix(&crash_path_buf, "crash-phase");
-    defer cleanupWalDir(crash_path);
-
-    _ = try replayWalSimActionsAtPath(allocator, committed_path, fixture_opts, case_label, prelude_actions, 0);
-    _ = try replayWalSimActionsAtPath(allocator, crash_path, fixture_opts, case_label, prelude_actions, 0);
-
-    const before_snapshot = try takeWalSnapshot(allocator, committed_path, fixture_opts);
-    defer freeWalSnapshot(allocator, before_snapshot);
-
-    try applyCommittedWalCrashActionAtPath(
-        allocator,
-        committed_path,
-        fixture_opts,
-        case_label,
-        prelude_actions.len,
-        crash_action,
-    );
-    const after_snapshot = try takeWalSnapshot(allocator, committed_path, fixture_opts);
-    defer freeWalSnapshot(allocator, after_snapshot);
-
-    try applyWalCrashActionAtPath(
-        allocator,
-        crash_path,
-        fixture_opts,
-        case_label,
-        prelude_actions.len,
-        crash_action,
-        phase,
-    );
-
-    const zig_reopened_snapshot = try takeWalSnapshot(allocator, crash_path, fixture_opts);
-    defer freeWalSnapshot(allocator, zig_reopened_snapshot);
-
-    return try classifyWalCrashSnapshot(before_snapshot, after_snapshot, zig_reopened_snapshot, phase);
-}
-
 fn walReplayArtifactPath(buf: []u8, suffix: []const u8) []const u8 {
     const base = "/tmp/antfly-wal-replay-";
     const ts = nowNs();
@@ -2322,46 +1964,6 @@ fn writeWalReplayFixtureArtifact(
         summary.visible_entries,
         summary.last_lsn,
         actions,
-    );
-    defer allocator.free(normalized);
-
-    var file = try std.Io.Dir.createFileAbsolute(std.testing.io, path, .{});
-    defer file.close(std.testing.io);
-
-    var file_buf: [4096]u8 = undefined;
-    var writer = file.writer(std.testing.io, &file_buf);
-    try writer.interface.writeAll(normalized);
-    try writer.end();
-
-    return path;
-}
-
-fn writeWalCrashFixtureArtifact(
-    allocator: Allocator,
-    opts: WalOptions,
-    case_label: []const u8,
-    seed: u64,
-    phase: zig_lmdb.commit_support.CommitPublishPhase,
-    expectation_note: []const u8,
-    expected_outcome: WalCrashOutcome,
-    prelude_actions: []const WalSimAction,
-    crash_action: WalSimAction,
-) !?[]u8 {
-    var path_buf: [256]u8 = undefined;
-    const artifact_path = walReplayArtifactPath(&path_buf, case_label);
-    const path = try allocator.dupe(u8, artifact_path);
-    errdefer allocator.free(path);
-
-    const normalized = try wal_sim_fixture.renderCrashArtifact(
-        allocator,
-        fixtureOptionsFromWalOptions(opts),
-        case_label,
-        seed,
-        fixturePhaseFromCommitPhase(phase),
-        expectation_note,
-        expected_outcome,
-        prelude_actions,
-        crash_action,
     );
     defer allocator.free(normalized);
 
@@ -2498,93 +2100,6 @@ fn expectWalCrashOutcome(
     }
 }
 
-fn fixturePhaseFromCommitPhase(phase: zig_lmdb.commit_support.CommitPublishPhase) wal_sim_fixture.CommitPhase {
-    return switch (phase) {
-        .before_data_sync => .before_data_sync,
-        .after_data_sync_before_meta => .after_data_sync_before_meta,
-        .after_meta_write_before_meta_sync => .after_meta_write_before_meta_sync,
-        .fully_published => .fully_published,
-    };
-}
-
-fn commitPhaseFromFixturePhase(phase: wal_sim_fixture.CommitPhase) zig_lmdb.commit_support.CommitPublishPhase {
-    return switch (phase) {
-        .before_data_sync => .before_data_sync,
-        .after_data_sync_before_meta => .after_data_sync_before_meta,
-        .after_meta_write_before_meta_sync => .after_meta_write_before_meta_sync,
-        .fully_published => .fully_published,
-    };
-}
-
-fn walCrashExpectationNoteForPhase(phase: zig_lmdb.commit_support.CommitPublishPhase) []const u8 {
-    return switch (phase) {
-        .before_data_sync, .after_data_sync_before_meta => "expected WAL reopen to preserve the previous committed snapshot",
-        .after_meta_write_before_meta_sync => "expected WAL reopen to match either the previous or newly committed snapshot",
-        .fully_published => "expected WAL reopen to preserve the newly committed snapshot",
-    };
-}
-
-fn reportReducedWalCrashSchedule(
-    allocator: Allocator,
-    opts: WalOptions,
-    case_label: []const u8,
-    seed: u64,
-    phase: zig_lmdb.commit_support.CommitPublishPhase,
-    prelude_actions: []const WalSimAction,
-    crash_action: WalSimAction,
-) !void {
-    const Replayer = struct {
-        allocator: Allocator,
-        opts: WalOptions,
-        case_label: []const u8,
-        phase: zig_lmdb.commit_support.CommitPublishPhase,
-        crash_action: WalSimAction,
-
-        pub fn replay(self: @This(), candidate: []const WalSimAction) !void {
-            _ = try replayWalCrashWorkload(self.allocator, self.opts, self.case_label, candidate, self.crash_action, self.phase);
-        }
-    };
-
-    const reduced = try zig_lmdb.sim.reduceFailingSequence(
-        WalSimAction,
-        allocator,
-        prelude_actions,
-        Replayer{
-            .allocator = allocator,
-            .opts = opts,
-            .case_label = case_label,
-            .phase = phase,
-            .crash_action = crash_action,
-        },
-    );
-    defer allocator.free(reduced);
-
-    const expected_outcome: WalCrashOutcome = switch (phase) {
-        .before_data_sync, .after_data_sync_before_meta => .previous,
-        .after_meta_write_before_meta_sync => .previous_or_committed,
-        .fully_published => .committed,
-    };
-
-    const artifact_path = writeWalCrashFixtureArtifact(
-        allocator,
-        opts,
-        case_label,
-        seed,
-        phase,
-        walCrashExpectationNoteForPhase(phase),
-        expected_outcome,
-        reduced,
-        crash_action,
-    ) catch |err| blk: {
-        std.debug.print("failed to write WAL crash artifact for {s}: {s}\n", .{ case_label, @errorName(err) });
-        break :blk null;
-    };
-    defer if (artifact_path) |path| allocator.free(path);
-
-    std.debug.print("reduced failing WAL crash prelude ({d} actions):\n", .{reduced.len});
-    if (artifact_path) |path| std.debug.print("replay fixture: {s}\n", .{path});
-}
-
 fn replayWalFixtureFile(allocator: Allocator, name: []const u8) !void {
     const path = try std.fmt.allocPrint(allocator, "pkg/antfly/src/storage/wal_sim_fixtures/{s}", .{name});
     defer allocator.free(path);
@@ -2605,18 +2120,7 @@ fn replayWalFixtureFile(allocator: Allocator, name: []const u8) !void {
             );
             try expectWalReplaySummary(fixture.case_label orelse fixture.label orelse name, fixture.opts, summary);
         },
-        .crash => {
-            if (!zig_lmdb.is_zig_backend) return;
-            const outcome = try replayWalCrashWorkload(
-                allocator,
-                walOptionsFromFixtureOptions(fixture.opts),
-                fixture.case_label orelse fixture.label orelse "wal-crash",
-                fixture.prelude_actions,
-                fixture.crash_action orelse return error.InvalidFixture,
-                commitPhaseFromFixturePhase(fixture.phase orelse return error.InvalidFixture),
-            );
-            try expectWalCrashOutcome(fixture.case_label orelse fixture.label orelse name, fixture.opts, outcome);
-        },
+        .crash => try replayModeledWalFixtureFile(allocator, name),
     }
 }
 
@@ -2866,46 +2370,6 @@ fn runModeledWalSimCase(
     try verifyWalSimState(allocator, &wal, model.items, runtime_next_lsn, 1);
 }
 
-fn runWalCrashCase(
-    allocator: Allocator,
-    opts: WalOptions,
-    case_label: []const u8,
-    seed: u64,
-    steps: usize,
-) !void {
-    const phases = [_]zig_lmdb.commit_support.CommitPublishPhase{
-        .before_data_sync,
-        .after_data_sync_before_meta,
-        .after_meta_write_before_meta_sync,
-    };
-
-    for (phases, 0..) |phase, phase_index| {
-        var prng = std.Random.DefaultPrng.init(seed + phase_index);
-        const random = prng.random();
-        var prelude: std.ArrayListUnmanaged(WalSimAction) = .empty;
-        defer prelude.deinit(allocator);
-
-        var simulated_runtime_next_lsn: u64 = 1;
-        for (0..steps) |_| {
-            const action = nextWalCrashPreludeAction(random, simulated_runtime_next_lsn);
-            try prelude.append(allocator, action);
-            switch (action) {
-                .append => simulated_runtime_next_lsn += 1,
-                .append_batch => |count| simulated_runtime_next_lsn += count,
-                .reopen_and_verify_from => {},
-                .verify_from => {},
-                else => unreachable,
-            }
-        }
-
-        const crash_action = walCrashActionForCase(phase_index + case_label.len);
-        _ = replayWalCrashWorkload(allocator, opts, case_label, prelude.items, crash_action, phase) catch |err| {
-            reportReducedWalCrashSchedule(allocator, opts, case_label, seed, phase, prelude.items, crash_action) catch {};
-            return err;
-        };
-    }
-}
-
 fn runWalSoak(allocator: Allocator) !void {
     const sim_cases = [_]WalSimCase{
         .{ .label = "soak-adaptive-a", .opts = .{}, .seed = 0xA17F_A001, .steps = 120 },
@@ -2924,9 +2388,6 @@ fn runWalSoak(allocator: Allocator) !void {
     for (sim_cases) |case| {
         try runWalSimCase(allocator, case);
     }
-
-    try runWalCrashCase(allocator, .{}, "soak-crash-default", 0xA17F_A101, 12);
-    try runWalCrashCase(allocator, .{ .commit_backend = .async_io }, "soak-crash-async-io", 0xA17F_A102, 12);
 }
 
 test "wal defaults to adaptive commit backend" {
@@ -3282,13 +2743,6 @@ test "wal modeled storage commit delay uses injected virtual clock" {
     try std.testing.expectEqual(@as(u64, 3 * std.time.ns_per_ms), stats.total_wait_ns);
 }
 
-test "wal crash publish phases survive reopen" {
-    if (!zig_lmdb.is_zig_backend) return;
-    const allocator = std.testing.allocator;
-    try runWalCrashCase(allocator, .{}, "crash-default", 0xA17F_3001, 6);
-    try runWalCrashCase(allocator, .{ .commit_backend = .async_io }, "crash-async-io", 0xA17F_3002, 6);
-}
-
 test "wal replay fixtures stay green" {
     try runWalReplayFixtures(std.testing.allocator);
 }
@@ -3605,27 +3059,6 @@ test "wal async-io group commit coalesces concurrent appends" {
     }
 
     return error.TestExpectedEqual;
-}
-
-test "wal exposes underlying lmdb commit stats when available" {
-    var buf: [256]u8 = undefined;
-    const path = walTmpPath(&buf);
-    defer cleanupWalDir(path);
-
-    var wal = try WAL.open(path, .{});
-    defer wal.close();
-
-    _ = try wal.append("hello");
-
-    const full = wal.fullStatsSnapshot();
-    try std.testing.expectEqual(@as(u64, 1), full.wal.append_calls);
-    if (full.commit) |commit| {
-        try std.testing.expect(commit.publish_calls >= 1);
-        try std.testing.expect(commit.full_publish_calls >= 1);
-        try std.testing.expect(commit.page_images_written > 0);
-        try std.testing.expect(commit.bytes_written > 0);
-        try std.testing.expect(commit.total_publish_ns > 0);
-    }
 }
 
 test "wal async-io commit backend survives repeated append and reopen" {
@@ -4243,7 +3676,6 @@ test "wal routes lsm profile options" {
 
     switch (wal.store_owner) {
         .lsm => |handle| try std.testing.expectEqual(@as(usize, 37), handle.backend.options.flush_threshold),
-        else => return error.TestUnexpectedResult,
     }
 }
 

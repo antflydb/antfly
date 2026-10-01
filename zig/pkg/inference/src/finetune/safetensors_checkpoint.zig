@@ -34,6 +34,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const compat = @import("../io/compat.zig");
+const Control = @import("../execution_control.zig").InferenceExecutionControl;
 
 pub const NamedTensor = struct {
     name: []const u8,
@@ -51,11 +52,26 @@ pub fn save(
     path: []const u8,
     tensors: []const NamedTensor,
 ) !void {
+    return saveControlled(allocator, path, tensors, null, false);
+}
+
+/// The durable checkpoint owner publishes this file only after it is synced.
+/// Exclusive temporary creation prevents concurrent writers from sharing a
+/// staging file. Cancellation is checked between bounded payload chunks.
+pub fn saveControlled(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    tensors: []const NamedTensor,
+    control: ?Control,
+    exclusive: bool,
+) !void {
+    if (control) |active| try active.check();
     // 1. Compute per-tensor byte offsets within the data section.
     var offsets = try allocator.alloc(u64, tensors.len + 1);
     defer allocator.free(offsets);
     offsets[0] = 0;
     for (tensors, 0..) |t, i| {
+        if (control) |active| try active.check();
         offsets[i + 1] = offsets[i] + @as(u64, t.data.len) * 4;
     }
 
@@ -96,7 +112,9 @@ pub fn save(
         if (dir.len > 0) try compat.cwd().createDirPath(compat.io(), dir);
     }
     const io = compat.io();
-    var file = try compat.cwd().createFile(io, path, .{ .truncate = true });
+    if (control) |active| try active.check();
+    var file = try compat.cwd().createFile(io, path, .{ .truncate = true, .exclusive = exclusive });
+    errdefer if (exclusive) compat.cwd().deleteFile(io, path) catch {};
     defer file.close(io);
     var write_buffer: [64 * 1024]u8 = undefined;
     var file_writer = file.writer(io, &write_buffer);
@@ -118,9 +136,17 @@ pub fn save(
         // already little-endian, so we can write the slice directly.
         // On big-endian hosts we swap each element.
         if (comptime builtin.cpu.arch.endian() == .little) {
-            try w.writeAll(std.mem.sliceAsBytes(t.data));
+            const bytes = std.mem.sliceAsBytes(t.data);
+            var offset: usize = 0;
+            while (offset < bytes.len) {
+                if (control) |active| try active.check();
+                const end = offset + @min(bytes.len - offset, 256 * 1024);
+                try w.writeAll(bytes[offset..end]);
+                offset = end;
+            }
         } else {
-            for (t.data) |val| {
+            for (t.data, 0..) |val, i| {
+                if ((i & 65535) == 0) if (control) |active| try active.check();
                 var le_buf: [4]u8 = undefined;
                 std.mem.writeInt(u32, &le_buf, @bitCast(val), .little);
                 try w.writeAll(&le_buf);
@@ -129,5 +155,7 @@ pub fn save(
     }
 
     try w.flush();
+    if (control) |active| try active.check();
     try file.sync(io);
+    if (control) |active| try active.check();
 }

@@ -13,6 +13,7 @@ pub const TavilySearchConfig = types.TavilySearchConfig;
 pub const VertexSearchConfig = types.VertexSearchConfig;
 pub const WebSearchConfig = types.WebSearchConfig;
 pub const WebSearchProvider = types.WebSearchProvider;
+pub const WebSearchProviderConfig = types.WebSearchProviderConfig;
 pub const WebSearchResponse = types.WebSearchResponse;
 pub const WebSearchResult = types.WebSearchResult;
 pub const YouSearchConfig = types.YouSearchConfig;

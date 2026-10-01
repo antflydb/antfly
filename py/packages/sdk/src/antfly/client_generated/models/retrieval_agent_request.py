@@ -15,8 +15,8 @@ if TYPE_CHECKING:
     from ..models.chat_tools_config import ChatToolsConfig
     from ..models.filter_spec import FilterSpec
     from ..models.generator_config import GeneratorConfig
+    from ..models.query_request import QueryRequest
     from ..models.retrieval_agent_steps import RetrievalAgentSteps
-    from ..models.retrieval_query_request import RetrievalQueryRequest
 
 
 T = TypeVar("T", bound="RetrievalAgentRequest")
@@ -25,7 +25,8 @@ T = TypeVar("T", bound="RetrievalAgentRequest")
 @_attrs_define
 class RetrievalAgentRequest:
     """Request for the retrieval agent. Queries define which tables and indexes
-    to search, each as a QueryRequest with optional tree search configuration.
+    to search, each as an ordinary QueryRequest. Optional tree or graph exploration
+    is configured by steps.retrieval.navigation, targeting one query by index.
 
     **Pipeline mode** (default, max_internal_iterations=0): Queries are executed
     directly without an LLM tool-calling loop.
@@ -42,7 +43,7 @@ class RetrievalAgentRequest:
 
         Attributes:
             query (str): User's natural language query Example: How do I configure OAuth?.
-            queries (list[RetrievalQueryRequest]): Queries to execute. Each query carries its own table via the
+            queries (list[QueryRequest]): Queries to execute. Each query carries its own table via the
                 QueryRequest table field.
 
                 In pipeline mode (max_internal_iterations=0), these are executed directly.
@@ -103,14 +104,28 @@ class RetrievalAgentRequest:
                 behavior.
                 Each step can have its own generator (or chain of generators) and step-specific options.
                 If a step is not configured, it is skipped (retrieval always runs).
-            document_renderer (str | Unset): Handlebars template for rendering documents in the generation prompt.
-                Default uses TOON format for token efficiency.
-                Requires steps.generation to be set.
+            document_renderer (str | Unset): Handlebars template that renders each retrieved document in the
+                generation prompt. Requires steps.generation to be set.
+
+                The template is rendered once per hit against `{id, score, fields}`,
+                where `fields` is the hit's source. When omitted, each document's
+                fields are encoded as TOON (Token-Oriented Object Notation), which
+                carries the same structure as JSON in fewer tokens.
+
+                Helpers: `encodeToon` (options `indent`, 1 to 16, default 2; and
+                `delimiter`: `comma`, `tab`, or `pipe`), `scrubHtml`, `eq`, and
+                `media`. Values in `{{...}}` are HTML-escaped; use `{{{...}}}` for
+                raw text.
+
+                Examples:
+                - `{{encodeToon this.fields}}`
+                - `{{encodeToon this.fields delimiter="tab"}}`
+                - `Title: {{{this.fields.title}}}`
                  Example: {{encodeToon this.fields}}.
     """
 
     query: str
-    queries: list[RetrievalQueryRequest]
+    queries: list[QueryRequest]
     messages: list[ChatMessage] | Unset = UNSET
     agent_knowledge: str | Unset = UNSET
     accumulated_filters: list[FilterSpec] | Unset = UNSET
@@ -251,8 +266,8 @@ class RetrievalAgentRequest:
         from ..models.chat_tools_config import ChatToolsConfig
         from ..models.filter_spec import FilterSpec
         from ..models.generator_config import GeneratorConfig
+        from ..models.query_request import QueryRequest
         from ..models.retrieval_agent_steps import RetrievalAgentSteps
-        from ..models.retrieval_query_request import RetrievalQueryRequest
 
         d = dict(src_dict)
         query = d.pop("query")
@@ -260,7 +275,7 @@ class RetrievalAgentRequest:
         queries = []
         _queries = d.pop("queries")
         for queries_item_data in _queries:
-            queries_item = RetrievalQueryRequest.from_dict(queries_item_data)
+            queries_item = QueryRequest.from_dict(queries_item_data)
 
             queries.append(queries_item)
 

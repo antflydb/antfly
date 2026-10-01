@@ -755,8 +755,25 @@ test "serverless background publisher loop publishes asynchronously and latest r
     });
     defer next_ingest.deinit(alloc);
 
+    const PublicationBarrier = struct {
+        ready: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+
+        fn reach(ptr: *anyopaque, event: @import("builder.zig").PublicationLifecycleEvent) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (event.candidate_version != 2) return;
+            self.ready.set(std.testing.io);
+            self.release.waitUncancelable(std.testing.io);
+        }
+    };
+    var barrier: PublicationBarrier = .{};
+    builder.setPublicationLifecycleHook(.{ .ptr = &barrier, .reach_fn = PublicationBarrier.reach });
+    defer builder.setPublicationLifecycleHook(null);
+
     var publisher = BackgroundPublisher.init(alloc, std.testing.io, &catalog, 1);
     defer publisher.deinit();
+    // Release a parked worker before deinit joins it, including assertion failures.
+    defer barrier.release.set(std.testing.io);
     {
         var unavailable = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .nothing });
         defer unavailable.deinit();
@@ -774,21 +791,27 @@ test "serverless background publisher loop publishes asynchronously and latest r
 
     var query = @import("../query/mod.zig").QueryRuntime.init(alloc, &artifact_store, &manifest_store, &progress_store);
     defer query.deinit();
-    var latest_seen_tail = false;
-    var attempts: usize = 0;
-    while (attempts < 50) : (attempts += 1) {
-        const head = progress_store.getHead("docs") catch 0;
+    // Park the worker immediately before HEAD CAS. Read the old manifest and
+    // its WAL tail at a known publication boundary, regardless of disk speed.
+    try barrier.ready.waitTimeout(std.testing.io, .{ .duration = .{
+        .raw = .fromSeconds(10),
+        .clock = .awake,
+    } });
+    try std.testing.expectEqual(@as(u64, 1), try progress_store.getHead("docs"));
+    {
         var session = try query.openHeadSession("docs");
         defer session.deinit();
         const tail = try wal_store.readFromAlloc("docs", session.manifest.wal_end_lsn + 1);
         defer @import("../wal/mod.zig").freeRecords(alloc, tail);
         try std.testing.expect(session.manifest.wal_end_lsn <= try wal_store.latestLsn("docs"));
-        if (tail.len > 0) latest_seen_tail = true;
-        if (head >= 2) break;
-        sleepMs(5);
+        try std.testing.expect(tail.len > 0);
     }
-
-    try std.testing.expect(latest_seen_tail);
+    barrier.release.set(std.testing.io);
+    // The parked worker already owns run_mutex. Acquiring it after release
+    // joins that publication pass without a scheduler-speed polling window.
+    publisher.run_mutex.lockUncancelable(publisher.io);
+    publisher.run_mutex.unlock(publisher.io);
+    if (publisher.runtimeFailure()) |err| return err;
     try std.testing.expectEqual(@as(u64, 2), try progress_store.getHead("docs"));
     publisher.stop();
     publisher.poll_interval_ms = 60_000;

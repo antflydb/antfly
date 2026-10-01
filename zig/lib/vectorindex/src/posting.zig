@@ -41,6 +41,9 @@ pub const PostingView = struct {
 pub const PostingState = types.PostingState;
 
 pub const PostingMaintenanceOptions = struct {
+    /// Resume an optional state scan without revisiting its clean prefix.
+    start_node: u64 = 1,
+    max_scanned_nodes: usize = std.math.maxInt(usize),
     max_postings: usize = std.math.maxInt(usize),
     refresh_payloads: bool = true,
     /// Decode-check stored quantized payloads against the current posting
@@ -61,6 +64,8 @@ pub const PostingMaintenanceOptions = struct {
 };
 
 pub const PostingMaintenanceResult = struct {
+    /// Zero means the scan reached the current end; otherwise resume here.
+    next_node: u64 = 0,
     scanned_nodes: u64 = 0,
     scanned_postings: u64 = 0,
     dirty_postings: u64 = 0,

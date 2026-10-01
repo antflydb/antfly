@@ -28,6 +28,7 @@ const contracts = @import("backend_contracts.zig");
 const ops_mod = @import("../ops/ops.zig");
 const native_mod = @import("../ops/native_compute.zig");
 const cache_mod = @import("cache.zig");
+const buffer_plan_mod = @import("buffer_plan.zig");
 const compiled_backend = @import("compiled_backend.zig");
 const compiled_registry = @import("compiled_registry.zig");
 const interpreter = @import("interpreter.zig");
@@ -83,9 +84,11 @@ pub const Runtime = struct {
     default_backend: *const ComputeBackend,
     mesh: ?device_mesh_mod.DeviceMesh = null,
     plan: ?multi_executor.DevicePartitionPlan = null,
+    buffer_plan: ?buffer_plan_mod.BufferPlan = null,
     runtime_cache_entry: ?cache_mod.CacheEntry = null,
     native_partition_executors: std.ArrayListUnmanaged(*native_partition_executor.NativePartitionExecutor) = .empty,
-    fallback_native: ?FallbackNativeBackend = null,
+    // DeviceMesh borrows this backend across moves of Runtime itself.
+    fallback_native: ?*FallbackNativeBackend = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -111,6 +114,8 @@ pub const Runtime = struct {
     }
 
     pub fn deinit(self: *Runtime) void {
+        if (self.buffer_plan) |*plan| plan.deinit();
+        self.buffer_plan = null;
         if (self.plan) |*plan| {
             plan.deinit();
             self.plan = null;
@@ -128,8 +133,9 @@ pub const Runtime = struct {
             mesh.deinit();
             self.mesh = null;
         }
-        if (self.fallback_native) |*fallback| {
+        if (self.fallback_native) |fallback| {
             fallback.deinit(self.allocator);
+            self.allocator.destroy(fallback);
             self.fallback_native = null;
         }
     }
@@ -154,7 +160,11 @@ pub const Runtime = struct {
             .partitioned, .compiled_preferred, .compiled_required => {
                 const plan = self.plan orelse return error.MissingGraphRuntimePlan;
                 const mesh = self.mesh orelse return error.MissingGraphRuntimeMesh;
-                var result = try multi_executor.executeMultiDevice(allocator, graph, &plan, &mesh, options);
+                var planned_options = options;
+                if (planned_options.cached_buffer_plan == null) {
+                    if (self.buffer_plan) |*buffers| planned_options.cached_buffer_plan = buffers;
+                }
+                var result = try multi_executor.executeMultiDevice(allocator, graph, &plan, &mesh, planned_options);
                 errdefer result.deinit(&mesh);
                 try self.normalizeOutputsToDefaultDevice(allocator, &result);
                 const outputs = result.outputs;
@@ -275,6 +285,7 @@ pub const Runtime = struct {
         };
         plan_installed = true;
         try self.attachCompiledPartitionExecutors(graph, backend, target_kind);
+        self.buffer_plan = try buffer_plan_mod.build(self.allocator, graph, &self.plan.?.base, .{});
     }
 
     fn allComputePartitionsHaveAttachedExecutors(self: *const Runtime, graph: *const Graph) bool {
@@ -370,11 +381,14 @@ pub const Runtime = struct {
         const compute = try self.allocator.create(NativeCompute);
         errdefer self.allocator.destroy(compute);
         compute.* = NativeCompute.init(self.allocator, weight_store, null);
-        self.fallback_native = .{
+        errdefer compute.deinit();
+        const fallback = try self.allocator.create(FallbackNativeBackend);
+        fallback.* = .{
             .weight_store = weight_store,
             .compute = compute,
             .backend = compute.computeBackend(),
         };
+        self.fallback_native = fallback;
     }
 
     fn normalizeOutputsToDefaultDevice(
@@ -678,6 +692,13 @@ fn dumpPartitionReport(
             }
             for (part.node_ids) |node_id| {
                 addOpCount(&fallback_counts, &fallback_used, @tagName(graph.node(node_id).op));
+                if (include_parts) {
+                    const node = graph.node(node_id);
+                    std.debug.print("graph-partition-report fallback node={d} op={s} shape={any} attrs={any}\n", .{ node_id, @tagName(node.op), node.output_shape, node.op });
+                    for (node.getInputs()) |input| if (input != ml.graph.null_node) {
+                        std.debug.print("graph-partition-report fallback input={d} shape={any}\n", .{ input, graph.node(input).output_shape });
+                    };
+                }
             }
         }
     }

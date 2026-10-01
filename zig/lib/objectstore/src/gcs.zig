@@ -127,12 +127,14 @@ pub const TransportResponse = struct {
     status: u16,
     body: []u8,
     etag: ?[]u8 = null,
+    generation: ?[]u8 = null,
     content_type: ?[]u8 = null,
     location: ?[]u8 = null,
 
     pub fn deinit(self: *TransportResponse, alloc: Allocator) void {
         alloc.free(self.body);
         if (self.etag) |value| alloc.free(value);
+        if (self.generation) |value| alloc.free(value);
         if (self.content_type) |value| alloc.free(value);
         if (self.location) |value| alloc.free(value);
         self.* = undefined;
@@ -211,7 +213,7 @@ const HttpxTransport = struct {
         }) catch |err| return if (err == error.Cancelled) error.Canceled else err;
         defer response.deinit();
 
-        return try transportResponseAlloc(
+        var result = try transportResponseAlloc(
             alloc,
             response.status.code,
             response.body orelse "",
@@ -219,6 +221,9 @@ const HttpxTransport = struct {
             response.headers.get("Content-Type"),
             response.headers.get("Location"),
         );
+        errdefer result.deinit(alloc);
+        if (response.headers.get("x-goog-generation")) |generation| result.generation = try alloc.dupe(u8, generation);
+        return result;
     }
 };
 
@@ -341,6 +346,27 @@ pub const JsonApiClient = struct {
             409 => return,
             else => return mapUnexpectedStatus(response.status),
         }
+    }
+
+    /// Atomic JSON API publication against a generation obtained with the
+    /// payload. Generation "0" creates only when no live object exists.
+    /// ETag If-Match is a read precondition in GCS, not an upload CAS.
+    pub fn putObjectAtGeneration(self: *JsonApiClient, alloc: Allocator, bucket: []const u8, key: []const u8, body: []const u8, generation: []const u8, content_type: []const u8) !void {
+        if (generation.len == 0 or generation.len > 20) return error.InvalidArgument;
+        for (generation) |digit| if (!std.ascii.isDigit(digit)) return error.InvalidArgument;
+        _ = std.fmt.parseInt(u64, generation, 10) catch return error.InvalidArgument;
+        const base = try uploadMediaUrlAlloc(alloc, self.cfg, bucket, key, .{});
+        defer alloc.free(base);
+        const url = try std.fmt.allocPrint(alloc, "{s}&ifGenerationMatch={s}", .{ base, generation });
+        defer alloc.free(url);
+        var response = try self.performWithResponseLimit(.POST, url, &.{}, body, content_type, 64 * 1024);
+        defer response.deinit(self.alloc);
+        return switch (response.status) {
+            200, 201 => {},
+            304, 412 => error.PreconditionFailed,
+            404 => error.FileNotFound,
+            else => mapUnexpectedStatus(response.status),
+        };
     }
 
     fn putObject(
@@ -674,6 +700,7 @@ pub const JsonApiClient = struct {
         meta.content_length = @intCast(response.body.len);
         if (opts.skip_metadata_probe) {
             if (response.etag) |value| meta.etag = try alloc.dupe(u8, value);
+            if (response.generation) |value| meta.version_id = try alloc.dupe(u8, value);
         }
         if (response.content_type) |value| {
             if (meta.content_type) |current| alloc.free(current);

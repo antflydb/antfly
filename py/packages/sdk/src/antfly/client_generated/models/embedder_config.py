@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.embedder_config_inputs_item import EmbedderConfigInputsItem
 from ..models.embedder_provider import EmbedderProvider
 from ..types import UNSET, Unset
 
@@ -19,7 +20,7 @@ T = TypeVar("T", bound="EmbedderConfig")
 
 @_attrs_define
 class EmbedderConfig:
-    r"""A unified configuration for an embedding provider.
+    """A unified configuration for an embedding provider.
 
     Embedders can be configured with templates to customize how documents are
     converted to text before embedding. Templates use Handlebars syntax and
@@ -76,50 +77,9 @@ class EmbedderConfig:
 
        See: https://antfly.io/docs/configuration#security--cors
 
-    4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation)
-       ```handlebars
-       {{encodeToon this.fields}}
-       {{encodeToon this.fields lengthMarker=false indent=4}}
-       {{encodeToon this.fields delimiter="\t"}}
-       ```
-
-       **What is TOON?**
-       TOON is a compact, human-readable format designed for passing structured data to LLMs.
-       It provides **30-60% token reduction** compared to JSON while maintaining high LLM
-       comprehension accuracy.
-
-       **Key Features:**
-       - Compact syntax using `:` for key-value pairs
-       - Array length markers: `tags[#3]: ai,search,ml`
-       - Tabular format for uniform data structures
-       - Optimized for LLM parsing and understanding
-       - Maintains human readability
-
-       **Benefits:**
-       - **Lower API costs** - Reduced token usage means lower LLM API costs
-       - **Faster responses** - Less tokens to process
-       - **More context** - Fit more documents within token limits
-
-       **Options:**
-       - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true)
-       - `indent` (int): Indentation spacing for nested objects (default: 2)
-       - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs)
-
-       **Example output:**
-       ```
-       title: Introduction to Vector Search
-       author: Jane Doe
-       tags[#3]: ai,search,ml
-       metadata:
-         edition: 2
-         pages: 450
-       ```
-
-       **Default in RAG:** TOON is the default format for document rendering in RAG queries.
-
-       **References:**
-       - TOON Specification: https://github.com/toon-format/toon
-       - Go Implementation: https://github.com/alpkeskin/gotoon
+    4. **encodeToon** is not available in these templates. It is a helper of the
+       retrieval agent's `document_renderer`, which renders documents into the
+       generation prompt as TOON by default.
 
     **Template Examples:**
 
@@ -202,22 +162,23 @@ class EmbedderConfig:
                 endpoint, operation, model, credential source, project and region/location.
                 Conflicting policies for an active scope are rejected. These limits do
                 not coordinate across replicas or infer the provider's account quota.
-            multimodal (bool | Unset): Declare that this model supports non-text content (images, audio, video, PDFs),
-                even if the model isn't in Antfly's built-in model registry yet.
+            inputs (list[EmbedderConfigInputsItem] | Unset): Input types the model accepts. Normally omitted: Antfly learns
+                them from the
+                model's capabilities, which Antfly inference publishes for every model it
+                serves. Set it only to use a model whose capabilities Antfly cannot discover
+                yet, such as a newly released model. When set, it replaces the discovered
+                input types.
 
-                When `true`, Antfly treats the model as multimodal and sends binary content
-                (images, audio, etc.) through an embedding adapter that supports content parts.
-                Antfly currently provides that contract for local Antfly inference and Bedrock;
-                text-only provider adapters reject media rather than silently discarding it.
-
-                Not needed for models already in the local registry (e.g., `clip-*`, `clipclap`).
+                Only providers whose adapters can send media accept media inputs: `antfly`
+                (`image`, `audio`) and `bedrock` (`image`). Other providers reject `image` and
+                `audio` here rather than silently discarding media.
 
                 **Example:**
                 ```json
                 {
                   "provider": "antfly",
                   "model": "some-future-multimodal-model",
-                  "multimodal": true
+                  "inputs": ["text", "image"]
                 }
                 ```
             query_input_type (str | Unset): Deprecated compatibility form of
@@ -238,7 +199,7 @@ class EmbedderConfig:
 
     provider: EmbedderProvider
     rate_limit: RateLimitConfig | Unset = UNSET
-    multimodal: bool | Unset = UNSET
+    inputs: list[EmbedderConfigInputsItem] | Unset = UNSET
     query_input_type: str | Unset = UNSET
     document_input_type: str | Unset = UNSET
     query_instruction: str | Unset = UNSET
@@ -252,7 +213,12 @@ class EmbedderConfig:
         if not isinstance(self.rate_limit, Unset):
             rate_limit = self.rate_limit.to_dict()
 
-        multimodal = self.multimodal
+        inputs: list[str] | Unset = UNSET
+        if not isinstance(self.inputs, Unset):
+            inputs = []
+            for inputs_item_data in self.inputs:
+                inputs_item = inputs_item_data.value
+                inputs.append(inputs_item)
 
         query_input_type = self.query_input_type
 
@@ -273,8 +239,8 @@ class EmbedderConfig:
         )
         if rate_limit is not UNSET:
             field_dict["rate_limit"] = rate_limit
-        if multimodal is not UNSET:
-            field_dict["multimodal"] = multimodal
+        if inputs is not UNSET:
+            field_dict["inputs"] = inputs
         if query_input_type is not UNSET:
             field_dict["query_input_type"] = query_input_type
         if document_input_type is not UNSET:
@@ -301,7 +267,14 @@ class EmbedderConfig:
         else:
             rate_limit = RateLimitConfig.from_dict(_rate_limit)
 
-        multimodal = d.pop("multimodal", UNSET)
+        _inputs = d.pop("inputs", UNSET)
+        inputs: list[EmbedderConfigInputsItem] | Unset = UNSET
+        if _inputs is not UNSET:
+            inputs = []
+            for inputs_item_data in _inputs:
+                inputs_item = EmbedderConfigInputsItem(inputs_item_data)
+
+                inputs.append(inputs_item)
 
         query_input_type = d.pop("query_input_type", UNSET)
 
@@ -319,7 +292,7 @@ class EmbedderConfig:
         embedder_config = cls(
             provider=provider,
             rate_limit=rate_limit,
-            multimodal=multimodal,
+            inputs=inputs,
             query_input_type=query_input_type,
             document_input_type=document_input_type,
             query_instruction=query_instruction,

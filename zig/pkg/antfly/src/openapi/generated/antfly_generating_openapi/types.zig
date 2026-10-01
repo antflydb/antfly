@@ -558,6 +558,10 @@ pub const GeneratorConfig = struct {
     timeout: ?i64 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
+    /// OpenAI completion budget, including visible output and reasoning tokens. Use for reasoning models instead of max_tokens; the two are mutually exclusive.
+    max_completion_tokens: ?i64 = null,
+    /// Optional reasoning effort. Supported values depend on the selected OpenAI model.
+    reasoning_effort: ?OpenAIReasoningEffort = null,
     /// Penalty for token frequency (-2.0 to 2.0).
     frequency_penalty: ?f32 = null,
     /// Penalty for token presence (-2.0 to 2.0).
@@ -579,6 +583,8 @@ pub const GeneratorConfig = struct {
         .{ "credentials_path", "credentials_path", true },
         .{ "timeout", "timeout", true },
         .{ "api_url", "api_url", true },
+        .{ "max_completion_tokens", "max_completion_tokens", true },
+        .{ "reasoning_effort", "reasoning_effort", true },
         .{ "frequency_penalty", "frequency_penalty", true },
         .{ "presence_penalty", "presence_penalty", true },
         .{ "rate_limit", "rate_limit", false },
@@ -646,6 +652,14 @@ pub const GeneratorConfig = struct {
             try jw.objectField("api_url");
             try jw.write(value);
         }
+        if (self.max_completion_tokens) |value| {
+            try jw.objectField("max_completion_tokens");
+            try jw.write(value);
+        }
+        if (self.reasoning_effort) |value| {
+            try jw.objectField("reasoning_effort");
+            try jw.write(value);
+        }
         if (self.frequency_penalty) |value| {
             try jw.objectField("frequency_penalty");
             try jw.write(value);
@@ -671,6 +685,7 @@ pub const GeneratorProvider = enum {
     vertex,
     ollama,
     openai,
+    openrouter,
     antfly,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -679,6 +694,7 @@ pub const GeneratorProvider = enum {
             .vertex => "vertex",
             .ollama => "ollama",
             .openai => "openai",
+            .openrouter => "openrouter",
             .antfly => "antfly",
         };
         try jw.write(s);
@@ -694,6 +710,7 @@ pub const GeneratorProvider = enum {
             .{ "vertex", .vertex },
             .{ "ollama", .ollama },
             .{ "openai", .openai },
+            .{ "openrouter", .openrouter },
             .{ "antfly", .antfly },
         });
         return map.get(s) orelse error.UnexpectedToken;
@@ -892,6 +909,10 @@ pub const OpenAIGeneratorConfig = struct {
     temperature: ?f32 = null,
     /// Maximum number of tokens to generate.
     max_tokens: ?i64 = null,
+    /// OpenAI completion budget, including visible output and reasoning tokens. Use for reasoning models instead of max_tokens; the two are mutually exclusive.
+    max_completion_tokens: ?i64 = null,
+    /// Optional reasoning effort. Supported values depend on the selected OpenAI model.
+    reasoning_effort: ?OpenAIReasoningEffort = null,
     /// Nucleus sampling parameter.
     top_p: ?f32 = null,
     /// Penalty for token frequency (-2.0 to 2.0).
@@ -907,6 +928,8 @@ pub const OpenAIGeneratorConfig = struct {
         .{ "api_key", "api_key", true },
         .{ "temperature", "temperature", true },
         .{ "max_tokens", "max_tokens", true },
+        .{ "max_completion_tokens", "max_completion_tokens", true },
+        .{ "reasoning_effort", "reasoning_effort", true },
         .{ "top_p", "top_p", true },
         .{ "frequency_penalty", "frequency_penalty", true },
         .{ "presence_penalty", "presence_penalty", true },
@@ -942,6 +965,14 @@ pub const OpenAIGeneratorConfig = struct {
             try jw.objectField("max_tokens");
             try jw.write(value);
         }
+        if (self.max_completion_tokens) |value| {
+            try jw.objectField("max_completion_tokens");
+            try jw.write(value);
+        }
+        if (self.reasoning_effort) |value| {
+            try jw.objectField("reasoning_effort");
+            try jw.write(value);
+        }
         if (self.top_p) |value| {
             try jw.objectField("top_p");
             try jw.write(value);
@@ -958,12 +989,54 @@ pub const OpenAIGeneratorConfig = struct {
     }
 };
 
+/// OpenAI reasoning effort; model support varies. Omit to use the model default.
+pub const OpenAIReasoningEffort = enum {
+    none,
+    minimal,
+    low,
+    medium,
+    high,
+    xhigh,
+    max,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .none => "none",
+            .minimal => "minimal",
+            .low => "low",
+            .medium => "medium",
+            .high => "high",
+            .xhigh => "xhigh",
+            .max => "max",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "none", .none },
+            .{ "minimal", .minimal },
+            .{ "low", .low },
+            .{ "medium", .medium },
+            .{ "high", .high },
+            .{ "xhigh", .xhigh },
+            .{ "max", .max },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Configuration for the OpenRouter generative AI provider.
 pub const OpenRouterGeneratorConfig = struct {
-    /// Single model identifier. Either model or models must be provided.
-    model: ?[]const u8 = null,
-    /// Array of model identifiers for fallback routing. Either model or models must be provided.
-    models: ?[]const []const u8 = null,
+    provider: []const u8,
+    /// The OpenRouter model identifier to use.
+    model: []const u8,
+    /// The URL of the OpenRouter API endpoint.
+    url: ?[]const u8 = null,
     /// The OpenRouter API key.
     api_key: ?[]const u8 = null,
     /// Controls randomness in generation (0.0-2.0).
@@ -979,8 +1052,9 @@ pub const OpenRouterGeneratorConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "model", "model", true },
-        .{ "models", "models", true },
+        .{ "provider", "provider", false },
+        .{ "model", "model", false },
+        .{ "url", "url", true },
         .{ "api_key", "api_key", true },
         .{ "temperature", "temperature", true },
         .{ "max_tokens", "max_tokens", true },
@@ -999,12 +1073,12 @@ pub const OpenRouterGeneratorConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        if (self.model) |value| {
-            try jw.objectField("model");
-            try jw.write(value);
-        }
-        if (self.models) |value| {
-            try jw.objectField("models");
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.url) |value| {
+            try jw.objectField("url");
             try jw.write(value);
         }
         if (self.api_key) |value| {

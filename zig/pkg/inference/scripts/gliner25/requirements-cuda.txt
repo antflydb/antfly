@@ -1,0 +1,4 @@
+# Frozen numerical oracle plus tokenizer dependencies needed by the CUDA host.
+-r requirements.txt
+protobuf==6.33.0
+sentencepiece==0.2.1

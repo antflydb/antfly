@@ -28,30 +28,78 @@ import (
 
 // Re-export commonly used types from oapi package
 type (
+	SQLRequest                  = oapi.SQLRequest
+	SQLPrepareRequest           = oapi.SQLPrepareRequest
+	SQLPreparedExecutionRequest = oapi.SQLPreparedExecutionRequest
+	SQLPreparedResponse         = oapi.SQLPreparedResponse
+	SQLResponse                 = oapi.SQLResponse
+	SQLColumn                   = oapi.SQLColumn
+	SQLColumnType               = oapi.SQLColumnType
+	SQLDiagnostic               = oapi.SQLDiagnostic
+	SQLMutationOutcome          = oapi.SQLMutationOutcome
 	// Table and Index types
-	CreateTableRequest           = oapi.CreateTableRequest
-	TableStatus                  = oapi.TableStatus
-	TableMigration               = oapi.TableMigration
-	TableSchema                  = oapi.TableSchema
-	IndexConfig                  = oapi.IndexConfig
-	CreateIndexRequest           = oapi.CreateIndexRequest
-	CreateFullTextIndexRequest   = oapi.CreateFullTextIndexRequest
-	CreateEmbeddingsIndexRequest = oapi.CreateEmbeddingsIndexRequest
-	CreateGraphIndexRequest      = oapi.CreateGraphIndexRequest
-	CreateAlgebraicIndexRequest  = oapi.CreateAlgebraicIndexRequest
-	CreatedFullTextIndex         = oapi.CreatedFullTextIndex
-	CreatedEmbeddingsIndex       = oapi.CreatedEmbeddingsIndex
-	CreatedGraphIndex            = oapi.CreatedGraphIndex
-	CreatedAlgebraicIndex        = oapi.CreatedAlgebraicIndex
-	CreatedFullTextIndexType     = oapi.CreatedFullTextIndexType
-	CreatedEmbeddingsIndexType   = oapi.CreatedEmbeddingsIndexType
-	CreatedGraphIndexType        = oapi.CreatedGraphIndexType
-	CreatedAlgebraicIndexType    = oapi.CreatedAlgebraicIndexType
-	IndexStatus                  = oapi.IndexStatus
-	IndexType                    = oapi.IndexType
-	IndexPublicationPolicy       = oapi.IndexPublicationPolicy
-	IndexReadinessState          = oapi.IndexReadinessState
-	DerivedCoveragePolicy        = oapi.DerivedCoveragePolicy
+	CreateTableRequest                    = oapi.CreateTableRequest
+	TableStatus                           = oapi.TableStatus
+	TableMigration                        = oapi.TableMigration
+	TableSchema                           = oapi.TableSchema
+	TableStorageMode                      = oapi.TableStorageMode
+	RelationalIndexDefinition             = oapi.RelationalIndexDefinition
+	RelationalIndexPredicate              = oapi.RelationalIndexPredicate
+	RelationalScalarExpression            = oapi.RelationalScalarExpression
+	RelationalColumnExpression            = oapi.RelationalColumnExpression
+	RelationalExpressionOp                = oapi.RelationalExpressionOp
+	RelationalExpressionType              = oapi.RelationalExpressionType
+	RelationalCheckConstraint             = oapi.RelationalCheckConstraint
+	RelationalUniqueConstraint            = oapi.RelationalUniqueConstraint
+	RelationalForeignKeyConstraint        = oapi.RelationalForeignKeyConstraint
+	RelationalRow                         = oapi.RelationalRow
+	RelationalRowCondition                = oapi.RelationalRowCondition
+	RelationalRowQueryRequest             = oapi.RelationalRowQueryRequest
+	RelationalRowMutation                 = oapi.RelationalRowMutation
+	RelationalRowMutationRequest          = oapi.RelationalRowMutationRequest
+	RelationalConstraintStatus            = oapi.RelationalConstraintStatus
+	RelationalConstraintRetryRequest      = oapi.RelationalConstraintRetryRequest
+	RelationalConstraintRetirementRequest = oapi.RelationalConstraintRetirementRequest
+	RelationalConstraintRetirementStatus  = oapi.RelationalConstraintRetirementStatus
+	RelationalConstraintRetryResponse     = oapi.RelationalConstraintRetryResponse
+	RelationalConstraintRangeStatus       = oapi.RelationalConstraintRangeStatus
+	RelationalConstraintConflictReason    = oapi.RelationalConstraintConflictReason
+	RelationalComparisonOp                = oapi.RelationalComparisonOp
+	RelationalIndexKey                    = oapi.RelationalIndexKey
+	RelationalIndexKeyDirection           = oapi.RelationalIndexKeyDirection
+	RelationalIndexKeyNulls               = oapi.RelationalIndexKeyNulls
+	IndexConfig                           = oapi.IndexConfig
+	CreateIndexRequest                    = oapi.CreateIndexRequest
+	CreateFullTextIndexRequest            = oapi.CreateFullTextIndexRequest
+	CreateEmbeddingsIndexRequest          = oapi.CreateEmbeddingsIndexRequest
+	CreateGraphIndexRequest               = oapi.CreateGraphIndexRequest
+	CreateAlgebraicIndexRequest           = oapi.CreateAlgebraicIndexRequest
+	CreateRelationalIndexRequest          = oapi.CreateRelationalIndexRequest
+	CreatedRelationalIndex                = oapi.CreatedRelationalIndex
+	CreatedRelationalIndexType            = oapi.CreatedRelationalIndexType
+	RelationalIndexConfig                 = oapi.RelationalIndexConfig
+	RelationalIndexStats                  = oapi.RelationalIndexStats
+	RelationalIndexStatus                 = oapi.RelationalIndexStatus
+	RelationalIndexRangeStatus            = oapi.RelationalIndexRangeStatus
+	RelationalIndexBuildState             = oapi.RelationalIndexBuildState
+	RelationalIndexBuildFailure           = oapi.RelationalIndexBuildFailure
+	RelationalRowIndexBound               = oapi.RelationalRowIndexBound
+	CreatedFullTextIndex                  = oapi.CreatedFullTextIndex
+	CreatedEmbeddingsIndex                = oapi.CreatedEmbeddingsIndex
+	CreatedGraphIndex                     = oapi.CreatedGraphIndex
+	CreatedAlgebraicIndex                 = oapi.CreatedAlgebraicIndex
+	CreatedFullTextIndexType              = oapi.CreatedFullTextIndexType
+	CreatedEmbeddingsIndexType            = oapi.CreatedEmbeddingsIndexType
+	CreatedGraphIndexType                 = oapi.CreatedGraphIndexType
+	CreatedAlgebraicIndexType             = oapi.CreatedAlgebraicIndexType
+	IndexStatus                           = oapi.IndexStatus
+	IndexMaintenanceRequest               = oapi.IndexMaintenanceRequest
+	IndexMaintenanceResponse              = oapi.IndexMaintenanceResponse
+	IndexMaintenanceOwnerProof            = oapi.IndexMaintenanceOwnerProof
+	IndexType                             = oapi.IndexType
+	IndexPublicationPolicy                = oapi.IndexPublicationPolicy
+	IndexReadinessState                   = oapi.IndexReadinessState
+	DerivedCoveragePolicy                 = oapi.DerivedCoveragePolicy
 
 	// Artifact types
 	DocumentArtifactChildRange               = oapi.DocumentArtifactChildRange
@@ -214,6 +262,10 @@ type (
 	AgentStepKind       = oapi.AgentStepKind
 	AgentStepStatus     = oapi.AgentStepStatus
 
+	// Provider-specific web search options
+	WebSearchProviderConfig = oapi.WebSearchProviderConfig
+	ExaSearchConfig         = oapi.ExaSearchConfig
+
 	// Query Builder types
 	QueryBuilderRequest = oapi.QueryBuilderRequest
 	QueryBuilderResult  = oapi.QueryBuilderResult
@@ -226,6 +278,38 @@ type (
 	PruneStats            = oapi.PruneStats
 	RetrievalAgentSteps   = oapi.RetrievalAgentSteps
 
+	// Research Agent types
+	ResearchAgentRequest            = oapi.ResearchAgentRequest
+	ResearchAgentResult             = oapi.ResearchAgentResult
+	ResearchAgentSteps              = oapi.ResearchAgentSteps
+	ResearchBudget                  = oapi.ResearchBudget
+	ResearchState                   = oapi.ResearchState
+	ResearchPhase                   = oapi.ResearchPhase
+	ResearchStepConfig              = oapi.ResearchStepConfig
+	ResearchRetrievalStepConfig     = oapi.ResearchRetrievalStepConfig
+	ResearchWriteStepConfig         = oapi.ResearchWriteStepConfig
+	ResearchPlan                    = oapi.ResearchPlan
+	ResearchSubQuestion             = oapi.ResearchSubQuestion
+	ResearchSubQuestionSources      = oapi.ResearchSubQuestionSources
+	ResearchSubQuestionStatus       = oapi.ResearchSubQuestionStatus
+	ResearchClaim                   = oapi.ResearchClaim
+	ResearchFinding                 = oapi.ResearchFinding
+	ResearchEvidence                = oapi.ResearchEvidence
+	ResearchEvidenceSource          = oapi.ResearchEvidenceSource
+	ResearchReflection              = oapi.ResearchReflection
+	ResearchReport                  = oapi.ResearchReport
+	ResearchReportSection           = oapi.ResearchReportSection
+	ResearchCitation                = oapi.ResearchCitation
+	ResearchUnsupportedClaim        = oapi.ResearchUnsupportedClaim
+	ResearchVerification            = oapi.ResearchVerification
+	ResearchUsage                   = oapi.ResearchUsage
+	ResearchIncompleteDetails       = oapi.ResearchIncompleteDetails
+	ResearchIncompleteDetailsReason = oapi.ResearchIncompleteDetailsReason
+	ResearchJob                     = oapi.ResearchJob
+	ResearchJobState                = oapi.ResearchJobState
+	ResearchJobStartRequest         = oapi.ResearchJobStartRequest
+	ResearchJobAdvanceRequest       = oapi.ResearchJobAdvanceRequest
+
 	// SSE event types for streaming
 	SSEEvent         = oapi.SSEEvent
 	SSEStepStarted   = oapi.SSEStepStarted
@@ -234,10 +318,10 @@ type (
 	SSEToolMode      = oapi.SSEToolMode
 	SSEError         = oapi.SSEError
 
-	RetrievalQueryRequest = oapi.RetrievalQueryRequest
-	RetrievalStrategy     = oapi.RetrievalStrategy
-	TreeSearchConfig      = oapi.TreeSearchConfig
-	QueryHit              = oapi.QueryHit
+	RetrievalQueryRequest     = oapi.QueryRequest
+	RetrievalStrategy         = oapi.RetrievalStrategy
+	RetrievalNavigationConfig = oapi.RetrievalNavigationConfig
+	QueryHit                  = oapi.QueryHit
 
 	// Evaluation types
 	EvalConfig    = oapi.EvalConfig
@@ -466,6 +550,8 @@ func (c CreatedIndex) Value() (any, error) {
 		return c.AsCreatedGraphIndex()
 	case IndexTypeAlgebraic:
 		return c.AsCreatedAlgebraicIndex()
+	case IndexTypeRelational:
+		return c.AsCreatedRelationalIndex()
 	default:
 		return nil, fmt.Errorf("unknown created index discriminator %q", kind)
 	}
@@ -527,6 +613,20 @@ func (c CreatedIndex) AsCreatedAlgebraicIndex() (CreatedAlgebraicIndex, error) {
 	return value, nil
 }
 
+func (c CreatedIndex) AsCreatedRelationalIndex() (CreatedRelationalIndex, error) {
+	if err := c.requireKind(IndexTypeRelational); err != nil {
+		return CreatedRelationalIndex{}, err
+	}
+	value, err := c.generated.AsCreatedRelationalIndex()
+	if err != nil {
+		return CreatedRelationalIndex{}, err
+	}
+	if value.Name == "" || value.Type != CreatedRelationalIndexTypeRelational || len(value.Keys) == 0 {
+		return CreatedRelationalIndex{}, fmt.Errorf("invalid relational create-index response")
+	}
+	return value, nil
+}
+
 func (c CreatedIndex) requireKind(expected IndexType) error {
 	actual, err := c.Kind()
 	if err != nil {
@@ -539,6 +639,24 @@ func (c CreatedIndex) requireKind(expected IndexType) error {
 }
 
 const (
+	TableStorageModeDocument            = oapi.TableStorageModeDocument
+	TableStorageModeRelational          = oapi.TableStorageModeRelational
+	RelationalIndexKeyDirectionAsc      = oapi.RelationalIndexKeyDirectionAsc
+	RelationalIndexKeyDirectionDesc     = oapi.RelationalIndexKeyDirectionDesc
+	RelationalIndexKeyNullsDefault      = oapi.RelationalIndexKeyNullsDefault
+	RelationalIndexKeyNullsFirst        = oapi.RelationalIndexKeyNullsFirst
+	RelationalIndexKeyNullsLast         = oapi.RelationalIndexKeyNullsLast
+	RelationalComparisonOpEq            = oapi.RelationalComparisonOpEq
+	RelationalComparisonOpNe            = oapi.RelationalComparisonOpNe
+	RelationalComparisonOpGt            = oapi.RelationalComparisonOpGt
+	RelationalComparisonOpGte           = oapi.RelationalComparisonOpGte
+	RelationalComparisonOpLt            = oapi.RelationalComparisonOpLt
+	RelationalComparisonOpLte           = oapi.RelationalComparisonOpLte
+	RelationalComparisonOpIsNull        = oapi.RelationalComparisonOpIsNull
+	RelationalComparisonOpIsNotNull     = oapi.RelationalComparisonOpIsNotNull
+	RelationalComparisonOpIsDistinct    = oapi.RelationalComparisonOpIsDistinct
+	RelationalComparisonOpIsNotDistinct = oapi.RelationalComparisonOpIsNotDistinct
+
 	QueryHitsTotalRelationExact = oapi.QueryHitsTotalRelationExact
 	QueryHitsTotalRelationGte   = oapi.QueryHitsTotalRelationGte
 
@@ -635,6 +753,9 @@ const (
 	IndexTypeFullText                          = oapi.IndexTypeFullText
 	IndexTypeGraph                             = oapi.IndexTypeGraph
 	IndexTypeAlgebraic                         = oapi.IndexTypeAlgebraic
+	IndexTypeRelational                        = oapi.IndexTypeRelational
+	CreatedRelationalIndexTypeRelational       = oapi.CreatedRelationalIndexTypeRelational
+	CreateRelationalIndexRequestTypeRelational = oapi.CreateRelationalIndexRequestTypeRelational
 	CreatedFullTextIndexTypeFullText           = oapi.CreatedFullTextIndexTypeFullText
 	CreatedGraphIndexTypeGraph                 = oapi.CreatedGraphIndexTypeGraph
 	CreatedAlgebraicIndexTypeAlgebraic         = oapi.CreatedAlgebraicIndexTypeAlgebraic

@@ -37,16 +37,20 @@ def native_stack_dumps(
     per_process_timeout_s: float = 10.0,
 ) -> str:
     """Capture live failure evidence before teardown; never retry the operation."""
-    if shutil.which("gdb") is None:
-        return "<gdb not available>"
+    sampler = shutil.which("sample") if sys.platform == "darwin" else None
+    debugger = "sample" if sampler else "gdb"
+    if not sampler and shutil.which("gdb") is None:
+        return "<native stack debugger not available>"
     parts = []
     for label, proc in processes:
         if proc.poll() is not None:
             parts.append(f"[{label} pid {proc.pid}] exited rc={proc.returncode}")
             continue
         try:
-            result = subprocess.run(
-                [
+            command = (
+                [sampler, str(proc.pid), "1", "1", "-mayDie", "-file", "/dev/stdout"]
+                if sampler
+                else [
                     "gdb",
                     "--readnever",
                     "-q",
@@ -58,7 +62,10 @@ def native_stack_dumps(
                     "set pagination off",
                     "-ex",
                     "thread apply all bt 30",
-                ],
+                ]
+            )
+            result = subprocess.run(
+                command,
                 check=False,
                 capture_output=True,
                 text=True,
@@ -66,7 +73,9 @@ def native_stack_dumps(
             )
             body = result.stdout[-250000:]
             if result.returncode != 0:
-                body += f"\n<gdb rc={result.returncode}>\n{result.stderr[-2000:]}"
+                body += (
+                    f"\n<{debugger} rc={result.returncode}>\n{result.stderr[-2000:]}"
+                )
             parts.append(f"[{label} pid {proc.pid}]\n{body}")
         except subprocess.TimeoutExpired as exc:
             # Preserve any frames emitted before the deadline. Loading full
@@ -75,9 +84,11 @@ def native_stack_dumps(
             partial = exc.stdout or b""
             if isinstance(partial, bytes):
                 partial = partial.decode(errors="replace")
-            parts.append(f"[{label} pid {proc.pid}] gdb timed out\n{partial[-250000:]}")
+            parts.append(
+                f"[{label} pid {proc.pid}] {debugger} timed out\n{partial[-250000:]}"
+            )
         except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
-            parts.append(f"[{label} pid {proc.pid}] gdb failed: {exc!r}")
+            parts.append(f"[{label} pid {proc.pid}] {debugger} failed: {exc!r}")
     return "\n".join(parts)
 
 

@@ -8,7 +8,10 @@
 //! owning model-family packages.
 
 const std = @import("std");
-const data_uri = @import("antfly_scraping").data_uri;
+const data_uri = if (@import("builtin").os.tag == .freestanding)
+    @import("antfly_data_uri")
+else
+    @import("antfly_scraping").data_uri;
 const antfly_image = @import("antfly_image");
 
 pub const mimeTypeEssence = data_uri.mediaTypeEssence;
@@ -45,7 +48,6 @@ pub const Operation = enum {
     embed,
     embeddings,
     rerank,
-    rerank_multimodal,
     chunk,
     extract,
     rewrite,
@@ -56,7 +58,7 @@ pub const Operation = enum {
             .read => .read,
             .generate, .generate_batch, .chat_completions => .generate,
             .embed, .embeddings => .embed,
-            .rerank, .rerank_multimodal => .rerank,
+            .rerank => .rerank,
             .chunk => .chunk,
             .extract => .extract,
             .rewrite => .rewrite,
@@ -68,7 +70,6 @@ pub const Operation = enum {
         return switch (self) {
             .generate_batch => "generate.batch",
             .chat_completions => "chat.completions",
-            .rerank_multimodal => "rerank_multimodal",
             else => @tagName(self),
         };
     }
@@ -900,6 +901,9 @@ pub const InferenceCapabilities = struct {
     /// The HTTP route guarantees AFN1 dense/score responses when requested
     /// exclusively. Version 1 has a fixed 4-MiB frame ceiling.
     numeric_responses_v1: bool = false,
+    /// The `/rerank` route accepts `documents` (strings or content parts)
+    /// instead of only the deprecated text `prompts`.
+    rerank_documents_v1: bool = false,
     /// Linked-process executor has a concrete borrowed raw-raster entrypoint.
     /// This is never inferred from image modality or encoded attachment support.
     borrowed_rasters: bool = false,
@@ -914,7 +918,7 @@ pub const InferenceCapabilities = struct {
     /// may derive pixels from its wire budget; encoded inputs keep model limits.
     pub fn renderPixelLimit(self: InferenceCapabilities, raw: bool) u64 {
         const pixels = self.batch.max_decoded_pixels orelse std.math.maxInt(u64);
-        return if (raw) @min(pixels, if (self.attachment_payload_max_bytes) |bytes| bytes / 4 else std.math.maxInt(u64)) else pixels;
+        return if (raw) @min(pixels, if (self.attachment_payload_max_bytes) |bytes| @as(u64, bytes) / 4 else std.math.maxInt(u64)) else pixels;
     }
 
     pub fn validate(self: InferenceCapabilities) !void {

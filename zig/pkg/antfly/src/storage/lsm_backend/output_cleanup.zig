@@ -27,7 +27,7 @@ pub const Queue = struct {
     tail: ?*Ticket = null,
     pending: std.atomic.Value(usize) = .init(0),
     live: std.atomic.Value(usize) = .init(0),
-    bytes: std.atomic.Value(u64) = .init(0),
+    bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
     manager: ?*resources.ResourceManager = null,
     wake_context: ?*anyopaque = null,
     wake_fn: ?*const fn (*anyopaque) void = null,
@@ -274,8 +274,15 @@ test "output cleanup owns partial outputs after cancellation and wakes bulk main
     try std.testing.expectEqual(@as(usize, 2), Hook.tables);
     const queue = backend.options.unpublished_outputs.?;
     try std.testing.expectEqual(@as(usize, 2), queue.pending.load(.acquire));
-    try std.testing.expectEqual(@as(?u64, 0), backend.nextMaintenanceWakeDelayNsBestEffort());
-    try std.testing.expect(try backend.runMaintenanceStep());
+    // Maintenance hands off at most 64 tickets within a 2 ms slice. A busy
+    // runner may exhaust that slice before both cancelled outputs transfer.
+    // Drive the continuation and check ownership after every bounded turn.
+    for (0..128) |_| {
+        if (queue.pending.load(.acquire) == 0) break;
+        try std.testing.expectEqual(@as(?u64, 0), backend.nextMaintenanceWakeDelayNsBestEffort());
+        _ = try backend.runMaintenanceStep();
+        try std.testing.expectEqual(@as(usize, 2), queue.pending.load(.acquire) + backend.obsolete_paths.count());
+    }
     try std.testing.expectEqual(@as(usize, 0), queue.pending.load(.acquire));
     try std.testing.expectEqual(@as(usize, 2), backend.obsolete_paths.count());
     // Bulk mode may defer physical deletion, but cannot lose cleanup intent.

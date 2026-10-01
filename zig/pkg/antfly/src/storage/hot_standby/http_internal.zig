@@ -344,18 +344,18 @@ fn knownFixedRoute(path: []const u8) bool {
         std.mem.eql(u8, path, internal_api.routes.standby_replication_status);
 }
 
-fn uint64FromJson(value: i64) !u64 {
+fn uint64FromJson(value: anytype) !u64 {
     if (value < 0) return error.InvalidInternalRequest;
     return @intCast(value);
 }
 
-fn positiveUint64FromJson(value: i64) !u64 {
+fn positiveUint64FromJson(value: anytype) !u64 {
     const parsed = try uint64FromJson(value);
     if (parsed == 0) return error.InvalidInternalRequest;
     return parsed;
 }
 
-fn usizeFromJson(value: i64) !usize {
+fn usizeFromJson(value: anytype) !usize {
     const parsed = try uint64FromJson(value);
     if (parsed > std.math.maxInt(usize)) return error.InvalidInternalRequest;
     return @intCast(parsed);

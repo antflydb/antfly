@@ -318,6 +318,8 @@ components:
         OpenRouter provides a unified API for multiple embedding models from different providers.
         API key via `api_key` field or `OPENROUTER_API_KEY` environment variable.
 
+        Antfly currently supports dense text embeddings through this provider.
+
         **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large,
         google/gemini-embedding-001, qwen/qwen3-embedding-8b
 
@@ -331,6 +333,10 @@ components:
           description: "The OpenRouter model identifier (e.g., 'openai/text-embedding-3-small', 'google/gemini-embedding-001')."
           default: "openai/text-embedding-3-small"
           example: "openai/text-embedding-3-small"
+        url:
+          type: string
+          format: uri
+          description: "The OpenRouter API base URL. Defaults to OPENROUTER_BASE_URL or https://openrouter.ai/api/v1."
         api_key:
           type: string
           writeOnly: true
@@ -352,13 +358,12 @@ components:
         Configuration for the Antfly inference embedding provider.
 
         Antfly inference is Antfly's built-in ML service for local embeddings using ONNX models.
-        It provides embedding generation with multi-tier caching (memory + persistent).
 
         **Features:**
         - Local ONNX-based embedding generation
-        - L1 memory cache with configurable TTL
-        - L2 persistent Pebble database cache
-        - Singleflight deduplication for concurrent identical requests
+        - Query-time embeddings are served from an in-memory cache (64 MiB budget,
+          5-minute TTL by default) with concurrent identical requests coalesced onto
+          a single computation; there is no persistent on-disk cache tier
 
         **Example Models:** bge-base-en-v1.5 (768 dims), all-MiniLM-L6-v2 (384 dims)
 
@@ -423,6 +428,7 @@ components:
       oneOf:
         - $ref: "#/components/schemas/OllamaEmbedderConfig"
         - $ref: "#/components/schemas/OpenAIEmbedderConfig"
+        - $ref: "#/components/schemas/OpenRouterEmbedderConfig"
         - $ref: "#/components/schemas/BedrockEmbedderConfig"
         - $ref: "#/components/schemas/CohereEmbedderConfig"
         - $ref: "#/components/schemas/GoogleEmbedderConfig"
@@ -433,6 +439,7 @@ components:
         mapping:
           ollama: "#/components/schemas/OllamaEmbedderConfig"
           openai: "#/components/schemas/OpenAIEmbedderConfig"
+          openrouter: "#/components/schemas/OpenRouterEmbedderConfig"
           bedrock: "#/components/schemas/BedrockEmbedderConfig"
           cohere: "#/components/schemas/CohereEmbedderConfig"
           gemini: "#/components/schemas/GoogleEmbedderConfig"
@@ -498,50 +505,9 @@ components:
 
            See: https://antfly.io/docs/configuration#security--cors
 
-        4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation)
-           ```handlebars
-           {{encodeToon this.fields}}
-           {{encodeToon this.fields lengthMarker=false indent=4}}
-           {{encodeToon this.fields delimiter="\t"}}
-           ```
-
-           **What is TOON?**
-           TOON is a compact, human-readable format designed for passing structured data to LLMs.
-           It provides **30-60% token reduction** compared to JSON while maintaining high LLM
-           comprehension accuracy.
-
-           **Key Features:**
-           - Compact syntax using `:` for key-value pairs
-           - Array length markers: `tags[#3]: ai,search,ml`
-           - Tabular format for uniform data structures
-           - Optimized for LLM parsing and understanding
-           - Maintains human readability
-
-           **Benefits:**
-           - **Lower API costs** - Reduced token usage means lower LLM API costs
-           - **Faster responses** - Less tokens to process
-           - **More context** - Fit more documents within token limits
-
-           **Options:**
-           - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true)
-           - `indent` (int): Indentation spacing for nested objects (default: 2)
-           - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs)
-
-           **Example output:**
-           ```
-           title: Introduction to Vector Search
-           author: Jane Doe
-           tags[#3]: ai,search,ml
-           metadata:
-             edition: 2
-             pages: 450
-           ```
-
-           **Default in RAG:** TOON is the default format for document rendering in RAG queries.
-
-           **References:**
-           - TOON Specification: https://github.com/toon-format/toon
-           - Go Implementation: https://github.com/alpkeskin/gotoon
+        4. **encodeToon** is not available in these templates. It is a helper of the
+           retrieval agent's `document_renderer`, which renders documents into the
+           generation prompt as TOON by default.
 
         **Template Examples:**
 
@@ -630,25 +596,33 @@ components:
               $ref: "../shared/provider.yaml#/components/schemas/RateLimitConfig"
             provider:
               $ref: "#/components/schemas/EmbedderProvider"
-            multimodal:
-              type: boolean
+            inputs:
+              type: array
+              minItems: 1
+              uniqueItems: true
+              items:
+                type: string
+                enum:
+                  - text
+                  - image
+                  - audio
               description: |-
-                Declare that this model supports non-text content (images, audio, video, PDFs),
-                even if the model isn't in Antfly's built-in model registry yet.
+                Input types the model accepts. Normally omitted: Antfly learns them from the
+                model's capabilities, which Antfly inference publishes for every model it
+                serves. Set it only to use a model whose capabilities Antfly cannot discover
+                yet, such as a newly released model. When set, it replaces the discovered
+                input types.
 
-                When `true`, Antfly treats the model as multimodal and sends binary content
-                (images, audio, etc.) through an embedding adapter that supports content parts.
-                Antfly currently provides that contract for local Antfly inference and Bedrock;
-                text-only provider adapters reject media rather than silently discarding it.
-
-                Not needed for models already in the local registry (e.g., `clip-*`, `clipclap`).
+                Only providers whose adapters can send media accept media inputs: `antfly`
+                (`image`, `audio`) and `bedrock` (`image`). Other providers reject `image` and
+                `audio` here rather than silently discarding media.
 
                 **Example:**
                 ```json
                 {
                   "provider": "antfly",
                   "model": "some-future-multimodal-model",
-                  "multimodal": true
+                  "inputs": ["text", "image"]
                 }
                 ```
             query_input_type:

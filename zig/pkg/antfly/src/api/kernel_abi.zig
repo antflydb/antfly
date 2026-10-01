@@ -27,9 +27,18 @@ pub const StatusDetail = error_abi.Detail;
 /// Version of the API-kernel control structs below. This is intentionally
 /// independent of the status ABI: adding flags/reserved fields must invalidate
 /// an older context before the callee reads beyond its layout.
-pub const abi_version: u32 = 18;
+pub const abi_version: u32 = 19;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
+
+pub const RuntimeIoBorrows = extern struct {
+    version: u32 = abi_version,
+    struct_size: u32 = @sizeOf(@This()),
+    api: ?*const native_abi.IoBorrow = null,
+    api_network: ?*const native_abi.IoBorrow = null,
+    api_filesystem: ?*const native_abi.IoBorrow = null,
+    durable: ?*const native_abi.IoBorrow = null,
+};
 
 pub const CreateContext = extern struct {
     abi_version: u32,
@@ -38,6 +47,7 @@ pub const CreateContext = extern struct {
     owner_alloc: *const memory_abi.Allocator,
     cfg: *const anyopaque,
     cfg_contract: native_abi.TypeContract,
+    runtime_io: ?*const RuntimeIoBorrows = null,
     source: *const anyopaque,
     source_contract: native_abi.TypeContract,
     table_reads: *const anyopaque,
@@ -279,4 +289,12 @@ test "API kernel ABI rejects mismatched context and function-table prefixes" {
     table.struct_size = requiredFunctionTableSize(Capability.core).?;
     try std.testing.expect(validFunctionTable(&table, Capability.core));
     try std.testing.expect(!validFunctionTable(&table, 1 << 63));
+}
+
+test "API imported runtime capability struct retains versioned C layout" {
+    const std = @import("std");
+    try std.testing.expectEqual(.@"extern", @typeInfo(RuntimeIoBorrows).@"struct".layout);
+    try std.testing.expect(validContext(RuntimeIoBorrows, abi_version, @sizeOf(RuntimeIoBorrows)));
+    try std.testing.expect(!validContext(RuntimeIoBorrows, abi_version - 1, @sizeOf(RuntimeIoBorrows)));
+    try std.testing.expect(!validContext(RuntimeIoBorrows, abi_version, @sizeOf(RuntimeIoBorrows) - 1));
 }

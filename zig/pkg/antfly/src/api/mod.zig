@@ -17,16 +17,29 @@ const document_mapper = @import("../storage/db/document_mapper.zig");
 
 pub const cluster = @import("cluster.zig");
 pub const operation = @import("operation.zig");
+const sql_execution = @import("sql_execution.zig");
+const sql_pgwire = @import("sql_pgwire.zig");
+const sql_session = @import("sql_session.zig");
 pub const probe_operations = @import("probe_operations.zig");
 pub const storage_maintenance_operations = @import("storage_maintenance_operations.zig");
 pub const batch = @import("batch.zig");
 pub const backups = @import("backups.zig");
+pub const restore_owner = @import("restore_owner.zig");
+pub const restore_parent_activation = @import("restore_parent_activation.zig");
+pub const relational_fk_generation_publication = @import("relational_fk_generation_publication.zig");
+pub const row_policy_install = @import("row_policy_install.zig");
+pub const row_policy_publication_coordinator = @import("row_policy_publication_coordinator.zig");
+pub const fk_generation_publication_coordinator = @import("fk_generation_publication_coordinator.zig");
 pub const linear_merge = @import("linear_merge.zig");
 pub const query = @import("query.zig");
 pub const query_contract = @import("query_contract.zig");
 pub const runtime_status = @import("runtime_status.zig");
 pub const cluster_api_http = @import("cluster_api_http.zig");
 pub const retrieval_agent = @import("retrieval_agent.zig");
+pub const research_agent = @import("research_agent.zig");
+pub const research_jobs = @import("research_jobs.zig");
+pub const web_fetch = @import("web_fetch.zig");
+pub const document_renderer = @import("document_renderer.zig");
 pub const public_table_http = @import("public_table_http.zig");
 pub const public_embedding_query = @import("public_embedding_query.zig");
 pub const public_graph_query = @import("public_graph_query.zig");
@@ -41,6 +54,7 @@ const multi_node_e2e = @import("multi_node_e2e.zig");
 pub const table_catalog = @import("table_catalog.zig");
 pub const table_router = @import("table_router.zig");
 pub const tables = @import("tables.zig");
+pub const relational_contract = @import("relational_contract.zig");
 pub const table_contract = @import("table_contract.zig");
 pub const indexes = @import("indexes.zig");
 const openapi_contract = @import("openapi_contract.zig");
@@ -54,6 +68,7 @@ pub const kernel_owner_source = @import("kernel_owner_source.zig");
 pub const storage_maintenance_source = @import("storage_maintenance_source.zig");
 pub const distributed_candidate_source = @import("distributed_candidate_source.zig");
 pub const distributed_entity_sink = @import("distributed_entity_sink.zig");
+pub const join_planning = @import("join_planning.zig");
 pub const distributed_join = @import("distributed_join.zig");
 pub const distributed_graph = @import("distributed_graph.zig");
 pub const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");
@@ -63,6 +78,7 @@ pub const contextual_operations = @import("contextual_operations.zig");
 pub const internal_join_operations = @import("internal_join_operations.zig");
 pub const internal_repair_operations = @import("internal_repair_operations.zig");
 pub const restore_jobs = @import("restore_jobs.zig");
+pub const relational_rewrite_driver = @import("relational_rewrite_driver.zig");
 pub const internal_query_operations = @import("internal_query_operations.zig");
 pub const internal_transition_wire = @import("internal_transition_wire.zig");
 pub const http_server = @import("http_server.zig");
@@ -70,6 +86,7 @@ pub const kernel_bridge = @import("kernel_bridge.zig");
 const kernel_abi = @import("kernel_abi.zig");
 pub const http_client = @import("http_client.zig");
 pub const httpx_handler = @import("httpx_handler.zig");
+pub const store_root_enrollment_http = @import("store_root_enrollment_http.zig");
 pub const connections = @import("connections.zig");
 const protocol_adapters = @import("protocol_adapters.zig");
 
@@ -94,6 +111,7 @@ pub const TableWriteSource = table_writes.TableWriteSource;
 pub const BoundTableWriteSource = table_writes.BoundTableWriteSource;
 pub const ProvisionedTableWriteCache = table_writes.ProvisionedTableWriteCache;
 pub const ProvisionedTableWriteSource = table_writes.ProvisionedTableWriteSource;
+pub const InitialChildRetirementObservation = table_writes.InitialChildRetirementObservation;
 pub const ProvisionedKernelOwnerSource = kernel_owner_source.ProvisionedKernelOwnerSource;
 pub const HostedProvisionedTableWriteSource = table_writes.HostedProvisionedTableWriteSource;
 pub const HostedGroupRouter = table_router.HostedGroupRouter;
@@ -102,6 +120,7 @@ pub const ApiHttpClient = http_client.ApiHttpClient;
 
 test "api restore jobs module compiles" {
     _ = restore_jobs;
+    _ = relational_rewrite_driver;
 }
 
 test "api query contract preserves filter-only query string filters" {
@@ -222,6 +241,14 @@ test "join inequality: incomparable types return 0" {
 }
 
 test "api module compiles" {
+    _ = @import("sql_truncate.zig");
+    _ = @import("sql_policy_ddl.zig");
+    _ = sql_execution;
+    _ = @import("sql_schema_cache.zig");
+    _ = sql_pgwire;
+    _ = sql_session;
+    _ = @import("sql_connection_record.zig");
+    _ = @import("sql_connections.zig");
     _ = cluster;
     _ = batch;
     _ = backups;
@@ -230,6 +257,9 @@ test "api module compiles" {
     _ = query_contract;
     _ = cluster_api_http;
     _ = retrieval_agent;
+    _ = research_agent;
+    _ = research_jobs;
+    _ = web_fetch;
     _ = public_table_http;
     _ = public_graph_query;
     _ = public_query_string;
@@ -247,6 +277,7 @@ test "api module compiles" {
     _ = table_catalog;
     _ = table_router;
     _ = tables;
+    _ = relational_contract;
     _ = table_contract;
     _ = indexes;
     _ = openapi_contract;
@@ -265,6 +296,7 @@ test "api module compiles" {
     _ = kernel_bridge;
     _ = http_client;
     _ = httpx_handler;
+    _ = store_root_enrollment_http;
     _ = connections;
     _ = ClusterHealth;
     _ = ClusterStatus;

@@ -1,0 +1,14 @@
+{
+  "compiler": "Cuda compilation tools, release 12.8, V12.8.93",
+  "options": [
+    "--gpu-architecture=compute_75",
+    "--std=c++17",
+    "--fmad=true",
+    "--ftz=false",
+    "--prec-div=true",
+    "--prec-sqrt=true"
+  ],
+  "profile": "gliner25_training_norm_cuda128_v15",
+  "ptx_sha256": "a5a44a8cb012c39dfcb801038043f31b93b3376cd2c2442821636e07b56c76ac",
+  "source_sha256": "fa6cbf23262bda49071618ff53d02ca29dca6e742edcef2189b0243e8594183e"
+}

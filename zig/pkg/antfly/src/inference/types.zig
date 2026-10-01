@@ -358,10 +358,12 @@ pub const SparseEmbedResult = struct {
 pub const GenerateResult = struct {
     content: []const u8,
     tool_calls: []ToolCall = &.{},
+    google_parts_json: ?[]const u8 = null,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *GenerateResult) void {
         self.allocator.free(self.content);
+        if (self.google_parts_json) |parts| self.allocator.free(parts);
         for (self.tool_calls) |*tool_call| tool_call.deinit(self.allocator);
         if (self.tool_calls.len > 0) self.allocator.free(self.tool_calls);
         self.* = undefined;
@@ -450,6 +452,16 @@ fn jsonContentPayload(raw: []const u8) []const u8 {
         text = std.mem.trim(u8, text[0 .. text.len - 3], " \t\r\n");
     }
     return text;
+}
+
+/// Shared HTTP failure taxonomy for reranking provider adapters.
+pub fn rerankStatusError(status: u16) anyerror {
+    return switch (status) {
+        408, 504 => error.Timeout,
+        429 => error.RerankRateLimited,
+        500...503, 505...599 => error.RerankTransientFailure,
+        else => error.RerankRequestFailed,
+    };
 }
 
 pub const RerankResult = struct {

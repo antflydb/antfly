@@ -2299,7 +2299,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         "host": platform.platform(),
         "machine": platform.machine(),
         "model_topology": args.model_topology,
-        # Machine-identity + thermal ledger (GEMMA4_PERF_PLAN.md M0.4): the
+        # Machine-identity + thermal ledger (GEMMA4.md "Metal Performance Plan" M0.4): the
         # roofline differs 2.3x between base M4 (120 GB/s) and M4 Pro
         # (273 GB/s); summaries from different chips must never be compared.
         "chip": _sysctl("machdep.cpu.brand_string"),

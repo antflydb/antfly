@@ -166,6 +166,12 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         if (unit == .storage_kernel) {
             const capi_options = b.addOptions();
             capi_options.addOption(bool, "linked_storage", true);
+            // This archive is shared by the default `libantfly` and by the
+            // `antfly` executable. Both link the inference runtime archive
+            // in-process (see `link_anchor.zig` and the `.inference` unit
+            // linked into `libantfly_link_mod` below), so the
+            // embedded-inference construction path is always available.
+            capi_options.addOption(bool, "inference_enabled", true);
             role_mod.addOptions("capi_build_options", capi_options);
         }
         addMacosSdkPaths(b, role_mod, target);
@@ -226,6 +232,12 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
     }
 
     libantfly_link_mod.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.enrichment_compute)].?);
+    // libantfly embeds the standalone inference runtime in-process, the same
+    // as the `antfly` executable (2026-09-17 product decision: Lite hosts
+    // get local inference without a separate runtime). This is why
+    // `link_anchor.zig` no longer traps
+    // `antfly_standalone_inference_get_function_table`.
+    libantfly_link_mod.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.inference)].?);
 
     // Exercise the real production archive boundary for encoded-image reads.
     // The probe resolves only the exported C function table, so it cannot

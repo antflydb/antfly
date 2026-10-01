@@ -20,7 +20,6 @@ const work_budget = @import("work_budget.zig");
 const Directory = @import("run_directory.zig").Directory;
 const Job = @import("dependency_job.zig").Job;
 const runtime = @import("runtime.zig");
-const time = @import("antfly_platform").time;
 const Reservation = @import("../resource_manager.zig").Reservation;
 
 pub const Validation = struct {
@@ -148,3 +147,60 @@ pub const Validation = struct {
         if (self.reservation) |*lease| lease.release();
     }
 };
+
+test "dependency validation uses the borrowed clock for every phase" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const Clock = struct {
+        var epoch: i96 = 0;
+        fn now(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            return .fromNanoseconds(epoch);
+        }
+    };
+    Clock.epoch = 0;
+    var vtable = std.testing.io.vtable.*;
+    vtable.now = Clock.now;
+    var io = std.testing.io;
+    io.vtable = &vtable;
+    const allocator = std.testing.allocator;
+    var backend = Backend.init(allocator, .{ .wal_enabled = false, .read_runtime = .{ .io = io } });
+    defer backend.close();
+    try std.testing.expect(backend.mu.tryLock());
+    defer backend.mu.unlock();
+    for (1..3) |id| try backend.runs.append(allocator, .{
+        .id = id,
+        .level = 0,
+        .size_bytes = 1,
+        .path = null,
+        .smallest_namespace_name = null,
+        .smallest_key = @constCast("a"),
+        .largest_namespace_name = null,
+        .largest_key = @constCast("a"),
+        .entry_count = 1,
+        .bloom_filter = null,
+        .state = .{},
+        .owns_metadata = false,
+    });
+    const directory = try backend.planningDirectory();
+    const handles = [_]Directory.Handle{ directory.at(0), directory.at(1) };
+    const plan = @import("compaction.zig").CompactionPlan{
+        .source_level = 0,
+        .source_start = 0,
+        .source_len = handles.len,
+        .target_start = handles.len,
+        .target_len = 0,
+        .output_level = 1,
+        .input_handles = &handles,
+    };
+    var validation = try Validation.init(&backend, plan);
+    defer validation.deinit(&backend);
+    _ = try validation.advanceBudgetedLocked(&backend, 1, 10);
+    try std.testing.expectEqual(@as(usize, 1), validation.job.index);
+    Clock.epoch = 10;
+    _ = try validation.advanceBudgetedLocked(&backend, 1, 10);
+    try std.testing.expectEqual(@as(usize, 1), validation.job.index);
+    for (0..32) |_| {
+        if (try validation.advanceBudgetedLocked(&backend, 1, 20) == .valid) break;
+    }
+    try std.testing.expectEqual(Validation.Result.valid, try validation.advanceBudgetedLocked(&backend, 1, 20));
+    try std.testing.expectEqual(handles.len, validation.job.index);
+}

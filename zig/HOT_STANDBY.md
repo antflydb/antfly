@@ -10,6 +10,58 @@ productionized in the 0.2.1 release; see [Implementation](#implementation) for
 the components and [Open work](#open-work) for what remains outside the
 current scope.
 
+## Empty instances and later table creation
+
+The whole-instance stream uses explicit `--hot-standby-table-id 0` and
+`--hot-standby-shard-id 0`. It can capture and activate an empty portable seed,
+then replicate new tables before subsequent document mutations. The operator
+must preserve these explicit zero arguments; omitted identities retain the
+legacy catalog-bootstrap behavior.
+
+The authenticated primary status snapshot optionally includes
+`waiting_for_tables`, derived from the runtime catalog. It does not create
+slots, capture seeds, or alter durability. The operator can use this signal for
+opt-in asynchronous `OnFirstTable` activation; established HA remains active
+when the last table is deleted. Eager empty-instance seeding remains the default,
+and synchronous configurations must use eager activation.
+
+Table creation uses version 3 JSON metadata records at stream identity `0/0`.
+The payload carries the resolved table definition and initial ranges. The
+standby persists those records before advancing applied progress. The primary
+persists its local catalog and requires the configured RemoteApply
+acknowledgement before reporting success. Startup replays catalog records that reached the WAL but whose
+local catalog publication was interrupted. A WAL or local publication failure
+fences the primary process until restart/recovery. A remote acknowledgement
+timeout reports an uncertain client outcome while preserving the committed
+catalog; replication can resume without restarting the primary. Inspect the
+table before retrying an uncertain creation.
+
+The shared mutation barrier orders table creation with seed capture. The
+transition mutex and write generation checks order it with fencing. Both
+members need a runtime that understands catalog records: older receivers fail
+closed and cannot acknowledge them. Existing table-scoped streams keep their
+previous catalog restrictions.
+
+Seed capture can return HTTP 503 with the exact body
+`HASeedSnapshotRuntimeBusy` while background maintenance owns snapshot
+resources, including on an empty instance. This is a pre-admission rejection:
+the capture has not created its retention slot or started the base backup.
+Callers may retry the same generation, slot, and lifecycle binding within a
+bounded deadline. This does not make arbitrary 503 responses or lost replies
+safe to replay; reconcile uncertain capture outcomes using their lifecycle
+receipts instead.
+
+This adds table creation, including the initial table schema/index definition.
+It does not enable deletion or alteration of existing tables, native auth
+changes, backups or other surfaces still rejected by the mutation inventory.
+Those require their own replicated lifecycle contracts.
+
+`e2e/antfly/test_standby_empty_bootstrap.py` exercises empty portable seed
+activation, two newly created tables, document writes, restart, fenced
+promotion, unavailable-standby rejection and recovery of a catalog snapshot
+that lags the WAL. Empty standalone catalogs are persisted before readiness,
+so volume inspection does not need to interpret a missing file as empty.
+
 ## Summary
 
 Antfly can support an efficient hot-standby design by combining:
@@ -1563,3 +1615,20 @@ described in [Implementation](#implementation):
   reads the final LSN. An explicit "stop accepting writes and report the final
   LSN" call would let the CLI report the boundary before fencing; it is not
   required for correctness.
+
+### Catalog-create retries
+
+In whole-instance mode, a table-create retry waits for RemoteApply through the
+current primary log position before returning `table already exists`. A table
+visible only on the primary still returns the versioned unknown-outcome response,
+including after primary restart. Catch-up lets the same retry complete without
+appending another catalog record or restarting the primary.
+
+### Operator catalog-mode opt-in
+
+For operator-managed whole-instance catalog replication, set the AntflyCluster
+annotation `antfly.io/ha-catalog-replication: "true"` on both nodes and use zero
+table/shard identities with the matching runtime and operator release. The
+operator then emits explicit zero CLI identities. Without this opt-in, omitted
+or zero-valued identity fields retain the legacy omitted CLI arguments; existing
+nonzero table-scoped identities remain unchanged across operator upgrades.

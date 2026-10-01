@@ -291,7 +291,7 @@ pub const Client = struct {
             admin_api.ReplicationSlotCreateRequest{
                 .slot_name = slot_name,
                 .initial_lsn = if (initial_lsn) |lsn|
-                    .{ .value = try i64FromU64(lsn) }
+                    .{ .value = lsn }
                 else
                     .absent,
             },
@@ -805,11 +805,6 @@ fn isQueryValueUnreserved(byte: u8) bool {
         (byte >= 'a' and byte <= 'z') or
         (byte >= '0' and byte <= '9') or
         byte == '-' or byte == '.' or byte == '_' or byte == '~';
-}
-
-fn i64FromU64(value: u64) !i64 {
-    if (value > @as(u64, @intCast(std.math.maxInt(i64)))) return error.InvalidHaCommand;
-    return @intCast(value);
 }
 
 fn validateSchemaVersion(version: i64, err: anyerror) !void {
@@ -1531,7 +1526,7 @@ test "storage.hot_standby http client accepts zero LSN promotion assessment" {
     });
     defer assessment.deinit(alloc);
 
-    try std.testing.expectEqual(@as(i64, 0), assessment.parsed.value.assessment.required_lsn);
+    try std.testing.expectEqual(0, assessment.parsed.value.assessment.required_lsn);
     try std.testing.expect(assessment.parsed.value.assessment.has_required_lsn);
     try std.testing.expect(assessment.parsed.value.assessment.safe);
 }
@@ -1564,9 +1559,9 @@ test "storage.hot_standby http client round trips admin commands" {
 
     var typed_primary_status = try client.getPrimaryStatus("http://ha-admin.test", .{ .max_lag_lsn = 1 });
     defer typed_primary_status.deinit(alloc);
-    try std.testing.expectEqual(@as(i64, 1), typed_primary_status.parsed.value.schema_version);
+    try std.testing.expectEqual(1, typed_primary_status.parsed.value.schema_version);
     try std.testing.expectEqualStrings("primary", typed_primary_status.parsed.value.snapshot.role);
-    try std.testing.expectEqual(@as(i64, 0), typed_primary_status.parsed.value.snapshot.current_lsn);
+    try std.testing.expectEqual(0, typed_primary_status.parsed.value.snapshot.current_lsn);
 
     var typed_created = try client.createReplicationSlot("http://ha-admin.test", "standby-typed", 0);
     defer typed_created.deinit(alloc);
@@ -1576,7 +1571,7 @@ test "storage.hot_standby http client round trips admin commands" {
 
     var typed_slots = try client.listReplicationSlots("http://ha-admin.test");
     defer typed_slots.deinit(alloc);
-    try std.testing.expectEqual(@as(i64, 1), typed_slots.parsed.value.schema_version);
+    try std.testing.expectEqual(1, typed_slots.parsed.value.schema_version);
     try std.testing.expectEqual(@as(usize, 1), typed_slots.parsed.value.slots.len);
     try std.testing.expectEqualStrings("standby-typed", typed_slots.parsed.value.slots[0].slot_name);
 
@@ -1629,7 +1624,7 @@ test "storage.hot_standby http client round trips admin commands" {
         .sync_policy = .{ .mode = "async" },
     });
     defer appended.deinit(alloc);
-    try std.testing.expectEqual(@as(i64, 1), appended.parsed.value.lsn);
+    try std.testing.expectEqual(1, appended.parsed.value.lsn);
     try std.testing.expectEqualStrings("acknowledge", appended.parsed.value.gate.action);
 
     var streamed = try client.executeCommand("http://ha-admin.test", &.{ "--table", "stream", "once", "--slot", "standby-a" });
@@ -1640,11 +1635,11 @@ test "storage.hot_standby http client round trips admin commands" {
 
     var typed_standby_status = try client.getStandbyStatus("http://ha-admin.test", 2);
     defer typed_standby_status.deinit(alloc);
-    try std.testing.expectEqual(@as(i64, 1), typed_standby_status.parsed.value.schema_version);
+    try std.testing.expectEqual(1, typed_standby_status.parsed.value.schema_version);
     try std.testing.expectEqualStrings("standby", typed_standby_status.parsed.value.snapshot.role);
-    try std.testing.expectEqual(@as(i64, 1), typed_standby_status.parsed.value.snapshot.applied_lsn);
-    try std.testing.expectEqual(@as(?i64, 2), typed_standby_status.parsed.value.snapshot.upstream_lsn.valueOrNull());
-    try std.testing.expectEqual(@as(?i64, 1), typed_standby_status.parsed.value.snapshot.write_lag_lsn.valueOrNull());
+    try std.testing.expectEqual(1, typed_standby_status.parsed.value.snapshot.applied_lsn);
+    try std.testing.expectEqual(@as(?u64, 2), typed_standby_status.parsed.value.snapshot.upstream_lsn.valueOrNull());
+    try std.testing.expectEqual(@as(?u64, 1), typed_standby_status.parsed.value.snapshot.write_lag_lsn.valueOrNull());
 
     try std.testing.expectError(error.HaCommandConflict, client.executeCommand("http://ha-admin.test", &.{
         "operator",
@@ -1697,7 +1692,7 @@ test "storage.hot_standby http client round trips admin commands" {
     var promoted = try client.promoteWithCurrentFence("http://ha-admin.test");
     defer promoted.deinit(alloc);
     try std.testing.expectEqualStrings("promotion", promoted.parsed.value.action.action_kind);
-    try std.testing.expectEqual(@as(i64, 2), promoted.parsed.value.promotion.new_identity.timeline_id);
+    try std.testing.expectEqual(2, promoted.parsed.value.promotion.new_identity.timeline_id);
 
     try std.testing.expectError(error.HaCommandConflict, client.executeCommand("http://ha-admin.test", &.{
         "--table",
@@ -1829,7 +1824,7 @@ test "storage.hot_standby http client round trips typed commit operations" {
         .sync_policy = .{ .mode = "async" },
     });
     defer appended.deinit(alloc);
-    try std.testing.expectEqual(@as(i64, 1), appended.parsed.value.lsn);
+    try std.testing.expectEqual(1, appended.parsed.value.lsn);
     try std.testing.expectEqualStrings("acknowledge", appended.parsed.value.gate.action);
     try std.testing.expectEqualStrings("async", appended.parsed.value.gate.durability.mode);
 
@@ -1843,10 +1838,10 @@ test "storage.hot_standby http client round trips typed commit operations" {
         },
     });
     defer checked.deinit(alloc);
-    try std.testing.expectEqual(@as(i64, 1), checked.parsed.value.gate.target_lsn);
+    try std.testing.expectEqual(1, checked.parsed.value.gate.target_lsn);
     try std.testing.expectEqualStrings("acknowledge", checked.parsed.value.gate.action);
     try std.testing.expectEqualStrings("remote_write", checked.parsed.value.gate.durability.mode);
-    try std.testing.expectEqual(@as(i64, 1), checked.parsed.value.gate.durability.progress_lsn);
+    try std.testing.expectEqual(1, checked.parsed.value.gate.durability.progress_lsn);
 
     var degraded = try client.appendCommit("http://ha-admin.test", .{
         .payload = "two",
@@ -1861,7 +1856,7 @@ test "storage.hot_standby http client round trips typed commit operations" {
         },
     });
     defer degraded.deinit(alloc);
-    try std.testing.expectEqual(@as(i64, 2), degraded.parsed.value.lsn);
+    try std.testing.expectEqual(2, degraded.parsed.value.lsn);
     try std.testing.expectEqualStrings("acknowledge_degraded", degraded.parsed.value.gate.action);
     try std.testing.expectEqualStrings("degraded_to_async", degraded.parsed.value.gate.durability.status);
 }
@@ -1892,7 +1887,7 @@ test "storage.hot_standby http client round trips typed gate operations" {
     });
     defer primary_write.deinit(alloc);
     try std.testing.expectEqualStrings("allow_write", primary_write.parsed.value.decision.action);
-    try std.testing.expectEqual(@as(i64, 1), primary_write.parsed.value.decision.next_lsn);
+    try std.testing.expectEqual(1, primary_write.parsed.value.decision.next_lsn);
 
     var primary_owner_job = try client.checkOwnerJob("http://ha-admin.test", .{
         .role = "primary",
@@ -1911,7 +1906,7 @@ test "storage.hot_standby http client round trips typed gate operations" {
         .sync_policy = .{ .mode = "async" },
     });
     defer appended.deinit(alloc);
-    try std.testing.expectEqual(@as(i64, 1), appended.parsed.value.lsn);
+    try std.testing.expectEqual(1, appended.parsed.value.lsn);
 
     var apply_ctx: u8 = 0;
     _ = try standby.receive(testRecord(identity, 1, "one"));
@@ -1923,7 +1918,7 @@ test "storage.hot_standby http client round trips typed gate operations" {
     });
     defer ready_read.deinit(alloc);
     try std.testing.expectEqualStrings("serve_standby", ready_read.parsed.value.decision.action);
-    try std.testing.expectEqual(@as(?i64, 1), ready_read.parsed.value.decision.serve_lsn.valueOrNull());
+    try std.testing.expectEqual(@as(?u64, 1), ready_read.parsed.value.decision.serve_lsn.valueOrNull());
 
     var waiting_read = try client.checkRead("http://ha-admin.test", .{
         .consistency = "at_least_lsn",
@@ -1931,7 +1926,7 @@ test "storage.hot_standby http client round trips typed gate operations" {
     });
     defer waiting_read.deinit(alloc);
     try std.testing.expectEqualStrings("wait_for_apply", waiting_read.parsed.value.decision.action);
-    try std.testing.expectEqual(@as(i64, 1), waiting_read.parsed.value.decision.missing_lsn_count);
+    try std.testing.expectEqual(1, waiting_read.parsed.value.decision.missing_lsn_count);
 
     var standby_write = try client.checkWrite("http://ha-admin.test", .{
         .role = "standby",
@@ -1975,11 +1970,11 @@ test "storage.hot_standby http client round trips typed seed operations" {
         .manifest_id = "base-http-client",
     });
     defer begin.deinit(alloc);
-    try std.testing.expectEqual(@as(i64, 1), begin.parsed.value.schema_version);
+    try std.testing.expectEqual(1, begin.parsed.value.schema_version);
     try std.testing.expectEqualStrings("standby-seed", begin.parsed.value.slot_name);
     try std.testing.expectEqualStrings("base-http-client", begin.parsed.value.manifest_id);
-    try std.testing.expectEqual(@as(i64, 1), begin.parsed.value.backup_lsn);
-    try std.testing.expectEqual(@as(i64, 1), begin.parsed.value.start_record_lsn);
+    try std.testing.expectEqual(1, begin.parsed.value.backup_lsn);
+    try std.testing.expectEqual(1, begin.parsed.value.start_record_lsn);
 
     try std.testing.expectEqual(@as(u64, 2), try primary.append(.{ .payload = "during-copy" }));
 
@@ -2008,8 +2003,8 @@ test "storage.hot_standby http client round trips typed seed operations" {
     });
     defer finish.deinit(alloc);
     try std.testing.expectEqualStrings("base-http-client", finish.parsed.value.manifest_id);
-    try std.testing.expectEqual(@as(i64, 1), finish.parsed.value.backup_lsn);
-    try std.testing.expectEqual(@as(i64, 3), finish.parsed.value.end_record_lsn);
+    try std.testing.expectEqual(1, finish.parsed.value.backup_lsn);
+    try std.testing.expectEqual(3, finish.parsed.value.end_record_lsn);
 
     var bootstrap = try client.bootstrapStandby("http://ha-admin.test", .{
         .manifest_path = manifest_path,
@@ -2017,7 +2012,7 @@ test "storage.hot_standby http client round trips typed seed operations" {
     });
     defer bootstrap.deinit(alloc);
     try std.testing.expectEqualStrings("base-http-client", bootstrap.parsed.value.manifest_id);
-    try std.testing.expectEqual(@as(i64, 2), bootstrap.parsed.value.checkpoint_lsn);
+    try std.testing.expectEqual(2, bootstrap.parsed.value.checkpoint_lsn);
     try std.testing.expectEqual(@as(u64, 3), standby.nextReceiveLsn());
 }
 
@@ -2158,9 +2153,9 @@ test "storage.hot_standby http client round trips typed safety operations" {
     };
     var fence = try client.acquireFence("http://ha-admin.test", fence_request);
     defer fence.deinit(alloc);
-    try std.testing.expectEqual(@as(i64, 1), fence.parsed.value.schema_version);
+    try std.testing.expectEqual(1, fence.parsed.value.schema_version);
     try std.testing.expectEqualStrings("standby-a", fence.parsed.value.receipt.promoted_node_id);
-    try std.testing.expectEqual(@as(i64, 2), fence.parsed.value.receipt.new_timeline_id);
+    try std.testing.expectEqual(2, fence.parsed.value.receipt.new_timeline_id);
 
     var current = try client.currentFence("http://ha-admin.test");
     defer current.deinit(alloc);
@@ -2183,8 +2178,8 @@ test "storage.hot_standby http client round trips typed safety operations" {
 
     var promoted = try client.promoteWithCurrentFence("http://ha-admin.test");
     defer promoted.deinit(alloc);
-    try std.testing.expectEqual(@as(i64, 2), promoted.parsed.value.promotion.new_identity.timeline_id);
-    try std.testing.expectEqual(@as(i64, 1), promoted.parsed.value.fence_generation);
+    try std.testing.expectEqual(2, promoted.parsed.value.promotion.new_identity.timeline_id);
+    try std.testing.expectEqual(1, promoted.parsed.value.fence_generation);
 
     var rejoin = try client.assessRejoin("http://ha-admin.test", .{
         .node_id = "primary-a",
@@ -2196,12 +2191,12 @@ test "storage.hot_standby http client round trips typed safety operations" {
     });
     defer rejoin.deinit(alloc);
     try std.testing.expectEqualStrings("reseed", rejoin.parsed.value.assessment.action);
-    try std.testing.expectEqual(@as(i64, 2), rejoin.parsed.value.assessment.target_timeline_id);
-    try std.testing.expectEqual(@as(i64, 100), rejoin.parsed.value.assessment.parent_cluster_id);
-    try std.testing.expectEqual(@as(i64, 10), rejoin.parsed.value.assessment.parent_shard_id);
-    try std.testing.expectEqual(@as(i64, 20), rejoin.parsed.value.assessment.parent_table_id);
-    try std.testing.expectEqual(@as(i64, 1), rejoin.parsed.value.assessment.parent_timeline_id);
-    try std.testing.expectEqual(@as(i64, 1), rejoin.parsed.value.assessment.parent_epoch);
+    try std.testing.expectEqual(2, rejoin.parsed.value.assessment.target_timeline_id);
+    try std.testing.expectEqual(100, rejoin.parsed.value.assessment.parent_cluster_id);
+    try std.testing.expectEqual(10, rejoin.parsed.value.assessment.parent_shard_id);
+    try std.testing.expectEqual(20, rejoin.parsed.value.assessment.parent_table_id);
+    try std.testing.expectEqual(1, rejoin.parsed.value.assessment.parent_timeline_id);
+    try std.testing.expectEqual(1, rejoin.parsed.value.assessment.parent_epoch);
 
     try std.testing.expectError(error.HaCommandConflict, client.rewindRejoin("http://ha-admin.test", .{
         .node_id = "primary-a",
@@ -2222,7 +2217,7 @@ test "storage.hot_standby http client round trips typed safety operations" {
     });
     defer reseed.deinit(alloc);
     try std.testing.expectEqualStrings("reseed", reseed.parsed.value.assessment.action);
-    try std.testing.expectEqual(@as(i64, 1), reseed.parsed.value.assessment.parent_timeline_id);
+    try std.testing.expectEqual(1, reseed.parsed.value.assessment.parent_timeline_id);
     try std.testing.expect(reseed.parsed.value.reseed != null);
     try std.testing.expect(reseed.parsed.value.reseed.?.reseed_required);
     try std.testing.expect(reseed.parsed.value.reseed.?.base_backup_required);
@@ -2248,7 +2243,7 @@ test "storage.hot_standby http client accepts authoritative former primary tail 
         .receipt = null,
     });
     defer response.deinit(alloc);
-    try std.testing.expectEqual(@as(i64, 4), response.parsed.value.assessment.former_last_lsn);
+    try std.testing.expectEqual(4, response.parsed.value.assessment.former_last_lsn);
     try std.testing.expectEqual(response.parsed.value.assessment.former_last_lsn, response.parsed.value.assessment.fork_lsn);
 }
 

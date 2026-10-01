@@ -2,6 +2,24 @@
 
 This guide covers backing up and restoring Antfly database clusters using the AntflyBackup and AntflyRestore CRDs.
 
+## Configure schedules before creating tables
+
+An `AntflyBackup` can be created before the cluster contains any tables. The
+operator retains the requested schedule and suspends its CronJob while the
+public table catalog is empty. The schedule reports `Pending` with reason
+`WaitingForTables`; it does not create backup jobs or success/failure records.
+The operator checks the catalog every 30 seconds and resumes the CronJob once a
+table exists, even if the table contains no documents. Kubernetes' normal cron
+and missed-run rules then apply. Deleting the last table pauses new backups again.
+An already-running backup is not canceled, and its real completion is retained.
+
+Catalog authentication, connectivity, and decoding errors report
+`CatalogUnavailable` and keep new jobs suspended; they are not treated as proof
+that the cluster is empty. The check uses the same public service as the backup
+CLI (`GET /db/v1/tables`). Explicit `spec.suspend: true` always wins. This does
+not change the behavior of manual backup requests or validate missing named
+tables as successful backups.
+
 ## Overview
 
 The Antfly Operator provides two CRDs for data protection:

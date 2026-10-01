@@ -143,6 +143,7 @@ pub fn deinitDerivedGraphWrite(alloc: Allocator, write: graph_edge_types.GraphEd
     if (write.edge_id.len > 0) alloc.free(@constCast(write.edge_id));
     if (write.owner_document.len > 0) alloc.free(@constCast(write.owner_document));
     if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
+    if (write.owner.len > 0) alloc.free(@constCast(write.owner));
 }
 
 pub fn deinitDerivedGraphDelete(alloc: Allocator, delete: graph_edge_types.GraphEdgeDelete) void {
@@ -152,6 +153,7 @@ pub fn deinitDerivedGraphDelete(alloc: Allocator, delete: graph_edge_types.Graph
     alloc.free(@constCast(delete.edge_type));
     if (delete.edge_id.len > 0) alloc.free(@constCast(delete.edge_id));
     if (delete.owner_document.len > 0) alloc.free(@constCast(delete.owner_document));
+    if (delete.owner.len > 0) alloc.free(@constCast(delete.owner));
 }
 
 fn cloneDerivedTargetRefs(alloc: Allocator, targets: []const DerivedTargetRef) ![]DerivedTargetRef {
@@ -262,6 +264,8 @@ pub fn cloneDerivedGraphWrite(alloc: Allocator, write: graph_edge_types.GraphEdg
         try alloc.dupe(u8, write.metadata_json)
     else
         "";
+    errdefer if (metadata_json.len > 0) alloc.free(metadata_json);
+    const owner = if (write.owner.len > 0) try alloc.dupe(u8, write.owner) else "";
     return .{
         .index_name = index_name,
         .source = source,
@@ -272,7 +276,9 @@ pub fn cloneDerivedGraphWrite(alloc: Allocator, write: graph_edge_types.GraphEdg
         .weight = write.weight,
         .created_at = write.created_at,
         .updated_at = write.updated_at,
+        .ttl_created_ns = write.ttl_created_ns,
         .metadata_json = metadata_json,
+        .owner = owner,
     };
 }
 
@@ -288,6 +294,8 @@ pub fn cloneDerivedGraphDelete(alloc: Allocator, delete: graph_edge_types.GraphE
     const edge_id = try alloc.dupe(u8, delete.edge_id);
     errdefer alloc.free(edge_id);
     const owner_document = try alloc.dupe(u8, delete.owner_document);
+    errdefer alloc.free(owner_document);
+    const owner = if (delete.owner.len > 0) try alloc.dupe(u8, delete.owner) else "";
     return .{
         .index_name = index_name,
         .source = source,
@@ -295,6 +303,7 @@ pub fn cloneDerivedGraphDelete(alloc: Allocator, delete: graph_edge_types.GraphE
         .edge_type = edge_type,
         .edge_id = edge_id,
         .owner_document = owner_document,
+        .owner = owner,
     };
 }
 
@@ -456,7 +465,11 @@ pub fn cloneBatch(alloc: Allocator, batch: DerivedBatch) !DerivedBatch {
 }
 
 const binary_magic = "ADLG";
-const binary_version: u16 = 6;
+// v6 adds the graph mutation owner (entity-sourced relations,
+// zig/AUTOSCHEMA.md); older records decode with an empty owner, the legacy
+// source-is-owner shape.
+const binary_version: u16 = 8;
+const relationship_binary_version: u16 = 8;
 const min_supported_binary_version: u16 = 2;
 
 pub fn encodeLogRecord(alloc: Allocator, batch: DerivedBatch) ![]u8 {
@@ -470,8 +483,8 @@ pub fn encodeLogRecordInto(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), b
     out.clearRetainingCapacity();
 
     try out.appendSlice(alloc, binary_magic);
-    // Preserve v5 replay compatibility until a batch actually uses explicit identities.
-    var version: u16 = 5;
+    // Preserve main's owner/TTL v7 layout unless explicit relationships require v8.
+    var version: u16 = 7;
     for (batch.graph_writes) |write| if (write.edge_id.len > 0 or write.owner_document.len > 0) {
         version = binary_version;
         break;
@@ -540,14 +553,16 @@ pub fn encodeLogRecordInto(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), b
         try writeBytes(out, alloc, write.source);
         try writeBytes(out, alloc, write.target);
         try writeBytes(out, alloc, write.edge_type);
-        if (version >= 6) {
-            try writeBytes(out, alloc, write.edge_id);
-            try writeBytes(out, alloc, write.owner_document);
-        }
         try appendInt(out, alloc, u64, @bitCast(write.weight));
         try appendInt(out, alloc, u64, write.created_at);
         try appendInt(out, alloc, u64, write.updated_at);
         try writeBytes(out, alloc, write.metadata_json);
+        try writeBytes(out, alloc, write.owner);
+        try appendInt(out, alloc, u64, write.ttl_created_ns);
+        if (version >= relationship_binary_version) {
+            try writeBytes(out, alloc, write.edge_id);
+            try writeBytes(out, alloc, write.owner_document);
+        }
     }
 
     try appendInt(out, alloc, u32, @intCast(batch.graph_deletes.len));
@@ -556,7 +571,8 @@ pub fn encodeLogRecordInto(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), b
         try writeBytes(out, alloc, delete.source);
         try writeBytes(out, alloc, delete.target);
         try writeBytes(out, alloc, delete.edge_type);
-        if (version >= 6) {
+        try writeBytes(out, alloc, delete.owner);
+        if (version >= relationship_binary_version) {
             try writeBytes(out, alloc, delete.edge_id);
             try writeBytes(out, alloc, delete.owner_document);
         }
@@ -685,53 +701,38 @@ const SliceReader = struct {
 };
 
 fn decodeGraphWriteAlloc(alloc: Allocator, reader: *SliceReader, version: u32) !graph_edge_types.GraphEdgeWrite {
-    const index_name = try reader.readBytesAlloc(alloc);
-    errdefer alloc.free(index_name);
-    const source = try reader.readBytesAlloc(alloc);
-    errdefer alloc.free(source);
-    const target = try reader.readBytesAlloc(alloc);
-    errdefer alloc.free(target);
-    const edge_type = try reader.readBytesAlloc(alloc);
-    errdefer alloc.free(edge_type);
-    const edge_id = if (version >= 6) try reader.readBytesOrEmpty(alloc) else "";
-    errdefer alloc.free(edge_id);
-    const owner_document = if (version >= 6) try reader.readBytesOrEmpty(alloc) else "";
-    errdefer alloc.free(owner_document);
-    return .{
-        .index_name = index_name,
-        .source = source,
-        .target = target,
-        .edge_type = edge_type,
-        .edge_id = edge_id,
-        .owner_document = owner_document,
-        .weight = @bitCast(try reader.readInt(u64)),
-        .created_at = try reader.readInt(u64),
-        .updated_at = try reader.readInt(u64),
-        .metadata_json = try reader.readBytesOrEmpty(alloc),
-    };
+    var write = graph_edge_types.GraphEdgeWrite{ .index_name = "", .source = "", .target = "", .edge_type = "" };
+    errdefer deinitDerivedGraphWrite(alloc, write);
+    write.index_name = try reader.readBytesAlloc(alloc);
+    write.source = try reader.readBytesAlloc(alloc);
+    write.target = try reader.readBytesAlloc(alloc);
+    write.edge_type = try reader.readBytesAlloc(alloc);
+    write.weight = @bitCast(try reader.readInt(u64));
+    write.created_at = try reader.readInt(u64);
+    write.updated_at = try reader.readInt(u64);
+    write.metadata_json = try reader.readBytesOrEmpty(alloc);
+    if (version >= 6) write.owner = try reader.readBytesOrEmpty(alloc);
+    if (version >= 7) write.ttl_created_ns = try reader.readInt(u64);
+    if (version >= relationship_binary_version) {
+        write.edge_id = try reader.readBytesOrEmpty(alloc);
+        write.owner_document = try reader.readBytesOrEmpty(alloc);
+    }
+    return write;
 }
 
 fn decodeGraphDeleteAlloc(alloc: Allocator, reader: *SliceReader, version: u32) !graph_edge_types.GraphEdgeDelete {
-    const index_name = try reader.readBytesAlloc(alloc);
-    errdefer alloc.free(index_name);
-    const source = try reader.readBytesAlloc(alloc);
-    errdefer alloc.free(source);
-    const target = try reader.readBytesAlloc(alloc);
-    errdefer alloc.free(target);
-    const edge_type = try reader.readBytesAlloc(alloc);
-    errdefer alloc.free(edge_type);
-    const edge_id = if (version >= 6) try reader.readBytesOrEmpty(alloc) else "";
-    errdefer alloc.free(edge_id);
-    const owner_document = if (version >= 6) try reader.readBytesOrEmpty(alloc) else "";
-    errdefer alloc.free(owner_document);
-    return .{
-        .index_name = index_name,
-        .source = source,
-        .target = target,
-        .edge_type = edge_type,
-        .edge_id = edge_id,
-        .owner_document = owner_document,
-    };
+    var deletion = graph_edge_types.GraphEdgeDelete{ .index_name = "", .source = "", .target = "", .edge_type = "" };
+    errdefer deinitDerivedGraphDelete(alloc, deletion);
+    deletion.index_name = try reader.readBytesAlloc(alloc);
+    deletion.source = try reader.readBytesAlloc(alloc);
+    deletion.target = try reader.readBytesAlloc(alloc);
+    deletion.edge_type = try reader.readBytesAlloc(alloc);
+    if (version >= 6) deletion.owner = try reader.readBytesOrEmpty(alloc);
+    if (version >= relationship_binary_version) {
+        deletion.edge_id = try reader.readBytesOrEmpty(alloc);
+        deletion.owner_document = try reader.readBytesOrEmpty(alloc);
+    }
+    return deletion;
 }
 
 fn decodeBinaryLogRecord(alloc: Allocator, payload: []const u8) !DecodedLogRecord {
@@ -979,9 +980,11 @@ test "derived log record binary round trips" {
         },
         .graph_writes = &.{
             .{ .index_name = "gr_v1", .source = "doc:a", .target = "doc:b", .edge_type = "cites", .weight = 2.0 },
+            .{ .index_name = "gr_v1", .source = "person/ada", .owner = "doc:a", .target = "org/antfly", .edge_type = "works_at" },
         },
         .graph_deletes = &.{
             .{ .index_name = "gr_v1", .source = "doc:b", .target = "doc:c", .edge_type = "replies" },
+            .{ .index_name = "gr_v1", .source = "person/ada", .owner = "doc:a", .target = "event/x", .edge_type = "participates_in" },
         },
     });
     defer alloc.free(payload);
@@ -989,7 +992,7 @@ test "derived log record binary round trips" {
     var decoded = try decodeLogRecord(alloc, payload);
     defer decoded.deinit();
 
-    try std.testing.expectEqual(@as(u16, 5), decoded.version);
+    try std.testing.expectEqual(@as(u16, 7), decoded.version);
     try std.testing.expectEqual(@as(u64, 42), decoded.batch.sequence);
     try std.testing.expectEqualStrings("doc:a", decoded.batch.documents[0].key);
     try std.testing.expectEqualStrings("dv_v1", decoded.batch.documents[0].targets[0].index_name);
@@ -1005,6 +1008,21 @@ test "derived log record binary round trips" {
     try std.testing.expectEqualStrings("body_chunks_v1", decoded.batch.generated_enrichment_refs[0].artifact_name);
     try std.testing.expectEqual(@as(f64, 2.0), decoded.batch.graph_writes[0].weight);
     try std.testing.expectEqualStrings("replies", decoded.batch.graph_deletes[0].edge_type);
+    // Entity-sourced mutations round-trip owner alongside the topological
+    // source (v6); legacy-shaped mutations keep an empty owner.
+    try std.testing.expectEqual(@as(usize, 0), decoded.batch.graph_writes[0].owner.len);
+    try std.testing.expectEqualStrings("person/ada", decoded.batch.graph_writes[1].source);
+    try std.testing.expectEqualStrings("doc:a", decoded.batch.graph_writes[1].owner);
+    try std.testing.expectEqual(@as(usize, 0), decoded.batch.graph_deletes[0].owner.len);
+    try std.testing.expectEqualStrings("person/ada", decoded.batch.graph_deletes[1].source);
+    try std.testing.expectEqualStrings("doc:a", decoded.batch.graph_deletes[1].owner);
+
+    // The clone path preserves owner too (the derived-batch clone previously
+    // dropped it, collapsing entity-sourced mutations back to their source).
+    var cloned = try cloneBatch(std.testing.allocator, decoded.batch);
+    defer deinitDerivedBatch(std.testing.allocator, &cloned);
+    try std.testing.expectEqualStrings("doc:a", cloned.graph_writes[1].owner);
+    try std.testing.expectEqualStrings("doc:a", cloned.graph_deletes[1].owner);
 }
 
 test "derived log record decodes legacy json payloads" {
@@ -1143,7 +1161,7 @@ test "derived batch clone releases every partial allocation" {
     );
 }
 
-test "derived log relationship identities select v6 and survive cloning" {
+test "derived log relationship identities select v8 and survive cloning" {
     const alloc = std.testing.allocator;
     const write = graph_edge_types.GraphEdgeWrite{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "RELATES_TO", .edge_id = "fact:1", .owner_document = "fact:1" };
     const delete = graph_edge_types.GraphEdgeDelete{ .index_name = write.index_name, .source = write.source, .target = write.target, .edge_type = write.edge_type, .edge_id = write.edge_id, .owner_document = write.owner_document };
@@ -1151,7 +1169,7 @@ test "derived log relationship identities select v6 and survive cloning" {
     defer alloc.free(payload);
     var decoded = try decodeLogRecord(alloc, payload);
     defer decoded.deinit();
-    try std.testing.expectEqual(@as(u16, 6), decoded.version);
+    try std.testing.expectEqual(@as(u16, 8), decoded.version);
     try std.testing.expectEqualStrings("fact:1", decoded.batch.graph_writes[0].edge_id);
     try std.testing.expectEqualStrings("fact:1", decoded.batch.graph_deletes[0].owner_document);
     var cloned = try cloneBatch(alloc, decoded.batch);
@@ -1180,4 +1198,31 @@ test "graph replay truncated relationship fields release all allocations" {
     }
     var decoded = try decodeLogRecord(alloc, payload);
     defer decoded.deinit();
+}
+
+test "graph relationship integration decodes legacy owner TTL and explicit identity journals" {
+    const alloc = std.testing.allocator;
+    const legacy = try encodeLogRecord(alloc, .{ .sequence = 1, .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R", .owner = "producer", .ttl_created_ns = 123 }} });
+    defer alloc.free(legacy);
+    try std.testing.expectEqual(@as(u16, 7), std.mem.readInt(u16, legacy[4..6], .little));
+    var ttl = try decodeLogRecord(alloc, legacy);
+    defer ttl.deinit();
+    try std.testing.expectEqualStrings("producer", ttl.batch.graph_writes[0].owner);
+    try std.testing.expectEqual(@as(u64, 123), ttl.batch.graph_writes[0].ttl_created_ns);
+    // v6 ends each graph write with its owner; v7 appended an eight-byte TTL.
+    const v6 = try std.mem.concat(alloc, u8, &.{ legacy[0 .. legacy.len - 12], legacy[legacy.len - 4 ..] });
+    defer alloc.free(v6);
+    std.mem.writeInt(u16, v6[4..6], 6, .little);
+    var owner = try decodeLogRecord(alloc, v6);
+    defer owner.deinit();
+    try std.testing.expectEqualStrings("producer", owner.batch.graph_writes[0].owner);
+    try std.testing.expectEqual(@as(u64, 0), owner.batch.graph_writes[0].ttl_created_ns);
+    const modern = try encodeLogRecord(alloc, .{ .sequence = 2, .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R", .edge_id = "one", .owner_document = "fact:one", .ttl_created_ns = 456 }} });
+    defer alloc.free(modern);
+    try std.testing.expectEqual(@as(u16, 8), std.mem.readInt(u16, modern[4..6], .little));
+    var fact = try decodeLogRecord(alloc, modern);
+    defer fact.deinit();
+    try std.testing.expectEqualStrings("one", fact.batch.graph_writes[0].edge_id);
+    try std.testing.expectEqualStrings("fact:one", fact.batch.graph_writes[0].owner_document);
+    try std.testing.expectEqual(@as(u64, 456), fact.batch.graph_writes[0].ttl_created_ns);
 }

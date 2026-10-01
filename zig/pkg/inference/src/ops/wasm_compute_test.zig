@@ -71,13 +71,13 @@ fn registerTestWeights(compute: *wasm_compute.WasmCompute, allocator: std.mem.Al
     compute.registerWeight("embeddings.LayerNorm.bias", try zerosF32(allocator, H));
 
     // Encoder layer 0
-    const layer_prefixes = [_][]const u8{
-        "encoder.layer.0.attention.self.query",
-        "encoder.layer.0.attention.self.key",
-        "encoder.layer.0.attention.self.value",
-        "encoder.layer.0.attention.output.dense",
-        "encoder.layer.0.intermediate.dense",
-        "encoder.layer.0.output.dense",
+    const layer_names = [_]struct { weight: []const u8, bias: []const u8 }{
+        .{ .weight = "encoder.layer.0.attention.self.query.weight", .bias = "encoder.layer.0.attention.self.query.bias" },
+        .{ .weight = "encoder.layer.0.attention.self.key.weight", .bias = "encoder.layer.0.attention.self.key.bias" },
+        .{ .weight = "encoder.layer.0.attention.self.value.weight", .bias = "encoder.layer.0.attention.self.value.bias" },
+        .{ .weight = "encoder.layer.0.attention.output.dense.weight", .bias = "encoder.layer.0.attention.output.dense.bias" },
+        .{ .weight = "encoder.layer.0.intermediate.dense.weight", .bias = "encoder.layer.0.intermediate.dense.bias" },
+        .{ .weight = "encoder.layer.0.output.dense.weight", .bias = "encoder.layer.0.output.dense.bias" },
     };
     const layer_sizes = [_][2]usize{
         .{ H, H }, // query
@@ -88,13 +88,9 @@ fn registerTestWeights(compute: *wasm_compute.WasmCompute, allocator: std.mem.Al
         .{ H, I }, // output
     };
 
-    for (layer_prefixes, layer_sizes) |prefix, sizes| {
-        var w_name_buf: [128]u8 = undefined;
-        var b_name_buf: [128]u8 = undefined;
-        const w_name = std.fmt.bufPrint(&w_name_buf, "{s}.weight", .{prefix}) catch unreachable;
-        const b_name = std.fmt.bufPrint(&b_name_buf, "{s}.bias", .{prefix}) catch unreachable;
-        compute.registerWeight(w_name, try randomF32(allocator, sizes[0] * sizes[1]));
-        compute.registerWeight(b_name, try zerosF32(allocator, sizes[0]));
+    for (layer_names, layer_sizes) |names, sizes| {
+        compute.registerWeight(names.weight, try randomF32(allocator, sizes[0] * sizes[1]));
+        compute.registerWeight(names.bias, try zerosF32(allocator, sizes[0]));
     }
 
     // LayerNorm weights for attention output and layer output
@@ -106,12 +102,14 @@ fn registerTestWeights(compute: *wasm_compute.WasmCompute, allocator: std.mem.Al
 
 test "wasm_compute: tiny BERT forward pass" {
     const allocator = std.testing.allocator;
+    var weight_arena = std.heap.ArenaAllocator.init(allocator);
+    defer weight_arena.deinit();
 
     var compute = wasm_compute.WasmCompute.init(allocator);
     var cb = compute.computeBackend();
     defer cb.deinit();
 
-    try registerTestWeights(&compute, allocator);
+    try registerTestWeights(&compute, weight_arena.allocator());
 
     const batch: usize = 1;
     const seq_len: usize = 4;
@@ -145,12 +143,14 @@ test "wasm_compute: tiny BERT forward pass" {
 
 test "wasm_compute: batched embedding" {
     const allocator = std.testing.allocator;
+    var weight_arena = std.heap.ArenaAllocator.init(allocator);
+    defer weight_arena.deinit();
 
     var compute = wasm_compute.WasmCompute.init(allocator);
     var cb = compute.computeBackend();
     defer cb.deinit();
 
-    try registerTestWeights(&compute, allocator);
+    try registerTestWeights(&compute, weight_arena.allocator());
 
     const batch: usize = 2;
     const seq_len: usize = 3;
@@ -231,12 +231,12 @@ test "wasm_compute: embeddingLookupTensor from i32 token tensor" {
     const allocator = std.testing.allocator;
 
     var compute = wasm_compute.WasmCompute.init(allocator);
-    const embed = try allocator.dupe(f32, &[_]f32{
+    var embed = [_]f32{
         1.0, 2.0, 3.0,
         4.0, 5.0, 6.0,
         7.0, 8.0, 9.0,
-    });
-    compute.registerWeight("embed.weight", embed);
+    };
+    compute.registerWeight("embed.weight", &embed);
 
     var cb = compute.computeBackend();
     defer cb.deinit();
@@ -302,14 +302,16 @@ test "wasm_compute: decoder runtime absolute embeddings" {
     var cb = compute.computeBackend();
     defer cb.deinit();
 
-    compute.registerWeight("tok", try allocator.dupe(f32, &[_]f32{
+    var token_embeddings = [_]f32{
         1.0,  2.0,  3.0,
         10.0, 20.0, 30.0,
-    }));
-    compute.registerWeight("pos", try allocator.dupe(f32, &[_]f32{
+    };
+    var position_embeddings = [_]f32{
         0.5, 0.25, 0.125,
         1.0, 1.5,  2.0,
-    }));
+    };
+    compute.registerWeight("tok", &token_embeddings);
+    compute.registerWeight("pos", &position_embeddings);
     const tok = try cb.getWeight("tok");
     const pos = try cb.getWeight("pos");
 

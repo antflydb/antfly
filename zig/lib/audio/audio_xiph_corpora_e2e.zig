@@ -405,6 +405,12 @@ fn probeOneOpusRfcVector(alloc: Allocator, root_dir: []const u8, relative_path: 
     return .success;
 }
 
+/// Minimum SNR against the RFC 8251 reference decodes. The two references
+/// per vector (`.dec` and `m.dec`, from two builds of the reference decoder)
+/// agree with each other to about 78 dB; a matching decoder lands at 65 dB
+/// or higher against either, so this leaves room for float rounding only.
+const min_rfc_vector_snr_db: f64 = 40.0;
+
 fn probeOneOpusRfcVectorChannels(
     alloc: Allocator,
     packet_stream: []const u8,
@@ -418,104 +424,52 @@ fn probeOneOpusRfcVectorChannels(
     };
     defer decoded.deinit();
 
-    inference_audio.normalizePcmInPlace(decoded.samples);
     if (!allFinite(decoded.samples)) return false;
-    const primary = matchesReferencePcm16(decoded.samples, channels, ref_primary);
-    const alt = matchesReferencePcm16(decoded.samples, channels, ref_alt);
-    if (primary or alt) return true;
-    const shape_primary = matchesReferenceShape(decoded.samples, channels, ref_primary);
-    const shape_alt = matchesReferenceShape(decoded.samples, channels, ref_alt);
-    return shape_primary or shape_alt;
-}
-
-fn matchesReferencePcm16(samples: []const f32, channels: u8, reference_bytes: []const u8) bool {
-    if (reference_bytes.len % 2 != 0) return false;
-    if (matchesReferencePcm16Direct(samples, reference_bytes)) return true;
-    if (channels == 1 and reference_bytes.len % 4 == 0 and samples.len == reference_bytes.len / 4) {
-        if (matchesReferenceMonoAgainstStereoPcm16(samples, reference_bytes, 0)) return true;
-        if (matchesReferenceMonoAgainstStereoPcm16(samples, reference_bytes, 1)) return true;
-        if (matchesReferenceMonoAgainstStereoDownmixPcm16(samples, reference_bytes)) return true;
+    // Both reference files are stereo. A mono decode of a stereo stream is
+    // the average of the two channels in both Opus layers (CELT downmixes
+    // the spectrum, SILK returns the mid channel), so compare it against the
+    // downmixed reference.
+    const snr = @max(
+        referenceSnrDb(decoded.samples, channels, ref_primary),
+        referenceSnrDb(decoded.samples, channels, ref_alt),
+    );
+    if (snr < min_rfc_vector_snr_db) {
+        std.debug.print("opus rfc vector channels={d}: snr {d:.1} dB below {d:.1} dB\n", .{ channels, snr, min_rfc_vector_snr_db });
+        return false;
     }
-    return false;
+    return true;
 }
 
-fn matchesReferencePcm16Direct(samples: []const f32, reference_bytes: []const u8) bool {
-    if (samples.len != reference_bytes.len / 2) return false;
-    var sample_energy: f64 = 0;
-    var ref_energy: f64 = 0;
-    for (samples, 0..) |sample, index| {
-        if (!std.math.isFinite(sample)) return false;
-        const off = index * 2;
-        const raw = @as(i16, @bitCast(@as(u16, reference_bytes[off]) | (@as(u16, reference_bytes[off + 1]) << 8)));
-        const ref = @as(f32, @floatFromInt(raw)) / 32768.0;
-
-        sample_energy += @as(f64, sample) * @as(f64, sample);
-        ref_energy += @as(f64, ref) * @as(f64, ref);
-    }
-    return matchesReferenceEnergyAndSignal(samples, sample_energy, ref_energy);
-}
-
-fn matchesReferenceMonoAgainstStereoPcm16(samples: []const f32, reference_bytes: []const u8, channel_index: usize) bool {
-    var sample_energy: f64 = 0;
-    var ref_energy: f64 = 0;
-    for (samples, 0..) |sample, index| {
-        if (!std.math.isFinite(sample)) return false;
-        const off = (index * 2 + channel_index) * 2;
-        const raw = @as(i16, @bitCast(@as(u16, reference_bytes[off]) | (@as(u16, reference_bytes[off + 1]) << 8)));
-        const ref = @as(f32, @floatFromInt(raw)) / 32768.0;
-
-        sample_energy += @as(f64, sample) * @as(f64, sample);
-        ref_energy += @as(f64, ref) * @as(f64, ref);
-    }
-    return matchesReferenceEnergyAndSignal(samples, sample_energy, ref_energy);
-}
-
-fn matchesReferenceMonoAgainstStereoDownmixPcm16(samples: []const f32, reference_bytes: []const u8) bool {
-    var sample_energy: f64 = 0;
-    var ref_energy: f64 = 0;
-    for (samples, 0..) |sample, index| {
-        if (!std.math.isFinite(sample)) return false;
-        const left_off = index * 4;
-        const right_off = left_off + 2;
-        const left_raw = @as(i16, @bitCast(@as(u16, reference_bytes[left_off]) | (@as(u16, reference_bytes[left_off + 1]) << 8)));
-        const right_raw = @as(i16, @bitCast(@as(u16, reference_bytes[right_off]) | (@as(u16, reference_bytes[right_off + 1]) << 8)));
-        const left = @as(f32, @floatFromInt(left_raw)) / 32768.0;
-        const right = @as(f32, @floatFromInt(right_raw)) / 32768.0;
-        const ref = 0.5 * (left + right);
-
-        sample_energy += @as(f64, sample) * @as(f64, sample);
-        ref_energy += @as(f64, ref) * @as(f64, ref);
-    }
-    return matchesReferenceEnergyAndSignal(samples, sample_energy, ref_energy);
-}
-
-fn matchesReferenceEnergyAndSignal(samples: []const f32, sample_energy: f64, ref_energy: f64) bool {
-    if (ref_energy == 0) return sample_energy <= 1e-12;
-    const ratio = sample_energy / ref_energy;
-    if (!std.math.isFinite(ratio)) return false;
-    if (ratio < 0.05 or ratio > 20.0) return false;
-
-    var saw_signal = false;
-    for (samples) |sample| {
-        if (@abs(sample) > 1e-5) {
-            saw_signal = true;
-            break;
+fn referenceSnrDb(samples: []const f32, channels: u8, reference_bytes: []const u8) f64 {
+    if (reference_bytes.len % 4 != 0) return -std.math.inf(f64);
+    const reference_frames = reference_bytes.len / 4;
+    if (samples.len != reference_frames * channels) return -std.math.inf(f64);
+    var signal: f64 = 0;
+    var noise: f64 = 0;
+    for (0..reference_frames) |frame| {
+        const left = referencePcm16(reference_bytes, 2 * frame);
+        const right = referencePcm16(reference_bytes, 2 * frame + 1);
+        if (channels == 2) {
+            const err_l = @as(f64, samples[2 * frame]) - left;
+            const err_r = @as(f64, samples[2 * frame + 1]) - right;
+            signal += left * left + right * right;
+            noise += err_l * err_l + err_r * err_r;
+        } else {
+            const ref = 0.5 * (left + right);
+            const err = @as(f64, samples[frame]) - ref;
+            signal += ref * ref;
+            noise += err * err;
         }
     }
-    return saw_signal;
+    if (signal == 0) return if (noise == 0) std.math.inf(f64) else -std.math.inf(f64);
+    if (noise == 0) return std.math.inf(f64);
+    return 10.0 * std.math.log10(signal / noise);
 }
 
-fn matchesReferenceShape(samples: []const f32, channels: u8, reference_bytes: []const u8) bool {
-    if (reference_bytes.len % 2 != 0) return false;
-    const reference_samples = reference_bytes.len / 2;
-    const exact = samples.len == reference_samples;
-    const stereo_to_mono = channels == 1 and reference_bytes.len % 4 == 0 and samples.len == reference_bytes.len / 4;
-    if (!exact and !stereo_to_mono) return false;
-
-    for (samples) |sample| {
-        if (@abs(sample) > 1e-5) return true;
-    }
-    return false;
+fn referencePcm16(reference_bytes: []const u8, index: usize) f64 {
+    const off = index * 2;
+    const raw = @as(i16, @bitCast(@as(u16, reference_bytes[off]) | (@as(u16, reference_bytes[off + 1]) << 8)));
+    return @as(f64, @floatFromInt(raw)) / 32768.0;
 }
 
 fn allFinite(samples: []const f32) bool {
@@ -736,6 +690,7 @@ fn formatName(format: inference_audio.EncodedFormat) []const u8 {
         .aiff => "aiff",
         .caf => "caf",
         .au => "au",
+        .webm => "webm",
     };
 }
 

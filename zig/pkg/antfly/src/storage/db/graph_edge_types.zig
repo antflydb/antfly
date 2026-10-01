@@ -17,6 +17,8 @@ const std = @import("std");
 pub const GraphEdgeWrite = struct {
     edge_id: []const u8 = "",
     owner_document: []const u8 = "",
+    /// Producer for legacy tuple contributions; empty uses the source.
+    owner: []const u8 = "",
     index_name: []const u8,
     source: []const u8,
     target: []const u8,
@@ -24,6 +26,7 @@ pub const GraphEdgeWrite = struct {
     weight: f64 = 1.0,
     created_at: u64 = 0,
     updated_at: u64 = 0,
+    ttl_created_ns: u64 = 0,
     metadata_json: []const u8 = "",
 
     /// Owned fields retained by projection pages, including the complete
@@ -32,6 +35,10 @@ pub const GraphEdgeWrite = struct {
         var bytes: usize = @sizeOf(@This());
         inline for (identity_fields) |field| bytes +|= @field(self, field).len;
         return bytes +| self.metadata_json.len;
+    }
+
+    pub fn producingDocument(self: @This()) []const u8 {
+        return if (self.owner_document.len > 0) self.owner_document else if (self.owner.len > 0) self.owner else self.source;
     }
 
     pub fn cloneAlloc(self: @This(), alloc: std.mem.Allocator) !@This() {
@@ -48,10 +55,16 @@ pub const GraphEdgeWrite = struct {
 pub const GraphEdgeDelete = struct {
     edge_id: []const u8 = "",
     owner_document: []const u8 = "",
+    /// Producer for legacy tuple contributions; empty uses the source.
+    owner: []const u8 = "",
     index_name: []const u8,
     source: []const u8,
     target: []const u8,
     edge_type: []const u8,
+    pub fn producingDocument(self: @This()) []const u8 {
+        return if (self.owner_document.len > 0) self.owner_document else if (self.owner.len > 0) self.owner else self.source;
+    }
+
     pub fn cloneAlloc(self: @This(), alloc: std.mem.Allocator) !@This() {
         return cloneMutationAlloc(alloc, self);
     }
@@ -63,7 +76,7 @@ pub const GraphEdgeDelete = struct {
     }
 };
 
-const identity_fields = [_][]const u8{ "index_name", "source", "target", "edge_type", "edge_id", "owner_document" };
+const identity_fields = [_][]const u8{ "index_name", "source", "target", "edge_type", "edge_id", "owner_document", "owner" };
 
 fn freeOwnedMutation(alloc: std.mem.Allocator, mutation: anytype) void {
     inline for (identity_fields) |field| alloc.free(@field(mutation, field));

@@ -210,6 +210,45 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the graph index */
+                indexName: string;
+                /** @description Name of the configured graph metric */
+                metricName: string;
+                /** @description Operational action to apply to the graph metric materialization */
+                action: "refresh" | "rebuild" | "delete" | "pause" | "resume";
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Execute a graph metric operational action
+         * @description Refresh, rebuild, delete, pause, or resume maintenance for a configured
+         *     graph metric. The metric configuration remains owned by the graph index.
+         *     Refresh and rebuild durably enqueue bounded, resumable maintenance and
+         *     return the aggregate shard status without waiting for graph-sized work.
+         *     `delete` clears materialized metric state and durably disables automatic
+         *     maintenance. A later refresh, rebuild, or resume action re-enables the
+         *     metric and can publish a new generation.
+         */
+        post: operations["executeNamespaceTableGraphMetricAction"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/transactions/commit": {
         parameters: {
             query?: never;
@@ -607,6 +646,197 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/sql/connections": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Open a durable idle HTTP SQL connection
+         * @description Creates a principal- and API-node-owned connection with a one-hour idle-use deadline. Active or uncertain transactions retain their exact connection binding until completion or reconciliation; expiry is not an abort decision. Send connection_id with later SQL and prepared requests. This ID is not a transaction session_id. DISCARD ALL resets only this connection's setting overlay and prepared resources, and refuses active or uncertain transactions. Do not automatically replay ambiguous create responses.
+         */
+        post: operations["openSQLConnection"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/sql/connections/{connection_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                connection_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Close an idle SQL connection and its prepared resources
+         * @description Refuses an active, beginning or uncertain transaction; route to owner_node_id.
+         */
+        delete: operations["closeSQLConnection"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/sql/prepared": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create a durable prepared SQL resource
+         * @description Binds SELECT, INSERT, UPDATE or DELETE without executing it. The immutable resource belongs to the authenticated principal and API node, expires after one hour, and survives transaction COMMIT and owner restart with the same durable store and node identity. A session-bound resource is executable only while its attached session remains active. Owner failover is not automatic; execute and close must reach owner_node_id. Each durable store admits at most 128 resources and 4 MiB of serialized prepared state. Expired resources are reclaimed atomically during subsequent creation or close. Execution authenticates and authorizes again and rejects changed catalog identities or schemas. When session_id is supplied, preparation uses the attached session's authenticated database, namespace and setting overlay under its execution lease. The resource is bound to that session; execution re-reads current values but rejects a changed setting catalog. A native durable session store is required.
+         */
+        post: operations["prepareSQL"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/sql/prepared/{prepared_id}/execute": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                prepared_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Execute a durable prepared SQL resource
+         * @description Uses the stored statement, namespace and immutable binding identities. Resource admission linearizes when its durable record is loaded; a later close or expiry does not cancel that already admitted execution. Mutation outcomes must be reconciled rather than replayed after ambiguous errors.
+         */
+        post: operations["executePreparedSQL"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/sql/prepared/{prepared_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                prepared_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Release a durable prepared SQL resource */
+        delete: operations["closePreparedSQL"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Publish or remove a durable SQL setting
+         * @description Cluster-administrator-only, revision-fenced publication of typed setting definitions and global, database, and credential-role defaults. SQL SET cannot change policy-sensitive settings. Observe an ambiguous mutation before retrying.
+         */
+        post: operations["administerSqlSettings"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/store-roots/enroll": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Approve a physical store-root signing identity
+         * @description Cluster-administrator-only approval of a locally signed proof bound to the metadata cluster, node, store and physical root. Ordinary node registration does not grant retirement authority. The request is not automatically retried; observe the enrollment after an ambiguous 503.
+         */
+        post: operations["enrollStoreRoot"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/store-roots/enrollment-status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Check one exact physical store-root enrollment
+         * @description Read-only, linearizable cluster-administrator check for the exact identity in a signed proof. Use after an ambiguous enroll response; this operation never submits another enrollment mutation.
+         */
+        post: operations["getStoreRootEnrollmentStatus"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/sql": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Execute a SQL statement
+         * @description Executes the bounded relational SELECT, INSERT, UPDATE, and DELETE
+         *     subset through the current catalog and native row execution contracts.
+         *     Parameters are bound separately from statement text. Document, graph,
+         *     and lake SQL sources, DDL, and SQL sessions are not yet supported.
+         *     Reads inherit native owner-local consistency, not a global SQL
+         *     transaction snapshot. Statements requiring a retained multi-page
+         *     statement snapshot fail when that capability is unavailable.
+         *     Unsupported statement shapes fail explicitly; the server never
+         *     silently substitutes a different query or truncates the result.
+         */
+        post: operations["executeSQL"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/query": {
         parameters: {
             query?: never;
@@ -782,6 +1012,131 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/agents/research": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Research Agent - Bounded multi-phase research with a cited report
+         * @description Runs a bounded research state machine:
+         *     plan → research (parallel retrieval researchers) → reflect → … → write → verify
+         *
+         *     Every researcher is an ordinary retrieval-agent run over the request's
+         *     authorized queries, so authorization, mandatory predicates and tool
+         *     policy are identical to `/agents/retrieval`. Researchers return
+         *     compressed findings; the writer only sees findings and a deduplicated
+         *     evidence registry, and the server validates every `[E#]` citation.
+         *
+         *     All work is bounded by `budget`. Send `research_state` back to resume
+         *     or extend a run. For runs longer than one request, use
+         *     `/agents/research/jobs`.
+         *
+         *     **SSE Event Types:** the retrieval-agent events are reused.
+         *     `step_progress` carries `phase` values `plan`, `sub_question_started`,
+         *     `finding`, `reflection`, `section` and `verification`. Report text
+         *     streams as `generation`. `done` carries the authoritative
+         *     ResearchAgentResult.
+         */
+        post: operations["researchAgent"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/agents/research/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start a durable research job
+         * @description Persists a research request as a durable job that advances one bounded
+         *     phase at a time. Each phase checkpoints its research_state, so a job
+         *     survives server restarts and can be resumed by any caller holding the
+         *     same identity. Jobs are scoped to the authenticated principal.
+         */
+        post: operations["startResearchJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/agents/research/jobs/{jobId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Research job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        /** Get a durable research job */
+        get: operations["getResearchJob"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/agents/research/jobs/{jobId}/advance": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Research job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Advance a durable research job
+         * @description Runs up to `max_phases` bounded research phases and persists the
+         *     checkpoint after each one. Concurrent advances of the same job are
+         *     rejected with 409.
+         */
+        post: operations["advanceResearchJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/agents/research/jobs/{jobId}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Research job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Cancel a durable research job */
+        post: operations["cancelResearchJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables": {
         parameters: {
             query?: never;
@@ -945,6 +1300,145 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/constraints/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /** Read distributed UNIQUE, foreign-key, and CHECK validation coverage */
+        get: operations["getRelationalConstraintStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/constraints/repair": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Repair version-conditional rows after failed or diagnosed constraint activation
+         * @description Requires table administrator permission. Each affected target range must
+         *     have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+         *     missing-parent diagnostic. Replacement values still satisfy all
+         *     constraints, and referential actions require write permission on every
+         *     affected table. Existing dependencies remain protected. Repairs do not
+         *     mark historical coverage valid. Invoke constraint retry after repairing
+         *     failed activation; validating diagnostics resume validation automatically.
+         */
+        post: operations["repairRelationalConstraints"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/constraints/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Restart failed UNIQUE/FK/CHECK validation after administrative repair
+         * @description Requires table administrator permission. Resets each failed owner using
+         *     an exact checkpoint precondition. Owners already validating or enforced
+         *     are unchanged. Retrying after partial progress is safe. Inspect the
+         *     constraint status endpoint for coverage and diagnostics.
+         *     When a retirement job is active, clears its paused diagnostic and
+         *     resumes that job instead of restarting activation. Retirement remains
+         *     fenced and retains all prior drain progress.
+         */
+        post: operations["retryRelationalConstraints"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/constraints/retire": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retire unique and foreign-key definitions safely
+         * @description Requires table administrator permission. Starts a durable, bounded
+         *     all-owner drain. Poll constraints/status for progress. A target schema
+         *     is published automatically after the drain. With drop=true the table
+         *     remains fenced at ready_to_drop until an administrator explicitly
+         *     deletes it with the existing table deletion endpoint.
+         */
+        post: operations["retireRelationalConstraints"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/rows/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Query projected typed relational rows */
+        post: operations["queryRelationalRows"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/rows/mutate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Atomically replace or delete version-conditional typed rows */
+        post: operations["mutateRelationalRows"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables/{tableName}/batch": {
         parameters: {
             query?: never;
@@ -1077,8 +1571,25 @@ export interface paths {
     };
     "/db/v1/tables/{tableName}/schema": {
         parameters: {
-            query?: never;
-            header?: never;
+            query?: {
+                /**
+                 * @description Explicitly enqueue a durable fresh-generation schema rewrite instead
+                 *     of changing the live schema. Requires administrator permission on the
+                 *     entire dependency cohort. Sources remain writable during snapshot and
+                 *     catch-up; final validation and publication are atomic across the cohort.
+                 *     Returns a restore job (202), whose existing status/cancel routes apply.
+                 *     Independent graph/vector artifacts without a retained row-derived
+                 *     source proof are rejected before admission. The default false retains
+                 *     ordinary schema-update behavior. Existing absent values remain absent
+                 *     rather than retroactively receiving defaults. Stored column type
+                 *     changes and destructive column removal are rejected.
+                 */
+                rewrite?: boolean;
+            };
+            header?: {
+                /** @description Retry identity for rewrite=true admission. Reusing a key for a different rewrite returns 409. */
+                "Idempotency-Key"?: string;
+            };
             path: {
                 /** @description Name of the table */
                 tableName: string;
@@ -1228,6 +1739,68 @@ export interface paths {
          *     `target=index` for index repair candidates.
          */
         post: operations["listTableRepairIssues"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/storage/migrations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create or resume a table storage migration job
+         * @description Table-admin operation for local single-shard standalone tables. Target
+         *     vector_store changes primary_lsm source ownership without changing models,
+         *     dimensions, artifacts or logical indexes. Retry creation with the same
+         *     job_id, target and budgets. The job is advanced explicitly through its
+         *     job endpoint; the server does not schedule an unattended migration loop.
+         *     Offline migration uses antfly storage migrate against a stopped server.
+         */
+        post: operations["createTableStorageMigration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/storage/migrations/{jobId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Read a table storage migration receipt
+         * @description Table-admin observation only. Does not admit, advance, or publish a job.
+         *     A phase of admitted means catalog admission is durable but DB preparation
+         *     has not begun; retry creation or send a job action to recover it. The
+         *     receipt is retained until a later migration replaces it; this endpoint
+         *     is not a permanent job history.
+         */
+        get: operations["getTableStorageMigration"];
+        put?: never;
+        /**
+         * Advance, publish or cancel a table storage migration job
+         * @description Uses the job's durable configuration and budgets. Each step commits
+         *     bounded progress. Publish is accepted only at ready; complete additionally
+         *     certifies reference-only primary artifacts and native ANN serving.
+         *     Cancellation is allowed only before publication. Repeating an action
+         *     after an ambiguous response resumes the durable job.
+         */
+        post: operations["advanceTableStorageMigration"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1653,6 +2226,52 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/indexes/{indexName}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retry a failed index build
+         * @description Generation-fenced relational index maintenance. Requires table ADMIN permission. Retry accepts failed generations. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+         */
+        post: operations["retryIndex"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/indexes/{indexName}/repair": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Repair an index generation
+         * @description Generation-fenced relational index maintenance. Requires table ADMIN permission. Repair accepts ready or failed generations and rebuilds their derived records. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+         */
+        post: operations["repairIndex"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables/{tableName}/indexes/{indexName}": {
         parameters: {
             query?: never;
@@ -1672,6 +2291,789 @@ export interface paths {
         post: operations["createIndex"];
         /** Drop an index from a table */
         delete: operations["dropIndex"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tablespaces": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List tablespaces
+         * @description Lists tablespace catalog objects visible to the caller.
+         */
+        get: operations["listTablespaces"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tablespaces/{tablespaceName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Tablespace name */
+                tablespaceName: string;
+            };
+            cookie?: never;
+        };
+        /** Get tablespace */
+        get: operations["getTablespace"];
+        put?: never;
+        /**
+         * Create tablespace
+         * @description Creates a tablespace catalog object. The server applies the same lifecycle semantics as `CREATE TABLESPACE`.
+         */
+        post: operations["createTablespace"];
+        /**
+         * Drop tablespace
+         * @description Drops a tablespace catalog object. Table placement by tablespace is fail-closed until native placement planning consumes tablespace policy.
+         */
+        delete: operations["dropTablespace"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List databases
+         * @description Lists database catalog objects visible to the caller. Shorthand table APIs resolve through the caller's current/default database.
+         */
+        get: operations["listDatabases"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+            };
+            cookie?: never;
+        };
+        /** Get database */
+        get: operations["getDatabase"];
+        put?: never;
+        /**
+         * Create database
+         * @description Creates a database catalog object. The server applies the same semantics as `CREATE DATABASE`.
+         */
+        post: operations["createDatabase"];
+        /**
+         * Drop database
+         * @description Drops an empty database catalog object. Non-empty databases fail with a conflict.
+         */
+        delete: operations["dropDatabase"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/tablespace": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Set database tablespace
+         * @description Binds the database catalog object to an existing tablespace.
+         */
+        put: operations["setDatabaseTablespace"];
+        post?: never;
+        /**
+         * Clear database tablespace
+         * @description Clears the database catalog object's durable tablespace binding.
+         */
+        delete: operations["clearDatabaseTablespace"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * List namespaces
+         * @description Lists namespace catalog objects inside a database. PostgreSQL schemas map to these namespaces.
+         */
+        get: operations["listNamespaces"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create namespace
+         * @description Creates a namespace catalog object in a database. The server applies the same semantics as `CREATE SCHEMA` for the selected database.
+         */
+        post: operations["createNamespace"];
+        /**
+         * Drop namespace
+         * @description Drops an empty namespace catalog object. Non-empty namespaces fail with a conflict.
+         */
+        delete: operations["dropNamespace"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tablespace": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Set namespace tablespace
+         * @description Binds the namespace catalog object to an existing tablespace.
+         */
+        put: operations["setNamespaceTablespace"];
+        post?: never;
+        /**
+         * Clear namespace tablespace
+         * @description Clears the namespace catalog object's durable tablespace binding.
+         */
+        delete: operations["clearNamespaceTablespace"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * List tables in namespace
+         * @description Lists table catalog objects under an explicit database and namespace.
+         */
+        get: operations["listNamespaceTables"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Get namespace table details
+         * @description Gets a table through an explicit database and namespace route.
+         */
+        get: operations["getNamespaceTable"];
+        put?: never;
+        /**
+         * Create namespace table
+         * @description Creates a table through an explicit database and namespace route.
+         */
+        post: operations["createNamespaceTable"];
+        /**
+         * Drop namespace table
+         * @description Drops a table through an explicit database and namespace route.
+         */
+        delete: operations["dropNamespaceTable"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Query an explicit namespace table
+         * @description Queries a table through an explicit database and namespace route. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
+         */
+        post: operations["queryNamespaceTable"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/batch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Perform batch inserts and deletes on an explicit namespace table
+         * @description Performs batch writes through an explicit database and namespace route. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
+         */
+        post: operations["batchNamespaceTable"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/schema": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Name of the table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Replace a table's schema
+         * @description Replaces the complete table schema. Properties omitted from the request
+         *     are removed. Use PATCH on this path for a partial JSON Merge Patch update.
+         */
+        put: operations["updateNamespaceTableSchema"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Patch a table's schema
+         * @description Applies an RFC 7396 JSON Merge Patch to the current table schema. Object
+         *     members are merged recursively and a null value removes that member.
+         *     Antfly validates and versions the resulting complete schema atomically.
+         */
+        patch: operations["patchNamespaceTableSchema"];
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/backup": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Backup an explicit namespace table */
+        post: operations["backupNamespaceTable"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/restore": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Restore an explicit namespace table from backup */
+        post: operations["restoreNamespaceTable"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/documents/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+                /** @description Key of the document to retrieve */
+                key: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Retrieve a document by key from an explicit namespace table
+         * @description Retrieves a document through an explicit database and namespace route. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
+         */
+        get: operations["lookupNamespaceTableDocument"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * List indexes for an explicit namespace table
+         * @description Lists index metadata through an explicit database and namespace route.
+         */
+        get: operations["listNamespaceTableIndexes"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+                /** @description Name of the index */
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        /** Get index details for an explicit namespace table */
+        get: operations["getNamespaceTableIndex"];
+        put?: never;
+        /** Add an index to an explicit namespace table */
+        post: operations["createNamespaceTableIndex"];
+        /** Drop an index from an explicit namespace table */
+        delete: operations["dropNamespaceTableIndex"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /** Read distributed UNIQUE, foreign-key, and CHECK validation coverage */
+        get: operations["getNamespaceRelationalConstraintStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/repair": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Repair version-conditional rows after failed or diagnosed constraint activation
+         * @description Requires table administrator permission. Each affected target range must
+         *     have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+         *     missing-parent diagnostic. Replacement values still satisfy all
+         *     constraints, and referential actions require write permission on every
+         *     affected table. Existing dependencies remain protected. Repairs do not
+         *     mark historical coverage valid. Invoke constraint retry after repairing
+         *     failed activation; validating diagnostics resume validation automatically.
+         */
+        post: operations["repairNamespaceRelationalConstraints"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Restart failed UNIQUE/FK/CHECK validation after administrative repair
+         * @description Requires table administrator permission. Resets each failed owner using
+         *     an exact checkpoint precondition. Owners already validating or enforced
+         *     are unchanged. Retrying after partial progress is safe. Inspect the
+         *     constraint status endpoint for coverage and diagnostics.
+         *     When a retirement job is active, clears its paused diagnostic and
+         *     resumes that job instead of restarting activation. Retirement remains
+         *     fenced and retains all prior drain progress.
+         */
+        post: operations["retryNamespaceRelationalConstraints"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retire": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retire unique and foreign-key definitions safely
+         * @description Requires table administrator permission. Starts a durable, bounded
+         *     all-owner drain. Poll constraints/status for progress. A target schema
+         *     is published automatically after the drain. With drop=true the table
+         *     remains fenced at ready_to_drop until an administrator explicitly
+         *     deletes it with the existing table deletion endpoint.
+         */
+        post: operations["retireNamespaceRelationalConstraints"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Query projected typed relational rows */
+        post: operations["queryNamespaceRelationalRows"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/mutate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Atomically replace or delete version-conditional typed rows */
+        post: operations["mutateNamespaceRelationalRows"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retry a failed index build
+         * @description Generation-fenced relational index maintenance. Requires table ADMIN permission. Retry accepts failed generations. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+         */
+        post: operations["retryNamespaceIndex"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/repair": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Repair an index generation
+         * @description Generation-fenced relational index maintenance. Requires table ADMIN permission. Repair accepts ready or failed generations and rebuilds their derived records. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+         */
+        post: operations["repairNamespaceIndex"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/rename": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Rename catalog resource */
+        post: operations["renameDatabase"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/rename": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Rename catalog resource */
+        post: operations["renameNamespace"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tablespaces/{tablespaceName}/rename": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Rename catalog resource */
+        post: operations["renameTablespace"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rename": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Rename catalog resource */
+        post: operations["renameNamespaceTable"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/tablespace": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Set namespace tablespace
+         * @description Binds the namespace catalog object to an existing tablespace.
+         */
+        put: operations["setNamespaceTableTablespace"];
+        post?: never;
+        /**
+         * Clear namespace tablespace
+         * @description Clears the namespace catalog object's durable tablespace binding.
+         */
+        delete: operations["clearNamespaceTableTablespace"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1901,7 +3303,14 @@ export interface paths {
     };
     "/auth/v1/subjects/{subject}/row-filters/{table}": {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Explicit database; defaults to default when namespace is supplied. */
+                database?: string;
+                /** @description Explicit namespace; defaults to public when database is supplied. */
+                namespace?: string;
+                /** @description Select all tables in the explicit namespace instead of the literal path table. */
+                all_tables?: boolean;
+            };
             header?: never;
             path: {
                 /** @description Casbin subject name, such as role:tenant_reader or group:eng. */
@@ -1934,7 +3343,14 @@ export interface paths {
     };
     "/auth/v1/users/{userName}/row-filters/{table}": {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Explicit database; defaults to default when namespace is supplied. */
+                database?: string;
+                /** @description Explicit namespace; defaults to public when database is supplied. */
+                namespace?: string;
+                /** @description Select all tables in the explicit namespace instead of the literal path table. */
+                all_tables?: boolean;
+            };
             header?: never;
             path: {
                 /** @description The username. */
@@ -2079,33 +3495,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/ai/v1/rerank_multimodal": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Rerank multimodal documents by relevance
-         * @description Re-scores multimodal documents based on relevance to a text query.
-         *
-         *     This endpoint accepts the same content-part image conventions as generation and embedding.
-         *     Text-only requests can be served immediately. Image-bearing requests reserve the stable
-         *     contract for native ColQwen-style late-interaction reranking as that encoder lands.
-         *     Image-bearing requests already run native Zig image preprocessing and grid preparation.
-         *     Remote URL byte potential is reserved before fetch, and image headers plus aggregate
-         *     decoded pixels are admitted before model loading.
-         */
-        post: operations["rerankMultimodalPrompts"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/ai/v1/rerank": {
         parameters: {
             query?: never;
@@ -2116,32 +3505,34 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Rerank prompts by relevance
-         * @description Re-scores pre-rendered text prompts based on relevance to a query using native or ONNX reranking models.
+         * Rerank documents by relevance
+         * @description Re-scores documents by relevance to a text query. Returns one score per
+         *     document, in request order.
          *
-         *     ## Client Responsibilities
+         *     Each entry in `documents` is either a string or an array of content parts, in
+         *     the same format that generation and embedding use: `text` parts, `image_url`
+         *     parts, and inline `media` parts with an `image/*` MIME type. The client renders
+         *     document fields or templates to text before calling this endpoint.
          *
-         *     The client must:
-         *     1. Extract relevant fields from documents
-         *     2. Render any templates
-         *     3. Send pre-rendered text strings as `prompts`
-         *
-         *     This design keeps inference stateless and allows clients to customize rendering logic.
+         *     Text-only documents work with any reranker. Documents with images require a
+         *     model that supports them: a ColQwen-style late-interaction reranker (manifest
+         *     capability `colqwen` or `multimodal_late_interaction`) or a Qwen3-VL reranker
+         *     bundled with its GGUF vision projector. Otherwise the request is rejected with
+         *     a `400`. Within a request that contains images, documents without images are
+         *     scored by the model's text scorer.
          *
          *     ## Models
          *
          *     - Models are auto-discovered from `models_dir/rerankers/`
-         *     - Cross-encoder rerankers are supported through the existing text scorer
+         *     - Cross-encoder rerankers are supported through the text scorer
          *     - Late-interaction text rerankers such as ColBERT can opt in with `model_manifest.json` capability `late_interaction` or `colbert`
-         *     - Supports quantized models (`model_quantized.onnx`)
          *     - Automatically prefers quantized variants if available
          *
-         *     This endpoint is still text-only. Real ColQwen-style multimodal reranking requires a future request shape that carries page images or image-derived embeddings.
-         *
-         *     For document-based reranking with field extraction, use the client-side
-         *     `lib/reranking` package which handles rendering before calling this endpoint.
+         *     Remote image URLs are fetched subject to the configured content security
+         *     policy. Image headers and aggregate decoded pixels are admitted before the
+         *     model loads.
          */
-        post: operations["rerankPrompts"];
+        post: operations["rerankDocuments"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2407,6 +3798,220 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ai/v1/dictate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Dictate speech into clean written text
+         * @description Push-to-talk dictation. Transcribes one recorded clip with a Whisper
+         *     transcriber, then rewrites the transcript as clean written text with a
+         *     generator model: fillers, false starts, and repeated words are removed,
+         *     punctuation and paragraphing are added, and preferred spellings from
+         *     `dictionary` are applied. Clips longer than the 30 s Whisper window
+         *     are transcribed in windows cut at the quietest pause near the boundary.
+         *
+         *     Set `cleanup_model` to the generator that rewrites the transcript.
+         *     Without it, or with `style: verbatim`, the response carries the raw
+         *     transcript and no generation runs.
+         *
+         *     The framed attachment transport is accepted: send the JSON as the
+         *     envelope metadata with `"audio": "attachment:0"` and the clip as the
+         *     single attachment.
+         *
+         *     With `stream: true` the response is Server-Sent Events. The stream
+         *     emits one `dictation.transcript` event as soon as transcription
+         *     finishes, then `dictation.delta` events with cleaned-text tokens,
+         *     then `dictation.completed` with the full cleaned text, then `[DONE]`.
+         *
+         *     ```json
+         *     {
+         *       "model": "openai/whisper-tiny",
+         *       "cleanup_model": "ggml-org/gemma-4-E4B-it-GGUF",
+         *       "audio": "UklGRi...",
+         *       "dictionary": ["Antfly", "Colony"],
+         *       "context": "reply in a Slack thread",
+         *       "stream": true
+         *     }
+         *     ```
+         */
+        post: operations["dictate"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/transcription/sessions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Open a streaming transcription session
+         * @description Creates a server-side session that accepts audio in chunks and returns
+         *     transcript events as speech is endpointed. Append audio with
+         *     `POST /transcription/sessions/{session_id}/audio`; each append runs
+         *     voice activity detection over the buffered audio and returns the
+         *     events it produced:
+         *
+         *     - `partial`: the open speech segment decoded again. `stable_text` is
+         *       the word prefix that agreed with the previous hypothesis and can be
+         *       rendered as committed text.
+         *     - `final`: a segment closed by `vad.min_silence_ms` of silence, by
+         *       `max_segment_ms` of continuous speech, or by `commit: true`.
+         *
+         *     Sessions expire after `ttl_seconds` without appends and are closed
+         *     with `DELETE`.
+         */
+        post: operations["createTranscriptionSession"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/transcription/sessions/{session_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Inspect a streaming transcription session */
+        get: operations["getTranscriptionSession"];
+        put?: never;
+        post?: never;
+        /**
+         * Close a streaming transcription session
+         * @description Discards buffered audio that has not been committed.
+         */
+        delete: operations["deleteTranscriptionSession"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/transcription/sessions/{session_id}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Subscribe to a session's transcript events
+         * @description Long-lived Server-Sent Events stream that pushes every `partial` and
+         *     `final` event the session produces, whether they came from
+         *     `POST .../audio` appends or a `POST .../stream` upload. Clients that
+         *     append from one connection and render from another use this instead
+         *     of reading the append responses. A `ping` is sent after 15 s of
+         *     silence. The stream ends with `session.closed` and `[DONE]` when the
+         *     session is deleted or expires.
+         */
+        get: operations["streamTranscriptionSessionEvents"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/transcription/sessions/{session_id}/stream": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Stream raw audio into a session and receive events as they occur
+         * @description Full-duplex transcription over one request. The request body is raw
+         *     little-endian mono PCM (`format` selects 16-bit or float32 samples at
+         *     `sample_rate`), sent as it is captured. The server decodes as chunks
+         *     arrive and writes `transcription.event` messages on the response while
+         *     the upload continues. At end of body, buffered speech is finalized
+         *     when `commit` is true (the default).
+         *
+         *     Over HTTP/2 the body is read incrementally. Over HTTP/1.1 the body is
+         *     read after it has fully arrived, so use `/audio` appends there for
+         *     live results. Appends to the same session are refused with 409 while
+         *     a stream is open.
+         */
+        post: operations["streamTranscriptionAudio"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/transcription/sessions/{session_id}/audio": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Append audio to a streaming transcription session
+         * @description Appends one chunk of audio and runs endpointing and decoding over the
+         *     session buffer. The response lists the events produced by this
+         *     append, in order. Appends to one session must be sequential; a
+         *     concurrent append is rejected with 409.
+         *
+         *     `audio` is base64. With `format: auto` (default) the bytes are a
+         *     container the runtime can decode (WAV, Opus, MP3, FLAC, ...). With
+         *     `format: pcm16` or `pcm_f32` the bytes are raw little-endian mono
+         *     samples at `sample_rate`, which lets a client send microphone frames
+         *     without re-encoding. Chunks of 250 ms to 1 s balance latency and
+         *     decoder work.
+         *
+         *     `commit: true` finalizes buffered speech even without trailing
+         *     silence. It may be sent without `audio` to flush at the end of a
+         *     recording.
+         *
+         *     The framed attachment transport is accepted: send the JSON as the
+         *     envelope metadata with `"audio": "attachment:0"` and the bytes as the
+         *     single attachment.
+         */
+        post: operations["appendTranscriptionAudio"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/decide": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Answer named choice, ordinal score, and Boolean questions */
+        post: operations["decide"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/ai/v1/extract": {
         parameters: {
             query?: never;
@@ -2422,6 +4027,13 @@ export interface paths {
          *     canonical public API for named entity recognition, relation extraction,
          *     text/document classification, token classification, and structured
          *     document extraction.
+         *
+         *     Set `schema_version: 2` for strict mixed-task schemas, span attributes,
+         *     constrained classification, typed records and JointIE. Each input may
+         *     replace the shared schema/options. Offsets default to half-open UTF-8
+         *     bytes, and text content parts are joined by a single newline. Inputs
+         *     are validated atomically. Unsupported features and long documents are
+         *     rejected explicitly; windowing requires runtime support.
          *
          *     Image-backed extraction uses the same byte-reserving and image-count-weighted
          *     admission policy as `/read`, before model resolution or download. Text-only
@@ -2762,6 +4374,323 @@ export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
         /**
+         * @description Logical SQL result type. Integer values are decimal strings to preserve exact precision in every client.
+         * @enum {string}
+         */
+        SQLColumnType: "string" | "uuid" | "integer" | "number" | "boolean" | "datetime" | "json" | "unknown";
+        SQLColumn: {
+            /** @description Display label. Labels need not be unique; rows use matching ordinal positions. */
+            name: string;
+            type: components["schemas"]["SQLColumnType"];
+        };
+        SQLPrepareRequest: {
+            statement: string;
+            database?: string;
+            namespace?: string;
+            /** @description Optional durable SQL session. Preparation binds its authenticated scope and current setting catalog under the session lease; execution must supply the same session. */
+            session_id?: string;
+            /** @description Optional idle HTTP SQL connection. Preparation binds to its current DISCARD generation; a transaction-bound preparation remains bound to session_id instead. */
+            connection_id?: string;
+        };
+        SQLPreparedExecutionRequest: {
+            parameters?: unknown[];
+            /** @default 128 */
+            limit?: number;
+            /** @description Optional durable transaction session. Required when the resource was prepared against a session; otherwise independent of the prepared resource lifetime. */
+            session_id?: string;
+            /** @description Required for a connection-bound resource; DISCARD ALL closes it without affecting other clients' resources. */
+            connection_id?: string;
+        };
+        SQLConnectionOpenRequest: {
+            /** @default default */
+            database?: string;
+            /** @default public */
+            namespace?: string;
+        };
+        SQLConnectionResponse: {
+            connection_id: string;
+            /** @description The owning API node. Zero denotes a standalone-local endpoint; send subsequent connection requests to that same endpoint. Otherwise route requests to the returned owning node. */
+            owner_node_id: string;
+            /**
+             * Format: int64
+             * @description Idle-use deadline in Unix milliseconds. An attached active or uncertain transaction remains accessible for completion and reconciliation after this deadline; expiry never implies abort.
+             */
+            expires_at_ms: number;
+            database: string;
+            namespace: string;
+        };
+        SQLPreparedResponse: {
+            prepared_id: string;
+            /** Format: int64 */
+            expires_at_ms: number;
+            /** @description Exact decimal API owner identifier, preserved by JavaScript clients. */
+            owner_node_id: string;
+            parameter_types: components["schemas"]["SQLColumnType"][];
+            columns: components["schemas"]["SQLColumn"][];
+        };
+        /** @description One typed setting value, matching the declared kind. */
+        SqlSettingValue: {
+            boolean: boolean;
+        } | {
+            /** Format: int64 */
+            integer: number;
+        } | {
+            string: string;
+        };
+        SqlSettingDatabaseDefault: {
+            database: string;
+            value: components["schemas"]["SqlSettingValue"];
+        };
+        SqlSettingRoleDefault: {
+            principal: string;
+            database: string;
+            value: components["schemas"]["SqlSettingValue"];
+        };
+        SqlSettingPut: {
+            name: string;
+            /** @enum {string} */
+            kind: "boolean" | "integer" | "string";
+            policy_sensitive?: boolean;
+            session_writable?: boolean;
+            default: components["schemas"]["SqlSettingValue"];
+            database_defaults?: components["schemas"]["SqlSettingDatabaseDefault"][];
+            role_defaults?: components["schemas"]["SqlSettingRoleDefault"][];
+        };
+        SqlSettingMutationPut: {
+            put: components["schemas"]["SqlSettingPut"];
+        };
+        SqlSettingMutationDrop: {
+            drop: string;
+        };
+        /** @description Put a complete definition/default set or drop one by name. */
+        SqlSettingMutationRequest: components["schemas"]["SqlSettingMutationPut"] | components["schemas"]["SqlSettingMutationDrop"];
+        StoreRootEnrollmentIdentity: {
+            metadata_incarnation: string;
+            /** Format: int64 */
+            node_id: number;
+            /** Format: int64 */
+            store_id: number;
+            /** @description Decimal u128 string; never pass through a floating-point JSON number. */
+            root_incarnation: string;
+            /** @description Ed25519 public key in lowercase hex. */
+            public_key: string;
+        };
+        StoreRootEnrollmentRequest: {
+            identity: components["schemas"]["StoreRootEnrollmentIdentity"];
+            /** @description Ed25519 proof-of-possession signature in lowercase hex. */
+            signature: string;
+        };
+        /**
+         * @description Execute one SQL statement. Parameters are positional (`$1`, `$2`, ...),
+         *     never interpolated into SQL text. To preserve integer precision in
+         *     JavaScript clients, supply integers outside the exact JSON number range
+         *     as decimal strings; binding coerces parameters to the expected type.
+         *     The result limit is an admission bound, not an implicit SQL LIMIT:
+         *     statements whose results exceed it fail instead of silently truncating.
+         *     Request bodies are limited to 4 MiB, preparation to 8 MiB of allocated
+         *     memory, and encoded results to a 16 MiB allocation budget.
+         */
+        SQLRequest: {
+            /** @description A single SQL statement. */
+            statement: string;
+            /** @description Positional JSON parameter values, including null. */
+            parameters?: unknown[];
+            /** @description Database used to resolve unqualified catalog names. */
+            database?: string;
+            /** @description Namespace used to resolve unqualified table names. */
+            namespace?: string;
+            /**
+             * @description Maximum admitted result rows; does not change statement semantics.
+             * @default 128
+             */
+            limit?: number;
+            /** @description Opaque SQL session identifier returned by a previous response. */
+            session_id?: string;
+            /** @description Durable idle HTTP connection. Its scope and settings are inherited; active transaction IDs cannot be bypassed by omitting session_id. DISCARD ALL requires this identity and is rejected while a transaction is active or uncertain. */
+            connection_id?: string;
+        };
+        /**
+         * @description Authoritative native SQL session state after the statement. Failed sessions require ROLLBACK or ROLLBACK TO SAVEPOINT; uncertain commit outcomes must be reconciled by transaction_id, never replayed.
+         * @enum {string}
+         */
+        SQLTransactionStatus: "idle" | "in_transaction" | "failed";
+        /**
+         * @description Durable mutation outcome. Every value confirms a commit and must not
+         *     cause the statement to be replayed. Pending or repair outcomes require
+         *     visibility convergence or operator action rather than another write.
+         * @enum {string}
+         */
+        SQLMutationOutcome: "committed" | "committed_pending" | "committed_repair_required" | "committed_graph_metric_materialization_rejected";
+        /**
+         * @description Ordinal result rows with corresponding logical column metadata. SQL NULL
+         *     is JSON null; sql_nulls distinguishes it from a JSON column containing
+         *     the JSON literal null. Integer-typed values are exact decimal strings; datetime
+         *     values are strings. Objects and arrays in JSON columns remain JSON.
+         */
+        SQLResponse: {
+            columns: components["schemas"]["SQLColumn"][];
+            rows: unknown[][];
+            /**
+             * Format: int64
+             * @description Number of rows affected by a mutation, or zero for a read-only statement.
+             */
+            rows_affected: number;
+            /**
+             * @description Null flags aligned exactly with rows and their columns. True denotes
+             *     SQL NULL; false denotes a value, including the JSON literal null.
+             *     When omitted, null cells have the legacy SQL NULL interpretation.
+             */
+            sql_nulls?: boolean[][];
+            /** @description SQL command completion tag. */
+            command_tag: string;
+            mutation_outcome?: components["schemas"]["SQLMutationOutcome"];
+            ddl_receipt?: components["schemas"]["SQLDDLReceipt"];
+            /** @description Native transaction receipt for visibility or repair reconciliation; never replay a committed statement. */
+            transaction_id?: string;
+            /** @description Opaque SQL session identifier for subsequent requests. */
+            session_id?: string;
+            transaction_status?: components["schemas"]["SQLTransactionStatus"];
+        };
+        /** @enum {string} */
+        SQLDDLReceiptState: "ready" | "pending" | "invalid" | "admission_unknown";
+        /**
+         * @description Durable DDL declaration receipt. admission_unknown means admission has
+         *     not been confirmed; reconcile restore_job_id and idempotency_key without replaying DDL.
+         *     Pending or invalid means the declaration
+         *     committed but validation has not established an active constraint. Do not
+         *     replay it. Inspect table constraint status using this immutable table
+         *     identity and schema generation; a later generation supersedes this receipt.
+         */
+        SQLDDLReceipt: {
+            database: string;
+            namespace: string;
+            table: string;
+            table_id: string;
+            /** Format: int64 */
+            schema_version: number;
+            state: components["schemas"]["SQLDDLReceiptState"];
+            diagnostic?: string;
+            /** @description Native staging job for an atomic schema rewrite or TRUNCATE generation barrier. table_id identifies the source generation. Poll the job; pending or admission_unknown is not completed DDL and must not be replayed. */
+            restore_job_id?: string;
+            /** @description Durable retry identity for an admitted or uncertain schema rewrite. Retain it with restore_job_id when reconciling admission; do not replay the DDL. */
+            idempotency_key?: string;
+        };
+        SQLDiagnostic: {
+            /** @description Five-character SQLSTATE error code. */
+            code: string;
+            /** @description Human-readable diagnostic with no sensitive parameter values. */
+            message: string;
+            /** @description Optional one-based character position in the submitted SQL statement. */
+            position?: number;
+            /** @description Native transaction receipt for reconciliation when a mutation outcome is unknown. */
+            transaction_id?: string;
+            /** @description False for SQLSTATE 40003; never replay a mutation whose outcome is unknown. */
+            retryable?: boolean;
+            transaction_status?: components["schemas"]["SQLTransactionStatus"];
+        };
+        /** @description Database catalog object. Tables and namespaces resolve under a database before authorization and routing. */
+        DatabaseCatalogRecord: {
+            /**
+             * Format: uint64
+             * @description Stable database catalog identifier.
+             * @example 22
+             */
+            database_id: number;
+            /**
+             * @description Database name.
+             * @example tenant_ops
+             */
+            name: string;
+            /**
+             * @description JSON-encoded database settings owned by the catalog.
+             * @example {}
+             */
+            settings_json: string;
+            /**
+             * @description Optional durable tablespace binding inherited by new namespace/table placement policy.
+             * @example fastspace
+             */
+            tablespace_name?: string | null;
+        };
+        /** @description Namespace catalog object inside a database. PostgreSQL schemas map to Antfly namespaces. */
+        NamespaceCatalogRecord: {
+            /**
+             * Format: uint64
+             * @description Stable namespace catalog identifier.
+             * @example 222
+             */
+            namespace_id: number;
+            /**
+             * Format: uint64
+             * @description Parent database identifier.
+             * @example 22
+             */
+            database_id: number;
+            /**
+             * @description Parent database name.
+             * @example tenant_ops
+             */
+            database_name: string;
+            /**
+             * @description Namespace name.
+             * @example analytics
+             */
+            name: string;
+            /**
+             * @description Optional durable tablespace binding inherited by new table placement policy in this namespace.
+             * @example fastspace
+             */
+            tablespace_name?: string | null;
+        };
+        CatalogTablespaceBindingRequest: {
+            /**
+             * @description Existing tablespace name to bind to the catalog object.
+             * @example fastspace
+             */
+            tablespace_name: string;
+        };
+        /** @description Tablespace catalog object. Placement policy resource with a stable identity. SQL adapters consume this native lifecycle surface. */
+        TablespaceCatalogRecord: {
+            /**
+             * Format: uint64
+             * @description Stable tablespace catalog identifier.
+             * @example 42
+             */
+            tablespace_id: number;
+            /**
+             * @description Tablespace name.
+             * @example fastspace
+             */
+            name: string;
+            /**
+             * @description JSON-encoded location descriptor. String locations are encoded as JSON strings.
+             * @example "/var/lib/antfly/fastspace"
+             */
+            location_json: string;
+            /**
+             * @description JSON-encoded placement policy reserved for native placement planning.
+             * @example {}
+             */
+            placement_policy_json: string;
+        };
+        /** @description Tablespace creation request. Placement policy is validated and applied when new tables are created. */
+        CreateTablespaceRequest: {
+            /**
+             * @description JSON-encoded location descriptor. Defaults to `null`.
+             * @example "/var/lib/antfly/fastspace"
+             */
+            location_json?: string;
+            /**
+             * @description JSON-encoded placement policy. Supported fields are placement_role, desired_replica_count, and min_ranges. Location is metadata, never a filesystem override.
+             * @example {}
+             */
+            placement_policy_json?: string;
+        };
+        RenameCatalogResourceRequest: {
+            /** @description New logical name. The durable resource identity remains unchanged. */
+            name: string;
+        };
+        /**
          * @description The metadata mutation committed, but requested visibility or local
          *     materialization is not yet fully healthy. Clients must observe status
          *     instead of automatically replaying the mutation. `committed_superseded`
@@ -2778,6 +4707,11 @@ export interface components {
          */
         TableSchemaPatch: {
             [key: string]: unknown;
+        };
+        /** @description The mutation committed. Read the resource to observe it; do not replay the mutation to obtain its representation. */
+        CatalogMutationVisibilityPending: {
+            /** @enum {string} */
+            status: "committed_visibility_pending";
         };
         Error: {
             /** @description Optional stable machine-readable error code for programmatic handling. */
@@ -3418,50 +5352,9 @@ export interface components {
          *
          *        See: https://antfly.io/docs/configuration#security--cors
          *
-         *     4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation)
-         *        ```handlebars
-         *        {{encodeToon this.fields}}
-         *        {{encodeToon this.fields lengthMarker=false indent=4}}
-         *        {{encodeToon this.fields delimiter="\t"}}
-         *        ```
-         *
-         *        **What is TOON?**
-         *        TOON is a compact, human-readable format designed for passing structured data to LLMs.
-         *        It provides **30-60% token reduction** compared to JSON while maintaining high LLM
-         *        comprehension accuracy.
-         *
-         *        **Key Features:**
-         *        - Compact syntax using `:` for key-value pairs
-         *        - Array length markers: `tags[#3]: ai,search,ml`
-         *        - Tabular format for uniform data structures
-         *        - Optimized for LLM parsing and understanding
-         *        - Maintains human readability
-         *
-         *        **Benefits:**
-         *        - **Lower API costs** - Reduced token usage means lower LLM API costs
-         *        - **Faster responses** - Less tokens to process
-         *        - **More context** - Fit more documents within token limits
-         *
-         *        **Options:**
-         *        - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true)
-         *        - `indent` (int): Indentation spacing for nested objects (default: 2)
-         *        - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs)
-         *
-         *        **Example output:**
-         *        ```
-         *        title: Introduction to Vector Search
-         *        author: Jane Doe
-         *        tags[#3]: ai,search,ml
-         *        metadata:
-         *          edition: 2
-         *          pages: 450
-         *        ```
-         *
-         *        **Default in RAG:** TOON is the default format for document rendering in RAG queries.
-         *
-         *        **References:**
-         *        - TOON Specification: https://github.com/toon-format/toon
-         *        - Go Implementation: https://github.com/alpkeskin/gotoon
+         *     4. **encodeToon** is not available in these templates. It is a helper of the
+         *        retrieval agent's `document_renderer`, which renders documents into the
+         *        generation prompt as TOON by default.
          *
          *     **Template Examples:**
          *
@@ -3543,26 +5436,26 @@ export interface components {
             rate_limit?: components["schemas"]["RateLimitConfig"];
             provider: components["schemas"]["EmbedderProvider"];
             /**
-             * @description Declare that this model supports non-text content (images, audio, video, PDFs),
-             *     even if the model isn't in Antfly's built-in model registry yet.
+             * @description Input types the model accepts. Normally omitted: Antfly learns them from the
+             *     model's capabilities, which Antfly inference publishes for every model it
+             *     serves. Set it only to use a model whose capabilities Antfly cannot discover
+             *     yet, such as a newly released model. When set, it replaces the discovered
+             *     input types.
              *
-             *     When `true`, Antfly treats the model as multimodal and sends binary content
-             *     (images, audio, etc.) through an embedding adapter that supports content parts.
-             *     Antfly currently provides that contract for local Antfly inference and Bedrock;
-             *     text-only provider adapters reject media rather than silently discarding it.
-             *
-             *     Not needed for models already in the local registry (e.g., `clip-*`, `clipclap`).
+             *     Only providers whose adapters can send media accept media inputs: `antfly`
+             *     (`image`, `audio`) and `bedrock` (`image`). Other providers reject `image` and
+             *     `audio` here rather than silently discarding media.
              *
              *     **Example:**
              *     ```json
              *     {
              *       "provider": "antfly",
              *       "model": "some-future-multimodal-model",
-             *       "multimodal": true
+             *       "inputs": ["text", "image"]
              *     }
              *     ```
              */
-            multimodal?: boolean;
+            inputs?: ("text" | "image" | "audio")[];
             /**
              * @deprecated
              * @description Deprecated compatibility form of
@@ -3592,7 +5485,7 @@ export interface components {
          *     canonical provider configurations; it does not define a second provider
          *     namespace.
          */
-        IndexEmbedderConfig: components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"];
+        IndexEmbedderConfig: components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["OpenRouterEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"];
         /**
          * @description Overall health status of the cluster
          * @enum {string}
@@ -4664,6 +6557,15 @@ export interface components {
             /** @description Secret name (e.g., openai.api_key) */
             key: string;
             status: components["schemas"]["SecretStatus"];
+            /** @description Name of the winning source, or environment. */
+            source?: string;
+            /** @description Whether this key has an Antfly-managed override that can be deleted. */
+            managed?: boolean;
+            /**
+             * Format: uint64
+             * @description Committed native entry revision, when supported by the configured backend.
+             */
+            revision?: number;
             /** @description Corresponding environment variable name (e.g., OPENAI_API_KEY) */
             env_var?: string;
             /** Format: date-time */
@@ -4672,6 +6574,8 @@ export interface components {
             updated_at?: string;
         };
         SecretList: {
+            /** @description Whether this server has a native store for secret API writes. */
+            writable?: boolean;
             secrets: components["schemas"]["SecretEntry"][];
         };
         SecretWriteRequest: {
@@ -4682,7 +6586,7 @@ export interface components {
         /**
          * @description Synchronization level for batch operations:
          *     - "propose": Wait for Raft proposal acceptance (fastest, default)
-         *     - "write": Wait for Pebble KV write
+         *     - "write": Wait for the write to be durably applied to the local key-value store
          *     - "full_text": Wait for full-text index WAL write
          *     - "enrichments": Precompute enrichments before committing the document. A synchronous
          *       producer failure rejects the write; post-commit worker failures retain the document
@@ -4695,16 +6599,18 @@ export interface components {
         ShardConfig: {
             byte_range: components["schemas"]["ByteRange"];
         };
-        /** @description Immutable source embedding storage selected when creating a table. */
+        /** @description Immutable source embedding ownership. Omit storage when creating a table to select vector_store for a local single-shard standalone table without HA or replication, and primary_lsm for other deployments. Existing tables retain their recorded ownership; changing the creation default does not migrate data. Snapshot/backup and split operations currently reject vector_store tables; explicitly select primary_lsm when these operations are required. */
         TableStorageSettings: {
             /**
-             * @description Experimental vector_store mode requires a fresh local single-shard table without HA or replication.
+             * @description Explicit ownership choice. vector_store requires a fresh local single-shard standalone table without HA or replication. An explicit empty storage object keeps primary_lsm; omit the storage object to use the deployment default.
              * @default primary_lsm
              * @enum {string}
              */
             dense_embeddings?: "primary_lsm" | "vector_store";
         };
         CreateTableRequest: {
+            /** @description Explicit tablespace policy for the new table, overriding namespace and database defaults. */
+            tablespace_name?: string;
             storage?: components["schemas"]["TableStorageSettings"];
             /**
              * Format: uint
@@ -4854,7 +6760,7 @@ export interface components {
             index_sort_order?: "asc" | "desc";
         };
         /** @enum {string} */
-        AntflyType: "search_as_you_type" | "keyword" | "text" | "html" | "numeric" | "datetime" | "boolean" | "link" | "geopoint" | "geoshape" | "embedding" | "blob";
+        AntflyType: "search_as_you_type" | "substring" | "keyword" | "text" | "html" | "numeric" | "datetime" | "boolean" | "link" | "geopoint" | "geoshape" | "embedding" | "blob";
         Table: {
             storage?: components["schemas"]["TableStorageSettings"];
             name: string;
@@ -5495,6 +7401,46 @@ export interface components {
             collection_publish_ns?: number;
             /**
              * Format: int64
+             * @description Time preparing and sorting immutable collection input outside source and DB apply locks.
+             */
+            collection_plan_outside_lock_ns?: number;
+            /**
+             * Format: int64
+             * @description Time validating staged immutable readers outside source and DB apply locks.
+             */
+            collection_reader_prepare_ns?: number;
+            /**
+             * Format: int64
+             * @description Longest detached immutable reader validation step.
+             */
+            collection_max_reader_prepare_ns?: number;
+            /**
+             * Format: int64
+             * @description Staged immutable readers validated before publication.
+             */
+            collection_readers_prepared?: number;
+            /**
+             * Format: int64
+             * @description Time retiring old collection owners and known obsolete files outside source and DB apply locks.
+             */
+            collection_retire_outside_lock_ns?: number;
+            /**
+             * Format: int64
+             * @description Verified collections that deferred copying because reclamation benefit was small.
+             */
+            collection_copy_deferrals?: number;
+            /**
+             * Format: int64
+             * @description Verified obsolete payload bytes retained by the copy-cost policy.
+             */
+            collection_deferred_obsolete_bytes?: number;
+            /**
+             * Format: int64
+             * @description Process-monotonic reclamation scheduling deadline translated from the durable wall-clock deadline; not a completion guarantee.
+             */
+            collection_reclaim_deadline_ns?: number;
+            /**
+             * Format: int64
              * @description Longest locked publication step.
              */
             collection_max_publish_ns?: number;
@@ -5635,6 +7581,8 @@ export interface components {
             lsm?: components["schemas"]["LsmStorageStatus"];
         };
         TableStatus: components["schemas"]["Table"] & {
+            /** @description Immutable physical table identity, preserved by catalog renames. */
+            table_id?: string;
             storage_status: components["schemas"]["StorageStatus"];
             /** @description Table-level generated artifact enrichments registered outside a specific index. */
             artifact_enrichments?: components["schemas"]["EnrichmentConfig"][];
@@ -5753,6 +7701,98 @@ export interface components {
              * @example 100
              */
             limit?: number;
+        };
+        RelationalRowCondition: {
+            column: string;
+            op: components["schemas"]["RelationalComparisonOp"];
+            /** @description Typed scalar operand. Omission means NULL. Integer columns also accept exact decimal strings. */
+            value?: unknown;
+            collation?: string;
+        };
+        /**
+         * @description Bounded relational scan in primary-key order, or composite index order
+         *     when index is supplied. Index queries require schema_version and every
+         *     owning shard must have the selected generation ready. Partial indexes
+         *     require their WHERE predicates to be implied by the query conditions.
+         *     The bounded proof combines per-column equality, tighter ranges,
+         *     exclusions, and NULL-aware predicates using exact typed values and
+         *     matching collations. Unsupported implications fail closed. Explicit
+         *     scan bounds alone are not an implication proof. Equal tuples are
+         *     ordered by primary key. Each shard read pins its own immutable schema
+         *     and row snapshot; this is not a table-wide consistent snapshot.
+         *     Resume with the last returned _id as from for primary scans, or its
+         *     cursor as after for index scans. A resumed request opens a fresh snapshot,
+         *     not a retained cursor; concurrent mutations may move rows across the
+         *     continuation boundary. Keep index, bounds and conditions unchanged when paging.
+         *     An empty projection returns row identities and versions only.
+         */
+        RelationalRowQueryRequest: {
+            /** @description Ready composite secondary index. Requires schema_version; cannot be combined with from/to. */
+            index?: string;
+            /** @description Opaque exclusive index-order cursor from the last returned row. Binds the immutable schema version, logical index name, and comparison semantics, independent of owner-local physical generations. Each owner must still prove its current local index is ready. */
+            after?: string;
+            lower?: components["schemas"]["RelationalRowIndexBound"];
+            upper?: components["schemas"]["RelationalRowIndexBound"];
+            fields: string[];
+            conditions?: components["schemas"]["RelationalRowCondition"][];
+            /** @description Exclusive lower primary-key bound, including pagination continuation. */
+            from?: string;
+            /** @description Exclusive upper primary-key bound. */
+            to?: string;
+            /**
+             * Format: uint32
+             * @default 128
+             */
+            limit?: number;
+            /**
+             * Format: uint32
+             * @description Reject the read if an owning shard has a different active schema epoch. Zero is a valid epoch and is distinct from omission.
+             */
+            schema_version?: number;
+        };
+        /** @description Typed left-prefix bound in declared index order, including descending components. Inclusive bounds include the entire matching prefix. Integer components accept exact decimal strings; null is an indexed null. */
+        RelationalRowIndexBound: {
+            values: unknown[];
+            /** @default true */
+            inclusive?: boolean;
+        };
+        RelationalRow: {
+            /** @description Opaque index-order continuation; present only for secondary-index queries. */
+            cursor?: string;
+            _id: string;
+            row: {
+                [key: string]: unknown;
+            };
+            /** @description Projected JSON columns containing the JSON literal null rather than SQL NULL. Other null-valued fields are SQL NULL. */
+            json_null_fields?: string[];
+            /** @description Exact row version for mutation preconditions, encoded as decimal text. */
+            version: string;
+            /**
+             * Format: uint32
+             * @description Active pinned schema epoch, not the historical physical row layout.
+             */
+            schema_version: number;
+        };
+        /** @description A complete row replacement, or deletion when row is omitted. No read-modify-write is implied. */
+        RelationalRowMutation: {
+            key: string;
+            /** @description Exact observed version. Zero requires that the row does not exist. */
+            expected_version: string;
+            row?: {
+                [key: string]: unknown;
+            };
+            /** @description Names of JSON-typed columns whose row value is the JSON literal null rather than SQL NULL. Each name must identify a present null-valued JSON column; duplicates, unknown names, non-null values, and use with deletion are rejected. */
+            json_null_fields?: string[];
+        };
+        /** @description Atomic version-conditional typed-row replacements and deletions using the durable distributed transaction coordinator. */
+        RelationalRowMutationRequest: {
+            /**
+             * Format: uint32
+             * @description Required active relational schema epoch, fenced during every participant prepare.
+             */
+            schema_version: number;
+            mutations: components["schemas"]["RelationalRowMutation"][];
+            sync_level?: components["schemas"]["SyncLevel"];
         };
         /**
          * @description Batch insert, delete, and transform operations in a single request.
@@ -6048,6 +8088,75 @@ export interface components {
              */
             phase?: "begin" | "prepare" | "resolve";
         };
+        /**
+         * @description Deterministic relational integrity failure; changing the mutation or data is required before retry.
+         * @enum {string}
+         */
+        RelationalConstraintConflictReason: "unique_constraint_violation" | "foreign_key_parent_missing" | "foreign_key_referenced";
+        /** @enum {string} */
+        RelationalConstraintActivationPhase: "unique" | "foreign_key" | "check";
+        RelationalConstraintRangeStatus: {
+            /** @description Exact owner group identifier as decimal text. */
+            group_id: string;
+            state: components["schemas"]["RelationalConstraintValidationState"];
+            phase: components["schemas"]["RelationalConstraintActivationPhase"];
+            /** @description Exact cumulative validation row count as decimal text. */
+            rows_scanned: string;
+            /** @description Opaque namespace-and-range ownership digest. */
+            owner: string;
+            failure?: string;
+        };
+        RelationalConstraintRetryRequest: {
+            schema_version: number;
+        };
+        RelationalConstraintRetryResponse: {
+            /** @enum {string} */
+            status: "accepted";
+        };
+        /**
+         * @description Supply exactly one of target_schema or drop=true. A target schema may
+         *     only remove UNIQUE/FK definitions; all other schema properties must
+         *     remain unchanged. Its version is assigned by the server. Retirement
+         *     fences primary mutations while existing reference and claim records
+         *     are drained. External foreign keys referencing removed definitions
+         *     must be retired first.
+         */
+        RelationalConstraintRetirementRequest: {
+            schema_version: number;
+            target_schema?: components["schemas"]["TableSchema"];
+            /**
+             * @description Prepare for explicit table deletion; this operation does not delete the table.
+             * @default false
+             */
+            drop?: boolean;
+        };
+        RelationalConstraintRetirementStatus: {
+            /** @description Opaque retirement job identity. */
+            id: string;
+            /** @enum {string} */
+            phase: "fencing" | "foreign_keys" | "unique" | "publishing" | "published" | "ready_to_drop";
+            drop: boolean;
+            /** Format: uint32 */
+            target_schema_version: number;
+            /**
+             * @description Durable diagnostic that pauses the job. Retry resumes the exact
+             *     checkpoint after the cause is addressed; it does not undo a partial
+             *     drain or permit primary mutations while retirement is active.
+             */
+            failure?: string;
+        };
+        RelationalConstraintStatus: {
+            /** Format: uint32 */
+            schema_version: number;
+            /**
+             * @description Distributed UNIQUE, foreign-key, and scalar CHECK coverage across every current table owner. Native local validation is not a substitute for this coordinated proof.
+             * @enum {string}
+             */
+            coverage_kind: "unique_foreign_key_and_check";
+            state: components["schemas"]["RelationalConstraintValidationState"];
+            ranges: components["schemas"]["RelationalConstraintRangeStatus"][];
+            retirement?: components["schemas"]["RelationalConstraintRetirementStatus"];
+        };
         /** @description Structured details for an aborted transaction attempt. */
         TransactionConflict: {
             /** @description Table where the conflict was detected. */
@@ -6056,6 +8165,7 @@ export interface components {
             key: string;
             /** @description Human-readable conflict description. */
             message: string;
+            reason?: components["schemas"]["RelationalConstraintConflictReason"];
             /**
              * @description Stable machine-readable conflict classification.
              * @enum {string}
@@ -6164,6 +8274,11 @@ export interface components {
             lease_expires_at: number;
             lease_state: string;
             sync_level: string;
+            /**
+             * @description Durable read-only transaction outcome. outcome_unknown is not permission to replay a mutation with another ID.
+             * @enum {string}
+             */
+            disposition: "active" | "outcome_unknown" | "committed" | "committed_pending" | "committed_repair_required" | "aborted";
             staged_table_count: number;
             staged_read_count: number;
             staged_write_count: number;
@@ -6258,6 +8373,14 @@ export interface components {
              */
             connection: string;
         };
+        /**
+         * @description Native cluster backups pin a common transaction cut across a dependency-complete
+         *     table set. Restart-stable LSM seals are journaled before releasing write fences;
+         *     artifact upload uses those immutable seals without holding the write pause.
+         *     Native cohorts support at most 4096 tables and 4096 ranges and require the
+         *     filesystem-managed LSM backend. Portable backups do not support coordinated
+         *     UNIQUE/FK constraints or promise a common cross-table transaction cut.
+         */
         ClusterBackupRequest: {
             /**
              * @description Unique identifier for this backup. Used to reference the backup for restore operations.
@@ -6348,6 +8471,17 @@ export interface components {
             /** @description Opaque artifact generation retained by an ambiguous cluster attempt. */
             artifact_backup_id?: string;
         };
+        /**
+         * @description Native cohort restores use the existing asynchronous restore job to provision
+         *     hidden fresh generations, import rows, rebuild indexes and coordinated constraints,
+         *     and publish the dependency-complete target set atomically. Document, relational,
+         *     and mixed native cohorts use the same workflow (at most 128 tables/4096 ranges).
+         *     Skipping a live parent cannot substitute it for a parent generation required by
+         *     a restored child. Overwrite retains the old generation until validation and
+         *     cutover; cancellation after publication completes publication rather than rollback.
+         *     Reserved destination authorization is immutable: changing principal requires
+         *     canceling the old job and creating a new restore.
+         */
         ClusterRestoreRequest: {
             /**
              * @description Unique identifier of the backup to restore from.
@@ -6385,6 +8519,8 @@ export interface components {
         RestoreJob: {
             /** @description Opaque durable restore-job identifier. Clients must not parse it as a number. */
             job_id: string;
+            /** @description Durable admission identity. Retain it with job_id when reconciling an uncertain schema rewrite; do not replay the DDL. */
+            idempotency_key?: string;
             /** Format: int64 */
             attempt_id: number;
             /** @enum {string} */
@@ -6456,6 +8592,7 @@ export interface components {
                 /** @description True when additional failed tables or part of a long table name or error were omitted. */
                 failure_details_truncated?: boolean;
             };
+            /** @description Most recent retry or terminal failure reason. Retained while queued or running, including across progress checkpoints and recovery; omitted after successful completion. */
             error?: string;
             /** Format: int64 */
             created_at_ms: number;
@@ -6588,8 +8725,9 @@ export interface components {
              */
             mode?: string;
             /**
-             * @description Preferred output artifact. Suggested values are `query_request`, `bleve`, and
-             *     `filter_query`. The compatibility `query` field is still returned for existing clients.
+             * @description Preferred output artifact. Suggested values are `query_request`, `bleve` (Antfly's
+             *     native, Bleve-compatible full-text query JSON), and `filter_query`. The compatibility
+             *     `query` field is still returned for existing clients.
              * @example query_request
              */
             output?: string;
@@ -6627,7 +8765,8 @@ export interface components {
             /** @description Clarification questions exposed in the shared bounded-agent envelope. */
             questions?: components["schemas"]["AgentQuestion"][];
             /**
-             * @description Generated search query in native Bleve format.
+             * @description Generated search query in Antfly's native full-text query format (a Bleve-compatible
+             *     JSON query DSL: `match`, `term`, `conjuncts`, `disjuncts`, `must_not`, etc.).
              *     Can be used directly in QueryRequest.full_text_search or filter_query.
              * @example {
              *       "conjuncts": [
@@ -6652,10 +8791,12 @@ export interface components {
             query_request?: components["schemas"]["QueryRequest"];
             /**
              * @description Antfly retrieval query assembled by the coordinator when the requested artifact
-             *     needs retrieval-only features such as tree_search. This is additive to
+             *     is intended for retrieval. Apply retrieval_navigation to steps.retrieval.navigation. This is additive to
              *     query_request for clients that execute through the retrieval agent pipeline.
              */
-            retrieval_query_request?: components["schemas"]["RetrievalQueryRequest"];
+            retrieval_query_request?: components["schemas"]["QueryRequest"];
+            /** @description Optional retrieval-step navigation policy for the returned query at query_index zero. */
+            retrieval_navigation?: components["schemas"]["RetrievalNavigationConfig"];
             /**
              * @description Specialist or strategy used to build the query, such as `full_text`, `filter`, or `hybrid`.
              * @example full_text
@@ -6707,47 +8848,51 @@ export interface components {
          * @enum {string}
          */
         RetrievalStrategy: "semantic" | "bm25" | "metadata" | "tree" | "graph" | "hybrid";
+        /** @enum {string} */
+        RetrievalNavigationStrategy: "tree" | "graph";
+        /** @enum {string} */
+        RetrievalNavigationSelection: "agentic" | "ranked";
         /**
-         * @description Configuration for tree search strategy. Tree search navigates hierarchical
-         *     document structures by evaluating summaries at each level.
+         * @description Retrieval-step navigation targeting one ordinary query. Graph navigation
+         *     follows one path; tree navigation explores a retained branch frontier.
+         *     Agentic selection uses the enclosing model and budgets. Ranked selection
+         *     is supported for trees and uses the existing deterministic tree traversal.
+         *     Agentic selection requires agentic mode and a retrieval generator. Search
+         *     starts exploration; navigation selects only an offered, unvisited node.
+         *     All reads enforce mandatory predicates and authenticated row filters.
          */
-        TreeSearchConfig: {
-            /**
-             * @description Name of the graph index to use for tree navigation
-             * @example doc_hierarchy
-             */
-            index: string;
-            /**
-             * @description Starting nodes for tree search:
-             *     - "$roots" - Query for root nodes (nodes with no parents)
-             *     - Comma-separated explicit node IDs
-             *     When omitted and combined with a QueryRequest in a RetrievalQueryRequest,
-             *     the query results are used as start nodes.
-             * @example $roots
-             */
-            start_nodes?: string;
-            /**
-             * @description Maximum depth to traverse in the tree
-             * @default 5
-             */
+        RetrievalNavigationConfig: {
+            /** @description Zero-based index into the enclosing request queries. */
+            query_index: number;
+            strategy: components["schemas"]["RetrievalNavigationStrategy"];
+            /** @description Ranked selection is supported only with strategy tree. */
+            selection: components["schemas"]["RetrievalNavigationSelection"];
+            /** @description Tree-only maximum depth from the start node (depth zero); defaults to 5. */
             max_depth?: number;
-            /**
-             * @description Number of branches to explore at each level
-             * @default 3
-             */
+            /** @description Tree-only maximum children offered per expansion; defaults to 3. */
             beam_width?: number;
-        };
-        /**
-         * @description A canonical query in the retrieval pipeline with an optional tree search
-         *     configuration. Each query specifies its own table. Deprecated stateful
-         *     graph_searches compatibility is intentionally unavailable here.
-         *
-         *     When both search fields (semantic_search, full_text_search) and tree_search
-         *     are provided, the search results are used as start nodes for tree navigation.
-         */
-        RetrievalQueryRequest: components["schemas"]["QueryRequest"] & {
-            /** @description Optional tree search configuration */
-            tree_search?: components["schemas"]["TreeSearchConfig"];
+            /** @description Graph index used for every neighbor read. */
+            index: string;
+            /** @description Ranked-tree-only seed selector (comma-separated keys, $roots, or a prior-result selector). Mutually exclusive with start_key. */
+            start_nodes?: string;
+            /** @description Literal start document key. Agentic selection defaults to the first query hit; ranked selection defaults to seed results or prior query hits. */
+            start_key?: string;
+            /** @description Direction for every hop; defaults to out. */
+            direction?: components["schemas"]["EdgeDirection"];
+            edge_types?: components["schemas"]["GraphEdgeType"][];
+            /** @description Graph-only maximum moves after the start node (default 8). The enclosing agent's iteration and tool limits also apply. */
+            max_steps?: number;
+            /** @description Graph-only maximum candidate neighbors per node (default 8), further limited by the context budget. */
+            neighbor_limit?: number;
+            /** @description Optional caller-supplied workflow instruction retained in agent history. */
+            instruction?: string;
+            /**
+             * @description Explicitly opt in to following instructions from this top-level string
+             *     field of each visited document. Instructions accumulate in agent history.
+             *     Other document fields and unvisited neighbors remain untrusted evidence.
+             *     The field must be included if the query uses a fields projection.
+             */
+            instruction_field?: string;
         };
         /**
          * @description UI rendering/answer handling hint for a bounded agent question
@@ -6906,6 +9051,8 @@ export interface components {
          *     the top-level request tools policy when both are present.
          */
         RetrievalStepConfig: {
+            /** @description Navigation policy for one query; incompatible with graph_queries on that query. */
+            navigation?: components["schemas"]["RetrievalNavigationConfig"];
             /**
              * @description Tool configuration for the retrieval step. When set, this narrows
              *     the top-level tools policy for retrieval execution.
@@ -6953,7 +9100,8 @@ export interface components {
         };
         /**
          * @description Request for the retrieval agent. Queries define which tables and indexes
-         *     to search, each as a QueryRequest with optional tree search configuration.
+         *     to search, each as an ordinary QueryRequest. Optional tree or graph exploration
+         *     is configured by steps.retrieval.navigation, targeting one query by index.
          *
          *     **Pipeline mode** (default, max_internal_iterations=0): Queries are executed
          *     directly without an LLM tool-calling loop.
@@ -6998,7 +9146,7 @@ export interface components {
              *       }
              *     ]
              */
-            queries: components["schemas"]["RetrievalQueryRequest"][];
+            queries: components["schemas"]["QueryRequest"][];
             /** @description Optional conversational context for the current turn. Decisions remain the authoritative continuation input for bounded agent interactions. */
             messages?: components["schemas"]["ChatMessage"][];
             /**
@@ -7068,9 +9216,23 @@ export interface components {
             /** @description Step configuration */
             steps?: components["schemas"]["RetrievalAgentSteps"];
             /**
-             * @description Handlebars template for rendering documents in the generation prompt.
-             *     Default uses TOON format for token efficiency.
-             *     Requires steps.generation to be set.
+             * @description Handlebars template that renders each retrieved document in the
+             *     generation prompt. Requires steps.generation to be set.
+             *
+             *     The template is rendered once per hit against `{id, score, fields}`,
+             *     where `fields` is the hit's source. When omitted, each document's
+             *     fields are encoded as TOON (Token-Oriented Object Notation), which
+             *     carries the same structure as JSON in fewer tokens.
+             *
+             *     Helpers: `encodeToon` (options `indent`, 1 to 16, default 2; and
+             *     `delimiter`: `comma`, `tab`, or `pipe`), `scrubHtml`, `eq`, and
+             *     `media`. Values in `{{...}}` are HTML-escaped; use `{{{...}}}` for
+             *     raw text.
+             *
+             *     Examples:
+             *     - `{{encodeToon this.fields}}`
+             *     - `{{encodeToon this.fields delimiter="tab"}}`
+             *     - `Title: {{{this.fields.title}}}`
              * @example {{encodeToon this.fields}}
              */
             document_renderer?: string;
@@ -7150,6 +9312,473 @@ export interface components {
             followup_questions?: string[];
             /** @description Evaluation results when steps.eval was configured */
             eval_result?: components["schemas"]["EvalResult"];
+        };
+        /**
+         * @description Research state-machine phase. `plan` decomposes the question,
+         *     `research` runs one bounded round of retrieval researchers, `reflect`
+         *     decides whether another round is needed, `write` produces the cited
+         *     report, `verify` checks citations, and `done` is terminal.
+         * @enum {string}
+         */
+        ResearchPhase: "plan" | "research" | "reflect" | "write" | "verify" | "done";
+        /**
+         * @description Declared upper bounds for one research run. The worst-case LLM and
+         *     tool-call cost is computable before execution; requests whose worst
+         *     case exceeds the server ceiling are rejected, not clamped.
+         */
+        ResearchBudget: {
+            /**
+             * @description Maximum research rounds (plan or reflect, then fan-out).
+             * @default 2
+             */
+            max_rounds?: number;
+            /**
+             * @description Maximum sub-questions researched per round.
+             * @default 4
+             */
+            max_sub_questions?: number;
+            /**
+             * @description Maximum researchers in flight at once.
+             * @default 2
+             */
+            max_parallel?: number;
+            /**
+             * @description Model-generation rounds available to each researcher.
+             * @default 6
+             */
+            researcher_iterations?: number;
+            /**
+             * @description Tool calls available to each researcher.
+             * @default 8
+             */
+            researcher_tool_calls?: number;
+            /**
+             * @description Hard cap on model calls across every role in the run.
+             * @default 80
+             */
+            max_llm_calls?: number;
+            /**
+             * @description Hard cap on tool calls across every researcher in the run.
+             * @default 120
+             */
+            max_tool_calls?: number;
+            /**
+             * @description Maximum distinct evidence items retained in the registry.
+             * @default 80
+             */
+            max_evidence?: number;
+            /**
+             * @description Output token budget for the report writer.
+             * @default 4000
+             */
+            max_report_tokens?: number;
+            /**
+             * @description Wall-clock budget for a synchronous run or a single job advance.
+             * @default 600000
+             */
+            deadline_ms?: number;
+        };
+        /** @description Configuration for one research role. Generator and chain default to the top-level request values. */
+        ResearchStepConfig: {
+            /** @description Whether the step runs. Defaults vary by step. */
+            enabled?: boolean;
+            /** @description Generator for this role. */
+            generator?: components["schemas"]["GeneratorConfig"];
+            /** @description Chain of generators for this role. */
+            chain?: components["schemas"]["ChainLink"][];
+            /** @description Additional role instructions. They cannot change authorized tables, filters, tools or budgets. */
+            instructions?: string;
+        };
+        /**
+         * @description Configuration for researchers. Every researcher is a bounded retrieval
+         *     agent run over the request's authorized queries. `tools` narrows the
+         *     top-level tools policy and cannot widen it.
+         */
+        ResearchRetrievalStepConfig: {
+            /** @description Generator for researchers. Defaults to the top-level generator. */
+            generator?: components["schemas"]["GeneratorConfig"];
+            /** @description Chain of generators for researchers. */
+            chain?: components["schemas"]["ChainLink"][];
+            /** @description Additional researcher instructions. */
+            instructions?: string;
+            /** @description Researcher tool policy. Narrows the top-level tools policy. */
+            tools?: components["schemas"]["ChatToolsConfig"];
+            /** @description Optional tree or graph navigation available to each researcher. */
+            navigation?: components["schemas"]["RetrievalNavigationConfig"];
+        };
+        /** @description Configuration for the report writer. */
+        ResearchWriteStepConfig: {
+            /** @description Generator for the writer. Defaults to the top-level generator. */
+            generator?: components["schemas"]["GeneratorConfig"];
+            /** @description Chain of generators for the writer. */
+            chain?: components["schemas"]["ChainLink"][];
+            /** @description Additional writer instructions, for example audience or tone. */
+            instructions?: string;
+            /** @description Optional caller-supplied section headings. When omitted the writer chooses them. */
+            outline?: string[];
+        };
+        /** @description Per-role configuration for the research agent. */
+        ResearchAgentSteps: {
+            /** @description Planner that writes the research brief and sub-questions. Always runs unless research_state carries a plan. */
+            plan?: components["schemas"]["ResearchStepConfig"];
+            /** @description Researcher configuration. */
+            research?: components["schemas"]["ResearchRetrievalStepConfig"];
+            /** @description Gap analysis after each round. Enabled by default when budget.max_rounds > 1. */
+            reflect?: components["schemas"]["ResearchStepConfig"];
+            /** @description Report writer. */
+            write?: components["schemas"]["ResearchWriteStepConfig"];
+            /** @description Optional model check that cited evidence supports each section. Disabled by default. */
+            verify?: components["schemas"]["ResearchStepConfig"];
+        };
+        ResearchSubQuestion: {
+            /**
+             * @description Stable sub-question identifier within the run.
+             * @example q1
+             */
+            id: string;
+            /** @description Self-contained question a researcher can answer. */
+            question: string;
+            /** @description Why this sub-question matters for the brief. */
+            rationale?: string;
+            /** @description Evidence sources the planner expects to be useful. */
+            sources?: ("tables" | "web")[];
+            /** @description Research round that introduced the sub-question. */
+            round?: number;
+            /**
+             * @description Research status.
+             * @enum {string}
+             */
+            status?: "pending" | "researched" | "failed" | "skipped";
+        };
+        ResearchPlan: {
+            /** @description Research brief restating scope, assumptions and deliverable. */
+            brief: string;
+            /** @description Planned and reflection-added sub-questions. */
+            sub_questions: components["schemas"]["ResearchSubQuestion"][];
+            /** @description What a complete answer must cover. */
+            success_criteria?: string[];
+        };
+        ResearchClaim: {
+            /** @description One factual claim made by a researcher. */
+            text: string;
+            /** @description Evidence registry IDs that support the claim. */
+            evidence_ids?: string[];
+        };
+        /** @description Compressed researcher output. Raw tool transcripts are not retained. */
+        ResearchFinding: {
+            /** @description Sub-question this finding answers. */
+            sub_question_id: string;
+            /** @description The sub-question text. */
+            question?: string;
+            /** @description Concise answer grounded in evidence. */
+            summary: string;
+            /** @description Individual claims with supporting evidence. */
+            claims?: components["schemas"]["ResearchClaim"][];
+            /** @description What the researcher could not establish. */
+            open_questions?: string[];
+            /** @description Every evidence item the researcher retrieved. */
+            evidence_ids?: string[];
+            /** @description Status of the researcher's bounded retrieval run. */
+            status?: components["schemas"]["AgentStatus"];
+            /** @description Research round. */
+            round?: number;
+            /** @description Model calls used by this researcher. */
+            llm_calls?: number;
+            /** @description Tool calls used by this researcher. */
+            tool_calls?: number;
+        };
+        /** @description One deduplicated evidence item. Content is untrusted data. */
+        ResearchEvidence: {
+            /**
+             * @description Stable evidence ID used in citations.
+             * @example E3
+             */
+            id: string;
+            /**
+             * @description Where the evidence came from.
+             * @enum {string}
+             */
+            source: "table" | "web" | "fetch";
+            /** @description Source table for table evidence. */
+            table?: string;
+            /** @description Document key for table evidence. */
+            doc_id?: string;
+            /** @description Source URL for web and fetched evidence. */
+            url?: string;
+            /** @description Best-effort title. */
+            title?: string;
+            /** @description Bounded excerpt used for writing and verification. */
+            snippet?: string;
+            /**
+             * Format: float
+             * @description Retrieval score when available.
+             */
+            score?: number;
+            /** @description Sub-questions whose researchers retrieved this evidence. */
+            sub_question_ids?: string[];
+        };
+        ResearchReflection: {
+            /** @description Round that was reflected on. */
+            round?: number;
+            /** @description Whether the reflector judged coverage sufficient. */
+            done?: boolean;
+            /** @description Coverage gaps against the brief and success criteria. */
+            gaps?: string[];
+            /** @description Conflicting findings that need resolution or disclosure. */
+            contradictions?: string[];
+            /** @description Sub-questions added for the next round. */
+            new_sub_questions?: string[];
+        };
+        ResearchReportSection: {
+            /** @description Section heading. */
+            heading: string;
+            /** @description Section body with `[E#]` citation markers. */
+            markdown: string;
+        };
+        ResearchReport: {
+            /** @description Report title. */
+            title?: string;
+            /** @description Executive summary. */
+            summary?: string;
+            /** @description Report sections. */
+            sections?: components["schemas"]["ResearchReportSection"][];
+            /** @description The full report rendered as markdown, with a sources list. */
+            markdown: string;
+        };
+        ResearchCitation: {
+            /** @description Marker as written in the report, for example `[E3]`. */
+            marker: string;
+            /** @description Resolved evidence ID. */
+            evidence_id: string;
+            /** @description Section containing the marker. -1 is the summary. */
+            section_index?: number;
+            /** @description Number of occurrences in that section. */
+            count?: number;
+        };
+        ResearchUnsupportedClaim: {
+            /** @description Section containing the claim. */
+            section_index?: number;
+            /** @description Claim text. */
+            text?: string;
+            /** @description Evidence the claim cited. */
+            evidence_ids?: string[];
+            /** @description Why the claim is unsupported. */
+            reason?: string;
+        };
+        ResearchVerification: {
+            /** @description Number of sections checked. */
+            checked_sections?: number;
+            /** @description Citation markers that did not resolve to evidence and were removed. */
+            unresolved_markers?: string[];
+            /** @description Sections without any resolvable citation. */
+            uncited_sections?: number[];
+            /** @description Claims the verifier judged unsupported by their cited evidence. */
+            unsupported?: components["schemas"]["ResearchUnsupportedClaim"][];
+            /**
+             * Format: float
+             * @description Share of checked claims judged supported.
+             */
+            supported_ratio?: number;
+        };
+        ResearchUsage: {
+            /** @description Model calls across every role. */
+            llm_calls?: number;
+            /** @description Tool calls across every researcher. */
+            tool_calls?: number;
+            /** @description Researcher executions. */
+            researcher_runs?: number;
+            /** @description Research rounds completed. */
+            rounds?: number;
+            /** @description Evidence items in the registry. */
+            evidence_count?: number;
+            /**
+             * Format: int64
+             * @description Wall-clock time consumed so far.
+             */
+            elapsed_ms?: number;
+        };
+        /**
+         * @description Client-carried continuation state. Sending it back resumes the run at
+         *     `phase` without repeating completed work. It never contains raw tool
+         *     transcripts, credentials or connection settings. Evidence snippets are
+         *     bounded excerpts of documents the caller was authorized to read; every
+         *     resumed request is re-authorized.
+         *
+         *     The server signs the state it returns (`signature`) and rejects a
+         *     state whose signature does not verify, so a client cannot alter a
+         *     checkpoint, including its budget counters. Send the state back
+         *     unmodified. Signatures are valid across a cluster that shares an
+         *     internal service secret, otherwise only on the server that issued them
+         *     and until it restarts; use durable jobs to resume across restarts.
+         */
+        ResearchState: {
+            /** @description Server signature over this state. Do not modify the state. */
+            signature?: string;
+            phase: components["schemas"]["ResearchPhase"];
+            /** @description Completed research rounds. */
+            round?: number;
+            plan?: components["schemas"]["ResearchPlan"];
+            findings?: components["schemas"]["ResearchFinding"][];
+            evidence?: components["schemas"]["ResearchEvidence"][];
+            reflections?: components["schemas"]["ResearchReflection"][];
+            report?: components["schemas"]["ResearchReport"];
+            citations?: components["schemas"]["ResearchCitation"][];
+            verification?: components["schemas"]["ResearchVerification"];
+            usage?: components["schemas"]["ResearchUsage"];
+        };
+        ResearchIncompleteDetails: {
+            /**
+             * @description Why the run stopped:
+             *     - max_rounds: research rounds were exhausted before the reflector was satisfied (the report is still written)
+             *     - max_llm_calls / max_tool_calls: a hard budget was exhausted
+             *     - deadline: the wall-clock budget elapsed
+             *     - no_evidence: researchers found no evidence to write from
+             *     - clarification_required: the planner needs a user decision
+             *     - cancelled: a durable job was cancelled
+             *     - phase_limit: a job advance stopped after its requested number of phases
+             * @enum {string}
+             */
+            reason: "max_rounds" | "max_llm_calls" | "max_tool_calls" | "deadline" | "no_evidence" | "clarification_required" | "cancelled" | "phase_limit";
+            /** @description Human-readable detail. */
+            message?: string;
+        };
+        /**
+         * @description Request for the research agent. The agent plans sub-questions, runs a
+         *     bounded retrieval researcher per sub-question in parallel, reflects on
+         *     coverage, and writes a long-form report whose `[E#]` citations resolve
+         *     to a deduplicated evidence registry.
+         *
+         *     Researchers are ordinary retrieval-agent runs over `queries` with the
+         *     same authorization, mandatory predicates and tool policy. They cannot
+         *     widen tables, filters, tools or budgets.
+         */
+        ResearchAgentRequest: {
+            /**
+             * @description The research question.
+             * @example How do Antfly's hybrid search and reranking interact, and what are the tuning trade-offs?
+             */
+            query: string;
+            /**
+             * @description Authorized table scopes, as for the retrieval agent. `filter_query`
+             *     and `exclusion_query` are mandatory predicates for every researcher.
+             *     May be empty when web search is enabled.
+             */
+            queries: components["schemas"]["QueryRequest"][];
+            /** @description Optional conversational context. */
+            messages?: components["schemas"]["ChatMessage"][];
+            /** @description Domain context for every role. */
+            agent_knowledge?: string;
+            /** @description Mandatory filters applied to every researcher search. */
+            accumulated_filters?: components["schemas"]["FilterSpec"][];
+            /** @description Correlation identifier echoed back to the client. */
+            session_id?: string;
+            /** @description Structured user answers for client-carried continuation. */
+            decisions?: components["schemas"]["AgentDecision"][];
+            /**
+             * @description If true, the planner may return clarification questions instead of a plan.
+             * @default false
+             */
+            interactive?: boolean;
+            /** @description Default generator for every role. */
+            generator?: components["schemas"]["GeneratorConfig"];
+            /** @description Default chain of generators for every role. */
+            chain?: components["schemas"]["ChainLink"][];
+            /** @description Default tool policy for researchers, for example `web_search` and `fetch`. */
+            tools?: components["schemas"]["ChatToolsConfig"];
+            steps?: components["schemas"]["ResearchAgentSteps"];
+            budget?: components["schemas"]["ResearchBudget"];
+            /** @description Continuation state returned by an earlier run. */
+            research_state?: components["schemas"]["ResearchState"];
+            /** @description Per-researcher tool-result context budget in tokens. */
+            max_context_tokens?: number;
+            /** @description Tokens reserved from max_context_tokens for prompts and answers. */
+            reserve_tokens?: number;
+            /**
+             * @description Enable SSE streaming vs JSON response.
+             * @default true
+             */
+            stream?: boolean;
+        };
+        /** @description Result from the research agent. */
+        ResearchAgentResult: {
+            /**
+             * @description Unique response ID.
+             * @example resr_cr3ig20h5tbs73e3ahrg
+             */
+            id?: string;
+            /** @description Writer model. */
+            model?: string;
+            /**
+             * Format: int64
+             * @description Unix timestamp (seconds) when the response was created.
+             */
+            created_at?: number;
+            status: components["schemas"]["AgentStatus"];
+            incomplete_details?: components["schemas"]["ResearchIncompleteDetails"];
+            phase?: components["schemas"]["ResearchPhase"];
+            usage?: components["schemas"]["ResearchUsage"];
+            plan?: components["schemas"]["ResearchPlan"];
+            findings?: components["schemas"]["ResearchFinding"][];
+            evidence?: components["schemas"]["ResearchEvidence"][];
+            reflections?: components["schemas"]["ResearchReflection"][];
+            report?: components["schemas"]["ResearchReport"];
+            citations?: components["schemas"]["ResearchCitation"][];
+            verification?: components["schemas"]["ResearchVerification"];
+            research_state: components["schemas"]["ResearchState"];
+            /** @description Execution trace. */
+            steps?: components["schemas"]["AgentStep"][];
+            /** @description Clarification questions when status is clarification_required. */
+            questions?: components["schemas"]["AgentQuestion"][];
+            /** @description Echoed correlation identifier. */
+            session_id?: string;
+        };
+        /**
+         * @description Durable research job lifecycle state.
+         * @enum {string}
+         */
+        ResearchJobState: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+        ResearchJobStartRequest: {
+            /**
+             * @description The research request. `stream` is ignored. Durable jobs persist the
+             *     request, so generators must reference credentials through the
+             *     secret store, environment or server connections rather than inline
+             *     API keys.
+             */
+            request: components["schemas"]["ResearchAgentRequest"];
+            /**
+             * @description Number of phases to run before the start call returns.
+             * @default 0
+             */
+            advance?: number;
+        };
+        ResearchJobAdvanceRequest: {
+            /**
+             * @description Maximum phases to run in this advance. Each phase checkpoints before the next starts.
+             * @default 1
+             */
+            max_phases?: number;
+        };
+        ResearchJob: {
+            /** @description Job identifier. */
+            job_id: string;
+            state: components["schemas"]["ResearchJobState"];
+            phase: components["schemas"]["ResearchPhase"];
+            /** @description The research question. */
+            query?: string;
+            /** @description Completed advance calls. */
+            advances?: number;
+            /** @description Whether cancellation was requested. */
+            cancel_requested?: boolean;
+            /** @description Last advance error, if any. */
+            last_error?: string;
+            /** Format: int64 */
+            created_at_ms?: number;
+            /** Format: int64 */
+            updated_at_ms?: number;
+            /** Format: int64 */
+            expires_at_ms?: number;
+            /** @description Latest checkpointed result, including research_state. */
+            result?: components["schemas"]["ResearchAgentResult"];
         };
         /**
          * @deprecated
@@ -7364,9 +9993,18 @@ export interface components {
             ancestors?: components["schemas"]["HierarchyAncestors"];
             children?: components["schemas"]["HierarchyChildren"];
         } & (unknown & unknown & unknown);
+        /** @description An explicit native table target. Components are literal names; dots do not qualify a string table name. */
+        CatalogTableTarget: {
+            /** @default default */
+            database?: string;
+            /** @default public */
+            namespace?: string;
+            table: string;
+        };
         QueryRequest: {
+            table_target?: components["schemas"]["CatalogTableTarget"];
             /**
-             * @description Name of the table to query. Required for global-query requests.
+             * @description Literal table name in default.public. Global queries require exactly one of table or table_target.
              * @example wikipedia
              */
             table?: string;
@@ -7614,6 +10252,7 @@ export interface components {
              */
             fields?: string[];
             hierarchy?: components["schemas"]["QueryHierarchy"];
+            highlight?: components["schemas"]["QueryHighlight"];
             /**
              * @description Maximum number of top-level results to return. For semantic_search, this is the topk parameter.
              *     This does not limit nested matches attached through hierarchy.group_by.matches;
@@ -7766,9 +10405,9 @@ export interface components {
              *     ```
              */
             reranker?: components["schemas"]["RerankerConfig"];
-            /** @description Direct top-k read from a published graph metric generation. Results are returned in graph_metric_results under the requested name or the metric name when no explicit name is supplied. */
+            /** @description Direct top-k read from a published graph metric generation. Results are returned in graph_metric_results under the requested name or the metric name when no explicit name is supplied. Supplying seed_nodes switches a pagerank metric to query-seeded personalized PageRank computed at query time; that form requires metric_freshness=fresh because published generations are global-only. */
             graph_metric?: components["schemas"]["GraphMetricQuery"];
-            /** @description Blend a published graph metric feature into ordinary search hit scores. Requests may require either any published generation or a generation that is fresh with respect to graph writes. */
+            /** @description Blend a published graph metric feature into ordinary search hit scores. Requests may require either any published generation or a generation that is fresh with respect to graph writes. Supplying seed_nodes switches a pagerank metric to a query-seeded personalized PageRank blend computed at query time; that form requires metric_freshness=fresh. Retrieval-agent queries may opt in to automatic seeding with auto_seed=true, which seeds the blend from the query's literal graph-search start keys; only valid for pagerank metrics with metric_freshness=fresh. Caller-supplied seed_nodes always take precedence and are never overwritten. */
             graph_metric_rerank?: components["schemas"]["GraphMetricRerank"];
             analyses?: components["schemas"]["Analyses"];
             /**
@@ -7784,41 +10423,9 @@ export interface components {
              */
             graph_queries?: components["schemas"]["GraphQueries"];
             /**
-             * @description Optional Handlebars template string for rendering document content in RAG queries.
-             *     Template has access to document fields via `{{this.fields.fieldName}}`.
-             *
-             *     **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction:
-             *     ```handlebars
-             *     {{encodeToon this.fields}}
-             *     ```
-             *
-             *     **Available Helpers**:
-             *     - `encodeToon` - Renders fields in compact TOON format with configurable options:
-             *       - `lengthMarker` (bool): Add # prefix to array counts (default: true)
-             *       - `indent` (int): Indentation spacing (default: 2)
-             *       - `delimiter` (string): Field separator for tabular arrays
-             *     - `scrubHtml` - Removes HTML tags and extracts text
-             *     - `media` - Wraps data URIs for GenKit multimodal support
-             *     - `eq` - Equality comparison for conditionals
-             *
-             *     **Examples**:
-             *     - Basic TOON: `{{encodeToon this.fields}}`
-             *     - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}`
-             *     - Tabular data: `{{encodeToon this.fields delimiter="\t"}}`
-             *     - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}`
-             *     - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}`
-             *
-             *     TOON format produces compact, LLM-optimized output like:
-             *     ```
-             *     title: Introduction to Vector Search
-             *     author: Jane Doe
-             *     tags[#3]: ai,search,ml
-             *     ```
-             *
-             *     **References**:
-             *     - TOON Specification: https://github.com/toon-format/toon
-             *     - Go Implementation: https://github.com/alpkeskin/gotoon
-             * @example {{encodeToon this.fields}}
+             * @description Not supported on queries, which do not generate text; requests that
+             *     set it are rejected. Set `document_renderer` on a retrieval agent
+             *     request to control how documents appear in the generation prompt.
              */
             document_renderer?: string;
             /**
@@ -7977,11 +10584,12 @@ export interface components {
          *     Supports inner, left, and right joins with automatic strategy selection.
          */
         JoinClause: {
+            right_target?: components["schemas"]["CatalogTableTarget"];
             /**
-             * @description Name of the table to join with.
+             * @description Literal native table name or declared foreign-source alias. Specify exactly one of right_table or right_target.
              * @example customers
              */
-            right_table: string;
+            right_table?: string;
             /** @description Type of join to perform. Defaults to "inner". */
             join_type?: components["schemas"]["JoinType"];
             /** @description Join condition specifying which fields to match. */
@@ -8588,6 +11196,63 @@ export interface components {
              *     requests whose effective order is `_id` ascending.
              */
             _sort?: unknown[];
+            /**
+             * @description Highlighted fragments keyed by source field, present when the request
+             *     set `highlight` and the stored document has the field. Highlights are
+             *     computed from the unprojected document, so a `fields` projection that
+             *     omits a highlighted field does not suppress its highlights. Each
+             *     fragment is a window of the stored field value with byte-offset spans
+             *     marking the text the full-text query matched.
+             */
+            _highlights?: {
+                [key: string]: components["schemas"]["HighlightFragment"][];
+            };
+        };
+        /**
+         * @description Ask for highlighted fragments of the stored fields matched by
+         *     `full_text_search` and by named full-text queries. Matches are located
+         *     by re-analyzing the stored value with the field's analyzer, so stemmed
+         *     and stop-word-filtered terms highlight the surface form. `prefix`,
+         *     `wildcard`, `regexp`, and `fuzzy` clauses mark whole tokens; `match`,
+         *     `match_phrase`, or `prefix` on a `substring` companion
+         *     (`field._substring`) marks the exact contained bytes, including
+         *     matches that span two adjacent words.
+         */
+        QueryHighlight: {
+            /**
+             * @description Source fields to highlight. Defaults to every field the full-text
+             *     query references (companion suffixes such as `._substring` and
+             *     `.keyword` resolve to their root field).
+             * @example [
+             *       "title",
+             *       "body"
+             *     ]
+             */
+            fields?: string[];
+            /**
+             * @description Fragment window size in bytes.
+             * @default 150
+             */
+            fragment_size?: number;
+            /**
+             * @description Maximum fragments returned per field.
+             * @default 3
+             */
+            max_fragments?: number;
+        };
+        HighlightFragment: {
+            /** @description The fragment of the stored field value. */
+            text: string;
+            /** @description Byte offset of the fragment within the field value. */
+            offset: number;
+            /** @description Array index for one array; flattened value ordinal for paths through multiple arrays. */
+            item?: number;
+            spans: components["schemas"]["HighlightSpan"][];
+        };
+        /** @description Half-open byte range within the fragment text. */
+        HighlightSpan: {
+            start: number;
+            end: number;
         };
         /** @description A list of query hits. */
         QueryHits: {
@@ -9078,8 +11743,8 @@ export interface components {
              */
             on_delete?: components["schemas"]["ReplicationTransformOp"][];
             /**
-             * @description Bleve-style filter query that gets translated to SQL and applied as a
-             *     WHERE clause on the PostgreSQL publication. This filters rows at the
+             * @description Antfly's native filter query (see `RawQuery`) that gets translated to SQL and
+             *     applied as a WHERE clause on the PostgreSQL publication. This filters rows at the
              *     source before they are sent over the replication stream, reducing
              *     network and processing overhead.
              *
@@ -9173,7 +11838,7 @@ export interface components {
              */
             target_table: string;
             /**
-             * @description Bleve-style filter query evaluated against each CDC row. Only rows
+             * @description Antfly's native filter query (see `RawQuery`) evaluated against each CDC row. Only rows
              *     matching this filter are written to `target_table`. If omitted,
              *     all rows match (equivalent to `match_all`).
              */
@@ -9240,19 +11905,35 @@ export interface components {
          * @example table
          * @enum {string}
          */
-        ResourceType: "table" | "user" | "inference" | "*";
+        ResourceType: "table" | "database" | "namespace" | "tablespace" | "user" | "inference" | "*";
         /**
          * @description Type of permission.
          * @example read
          * @enum {string}
          */
         PermissionType: "read" | "write" | "admin";
+        /** @description A table or all tables in an explicit namespace. A missing table selects the namespace; a table named '*' remains literal. */
+        CatalogTableScope: {
+            /** @default default */
+            database?: string;
+            /** @default public */
+            namespace?: string;
+            table?: string;
+        };
+        ScopedRowFilter: {
+            table_target: components["schemas"]["CatalogTableScope"];
+            filter: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description Specify exactly one of a legacy literal resource or a structured table_target; table_target requires resource_type table. */
         Permission: {
             /**
              * @description Resource name (e.g., table name, target username, or '*' for all inference operations or a global grant).
              * @example orders_table
              */
-            resource: string;
+            resource?: string;
+            table_target?: components["schemas"]["CatalogTableScope"];
             resource_type: components["schemas"]["ResourceType"];
             type: components["schemas"]["PermissionType"];
         };
@@ -9329,6 +12010,7 @@ export interface components {
             username: string;
             /** @description Optional permission scoping. If empty, inherits owner's full permissions. */
             permissions?: components["schemas"]["Permission"][] | null;
+            scoped_row_filters?: components["schemas"]["ScopedRowFilter"][];
             /** @description Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing. */
             row_filter?: {
                 [key: string]: unknown;
@@ -9364,6 +12046,7 @@ export interface components {
              * @example orders
              */
             table: string;
+            table_target?: components["schemas"]["CatalogTableScope"];
             /**
              * @description Antfly query JSON that documents must match to be visible.
              * @example {
@@ -9390,6 +12073,7 @@ export interface components {
             expires_in?: string;
             /** @description Optional permission scoping. Each permission must be a subset of the creator's permissions. */
             permissions?: components["schemas"]["Permission"][] | null;
+            scoped_row_filters?: components["schemas"]["ScopedRowFilter"][];
             /** @description Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing. */
             row_filter?: {
                 [key: string]: unknown;
@@ -9604,6 +12288,8 @@ export interface components {
          *     OpenRouter provides a unified API for multiple embedding models from different providers.
          *     API key via `api_key` field or `OPENROUTER_API_KEY` environment variable.
          *
+         *     Antfly currently supports dense text embeddings through this provider.
+         *
          *     **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large,
          *     google/gemini-embedding-001, qwen/qwen3-embedding-8b
          *
@@ -9615,7 +12301,10 @@ export interface components {
          *     }
          */
         OpenRouterEmbedderConfig: {
-            /** @enum {string} */
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
             provider: "openrouter";
             /**
              * @description The OpenRouter model identifier (e.g., 'openai/text-embedding-3-small', 'google/gemini-embedding-001').
@@ -9623,6 +12312,11 @@ export interface components {
              * @example openai/text-embedding-3-small
              */
             model: string;
+            /**
+             * Format: uri
+             * @description The OpenRouter API base URL. Defaults to OPENROUTER_BASE_URL or https://openrouter.ai/api/v1.
+             */
+            url?: string;
             /** @description The OpenRouter API key. Can also be set via OPENROUTER_API_KEY environment variable. */
             api_key?: string;
             /** @description Output dimension for the embedding (if supported by the model). */
@@ -9736,13 +12430,12 @@ export interface components {
          * @description Configuration for the Antfly inference embedding provider.
          *
          *     Antfly inference is Antfly's built-in ML service for local embeddings using ONNX models.
-         *     It provides embedding generation with multi-tier caching (memory + persistent).
          *
          *     **Features:**
          *     - Local ONNX-based embedding generation
-         *     - L1 memory cache with configurable TTL
-         *     - L2 persistent Pebble database cache
-         *     - Singleflight deduplication for concurrent identical requests
+         *     - Query-time embeddings are served from an in-memory cache (64 MiB budget,
+         *       5-minute TTL by default) with concurrent identical requests coalesced onto
+         *       a single computation; there is no persistent on-disk cache tier
          *
          *     **Example Models:** bge-base-en-v1.5 (768 dims), all-MiniLM-L6-v2 (384 dims)
          *
@@ -9819,94 +12512,6 @@ export interface components {
          * @enum {string}
          */
         EnrichmentKind: "chunk" | "asset" | "embedding";
-        /** @description Non-semantic execution policy for one producer or index maintenance operation. These fields tune how work is batched and do not change generated artifact identity. */
-        ExecutionPolicy: {
-            /** @description Maximum items to process in one batch for this operation. */
-            batch_items?: number;
-            /**
-             * Format: uint64
-             * @description Approximate maximum source bytes to process in one batch for this operation.
-             */
-            batch_bytes?: number;
-            /**
-             * Format: uint32
-             * @description Maximum PDF pages admitted for one request-atomic document operation.
-             */
-            max_document_pages?: number;
-        };
-        /** @description Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams. */
-        EnrichmentConfig: {
-            /** @description Stable generated artifact name. */
-            name: string;
-            kind: components["schemas"]["EnrichmentKind"];
-            /** @description Source field to read from the source document or source artifact payload. */
-            field?: string;
-            /** @description Optional template for generated text input. */
-            template?: string;
-            /** @description Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts. */
-            source_artifact_name?: string;
-            /** @description Expected embedding dimension for embedding enrichments. */
-            expected_dims?: number;
-            /** @description Optional stable model/token-space identifier for embedding artifacts. When omitted on every source, Antfly requires the effective producers to be semantically equivalent. To combine intentionally compatible but distinct producers, set the same identifier on every source. Explicit and implicit modes cannot be mixed; dimensions are always validated independently. */
-            vector_space?: string;
-            /** @description Chunk size for chunk enrichments. */
-            chunk_size?: number;
-            /** @description Chunk overlap for chunk enrichments. */
-            chunk_overlap?: number;
-            /** @description Serialized chunker configuration for chunk enrichments. */
-            chunker_json?: string;
-            /**
-             * @description When true on a chunk or asset enrichment, route generated text into the table's default full-text index.
-             * @default false
-             */
-            full_text_index?: boolean;
-            /** @description Produced asset content type for asset enrichments. */
-            content_type?: string;
-            /** @description Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded. */
-            producer_json?: string;
-            /** @description Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity. */
-            execution?: components["schemas"]["ExecutionPolicy"];
-        };
-        /** @description Textual artifact stream consumed by a full-text index, with an optional source-local projection. */
-        FullTextArtifactIndexSource: {
-            /** @description Stable name of a chunk or textual asset artifact stream. Artifact names must be unique within the index. */
-            artifact: string;
-            /** @description Optional field selected from this artifact's records. When omitted, the index-level field is inherited; when both are omitted, Antfly indexes the default text projection. */
-            field?: string;
-        };
-        FullTextIndexConfig: {
-            /** @description Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. A source-local field overrides the shared index-level field for that stream. Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
-            sources?: components["schemas"]["FullTextArtifactIndexSource"][];
-            /** @description Whether to use memory-only storage */
-            mem_only?: boolean;
-            /** @description Content field indexed as text. With an artifact source, this selects the field within each artifact record; without one, it selects a document field. String values and arrays of strings are indexed; missing, null, and non-text values produce no posting. Omit to index the default text projection. */
-            field?: string;
-            /** @description Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
-            artifact_name?: string;
-        };
-        /**
-         * @description Publication behavior for a managed embeddings index. `progressive` makes a safely checkpointed active generation queryable before initial source coverage is complete. `atomic` keeps a new generation unavailable until complete validation and activation.
-         * @default progressive
-         * @enum {string}
-         */
-        IndexPublicationPolicy: "progressive" | "atomic";
-        /**
-         * @description How generation-scoped source outcomes determine derived-index completeness.
-         * @default strict
-         * @enum {string}
-         */
-        DerivedCoveragePolicy: "strict" | "partial" | "best_effort";
-        /** @description Named generated artifact stream consumed by an index. Producer inputs belong on the matching enrichment. */
-        ArtifactIndexSource: {
-            /** @description Stable name of a generated artifact stream. */
-            artifact: string;
-        };
-        /**
-         * @description Distance metric for the vector index (dense only). Use "cosine" for models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot product similarity. Use "l2_squared" for models trained with Euclidean distance. The default is "l2_squared".
-         * @default l2_squared
-         * @enum {string}
-         */
-        DistanceMetric: "l2_squared" | "inner_product" | "cosine";
         /** @description Options specific to text chunking. */
         TextChunkOptions: {
             /** @description Target number of tokens per chunk. */
@@ -9938,17 +12543,17 @@ export interface components {
         /**
          * @description Configuration for the Antfly inference chunking provider.
          *
-         *     Antfly inference is a centralized HTTP service that provides chunking with multi-tier caching.
+         *     Antfly inference is Antfly's built-in ML service for local chunking.
          *     The model name maps to ONNX model directory names (similar to how Ollama works).
          *
          *     **Chunking Models:**
          *     - fixed: Simple fixed-size chunking by token count (built-in, no ONNX required)
          *     - Any other name will attempt to load from models/chunkers/{name}/ directory
          *
-         *     **Caching:**
-         *     - L1: Memory cache with 2-minute TTL
-         *     - L2: Persistent Pebble database
-         *     - Singleflight deduplication for concurrent identical requests
+         *     **Deduplication:**
+         *     - Within a single document write, chunk results are deduplicated when multiple
+         *       indexes share the same source text and chunker configuration, so the source
+         *       is chunked at most once per write.
          * @example {
          *       "provider": "antfly",
          *       "api_url": "http://localhost:8080",
@@ -9999,9 +12604,9 @@ export interface components {
              */
             store_chunks?: boolean;
             /**
-             * @description Configuration for full-text indexing of chunks in Bleve.
-             *     When present (even if empty), chunks will be stored with :cft: suffix and indexed in Bleve's _chunks field.
-             *     When absent, chunks use :c: suffix and are only used for vector embeddings.
+             * @description Configuration for full-text indexing of chunks.
+             *     When present (even if empty), chunk artifacts are persisted and indexed in Antfly's native full-text index, queryable and projectable via the document's `_chunks` field.
+             *     When absent, chunks are generated only to drive vector embeddings and are not indexed for full-text search (unless `store_chunks` is also set).
              */
             full_text_index?: {
                 [key: string]: unknown;
@@ -10025,6 +12630,257 @@ export interface components {
             text?: components["schemas"]["TextChunkOptions"];
             audio?: components["schemas"]["AudioChunkOptions"];
         };
+        /** @description Bounded sample of the document's same-shard graph neighbors appended to an asset producer's rendered input as a compact JSON block ({"neighbors":[{"edge_type":...,"direction":...,"target":...,"weight":...}]}), ordered by edge type then target key. A conceptualizer enrichment on an entities table can thereby ground its abstractions in adjacent facts ("started_by -> John Andrew Rice"). The sampled block participates in the producer's skip state, so a changed adjacency re-runs the producer. */
+        EnrichmentNeighborContextConfig: {
+            /** @description Name of a graph index on the same table whose local state is sampled. Validated at admission; cross-shard neighbors are not sampled. */
+            graph_index: string;
+            /** @description Edge types to sample. Empty admits every edge type. */
+            edge_types?: string[];
+            /**
+             * @description Adjacency orientation to sample relative to the document.
+             * @default both
+             * @enum {string}
+             */
+            direction?: "out" | "in" | "both";
+            /**
+             * Format: uint32
+             * @description Maximum neighbors rendered into the producer input, applied after deterministic ordering.
+             * @default 8
+             */
+            limit?: number;
+        };
+        /** @description Non-semantic execution policy for one producer or index maintenance operation. These fields tune how work is batched and do not change generated artifact identity. */
+        ExecutionPolicy: {
+            /** @description Maximum items to process in one batch for this operation. */
+            batch_items?: number;
+            /**
+             * Format: uint64
+             * @description Approximate maximum source bytes to process in one batch for this operation.
+             */
+            batch_bytes?: number;
+            /**
+             * Format: uint32
+             * @description Maximum PDF pages admitted for one request-atomic document operation.
+             */
+            max_document_pages?: number;
+        };
+        /**
+         * @description The STT provider to use.
+         * @enum {string}
+         */
+        STTProvider: "openai" | "vertex" | "antfly";
+        /**
+         * @description Speech-to-text provider for the `transcriber` enrichment shorthand.
+         *
+         *     Carries the provider's STT configuration (`provider`, `model`, `api_url`, `api_key`, ...) plus the transcription options below. The fields are declared inline rather than composed from `STTConfig` so that a generated client can leave an option out: a composed schema makes a typed client serialize every field, and a `max_download_bytes` of zero would reject every recording.
+         *
+         *     **Example:**
+         *     ```yaml
+         *     name: call_transcripts
+         *     kind: asset
+         *     field: recording_url
+         *     transcriber:
+         *       provider: antfly
+         *       model: openai/whisper-base
+         *       language_code: en
+         *       timestamps: true
+         *     ```
+         */
+        TranscriberEnrichmentConfig: {
+            provider: components["schemas"]["STTProvider"];
+            /** @description Model name, as the provider names it (e.g. 'openai/whisper-base' for antfly, 'whisper-1' for openai). */
+            model?: string;
+            /**
+             * Format: uri
+             * @description Antfly inference API URL. Falls back to ANTFLY_INFERENCE_URL.
+             */
+            api_url?: string;
+            /**
+             * Format: uri
+             * @description OpenAI API base URL. Falls back to OPENAI_BASE_URL.
+             */
+            base_url?: string;
+            /** @description Provider API key. Falls back to the provider's environment variable. */
+            api_key?: string;
+            /** @description Google Cloud project ID for the vertex provider. Falls back to GOOGLE_CLOUD_PROJECT. */
+            project_id?: string;
+            /** @description Google Cloud location for the vertex provider. */
+            location?: string;
+            /** @description Path to an ADC credential JSON file for the vertex provider. Falls back to the default ADC chain. */
+            credentials_path?: string;
+            /** @description Spoken language hint (ISO 639-1, e.g. 'en'). Omit for automatic detection where the provider supports it. */
+            language_code?: string;
+            /**
+             * @description Request timestamped transcript segments so chunks carry recording offsets. Providers without segment timing return plain text.
+             * @default true
+             */
+            timestamps?: boolean;
+            /**
+             * @description Request speaker labels on transcript segments where the provider supports them.
+             * @default false
+             */
+            diarization?: boolean;
+            /** @description Largest recording fetched from a URL, in bytes. Defaults to 128 MiB, which covers a one hour voice memo or podcast. */
+            max_download_bytes?: number;
+        };
+        /** @description Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams. */
+        EnrichmentConfig: {
+            /** @description Stable generated artifact name. */
+            name: string;
+            kind: components["schemas"]["EnrichmentKind"];
+            /** @description Source field to read from the source document or source artifact payload. */
+            field?: string;
+            /** @description Optional template for generated text input. */
+            template?: string;
+            /** @description Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts; asset enrichments may consume other asset artifacts (the upstream asset's produced bytes become this producer's source, so field and template must be omitted and the producer must consume text: copy, generator, or extractor). */
+            source_artifact_name?: string;
+            /** @description Expected embedding dimension for embedding enrichments. */
+            expected_dims?: number;
+            /** @description Optional stable model/token-space identifier for embedding artifacts. When omitted on every source, Antfly requires the effective producers to be semantically equivalent. To combine intentionally compatible but distinct producers, set the same identifier on every source. Explicit and implicit modes cannot be mixed; dimensions are always validated independently. */
+            vector_space?: string;
+            /** @description Chunk size for chunk enrichments. */
+            chunk_size?: number;
+            /** @description Chunk overlap for chunk enrichments. */
+            chunk_overlap?: number;
+            /** @description Chunker configuration for chunk enrichments. Cannot be combined with chunker_json. */
+            chunker?: components["schemas"]["ChunkerConfig"];
+            /**
+             * @deprecated
+             * @description Legacy serialized chunker configuration for chunk enrichments. Cannot be combined with chunker.
+             */
+            chunker_json?: string;
+            /**
+             * @description When true on a chunk or asset enrichment, route generated text into the table's default full-text index.
+             * @default false
+             */
+            full_text_index?: boolean;
+            /** @description Produced asset content type for asset enrichments. */
+            content_type?: string;
+            /** @description Write-only producer configuration. Cannot be combined with producer_json or transcriber. */
+            producer?: {
+                [key: string]: unknown;
+            };
+            /**
+             * @deprecated
+             * @description Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded.
+             */
+            producer_json?: string;
+            /** @description Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator or extractor); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission. */
+            neighbor_context?: components["schemas"]["EnrichmentNeighborContextConfig"];
+            /** @description Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity. */
+            execution?: components["schemas"]["ExecutionPolicy"];
+            /** @description Typed shorthand for a transcription asset enrichment. Only valid with kind=asset and without producer_json; Antfly expands it into a document_extraction producer whose audio route transcribes each recording with this speech-to-text provider. The produced units carry the transcript text, provider confidence, and per-phrase time offsets, and chunk enrichments that consume them emit _start_time_ms/_end_time_ms on every chunk. With diarization: true the phrases also carry who spoke them, and a chunk that does not straddle a turn emits _speaker. content_type defaults to application/json. */
+            transcriber?: components["schemas"]["TranscriberEnrichmentConfig"];
+        };
+        /** @description Textual artifact stream consumed by a full-text index, with an optional source-local projection. */
+        FullTextArtifactIndexSource: {
+            /** @description Stable name of a chunk or textual asset artifact stream. Artifact names must be unique within the index. */
+            artifact: string;
+            /** @description Optional field selected from this artifact's records. When omitted, the index-level field is inherited; when both are omitted, Antfly indexes the default text projection. */
+            field?: string;
+        };
+        /** @description One named analysis component: its type and type-specific configuration. */
+        TextAnalysisComponent: {
+            type: string;
+            config?: {
+                [key: string]: unknown;
+            };
+        };
+        /**
+         * @description Custom text analysis for a full-text index. Component maps are keyed
+         *     by the name that analyzers and `field_analyzers` reference. Built-in
+         *     analyzers (`standard`, `simple`, `keyword`, `html`, `search_as_you_type`,
+         *     `substring`, and the language analyzers such as `german`) are always
+         *     available without declaring them.
+         *
+         *     Example: split camelCase identifiers and match them as substrings.
+         *
+         *     ```json
+         *     {
+         *       "analysis_config": {
+         *         "field_analyzers": {"symbol": "code"},
+         *         "token_filters": {
+         *           "tails": {"type": "suffix", "config": {"min": 3, "max": 24}}
+         *         },
+         *         "analyzers": {
+         *           "code": {
+         *             "type": "custom",
+         *             "config": {
+         *               "tokenizer": "whitespace",
+         *               "token_filters": ["camel_case", "unique", "tails"]
+         *             }
+         *           }
+         *         }
+         *       }
+         *     }
+         *     ```
+         */
+        TextAnalysisConfig: {
+            /** @description Map of indexed field name to analyzer name. Overrides the analyzer derived from the table schema for that field. */
+            field_analyzers?: {
+                [key: string]: string;
+            };
+            /** @description Named character filters. Types: `html_strip` (alias `html`), `ascii_fold`, `zero_width_non_joiner`. */
+            char_filters?: {
+                [key: string]: components["schemas"]["TextAnalysisComponent"];
+            };
+            /** @description Named tokenizers. Types: `unicode` (alias `unicode_words`), `whitespace`, `keyword`, `character`, `ngram` (`config.min`, `config.max`), `edge_ngram` (`config.min`, `config.max`, `config.side` of `front` or `back`). */
+            tokenizers?: {
+                [key: string]: components["schemas"]["TextAnalysisComponent"];
+            };
+            /** @description Named token filters. Types: `lowercase` (alias `to_lower`), `stop_words` (alias `stop`; optional `config.language`), `stemmer` (optional `config.language`), `ngram` and `edge_ngram` (`config.min`, `config.max`), `shingle` (`config.min`, `config.max`, `config.separator` of `space` or `none`), `suffix` (`config.min`, `config.max`; emits every suffix of each token so prefix queries answer containment), `length` (`config.min`, `config.max`), `truncate` (`config.length`), `camel_case`, `unique`, `reverse`, `elision`, `apostrophe`. Languages: english, german, french, spanish, italian, portuguese, dutch, swedish, norwegian, danish, finnish. */
+            token_filters?: {
+                [key: string]: components["schemas"]["TextAnalysisComponent"];
+            };
+            /** @description Named analyzers of type `custom`. `config.tokenizer` names a built-in or declared tokenizer; `config.char_filters` and `config.token_filters` list built-in or declared component names in application order. Configuration-free filters (`lowercase`, `stop_words`, `stemmer`, `camel_case`, `unique`, `reverse`, `elision`, `apostrophe`, `suffix`) can be listed by name without declaring them. */
+            analyzers?: {
+                [key: string]: components["schemas"]["TextAnalysisComponent"];
+            };
+            /** @description Name of the date-time parser applied to datetime fields without a field-specific parser. */
+            default_datetime_parser?: string;
+            /** @description Map of field name to date-time parser name. */
+            field_date_time_parsers?: {
+                [key: string]: string;
+            };
+            /** @description Named date-time parsers. Type `sanitizedgo` accepts `config.layouts`, a list of Go reference-time layouts tried in order. */
+            date_time_parsers?: {
+                [key: string]: components["schemas"]["TextAnalysisComponent"];
+            };
+        };
+        FullTextIndexConfig: {
+            /** @description Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. A source-local field overrides the shared index-level field for that stream. Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
+            sources?: components["schemas"]["FullTextArtifactIndexSource"][];
+            /** @description Whether to use memory-only storage */
+            mem_only?: boolean;
+            /** @description Content field indexed as text. With an artifact source, this selects the field within each artifact record; without one, it selects a document field. String values and arrays of strings are indexed; missing, null, and non-text values produce no posting. Omit to index the default text projection. */
+            field?: string;
+            /** @description Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
+            artifact_name?: string;
+            analysis_config?: components["schemas"]["TextAnalysisConfig"];
+        };
+        /**
+         * @description Publication behavior for a managed embeddings index. `progressive` makes a safely checkpointed active generation queryable before initial source coverage is complete. `atomic` keeps a new generation unavailable until complete validation and activation.
+         * @default progressive
+         * @enum {string}
+         */
+        IndexPublicationPolicy: "progressive" | "atomic";
+        /**
+         * @description How generation-scoped source outcomes determine derived-index completeness.
+         * @default strict
+         * @enum {string}
+         */
+        DerivedCoveragePolicy: "strict" | "partial" | "best_effort";
+        /** @description Named generated artifact stream consumed by an index. Producer inputs belong on the matching enrichment. */
+        ArtifactIndexSource: {
+            /** @description Stable name of a generated artifact stream. */
+            artifact: string;
+        };
+        /**
+         * @description Distance metric for the vector index (dense only). Use "cosine" for models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot product similarity. Use "l2_squared" for models trained with Euclidean distance. The default is "l2_squared".
+         * @default l2_squared
+         * @enum {string}
+         */
+        DistanceMetric: "l2_squared" | "inner_product" | "cosine";
         /** @description Namespaced execution policy for managed index shorthand. Only namespaces with runtime effects are accepted. */
         IndexExecutionConfig: {
             /** @description Chunk producer batching for shorthand-created chunk enrichments. */
@@ -10090,6 +12946,10 @@ export interface components {
             chunk_size?: number;
             /** @description Non-semantic execution policy for shorthand-created chunking or embedding producers. */
             execution?: components["schemas"]["IndexExecutionConfig"];
+        };
+        GraphTtlConfig: {
+            /** @description Expiration duration using Antfly's integer-component duration format (ns, us, ms, s, m, h, d). */
+            duration: string;
         };
         /** @description Durable graph edge type. Values must be valid UTF-8 and encode to at most 64 KiB; `maxLength` is the standard-schema code-point ceiling and `x-antfly-max-utf8-bytes` carries the exact wire-byte limit. */
         GraphEdgeType: string;
@@ -10303,6 +13163,11 @@ export interface components {
             /** @description HTTP response timeout in seconds for Inference API calls. */
             timeout?: number;
         };
+        /**
+         * @description OpenAI reasoning effort; model support varies. Omit to use the model default.
+         * @enum {string}
+         */
+        OpenAIReasoningEffort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
         /** @description Configuration for the OpenAI generative AI provider. */
         OpenAIGeneratorConfig: {
             /** @enum {string} */
@@ -10328,8 +13193,55 @@ export interface components {
             /** @description Maximum number of tokens to generate. */
             max_tokens?: number;
             /**
+             * @description OpenAI completion budget, including visible output and reasoning tokens.
+             *     Use for reasoning models instead of max_tokens; the two are mutually exclusive.
+             */
+            max_completion_tokens?: number;
+            /** @description Optional reasoning effort. Supported values depend on the selected OpenAI model. */
+            reasoning_effort?: components["schemas"]["OpenAIReasoningEffort"];
+            /**
              * Format: float
              * @description Nucleus sampling parameter.
+             */
+            top_p?: number;
+            /**
+             * Format: float
+             * @description Penalty for token frequency (-2.0 to 2.0).
+             */
+            frequency_penalty?: number;
+            /**
+             * Format: float
+             * @description Penalty for token presence (-2.0 to 2.0).
+             */
+            presence_penalty?: number;
+        };
+        /** @description Configuration for the OpenRouter generative AI provider. */
+        OpenRouterGeneratorConfig: {
+            /** @enum {string} */
+            provider: "openrouter";
+            /**
+             * @description The OpenRouter model identifier to use.
+             * @example openai/gpt-4.1
+             */
+            model: string;
+            /**
+             * Format: uri
+             * @description The URL of the OpenRouter API endpoint.
+             * @default https://openrouter.ai/api/v1
+             */
+            url?: string;
+            /** @description The OpenRouter API key. */
+            api_key?: string;
+            /**
+             * Format: float
+             * @description Controls randomness in generation (0.0-2.0).
+             */
+            temperature?: number;
+            /** @description Maximum number of tokens to generate in the response. */
+            max_tokens?: number;
+            /**
+             * Format: float
+             * @description Nucleus sampling parameter (0.0-1.0).
              */
             top_p?: number;
             /**
@@ -10347,7 +13259,7 @@ export interface components {
          * @description Generator providers implemented by Antfly's generation runtime.
          * @enum {string}
          */
-        GeneratorProvider: "gemini" | "vertex" | "ollama" | "openai" | "antfly";
+        GeneratorProvider: "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "antfly";
         /**
          * @description A unified configuration for a generative AI provider.
          * @example {
@@ -10357,7 +13269,7 @@ export interface components {
          *       "max_tokens": 2048
          *     }
          */
-        GeneratorConfig: (components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"]) & {
+        GeneratorConfig: (components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"] | components["schemas"]["OpenRouterGeneratorConfig"]) & {
             rate_limit?: components["schemas"]["RateLimitConfig"];
             provider: components["schemas"]["GeneratorProvider"];
         };
@@ -10393,7 +13305,14 @@ export interface components {
             source: components["schemas"]["GraphArtifactProducerSourceConfig"];
             content_type?: string;
             execution?: components["schemas"]["ExecutionPolicy"];
-            /** @description Write-only producer configuration; it may contain credentials and is never returned. */
+            /** @description Write-only producer configuration. Cannot be combined with producer_json. */
+            producer?: {
+                [key: string]: unknown;
+            };
+            /**
+             * @deprecated
+             * @description Write-only producer configuration; it may contain credentials and is never returned.
+             */
             producer_json?: {
                 [key: string]: unknown;
             };
@@ -10407,6 +13326,33 @@ export interface components {
         GraphAlgebraicPlanningConfig: {
             bounded_traversal?: components["schemas"]["GraphBoundedTraversalConfig"];
         };
+        GraphResolverScorerLevel: {
+            /** @description Matcher condition, such as 'exact' or 'jaro_winkler >= 0.9'. */
+            when?: string;
+            /** @description Catch-all level when no previous condition matched. */
+            else?: boolean;
+            /** Format: double */
+            weight: number;
+        };
+        GraphResolverScorerComparison: {
+            name: string;
+            left: string;
+            right: string;
+            levels: components["schemas"]["GraphResolverScorerLevel"][];
+        };
+        GraphResolverScorerConfig: {
+            comparisons: components["schemas"]["GraphResolverScorerComparison"][];
+            combine?: {
+                /** Format: double */
+                bias?: number;
+            };
+            decision?: {
+                /** Format: double */
+                match?: number;
+                /** Format: double */
+                review?: number;
+            };
+        };
         /** @description Versioned entity resolver attached to an artifact-backed graph index. */
         GraphResolverConfig: {
             name: string;
@@ -10419,8 +13365,13 @@ export interface components {
             source_artifact_kind?: "asset" | "chunk" | "any";
             resolution_artifact: string;
             key_template: string;
+            /** @description Mention labels this resolver consumes; empty consumes every label (catch-all). Labeled resolvers sharing a source artifact must claim disjoint label sets, and every catch-all on that artifact skips the labels claimed by labeled siblings, so extraction labels stay open-vocabulary while each mention routes to exactly one labeled resolver (label-routed tables, e.g. event mentions to an events table). */
+            labels?: string[];
             /** @default true */
             type_must_match?: boolean;
+            /** @description Typed matcher scorer. Cannot be combined with scorer_json. */
+            scorer?: components["schemas"]["GraphResolverScorerConfig"];
+            /** @deprecated */
             scorer_json?: string;
             /** @enum {string} */
             candidate_search?: "" | "exact_key" | "prefix" | "ann";
@@ -10438,11 +13389,20 @@ export interface components {
             fusion_prior?: number;
             /** Format: double */
             fusion_prior_weight?: number;
+            /**
+             * Format: double
+             * @description Mention admission floor: mentions whose extractor-asserted confidence is below this are never resolved — no canonical entity key, no mention edge, and relation endpoints referencing them are withheld. The cheap post-extraction junk filter for score-carrying extractors; 0 (the default) admits everything.
+             */
+            min_confidence?: number;
             /** Format: uint64 */
             config_generation?: number;
         };
         /** @description Configuration for graph index type */
         GraphIndexConfig: {
+            /** @description Creation-based edge expiration for this graph index. The duration is immutable within an index incarnation. */
+            ttl?: components["schemas"]["GraphTtlConfig"];
+            /** @description Compatibility alias for ttl.duration. Do not specify together with ttl. */
+            ttl_duration?: string;
             /** @description Named published graph metrics. Serverless supports background refresh only and limits configurations to 16 metrics per graph, 64 total per publication, 64 types per filter, and 128 UTF-8 bytes per metric name. */
             metrics?: {
                 [key: string]: components["schemas"]["GraphMetricConfig"];
@@ -10475,11 +13435,96 @@ export interface components {
             /** @description When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API. */
             derive_from_schema?: boolean;
         };
+        /** @enum {string} */
+        RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not";
+        /** @enum {string} */
+        RelationalExpressionType: "string" | "blob" | "boolean" | "datetime" | "integer" | "number";
+        /**
+         * @description Immutable typed scalar expression, limited to 128 nodes and 16 levels.
+         *     A literal requires type; omitted value means typed null. A column
+         *     requires column; other
+         *     operations require args. Unknown or irrelevant fields are rejected.
+         *     Arithmetic operands have the same integer or number type. Integer
+         *     division truncates toward zero. Overflow and division by zero reject
+         *     the write. Arithmetic and string operations propagate null. ASCII case
+         *     operations leave non-ASCII bytes unchanged. No volatile functions are
+         *     accepted. Allocated results are bounded to 1 MiB each. Allocations
+         *     and byte-comparison operand work share a 4 MiB evaluation budget per
+         *     row and expression set. An integer literal may use a decimal string
+         *     for exact int64 transport; blob uses base64 and datetime uses the
+         *     normal relational datetime representation.
+         *     Comparisons require operands of the same type and return boolean or
+         *     SQL UNKNOWN (null); is_distinct and is_not_distinct always return a
+         *     boolean. Unary is_null and is_not_null test presence/null. AND and OR
+         *     evaluate left to right with SQL three-valued short-circuit semantics;
+         *     NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE.
+         */
+        RelationalScalarExpression: {
+            op: components["schemas"]["RelationalExpressionOp"];
+            type?: components["schemas"]["RelationalExpressionType"];
+            /** @description Typed literal value, including null. */
+            value?: unknown;
+            column?: string;
+            /** @description Optional binary or ASCII case-insensitive collation for binary string comparison operations only; aliases match ordered indexes. */
+            collation?: string;
+            args?: components["schemas"]["RelationalScalarExpression"][];
+        };
+        /**
+         * @description Direction of one ordered index key component. Omission selects asc.
+         * @enum {string}
+         */
+        RelationalIndexKeyDirection: "asc" | "desc";
+        /**
+         * @description Null placement for one ordered index key component. The default is
+         *     last for ascending keys and first for descending keys. Omission selects default.
+         * @enum {string}
+         */
+        RelationalIndexKeyNulls: "default" | "first" | "last";
+        /**
+         * @description Ordered component of a relational ordered-tuple index key. Supply
+         *     either a declared column or a deterministic typed scalar expression
+         *     with its result_type. Composite keys may mix both forms. Bounds use
+         *     the expression result type, not its input columns.
+         */
+        RelationalIndexKey: {
+            /** @description Declared relational column used by this key component. */
+            column?: string;
+            expression?: components["schemas"]["RelationalScalarExpression"];
+            result_type?: components["schemas"]["RelationalExpressionType"];
+            /**
+             * @description String-key collation. Omission selects binary ordering. Supported
+             *     binary aliases are C, POSIX, and binary. The aliases ci,
+             *     case_insensitive, and antfly.case_insensitive select ASCII-only
+             *     case folding, not locale-aware or Unicode case folding.
+             */
+            collation?: string;
+            direction?: components["schemas"]["RelationalIndexKeyDirection"];
+            nulls?: components["schemas"]["RelationalIndexKeyNulls"];
+        };
+        /** @enum {string} */
+        RelationalComparisonOp: "is_null" | "is_not_null" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_distinct" | "is_not_distinct";
+        /** @description A typed partial-index conjunct. Only TRUE is indexed; FALSE and SQL UNKNOWN are excluded. */
+        RelationalIndexPredicate: {
+            column: string;
+            op: components["schemas"]["RelationalComparisonOp"];
+            /** @description Typed scalar operand; integer columns also accept exact decimal strings. Omission means NULL. */
+            value?: unknown;
+            /** @description String comparison collation with the same semantics as ordered keys. */
+            collation?: string;
+        };
+        /** @description Schema-bound composite ordered index on a relational table. Keys use stable typed comparison semantics and independent direction, null placement, and string collation. Existing rows build asynchronously; indexed queries require complete owner coverage. The table schema is the single durable authority for these definitions. */
+        RelationalIndexConfig: {
+            keys: components["schemas"]["RelationalIndexKey"][];
+            /** @description Non-key columns stored for index-only projection; distinct from keys. */
+            include_columns?: string[];
+            /** @description Optional conjunction selecting index members. Queries must explicitly include all typed conjuncts. */
+            where?: components["schemas"]["RelationalIndexPredicate"][];
+        };
         /**
          * @description The type of the index.
          * @enum {string}
          */
-        IndexType: "full_text" | "embeddings" | "graph" | "algebraic";
+        IndexType: "full_text" | "embeddings" | "graph" | "algebraic" | "relational";
         /** @description Configuration for an index */
         IndexConfig: {
             /** @description Name of the index */
@@ -10512,7 +13557,7 @@ export interface components {
              *     ]
              */
             enrichments?: components["schemas"]["EnrichmentConfig"][];
-        } & (components["schemas"]["FullTextIndexConfig"] | components["schemas"]["EmbeddingsIndexConfig"] | components["schemas"]["GraphIndexConfig"] | components["schemas"]["AlgebraicIndexConfig"]);
+        } & (components["schemas"]["FullTextIndexConfig"] | components["schemas"]["EmbeddingsIndexConfig"] | components["schemas"]["GraphIndexConfig"] | components["schemas"]["AlgebraicIndexConfig"] | components["schemas"]["RelationalIndexConfig"]);
         /** @description Fields shared by every create-index variant. The index name is owned by the request path. */
         CreateIndexCommon: {
             /** @description Optional description of the index and its purpose */
@@ -10569,8 +13614,147 @@ export interface components {
              */
             type: "algebraic";
         };
+        /** @description Create a composite ordered index through the shared index resource. */
+        CreateRelationalIndexRequest: components["schemas"]["RelationalIndexConfig"] & {
+            /** @description Optional description of the index and its purpose. */
+            description?: string;
+            /**
+             * @description Index implementation version. Only zero is supported; the schema epoch is managed by the server.
+             * @default 0
+             */
+            version?: number;
+            /** @enum {string} */
+            type: "relational";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "relational";
+        };
         /** @description Type-safe configuration for a new index. The index name is owned by the request path. */
-        CreateIndexRequest: components["schemas"]["CreateFullTextIndexRequest"] | components["schemas"]["CreateEmbeddingsIndexRequest"] | components["schemas"]["CreateGraphIndexRequest"] | components["schemas"]["CreateAlgebraicIndexRequest"];
+        CreateIndexRequest: components["schemas"]["CreateFullTextIndexRequest"] | components["schemas"]["CreateEmbeddingsIndexRequest"] | components["schemas"]["CreateGraphIndexRequest"] | components["schemas"]["CreateAlgebraicIndexRequest"] | components["schemas"]["CreateRelationalIndexRequest"];
+        /**
+         * @description Storage representation for the table. Omission selects "document".
+         *     "relational" stores schema-bound typed rows and requires exactly one
+         *     closed document schema with declared properties. It implies
+         *     enforce_types; explicitly setting enforce_types to false is invalid.
+         *     Existing JSON document write and read APIs remain available. This
+         *     setting alone does not declare primary keys or unique constraints.
+         * @enum {string}
+         */
+        TableStorageMode: "document" | "relational";
+        RelationalColumnExpression: {
+            column: string;
+            expression: components["schemas"]["RelationalScalarExpression"];
+        };
+        /**
+         * @description A typed CHECK. Supply either expression or column and op (with optional
+         *     value and collation), never both forms. Expressions must return boolean
+         *     and use the shared bounded immutable scalar expression vocabulary.
+         *     New writes are checked from schema publication;
+         *     existing rows are validated separately. SQL UNKNOWN satisfies CHECK.
+         *     Comparison values must match the column type. Integer values may also
+         *     use exact decimal strings to avoid client-side floating-point rounding.
+         */
+        RelationalCheckConstraint: {
+            name: string;
+            column?: string;
+            op?: components["schemas"]["RelationalComparisonOp"];
+            /** @description Scalar comparison operand. Omission represents NULL. Null tests require a NULL operand. */
+            value?: unknown;
+            /** @description String comparison collation; uses the same rules as ordered indexes. */
+            collation?: string;
+            expression?: components["schemas"]["RelationalScalarExpression"];
+        };
+        /**
+         * @description Enforcement timing for atomic mutations and transaction sessions. Deferred
+         *     requires deferrable=true and validates the final transaction state.
+         *     NO ACTION permits a valid final-state parent replacement; RESTRICT
+         *     still rejects referenced parent removal. Existing multi-request
+         *     transaction sessions retain deferred checks until commit; immediate
+         *     checks apply to each staged statement. SET CONSTRAINTS is not provided.
+         * @enum {string}
+         */
+        ForeignKeyTiming: "immediate" | "deferred";
+        /**
+         * @description A named, ordered composite unique key. Validation status is maintained
+         *     by the server. TTL expiry uses the distributed integrity coordinator.
+         *     Referenced unique keys are nondeferrable.
+         */
+        RelationalUniqueConstraint: {
+            name: string;
+            /** @description SQL primary-key identity. At most one per relational table; all key columns must be required and nonnullable. */
+            primary?: boolean;
+            columns?: string[];
+            /** @description Typed native unique keys. Specify either columns or keys. */
+            keys?: components["schemas"]["RelationalIndexKey"][];
+            /** @description Conjunction restricting uniqueness to matching rows. */
+            where?: components["schemas"]["RelationalIndexPredicate"][];
+            /** @description When true, NULL components compare equal for uniqueness. */
+            nulls_not_distinct?: boolean;
+            /** @description Permit uniqueness checks at transaction commit. Never eligible as an ON CONFLICT arbiter or a referenced foreign key target. */
+            deferrable?: boolean;
+            timing?: components["schemas"]["ForeignKeyTiming"];
+        };
+        /**
+         * @description Action on referencing rows when a referenced row is changed or removed.
+         * @enum {string}
+         */
+        ForeignKeyAction: "restrict" | "set_null" | "cascade" | "no_action";
+        /**
+         * @description Null matching semantics of a composite foreign key. Partial requires
+         *     at least one parent matching every non-null child component; all-null
+         *     children are exempt. Compatible parent witnesses are guarded through
+         *     commit, including concurrent deletion of alternative witnesses.
+         * @enum {string}
+         */
+        ForeignKeyMatch: "simple" | "full" | "partial";
+        /**
+         * @description Composite foreign key. Child and parent columns correspond by position
+         *     and must have the same physical comparison types. The parent columns
+         *     must identify a unique key. Existing-row validation is independent of
+         *     new-write enforcement and is never client-writable.
+         *     Enforcement and referential actions share the bounded distributed
+         *     transaction path, including TTL expiry. Partial matching uses ordered
+         *     support indexes on the parent; activation waits until these are ready.
+         *     SET NULL requires every child column to accept explicit NULL.
+         */
+        RelationalForeignKeyConstraint: {
+            name: string;
+            child_columns: string[];
+            /**
+             * @description Literal parent table name in the child table's database and namespace.
+             *     Resolved to an immutable table identity when the constraint is declared;
+             *     renaming a parent preserves the reference. Public schemas show its current name.
+             */
+            parent_table: string;
+            parent_columns: string[];
+            on_delete?: components["schemas"]["ForeignKeyAction"];
+            on_update?: components["schemas"]["ForeignKeyAction"];
+            timing?: components["schemas"]["ForeignKeyTiming"];
+            match?: components["schemas"]["ForeignKeyMatch"];
+            deferrable?: boolean;
+        };
+        /**
+         * @description Declarative table-owned ordered index. Keys are compared lexicographically
+         *     in the declared order, with independent direction, null placement, and
+         *     string collation. Creation builds existing rows asynchronously; queries
+         *     must wait for range-local coverage. Unique constraints and expression
+         *     keys are not implied by this object. Optional WHERE conjuncts select
+         *     only matching rows. INCLUDE columns
+         *     store typed values alongside keys for index-only projected reads.
+         */
+        RelationalIndexDefinition: {
+            /** @description Optional human-readable description, also exposed by the shared indexes API. */
+            description?: string;
+            name: string;
+            keys: components["schemas"]["RelationalIndexKey"][];
+            /** @description Non-key columns stored in the index; must be distinct from key columns. */
+            include_columns?: string[];
+            /** @description Conjunction of typed predicates. Indexed queries must explicitly contain every conjunct with equivalent typed comparison semantics. */
+            where?: components["schemas"]["RelationalIndexPredicate"][];
+        };
         /**
          * @description Field types accepted by detailed `x-antfly-field` and dynamic-template
          *     mappings. JSON-schema-oriented aliases are normalized to Antfly's
@@ -10579,7 +13763,7 @@ export interface components {
          *     geoshape.
          * @enum {string}
          */
-        FieldMappingType: "text" | "html" | "keyword" | "numeric" | "number" | "integer" | "boolean" | "bool" | "datetime" | "date" | "timestamp" | "geopoint" | "geo_point" | "geoshape" | "geo_shape" | "embedding" | "blob" | "link" | "search_as_you_type";
+        FieldMappingType: "text" | "html" | "keyword" | "numeric" | "number" | "integer" | "boolean" | "bool" | "datetime" | "date" | "timestamp" | "geopoint" | "geo_point" | "geoshape" | "geo_shape" | "embedding" | "blob" | "link" | "search_as_you_type" | "substring";
         /** @description Mapping for one named multifield emitted from its parent document property. Multifields are intentionally one level deep and read the parent property's JSON value rather than a nested JSON property. */
         DocumentSubfieldMapping: {
             type?: components["schemas"]["FieldMappingType"];
@@ -10753,6 +13937,52 @@ export interface components {
              * @description Backend-managed schema generation used for migrations. Omit it from create and update requests.
              */
             readonly version?: number;
+            storage_mode?: components["schemas"]["TableStorageMode"];
+            /**
+             * @description Immutable typed expressions applied only to absent columns on new
+             *     writes, never explicit null. Defaults cannot reference columns.
+             *     A column cannot have both a default and a generated expression.
+             *     Omission or [] declares none. Relational tables only.
+             */
+            column_defaults?: components["schemas"]["RelationalColumnExpression"][];
+            /**
+             * @description Stored immutable generated columns, evaluated in dependency order
+             *     on writes before validation and indexing. Cycles are rejected.
+             *     Generated columns are output-only; submitted values are replaced
+             *     by the computed value. Omission or [] declares none. Defaults
+             *     and generated declarations together are limited to 256 columns,
+             *     4096 expression nodes, and 4 MiB of literal data. Evaluation has
+             *     a shared 4 MiB allocation budget across all column expressions.
+             *     Restore verifies stored results instead of silently recomputing
+             *     them. Changing, adding, or removing generated semantics through
+             *     an existing table's schema update requires explicit rewrite=true
+             *     on the PUT or PATCH schema route. This returns a durable restore
+             *     job and replaces the complete authorized dependency cohort only
+             *     after distributed transformation and validation. Ordinary schema
+             *     updates reject these changes, even when a table appears empty.
+             *     Declaration reordering and default-only changes remain allowed.
+             *     Relational tables only.
+             */
+            generated_columns?: components["schemas"]["RelationalColumnExpression"][];
+            /**
+             * @description Named scalar CHECK constraints for a relational schema. This is
+             *     part of the complete schema: omission or [] declares no checks.
+             *     New writes enforce every check. Existing-row validation status is
+             *     maintained separately and is never accepted from the client.
+             */
+            checks?: components["schemas"]["RelationalCheckConstraint"][];
+            /** @description Complete set of composite unique declarations. Omission or [] declares none. */
+            unique_constraints?: components["schemas"]["RelationalUniqueConstraint"][];
+            /** @description Complete set of outgoing composite foreign keys. Omission or [] declares none. */
+            foreign_keys?: components["schemas"]["RelationalForeignKeyConstraint"][];
+            /**
+             * @description Desired ordered indexes for a relational table. Names must be unique.
+             *     An explicit array replaces the declarations; an empty array drops
+             *     them. Omission preserves existing declarations during schema updates.
+             *     Index definitions commit atomically with the schema; build progress
+             *     and readiness are local to each owning shard, not client-writable.
+             */
+            relational_indexes?: components["schemas"]["RelationalIndexDefinition"][];
             /** @description Default type to use from the document_types. */
             default_type?: string;
             /**
@@ -10798,10 +14028,13 @@ export interface components {
             vector_space?: string;
             chunk_size?: number;
             chunk_overlap?: number;
+            chunker?: components["schemas"]["ChunkerConfig"];
+            /** @deprecated */
             chunker_json?: string;
             /** @default false */
             full_text_index?: boolean;
             content_type?: string;
+            neighbor_context?: components["schemas"]["EnrichmentNeighborContextConfig"];
             execution?: components["schemas"]["ExecutionPolicy"];
         };
         /** @description Fields returned for every newly created index. Provider credentials are write-only and are never returned. */
@@ -10823,6 +14056,7 @@ export interface components {
             sources?: components["schemas"]["FullTextArtifactIndexSource"][];
             mem_only?: boolean;
             field?: string;
+            analysis_config?: components["schemas"]["TextAnalysisConfig"];
         };
         /** @description Normalized effective full-text index configuration returned after creation. */
         CreatedFullTextIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["CreatedFullTextIndexConfig"] & {
@@ -10973,8 +14207,19 @@ export interface components {
              */
             type: "algebraic";
         };
+        /** @description Effective schema-bound composite index configuration. */
+        CreatedRelationalIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["RelationalIndexConfig"] & {
+            /** @enum {string} */
+            type: "relational";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "relational";
+        };
         /** @description Discriminated normalized configuration returned after an index is created. */
-        CreatedIndex: components["schemas"]["CreatedFullTextIndex"] | components["schemas"]["CreatedEmbeddingsIndex"] | components["schemas"]["CreatedGraphIndex"] | components["schemas"]["CreatedAlgebraicIndex"];
+        CreatedIndex: components["schemas"]["CreatedFullTextIndex"] | components["schemas"]["CreatedEmbeddingsIndex"] | components["schemas"]["CreatedGraphIndex"] | components["schemas"]["CreatedAlgebraicIndex"] | components["schemas"]["CreatedRelationalIndex"];
         /**
          * @description Lifecycle state for the desired index incarnation. A failed desired repair may coexist with queryable=true when a separately proven serving incarnation remains available; clients must use the explicit milestone booleans.
          * @enum {string}
@@ -11371,7 +14616,10 @@ export interface components {
             error_count: number;
             /** Format: uint64 */
             retryable_error_count: number;
-            /** Format: uint64 */
+            /**
+             * Format: uint64
+             * @description Durable count of enrichment requests parked with a non-retryable (terminal) disposition, plus fatal worker failures. A terminally failed request never returns to pending; per-document terminal state is reported by the owning index's coverage counters (terminal_failed), and per-document diagnostics by the artifact repair issue listing.
+             */
             fatal_error_count: number;
             /**
              * Format: uint32
@@ -12082,8 +15330,49 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /** @enum {string} */
+        RelationalIndexBuildState: "building" | "ready" | "failed";
+        /** @enum {string} */
+        RelationalIndexBuildFailure: "incompatible_schema" | "invalid_row" | "key_too_large";
+        RelationalIndexRangeStatus: {
+            group_id: string;
+            /** @description Exact uint64 generation encoded as decimal, never a floating-point number. */
+            generation: string;
+            /** Format: uint32 */
+            slot: number;
+            /** @description Namespace and owned-range fingerprint. */
+            owner: string;
+            /** @description Executable tuple comparison fingerprint. */
+            comparison: string;
+            /** @description Exact durable progress observation for generation-fenced maintenance. */
+            progress_digest: string;
+            /** @description Replicated desired maintenance ticket, separate from replica-local progress. */
+            maintenance_epoch: string;
+            /** @description Most recently accepted maintenance command proof for exact retry acknowledgement. */
+            last_maintenance_request?: string;
+            state: components["schemas"]["RelationalIndexBuildState"];
+            rows_scanned: string;
+            failure?: components["schemas"]["RelationalIndexBuildFailure"];
+        };
+        RelationalIndexStatus: {
+            table_id: string;
+            /** Format: uint32 */
+            schema_version: number;
+            index_name: string;
+            state: components["schemas"]["RelationalIndexBuildState"];
+            ranges: components["schemas"]["RelationalIndexRangeStatus"][];
+        };
+        RelationalIndexStats: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            index_type: "relational";
+            milestones: components["schemas"]["IndexMilestones"];
+            relational_index: components["schemas"]["RelationalIndexStatus"];
+        };
         /** @description Statistics for an index */
-        IndexStats: components["schemas"]["FullTextIndexStats"] | components["schemas"]["EmbeddingsIndexStats"] | components["schemas"]["GraphIndexStats"] | components["schemas"]["AlgebraicIndexStats"];
+        IndexStats: components["schemas"]["FullTextIndexStats"] | components["schemas"]["EmbeddingsIndexStats"] | components["schemas"]["GraphIndexStats"] | components["schemas"]["AlgebraicIndexStats"] | components["schemas"]["RelationalIndexStats"];
         GraphMetricEdgeFilterStatus: {
             /** @enum {string} */
             mode: "all" | "types";
@@ -12233,6 +15522,11 @@ export interface components {
             recent_events?: components["schemas"]["GraphMetricEvent"][];
         };
         /**
+         * @description Validation state of an existing-row constraint.
+         * @enum {string}
+         */
+        RelationalConstraintValidationState: "enforced" | "unvalidated" | "validating" | "invalid";
+        /**
          * @description Available tool names for retrieval agents.
          *     - add_filter: Add search filters (field constraints)
          *     - ask_clarification: Ask user for clarification
@@ -12260,44 +15554,6 @@ export interface components {
          */
         WebSearchProvider: "exa" | "serper" | "tavily" | "brave" | "you" | "linkup" | "vertex";
         /**
-         * @description Configuration for Exa neural/semantic web search.
-         *
-         *     Exa is optimized for semantic web search, highlights, and retrieved page
-         *     contents for RAG and agent workflows.
-         *
-         *     **Setup:**
-         *     1. Sign up at https://exa.ai
-         *     2. Get API key from dashboard
-         *
-         *     **Docs:** https://docs.exa.ai
-         */
-        ExaSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
-            /** @description Exa API key (or set EXA_API_KEY env var) */
-            api_key?: string;
-            /**
-             * @description Search mode to request from Exa
-             * @default auto
-             * @enum {string}
-             */
-            search_type?: "auto" | "neural" | "keyword";
-            /** @description Provider-specific result count override */
-            num_results?: number;
-            /** @description ISO date/time lower bound for published date filtering */
-            start_published_date?: string;
-            /** @description ISO date/time upper bound for published date filtering */
-            end_published_date?: string;
-            /** @description Only include results from these domains */
-            include_domains?: string[];
-            /** @description Exclude results from these domains */
-            exclude_domains?: string[];
-        } & {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            provider: "exa";
-        };
-        /**
          * @description Configuration for Serper.dev Google Search API.
          *
          *     Serper provides a simpler alternative to Google Custom Search with
@@ -12310,11 +15566,12 @@ export interface components {
          *     **Docs:** https://serper.dev/docs
          */
         SerperSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+            /** @enum {string} */
+            provider?: "serper";
             /** @description Serper API key (or set SERPER_API_KEY env var) */
             api_key?: string;
             /**
              * @description Type of search to perform
-             * @default search
              * @enum {string}
              */
             search_type?: "search" | "news" | "images" | "places" | "shopping";
@@ -12323,6 +15580,12 @@ export interface components {
              * @enum {string}
              */
             time_period?: "d" | "w" | "m" | "y";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "serper";
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -12343,30 +15606,31 @@ export interface components {
          *     **Docs:** https://docs.tavily.com
          */
         TavilySearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+            /** @enum {string} */
+            provider?: "tavily";
             /** @description Tavily API key (or set TAVILY_API_KEY env var) */
             api_key?: string;
             /**
              * @description Search depth:
              *     - basic: Fast search with standard results
              *     - advanced: Deeper search with more comprehensive results
-             * @default basic
              * @enum {string}
              */
             search_depth?: "basic" | "advanced";
-            /**
-             * @description Include AI-generated answer summary
-             * @default true
-             */
+            /** @description Include AI-generated answer summary */
             include_answer?: boolean;
-            /**
-             * @description Include raw HTML content of pages
-             * @default false
-             */
+            /** @description Include raw HTML content of pages */
             include_raw_content?: boolean;
             /** @description Only include results from these domains */
             include_domains?: string[];
             /** @description Exclude results from these domains */
             exclude_domains?: string[];
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "tavily";
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -12386,6 +15650,8 @@ export interface components {
          *     **Docs:** https://api.search.brave.com/app/documentation
          */
         BraveSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+            /** @enum {string} */
+            provider?: "brave";
             /** @description Brave Search API key (or set BRAVE_API_KEY env var) */
             api_key?: string;
             /**
@@ -12393,16 +15659,16 @@ export interface components {
              * @enum {string}
              */
             freshness?: "pd" | "pw" | "pm" | "py";
-            /**
-             * @description Include text decorations (bold, italic markers)
-             * @default false
-             */
+            /** @description Include text decorations (bold, italic markers) */
             text_decorations?: boolean;
-            /**
-             * @description Enable spellcheck suggestions
-             * @default true
-             */
+            /** @description Enable spellcheck suggestions */
             spellcheck?: boolean;
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "brave";
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -12423,6 +15689,8 @@ export interface components {
          *     **Docs:** https://api.you.com
          */
         YouSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+            /** @enum {string} */
+            provider?: "you";
             /** @description You.com API key (or set YOU_API_KEY env var) */
             api_key?: string;
             /**
@@ -12430,6 +15698,12 @@ export interface components {
              * @description You.com API endpoint URL
              */
             endpoint?: string;
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "you";
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -12450,20 +15724,26 @@ export interface components {
          *     **Docs:** https://docs.linkup.so
          */
         LinkupSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+            /** @enum {string} */
+            provider?: "linkup";
             /** @description Linkup API key (or set LINKUP_API_KEY env var) */
             api_key?: string;
             /**
              * @description Search depth to request from Linkup
-             * @default standard
              * @enum {string}
              */
             depth?: "standard" | "deep";
             /**
              * @description Linkup response shape to request
-             * @default searchResults
              * @enum {string}
              */
             output_type?: "searchResults" | "sourcedAnswer";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "linkup";
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -12486,28 +15766,29 @@ export interface components {
          *     **Docs:** https://cloud.google.com/generative-ai-app-builder/docs
          */
         VertexSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+            /** @enum {string} */
+            provider?: "vertex";
             /**
              * @description Google Cloud search service flavor
-             * @default agent_search
              * @enum {string}
              */
             service?: "agent_search";
             /** @description Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT. */
             project_id?: string;
-            /**
-             * @description Google Cloud location. Falls back to GOOGLE_CLOUD_LOCATION.
-             * @default global
-             */
+            /** @description Google Cloud location. Falls back to GOOGLE_CLOUD_LOCATION. */
             location?: string;
             /** @description Agent Search data store ID. */
             data_store?: string;
-            /**
-             * @description Agent Search serving config ID.
-             * @default default_config
-             */
+            /** @description Agent Search serving config ID. */
             serving_config?: string;
             /** @description Service account JSON path. Falls back to GOOGLE_APPLICATION_CREDENTIALS. */
             credentials_path?: string;
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "vertex";
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -12520,6 +15801,12 @@ export interface components {
          *
          *     Each provider has specific configuration requirements. Use the appropriate
          *     provider-specific config or set common options at the top level.
+         *
+         *     Omitted options inherit the named connection when one is supplied.
+         *     Inline configurations preserve omission; clients must not materialize
+         *     defaults as overrides. Without a connection, the server applies provider
+         *     defaults (Exa: 5 results, 10000 ms timeout, safe search enabled, content
+         *     and highlights disabled, and auto search).
          *
          *     **Environment Variables (fallbacks):**
          *     - EXA_API_KEY
@@ -12546,20 +15833,11 @@ export interface components {
             serving_config?: string;
             /** @description Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC. */
             credentials_path?: string;
-            /**
-             * @description Maximum number of search results to return
-             * @default 5
-             */
+            /** @description Maximum number of search results to return */
             max_results?: number;
-            /**
-             * @description Request timeout in milliseconds
-             * @default 10000
-             */
+            /** @description Request timeout in milliseconds */
             timeout_ms?: number;
-            /**
-             * @description Enable safe search filtering
-             * @default true
-             */
+            /** @description Enable safe search filtering */
             safe_search?: boolean;
             /**
              * @description Preferred language for results (e.g., 'en', 'es', 'fr')
@@ -12571,17 +15849,58 @@ export interface components {
              * @example us
              */
             region?: string;
-            /**
-             * @description Ask the provider to return extracted page content when supported
-             * @default false
-             */
+            /** @description Ask the provider to return extracted page content when supported */
             include_content?: boolean;
-            /**
-             * @description Ask the provider to return highlighted passages when supported
-             * @default false
-             */
+            /** @description Ask the provider to return highlighted passages when supported */
             include_highlights?: boolean;
         };
+        /**
+         * @description Configuration for Exa neural/semantic web search.
+         *
+         *     Exa is optimized for semantic web search, highlights, and retrieved page
+         *     contents for RAG and agent workflows.
+         *
+         *     **Setup:**
+         *     1. Sign up at https://exa.ai
+         *     2. Get API key from dashboard
+         *
+         *     **Docs:** https://docs.exa.ai
+         */
+        ExaSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+            /** @enum {string} */
+            provider?: "exa";
+            /** @description Exa API key (or set EXA_API_KEY env var) */
+            api_key?: string;
+            /**
+             * @description Search mode to request from Exa
+             * @enum {string}
+             */
+            search_type?: "auto" | "neural" | "keyword";
+            /** @description Provider-specific result count override */
+            num_results?: number;
+            /** @description ISO date/time lower bound for published date filtering */
+            start_published_date?: string;
+            /** @description ISO date/time upper bound for published date filtering */
+            end_published_date?: string;
+            /** @description Only include results from these domains */
+            include_domains?: string[];
+            /** @description Exclude results from these domains */
+            exclude_domains?: string[];
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "exa";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "exa";
+        };
+        /** @description Provider-specific inline web search configuration. */
+        WebSearchProviderConfig: components["schemas"]["ExaSearchConfig"] | components["schemas"]["SerperSearchConfig"] | components["schemas"]["TavilySearchConfig"] | components["schemas"]["BraveSearchConfig"] | components["schemas"]["YouSearchConfig"] | components["schemas"]["LinkupSearchConfig"] | components["schemas"]["VertexSearchConfig"];
         Credentials: {
             /**
              * @description S3-compatible endpoint (e.g., 's3.amazonaws.com' or 'localhost:9000' for MinIO)
@@ -12684,7 +16003,7 @@ export interface components {
              *     requests. See specs/openapi/antfly/websearch.yaml for provider-specific
              *     options.
              */
-            web_search_config?: components["schemas"]["WebSearchConfig"];
+            web_search_config?: components["schemas"]["WebSearchProviderConfig"];
             /**
              * @description Name of a configured connections.<id> resource with kind web_search.
              *     Request-level tool options may reduce scope, but cannot expand the
@@ -13079,6 +16398,14 @@ export interface components {
             field?: string;
             boost?: components["schemas"]["Boost"];
         };
+        /**
+         * @description Analyze the text with the field's analyzer and match any of the
+         *     resulting terms. On a `substring` companion field (`fieldName._substring`)
+         *     the text is lowercased and matched as a contained substring instead:
+         *     `{"match": "g3we", "field": "sku._substring"}` finds `RAG3-WEAVER`.
+         *     Substring lookups require at least two bytes and reject a token or
+         *     adjacent token pair longer than 32 bytes.
+         */
         MatchQuery: {
             match: string;
             field?: string;
@@ -13097,6 +16424,13 @@ export interface components {
         };
         /** @description The fuzziness of the query. Can be an integer or "auto". */
         Fuzziness: number | "auto";
+        /**
+         * @description Match a phrase using the field's analyzer. On a `substring` companion,
+         *     one or two words match contained text across token separators. Three
+         *     or more words are rejected because the suffix index cannot verify
+         *     their word boundaries; lookups over 32 bytes are also rejected.
+         *     Nonzero or automatic fuzziness is rejected on substring fields; use a standalone fuzzy query instead.
+         */
         MatchPhraseQuery: {
             match_phrase: string;
             field?: string;
@@ -13124,6 +16458,11 @@ export interface components {
             field?: string;
             boost?: components["schemas"]["Boost"];
         };
+        /**
+         * @description Match terms that start with the given bytes. On a `substring`
+         *     companion field the prefix is lowercased and matched as a contained
+         *     substring, exactly like `match` on that field.
+         */
         PrefixQuery: {
             prefix: string;
             field?: string;
@@ -13399,7 +16738,7 @@ export interface components {
             provider: components["schemas"]["RerankerProvider"];
             /** @description Field name to extract from documents for reranking. */
             field?: string;
-            /** @description Handlebars template to render document text for reranking. */
+            /** @description Handlebars template that renders each candidate for reranking. The `media` and `remoteMedia` helpers add images, which are sent to the reranker alongside the rendered text; only an Antfly reranker whose model accepts images can score them, and any other reranker rejects the query with `400`. */
             template?: string;
             /** @description Optional provider model name. When omitted, the selected provider's documented default is used. */
             model?: string;
@@ -13431,6 +16770,13 @@ export interface components {
              * @enum {string}
              */
             metric_freshness?: "published" | "fresh";
+            /** @description Node keys receiving all teleport mass for query-seeded personalized PageRank (HippoRAG-style retrieval). Only valid for pagerank metrics and requires metric_freshness=fresh: personalized scores are computed at query time from the current edge snapshot, while published generations are global-only, so seeded reads against published freshness are rejected. Seed keys absent from the graph are skipped; if none resolve, ranking degenerates to global PageRank. */
+            seed_nodes?: string[];
+            /**
+             * Format: double
+             * @description Damping override for query-seeded personalized PageRank (typical HippoRAG-style retrieval uses 0.9). Only valid together with seed_nodes; omitted reads keep the metric's configured damping.
+             */
+            damping?: number;
         };
         /** @description Blends a published graph metric into hit scores. Multi-shard tables require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required. */
         GraphMetricRerank: {
@@ -13467,6 +16813,18 @@ export interface components {
              * @enum {string}
              */
             metric_freshness?: "published" | "fresh";
+            /** @description Node keys receiving all teleport mass for a query-seeded personalized PageRank blend (HippoRAG-style retrieval). Only valid for pagerank metrics and requires metric_freshness=fresh: the blended feature scores are computed at query time from the current edge snapshot, while published generations are global-only, so seeded blends against published freshness are rejected. Seed keys absent from the graph are skipped; if none resolve, the blend degenerates to global PageRank. */
+            seed_nodes?: string[];
+            /**
+             * Format: double
+             * @description Damping override for the query-seeded personalized PageRank blend. Only valid together with seed_nodes; omitted blends keep the metric's configured damping.
+             */
+            damping?: number;
+            /**
+             * @description Seed the personalized PageRank blend from the query's literal graph-search start keys; only valid for pagerank metrics with metric_freshness=fresh. Honored by retrieval-agent queries: caller-supplied seed_nodes always take precedence and are never overwritten, and queries without literal graph-search start keys keep their unseeded (global) blend.
+             * @default false
+             */
+            auto_seed?: boolean;
         };
         /** @description User-visible graph alias or named result under Antfly graph identifier policy v1 (Unicode 15.0.0). Identifiers are exact UTF-8 strings and are not normalized. Ordinary internal ASCII spaces are allowed. The value must not equal `*`, begin with `$`, have leading or trailing spaces, contain non-ASCII Unicode White_Space, or contain Unicode Cc control or Cf format code points. UTF-8 encoding is limited to 512 bytes. */
         GraphIdentifier: string;
@@ -14352,6 +17710,26 @@ export interface components {
             /** @description IDs of retrieved documents (for retrieval metrics) */
             retrieved_ids?: string[];
         };
+        IndexMaintenanceOwnerProof: {
+            group_id: string;
+            generation: string;
+            /** Format: uint32 */
+            slot: number;
+            owner: string;
+            comparison: string;
+            progress_digest: string;
+            maintenance_epoch: string;
+        };
+        /** @description Exact observations from index status. Each selected owner is admitted atomically through the replicated transaction journal; the selection is not one global transaction. Cancellation, conflicts, or a lost acknowledgement may leave some owners admitted. Resubmit the identical request to resume safely; do not replace its observations with newer progress unless starting a new maintenance attempt. */
+        IndexMaintenanceRequest: {
+            table_id: string;
+            /** Format: uint32 */
+            schema_version: number;
+            owners: components["schemas"]["IndexMaintenanceOwnerProof"][];
+        };
+        IndexMaintenanceResponse: {
+            acknowledged_groups: string[];
+        };
         InferenceError: {
             /** @description Stable machine-readable error code */
             error: string;
@@ -14366,6 +17744,10 @@ export interface components {
             retryable?: boolean;
             /** @description Minimum retry delay in milliseconds */
             retry_after_ms?: number;
+            /** @description Input whose atomic extraction validation or decoding failed, when known */
+            input_index?: number;
+            /** @description Extraction failure stage, when known */
+            stage?: string;
         };
         /** @description Actionable retry contract for temporary inference-capacity failures. */
         InferenceTransientCapacityError: {
@@ -14612,33 +17994,32 @@ export interface components {
              */
             query: string;
             /**
-             * @description Pre-rendered document texts to rerank. The client is responsible for extracting
-             *     and rendering document fields/templates before calling this endpoint.
+             * @description Documents to rerank. Each entry is a string or an array of text and image
+             *     content parts. Exactly one of `documents` and `prompts` is required.
              * @example [
              *       "Introduction to machine learning...",
-             *       "Deep learning fundamentals..."
+             *       [
+             *         {
+             *           "type": "text",
+             *           "text": "Quarterly invoice"
+             *         },
+             *         {
+             *           "type": "image_url",
+             *           "image_url": {
+             *             "url": "data:image/png;base64,iVBORw0KGgo..."
+             *           }
+             *         }
+             *       ]
              *     ]
              */
-            prompts: string[];
-        };
-        InferenceRerankMultimodalDocument: {
-            /** @description Optional caller-provided document identifier */
-            id?: string;
-            content: components["schemas"]["ChatMessageContent"];
-        };
-        InferenceRerankMultimodalRequest: {
+            documents?: components["schemas"]["ChatMessageContent"][];
             /**
-             * @description Name of multimodal reranking model from models_dir/rerankers/
-             * @example vidore/colqwen2-v1.0
+             * @deprecated
+             * @description Deprecated text-only form of `documents`. Accepted so older clients keep
+             *     working; send `documents` instead. Exactly one of `documents` and `prompts`
+             *     is required.
              */
-            model: string;
-            /**
-             * @description Text query for relevance scoring
-             * @example invoice total due date
-             */
-            query: string;
-            /** @description Documents expressed as text and image content parts */
-            documents: components["schemas"]["InferenceRerankMultimodalDocument"][];
+            prompts?: string[];
         };
         InferenceRerankResponse: {
             /**
@@ -14646,7 +18027,7 @@ export interface components {
              * @enum {string}
              */
             object: "list";
-            /** @description Rerank score objects, one per input prompt. */
+            /** @description Rerank score objects, one per input document. */
             data: components["schemas"]["InferenceRerankObject"][];
             /** @description Name of model used for reranking */
             model: string;
@@ -14795,7 +18176,7 @@ export interface components {
             model: string;
             /**
              * Format: byte
-             * @description Base64-encoded audio data (WAV, MP3, FLAC, etc.)
+             * @description Base64-encoded audio data (WAV, MP3, AAC/M4A, MP4/MOV audio, Ogg/Opus, WebM/Matroska, FLAC, etc.). Clips longer than 30 s are transcribed in windows cut at pauses; silent clips return an empty transcript.
              */
             audio: string;
             /**
@@ -14803,6 +18184,8 @@ export interface components {
              * @example en
              */
             language?: string;
+            /** @description Label each segment with a speaker. Runs a local speaker-embedding model (pull `csukuangfj/speaker-embedding-models:3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx`) and clusters phrases by voice; labels are `SPEAKER_00`, `SPEAKER_01`, ... in order of first appearance. */
+            diarization?: boolean;
         };
         InferenceTranscribeResponse: {
             /**
@@ -14831,6 +18214,272 @@ export interface components {
              * @example en
              */
             language?: string;
+            /** @description Decoded clip duration in milliseconds. */
+            duration_ms?: number;
+            /** @description Timestamped phrases in clip order, so a transcript can be indexed and linked back to a moment in the recording. Clips longer than 30 s are transcribed in windows; segment offsets are relative to the whole clip. */
+            segments?: components["schemas"]["InferenceDictationSegment"][];
+            /** @description Speaker labels found by diarization, in order of first appearance. Present only when `diarization` was requested. */
+            speakers?: string[];
+        };
+        /**
+         * @description How the cleanup pass rewrites the transcript. `clean` removes fillers
+         *     and fixes punctuation while keeping the speaker's wording; `formal`
+         *     and `casual` also adjust register; `verbatim` skips the generator and
+         *     returns the raw transcript.
+         * @enum {string}
+         */
+        InferenceDictationStyle: "clean" | "formal" | "casual" | "verbatim";
+        InferenceDictateRequest: {
+            /**
+             * @description Transcriber model from models_dir/transcribers/.
+             * @example openai/whisper-tiny
+             */
+            model: string;
+            /**
+             * Format: byte
+             * @description Base64-encoded audio clip (WAV, Opus, MP3, FLAC, etc.). Clips longer than 30 s are transcribed in windows.
+             */
+            audio: string;
+            /**
+             * @description Force the transcript language (ISO 639-1). Omit for automatic detection.
+             * @example en
+             */
+            language?: string;
+            /**
+             * @description Generator model from models_dir/generators/ that rewrites the transcript. Omit to return the raw transcript.
+             * @example ggml-org/gemma-4-E4B-it-GGUF
+             */
+            cleanup_model?: string;
+            style?: components["schemas"]["InferenceDictationStyle"];
+            /** @description Preferred spellings for names and terms the recognizer tends to miss. */
+            dictionary?: string[];
+            /** @description Where the text will be inserted, for example "email to a customer". Steers tone and formatting. */
+            context?: string;
+            /** @description Extra cleanup instructions appended to the built-in rules. */
+            instructions?: string;
+            /** @description Text the recognizer treats as preceding context, so it prefers these spellings and this style. Defaults to the dictionary entries joined by commas. */
+            transcript_prompt?: string;
+            vad?: components["schemas"]["InferenceVadConfig"];
+            audio_context?: components["schemas"]["InferenceAudioContext"];
+            /**
+             * @description Stream the response as Server-Sent Events.
+             * @default false
+             */
+            stream?: boolean;
+            /** @description Output budget for the cleanup pass. Defaults to about twice the transcript length. */
+            max_tokens?: number;
+        };
+        InferenceDictationWord: {
+            word: string;
+            start_ms: number;
+            end_ms: number;
+        };
+        /** @description One phrase bracketed by Whisper timestamp tokens (about 20 ms resolution). */
+        InferenceDictationSegment: {
+            text: string;
+            /** @description Phrase start offset in the clip, in milliseconds. */
+            start_ms: number;
+            /** @description Phrase end offset in the clip, in milliseconds. */
+            end_ms: number;
+            /** @description Word spans estimated inside the phrase by distributing its duration over word lengths. */
+            words: components["schemas"]["InferenceDictationWord"][];
+            /** @description Speaker label from diarization (`SPEAKER_00`, ...). Absent without diarization or when the phrase had no usable audio. */
+            speaker?: string;
+        };
+        InferenceDictationTranscript: {
+            /** @description Raw transcript before cleanup. */
+            text: string;
+            /** @description Detected or forced language. */
+            language?: string;
+            /** @description Decoded clip duration in milliseconds. */
+            duration_ms: number;
+            /** @description Timestamped phrases in clip order. */
+            segments: components["schemas"]["InferenceDictationSegment"][];
+        };
+        InferenceDictateResponse: {
+            /** @enum {string} */
+            object: "dictation";
+            id: string;
+            /** @description Unix timestamp (seconds). */
+            created: number;
+            /** @description Transcriber model used. */
+            model: string;
+            /** @description Generator model used for cleanup, when one ran. */
+            cleanup_model?: string;
+            transcript: components["schemas"]["InferenceDictationTranscript"];
+            /** @description Cleaned text, or the raw transcript when no cleanup ran. */
+            text: string;
+            usage: components["schemas"]["InferenceGenerateUsage"];
+        };
+        /**
+         * @description One Server-Sent Event of a streaming dictation. `dictation.transcript`
+         *     carries `transcript`; `dictation.delta` carries `delta`;
+         *     `dictation.completed` carries `text` and `usage`; `error` carries
+         *     `error` and `message`. The stream ends with the literal `[DONE]`.
+         */
+        InferenceDictationEvent: {
+            /** @enum {string} */
+            type: "dictation.transcript" | "dictation.delta" | "dictation.completed" | "error";
+            id: string;
+            model?: string;
+            cleanup_model?: string;
+            transcript?: components["schemas"]["InferenceDictationTranscript"];
+            delta?: string;
+            text?: string;
+            usage?: components["schemas"]["InferenceGenerateUsage"];
+            error?: string;
+            message?: string;
+        };
+        /**
+         * @description How much of Whisper's 30 s window the encoder processes. `full` pads
+         *     every clip to 30 s, which is what the model was trained on and gives
+         *     the most accurate transcripts. `dynamic` trims the encoder to the
+         *     audio actually present (plus one second), which cuts encoder time
+         *     roughly in proportion for short clips at a small accuracy cost on
+         *     some models. Dictation defaults to `full`; streaming sessions default
+         *     to `dynamic` because partials re-decode short open segments many times.
+         * @enum {string}
+         */
+        InferenceAudioContext: "full" | "dynamic";
+        /**
+         * @description Voice activity detection. Without `model`, frames are classified by
+         *     RMS energy against `threshold`. With `model` naming a pulled Silero
+         *     VAD export (`antfly inference pull onnx-community/silero-vad --tasks vad`),
+         *     512-sample frames at 16 kHz are scored by the neural model, which
+         *     separates speech from tones, music, and keyboard noise that the
+         *     energy rule accepts.
+         */
+        InferenceVadConfig: {
+            /**
+             * @description Silero VAD model directory name from models_dir, for example `onnx-community/silero-vad`.
+             * @example onnx-community/silero-vad
+             */
+            model?: string;
+            /**
+             * Format: float
+             * @description Speech probability at or above which a Silero frame counts as speech. Default 0.5.
+             */
+            silero_threshold?: number;
+            /**
+             * Format: float
+             * @description RMS amplitude on [-1, 1] PCM at or above which a 20 ms frame counts as speech. Default 0.012 (about -38 dBFS).
+             */
+            threshold?: number;
+            /** @description Consecutive speech needed to open a segment. Default 120. */
+            min_speech_ms?: number;
+            /** @description Continuous silence that closes a segment. Default 600. */
+            min_silence_ms?: number;
+            /** @description Padding kept on both sides of each segment. Default 120. */
+            speech_pad_ms?: number;
+        };
+        InferenceTranscriptionSessionRequest: {
+            /**
+             * @description Transcriber model from models_dir/transcribers/.
+             * @example openai/whisper-tiny
+             */
+            model: string;
+            /** @description Force the transcript language (ISO 639-1). Omit for automatic detection. */
+            language?: string;
+            vad?: components["schemas"]["InferenceVadConfig"];
+            audio_context?: components["schemas"]["InferenceAudioContext"];
+            /** @description Minimum new audio before the open segment is decoded again for a partial. Each partial is a full Whisper pass, so lower values raise decoder load. Default 2000. */
+            partial_interval_ms?: number;
+            /** @description Continuous speech that forces a segment boundary. Default 25000. */
+            max_segment_ms?: number;
+            /**
+             * @description Emit partial hypotheses for the open segment.
+             * @default true
+             */
+            emit_partials?: boolean;
+            /** @description Preferred spellings for names and terms; joined into the recognizer's preceding-context prompt. */
+            dictionary?: string[];
+            /** @description Explicit preceding-context text for the recognizer. Overrides `dictionary`. */
+            transcript_prompt?: string;
+            /** @description Idle time after which the session expires. Default 300. */
+            ttl_seconds?: number;
+        };
+        InferenceTranscriptionSession: {
+            /** @enum {string} */
+            object: "transcription.session";
+            id: string;
+            model: string;
+            language?: string;
+            /** @description Unix timestamp (seconds). */
+            created: number;
+            /** @description Unix timestamp (seconds) after which the session is reclaimed unless audio is appended. */
+            expires_at: number;
+            /** @description Audio held for the open segment. */
+            buffered_ms: number;
+            /** @description Audio appended over the session lifetime. */
+            total_ms: number;
+            finals: number;
+            partials: number;
+        };
+        InferenceTranscriptionSessionDeleted: {
+            /** @enum {string} */
+            object: "transcription.session.deleted";
+            id: string;
+            deleted: boolean;
+        };
+        /** @enum {string} */
+        InferenceTranscriptionAudioFormat: "auto" | "pcm16" | "pcm_f32";
+        InferenceTranscriptionAudioAppend: {
+            /**
+             * Format: byte
+             * @description Base64 audio chunk. Optional when `commit` is true.
+             */
+            audio?: string;
+            format?: components["schemas"]["InferenceTranscriptionAudioFormat"];
+            /** @description Sample rate of raw `pcm16` / `pcm_f32` chunks. Default 16000. Ignored for containers. */
+            sample_rate?: number;
+            /**
+             * @description Finalize buffered speech even without trailing silence.
+             * @default false
+             */
+            commit?: boolean;
+        };
+        InferenceTranscriptionEvent: {
+            /** @enum {string} */
+            object: "transcription.event";
+            /** @enum {string} */
+            type: "partial" | "final";
+            /** @description Monotonic per-session event counter. */
+            sequence: number;
+            /** @description Current hypothesis for the segment. */
+            text: string;
+            /** @description Prefix of `text` that agreed with the previous hypothesis. Equals `text` for final events. */
+            stable_text: string;
+            /** @description Segment start in the session timeline, in milliseconds. */
+            start_ms: number;
+            end_ms: number;
+            language?: string;
+            /** @description Word spans on the session timeline. Empty for partial events. */
+            words?: components["schemas"]["InferenceDictationWord"][];
+        };
+        /**
+         * @description One Server-Sent Event on a session event stream. `session.open` starts
+         *     the stream, `transcription.event` carries `event`, `ping` keeps the
+         *     connection alive, `session.closed` ends it, and `error` carries
+         *     `error` and `message`. The stream ends with the literal `[DONE]`.
+         */
+        InferenceTranscriptionStreamMessage: {
+            /** @enum {string} */
+            type: "session.open" | "transcription.event" | "ping" | "session.closed" | "error";
+            session_id: string;
+            event?: components["schemas"]["InferenceTranscriptionEvent"];
+            buffered_ms?: number;
+            total_ms?: number;
+            error?: string;
+            message?: string;
+        };
+        InferenceTranscriptionEventList: {
+            /** @enum {string} */
+            object: "list";
+            session_id: string;
+            model: string;
+            data: components["schemas"]["InferenceTranscriptionEvent"][];
+            buffered_ms: number;
+            total_ms: number;
         };
         /** @description Information about a model including its capabilities */
         InferenceModelInfo: {
@@ -14838,6 +18487,47 @@ export interface components {
             capabilities?: string[];
             /** @description List of input modalities this model accepts, such as `text`, `image`, or `audio` */
             inputs?: string[];
+        };
+        InferenceDecideRequest: {
+            model: string;
+            state: string;
+            questions: {
+                [key: string]: components["schemas"]["InferenceDecideQuestion"];
+            };
+        };
+        InferenceDecideQuestion: {
+            /** @enum {string} */
+            type: "choice" | "score" | "noul";
+            instructions: string;
+            /** @description Choice uses option IDs mapped to descriptions; score uses ordered descriptions; noul omits criteria. */
+            criteria?: {
+                [key: string]: string;
+            } | string[];
+        };
+        InferenceDecideResponse: {
+            model: string;
+            answers: {
+                [key: string]: components["schemas"]["InferenceDecideAnswer"];
+            };
+            usage: {
+                /** @description Encoded prompt tokens consumed by the executor, including repeated state text for split GLiNER tasks. */
+                input_tokens: number;
+                /** @description Zero for classifier executors, which emit no generated tokens. */
+                output_tokens: number;
+            };
+        };
+        InferenceDecideAnswer: {
+            /** @enum {string} */
+            type: "choice" | "score" | "noul";
+            choice?: string;
+            score?: number;
+            noul?: number;
+            legend?: {
+                [key: string]: string;
+            };
+            probabilities?: {
+                [key: string]: number;
+            };
         };
         InferenceModelsResponse: {
             /**
@@ -14869,6 +18559,10 @@ export interface components {
             };
             /** @description Available extractor models (models with 'extraction' capability) */
             extractors: {
+                [key: string]: components["schemas"]["InferenceModelInfo"];
+            };
+            /** @description Models declaring the decide task and typed_decisions capability */
+            deciders: {
                 [key: string]: components["schemas"]["InferenceModelInfo"];
             };
             /** @description Available generator/LLM models from models_dir/generators/ */
@@ -15386,8 +19080,8 @@ export interface components {
         /** @description Native generator prompt KV cache configuration. */
         InferencePromptCacheConfig: {
             /**
-             * @description Enable inference-native prompt KV cache reuse for generator requests.
-             * @default false
+             * @description Enable inference-native prompt KV cache reuse for generator requests. On by default; set false to disable.
+             * @default true
              */
             enabled?: boolean;
             /**
@@ -15937,51 +19631,111 @@ export interface components {
         ExtensionError: {
             error: string;
         };
+        /**
+         * @description Omission preserves the legacy extraction contract. Version 2 opts into strict mixed-task schemas, per-input replacements and explicit offsets; the selected model/runtime must support every requested feature.
+         * @default 1
+         * @enum {integer}
+         */
+        ExtractionSchemaVersion: 1 | 2;
         ExtractionToken: {
             text: string;
             box?: number[];
         };
-        ExtractionInput: {
-            id?: string;
-            content: components["schemas"]["ChatMessageContent"];
-            tokens?: components["schemas"]["ExtractionToken"][];
-            metadata?: {
-                [key: string]: unknown;
-            };
-        };
+        /** Format: double */
+        ExtractionProbability: number;
         /** @description Optional source and target labels constrain relation endpoints. A target requires a source. */
         ExtractionRelationSchema: {
             type: string;
             source?: string;
             target?: string;
+            /** @description Version 2 model-facing relation description. */
+            description?: string;
+            threshold?: components["schemas"]["ExtractionProbability"];
         };
+        ExtractionLabelDefinition: {
+            /** @description Model-facing label description. */
+            description?: string;
+        };
+        /**
+         * Format: double
+         * @description Finite centered-logit decisions require a threshold strictly between zero and one.
+         */
+        ExtractionDecisionProbability: number;
+        ExtractionClassificationExample: {
+            input: string;
+            label: string;
+        } | string[];
         ExtractionClassificationSchema: {
             name: string;
             labels: string[];
-            /**
-             * @description When false, return the highest-ranked labels up to `top_k` (one by
-             *     default). When true, return every label meeting `options.threshold`.
-             * @default false
-             */
+            /** @description The server uses false when omitted. Version 1: return highest-ranked labels up to top_k when false, or labels meeting options.threshold when true. Version 2: selects ordinary single or multi classification unless mode is specified; classification.threshold controls the decision threshold. */
             multi_label?: boolean;
-            /**
-             * @description NLI hypothesis template for this named taxonomy. Use `{}` as the
-             *     candidate-label placeholder. Non-NLI extractors ignore this field.
-             * @default This example is {}.
-             */
+            /** @description Version 1 NLI hypothesis template with {} as the label placeholder; the server uses "This example is {}." when omitted. Version 2 GLiNER boundary extraction rejects an explicit hypothesis_template; use prompt/instruction and label_definitions for model conditioning. */
             hypothesis_template?: string;
-            /**
-             * @description Maximum labels returned for single-label classification. Ignored
-             *     when `multi_label` is true, where `options.threshold` controls the
-             *     returned set.
-             * @default 1
-             */
+            /** @description Maximum labels for ordinary single-label classification; the server uses 1 when omitted. Version 2 constrained or ordinal selection uses min_labels/max_labels. Advanced set-selection options or cross-task constraints on any classification in the collection reject every explicit top_k in that collection, including 1. Omit top_k when using these options. */
             top_k?: number;
+            /**
+             * @description Version 2 classification mode. Ordinal labels are ordered from lowest to highest.
+             *     Typed-decision extractors support boolean with labels ["false", "true"] in that order.
+             *     Each model rejects modes it does not support.
+             * @enum {string}
+             */
+            mode?: "single" | "multi" | "ordinal" | "boolean";
+            label_definitions?: {
+                [key: string]: components["schemas"]["ExtractionLabelDefinition"];
+            };
+            min_labels?: number;
+            /** @description Version 2 maximum selected labels. Explicit null means no maximum; omission preserves mode defaults. */
+            max_labels?: number | null;
+            ordered?: boolean;
+            threshold?: components["schemas"]["ExtractionDecisionProbability"];
+            candidate_threshold?: components["schemas"]["ExtractionProbability"];
+            /** @enum {string} */
+            activation?: "auto" | "sigmoid" | "softmax";
+            /** Format: double */
+            temperature?: number;
+            /** @description Version 2 fallback label; must be declared in labels. */
+            default?: string;
+            /** @description Version 2 model-facing task instruction. Mutually exclusive with instruction. */
+            prompt?: string;
+            /** @description Alias of prompt. */
+            instruction?: string;
+            examples?: components["schemas"]["ExtractionClassificationExample"][];
+        };
+        ExtractionRegexValidator: {
+            /** @enum {string} */
+            type?: "regex";
+            pattern: string;
+            /**
+             * @default full
+             * @enum {string}
+             */
+            mode?: "full" | "partial";
+            /** @default false */
+            exclude?: boolean;
+            /**
+             * @description Python-compatible regex flags supported by the active bounded validator engine; unsupported flags or syntax fail validation.
+             * @default 2
+             */
+            flags?: number;
         };
         ExtractionStructureField: string | ({
             /** @enum {string} */
             type?: "str" | "string" | "list" | "array";
             enum?: string[];
+            /** @enum {string} */
+            dtype?: "str" | "list";
+            choices?: string[];
+            description?: string;
+            threshold?: components["schemas"]["ExtractionProbability"];
+            /**
+             * @description Version 2 explicit cardinality. Required fields are validated after record assignment.
+             * @enum {string}
+             */
+            cardinality?: "optional_one" | "required_one" | "zero_or_more" | "one_or_more";
+            /** @description Version 2 field spans cannot be assigned to multiple record instances. */
+            exclusive?: boolean;
+            validators?: components["schemas"]["ExtractionRegexValidator"][];
         } & {
             [key: string]: unknown;
         });
@@ -15989,13 +19743,302 @@ export interface components {
             fields: {
                 [key: string]: components["schemas"]["ExtractionStructureField"];
             };
+            /**
+             * @description Version 2 record grouping. Omission preserves one-record extraction.
+             * @enum {string}
+             */
+            mode?: "natural" | "latent" | "anchorless";
+            /** @description Natural mode only; defaults to the first declared field. */
+            anchor?: string;
+            /** @enum {string} */
+            occurrence_policy?: "all" | "first" | "error_on_ambiguous" | "latent_all";
         } & {
             [key: string]: unknown;
         };
+        ExtractionEntityDefinition: {
+            description?: string;
+            /** @enum {string} */
+            dtype?: "str" | "list";
+            /** @enum {string} */
+            type?: "str" | "string" | "list" | "array";
+            threshold?: components["schemas"]["ExtractionProbability"];
+            validators?: components["schemas"]["ExtractionRegexValidator"][];
+        };
+        /** @description Version 2 attributes are scored on retained entity spans using shared encoded states. Omitted applies_to selects all entities; [] selects none. Raw labels must be unique across groups, including when qualify_labels is true. Group names text,confidence,start,end are reserved. */
+        ExtractionAttributeGroup: {
+            labels: string[];
+            /** @default false */
+            multi_label?: boolean;
+            threshold?: components["schemas"]["ExtractionProbability"];
+            applies_to?: string[];
+            /** @default false */
+            qualify_labels?: boolean;
+        };
+        ExtractionConstraintLabelRef: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "LabelRef";
+            task: string;
+            label: string;
+        };
+        ExtractionConstraintAnySelected: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "AnySelected";
+            task: string;
+        };
+        ExtractionConstraintAnyOtherSelected: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "AnyOtherSelected";
+            task: string;
+        };
+        ExtractionConstraintIsDefault: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "IsDefault";
+            task: string;
+        };
+        ExtractionConstraintCardinality: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "Cardinality";
+            task: string;
+            minimum?: number;
+            maximum?: number | null;
+        };
+        ExtractionConstraintMinLevel: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "MinLevel";
+            task: string;
+            level: string | number;
+        };
+        ExtractionConstraintMaxLevel: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "MaxLevel";
+            task: string;
+            level: string | number;
+        };
+        ExtractionConstraintAtLevel: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "AtLevel";
+            task: string;
+            level: string | number;
+        };
+        ExtractionConstraintNot: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "Not";
+            child: components["schemas"]["ExtractionClassificationConstraint"];
+        };
+        ExtractionConstraintAnd: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "And";
+            children: components["schemas"]["ExtractionClassificationConstraint"][];
+        };
+        ExtractionConstraintOr: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "Or";
+            children: components["schemas"]["ExtractionClassificationConstraint"][];
+        };
+        ExtractionConstraintExactlyOneOf: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "ExactlyOneOf";
+            children: components["schemas"]["ExtractionClassificationConstraint"][];
+        };
+        ExtractionConstraintImplies: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "Implies";
+            cond: components["schemas"]["ExtractionClassificationConstraint"];
+            then: components["schemas"]["ExtractionClassificationConstraint"];
+        };
+        ExtractionConstraintIff: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "Iff";
+            left: components["schemas"]["ExtractionClassificationConstraint"];
+            right: components["schemas"]["ExtractionClassificationConstraint"];
+        };
+        ExtractionConstraintExcludes: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "Excludes";
+            left: components["schemas"]["ExtractionClassificationConstraint"];
+            right: components["schemas"]["ExtractionClassificationConstraint"];
+        };
+        /** @description Declarative, bounded constraint AST. Task and label references are validated before inference. Nesting is bounded by the server schema limit. */
+        ExtractionClassificationConstraint: components["schemas"]["ExtractionConstraintLabelRef"] | components["schemas"]["ExtractionConstraintAnySelected"] | components["schemas"]["ExtractionConstraintAnyOtherSelected"] | components["schemas"]["ExtractionConstraintIsDefault"] | components["schemas"]["ExtractionConstraintCardinality"] | components["schemas"]["ExtractionConstraintMinLevel"] | components["schemas"]["ExtractionConstraintMaxLevel"] | components["schemas"]["ExtractionConstraintAtLevel"] | components["schemas"]["ExtractionConstraintNot"] | components["schemas"]["ExtractionConstraintAnd"] | components["schemas"]["ExtractionConstraintOr"] | components["schemas"]["ExtractionConstraintExactlyOneOf"] | components["schemas"]["ExtractionConstraintImplies"] | components["schemas"]["ExtractionConstraintIff"] | components["schemas"]["ExtractionConstraintExcludes"];
+        ExtractionJointEntity: {
+            description?: string;
+            threshold?: components["schemas"]["ExtractionDecisionProbability"];
+            candidate_threshold?: components["schemas"]["ExtractionProbability"];
+            max_candidates?: number;
+            allow_nested?: boolean;
+        };
+        ExtractionJointRelation: {
+            head: string[];
+            tail: string[];
+            /** @description Retained declarative metadata; model conditioning follows the pinned JointIE compiler. */
+            description?: string;
+            threshold?: components["schemas"]["ExtractionDecisionProbability"];
+            candidate_threshold?: components["schemas"]["ExtractionProbability"];
+            /** @default true */
+            directed?: boolean;
+            /** @default false */
+            symmetric?: boolean;
+            inverse?: string;
+            /** @default false */
+            allow_self?: boolean;
+            max_per_head?: number;
+            max_per_tail?: number;
+        };
+        ExtractionJointConstraintTypedEndpoints: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "TypedEndpoints";
+            relation?: string;
+            head_types?: string[];
+            tail_types?: string[];
+        };
+        ExtractionJointConstraintNoSelfLoops: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "NoSelfLoops";
+            relation?: string;
+        };
+        ExtractionJointConstraintUniqueRelationPair: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "UniqueRelationPair";
+            relation?: string;
+            /** @default true */
+            directed?: boolean;
+        };
+        ExtractionJointConstraintUniqueRelationSlot: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "UniqueRelationSlot";
+            relation?: string;
+            /**
+             * @default head
+             * @enum {string}
+             */
+            slot?: "head" | "tail" | "slot";
+        };
+        ExtractionJointConstraintEntityOverlapPolicy: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "EntityOverlapPolicy";
+            /** @enum {string} */
+            policy?: "allow" | "disallow" | "nested";
+        };
+        ExtractionJointConstraintMaxRelationsPerHead: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "MaxRelationsPerHead";
+            relation?: string;
+            limit: number;
+        };
+        ExtractionJointConstraintMaxRelationsPerTail: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "MaxRelationsPerTail";
+            relation?: string;
+            limit: number;
+        };
+        ExtractionJointConstraintSymmetricRelation: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "SymmetricRelation";
+            relation: string;
+        };
+        ExtractionJointConstraintAcyclicRelation: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "AcyclicRelation";
+            relation: string;
+        };
+        ExtractionJointConstraintInverseRelation: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "InverseRelation";
+            relation: string;
+            inverse: string;
+        };
+        ExtractionJointConstraint: components["schemas"]["ExtractionJointConstraintTypedEndpoints"] | components["schemas"]["ExtractionJointConstraintNoSelfLoops"] | components["schemas"]["ExtractionJointConstraintUniqueRelationPair"] | components["schemas"]["ExtractionJointConstraintUniqueRelationSlot"] | components["schemas"]["ExtractionJointConstraintEntityOverlapPolicy"] | components["schemas"]["ExtractionJointConstraintMaxRelationsPerHead"] | components["schemas"]["ExtractionJointConstraintMaxRelationsPerTail"] | components["schemas"]["ExtractionJointConstraintSymmetricRelation"] | components["schemas"]["ExtractionJointConstraintAcyclicRelation"] | components["schemas"]["ExtractionJointConstraintInverseRelation"];
+        /** @description Separate typed graph schema, mutually exclusive with ordinary extraction families. Hard typed endpoints, overlap, uniqueness and declared graph constraints apply to every returned edge, including derived companions. */
+        ExtractionJointSchema: {
+            entities: {
+                [key: string]: string | components["schemas"]["ExtractionJointEntity"];
+            };
+            relations?: {
+                [key: string]: components["schemas"]["ExtractionJointRelation"];
+            };
+            constraints?: components["schemas"]["ExtractionJointConstraint"][];
+        };
         /**
-         * @description Selects one extraction operation family per request. Entity labels may
-         *     accompany relation schemas so relation extraction can return its
-         *     participating entities in the same response.
+         * @description Version 1 selects one extraction family; entities may accompany relations.
+         *     With schema_version 2, entities, attributes, classifications, structures,
+         *     and ordinary relations may share one encoded input. joint_ie is a separate,
+         *     mutually exclusive typed graph schema. The version 2 compiler rejects
+         *     unknown fields and validates all references before model execution.
          */
         ExtractionSchema: {
             entities?: string[];
@@ -16004,8 +20047,66 @@ export interface components {
             structures?: {
                 [key: string]: components["schemas"]["ExtractionStructureSchema"];
             };
+            entity_definitions?: {
+                [key: string]: components["schemas"]["ExtractionEntityDefinition"];
+            };
+            entity_attributes?: {
+                [key: string]: components["schemas"]["ExtractionAttributeGroup"];
+            };
+            classification_constraints?: components["schemas"]["ExtractionClassificationConstraint"][];
+            joint_ie?: components["schemas"]["ExtractionJointSchema"];
         } & {
             [key: string]: unknown;
+        };
+        /**
+         * @description Half-open offsets into the immutable caller text. Version 2 defaults to utf8_bytes. No normalization, lowercasing or synthetic suffix is included in these coordinates.
+         * @enum {string}
+         */
+        ExtractionOffsetUnit: "utf8_bytes" | "unicode_codepoints" | "utf16_codeunits";
+        /** @description Version 2 never silently truncates. Reject is the default. Windowing requires an enabled runtime capability, reconstructs document-global offsets and revalidates all hard graph constraints after merging. */
+        ExtractionLongDocumentOptions: {
+            /**
+             * @default reject
+             * @enum {string}
+             */
+            mode?: "reject" | "window";
+            /** @description Maximum body words per window; also bounded by the checkpoint and encoded token limits. */
+            window_words?: number;
+            overlap_words?: number;
+            max_windows?: number;
+            /**
+             * @description Identity of latent, anchorless and legacy records across windows. Occurrence uses exact source spans; semantic explicitly merges equal field values. Natural records always use their exact source anchor. This is independent of annotation occurrence_policy.
+             * @default occurrence
+             * @enum {string}
+             */
+            record_identity?: "occurrence" | "semantic";
+        };
+        /** @description Bounded classification and JointIE selection. Exact optimality is with respect to admitted candidates. A completed beam may be feasible without an optimality proof. By default exhausted search is an error; best_effort permits only a validated feasible witness and reports exhausted:true. */
+        ExtractionDecoderOptions: {
+            /**
+             * @description Omit to use the model's per-task default. GLiNER2.5 uses source-compatible beam selection for single-window JointIE and automatic selection for classification. Windowed JointIE uses the native automatic global solver with independent window resources. Explicit values select the native bounded search algorithm.
+             * @enum {string}
+             */
+            algorithm?: "auto" | "exact" | "beam";
+            beam_width?: number;
+            max_search_nodes?: number;
+            max_local_assignments?: number;
+            /** @default false */
+            best_effort?: boolean;
+        };
+        /** @description JointIE proposal admission and utility calibration. Entity candidate caps are bypassed for endpoints of retained relation proposals, subject to server hard bounds. entity_threshold overrides candidate admission, not entity decision thresholds. */
+        ExtractionJointOptions: {
+            candidate_threshold?: components["schemas"]["ExtractionProbability"];
+            entity_threshold?: components["schemas"]["ExtractionProbability"];
+            relation_role_threshold?: components["schemas"]["ExtractionProbability"];
+            top_k_entities?: number;
+            top_k_roles?: number;
+            relation_pair_cap?: number;
+            max_edges_per_type?: number;
+            /** Format: double */
+            entity_weight?: number;
+            /** Format: double */
+            relation_weight?: number;
         };
         ExtractionReaderOptions: {
             provider?: string;
@@ -16045,17 +20146,86 @@ export interface components {
             flat_ner?: boolean;
             include_confidence?: boolean;
             include_spans?: boolean;
+            /**
+             * @description Version 2 source word splitting. char keeps ASCII alphanumeric and @._-+ runs together and splits other non-whitespace codepoints, preserving original source offsets. An input's options replace the shared options in full; omitted word_splitter uses whitespace. Explicit word_splitter is rejected by version 1.
+             * @enum {string}
+             */
+            word_splitter?: "whitespace" | "char";
+            /**
+             * @description Version 2 overlap selection. flat/disallow prohibit overlap, nested permits containment, longest removes strictly contained spans.
+             * @enum {string}
+             */
+            overlap?: "allow" | "nested" | "flat" | "disallow" | "longest";
+            offset_unit?: components["schemas"]["ExtractionOffsetUnit"];
+            long_document?: components["schemas"]["ExtractionLongDocumentOptions"];
+            decoder?: components["schemas"]["ExtractionDecoderOptions"];
+            joint_ie?: components["schemas"]["ExtractionJointOptions"];
             reader?: components["schemas"]["ExtractionReaderOptions"];
             resolver?: components["schemas"]["ExtractionResolverOptions"];
         } & {
             [key: string]: unknown;
         };
+        ExtractionInput: {
+            id?: string;
+            content: components["schemas"]["ChatMessageContent"];
+            tokens?: components["schemas"]["ExtractionToken"][];
+            metadata?: {
+                [key: string]: unknown;
+            };
+            /** @description Version 2 only. Replaces the complete shared schema for this input. */
+            schema?: components["schemas"]["ExtractionSchema"];
+            /** @description Version 2 only. Replaces the complete shared options; omitted fields use runtime defaults. */
+            options?: components["schemas"]["ExtractionOptions"];
+        };
+        /** @description Atomic extraction request. Every input is validated before inference; failures return no partial data. */
         ExtractionRequest: {
             model: string;
+            schema_version?: components["schemas"]["ExtractionSchemaVersion"];
             inputs: components["schemas"]["ExtractionInput"][];
             schema: components["schemas"]["ExtractionSchema"];
             options?: components["schemas"]["ExtractionOptions"];
         };
+        ExtractionLabelProbability: {
+            label: string;
+            /** Format: float */
+            probability: number;
+        };
+        /** @description Version 2 typed classification decision. Probabilities follow request label order; ordinal levels are zero-based. */
+        ExtractionDecision: {
+            name: string;
+            /** @enum {string} */
+            type: "choice" | "score" | "boolean";
+            /** @description Highest-probability label. This is distinct from the expected ordinal value. */
+            label: string;
+            probabilities: components["schemas"]["ExtractionLabelProbability"][];
+            /** Format: float */
+            confidence: number;
+            /**
+             * @description Entropy confidence is not the probability that the selected label is correct.
+             * @enum {string}
+             */
+            confidence_method: "normalized_inverse_entropy" | "max_probability";
+            /**
+             * Format: float
+             * @description Score decisions only; sum of zero-based level index times probability.
+             */
+            expected_value?: number;
+            /**
+             * Format: float
+             * @description Boolean decisions only; probability of the true label.
+             */
+            true_probability?: number;
+            /**
+             * Format: float
+             * @description Auxiliary model estimate for acting. Does not authorize or execute a tool call.
+             */
+            act_probability: number;
+        };
+        ExtractionAttributeLabel: {
+            label: string;
+            confidence: components["schemas"]["ExtractionProbability"];
+        };
+        ExtractionAttributeSelection: components["schemas"]["ExtractionAttributeLabel"] | components["schemas"]["ExtractionAttributeLabel"][];
         ExtractionEntity: {
             label: string;
             text: string;
@@ -16063,10 +20233,22 @@ export interface components {
             end?: number;
             /** Format: float */
             score?: number;
+            /** @description Version 2 span attributes. Attribute confidence is retained independently of include_confidence. */
+            attributes?: {
+                [key: string]: components["schemas"]["ExtractionAttributeSelection"];
+            };
         };
         ExtractionRelationEndpoint: {
             entity_index?: number;
             id?: string;
+            /** @description Entity type when the endpoint has a typed identity. */
+            label?: string;
+            /** @description Version 2 endpoint surface, including endpoints absent from the entities list. */
+            text?: string;
+            start?: number;
+            end?: number;
+            /** Format: float */
+            score?: number;
         } & {
             [key: string]: unknown;
         };
@@ -16076,6 +20258,8 @@ export interface components {
             target?: components["schemas"]["ExtractionRelationEndpoint"];
             /** Format: float */
             score?: number;
+            /** @description Version 2 inverse or symmetric companion derived from a selected relation. */
+            derived?: boolean;
         } & {
             [key: string]: unknown;
         };
@@ -16087,14 +20271,61 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        ExtractionRecordMetadata: {
+            score?: components["schemas"]["ExtractionProbability"];
+            anchor?: {
+                start: number;
+                end: number;
+            };
+        };
+        ExtractionSolverStatus: {
+            /** @enum {string} */
+            status: "optimal" | "feasible";
+            /** Format: double */
+            utility: number;
+            visited_nodes: number;
+            exhausted: boolean;
+        };
+        ExtractionSolverDiagnostics: {
+            classification?: components["schemas"]["ExtractionSolverStatus"];
+            joint_ie?: components["schemas"]["ExtractionSolverStatus"];
+            records?: components["schemas"]["ExtractionSolverStatus"];
+        };
+        ExtractionLongDocumentMetadata: {
+            /** @enum {integer} */
+            version: 1;
+            window_count: number;
+            /** @enum {string} */
+            window_policy: "source_words_midpoint_ownership";
+            /** @enum {string} */
+            classification_aggregation: "owned_word_weighted_mean_raw_logits";
+            /** @enum {string} */
+            duplicate_score: "maximum_calibrated_score";
+            /** @enum {string} */
+            natural_record_identity: "exact_source_anchor";
+            /** @enum {string} */
+            other_record_identity: "occurrence" | "semantic";
+            /** @enum {string} */
+            solver_optimality_scope: "retained_candidate_graph";
+        };
         ExtractionObject: {
+            /** @description Typed decision results from capable extractors, alongside compatible per-label classifications. */
+            decisions?: components["schemas"]["ExtractionDecision"][];
             id?: string;
+            offset_unit?: components["schemas"]["ExtractionOffsetUnit"];
             entities?: components["schemas"]["ExtractionEntity"][];
             relations?: components["schemas"]["ExtractionRelation"][];
             classifications?: components["schemas"]["ExtractionClassification"][];
+            /** @description Structure name to record array. Each record maps field names to value objects or arrays of value objects; v2 value objects follow ExtractionFieldValue. */
             structures?: {
                 [key: string]: unknown;
             };
+            /** @description Version 2 metadata arrays aligned with each named structure's record array. */
+            structure_metadata?: {
+                [key: string]: components["schemas"]["ExtractionRecordMetadata"][];
+            };
+            solvers?: components["schemas"]["ExtractionSolverDiagnostics"];
+            long_document?: components["schemas"]["ExtractionLongDocumentMetadata"];
         } & {
             [key: string]: unknown;
         };
@@ -16102,6 +20333,7 @@ export interface components {
             /** @enum {string} */
             object: "extraction";
             model: string;
+            schema_version?: components["schemas"]["ExtractionSchemaVersion"];
             data: components["schemas"]["ExtractionObject"][];
             usage?: {
                 [key: string]: unknown;
@@ -16873,6 +21105,69 @@ export interface operations {
             500: components["responses"]["InternalServerError"];
         };
     };
+    executeNamespaceTableGraphMetricAction: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the graph index */
+                indexName: string;
+                /** @description Name of the configured graph metric */
+                metricName: string;
+                /** @description Operational action to apply to the graph metric materialization */
+                action: "refresh" | "rebuild" | "delete" | "pause" | "resume";
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Aggregate graph metric status after the action is durably accepted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphMetricActionResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Graph metric actions are unavailable for this runtime */
+            405: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description The table topology or write-owner generation changed, or only some shards accepted the action; retrying is consistency-safe and reuses any still-active build */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+            /** @description Local storage resources are temporarily exhausted */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
     commitTransaction: {
         parameters: {
             query?: never;
@@ -17468,6 +21763,465 @@ export interface operations {
             500: components["responses"]["InternalServerError"];
         };
     };
+    openSQLConnection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["SQLConnectionOpenRequest"];
+            };
+        };
+        responses: {
+            /** @description Opened connection and routing owner */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLConnectionResponse"];
+                };
+            };
+            /** @description Connection admission failed */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+        };
+    };
+    closeSQLConnection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                connection_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Closed connection */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description Connection close rejected */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+        };
+    };
+    prepareSQL: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SQLPrepareRequest"];
+            };
+        };
+        responses: {
+            /** @description Durable prepared resource */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLPreparedResponse"];
+                };
+            };
+            /** @description Preparation rejected */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+        };
+    };
+    executePreparedSQL: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                prepared_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SQLPreparedExecutionRequest"];
+            };
+        };
+        responses: {
+            /** @description SQL result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLResponse"];
+                };
+            };
+            /** @description Execution rejected or durable mutation outcome */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+        };
+    };
+    closePreparedSQL: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Required to close a connection-bound prepared resource. */
+                "X-Antfly-SQL-Connection-Id"?: string;
+            };
+            path: {
+                prepared_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Resource released; already admitted executions may finish */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description Close rejected */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+        };
+    };
+    administerSqlSettings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SqlSettingMutationRequest"];
+            };
+        };
+        responses: {
+            /** @description Setting catalog mutation committed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Invalid setting definition or default */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Cluster administrator permission required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Catalog revision or setting generation changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Metadata peer upgrade required */
+            426: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Mutation outcome unknown or metadata unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    enrollStoreRoot: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StoreRootEnrollmentRequest"];
+            };
+        };
+        responses: {
+            /** @description Enrollment committed and observed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StoreRootEnrollmentIdentity"];
+                };
+            };
+            /** @description Invalid identity or proof of possession */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Cluster administrator permission required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Root registration or enrollment changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Metadata peer upgrade required */
+            426: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Outcome unknown or metadata unavailable; observe before retrying */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getStoreRootEnrollmentStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StoreRootEnrollmentIdentity"];
+            };
+        };
+        responses: {
+            /** @description Exact enrollment observed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StoreRootEnrollmentIdentity"];
+                };
+            };
+            /** @description Invalid identity */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Cluster administrator permission required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Exact identity is not enrolled, or store-root registration changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Metadata unavailable; retry the read later */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    executeSQL: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SQLRequest"];
+            };
+        };
+        responses: {
+            /** @description SQL statement result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLResponse"];
+                };
+            };
+            /** @description DDL declaration durably admitted; constraint validation or native staging is pending. Do not replay. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLResponse"];
+                };
+            };
+            /** @description Invalid statement, parameter, or result admission limit */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+            /** @description Authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Insufficient permission for the statement's catalog resources */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Transaction or catalog conflict, committed DDL whose validation failed, or uncertain DDL admission with a recovery receipt. Do not replay uncertain DDL. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"] | components["schemas"]["SQLResponse"];
+                };
+            };
+            /** @description Foreground query, write, or request-body admission is exhausted */
+            429: {
+                headers: {
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Internal SQL execution failure */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+            /** @description SQL statement shape is not supported */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+            /** @description SQL backend execution capacity is unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+        };
+    };
     globalQuery: {
         parameters: {
             query?: never;
@@ -17661,6 +22415,190 @@ export interface operations {
             504: components["responses"]["QueryGatewayTimeout"];
         };
     };
+    researchAgent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResearchAgentRequest"];
+            };
+        };
+        responses: {
+            /** @description Research agent response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/event-stream": string;
+                    "application/json": components["schemas"]["ResearchAgentResult"];
+                };
+            };
+            /** @description Invalid research agent request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description The caller lacks read permission on a requested table or tool connection */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            413: components["responses"]["QueryPayloadTooLarge"];
+            422: components["responses"]["QueryUnprocessable"];
+            429: components["responses"]["QueryRateLimited"];
+            500: components["responses"]["InternalServerError"];
+            502: components["responses"]["QueryBadGateway"];
+            503: components["responses"]["AgentTemporarilyUnavailable"];
+            504: components["responses"]["QueryGatewayTimeout"];
+        };
+    };
+    startResearchJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResearchJobStartRequest"];
+            };
+        };
+        responses: {
+            /** @description Research job durably accepted */
+            202: {
+                headers: {
+                    /** @description Relative URL of the durable research job resource. */
+                    Location?: string;
+                    /** @description Suggested delay in seconds before the next advance or poll. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResearchJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description The caller lacks read permission on a requested table or tool connection */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["QueryRateLimited"];
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getResearchJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Research job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Research job status and latest checkpoint */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResearchJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    advanceResearchJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Research job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ResearchJobAdvanceRequest"];
+            };
+        };
+        responses: {
+            /** @description Research job was already terminal */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResearchJob"];
+                };
+            };
+            /** @description Research job advanced */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResearchJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            429: components["responses"]["QueryRateLimited"];
+            500: components["responses"]["InternalServerError"];
+            502: components["responses"]["QueryBadGateway"];
+            503: components["responses"]["AgentTemporarilyUnavailable"];
+        };
+    };
+    cancelResearchJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Research job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Research job cancelled or already terminal */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResearchJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
     listTables: {
         parameters: {
             query?: {
@@ -17674,6 +22612,10 @@ export interface operations {
                  * @example ^user_.*
                  */
                 pattern?: string;
+                /** @description Maximum catalog rows examined per page (1-1000). Omit for the complete list. Authorization may return fewer rows; follow X-Antfly-Next-Cursor even for an empty page. */
+                limit?: number;
+                /** @description Opaque continuation from X-Antfly-Next-Cursor, bound to the same scope and prefix. Defaults to 100 rows when limit is omitted. Catalog DDL invalidates the cursor with 409; restart the listing. */
+                cursor?: string;
             };
             header?: never;
             path?: never;
@@ -17684,6 +22626,8 @@ export interface operations {
             /** @description A list of tables */
             200: {
                 headers: {
+                    /** @description Continue with this cursor until the header is absent. Pages may contain no authorized rows. */
+                    "X-Antfly-Next-Cursor"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -17691,6 +22635,15 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            /** @description Catalog changed during pagination. Restart without a cursor. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             500: components["responses"]["InternalServerError"];
         };
     };
@@ -17824,6 +22777,293 @@ export interface operations {
             502: components["responses"]["QueryBadGateway"];
             503: components["responses"]["QueryTemporarilyUnavailable"];
             504: components["responses"]["QueryGatewayTimeout"];
+        };
+    };
+    getRelationalConstraintStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Epoch- and owner-fenced validation status for every active range. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelationalConstraintStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Schema or ownership changed during status collection. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description One or more current owners could not report authoritative coverage. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    repairRelationalConstraints: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalRowMutationRequest"];
+            };
+        };
+        responses: {
+            /** @description Repair transaction committed. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            /** @description Commit is durable; visibility or participant recovery is pending. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Administrator or affected-table write permission is missing. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Activation, schema, row version, or constraint changed. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Write coordination is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    retryRelationalConstraints: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalConstraintRetryRequest"];
+            };
+        };
+        responses: {
+            /** @description Failed owner checkpoints reset; background validation is pending. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelationalConstraintRetryResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Administrator permission is missing. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Schema or activation state changed; refresh and retry. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Some owners could not be reset; repeating the request is safe. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    retireRelationalConstraints: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalConstraintRetirementRequest"];
+            };
+        };
+        responses: {
+            /** @description Retirement accepted; no data or schema publication is implied yet. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelationalConstraintRetryResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Administrator permission is missing. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Schema, retirement state, topology, or incoming foreign-key dependency changed. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Retirement coordination is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    queryRelationalRows: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalRowQueryRequest"];
+            };
+        };
+        responses: {
+            /** @description Bounded newline-delimited typed rows in primary-key order. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/x-ndjson": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Requested schema epoch is stale. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Read ownership or storage is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    mutateRelationalRows: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalRowMutationRequest"];
+            };
+        };
+        responses: {
+            /** @description Atomic mutations committed. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            /** @description Durable commit decision; participant visibility or recovery is pending. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description A version precondition or relational constraint conflicted. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Write coordination is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     batchWrite: {
@@ -18056,8 +23296,24 @@ export interface operations {
     };
     updateSchema: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description Explicitly enqueue a durable fresh-generation schema rewrite instead
+                 *     of changing the live schema. Requires administrator permission on the
+                 *     entire dependency cohort. Sources remain writable during snapshot and
+                 *     catch-up; final validation and publication are atomic across the cohort.
+                 *     Returns a restore job (202), whose existing status/cancel routes apply.
+                 *     Independent graph/vector artifacts without a retained row-derived
+                 *     source proof are rejected before admission. The default false retains
+                 *     ordinary schema-update behavior. Existing absent values remain absent
+                 *     rather than retroactively receiving defaults. Stored column type
+                 *     changes and destructive column removal are rejected.
+                 */
+                rewrite?: boolean;
+            };
             header?: {
+                /** @description Retry identity for rewrite=true admission. Reusing a key for a different rewrite returns 409. */
+                "Idempotency-Key"?: string;
                 /** @description Strong schema ETag returned by a previous schema mutation, for example `"schema-0"`. A mismatch returns 409 instead of overwriting a concurrent update. */
                 "If-Match"?: string;
             };
@@ -18084,7 +23340,17 @@ export interface operations {
                     "application/json": components["schemas"]["Table"];
                 };
             };
-            202: components["responses"]["CommittedMutationAccepted"];
+            /** @description Durable rewrite job accepted, or ordinary schema mutation committed with pending visibility */
+            202: {
+                headers: {
+                    /** @description Restore job status URL when rewrite=true. */
+                    Location?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RestoreJob"] | components["schemas"]["CommittedMutationOutcome"];
+                };
+            };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
@@ -18093,8 +23359,24 @@ export interface operations {
     };
     patchSchema: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description Explicitly enqueue a durable fresh-generation schema rewrite instead
+                 *     of changing the live schema. Requires administrator permission on the
+                 *     entire dependency cohort. Sources remain writable during snapshot and
+                 *     catch-up; final validation and publication are atomic across the cohort.
+                 *     Returns a restore job (202), whose existing status/cancel routes apply.
+                 *     Independent graph/vector artifacts without a retained row-derived
+                 *     source proof are rejected before admission. The default false retains
+                 *     ordinary schema-update behavior. Existing absent values remain absent
+                 *     rather than retroactively receiving defaults. Stored column type
+                 *     changes and destructive column removal are rejected.
+                 */
+                rewrite?: boolean;
+            };
             header?: {
+                /** @description Retry identity for rewrite=true admission. Reusing a key for a different rewrite returns 409. */
+                "Idempotency-Key"?: string;
                 /** @description Strong schema ETag returned by a previous schema mutation, for example `"schema-0"`. A mismatch returns 409 instead of overwriting a concurrent update. */
                 "If-Match"?: string;
             };
@@ -18122,7 +23404,17 @@ export interface operations {
                     "application/json": components["schemas"]["Table"];
                 };
             };
-            202: components["responses"]["CommittedMutationAccepted"];
+            /** @description Durable rewrite job accepted, or ordinary schema mutation committed with pending visibility */
+            202: {
+                headers: {
+                    /** @description Restore job status URL when rewrite=true. */
+                    Location?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RestoreJob"] | components["schemas"]["CommittedMutationOutcome"];
+                };
+            };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
@@ -18303,6 +23595,165 @@ export interface operations {
             404: components["responses"]["NotFound"];
             405: components["responses"]["MethodNotAllowed"];
             500: components["responses"]["InternalServerError"];
+        };
+    };
+    createTableStorageMigration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    job_id: string;
+                    /** @enum {string} */
+                    target: "vector_store";
+                    budget?: {
+                        /**
+                         * Format: int64
+                         * @default 4194304
+                         */
+                        batch_bytes?: number;
+                        /** @default 1024 */
+                        batch_rows?: number;
+                        /**
+                         * Format: int64
+                         * @default 68719476736
+                         */
+                        temporary_bytes?: number;
+                        /**
+                         * Format: int64
+                         * @default 1073741824
+                         */
+                        disk_reserve_bytes?: number;
+                    };
+                };
+            };
+        };
+        responses: {
+            /** @description Durable migration receipt, or admitted receipt before DB preparation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Conflicting job, lifecycle operation or publication state */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Retryable resource or recovery admission failure */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getTableStorageMigration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Durable migration receipt, or admitted receipt before DB preparation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Conflicting job, lifecycle operation or publication state */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Retryable resource or recovery admission failure */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    advanceTableStorageMigration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @enum {string} */
+                    action: "step" | "publish" | "cancel";
+                };
+            };
+        };
+        responses: {
+            /** @description Durable migration receipt, or admitted receipt before DB preparation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Conflicting job, lifecycle operation or publication state */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Retryable resource or recovery admission failure */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     runTableRepair: {
@@ -18855,6 +24306,72 @@ export interface operations {
             500: components["responses"]["InternalServerError"];
         };
     };
+    retryIndex: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IndexMaintenanceRequest"];
+            };
+        };
+        responses: {
+            /** @description All selected owner maintenance commands acknowledged */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexMaintenanceResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["IndexMutationConflict"];
+            429: components["responses"]["StorageResourceExhausted"];
+            503: components["responses"]["IndexMutationServiceUnavailable"];
+        };
+    };
+    repairIndex: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IndexMaintenanceRequest"];
+            };
+        };
+        responses: {
+            /** @description All selected owner maintenance commands acknowledged */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexMaintenanceResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["IndexMutationConflict"];
+            429: components["responses"]["StorageResourceExhausted"];
+            503: components["responses"]["IndexMutationServiceUnavailable"];
+        };
+    };
     getIndex: {
         parameters: {
             query?: never;
@@ -18952,6 +24469,1703 @@ export interface operations {
             404: components["responses"]["NotFound"];
             405: components["responses"]["MethodNotAllowed"];
             409: components["responses"]["IndexMutationConflict"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    listTablespaces: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A list of tablespaces */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TablespaceCatalogRecord"][];
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    getTablespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Tablespace name */
+                tablespaceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Tablespace details */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TablespaceCatalogRecord"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    createTablespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Tablespace name */
+                tablespaceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["CreateTablespaceRequest"];
+            };
+        };
+        responses: {
+            /** @description Tablespace created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TablespaceCatalogRecord"];
+                };
+            };
+            /** @description Mutation committed; resource visibility is pending. Observe with GET instead of repeating the mutation. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CatalogMutationVisibilityPending"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Tablespace already exists */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    dropTablespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Tablespace name */
+                tablespaceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Tablespace dropped */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    listDatabases: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A list of databases */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseCatalogRecord"][];
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    getDatabase: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Database details */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseCatalogRecord"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    createDatabase: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Database created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseCatalogRecord"];
+                };
+            };
+            /** @description Mutation committed; resource visibility is pending. Observe with GET instead of repeating the mutation. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CatalogMutationVisibilityPending"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Database already exists */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    dropDatabase: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Database dropped */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Database is not empty */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    setDatabaseTablespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CatalogTablespaceBindingRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated database */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseCatalogRecord"];
+                };
+            };
+            /** @description Mutation committed; resource visibility is pending. Observe with GET instead of repeating the mutation. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CatalogMutationVisibilityPending"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    clearDatabaseTablespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Updated database */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseCatalogRecord"];
+                };
+            };
+            /** @description Mutation committed; resource visibility is pending. Observe with GET instead of repeating the mutation. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CatalogMutationVisibilityPending"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    listNamespaces: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A list of namespaces in the database */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NamespaceCatalogRecord"][];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    createNamespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Namespace created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NamespaceCatalogRecord"];
+                };
+            };
+            /** @description Mutation committed; resource visibility is pending. Observe with GET instead of repeating the mutation. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CatalogMutationVisibilityPending"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Namespace already exists */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    dropNamespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Namespace dropped */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Namespace is not empty */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    setNamespaceTablespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CatalogTablespaceBindingRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated namespace */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NamespaceCatalogRecord"];
+                };
+            };
+            /** @description Mutation committed; resource visibility is pending. Observe with GET instead of repeating the mutation. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CatalogMutationVisibilityPending"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    clearNamespaceTablespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Updated namespace */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NamespaceCatalogRecord"];
+                };
+            };
+            /** @description Mutation committed; resource visibility is pending. Observe with GET instead of repeating the mutation. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CatalogMutationVisibilityPending"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    listNamespaceTables: {
+        parameters: {
+            query?: {
+                /** @description Filter tables by name prefix. */
+                prefix?: string;
+                /** @description Maximum catalog rows examined per page (1-1000). Omit for the complete list. Authorization may return fewer rows; follow X-Antfly-Next-Cursor even for an empty page. */
+                limit?: number;
+                /** @description Opaque continuation from X-Antfly-Next-Cursor, bound to the same scope and prefix. Defaults to 100 rows when limit is omitted. Catalog DDL invalidates the cursor with 409; restart the listing. */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A list of tables in the namespace */
+            200: {
+                headers: {
+                    /** @description Continue with this cursor until the header is absent. Pages may contain no authorized rows. */
+                    "X-Antfly-Next-Cursor"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableStatus"][];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Catalog changed during pagination. Restart without a cursor. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    getNamespaceTable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Table details */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    createNamespaceTable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateTableRequest"];
+            };
+        };
+        responses: {
+            /** @description Table created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableStatus"];
+                };
+            };
+            202: components["responses"]["CommittedMutationAccepted"];
+            400: components["responses"]["BadRequest"];
+            /** @description Explicit catalog table lifecycle is not supported by the configured local table write backend. */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    dropNamespaceTable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: components["responses"]["CommittedMutationAccepted"];
+            /** @description Table dropped */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Explicit catalog table lifecycle is not supported by the configured local table write backend. */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    queryNamespaceTable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StatefulQueryRequest"];
+                "application/x-ndjson": string;
+            };
+        };
+        responses: {
+            /** @description Query successful */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryResponses"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+            /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    batchNamespaceTable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BatchRequest"];
+            };
+        };
+        responses: {
+            /** @description Batch operation successful */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+            /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    updateNamespaceTableSchema: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Strong schema ETag returned by a previous schema mutation, for example `"schema-0"`. A mismatch returns 409 instead of overwriting a concurrent update. */
+                "If-Match"?: string;
+            };
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Name of the table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TableSchema"];
+            };
+        };
+        responses: {
+            /** @description Schema updated successfully */
+            200: {
+                headers: {
+                    /** @description Strong ETag for the committed schema version. */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Table"];
+                };
+            };
+            202: components["responses"]["CommittedMutationAccepted"];
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    patchNamespaceTableSchema: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Strong schema ETag returned by a previous schema mutation, for example `"schema-0"`. A mismatch returns 409 instead of overwriting a concurrent update. */
+                "If-Match"?: string;
+            };
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Name of the table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/merge-patch+json": components["schemas"]["TableSchemaPatch"];
+                "application/json": components["schemas"]["TableSchemaPatch"];
+            };
+        };
+        responses: {
+            /** @description Schema patched successfully */
+            200: {
+                headers: {
+                    /** @description Strong ETag for the committed schema version. */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Table"];
+                };
+            };
+            202: components["responses"]["CommittedMutationAccepted"];
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    backupNamespaceTable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BackupRequest"];
+            };
+        };
+        responses: {
+            /** @description Backup process initiated successfully */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @example successful */
+                        backup?: string;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    restoreNamespaceTable: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Stable key used to safely retry creation of this restore job. Keys are scoped to the authenticated principal and table. Requests without this header create a new job. */
+                "Idempotency-Key"?: string;
+            };
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RestoreRequest"];
+            };
+        };
+        responses: {
+            /** @description Restore process triggered successfully */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RestoreJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    lookupNamespaceTableDocument: {
+        parameters: {
+            query?: {
+                /** @description Comma-separated list of fields to include in the response. */
+                fields?: string;
+                /** @description Read consistency; defaults to read_index. */
+                consistency?: "read_index" | "stale";
+            };
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+                /** @description Key of the document to retrieve */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Record found */
+            200: {
+                headers: {
+                    /** @description Version token for this document. */
+                    "X-Antfly-Version"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+            /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    listNamespaceTableIndexes: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A list of indexes for the table */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexStatus"][];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+            /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getNamespaceTableIndex: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+                /** @description Name of the index */
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Index details */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexStatus"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+            /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    createNamespaceTableIndex: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+                /** @description Name of the index */
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateIndexRequest"];
+            };
+        };
+        responses: {
+            /** @description Index added successfully */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreatedIndex"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            500: components["responses"]["InternalServerError"];
+            /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    dropNamespaceTableIndex: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+                /** @description Name of the index */
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Index dropped successfully */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            500: components["responses"]["InternalServerError"];
+            /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getNamespaceRelationalConstraintStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Epoch- and owner-fenced validation status for every active range. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelationalConstraintStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Schema or ownership changed during status collection. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description One or more current owners could not report authoritative coverage. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    repairNamespaceRelationalConstraints: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalRowMutationRequest"];
+            };
+        };
+        responses: {
+            /** @description Repair transaction committed. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            /** @description Commit is durable; visibility or participant recovery is pending. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Administrator or affected-table write permission is missing. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Activation, schema, row version, or constraint changed. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Write coordination is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    retryNamespaceRelationalConstraints: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalConstraintRetryRequest"];
+            };
+        };
+        responses: {
+            /** @description Failed owner checkpoints reset; background validation is pending. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelationalConstraintRetryResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Administrator permission is missing. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Schema or activation state changed; refresh and retry. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Some owners could not be reset; repeating the request is safe. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    retireNamespaceRelationalConstraints: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalConstraintRetirementRequest"];
+            };
+        };
+        responses: {
+            /** @description Retirement accepted; no data or schema publication is implied yet. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelationalConstraintRetryResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Administrator permission is missing. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Schema, retirement state, topology, or incoming foreign-key dependency changed. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Retirement coordination is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    queryNamespaceRelationalRows: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalRowQueryRequest"];
+            };
+        };
+        responses: {
+            /** @description Bounded newline-delimited typed rows in primary-key order. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/x-ndjson": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Requested schema epoch is stale. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Read ownership or storage is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    mutateNamespaceRelationalRows: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalRowMutationRequest"];
+            };
+        };
+        responses: {
+            /** @description Atomic mutations committed. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            /** @description Durable commit decision; participant visibility or recovery is pending. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description A version precondition or relational constraint conflicted. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Write coordination is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    retryNamespaceIndex: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IndexMaintenanceRequest"];
+            };
+        };
+        responses: {
+            /** @description All selected owner maintenance commands acknowledged */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexMaintenanceResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["IndexMutationConflict"];
+            429: components["responses"]["StorageResourceExhausted"];
+            503: components["responses"]["IndexMutationServiceUnavailable"];
+        };
+    };
+    repairNamespaceIndex: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IndexMaintenanceRequest"];
+            };
+        };
+        responses: {
+            /** @description All selected owner maintenance commands acknowledged */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexMaintenanceResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["IndexMutationConflict"];
+            429: components["responses"]["StorageResourceExhausted"];
+            503: components["responses"]["IndexMutationServiceUnavailable"];
+        };
+    };
+    renameDatabase: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RenameCatalogResourceRequest"];
+            };
+        };
+        responses: {
+            /** @description Renamed with stable identity. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invalid name. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resource not found. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Name already exists or resource is protected. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    renameNamespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RenameCatalogResourceRequest"];
+            };
+        };
+        responses: {
+            /** @description Renamed with stable identity. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invalid name. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resource not found. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Name already exists or resource is protected. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    renameTablespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tablespaceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RenameCatalogResourceRequest"];
+            };
+        };
+        responses: {
+            /** @description Renamed with stable identity. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invalid name. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resource not found. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Name already exists or resource is protected. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    renameNamespaceTable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RenameCatalogResourceRequest"];
+            };
+        };
+        responses: {
+            /** @description Renamed with stable identity. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invalid name. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resource not found. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Name already exists or resource is protected. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    setNamespaceTableTablespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CatalogTablespaceBindingRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated namespace */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    clearNamespaceTableTablespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Updated namespace */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
             500: components["responses"]["InternalServerError"];
         };
     };
@@ -19370,6 +26584,9 @@ export interface operations {
                 resource: string;
                 /** @description The type of the resource for the permission to be removed. */
                 resourceType: components["schemas"]["ResourceType"];
+                database?: string;
+                namespace?: string;
+                all_tables?: boolean;
             };
             header?: never;
             path: {
@@ -19667,7 +26884,14 @@ export interface operations {
     };
     getSubjectRowFilter: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Explicit database; defaults to default when namespace is supplied. */
+                database?: string;
+                /** @description Explicit namespace; defaults to public when database is supplied. */
+                namespace?: string;
+                /** @description Select all tables in the explicit namespace instead of the literal path table. */
+                all_tables?: boolean;
+            };
             header?: never;
             path: {
                 /** @description Casbin subject name, such as role:tenant_reader or group:eng. */
@@ -19710,7 +26934,14 @@ export interface operations {
     };
     setSubjectRowFilter: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Explicit database; defaults to default when namespace is supplied. */
+                database?: string;
+                /** @description Explicit namespace; defaults to public when database is supplied. */
+                namespace?: string;
+                /** @description Select all tables in the explicit namespace instead of the literal path table. */
+                all_tables?: boolean;
+            };
             header?: never;
             path: {
                 /** @description Casbin subject name, such as role:tenant_reader or group:eng. */
@@ -19760,7 +26991,14 @@ export interface operations {
     };
     removeSubjectRowFilter: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Explicit database; defaults to default when namespace is supplied. */
+                database?: string;
+                /** @description Explicit namespace; defaults to public when database is supplied. */
+                namespace?: string;
+                /** @description Select all tables in the explicit namespace instead of the literal path table. */
+                all_tables?: boolean;
+            };
             header?: never;
             path: {
                 /** @description Casbin subject name, such as role:tenant_reader or group:eng. */
@@ -19801,7 +27039,14 @@ export interface operations {
     };
     getRowFilter: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Explicit database; defaults to default when namespace is supplied. */
+                database?: string;
+                /** @description Explicit namespace; defaults to public when database is supplied. */
+                namespace?: string;
+                /** @description Select all tables in the explicit namespace instead of the literal path table. */
+                all_tables?: boolean;
+            };
             header?: never;
             path: {
                 /** @description The username. */
@@ -19844,7 +27089,14 @@ export interface operations {
     };
     setRowFilter: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Explicit database; defaults to default when namespace is supplied. */
+                database?: string;
+                /** @description Explicit namespace; defaults to public when database is supplied. */
+                namespace?: string;
+                /** @description Select all tables in the explicit namespace instead of the literal path table. */
+                all_tables?: boolean;
+            };
             header?: never;
             path: {
                 /** @description The username. */
@@ -19903,7 +27155,14 @@ export interface operations {
     };
     removeRowFilter: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Explicit database; defaults to default when namespace is supplied. */
+                database?: string;
+                /** @description Explicit namespace; defaults to public when database is supplied. */
+                namespace?: string;
+                /** @description Select all tables in the explicit namespace instead of the literal path table. */
+                all_tables?: boolean;
+            };
             header?: never;
             path: {
                 /** @description The username. */
@@ -20100,7 +27359,14 @@ export interface operations {
     generateEmbeddings: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Set to `application/vnd.antfly.numeric.v1` to receive the values as a binary
+                 *     frame instead of JSON, which avoids serializing every float as text. Any
+                 *     other value, or none, returns the JSON body.
+                 */
+                Accept?: string;
+            };
             path?: never;
             cookie?: never;
         };
@@ -20117,6 +27383,7 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["InferenceEmbedResponse"];
+                    "application/vnd.antfly.numeric.v1": string;
                 };
             };
             /** @description Invalid request */
@@ -20239,16 +27506,23 @@ export interface operations {
             503: components["responses"]["TransientCapacity"];
         };
     };
-    rerankMultimodalPrompts: {
+    rerankDocuments: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Set to `application/vnd.antfly.numeric.v1` to receive the values as a binary
+                 *     frame instead of JSON, which avoids serializing every float as text. Any
+                 *     other value, or none, returns the JSON body.
+                 */
+                Accept?: string;
+            };
             path?: never;
             cookie?: never;
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["InferenceRerankMultimodalRequest"];
+                "application/json": components["schemas"]["InferenceRerankRequest"];
             };
         };
         responses: {
@@ -20259,6 +27533,7 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["InferenceRerankResponse"];
+                    "application/vnd.antfly.numeric.v1": string;
                 };
             };
             /** @description Invalid request or unsupported model */
@@ -20306,8 +27581,8 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Multimodal reranking contract recognized but encoder path not implemented yet */
-            501: {
+            /** @description Internal server error */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -20317,68 +27592,6 @@ export interface operations {
             };
             /** @description Remote content fetch failed */
             502: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
-            503: components["responses"]["TransientCapacity"];
-        };
-    };
-    rerankPrompts: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["InferenceRerankRequest"];
-            };
-        };
-        responses: {
-            /** @description Prompts reranked successfully */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceRerankResponse"];
-                };
-            };
-            /** @description Invalid request */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-            /** @description Authentication is enabled and valid credentials were not supplied */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-            /** @description Model not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-            /** @description Internal server error */
-            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -20869,6 +28082,523 @@ export interface operations {
             503: components["responses"]["TransientCapacity"];
         };
     };
+    dictate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InferenceDictateRequest"];
+            };
+        };
+        responses: {
+            /**
+             * @description Dictation result. Returns JSON for non-streaming requests, or
+             *     Server-Sent Events for streaming requests (stream: true).
+             */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceDictateResponse"];
+                    "text/event-stream": components["schemas"]["InferenceDictationEvent"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Model not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Audio exceeds the configured size limit */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
+        };
+    };
+    createTranscriptionSession: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InferenceTranscriptionSessionRequest"];
+            };
+        };
+        responses: {
+            /** @description Session created */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceTranscriptionSession"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Model not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Session limit reached */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
+        };
+    };
+    getTranscriptionSession: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Session state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceTranscriptionSession"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Session not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    deleteTranscriptionSession: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Session closed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceTranscriptionSessionDeleted"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Session not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Session is processing an append */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    streamTranscriptionSessionEvents: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Event stream */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/event-stream": components["schemas"]["InferenceTranscriptionStreamMessage"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Session not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    streamTranscriptionAudio: {
+        parameters: {
+            query?: {
+                /** @description Raw sample format. Default pcm16. */
+                format?: "pcm16" | "pcm_f32";
+                /** @description Sample rate of the raw stream. Default 16000. */
+                sample_rate?: number;
+                /** @description Finalize open speech at end of body. Default true. */
+                commit?: boolean;
+            };
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/octet-stream": string;
+            };
+        };
+        responses: {
+            /** @description Event stream */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/event-stream": components["schemas"]["InferenceTranscriptionStreamMessage"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Session or model not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Session is processing another request */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
+        };
+    };
+    appendTranscriptionAudio: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InferenceTranscriptionAudioAppend"];
+            };
+        };
+        responses: {
+            /** @description Events produced by this append */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceTranscriptionEventList"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Session or model not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Session is processing another append */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Audio exceeds the session buffer or size limit */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
+        };
+    };
+    decide: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InferenceDecideRequest"];
+            };
+        };
+        responses: {
+            /** @description Decision distributions and derived answers */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceDecideResponse"];
+                };
+            };
+            /** @description Invalid question or unsupported decision model */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Model not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description State, schema, or output exceeds an executor limit */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
+        };
+    };
     extract: {
         parameters: {
             query?: never;
@@ -20927,8 +28657,17 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Media content exceeds the configured size limit */
+            /** @description Media, text, schema, candidate graph, or output exceeds a configured size/work limit */
             413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Extraction hard constraints are infeasible, required record fields are missing, or bounded search exhausted without an accepted feasible witness */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -21017,7 +28756,14 @@ export interface operations {
     createEmbedding: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Set to `application/vnd.antfly.numeric.v1` to receive the values as a binary
+                 *     frame instead of JSON, which avoids serializing every float as text. Any
+                 *     other value, or none, returns the JSON body.
+                 */
+                Accept?: string;
+            };
             path?: never;
             cookie?: never;
         };
@@ -21034,6 +28780,7 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["InferenceEmbedResponse"];
+                    "application/vnd.antfly.numeric.v1": string;
                 };
             };
             /** @description Invalid request */

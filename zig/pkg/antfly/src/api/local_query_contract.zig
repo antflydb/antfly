@@ -3236,13 +3236,14 @@ pub fn parseStorageKernelDocumentArtifactManifestsResponse(alloc: std.mem.Alloca
 }
 
 pub fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) ![]u8 {
-    return try encodeQueryRequestWithGraphWireMode(alloc, req, false);
+    return try encodeQueryRequestWithGraphWireMode(alloc, req, false, false);
 }
 
 pub fn encodeQueryRequestWithGraphWireMode(
     alloc: std.mem.Allocator,
     req: db_mod.types.SearchRequest,
     allow_legacy_graph: bool,
+    include_aggregations: bool,
 ) ![]u8 {
     if (searchRequestHasUnserializableResolvedDocFilter(req)) return error.UnsupportedQueryRequest;
     if (req.dense != null and req.dense_queries.len > 0) return error.UnsupportedQueryRequest;
@@ -3260,8 +3261,23 @@ pub fn encodeQueryRequestWithGraphWireMode(
     var first = true;
     const has_named_embeddings = req.dense_queries.len > 0 or req.sparse_queries.len > 0;
 
+    if (include_aggregations and req.aggregations_json.len != 0) {
+        try appendJsonFieldName(alloc, &out, &first, "aggregations");
+        try out.appendSlice(alloc, req.aggregations_json);
+    }
+
     if (!req.include_all_fields) {
         try appendJsonFieldNames(alloc, &out, &first, "fields", req.fields);
+    }
+    if (req.highlight) |highlight| {
+        try appendJsonFieldName(alloc, &out, &first, "highlight");
+        const encoded = try std.json.Stringify.valueAlloc(alloc, .{
+            .fields = highlight.fields,
+            .fragment_size = highlight.fragment_size,
+            .max_fragments = highlight.max_fragments,
+        }, .{});
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
     }
     if (req.hierarchy_children != null or
         req.hierarchy_grouped_matches or
@@ -3283,6 +3299,9 @@ pub fn encodeQueryRequestWithGraphWireMode(
     }
     if (req.profile) {
         try appendJsonFieldBool(alloc, &out, &first, "profile", true);
+    }
+    if (req.search_effort) |value| {
+        try appendJsonFieldF32(alloc, &out, &first, "search_effort", value);
     }
     if (req.index_name) |index_name| {
         // The public `indexes` selector does not reconstruct the legacy
@@ -3419,6 +3438,11 @@ pub fn encodeQueryRequestWithGraphWireMode(
         );
     } else if (req.full_text) |full_text| {
         try appendTextQueryField(alloc, &out, &first, "full_text_search", full_text);
+    } else if ((dense_queries.len > 0 or sparse_queries.len > 0) and req.query == .match_all) {
+        // The storage request defaults to match-all, but a vector-only query
+        // has no text retrieval component. Serializing that default would make
+        // the owner parse it as an explicit full-text search and fuse arbitrary
+        // document-order hits into the ranked page.
     } else {
         try appendQueryField(alloc, &out, &first, req.query, req.limit);
     }
@@ -3431,14 +3455,109 @@ pub fn encodeStorageKernelQueryRequest(alloc: std.mem.Allocator, req: db_mod.typ
     // The compiled storage boundary remains in-process and must preserve the
     // deprecated public graph dialect for single-group compatibility. Generic
     // inter-node shard forwarding continues to reject that stateful dialect.
-    return try encodeQueryRequestWithGraphWireMode(alloc, req, true);
+    // Complete physical queries also own aggregation. Raw shard calls retain
+    // these search semantics and defer finalization through execution options.
+    return try encodeQueryRequestWithGraphWireMode(alloc, req, true, true);
 }
 
 pub const StorageKernelLookupWireRequest = struct {
     key: []const u8,
+    row_policy_principal_proof: []const u8 = "",
+    row_policy_database: []const u8 = "",
+    row_policy_receipt: ?struct {
+        generation: u64,
+        phase: @import("../system_catalog/policies.zig").Publication.Phase,
+    } = null,
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
+    include_primary_digest: bool = false,
+    restore_staging_scope: ?[32]u8 = null,
+    restore_staging_plan_id: ?[16]u8 = null,
+    relational_integrity_catalog: bool = false,
+    relational_integrity_action: bool = false,
+    relational_integrity_jobs_json: []const u8 = "",
+    relational_activation_json: []const u8 = "",
+    relational_index_status_json: []const u8 = "",
+    relational_topology_json: []const u8 = "",
+
+    pub fn options(self: StorageKernelLookupWireRequest) db_mod.types.LookupOptions {
+        return .{
+            .row_policy_principal_proof = self.row_policy_principal_proof,
+            .row_policy_database = self.row_policy_database,
+            .row_policy_receipt = if (self.row_policy_receipt) |receipt| .{ .generation = receipt.generation, .phase = receipt.phase } else null,
+            .fields = self.fields,
+            .include_all_fields = self.include_all_fields,
+            .include_primary_digest = self.include_primary_digest,
+            .restore_staging_scope = self.restore_staging_scope,
+            .restore_staging_plan_id = self.restore_staging_plan_id,
+            .relational_integrity_catalog = self.relational_integrity_catalog,
+            .relational_integrity_action = self.relational_integrity_action,
+            .relational_integrity_jobs_json = self.relational_integrity_jobs_json,
+            .relational_activation_json = self.relational_activation_json,
+            .relational_index_status_json = self.relational_index_status_json,
+            .relational_topology_json = self.relational_topology_json,
+        };
+    }
+
+    pub fn jsonStringify(self: StorageKernelLookupWireRequest, stream: anytype) @TypeOf(stream.*).Error!void {
+        try stream.beginObject();
+        inline for (@typeInfo(StorageKernelLookupWireRequest).@"struct".fields) |field| {
+            try stream.objectField(field.name);
+            if (comptime std.mem.eql(u8, field.name, "key") or std.mem.eql(u8, field.name, "restore_staging_scope") or std.mem.eql(u8, field.name, "restore_staging_plan_id")) {
+                try @import("../storage/db/relational_integrity_json.zig").write(@field(self, field.name), stream);
+            } else try stream.write(@field(self, field.name));
+        }
+        try stream.endObject();
+    }
 };
+
+pub fn integrityLookupMode(opts: db_mod.types.LookupOptions) bool {
+    return opts.row_policy_receipt != null or opts.relational_integrity_catalog or opts.relational_integrity_action or opts.relational_integrity_jobs_json.len != 0 or opts.relational_index_status_json.len != 0 or opts.relational_activation_json.len != 0 or opts.relational_topology_json.len != 0;
+}
+
+test "compiled lookup wire preserves binary scope and every integrity control" {
+    const alloc = std.testing.allocator;
+    const scope: [32]u8 = @splat(0xff);
+    const options: db_mod.types.LookupOptions = .{
+        .fields = &.{"id"},
+        .include_all_fields = false,
+        .include_primary_digest = true,
+        .restore_staging_scope = scope,
+        .restore_staging_plan_id = @splat(0xfe),
+        .relational_integrity_catalog = true,
+        .relational_integrity_action = true,
+        .relational_integrity_jobs_json = "{\"kind\":\"references\"}",
+        .relational_activation_json = "{\"mode\":\"status\"}",
+        .relational_index_status_json = "{\"name\":\"by_id\",\"schema_version\":2}",
+        .relational_topology_json = "{\"mode\":\"identity\"}",
+        .fk_generation_source_control = true,
+        .fk_generation_source_read_index_certified = true,
+        .generation_handoff_install_read_index_certified = true,
+        .row_policy_receipt = .{ .generation = 9, .phase = .pending_install },
+        .execution_deadline_ns = 1234,
+    };
+    const encoded = try encodeStorageKernelLookupRequest(alloc, "\xff\x00\x80", options);
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "fk_generation_source_control") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "fk_generation_source_read_index_certified") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "generation_handoff_install_read_index_certified") == null);
+    var decoded = try std.json.parseFromSlice(StorageKernelLookupWireRequest, alloc, encoded, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings("\xff\x00\x80", decoded.value.key);
+    const actual = decoded.value.options();
+    try std.testing.expectEqualSlices(u8, &scope, &actual.restore_staging_scope.?);
+    try std.testing.expectEqual(options.restore_staging_plan_id, actual.restore_staging_plan_id);
+    try std.testing.expect(actual.include_primary_digest and !actual.include_all_fields);
+    try std.testing.expect(actual.relational_integrity_catalog and actual.relational_integrity_action);
+    try std.testing.expectEqualStrings(options.relational_integrity_jobs_json, actual.relational_integrity_jobs_json);
+    try std.testing.expectEqualStrings(options.relational_activation_json, actual.relational_activation_json);
+    try std.testing.expectEqualStrings(options.relational_index_status_json, actual.relational_index_status_json);
+    try std.testing.expectEqualStrings(options.relational_topology_json, actual.relational_topology_json);
+    try std.testing.expectEqual(@as(u64, 9), actual.row_policy_receipt.?.generation);
+    try std.testing.expectEqual(@as(@import("../system_catalog/policies.zig").Publication.Phase, .pending_install), actual.row_policy_receipt.?.phase);
+    try std.testing.expectEqualStrings("id", actual.fields[0]);
+    try std.testing.expect(actual.execution_deadline_ns == null and actual.execution_io == null and actual.cancellation == null);
+}
 
 pub fn encodeStorageKernelLookupRequest(
     alloc: std.mem.Allocator,
@@ -3447,8 +3566,20 @@ pub fn encodeStorageKernelLookupRequest(
 ) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, StorageKernelLookupWireRequest{
         .key = key,
+        .row_policy_principal_proof = opts.row_policy_principal_proof,
+        .row_policy_database = opts.row_policy_database,
+        .row_policy_receipt = if (opts.row_policy_receipt) |receipt| .{ .generation = receipt.generation, .phase = receipt.phase } else null,
         .fields = opts.fields,
         .include_all_fields = opts.include_all_fields,
+        .include_primary_digest = opts.include_primary_digest,
+        .restore_staging_scope = opts.restore_staging_scope,
+        .restore_staging_plan_id = opts.restore_staging_plan_id,
+        .relational_integrity_catalog = opts.relational_integrity_catalog,
+        .relational_integrity_action = opts.relational_integrity_action,
+        .relational_integrity_jobs_json = opts.relational_integrity_jobs_json,
+        .relational_activation_json = opts.relational_activation_json,
+        .relational_index_status_json = opts.relational_index_status_json,
+        .relational_topology_json = opts.relational_topology_json,
     }, .{});
 }
 
@@ -3506,6 +3637,38 @@ pub const StorageKernelScanWireRequest = struct {
     include_all_fields: bool = true,
     filter_query_json: []const u8 = "",
     include_content_hashes: bool = false,
+    relational_query_json: []const u8 = "",
+    row_policy_principal_proof: []const u8 = "",
+    row_policy_database: []const u8 = "",
+    relational_query: ?db_mod.types.RelationalRowQuery = null,
+
+    pub fn options(self: StorageKernelScanWireRequest) db_mod.types.ScanOptions {
+        return .{
+            .inclusive_from = self.inclusive_from,
+            .exclusive_to = self.exclusive_to,
+            .include_documents = self.include_documents,
+            .limit = self.limit,
+            .fields = self.fields,
+            .include_all_fields = self.include_all_fields,
+            .filter_query_json = self.filter_query_json,
+            .include_content_hashes = self.include_content_hashes,
+            .relational_query_json = self.relational_query_json,
+            .row_policy_principal_proof = self.row_policy_principal_proof,
+            .row_policy_database = self.row_policy_database,
+            .relational_query = self.relational_query,
+        };
+    }
+
+    pub fn jsonStringify(self: StorageKernelScanWireRequest, stream: anytype) @TypeOf(stream.*).Error!void {
+        try stream.beginObject();
+        inline for (@typeInfo(StorageKernelScanWireRequest).@"struct".fields) |field| {
+            try stream.objectField(field.name);
+            if (comptime std.mem.eql(u8, field.name, "from_key") or std.mem.eql(u8, field.name, "to_key")) {
+                try @import("../storage/db/relational_integrity_json.zig").write(@field(self, field.name), stream);
+            } else try stream.write(@field(self, field.name));
+        }
+        try stream.endObject();
+    }
 };
 
 pub fn encodeStorageKernelScanRequest(
@@ -3525,6 +3688,10 @@ pub fn encodeStorageKernelScanRequest(
         .include_all_fields = opts.include_all_fields,
         .filter_query_json = opts.filter_query_json,
         .include_content_hashes = opts.include_content_hashes,
+        .relational_query_json = opts.relational_query_json,
+        .row_policy_principal_proof = opts.row_policy_principal_proof,
+        .row_policy_database = opts.row_policy_database,
+        .relational_query = opts.relational_query,
     }, .{});
 }
 
@@ -3537,9 +3704,37 @@ pub fn encodeStorageKernelScanNdjson(
     defer out.deinit(alloc);
     for (result.hashes, 0..) |entry, i| {
         const json = if (include_documents) result.documents[i].json else null;
-        try appendScanLine(alloc, &out, entry.id, json, entry.content_hash);
+        if (entry.relational_schema_version) |version| {
+            try appendRelationalScanLine(alloc, &out, .{ .id = entry.id, .hash = entry.hash, .document_json = json, .content_hash = entry.content_hash, .relational_schema_version = version, .relational_cursor = entry.relational_cursor, .json_null_fields = entry.json_null_fields }, version);
+        } else try appendScanLine(alloc, &out, entry.id, json, entry.content_hash);
     }
     return try out.toOwnedSlice(alloc);
+}
+
+test "compiled typed scan preserves filter projection and versioned row envelope" {
+    const alloc = std.testing.allocator;
+    const query = "{\"schema_version\":7,\"fields\":[\"count\"]}";
+    const filter = "{\"term\":\"tenant-a\"}";
+    const encoded = try encodeStorageKernelScanRequest(alloc, "\x80", "\xff", .{ .relational_query_json = query, .filter_query_json = filter, .include_documents = true, .include_all_fields = false, .fields = &.{"count"}, .limit = 12 });
+    defer alloc.free(encoded);
+    var decoded = try std.json.parseFromSlice(StorageKernelScanWireRequest, alloc, encoded, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings("\x80", decoded.value.from_key);
+    try std.testing.expectEqualStrings("\xff", decoded.value.to_key);
+    try std.testing.expectEqualStrings(query, decoded.value.options().relational_query_json);
+    try std.testing.expectEqualStrings(filter, decoded.value.options().filter_query_json);
+    try std.testing.expectEqualStrings("count", decoded.value.options().fields[0]);
+    try std.testing.expect(!decoded.value.options().include_all_fields);
+    const row = "{\"count\":9007199254740993}";
+    var hashes = [_]db_mod.types.ScanHash{.{ .id = @constCast("doc:a"), .hash = 9007199254740993, .relational_schema_version = 7 }};
+    var documents = [_]db_mod.types.ScanDocument{.{ .id = @constCast("doc:a"), .json = @constCast(row) }};
+    const buffered = try encodeStorageKernelScanNdjson(alloc, .{ .hashes = &hashes, .documents = &documents }, true);
+    defer alloc.free(buffered);
+    var streamed: std.ArrayListUnmanaged(u8) = .empty;
+    defer streamed.deinit(alloc);
+    try appendRelationalScanLine(alloc, &streamed, .{ .id = "doc:a", .hash = hashes[0].hash, .document_json = row, .relational_schema_version = 7 }, 7);
+    try std.testing.expectEqualStrings(buffered, streamed.items);
+    try std.testing.expectEqualStrings("{\"_id\":\"doc:a\",\"version\":\"9007199254740993\",\"schema_version\":7,\"row\":{\"count\":9007199254740993}}\n", buffered);
 }
 
 pub const StorageKernelDynamicFieldObservationWireRequest = struct {
@@ -4539,6 +4734,7 @@ pub fn parseRemoteSearchResultInner(alloc: std.mem.Allocator, body: []const u8) 
         hit.ancestor_unit_data = try remoteHierarchyAncestorDocumentAlloc(alloc, item.hierarchy, .unit);
         hit.artifact_ref = try parseRemoteHierarchyArtifactRefAlloc(alloc, item.hierarchy);
         hit.chunk_hits = try parseRemoteHierarchyMatchesAlloc(alloc, item.hierarchy);
+        hit.highlights = try parseRemoteHighlightsAlloc(alloc, item._highlights);
         hits[i] = hit;
         initialized += 1;
     }
@@ -4710,6 +4906,51 @@ pub fn parseRemoteArtifactKind(value: []const u8) !db_mod.types.ArtifactKind {
     return error.InvalidQueryRequest;
 }
 
+fn parseRemoteHighlightsAlloc(
+    alloc: std.mem.Allocator,
+    maybe_value: ?std.json.ArrayHashMap([]const metadata_openapi.HighlightFragment),
+) ![]db_mod.types.HighlightedField {
+    const value = maybe_value orelse return &.{};
+    if (value.map.count() == 0) return &.{};
+
+    var out = std.ArrayListUnmanaged(db_mod.types.HighlightedField).empty;
+    errdefer {
+        for (out.items) |*item| db_mod.types.freeHighlightedField(alloc, item);
+        out.deinit(alloc);
+    }
+    var it = value.map.iterator();
+    while (it.next()) |entry| {
+        const field = try alloc.dupe(u8, entry.key_ptr.*);
+        errdefer alloc.free(field);
+        var fragments = std.ArrayListUnmanaged(db_mod.types.HighlightFragment).empty;
+        errdefer {
+            for (fragments.items) |*fragment| db_mod.types.freeHighlightFragment(alloc, fragment);
+            fragments.deinit(alloc);
+        }
+        for (entry.value_ptr.*) |fragment| {
+            if (fragment.offset < 0) return error.InvalidQueryRequest;
+            const text = try alloc.dupe(u8, fragment.text);
+            errdefer alloc.free(text);
+            const spans = try alloc.alloc(db_mod.types.HighlightSpan, fragment.spans.len);
+            errdefer alloc.free(spans);
+            for (fragment.spans, spans) |span, *dst| {
+                if (span.start < 0 or span.end < span.start or span.end > @as(i64, @intCast(fragment.text.len))) return error.InvalidQueryRequest;
+                dst.* = .{ .start = @intCast(span.start), .end = @intCast(span.end) };
+            }
+            try fragments.append(alloc, .{
+                .text = text,
+                .offset = std.math.cast(u32, fragment.offset) orelse return error.InvalidQueryRequest,
+                .item = if (fragment.item) |index| (std.math.cast(u32, index) orelse return error.InvalidQueryRequest) else null,
+                .spans = spans,
+            });
+        }
+        // Keep fragments owned by their cleanup until the destination can accept them.
+        try out.ensureUnusedCapacity(alloc, 1);
+        out.appendAssumeCapacity(.{ .field = field, .fragments = try fragments.toOwnedSlice(alloc) });
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
 pub fn parseRemoteIndexScoresAlloc(
     alloc: std.mem.Allocator,
     maybe_value: ?std.json.ArrayHashMap(f64),
@@ -4870,7 +5111,7 @@ pub fn parseRemoteGraphResults(
     return results;
 }
 
-pub fn remoteGraphReturnedItemsMatch(value: i64, actual: usize) bool {
+pub fn remoteGraphReturnedItemsMatch(value: anytype, actual: usize) bool {
     const parsed = std.math.cast(usize, value) orelse return false;
     return parsed == actual;
 }
@@ -5560,6 +5801,29 @@ pub fn appendJsonStringArray(
     try out.append(alloc, ']');
 }
 
+pub fn appendRelationalScanLine(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), entry: db_mod.types.ScanVisitEntry, schema_version: u32) !void {
+    const projected = entry.document_json orelse "{}";
+    if (out.items.len +| projected.len +| entry.id.len > 16 * 1024 * 1024) return error.RelationalRowsOutputBudgetExceeded;
+    const header = try std.fmt.allocPrint(alloc, "{{\"_id\":{f},\"version\":\"{d}\",\"schema_version\":{d},\"row\":", .{ std.json.fmt(entry.id, .{}), entry.hash, schema_version });
+    defer alloc.free(header);
+    const cursor_bytes = if (entry.relational_cursor) |cursor| cursor.len +| 12 else @as(usize, 0);
+    const null_fields = if (entry.json_null_fields.len != 0) try std.json.Stringify.valueAlloc(alloc, entry.json_null_fields, .{}) else null;
+    defer if (null_fields) |bytes| alloc.free(bytes);
+    const null_bytes = if (null_fields) |bytes| bytes.len +| 20 else @as(usize, 0);
+    if (header.len +| projected.len +| cursor_bytes +| null_bytes +| 2 > (16 * 1024 * 1024) -| out.items.len) return error.RelationalRowsOutputBudgetExceeded;
+    try out.appendSlice(alloc, header);
+    try out.appendSlice(alloc, projected);
+    if (null_fields) |bytes| {
+        try out.appendSlice(alloc, ",\"json_null_fields\":");
+        try out.appendSlice(alloc, bytes);
+    }
+    if (entry.relational_cursor) |cursor| {
+        try out.appendSlice(alloc, ",\"cursor\":");
+        try appendJsonString(alloc, out, cursor);
+    }
+    try out.appendSlice(alloc, "}\n");
+}
+
 pub fn appendScanLine(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -6084,7 +6348,29 @@ pub fn appendGraphMetricRerankField(
         .published => "published",
         .fresh => "fresh",
     });
+    try appendGraphMetricPersonalizationFields(alloc, out, &rerank_first, rerank.seed_nodes, rerank.damping);
     try out.append(alloc, '}');
+}
+
+fn appendGraphMetricPersonalizationFields(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    seed_nodes: []const []const u8,
+    damping: ?f64,
+) !void {
+    if (seed_nodes.len != 0) {
+        try appendJsonFieldName(alloc, out, first, "seed_nodes");
+        try out.append(alloc, '[');
+        for (seed_nodes, 0..) |seed, i| {
+            if (i > 0) try out.append(alloc, ',');
+            try appendJsonString(alloc, out, seed);
+        }
+        try out.append(alloc, ']');
+    }
+    if (damping) |value| {
+        try appendJsonFieldF64(alloc, out, first, "damping", value);
+    }
 }
 
 pub fn appendGraphMetricQueryField(
@@ -6112,6 +6398,7 @@ pub fn appendGraphMetricQueryField(
                 .published => "published",
                 .fresh => "fresh",
             });
+            try appendGraphMetricPersonalizationFields(alloc, out, &metric_first, named.query.seed_nodes, named.query.damping);
             try out.append(alloc, '}');
         }
         try out.append(alloc, ']');
@@ -6130,6 +6417,7 @@ pub fn appendGraphMetricQueryField(
         .published => "published",
         .fresh => "fresh",
     });
+    try appendGraphMetricPersonalizationFields(alloc, out, &metric_first, named.query.seed_nodes, named.query.damping);
     try out.append(alloc, '}');
 }
 

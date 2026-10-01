@@ -65,6 +65,7 @@ pub const Parser = struct {
     path: ?[]const u8 = null,
     version: types.Version = .HTTP_1_1,
     status_code: ?u16 = null,
+    status_code_is_three_digits: bool = false,
     headers: Headers,
     body_buffer: std.ArrayListUnmanaged(u8) = .empty,
     /// Whether parsed body bytes should be retained in `body_buffer`.
@@ -218,6 +219,7 @@ pub const Parser = struct {
         self.path = null;
         self.path_owned = false;
         self.status_code = null;
+        self.status_code_is_three_digits = false;
         self.headers.clear();
         // Release oversized buffers to prevent permanent memory inflation
         // from occasional large requests on long-lived keep-alive connections.
@@ -379,6 +381,8 @@ pub const Parser = struct {
             self.error_reason = .malformed_status_line;
             return lr.consumed;
         };
+        self.status_code_is_three_digits = status_str.len == 3 and
+            std.ascii.isDigit(status_str[0]) and std.ascii.isDigit(status_str[1]) and std.ascii.isDigit(status_str[2]);
 
         try self.bumpHeaderBytes(line.len);
 
@@ -484,7 +488,7 @@ pub const Parser = struct {
             }
         }
         if (self.mode == .request and !self.headers_only and
-            self.content_length != null and self.content_length.? > 0 and !self.chunked)
+            (self.chunked or (self.content_length != null and self.content_length.? > 0)))
         {
             if (self.request_body_streaming_resolver) |resolve| {
                 if (self.request_body_streaming_context) |context| {
@@ -1150,4 +1154,27 @@ test "response headers parse when CRLF splits across feeds" {
     try std.testing.expectEqual(@as(?u16, 200), parser.status_code);
     try std.testing.expectEqualStrings("application/json", parser.headers.get("Content-Type").?);
     try std.testing.expect(parser.chunked);
+}
+
+test "error envelope status provenance resets between reused responses" {
+    var parser = Parser.initResponse(std.testing.allocator);
+    defer parser.deinit();
+    const cases = [_]struct { status: []const u8, valid: bool }{
+        .{ .status = "404", .valid = true },
+        .{ .status = "0404", .valid = false },
+        .{ .status = "503", .valid = true },
+        .{ .status = "+404", .valid = false },
+        .{ .status = "4_04", .valid = false },
+        .{ .status = "200", .valid = true },
+    };
+    for (cases) |case| {
+        parser.reset();
+        try std.testing.expect(!parser.status_code_is_three_digits);
+        parser.headers_only = true;
+        const head = try std.fmt.allocPrint(std.testing.allocator, "HTTP/1.1 {s} Response\r\nContent-Length: 0\r\n\r\n", .{case.status});
+        defer std.testing.allocator.free(head);
+        _ = try parser.feed(head);
+        try std.testing.expect(parser.isComplete());
+        try std.testing.expectEqual(case.valid, parser.status_code_is_three_digits);
+    }
 }

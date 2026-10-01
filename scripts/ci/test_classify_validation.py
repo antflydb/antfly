@@ -36,6 +36,17 @@ class ClassifyValidationTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertTrue(classify([path])["sdk"])
 
+    def test_lite_binding_changes_run_the_sdk_suite(self) -> None:
+        for path in (
+            "go/pkg/lite/lite_cgo.go",
+            "py/packages/lite/src/antfly_lite/_database.py",
+            "rs/crates/lite/src/lib.rs",
+            "rs/crates/lite-sys/src/lib.rs",
+            "zig/pkg/antfly/capi-conformance/cases/open_modes.json",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(classify([path])["sdk"])
+
     def test_openapi_tool_environment_runs_the_sdk_suite(self) -> None:
         for path in ("scripts/pyproject.toml", "scripts/uv.lock"):
             with self.subTest(path=path):
@@ -61,9 +72,11 @@ class ClassifyValidationTests(unittest.TestCase):
         self.assertFalse(scopes["antfarm_e2e"])
 
     def test_formatter_infrastructure_checks_every_language(self) -> None:
-        scopes = classify(["scripts/format.sh"])
-        for language in ("zig", "go", "python", "typescript", "rust"):
-            self.assertTrue(scopes[f"format_{language}"])
+        for path in ("scripts/format.sh", "ruff.toml"):
+            with self.subTest(path=path):
+                scopes = classify([path])
+                for language in ("zig", "go", "python", "typescript", "rust"):
+                    self.assertTrue(scopes[f"format_{language}"])
 
     def test_shared_validation_infrastructure_runs_every_contract(self) -> None:
         for path in (

@@ -729,7 +729,7 @@ const GraphReplayAccumulator = struct {
     }
 
     fn recordGraphWrite(self: *GraphReplayAccumulator, write: types.GraphEdgeWrite) !void {
-        const owned_key = try internal_keys.graphRelationshipArtifactKeyAlloc(self.alloc, if (write.owner_document.len > 0) write.owner_document else write.source, write.index_name, write.edge_type, write.target, write.source, write.edge_id);
+        const owned_key = try internal_keys.graphRelationshipArtifactKeyAlloc(self.alloc, if (write.owner_document.len > 0) write.owner_document else if (write.owner.len > 0) write.owner else write.source, write.index_name, write.edge_type, write.target, write.source, write.edge_id);
         errdefer self.alloc.free(owned_key);
 
         if (self.graph_deletes.fetchRemove(owned_key)) |removed| {
@@ -763,7 +763,7 @@ const GraphReplayAccumulator = struct {
             self.deleted_keys.contains(delete.source) or self.deleted_keys.contains(delete.target) or
                 self.doc_clears.contains(delete.source) or self.doc_clears.contains(delete.target)) return;
 
-        const owned_key = try internal_keys.graphRelationshipArtifactKeyAlloc(self.alloc, if (delete.owner_document.len > 0) delete.owner_document else delete.source, delete.index_name, delete.edge_type, delete.target, delete.source, delete.edge_id);
+        const owned_key = try internal_keys.graphRelationshipArtifactKeyAlloc(self.alloc, if (delete.owner_document.len > 0) delete.owner_document else if (delete.owner.len > 0) delete.owner else delete.source, delete.index_name, delete.edge_type, delete.target, delete.source, delete.edge_id);
         errdefer self.alloc.free(owned_key);
 
         if (self.graph_writes.fetchRemove(owned_key)) |removed| {
@@ -797,7 +797,7 @@ const GraphReplayAccumulator = struct {
         var writes_it = self.graph_writes.iterator();
         while (writes_it.next()) |entry| {
             const write = entry.value_ptr.*;
-            if (if (write.owner_document.len > 0 and !std.mem.eql(u8, write.owner_document, write.source)) std.mem.eql(u8, write.owner_document, key) else (std.mem.eql(u8, write.source, key) or std.mem.eql(u8, write.target, key))) {
+            if (if (!std.mem.eql(u8, write.producingDocument(), write.source)) std.mem.eql(u8, write.producingDocument(), key) else (std.mem.eql(u8, write.source, key) or std.mem.eql(u8, write.target, key))) {
                 try remove_keys.append(self.alloc, try self.alloc.dupe(u8, entry.key_ptr.*));
             }
         }
@@ -815,7 +815,7 @@ const GraphReplayAccumulator = struct {
         var deletes_it = self.graph_deletes.iterator();
         while (deletes_it.next()) |entry| {
             const delete = entry.value_ptr.*;
-            if (if (delete.owner_document.len > 0 and !std.mem.eql(u8, delete.owner_document, delete.source)) std.mem.eql(u8, delete.owner_document, key) else (std.mem.eql(u8, delete.source, key) or std.mem.eql(u8, delete.target, key))) {
+            if (if (!std.mem.eql(u8, delete.producingDocument(), delete.source)) std.mem.eql(u8, delete.producingDocument(), key) else (std.mem.eql(u8, delete.source, key) or std.mem.eql(u8, delete.target, key))) {
                 try remove_keys.append(self.alloc, try self.alloc.dupe(u8, entry.key_ptr.*));
             }
         }

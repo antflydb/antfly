@@ -20,12 +20,44 @@ const CancellationToken = @import("../common/cancellation.zig").CancellationToke
 const platform_time = @import("antfly_platform").time;
 
 pub const format_version: u32 = 2;
+
+pub fn validateArtifactRelativePath(path: []const u8) !void {
+    if (path.len == 0 or path.len > 4096 or std.fs.path.isAbsolute(path) or std.mem.indexOfScalar(u8, path, '\\') != null or std.mem.indexOfScalar(u8, path, 0) != null) {
+        return error.InvalidBackupArtifactPath;
+    }
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return error.InvalidBackupArtifactPath;
+    }
+}
 pub const backup_fence_metadata_group_id_header = "X-Antfly-Backup-Metadata-Group-Id";
 pub const backup_fence_metadata_incarnation_header = "X-Antfly-Backup-Metadata-Incarnation";
 pub const backup_fence_table_id_header = "X-Antfly-Backup-Table-Id";
 pub const backup_fence_definition_header = "X-Antfly-Backup-Definition-SHA256";
 pub const backup_fence_topology_count_header = "X-Antfly-Backup-Topology-Count";
 pub const backup_fence_topology_header = "X-Antfly-Backup-Topology-SHA256";
+pub const backup_cohort_fence_header = "X-Antfly-Backup-Cohort-Fence";
+pub const backup_pin_control_header = "X-Antfly-Backup-Pin-Control";
+pub const backup_sealed_handle_header = "X-Antfly-Backup-Sealed-Handle";
+pub const SealedHandle = @import("../metadata/backup_cohort.zig").SealReceipt;
+
+pub fn sealedHandleForGroup(handles: []const SealedHandle, group_id: u64) !?SealedHandle {
+    if (handles.len == 0) return null;
+    for (handles) |handle| if (handle.handle.fence.owner_group_id == group_id) return handle;
+    return error.InvalidBackupFence;
+}
+
+pub fn parseBackupCohortFenceHeader(value: ?[]const u8) !?@import("../storage/db/relational_integrity_topology_contract.zig").Fence {
+    const raw = value orelse return null;
+    const Fence = @import("../storage/db/relational_integrity_topology_contract.zig").Fence;
+    const Encoded = @typeInfo(@typeInfo(@TypeOf(Fence.encode)).@"fn".return_type.?).error_union.payload;
+    var bytes: Encoded = undefined;
+    if (raw.len != bytes.len * 2) return error.InvalidBackupFence;
+    _ = std.fmt.hexToBytes(&bytes, raw) catch return error.InvalidBackupFence;
+    const fence = Fence.decode(&bytes) catch return error.InvalidBackupFence;
+    if (fence.role != .backup_snapshot) return error.InvalidBackupFence;
+    return fence;
+}
 pub const backup_writer_not_after_header = "X-Antfly-Backup-Writer-Not-After-Unix-Ns";
 /// Relative storage-owner execution budget. The coordinator retains a small
 /// response reserve and never sends its process-local monotonic timestamp.
@@ -115,6 +147,8 @@ pub fn tableDefinitionDigest(
     return hasher.finalResult();
 }
 
+pub const SourceGenerationAdmissionSummaryEntry = @import("../storage/portable_backup.zig").SourceGenerationAdmissionSummaryEntry;
+
 pub const ShardSnapshot = struct {
     group_id: u64,
     /// Logical range identity is distinct from the physical Raft group after
@@ -133,6 +167,10 @@ pub const ShardSnapshot = struct {
     /// only when the authoritative inventory itself is unchanged.
     native_manifest_size_bytes: u64 = 0,
     native_manifest_sha256: []const u8 = "",
+    /// Exact sealed source-owner evidence for this physical range. Different
+    /// parent ranges can have different accepted scopes and revisions.
+    accepted_generation_summary: []const SourceGenerationAdmissionSummaryEntry = &.{},
+    accepted_generation_summary_digest: ?[32]u8 = null,
 
     pub fn deinit(self: ShardSnapshot, alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.start_key));
@@ -140,15 +178,22 @@ pub const ShardSnapshot = struct {
         alloc.free(@constCast(self.snapshot_path));
         if (self.artifact_sha256.len > 0) alloc.free(@constCast(self.artifact_sha256));
         if (self.native_manifest_sha256.len > 0) alloc.free(@constCast(self.native_manifest_sha256));
+        for (self.accepted_generation_summary) |entry| {
+            alloc.free(@constCast(entry.child_table_name));
+            alloc.free(@constCast(entry.constraint_name));
+        }
+        if (self.accepted_generation_summary.len != 0) alloc.free(@constCast(self.accepted_generation_summary));
     }
 };
 
 pub const TableBackupManifest = struct {
+    pub const AcceptedGeneration = SourceGenerationAdmissionSummaryEntry;
     format_version: u32 = format_version,
     format: BackupFormat,
     artifact_integrity_mode: ArtifactIntegrityMode = .declared,
     backup_id: []const u8,
     table_name: []const u8,
+    table_id: u64 = 0,
     description: []const u8,
     schema_json: []const u8,
     read_schema_json: []const u8,
@@ -194,6 +239,10 @@ pub const TableBackupPlan = struct {
     /// group. Public/coordinator callers leave this null and resolve the full
     /// fenced table topology before fan-out.
     target_group_id: ?u64 = null,
+    /// Private common-cut authorization. It is checked under the native
+    /// snapshot lock, not merely observed by the distributed coordinator.
+    relational_cohort_fence: ?@import("../storage/db/relational_integrity_topology_contract.zig").Fence = null,
+    sealed_handles: []const SealedHandle = &.{},
     /// Borrowed cooperative cancellation for capture, hashing, and local
     /// materialization. Durable publication still reports ambiguity according
     /// to the backup protocol once its commit point has been crossed.
@@ -204,6 +253,12 @@ pub const TableBackupPlan = struct {
     deadline_ns: ?u64 = null,
 
     pub fn ensureActive(self: @This()) !void {
+        if (self.sealed_handles.len != 0 and self.relational_cohort_fence != null) return error.InvalidBackupRequest;
+        if (self.relational_cohort_fence) |cohort| {
+            if (self.format != .native or cohort.role != .backup_snapshot or
+                (self.target_group_id != null and self.target_group_id.? != cohort.owner_group_id))
+                return error.InvalidBackupRequest;
+        }
         try self.cancellation.check();
         if (self.deadline_ns) |deadline_ns|
             if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
@@ -216,6 +271,9 @@ pub const TableBackupPlan = struct {
 pub const BackupOperationControl = struct {
     deadline_ns: u64,
     cancellation: CancellationToken = .none,
+    sealed_handles: []const SealedHandle = &.{},
+    capture_node_id: ?u64 = null,
+    owner_local_only: bool = false,
 
     pub fn ensureActive(self: @This()) !void {
         try self.cancellation.check();

@@ -1124,37 +1124,21 @@ The build now has explicit memory-model plumbing:
 - `zig build -Dwasm=true -Dwasm-memory-model=wasm32 wasm`
 - `zig build -Dwasm=true -Dwasm-memory-model=wasm64 wasm`
 
-Current status:
+Current status: `wasm32` remains the supported path, and `wasm64` target
+selection and shared profile plumbing are in place alongside it. The build
+emits profile-specific artifacts, `zig-out/bin/antfly-inference-wasm32.wasm`
+and `zig-out/bin/antfly-inference-wasm64.wasm`; the `wasm32` build also
+installs `zig-out/bin/antfly-inference.wasm` as a compatibility alias, and
+both the JS host runtime and the Node test harness resolve those
+profile-specific names first before falling back to the legacy alias.
+Most of `src/wasm_entry.zig`'s model/tokenizer/task-specific logic has been
+split out into dedicated `src/web/*_api.zig` and `src/web/*.zig` modules
+behind thin `wasm32`/`wasm64` export shims, and local build verification
+passes for both profiles.
 
-- `wasm32` remains the supported path
-- `wasm64` target selection and shared profile plumbing are in place
-- model/tokenizer handle state has started moving out of `src/wasm_entry.zig` into `src/web/runtime_state.zig`
-- GPT/T5 KV-cache slot state and lifecycle have started moving out of `src/wasm_entry.zig` into `src/web/cache_state.zig`
-- host-facing buffer-length conversion is now centralized in `src/web/host_abi.zig`, and the main JS-facing pointer/slice exports in `src/wasm_entry.zig` now route host buffer lengths through `HostSize` instead of hardcoded `u32`
-- tokenizer semantics and early task-specific execution paths have started moving out of `src/wasm_entry.zig` into `src/web/audio_api.zig`, `src/web/tokenizer_api.zig`, `src/web/bert_api.zig`, `src/web/rerank_api.zig`, `src/web/gliner_api.zig`, `src/web/clip_api.zig`, `src/web/whisper_api.zig`, `src/web/clap_api.zig`, `src/web/florence_api.zig`, and `src/web/t5_api.zig`
-- shared SafeTensors conversion and registration logic is now centralized in `src/web/weight_loader.zig`
-- JS host ABI adaptation is now centralized in `web/runtime/wasm-abi.js` and wired through the current `inference-web.js` and `inference-worker.js` host surface, including generic model loading, GPT, tokenizer, rerank, GLiNER, CLIP, Whisper, CLAP, Florence, T5, and multimodal vision paths
-- WebGPU host imports now explicitly coerce host pointers/sizes to JS-safe indices instead of assuming raw `wasm32` numbers
-- the Antfly inference wasm root now provides freestanding `PATH_MAX` / `NAME_MAX` overrides for Zig stdlib code that already consults `root.os`
-- shared wasm runtime state / cache state access and GPU KV-format parsing are now centralized in `src/web/entry_context.zig`
-- generic BERT GGUF / SafeTensors load and embedding now route through `src/web/bert_api.zig`, and CLIP / GLiNER model loading now route through their helper modules
-- GPT decoder-only loading / registration / forward / cached-forward / multimodal forward has started moving out of `src/wasm_entry.zig` into `src/web/gpt_api.zig`
-- T5 encoder-decoder loading / encode / decode / cached-decode has started moving out of `src/wasm_entry.zig` into `src/web/t5_api.zig`
-- the export surface is now split into `src/web/exports_core.zig` and `src/web/exports_generation.zig`, with `src/wasm_entry.zig` reduced to a thin freestanding root that imports those shims
-- build-time profile selection now uses explicit `src/wasm_entry_wasm32.zig` / `src/wasm_entry_wasm64.zig` roots and `src/web/exports_wasm32.zig` / `src/web/exports_wasm64.zig` shims instead of a single generic root
-- the build now emits `zig-out/bin/antfly-inference-wasm32.wasm` and `zig-out/bin/antfly-inference-wasm64.wasm`; the `wasm32` build also installs `zig-out/bin/antfly-inference.wasm` as a compatibility alias
-- `web/inference-web.js` and `web/inference-worker.js` now understand profile-specific artifact names, default `wasmMemoryModel` to `auto`, probe `memory64` support before instantiation, and fall back from `antfly-inference-wasm64.wasm` / `antfly-inference-wasm32.wasm` to legacy `antfly-inference.wasm`
-- the local Node-based wasm tests now share `web/test-wasm-path.mjs`, which resolves profile-specific artifacts first and can be steered with `ANTFLY_INFERENCE_WASM_MEMORY_MODEL=wasm32|wasm64`
-- the raw Node tests now share `web/test-wasm-runtime.mjs`, including `test-wasm.mjs`, `test-t5-wasm.mjs`, `test-mt5-wasm.mjs`, `test-rerank-wasm.mjs`, `test-gpt-wasm.mjs`, `test-gliner-wasm.mjs`, `test-clip-wasm.mjs`, `test-whisper-wasm.mjs`, `test-clap-wasm.mjs`, `test-florence-wasm.mjs`, `test-gemma3-q4-wasm.mjs`, and `test-gemma3-vision-wasm.mjs`, so their alloc/free, pointer sizes, and typed-array views are ABI-safe for both `wasm32` and `wasm64`
-- `web/runtime/safetensors-stream.js` now provides the true header-first SafeTensors streaming path for `streamLoadGptModel()`, and both `web/inference-web.js` and `web/inference-worker.js` use it to register one weight at a time from the fetch stream instead of concatenating the entire file before load
-- `web/runtime/gguf-stream.js` now provides the matching header-first GGUF streaming path for `streamLoadGgufModel()`, backed by the new `register_weight_gguf` export so quantized GGUF tensors can be registered incrementally in direct mode or worker mode
-- streamed GGUF tensor ingestion no longer requires a full JS `Uint8Array` for each tensor: the loader now allocates the tensor buffer directly in WASM, streams file chunks into that buffer, and finalizes registration with `register_weight_gguf_owned`
-- non-streamed tokenizer loading can now derive Hugging Face tokenizer state directly from GGUF metadata through `load_tokenizer_gguf`, and `web/inference-web.js` / `web/inference-worker.js` route `loadTokenizer(..., { format: 'gguf' })` through that path
-- streamed GGUF loading now parses tokenizer-related header metadata in `web/runtime/gguf-stream.js` and surfaces `{ tokenizerJson, chatTemplate }` through `streamLoadGgufModel(..., { onMetadata })`; `streamLoadGgufModel(..., { autoLoadTokenizer: true, onTokenizerLoaded })` can now also install that tokenizer automatically without a second whole-file fetch
-- the web runtime now exposes `gguf_chat_template` and `render_chat_prompt`, so direct mode and worker mode can extract a GGUF chat template and render a single-turn system/user prompt through Zig's existing Jinja chat-template engine instead of relying on raw prompt text
-- GPU-resident weights have now started as an explicit runtime feature: `WasmCompute` now owns a `GpuWeightStore`, WebGPU-enabled registration eagerly uploads those weights during model load, and the WebGPU matmul / LayerNorm / RMSNorm paths now reuse those resident GPU buffers instead of re-uploading long-lived `B`, `gamma`, and `beta` tensors on every dispatch
-- local build verification now passes for both `wasm32` and `wasm64`, but this currently depends on a local Zig freestanding `std.Io.Threaded` workaround that was tracked in a since-removed repo-root `ZIG.md` note
-- large-model browser bring-up remains follow-on work
+> **Relocated:** The detailed bullet-by-bullet refactor log behind this
+> status (31 lines) is preserved verbatim in
+> [work-log/completed/inference/wasm-status-history.md](../../../work-log/completed/inference/wasm-status-history.md).
 
 ### Initial Refactor Slice
 
@@ -1230,29 +1214,18 @@ Execution order:
 4. Introduce a real GPU weight store / manifest so the runtime can distinguish host metadata from GPU-resident tensor payloads
 5. Only after that, consider true on-demand paging / eviction for oversized models
 
-Current implementation status:
+Current implementation status: GPU weight residence preserves the stored
+representation when possible — quantized GGUF weights stay quantized in the
+GPU store for quantized matmul shaders, and host-side dequantization remains
+a fallback rather than the target architecture. Weight, activation, and KV
+buffers increasingly stay GPU-resident across dispatches (matmul, norms,
+attention, reshape/slice helpers, and the decoder block seam), reducing
+host round-trips, but activations and outputs are still transient GPU
+buffers today, so this is the first seam, not the full architecture.
 
-- registered weight tensors in `src/ops/wasm_compute.zig` now eagerly upload into an explicit `GpuWeightStore` when WebGPU is active, and hot kernels look up those resident GPU buffers from the store instead of hiding GPU state directly inside each `WasmBuf`
-- GPU weight residence preserves the stored representation when possible: quantized GGUF weights stay quantized in the GPU store for quantized matmul shaders, and host-side dequantization remains a fallback rather than the target architecture
-- quantized weights with supported GPU matmul shaders can now drop their host-side raw quantized copy after successful GPU upload, so resident GPU storage becomes the primary long-lived copy instead of a duplicate
-- WebGPU `matmulTransB`, quantized `matmulTransB`, `LayerNorm`, and `RMSNorm` now reuse those resident weight buffers instead of re-uploading weight tensors every call, and both `linearNoBias` and `linear + bias` honor the quantized-resident path
-- transient activation tensors from GPU `LayerNorm`, `RMSNorm`, and `linearNoBias` now keep an attached GPU buffer alongside their host copy, so later GPU linears/norms can reuse that activation buffer instead of re-uploading the same input tensor on every dispatch
-- the GPU attention fast paths now consume attached `Q/K/V` activation buffers when present and return GPU-backed outputs, so the main decoder-side `linear -> attention` path avoids another round of activation uploads
-- when the GPU KV cache uses plain `f32` layout, cached-attention now copies freshly produced GPU-backed `K/V` activations directly into the GPU cache via buffer-to-buffer copy instead of round-tripping those writes through host uploads
-- `reshape2d` is now a real WASM backend op instead of a null capability, and both `reshape2d` and primitive reshape preserve attached GPU activation buffers via device-to-device copy; that unlocks the GPT/Gemma reshape-gated RMSNorm fast paths without forcing those tensors back through host upload
-- the richer 2D shape helpers (`splitLastDim3`, `reshape2D`, `concatRows2D`, `sliceRows2D`) are now real WASM backend ops too, and when their inputs are already GPU-backed they preserve residence with device-to-device copies instead of falling back through `toFloat32`; this removes several decoder/runtime and vision-side host detours
-- WASM tensors now retain explicit shape metadata when they are created through shape-aware paths (`fromFloat32Shape`, 2D reshape/slice helpers, primitive reshape), and the backend now exposes `tensorShape` plus a real `sliceLastDim`; that lets GPT fused-QKV and other last-dimension slice paths stay on backend-owned tensors instead of immediately dropping to generic host exports
-- the main decoder-side tensor producers now propagate that shape metadata too: embedding lookup, linear/linearNoBias, norm, concat, attention, and RoPE outputs keep 2D shape when available, so `sliceLastDim` and related fast paths can actually fire on hot tensors instead of only on explicitly reshaped ones
-- the WASM backend now also fills in several decoder/runtime null hooks directly: `zeroTensor`, `argmaxLastRow`, `sampleLastRow`, `linearNoBiasArgmaxLastRow`, `linearNoBiasArgmaxLastRowTensor`, and `takeRows` are implemented, which removes more of the generic generation and grouped-MoE fallback surface from GPT paths while keeping sampling semantics aligned with the shared host sampler
-- the WASM backend now has basic integer-tensor interop too: `fromInt32Shape`, `embeddingLookupTensor`, `tensorDType`, `exportTensorData`, and `evalTensor` are implemented for the common `i32`/`f32` cases, which enables the device-token handoff path to stay inside the backend instead of immediately converting token ids back to host arrays
-- the prepared decoder-runtime seam is now partially implemented in `src/ops/wasm_compute.zig` too: absolute token/position embeddings, prepared layer norm / RMS norm slots, prepared linear slots, fused norm+linear argmax/sample helpers, backend-side activation/add, and the dense FFN residual strip can all stay inside the WASM backend instead of immediately falling back to the generic host decode path
-- the prepared attention seam now exists too: `runAttention` and `runAttentionResidual` are implemented in the WASM backend on top of the existing dense/paged GQA attention kernels plus prepared linear/RMS-norm slots, so the qLen=1 decoder residual path no longer has to peel back immediately to the generic host composition path
-- the block-level decoder seam now covers the split fallback path as well: `runDenseDecoderBlock` and `runGatedDecoderBlock` are implemented in the WASM backend by composing prepared attention-residual, optional FFN norm, and the existing dense/gated FFN residual helpers, which removes another layer of host-side orchestration from decoder runtime execution even before any larger fused-kernel path exists
-- the gated block `attention_input` path now routes through the shared prepared QKV helper as one backend operation instead of projecting `K/V` as a pair and `Q` separately, which keeps that orchestration inside the backend and gives the focused WASM test step coverage for both explicit `q/k/v` and projected-input block entrypoints
-- the WebGPU dispatch heuristics in `src/ops/wasm_compute.zig` are now chain-aware for prepared decode: when a decoder-runtime linear or norm receives an already GPU-backed input tensor, or a weight is already resident in `GpuWeightStore`, the backend prefers the GPU path even below the old bulk thresholds, which reduces avoidable CPU fallbacks in qLen=1 decode chains without changing the non-GPU surface
-- streamed GGUF loading can now register supported quantized tensors directly into GPU buffers in both direct mode and worker mode, bypassing WASM tensor allocation for those weights and registering them as GPU-primary quantized weights through `register_weight_gguf_gpu`
-- GLiNER’s disentangled relative-attention hotspot is no longer forced through the host path when WebGPU is available: `disentangledRelativeAttention` now has a real WebGPU kernel/JS bridge in the embedded runtime, so the self-attention step can stay on the GPU instead of falling back to `debertaDisentangledAttentionHost`
-- activations and outputs are still transient GPU buffers today, so this is the first seam, not the full architecture
+> **Relocated:** The detailed bullet-by-bullet implementation log behind
+> this status (23 lines) is preserved verbatim in
+> [work-log/completed/inference/wasm-status-history.md](../../../work-log/completed/inference/wasm-status-history.md).
 
 ## Electron Shell
 

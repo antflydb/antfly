@@ -36,8 +36,9 @@ build: ## Build the Antfly runtime; optional inference dependencies are provisio
 test: ## Run the default Zig test aggregate with bounded scheduler memory.
 	python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build test $(ZIG_BUILD_FLAGS)
 
+# PR CI uses reusable workflows from main; enable timings in the checked-out command too.
 unit-test: ## Run the existing repository unit gate across libraries, Antfly, and inference.
-	python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build lib-test antfly-unit-test inference-test inference-finetune-test $(ZIG_BUILD_FLAGS)
+	ANTFLY_TEST_TIMINGS="$${ANTFLY_TEST_TIMINGS:-$${CI:+1}}" python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build lib-test antfly-unit-test inference-test inference-finetune-test unit-test-inventory $(ZIG_BUILD_FLAGS)
 
 antfly-unit-test: ## Run hermetic Antfly unit tests with bounded scheduler memory.
 	python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build antfly-unit-test $(ZIG_BUILD_FLAGS)
@@ -78,16 +79,16 @@ mcp-schema-fragments-check:
 	$(SCRIPTS_PY) ../scripts/generate_mcp_schema_fragments.py --check
 
 snowball-generate:
-	$(ZIG) build regen-snowball
+	$(ZIG) build regen-snowball $(ZIG_BUILD_FLAGS)
 
 snowball-check:
-	$(ZIG) build check-snowball
+	$(ZIG) build check-snowball $(ZIG_BUILD_FLAGS)
 
 sql-grammar-generate:
-	$(ZIG) build regen-sql-grammar
+	$(ZIG) build regen-sql-grammar $(ZIG_BUILD_FLAGS)
 
 sql-grammar-check:
-	$(ZIG) build sql-grammar-generated-check
+	$(ZIG) build sql-grammar-generated-check $(ZIG_BUILD_FLAGS)
 
 cabi-header-generate:
 	$(SCRIPTS_PY) ../scripts/packaging/sync_cabi_header.py
@@ -141,8 +142,10 @@ endif
 	@set -e; \
 	segdir=$$(mktemp -d); \
 	trap 'rm -rf "$$segdir"' EXIT; \
+	producer=0; \
 	for f in $(TRACE_FILES); do \
-	  python3 ../scripts/tla-segment-raft-trace.py "$$f" "$$segdir"; \
+	  producer=$$((producer + 1)); \
+	  python3 ../scripts/tla-segment-raft-trace.py "$$f" "$$segdir/producer-$$producer"; \
 	done; \
 	segments=$$(find "$$segdir" -name '*.ndjson' -size +0c | sort); \
 	if [ -n "$$segments" ]; then \
@@ -159,6 +162,7 @@ tla-trace-txn: tla-tools
 ifndef TRACE_FILES
 	$(error TRACE_FILES is required. Example: make tla-trace-txn TRACE_FILES=/tmp/txn-trace.ndjson)
 endif
+	@python3 ../scripts/test_tla_filter_txn_trace.py
 	@set -e; \
 	validated=0; \
 	tmpfiles=""; tmpdirs=""; \

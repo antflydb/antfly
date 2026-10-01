@@ -30,6 +30,9 @@ pub const DownloadSource = struct {
     owner: []const u8,
     name: []const u8,
     variant: []const u8,
+    requested_revision: ?[]const u8 = null,
+    resolved_revision: ?[]const u8 = null,
+    selected_format: ?[]const u8 = null,
 };
 
 pub const DownloadReceipt = struct {

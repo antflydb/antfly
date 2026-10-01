@@ -23,6 +23,8 @@ pub const Conversation = struct {
     messages: std.ArrayListUnmanaged(generating.ChatMessage) = .empty,
     ids: std.StringHashMapUnmanaged(void) = .empty,
     bytes: usize = 0,
+    /// Nested agents may lend a smaller history ceiling than the default.
+    limit_bytes: usize = max_bytes,
     pub const max_bytes = 256 * 1024;
     pub const max_calls_per_turn = 8;
 
@@ -36,7 +38,7 @@ pub const Conversation = struct {
     }
 
     fn reserve(self: *@This(), count: usize) !void {
-        if (count > max_bytes - self.bytes) return error.AgentContextLimitExceeded;
+        if (count > self.limit_bytes -| self.bytes) return error.AgentContextLimitExceeded;
         self.bytes += count;
     }
 
@@ -48,6 +50,7 @@ pub const Conversation = struct {
             try self.reserve(call.id.len + call.name.len + call.arguments.len);
         }
         try self.reserve(result.content.len);
+        if (result.google_parts_json) |parts| try self.reserve(parts.len);
         const calls = try self.alloc.alloc(generating.ToolCall, result.tool_calls.len);
         for (calls, result.tool_calls) |*copy, call| copy.* = .{
             .id = try self.alloc.dupe(u8, call.id),
@@ -58,23 +61,113 @@ pub const Conversation = struct {
             .role = .assistant,
             .content = if (result.content.len > 0) .{ .text = try self.alloc.dupe(u8, result.content) } else null,
             .tool_calls = if (calls.len > 0) calls else null,
+            .google_parts_json = if (result.google_parts_json) |parts| try self.alloc.dupe(u8, parts) else null,
         });
         return calls;
     }
 };
 
+/// Execution ceilings for one model-directed agent loop. Public retrieval
+/// requests use the defaults; composite agents such as research lend each
+/// nested run a smaller slice so the parent's declared worst case holds.
+pub const Budget = struct {
+    /// Tool calls across every round, including delegated planning.
+    max_tool_calls: i64 = default_max_tool_calls,
+    /// Retained model history, see Conversation.limit_bytes.
+    max_history_bytes: usize = Conversation.max_bytes,
+
+    pub const default_max_tool_calls: i64 = 20;
+
+    pub fn toolCalls(self: Budget) i64 {
+        return std.math.clamp(self.max_tool_calls, 0, default_max_tool_calls);
+    }
+};
+
+/// Longest prefix of `text` of at most `max_bytes` that does not split a
+/// UTF-8 sequence. Use it for every byte-bounded cut of user or model text
+/// that is later serialized as JSON.
+pub fn truncateUtf8(text: []const u8, max_bytes: usize) []const u8 {
+    if (text.len <= max_bytes) return text;
+    var end = max_bytes;
+    while (end > 0 and (text[end] & 0xc0) == 0x80) end -= 1;
+    return text[0..end];
+}
+
+/// Conservative token estimate for budgeting text whose generator tokenizer
+/// is not available locally. ASCII averages about four bytes per token for
+/// BPE vocabularies; every non-ASCII code point (CJK, emoji, most non-Latin
+/// scripts) is charged a full token so those budgets are not overrun 3-4x.
+pub fn estimateTokens(text: []const u8) usize {
+    var ascii: usize = 0;
+    var other: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const byte = text[i];
+        if (byte < 0x80) {
+            ascii += 1;
+            i += 1;
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(byte) catch 1;
+        other += 1;
+        i += @min(len, text.len - i);
+    }
+    return (ascii + 3) / 4 + other;
+}
+
 pub fn withTools(alloc: std.mem.Allocator, chain: []const generating.ChainLink, schema: []const u8) ![]const generating.ChainLink {
     const copy = try alloc.dupe(generating.ChainLink, chain);
     for (copy) |*link| {
-        // These providers preserve both function definitions and tool history.
-        switch (link.generator.provider) {
-            .antfly, .openai => {},
-            else => return error.UnsupportedAgentToolProvider,
-        }
-        link.generator.tools_json = schema;
-        link.generator.tool_choice_json = "\"auto\"";
+        if (!link.generator.provider.supportsTools()) return error.UnsupportedAgentToolProvider;
+        // A finished graph walk can leave no available tools. Omit both
+        // fields for the final answer instead of sending an empty tool list
+        // with a provider-dependent automatic-tool choice.
+        const has_tools = !std.mem.eql(u8, schema, "[]");
+        link.generator.tools_json = if (has_tools) schema else null;
+        link.generator.tool_choice_json = if (has_tools) "\"auto\"" else null;
     }
     return copy;
+}
+
+test "token estimate charges non-ASCII code points individually" {
+    try std.testing.expectEqual(@as(usize, 0), estimateTokens(""));
+    try std.testing.expectEqual(@as(usize, 1), estimateTokens("abcd"));
+    try std.testing.expectEqual(@as(usize, 2), estimateTokens("abcde"));
+    // Three CJK code points are nine bytes but at least three tokens.
+    try std.testing.expectEqual(@as(usize, 3), estimateTokens("\u{4e2d}\u{6587}\u{5b57}"));
+    // Truncated sequences never read past the slice.
+    try std.testing.expectEqual(@as(usize, 1), estimateTokens("\xe4"));
+}
+
+test "UTF-8 truncation never splits a code point" {
+    const text = "ab\u{4e2d}\u{6587}";
+    try std.testing.expectEqualStrings("ab", truncateUtf8(text, 3));
+    try std.testing.expectEqualStrings("ab", truncateUtf8(text, 4));
+    try std.testing.expectEqualStrings("ab\u{4e2d}", truncateUtf8(text, 5));
+    try std.testing.expectEqualStrings(text, truncateUtf8(text, 64));
+    try std.testing.expect(std.unicode.utf8ValidateSlice(truncateUtf8("\u{1f600}\u{1f600}", 6)));
+}
+
+test "agent conversation honors a lent history ceiling" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var history = Conversation{ .alloc = arena.allocator(), .limit_bytes = 8 };
+    try history.append(.user, "12345678", null);
+    try std.testing.expectError(error.AgentContextLimitExceeded, history.append(.user, "x", null));
+    try std.testing.expectEqual(@as(i64, 20), (Budget{ .max_tool_calls = 99 }).toolCalls());
+}
+
+test "agent tools accept OpenRouter generators" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const chain = try withTools(arena_impl.allocator(), &.{.{ .generator = .{
+        .provider = .openrouter,
+        .model = "test-model",
+        .url = "https://openrouter.ai/api/v1",
+    } }}, "[{\"type\":\"function\",\"function\":{\"name\":\"search\",\"parameters\":{\"type\":\"object\"}}}]");
+    try std.testing.expectEqual(.openrouter, chain[0].generator.provider);
+    try std.testing.expect(chain[0].generator.tools_json != null);
+    try std.testing.expectEqualStrings("\"auto\"", chain[0].generator.tool_choice_json.?);
 }
 
 test "agent conversation rejects duplicate IDs and parallel budget overflow" {
@@ -88,4 +181,33 @@ test "agent conversation rejects duplicate IDs and parallel budget overflow" {
     try history.append(.tool, "{\"hits\":[]}", "call-1");
     try std.testing.expectEqualStrings("call-1", history.messages.items[1].tool_call_id.?);
     try std.testing.expectError(error.InvalidAgentToolCall, history.accept(result, 1));
+}
+
+test "agent tools enable every real generator adapter and omit empty schemas" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for (std.enums.values(generating.Provider)) |provider| {
+        const chain = [_]generating.ChainLink{.{ .generator = .{ .provider = provider, .model = "m", .url = "" } }};
+        if (provider == .mock) {
+            try std.testing.expectError(error.UnsupportedAgentToolProvider, withTools(arena.allocator(), &chain, "[]"));
+            continue;
+        }
+        const configured = try withTools(arena.allocator(), &chain, "[]");
+        try std.testing.expect(configured[0].generator.tools_json == null);
+        try std.testing.expect(configured[0].generator.tool_choice_json == null);
+    }
+}
+
+test "agent conversation owns Google replay parts and charges the context budget" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var history = Conversation{ .alloc = arena.allocator() };
+    var parts = [_]u8{ '[', ']' };
+    const result = generating.GenerateResult{ .allocator = arena.allocator(), .content = "ok", .google_parts_json = &parts };
+    _ = try history.accept(result, 1);
+    parts[0] = 'x';
+    try std.testing.expectEqualStrings("[]", history.messages.items[0].google_parts_json.?);
+    try std.testing.expectEqual(@as(usize, 4), history.bytes);
+    history.bytes = Conversation.max_bytes - 3;
+    try std.testing.expectError(error.AgentContextLimitExceeded, history.accept(result, 1));
 }

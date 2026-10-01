@@ -107,20 +107,12 @@ costs have already been cut by routing through the bulk builder.
 ### Bulk Partitioning Strategies
 
 Both a recursive bulk build and a Hilbert-seeded bulk build exist as
-partitioning strategies, along with an experimental doc-key-seeded path. On a
-first HBC bench comparison (`256` docs / `64` dims / `4` queries):
-
-- recursive bulk build: about `11.0ms`
-- Hilbert-seeded bulk build: about `11.9ms`
-- doc-key-seeded bulk build: about `17.1ms`
-
-Hilbert-seeded build produces a slightly smaller tree and slightly cheaper
-search on this workload, but it does not beat recursive bulk build on total
-build time. Doc-key-seeded build produces the best split locality on the
-synthetic HBC bench (`frontier_right=1`, `mixed_right_members=0`), but it
-regresses the actual dense child split handoff path when used there, and does
-not improve the DB split prepare probe when used for source-side empty-index
-ingest.
+partitioning strategies, along with an experimental doc-key-seeded path. An
+informal bench comparison found recursive bulk build fastest overall, with
+Hilbert-seeded producing a marginally smaller and cheaper-to-search tree
+without beating recursive on build time, and doc-key-seeded winning only on
+synthetic split locality while regressing the actual dense-split-handoff and
+empty-index-ingest probes.
 
 Recursive bulk build is the product default. Doc-key-seeded stays experimental
 until it wins on the product-shaped probes, not just the synthetic HBC bench.

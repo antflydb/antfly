@@ -22,9 +22,9 @@ const snapshot_payload_store = @import("snapshot_payload_store.zig");
 const file_snapshot_artifact = @import("file_snapshot_artifact.zig");
 
 const magic: u32 = 0x41524654; // ARFT
-// Version 5 requires a checksum and stores the Raft log compaction boundary
-// separately from the transferable state snapshot metadata.
-const version: u32 = 5;
+// Version 6 additionally distinguishes state-machine completion from snapshot
+// persistence. Version 5 is read with an unproven (zero) completion cursor.
+const version: u32 = 6;
 const state_checksum_len = @sizeOf(u32);
 const max_state_bytes: usize = 16 << 20;
 const max_state_body_bytes = max_state_bytes - state_checksum_len;
@@ -47,6 +47,9 @@ pub const PersistentReplicaState = struct {
     layout: storage_mod.ReplicaPathLayout,
     store: raft_engine.core.MemoryStorage,
     applied_index: raft_engine.core.types.Index = 0,
+    // Unlike applied_index, receiving/persisting a snapshot never advances this
+    // cursor. Only the shared state-machine completion sink may do so.
+    completed_applied_index: raft_engine.core.types.Index = 0,
     persist_buffer: std.ArrayListUnmanaged(u8) = .empty,
 
     pub fn init(
@@ -147,7 +150,14 @@ pub const PersistentReplicaState = struct {
         return self.applied_index;
     }
 
+    pub fn completedAppliedIndex(self: *const PersistentReplicaState) u64 {
+        return self.completed_applied_index;
+    }
+
     pub fn setAppliedIndex(self: *PersistentReplicaState, index: raft_engine.core.types.Index) !void {
+        const previous_completed = self.completed_applied_index;
+        errdefer self.completed_applied_index = previous_completed;
+        self.completed_applied_index = @max(index, self.completed_applied_index);
         if (index > self.applied_index) self.applied_index = index;
         try self.persist();
     }
@@ -313,7 +323,8 @@ pub const PersistentReplicaState = struct {
 
         var cursor: usize = 0;
         if (try readInt(u32, body, &cursor) != magic) return error.InvalidReplicaState;
-        if (try readInt(u32, body, &cursor) != version) return error.UnsupportedReplicaStateVersion;
+        const file_version = try readInt(u32, body, &cursor);
+        if (file_version != 5 and file_version != version) return error.UnsupportedReplicaStateVersion;
 
         self.store.setHardState(.{
             .current_term = try readInt(u64, body, &cursor),
@@ -321,6 +332,8 @@ pub const PersistentReplicaState = struct {
             .commit_index = try readInt(u64, body, &cursor),
         });
         self.applied_index = try readInt(u64, body, &cursor);
+        self.completed_applied_index = if (file_version >= 6) try readInt(u64, body, &cursor) else 0;
+        if (self.completed_applied_index > self.applied_index) return error.InvalidReplicaState;
 
         var conf_state = try decodeConfState(self.alloc, body, &cursor);
         defer conf_state.deinit(self.alloc);
@@ -365,6 +378,7 @@ pub const PersistentReplicaState = struct {
         if (self.store.hard_state.voted_for) |voted_for| try appendInt(u64, self.alloc, buffer, voted_for);
         try appendInt(u64, self.alloc, buffer, self.store.hard_state.commit_index);
         try appendInt(u64, self.alloc, buffer, self.applied_index);
+        try appendInt(u64, self.alloc, buffer, self.completed_applied_index);
         try encodeConfState(self.alloc, buffer, self.store.conf_state);
 
         const snapshot = self.store.snapshot_state;
@@ -653,7 +667,7 @@ test "persistent replica state rejects corrupt unchecked and structurally invali
 
     const unchecked = try alloc.dupe(u8, valid);
     defer alloc.free(unchecked);
-    std.mem.writeInt(u32, unchecked[4..8], version - 1, .little);
+    std.mem.writeInt(u32, unchecked[4..8], 4, .little);
     std.mem.writeInt(
         u32,
         unchecked[unchecked.len - state_checksum_len ..][0..state_checksum_len],
@@ -672,6 +686,7 @@ test "persistent replica state rejects corrupt unchecked and structurally invali
     try PersistentReplicaState.appendInt(u32, alloc, &invalid, version);
     try PersistentReplicaState.appendInt(u64, alloc, &invalid, 0);
     try PersistentReplicaState.appendBool(alloc, &invalid, false);
+    try PersistentReplicaState.appendInt(u64, alloc, &invalid, 0);
     try PersistentReplicaState.appendInt(u64, alloc, &invalid, 0);
     try PersistentReplicaState.appendInt(u64, alloc, &invalid, 0);
     try PersistentReplicaState.encodeConfState(alloc, &invalid, .{});
@@ -847,6 +862,61 @@ test "persistent replica state persists applied watermark and replays only unapp
         try std.testing.expectEqual(@as(u64, 11), rd.committed_entries[0].index);
         try std.testing.expectEqualStrings("eleven", rd.committed_entries[0].data);
     }
+}
+
+test "persistent replica completion excludes pending snapshots and legacy inference" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/completed", .{tmp.sub_path});
+    defer alloc.free(root);
+    var layout = try storage_mod.ReplicaPathLayout.initForReplica(alloc, root, 79, 4);
+    defer layout.deinit(alloc);
+    {
+        var state = try PersistentReplicaState.init(alloc, layout);
+        defer state.deinit();
+        try state.groupStorage().persistReady(79, .{
+            .hard_state = .{ .current_term = 2, .commit_index = 5 },
+            .snapshot = .{ .metadata = .{ .index = 5, .term = 2 }, .data = @constCast("five") },
+        });
+        try state.setAppliedIndex(5);
+        try state.groupStorage().persistReady(79, .{
+            .hard_state = .{ .current_term = 2, .commit_index = 10 },
+            .snapshot = .{ .metadata = .{ .index = 10, .term = 2 }, .data = @constCast("ten") },
+        });
+        try std.testing.expectEqual(@as(u64, 10), state.appliedIndex());
+        try std.testing.expectEqual(@as(u64, 5), state.completedAppliedIndex());
+    }
+    {
+        var state = try PersistentReplicaState.init(alloc, layout);
+        defer state.deinit();
+        try std.testing.expectEqual(@as(u64, 5), state.completedAppliedIndex());
+        // Completing an already-persisted snapshot must not take the ordinary
+        // applied-index duplicate fast path.
+        try state.setAppliedIndex(10);
+    }
+    {
+        var state = try PersistentReplicaState.init(alloc, layout);
+        defer state.deinit();
+        try std.testing.expectEqual(@as(u64, 10), state.completedAppliedIndex());
+    }
+    const path = try std.fmt.allocPrint(alloc, "{s}/state.bin", .{layout.log_dir});
+    defer alloc.free(path);
+    const encoded = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, alloc, .limited(max_state_bytes));
+    defer alloc.free(encoded);
+    // The preexisting checksummed v5 layout had no completion proof. Preserve
+    // its ordinary cursor, but do not invent completed native installation.
+    const legacy = try alloc.alloc(u8, encoded.len - 8);
+    defer alloc.free(legacy);
+    @memcpy(legacy[0..33], encoded[0..33]);
+    @memcpy(legacy[33..], encoded[41..]);
+    std.mem.writeInt(u32, legacy[4..8], 5, .little);
+    std.mem.writeInt(u32, legacy[legacy.len - 4 ..][0..4], Crc32.hash(legacy[0 .. legacy.len - 4]), .little);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = legacy });
+    var legacy_state = try PersistentReplicaState.init(alloc, layout);
+    defer legacy_state.deinit();
+    try std.testing.expectEqual(@as(u64, 10), legacy_state.appliedIndex());
+    try std.testing.expectEqual(@as(u64, 0), legacy_state.completedAppliedIndex());
 }
 
 test "persistent replica state persists snapshots across reopen" {

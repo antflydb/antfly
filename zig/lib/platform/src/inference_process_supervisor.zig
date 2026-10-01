@@ -20,7 +20,7 @@ const lifeline_env = "ANTFLY_INFERENCE_SUPERVISOR_LIFELINE";
 pub const restart_exit_code: u8 = 86;
 
 pub fn restartWorker() noreturn {
-    std.process.exit(restart_exit_code);
+    @import("process.zig").exitImmediately(restart_exit_code);
 }
 
 /// The server command reserves stdin as a supervisor-owned lifeline (it does
@@ -44,11 +44,11 @@ pub const WorkerLifetime = struct {
         var byte: [1]u8 = undefined;
         const count = std.Io.File.stdin().readStreaming(io, &.{&byte}) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
-            else => std.process.exit(1),
+            else => @import("process.zig").exitImmediately(1),
         };
         // No data is legal on this private channel. EOF is an intentional
         // owner-loss shutdown, not a watchdog restart request.
-        std.process.exit(if (count == 0) 0 else 1);
+        @import("process.zig").exitImmediately(if (count == 0) 0 else 1);
     }
 };
 

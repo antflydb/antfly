@@ -46,7 +46,6 @@ const Config = struct {
 
 const BackendSelection = enum {
     all,
-    lmdb,
     lsm,
     lsm_memory,
 };
@@ -68,12 +67,6 @@ const KeySet = struct {
 };
 
 const OpenedStore = union(enum) {
-    lmdb: struct {
-        runtime: ?backend_erased.Store = null,
-        namespace_runtime: ?backend_erased.NamespaceStore = null,
-        backend: antfly.lmdb_backend.Backend,
-        path: []u8,
-    },
     lsm: struct {
         runtime: ?backend_erased.Store = null,
         namespace_runtime: ?backend_erased.NamespaceStore = null,
@@ -88,7 +81,6 @@ const OpenedStore = union(enum) {
 
     fn runtime(self: *OpenedStore) *backend_erased.Store {
         return switch (self.*) {
-            .lmdb => |*opened| &opened.runtime.?,
             .lsm => |*opened| &opened.runtime.?,
             .lsm_memory => |*opened| &opened.runtime.?,
         };
@@ -96,7 +88,6 @@ const OpenedStore = union(enum) {
 
     fn namespaceRuntime(self: *OpenedStore) *backend_erased.NamespaceStore {
         return switch (self.*) {
-            .lmdb => |*opened| &opened.namespace_runtime.?,
             .lsm => |*opened| &opened.namespace_runtime.?,
             .lsm_memory => |*opened| &opened.namespace_runtime.?,
         };
@@ -104,7 +95,6 @@ const OpenedStore = union(enum) {
 
     fn label(self: *const OpenedStore) []const u8 {
         return switch (self.*) {
-            .lmdb => "lmdb",
             .lsm => "lsm",
             .lsm_memory => "lsm_memory",
         };
@@ -112,14 +102,6 @@ const OpenedStore = union(enum) {
 
     fn initRuntime(self: *OpenedStore, allocator: std.mem.Allocator) !void {
         switch (self.*) {
-            .lmdb => |*opened| {
-                if (opened.runtime == null) {
-                    opened.runtime = try opened.backend.runtimeStore(allocator, bench_namespace);
-                }
-                if (opened.namespace_runtime == null) {
-                    opened.namespace_runtime = try opened.backend.runtimeNamespaceStore(allocator);
-                }
-            },
             .lsm => |*opened| {
                 if (opened.runtime == null) {
                     opened.runtime = try opened.backend.runtimeStore(allocator, bench_namespace);
@@ -141,13 +123,6 @@ const OpenedStore = union(enum) {
 
     fn deinit(self: *OpenedStore, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .lmdb => |*opened| {
-                if (opened.runtime) |*store_runtime| store_runtime.deinit();
-                if (opened.namespace_runtime) |*ns_runtime| ns_runtime.deinit();
-                opened.backend.close();
-                cleanupPath(opened.path);
-                allocator.free(opened.path);
-            },
             .lsm => |*opened| {
                 if (opened.runtime) |*store_runtime| store_runtime.deinit();
                 if (opened.namespace_runtime) |*ns_runtime| ns_runtime.deinit();
@@ -177,13 +152,6 @@ const OpenedStore = union(enum) {
 
     fn closeForReopen(self: *OpenedStore) !void {
         switch (self.*) {
-            .lmdb => |*opened| {
-                if (opened.runtime) |*store_runtime| store_runtime.deinit();
-                if (opened.namespace_runtime) |*ns_runtime| ns_runtime.deinit();
-                opened.runtime = null;
-                opened.namespace_runtime = null;
-                opened.backend.close();
-            },
             .lsm => |*opened| {
                 if (opened.runtime) |*store_runtime| store_runtime.deinit();
                 if (opened.namespace_runtime) |*ns_runtime| ns_runtime.deinit();
@@ -203,15 +171,6 @@ const OpenedStore = union(enum) {
 
     fn openAfterClose(self: *OpenedStore, allocator: std.mem.Allocator, cfg: Config) !bool {
         switch (self.*) {
-            .lmdb => |*opened| {
-                const path_z = try allocator.dupeZ(u8, opened.path);
-                defer allocator.free(path_z);
-                opened.backend = try antfly.lmdb_backend.Backend.open(allocator, path_z.ptr, .{
-                    .backend = .{ .create_if_missing = true },
-                    .env = .{ .map_size = benchLmdbMapSize(cfg) },
-                });
-                return true;
-            },
             .lsm => |*opened| {
                 opened.backend = try antfly.lsm_backend.Backend.open(allocator, opened.path, .{
                     .backend = .{ .create_if_missing = true },
@@ -274,7 +233,7 @@ pub fn main(init: std.process.Init) !void {
     try stdout_writer.flush();
 
     const selections: []const BackendSelection = switch (cfg.backend) {
-        .all => &[_]BackendSelection{ .lmdb, .lsm, .lsm_memory },
+        .all => &[_]BackendSelection{ .lsm, .lsm_memory },
         else => &[_]BackendSelection{cfg.backend},
     };
 
@@ -387,28 +346,6 @@ pub fn main(init: std.process.Init) !void {
 
 fn openBackend(allocator: std.mem.Allocator, selection: BackendSelection, cfg: Config) !OpenedStore {
     switch (selection) {
-        .lmdb => {
-            const path = try tmpPath(allocator, "backend-bench-lmdb");
-            errdefer allocator.free(path);
-            const path_z = try allocator.dupeZ(u8, path);
-            defer allocator.free(path_z);
-            const backend = try antfly.lmdb_backend.Backend.open(allocator, path_z.ptr, .{
-                .backend = .{ .create_if_missing = true },
-                .env = .{ .map_size = benchLmdbMapSize(cfg) },
-            });
-            errdefer {
-                var backend_to_close = backend;
-                backend_to_close.close();
-                cleanupPath(path);
-            }
-            const opened: OpenedStore = .{
-                .lmdb = .{
-                    .backend = backend,
-                    .path = path,
-                },
-            };
-            return opened;
-        },
         .lsm => {
             const path = try tmpPath(allocator, "backend-bench-lsm");
             const backend = try antfly.lsm_backend.Backend.open(allocator, path, .{
@@ -850,32 +787,30 @@ fn printResult(writer: anytype, result: Result) !void {
 
 fn printLevelOccupancy(writer: anytype, opened: *OpenedStore, workload: []const u8) !void {
     switch (opened.*) {
-        .lmdb => return,
-        .lsm => |*store| try printBackendLevelOccupancy(writer, store.backend.runs.items, "lsm", workload),
-        .lsm_memory => |*store| try printBackendLevelOccupancy(writer, store.backend.runs.items, "lsm_memory", workload),
+        .lsm => |*store| try printBackendLevelOccupancy(writer, &store.backend.runs, "lsm", workload),
+        .lsm_memory => |*store| try printBackendLevelOccupancy(writer, &store.backend.runs, "lsm_memory", workload),
     }
 }
 
 fn printCompactionStats(writer: anytype, opened: *OpenedStore, workload: []const u8) !void {
     switch (opened.*) {
-        .lmdb => return,
-        .lsm => |*store| try printBackendCompactionStats(writer, "lsm", workload, store.backend.runs.items, store.backend.compaction_stats),
-        .lsm_memory => |*store| try printBackendCompactionStats(writer, "lsm_memory", workload, store.backend.runs.items, store.backend.compaction_stats),
+        .lsm => |*store| try printBackendCompactionStats(writer, "lsm", workload, &store.backend.runs, store.backend.compaction_stats),
+        .lsm_memory => |*store| try printBackendCompactionStats(writer, "lsm_memory", workload, &store.backend.runs, store.backend.compaction_stats),
     }
 }
 
 fn printBackendLevelOccupancy(writer: anytype, runs: anytype, backend_label: []const u8, workload: []const u8) !void {
-    if (runs.len == 0) return;
+    if (runs.count() == 0) return;
     var i: usize = 0;
-    while (i < runs.len) {
-        const level = runs[i].level;
+    while (i < runs.count()) {
+        const level = runs.at(i).level;
         var run_count: usize = 0;
         var entry_count: u64 = 0;
         var size_bytes: u64 = 0;
-        while (i < runs.len and runs[i].level == level) : (i += 1) {
+        while (i < runs.count() and runs.at(i).level == level) : (i += 1) {
             run_count += 1;
-            entry_count += runs[i].entry_count;
-            size_bytes += runs[i].size_bytes;
+            entry_count += runs.at(i).entry_count;
+            size_bytes += runs.at(i).size_bytes;
         }
         try writer.print(
             "{{\"backend\":\"{s}\",\"workload\":\"{s}\",\"level\":{d},\"runs\":{d},\"entries\":{d},\"bytes\":{d}}}\n",
@@ -892,7 +827,7 @@ fn printBackendCompactionStats(
     stats: antfly.lsm_backend.Backend.CompactionStats,
 ) !void {
     var resident_bytes: u64 = 0;
-    for (runs) |run| resident_bytes += run.size_bytes;
+    for (0..runs.count()) |rank| resident_bytes += runs.at(rank).size_bytes;
     const rewrite_over_resident = if (resident_bytes == 0)
         0.0
     else
@@ -993,12 +928,6 @@ fn shuffledKeys(allocator: std.mem.Allocator, keys: []const []u8) ![][]u8 {
         std.mem.swap([]u8, &shuffled[i], &shuffled[j]);
     }
     return shuffled;
-}
-
-fn benchLmdbMapSize(cfg: Config) usize {
-    const estimated_payload = cfg.keys * (cfg.value_size + 256);
-    const estimated_working_set = estimated_payload * 8;
-    return @max(128 * 1024 * 1024, estimated_working_set);
 }
 
 fn fragmentedConfig(cfg: Config) Config {

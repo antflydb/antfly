@@ -47,8 +47,9 @@ class QueryBuilderRequest:
             `semantic`, `hybrid`, `filter`, `tree`, and `graph`. Unknown values are accepted for
             forward compatibility and may fall back to `auto`.
              Example: auto.
-        output (str | Unset): Preferred output artifact. Suggested values are `query_request`, `bleve`, and
-            `filter_query`. The compatibility `query` field is still returned for existing clients.
+        output (str | Unset): Preferred output artifact. Suggested values are `query_request`, `bleve` (Antfly's
+            native, Bleve-compatible full-text query JSON), and `filter_query`. The compatibility
+            `query` field is still returned for existing clients.
              Example: query_request.
         constraints (QueryBuilderRequestConstraints | Unset): Optional execution constraints for the coordinator, such
             as `limit`, `allowed_fields`,

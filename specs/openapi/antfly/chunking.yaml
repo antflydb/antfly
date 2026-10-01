@@ -32,9 +32,9 @@ components:
               x-go-type-skip-optional-pointer: true
               type: object
               description: |
-                Configuration for full-text indexing of chunks in Bleve.
-                When present (even if empty), chunks will be stored with :cft: suffix and indexed in Bleve's _chunks field.
-                When absent, chunks use :c: suffix and are only used for vector embeddings.
+                Configuration for full-text indexing of chunks.
+                When present (even if empty), chunk artifacts are persisted and indexed in Antfly's native full-text index, queryable and projectable via the document's `_chunks` field.
+                When absent, chunks are generated only to drive vector embeddings and are not indexed for full-text search (unless `store_chunks` is also set).
               additionalProperties: true
             # Repeat all inherited fields for generators that flatten only one
             # allOf level. This direct reference preserves the standalone
@@ -76,17 +76,17 @@ components:
       description: |
         Configuration for the Antfly inference chunking provider.
 
-        Antfly inference is a centralized HTTP service that provides chunking with multi-tier caching.
+        Antfly inference is Antfly's built-in ML service for local chunking.
         The model name maps to ONNX model directory names (similar to how Ollama works).
 
         **Chunking Models:**
         - fixed: Simple fixed-size chunking by token count (built-in, no ONNX required)
         - Any other name will attempt to load from models/chunkers/{name}/ directory
 
-        **Caching:**
-        - L1: Memory cache with 2-minute TTL
-        - L2: Persistent Pebble database
-        - Singleflight deduplication for concurrent identical requests
+        **Deduplication:**
+        - Within a single document write, chunk results are deduplicated when multiple
+          indexes share the same source text and chunker configuration, so the source
+          is chunked at most once per write.
       allOf:
         - $ref: "../shared/chunking.yaml#/components/schemas/ChunkOptions"
         - type: object

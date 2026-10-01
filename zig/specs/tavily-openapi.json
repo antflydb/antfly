@@ -1,0 +1,3566 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Tavily Search and Extract API",
+    "description": "Our REST API provides seamless access to Tavily Search, a powerful search engine for LLM agents, and Tavily Extract, an advanced web scraping solution optimized for LLMs.",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "https://api.tavily.com/"
+    }
+  ],
+  "paths": {
+    "/search": {
+      "post": {
+        "summary": "Search for data based on a query",
+        "description": "Execute a search query using Tavily Search.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-codeSamples": [
+          {
+            "lang": "python",
+            "label": "Python SDK",
+            "source": "from tavily import TavilyClient\n\ntavily_client = TavilyClient(api_key=\"tvly-YOUR_API_KEY\")\nresponse = tavily_client.search(\"Who is Leo Messi?\")\n\nprint(response)"
+          },
+          {
+            "lang": "javascript",
+            "label": "JavaScript SDK",
+            "source": "const { tavily } = require(\"@tavily/core\");\n\nconst tvly = tavily({ apiKey: \"tvly-YOUR_API_KEY\" });\nconst response = await tvly.search(\"Who is Leo Messi?\");\n\nconsole.log(response);"
+          }
+        ],
+        "requestBody": {
+          "description": "Parameters for the Tavily Search request.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "query": {
+                    "type": "string",
+                    "description": "The search query to execute with Tavily.",
+                    "example": "who is Leo Messi?"
+                  },
+                  "search_depth": {
+                    "type": "string",
+                    "description": "Controls the latency vs. relevance tradeoff and how `results[].content` is generated:\n- `advanced`: Highest relevance with increased latency. Best for detailed, high-precision queries. Returns multiple semantically relevant snippets per URL (configurable via `chunks_per_source`).\n- `basic`: A balanced option for relevance and latency. Ideal for general-purpose searches. Returns multiple semantically relevant snippets per URL (configurable via `chunks_per_source`).\n- `fast`: Prioritizes lower latency while maintaining good relevance. Returns multiple semantically relevant snippets per URL (configurable via `chunks_per_source`).\n- `ultra-fast`: Minimizes latency above all else. Best for time-critical use cases. Returns one NLP summary per URL.\n\n**Cost**:\n- `basic`, `fast`, `ultra-fast`: 1 API Credit\n- `advanced`: 2 API Credits\n\nSee [Search Best Practices](/documentation/best-practices/best-practices-search#search-depth) for guidance on choosing the right search depth.",
+                    "enum": [
+                      "advanced",
+                      "basic",
+                      "fast",
+                      "ultra-fast"
+                    ],
+                    "default": "basic"
+                  },
+                  "chunks_per_source": {
+                    "type": "integer",
+                    "description": "Chunks are short content snippets (maximum 500 characters each) pulled directly from the source. Use `chunks_per_source` to define the maximum number of relevant chunks returned per source and to control the `content` length. Chunks will appear in the `content` field as: `<chunk 1> [...] <chunk 2> [...] <chunk 3>`. Available when `search_depth` is `advanced`, `basic` or `fast`.",
+                    "default": 3,
+                    "minimum": 1,
+                    "maximum": 3
+                  },
+                  "max_results": {
+                    "type": "integer",
+                    "example": 1,
+                    "description": "The maximum number of search results to return.",
+                    "default": 10,
+                    "minimum": 0,
+                    "maximum": 20
+                  },
+                  "topic": {
+                    "type": "string",
+                    "description": "The category of the search.`news` is useful for retrieving real-time updates, particularly about politics, sports, and major current events covered by mainstream media sources. `general` is for broader, more general-purpose searches that may include a wide range of sources.",
+                    "default": "general",
+                    "enum": [
+                      "general",
+                      "news",
+                      "finance"
+                    ]
+                  },
+                  "time_range": {
+                    "type": "string",
+                    "description": "The time range back from the current date to filter results based on publish date or last updated date. Useful when looking for sources that have published or updated data. By default, results with no detectable published date are not removed; set `filter_by_published_date` to `true` to remove them.",
+                    "enum": [
+                      "day",
+                      "week",
+                      "month",
+                      "year",
+                      "d",
+                      "w",
+                      "m",
+                      "y"
+                    ],
+                    "default": null
+                  },
+                  "start_date": {
+                    "type": "string",
+                    "description": "Will return all results after the specified start date based on publish date or last updated date. Required to be written in the format YYYY-MM-DD. By default, results with no detectable published date are not removed; set `filter_by_published_date` to `true` to remove them.",
+                    "example": "2025-02-09",
+                    "default": null
+                  },
+                  "end_date": {
+                    "type": "string",
+                    "description": "Will return all results before the specified end date based on publish date or last updated date. Required to be written in the format YYYY-MM-DD. By default, results with no detectable published date are not removed; set `filter_by_published_date` to `true` to remove them.",
+                    "example": "2025-12-29",
+                    "default": null
+                  },
+                  "include_published_date": {
+                    "type": "boolean",
+                    "description": "Include a `published_date` field in each result. The date is Tavily's best estimate of when the source was published or last updated, so it can be later than the original publish date. Results with no detectable date return `null`. Automatically enabled when `topic` is `news`.\n\n**Note**: this feature is currently in beta.",
+                    "default": false
+                  },
+                  "filter_by_published_date": {
+                    "type": "boolean",
+                    "description": "Remove results whose published date falls outside the `time_range`, `start_date`, or `end_date` window. Results with no detectable published date are also removed. Setting this to `true` also enables `include_published_date`.\n\nIf you want date-window filtering but don't want to lose sources without a detectable date, leave this `false` and set `include_published_date: true` together with a date range instead.",
+                    "default": false
+                  },
+                  "include_answer": {
+                    "oneOf": [
+                      {
+                        "type": "boolean"
+                      },
+                      {
+                        "type": "string",
+                        "enum": [
+                          "basic",
+                          "advanced"
+                        ]
+                      }
+                    ],
+                    "description": "Include an LLM-generated answer to the provided query. `basic` or `true` returns a quick answer. `advanced` returns a more detailed answer.",
+                    "default": false
+                  },
+                  "include_raw_content": {
+                    "oneOf": [
+                      {
+                        "type": "boolean"
+                      },
+                      {
+                        "type": "string",
+                        "enum": [
+                          "markdown",
+                          "text"
+                        ]
+                      }
+                    ],
+                    "description": "Include the cleaned and parsed HTML content of each search result. `markdown` or `true` returns search result content in markdown format. `text` returns the plain text from the results and may increase latency.",
+                    "default": false
+                  },
+                  "include_images": {
+                    "type": "boolean",
+                    "description": "Include images in the response. Returns both a top-level `images` list of query-related images and an `images` array inside each result object with images extracted from that specific source.",
+                    "default": false
+                  },
+                  "include_image_descriptions": {
+                    "type": "boolean",
+                    "description": "When `include_images` is `true`, also add a descriptive text for each image.",
+                    "default": false
+                  },
+                  "include_favicon": {
+                    "type": "boolean",
+                    "description": "Whether to include the favicon URL for each result.",
+                    "default": false
+                  },
+                  "include_domains": {
+                    "type": "array",
+                    "description": "A list of domains to specifically include in the search results. Maximum 300 domains.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "default": []
+                  },
+                  "exclude_domains": {
+                    "type": "array",
+                    "description": "A list of domains to specifically exclude from the search results. Maximum 150 domains.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "default": []
+                  },
+                  "include_domains_mode": {
+                    "type": "string",
+                    "description": "Controls how `include_domains` is applied. `restrict` limits results to only the listed domains. `prefer` also searches the rest of the web, so results outside `include_domains` can still surface, rather than excluding them. Requires `include_domains` to be set; returns a 400 error otherwise.",
+                    "enum": [
+                      "restrict",
+                      "prefer"
+                    ],
+                    "default": null
+                  },
+                  "country": {
+                    "type": "string",
+                    "description": "Boost search results from a specific country. This will prioritize content from the selected country in the search results. Available only if topic is `general`.",
+                    "enum": [
+                      "afghanistan",
+                      "albania",
+                      "algeria",
+                      "andorra",
+                      "angola",
+                      "argentina",
+                      "armenia",
+                      "australia",
+                      "austria",
+                      "azerbaijan",
+                      "bahamas",
+                      "bahrain",
+                      "bangladesh",
+                      "barbados",
+                      "belarus",
+                      "belgium",
+                      "belize",
+                      "benin",
+                      "bhutan",
+                      "bolivia",
+                      "bosnia and herzegovina",
+                      "botswana",
+                      "brazil",
+                      "brunei",
+                      "bulgaria",
+                      "burkina faso",
+                      "burundi",
+                      "cambodia",
+                      "cameroon",
+                      "canada",
+                      "cape verde",
+                      "central african republic",
+                      "chad",
+                      "chile",
+                      "china",
+                      "colombia",
+                      "comoros",
+                      "congo",
+                      "costa rica",
+                      "croatia",
+                      "cuba",
+                      "cyprus",
+                      "czech republic",
+                      "denmark",
+                      "djibouti",
+                      "dominican republic",
+                      "ecuador",
+                      "egypt",
+                      "el salvador",
+                      "equatorial guinea",
+                      "eritrea",
+                      "estonia",
+                      "ethiopia",
+                      "fiji",
+                      "finland",
+                      "france",
+                      "gabon",
+                      "gambia",
+                      "georgia",
+                      "germany",
+                      "ghana",
+                      "greece",
+                      "guatemala",
+                      "guinea",
+                      "haiti",
+                      "honduras",
+                      "hungary",
+                      "iceland",
+                      "india",
+                      "indonesia",
+                      "iran",
+                      "iraq",
+                      "ireland",
+                      "israel",
+                      "italy",
+                      "jamaica",
+                      "japan",
+                      "jordan",
+                      "kazakhstan",
+                      "kenya",
+                      "kuwait",
+                      "kyrgyzstan",
+                      "latvia",
+                      "lebanon",
+                      "lesotho",
+                      "liberia",
+                      "libya",
+                      "liechtenstein",
+                      "lithuania",
+                      "luxembourg",
+                      "madagascar",
+                      "malawi",
+                      "malaysia",
+                      "maldives",
+                      "mali",
+                      "malta",
+                      "mauritania",
+                      "mauritius",
+                      "mexico",
+                      "moldova",
+                      "monaco",
+                      "mongolia",
+                      "montenegro",
+                      "morocco",
+                      "mozambique",
+                      "myanmar",
+                      "namibia",
+                      "nepal",
+                      "netherlands",
+                      "new zealand",
+                      "nicaragua",
+                      "niger",
+                      "nigeria",
+                      "north korea",
+                      "north macedonia",
+                      "norway",
+                      "oman",
+                      "pakistan",
+                      "panama",
+                      "papua new guinea",
+                      "paraguay",
+                      "peru",
+                      "philippines",
+                      "poland",
+                      "portugal",
+                      "qatar",
+                      "romania",
+                      "russia",
+                      "rwanda",
+                      "saudi arabia",
+                      "senegal",
+                      "serbia",
+                      "singapore",
+                      "slovakia",
+                      "slovenia",
+                      "somalia",
+                      "south africa",
+                      "south korea",
+                      "south sudan",
+                      "spain",
+                      "sri lanka",
+                      "sudan",
+                      "sweden",
+                      "switzerland",
+                      "syria",
+                      "taiwan",
+                      "tajikistan",
+                      "tanzania",
+                      "thailand",
+                      "togo",
+                      "trinidad and tobago",
+                      "tunisia",
+                      "turkey",
+                      "turkmenistan",
+                      "uganda",
+                      "ukraine",
+                      "united arab emirates",
+                      "united kingdom",
+                      "united states",
+                      "uruguay",
+                      "uzbekistan",
+                      "venezuela",
+                      "vietnam",
+                      "yemen",
+                      "zambia",
+                      "zimbabwe"
+                    ],
+                    "default": null
+                  },
+                  "language": {
+                    "type": "string",
+                    "description": "Boost search results in a specific language. Accepts an ISO 639-1 code (e.g. `en`, `fr`, `zh-cn`) or an English language name (e.g. `english`, `french`). By default this only boosts matching-language results in ranking; pass `filter_by_language: true` to strictly filter out non-matching results instead. For best results, write your `query` in the same language you set here.",
+                    "example": "en",
+                    "default": null
+                  },
+                  "filter_by_language": {
+                    "type": "boolean",
+                    "description": "Strictly filter out search results that don't match the `language` parameter, instead of only boosting them in ranking. Requires `language` to be set; returns a 400 error otherwise.",
+                    "default": false
+                  },
+                  "auto_parameters": {
+                    "type": "boolean",
+                    "description": "When `auto_parameters` is enabled, Tavily automatically configures search parameters based on your query's content and intent. You can still set other parameters manually, and your explicit values will override the automatic ones. The parameters `include_answer`, `include_raw_content`, and `max_results` must always be set manually, as they directly affect response size. Note: `search_depth` may be automatically set to advanced when it's likely to improve results. This uses 2 API credits per request. To avoid the extra cost, you can explicitly set `search_depth` to `basic`.",
+                    "default": false
+                  },
+                  "exact_match": {
+                    "type": "boolean",
+                    "description": "Ensure that only search results containing the exact quoted phrase(s) in the query are returned, bypassing synonyms or semantic variations. Wrap target phrases in quotes within your query (e.g. `\"John Smith\" CEO Acme Corp`). Punctuation is typically ignored inside quotes.",
+                    "default": false
+                  },
+                  "include_usage": {
+                    "type": "boolean",
+                    "description": "Whether to include credit usage information in the response.",
+                    "default": false
+                  },
+                  "safe_search": {
+                    "type": "boolean",
+                    "description": "Whether to filter out adult or unsafe content from results. Not supported for `fast` or `ultra-fast` search depths.",
+                    "default": false
+                  }
+                },
+                "required": [
+                  "query"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Search results returned successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "query": {
+                      "type": "string",
+                      "description": "The search query that was executed.",
+                      "example": "Who is Leo Messi?"
+                    },
+                    "answer": {
+                      "type": "string",
+                      "description": "A short answer to the user's query, generated by an LLM. Included in the response only if `include_answer` is requested (i.e., set to `true`, `basic`, or `advanced`)",
+                      "example": "Lionel Messi, born in 1987, is an Argentine footballer widely regarded as one of the greatest players of his generation. He spent the majority of his career playing for FC Barcelona, where he won numerous domestic league titles and UEFA Champions League titles. Messi is known for his exceptional dribbling skills, vision, and goal-scoring ability. He has won multiple FIFA Ballon d'Or awards, numerous La Liga titles with Barcelona, and holds the record for most goals scored in a calendar year. In 2014, he led Argentina to the World Cup final, and in 2015, he helped Barcelona capture another treble. Despite turning 36 in June, Messi remains highly influential in the sport."
+                    },
+                    "images": {
+                      "type": "array",
+                      "description": "A list of query-related images from image search. If `include_image_descriptions` is true, each item will have `url` and `description`. Note: per-result images are also returned inside each result object's `images` field.",
+                      "example": [],
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "url": {
+                            "type": "string"
+                          },
+                          "description": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    },
+                    "results": {
+                      "type": "array",
+                      "description": "A list of sorted search results, ranked by relevancy.",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "title": {
+                            "type": "string",
+                            "description": "The title of the search result.",
+                            "example": "Lionel Messi Facts | Britannica"
+                          },
+                          "url": {
+                            "type": "string",
+                            "description": "The URL of the search result.",
+                            "example": "https://www.britannica.com/facts/Lionel-Messi"
+                          },
+                          "content": {
+                            "type": "string",
+                            "description": "A short description of the search result.",
+                            "example": "Lionel Messi, an Argentine footballer, is widely regarded as one of the greatest football players of his generation. Born in 1987, Messi spent the majority of his career playing for Barcelona, where he won numerous domestic league titles and UEFA Champions League titles. Messi is known for his exceptional dribbling skills, vision, and goal"
+                          },
+                          "score": {
+                            "type": "number",
+                            "format": "float",
+                            "description": "The relevance score of the search result.",
+                            "example": 0.81025416
+                          },
+                          "raw_content": {
+                            "type": "string",
+                            "description": "The cleaned and parsed HTML content of the search result. Only if `include_raw_content` is true.",
+                            "example": null
+                          },
+                          "published_date": {
+                            "type": "string",
+                            "description": "Tavily's best estimate of when the source was published or last updated. Can be later than the original publish date. `null` if no date could be detected. Only returned when `include_published_date` is `true` (automatically enabled when `topic` is `news`).",
+                            "example": "Tue, 11 Mar 2025 17:00:00 GMT"
+                          },
+                          "favicon": {
+                            "type": "string",
+                            "description": "The favicon URL for the result.",
+                            "example": "https://britannica.com/favicon.png"
+                          },
+                          "images": {
+                            "type": "array",
+                            "description": "A list of images extracted from this search result. Only included when `include_images` is `true`. If `include_image_descriptions` is `true`, each item will have `url` and `description`.",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "url": {
+                                  "type": "string"
+                                },
+                                "description": {
+                                  "type": "string"
+                                }
+                              }
+                            }
+                          },
+                          "id": {
+                            "type": "string",
+                            "description": "Unique identifier for this result",
+                            "example": "a3f9c2-04"
+                          }
+                        }
+                      }
+                    },
+                    "auto_parameters": {
+                      "type": "object",
+                      "description": "A dictionary of the selected auto_parameters, only shown when `auto_parameters` is true.",
+                      "example": {
+                        "topic": "general",
+                        "search_depth": "basic"
+                      }
+                    },
+                    "response_time": {
+                      "type": "number",
+                      "format": "float",
+                      "description": "Time in seconds it took to complete the request.",
+                      "example": "1.67"
+                    },
+                    "usage": {
+                      "type": "object",
+                      "description": "Credit usage details for the request.",
+                      "example": {
+                        "credits": 1
+                      }
+                    },
+                    "request_id": {
+                      "type": "string",
+                      "description": "A unique request identifier you can share with customer support to help resolve issues with specific requests.",
+                      "example": "123e4567-e89b-12d3-a456-426614174111"
+                    }
+                  },
+                  "required": [
+                    "query",
+                    "results",
+                    "images",
+                    "response_time",
+                    "answer"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request - Your request is invalid.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "<400 Bad Request, (e.g Invalid topic. Must be 'general' or 'news'.)>"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized - Your API key is wrong or missing.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Unauthorized: missing or invalid API key."
+                  }
+                }
+              }
+            }
+          },
+          "432": {
+            "description": "Key limit or Plan Limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "<432 Custom Forbidden Error (e.g This request exceeds your plan's set usage limit. Please upgrade your plan or contact support@tavily.com)>"
+                  }
+                }
+              }
+            }
+          },
+          "433": {
+            "description": "PayGo limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "This request exceeds the pay-as-you-go limit. You can increase your limit on the Tavily dashboard."
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too Many Requests. Error messages and retry delays can vary by rate-limit rule.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Your request has been blocked due to excessive requests. Please reduce the rate of requests."
+                  }
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error - We had a problem with our server.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Internal Server Error"
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Request validation failed. The detail array identifies invalid fields.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationError"
+                },
+                "example": {
+                  "detail": [
+                    {
+                      "type": "string_type",
+                      "loc": [
+                        "body",
+                        "query"
+                      ],
+                      "msg": "Input should be a valid string",
+                      "input": []
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "operationId": "search"
+      }
+    },
+    "/extract": {
+      "post": {
+        "summary": "Retrieve raw web content from specified URLs",
+        "description": "Extract content from one URL or batch up to 20 URLs in one request. Successful URLs appear in results; per-URL failures appear in failed_results. Check both arrays even when the response is HTTP 200. Request options apply to every URL in the batch.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-codeSamples": [
+          {
+            "lang": "python",
+            "label": "Python SDK",
+            "source": "from tavily import TavilyClient\n\ntavily_client = TavilyClient(api_key=\"tvly-YOUR_API_KEY\")\nresponse = tavily_client.extract(\"https://en.wikipedia.org/wiki/Artificial_intelligence\")\n\nprint(response)"
+          },
+          {
+            "lang": "javascript",
+            "label": "JavaScript SDK",
+            "source": "const { tavily } = require(\"@tavily/core\");\n\nconst tvly = tavily({ apiKey: \"tvly-YOUR_API_KEY\" });\nconst response = await tvly.extract(\"https://en.wikipedia.org/wiki/Artificial_intelligence\");\n\nconsole.log(response);"
+          }
+        ],
+        "requestBody": {
+          "description": "Parameters for the Tavily Extract request.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "urls": {
+                    "oneOf": [
+                      {
+                        "type": "string",
+                        "description": "The URL to extract content from.",
+                        "example": "https://en.wikipedia.org/wiki/Artificial_intelligence"
+                      },
+                      {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        },
+                        "description": "A list of 1\u201320 URLs to extract in one request.",
+                        "example": [
+                          "https://en.wikipedia.org/wiki/Artificial_intelligence",
+                          "https://en.wikipedia.org/wiki/Machine_learning",
+                          "https://en.wikipedia.org/wiki/Data_science"
+                        ],
+                        "minItems": 1,
+                        "maxItems": 20
+                      }
+                    ]
+                  },
+                  "query": {
+                    "type": "string",
+                    "description": "User intent for reranking extracted content chunks. When provided, chunks are reranked based on relevance to this query."
+                  },
+                  "chunks_per_source": {
+                    "type": "integer",
+                    "description": "Chunks are short content snippets (maximum 500 characters each) pulled directly from the source. Use `chunks_per_source` to define the maximum number of relevant chunks returned per source and to control the `raw_content` length. Chunks will appear in the `raw_content` field as: `<chunk 1> [...] <chunk 2> [...] <chunk 3>`. Available only when `query` is provided. Must be between 1 and 5.",
+                    "minimum": 1,
+                    "maximum": 5,
+                    "default": 3
+                  },
+                  "extract_depth": {
+                    "type": "string",
+                    "description": "The depth of the extraction process. `advanced` extraction retrieves more data, including tables and embedded content, with higher success but may increase latency.`basic` extraction costs 1 credit per 5 successful URL extractions, while `advanced` extraction costs 2 credits per 5 successful URL extractions.",
+                    "enum": [
+                      "basic",
+                      "advanced"
+                    ],
+                    "default": "basic"
+                  },
+                  "include_images": {
+                    "type": "boolean",
+                    "description": "Include a list of images extracted from the URLs in the response. Default is false.",
+                    "default": false
+                  },
+                  "include_favicon": {
+                    "type": "boolean",
+                    "description": "Whether to include the favicon URL for each result.",
+                    "default": false
+                  },
+                  "format": {
+                    "type": "string",
+                    "description": "The format of the extracted web page content. `markdown` returns content in markdown format. `text` returns plain text and may increase latency.",
+                    "enum": [
+                      "markdown",
+                      "text"
+                    ],
+                    "default": "markdown"
+                  },
+                  "timeout": {
+                    "type": "number",
+                    "format": "float",
+                    "description": "Maximum time in seconds to wait for the URL extraction before timing out. Must be between 1.0 and 60.0 seconds. If not specified, default timeouts are applied based on extract_depth: 10 seconds for basic extraction and 30 seconds for advanced extraction.",
+                    "minimum": 1.0,
+                    "maximum": 60.0,
+                    "default": "None"
+                  },
+                  "include_usage": {
+                    "type": "boolean",
+                    "description": "Whether to include credit usage information in the response. `NOTE:`The value may be 0 if the total successful URL extractions has not yet reached 5 calls. See our [Credits & Pricing documentation](https://docs.tavily.com/documentation/api-credits) for details.",
+                    "default": false
+                  }
+                },
+                "required": [
+                  "urls"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Extraction completed. Check results and failed_results for each URL. HTTP 200 can have an empty results array when all valid URLs fail during extraction; output order is not guaranteed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "results": {
+                      "type": "array",
+                      "description": "A list of extracted content from the provided URLs.",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "url": {
+                            "type": "string",
+                            "description": "The URL from which the content was extracted.",
+                            "example": "https://en.wikipedia.org/wiki/Artificial_intelligence"
+                          },
+                          "raw_content": {
+                            "type": "string",
+                            "description": "The full content extracted from the page. When `query` is provided, contains the top-ranked chunks joined by `[...]` separator.",
+                            "example": "\"Jump to content\\nMain menu\\nSearch\\nAppearance\\nDonate\\nCreate account\\nLog in\\nPersonal tools\\n        Photograph your local culture, help Wikipedia and win!\\nToggle the table of contents\\nArtificial intelligence\\n161 languages\\nArticle\\nTalk\\nRead\\nView source\\nView history\\nTools\\nFrom Wikipedia, the free encyclopedia\\n\\\"AI\\\" redirects here. For other uses, see AI (disambiguation) and Artificial intelligence (disambiguation).\\nPart of a series on\\nArtificial intelligence (AI)\\nshow\\nMajor goals\\nshow\\nApproaches\\nshow\\nApplications\\nshow\\nPhilosophy\\nshow\\nHistory\\nshow\\nGlossary\\nvte\\nArtificial intelligence (AI), in its broadest sense, is intelligence exhibited by machines, particularly computer systems. It is a field of research in computer science that develops and studies methods and software that enable machines to perceive their environment and use learning and intelligence to take actions that maximize their chances of achieving defined goals.[1] Such machines may be called AIs.\\nHigh-profile applications of AI include advanced web search engines (e.g., Google Search); recommendation systems (used by YouTube, Amazon, and Netflix); virtual assistants (e.g., Google Assistant, Siri, and Alexa); autonomous vehicles (e.g., Waymo); generative and creative tools (e.g., ChatGPT and AI art); and superhuman play and analysis in strategy games (e.g., chess and Go)..................."
+                          },
+                          "images": {
+                            "type": "array",
+                            "example": [],
+                            "description": "This is only available if `include_images` is set to `true`. A list of image URLs extracted from the page.",
+                            "items": {
+                              "type": "string"
+                            }
+                          },
+                          "favicon": {
+                            "type": "string",
+                            "description": "The favicon URL for the result.",
+                            "example": "https://en.wikipedia.org/static/favicon/wikipedia.ico"
+                          }
+                        }
+                      }
+                    },
+                    "failed_results": {
+                      "type": "array",
+                      "example": [],
+                      "description": "A list of URLs that could not be processed.",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "url": {
+                            "type": "string",
+                            "description": "The URL that failed to be processed."
+                          },
+                          "error": {
+                            "type": "string",
+                            "description": "An error message describing why the URL couldn't be processed."
+                          }
+                        }
+                      }
+                    },
+                    "response_time": {
+                      "type": "number",
+                      "format": "float",
+                      "description": "Time in seconds it took to complete the request.",
+                      "example": 0.02
+                    },
+                    "usage": {
+                      "type": "object",
+                      "description": "Credit usage details for the request.",
+                      "example": {
+                        "credits": 1
+                      }
+                    },
+                    "request_id": {
+                      "type": "string",
+                      "description": "A unique request identifier you can share with customer support to help resolve issues with specific requests.",
+                      "example": "123e4567-e89b-12d3-a456-426614174111"
+                    }
+                  }
+                },
+                "examples": {
+                  "partialSuccess": {
+                    "summary": "One URL succeeds and another fails",
+                    "value": {
+                      "results": [
+                        {
+                          "url": "https://example.com/article",
+                          "raw_content": "Example extracted article content.",
+                          "images": []
+                        }
+                      ],
+                      "failed_results": [
+                        {
+                          "url": "https://example.com/unavailable",
+                          "error": "Failed to retrieve content"
+                        }
+                      ],
+                      "response_time": 0.5,
+                      "request_id": "123e4567-e89b-12d3-a456-426614174111"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too Many Requests. Error messages and retry delays can vary by rate-limit rule.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Your request has been blocked due to excessive requests. Please reduce the rate of requests."
+                  }
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized - Your API key is wrong or missing.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Unauthorized: missing or invalid API key."
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request. More than 20 URLs, an empty URL list, or no URLs passing validation are rejected. When all URLs fail validation, detail.failed_results describes the individual failures.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ApiError"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "detail": {
+                          "type": "object",
+                          "properties": {
+                            "failed_results": {
+                              "type": "array",
+                              "description": "A list of URLs that could not be processed.",
+                              "items": {
+                                "type": "object",
+                                "properties": {
+                                  "url": {
+                                    "type": "string",
+                                    "description": "The URL that failed to be processed."
+                                  },
+                                  "error": {
+                                    "type": "string",
+                                    "description": "An error message describing why the URL couldn't be processed."
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  ]
+                },
+                "examples": {
+                  "tooManyUrls": {
+                    "summary": "More than 20 URLs",
+                    "value": {
+                      "detail": {
+                        "error": "Max 20 URLs are allowed."
+                      }
+                    }
+                  },
+                  "allInvalidUrls": {
+                    "summary": "No URL passes validation",
+                    "value": {
+                      "detail": {
+                        "error": "All URLs failed validation.",
+                        "failed_results": [
+                          {
+                            "url": "not-a-url",
+                            "error": "Validation Error: Invalid URL format"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "432": {
+            "description": "Key limit or Plan Limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "<432 Custom Forbidden Error (e.g This request exceeds your plan's set usage limit. Please upgrade your plan or contact support@tavily.com)>"
+                  }
+                }
+              }
+            }
+          },
+          "433": {
+            "description": "PayGo limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "This request exceeds the pay-as-you-go limit. You can increase your limit on the Tavily dashboard."
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error - We had a problem with our server.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Internal Server Error"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "operationId": "extract"
+      }
+    },
+    "/crawl": {
+      "post": {
+        "summary": "Initiate a web crawl from a base URL",
+        "description": "Tavily Crawl is a graph-based website traversal tool that can explore hundreds of paths in parallel with built-in extraction and intelligent discovery.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-codeSamples": [
+          {
+            "lang": "python",
+            "label": "Python SDK",
+            "source": "from tavily import TavilyClient\n\ntavily_client = TavilyClient(api_key=\"tvly-YOUR_API_KEY\")\nresponse = tavily_client.crawl(\"https://docs.tavily.com\", instructions=\"Find all pages on the Python SDK\")\n\nprint(response)"
+          },
+          {
+            "lang": "javascript",
+            "label": "JavaScript SDK",
+            "source": "const { tavily } = require(\"@tavily/core\");\n\nconst tvly = tavily({ apiKey: \"tvly-YOUR_API_KEY\" });\nconst response = await tvly.crawl(\"https://docs.tavily.com\", { instructions: \"Find all pages on the Python SDK\" });\n\nconsole.log(response);"
+          }
+        ],
+        "requestBody": {
+          "description": "Parameters for the Tavily Crawl request.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "url": {
+                    "type": "string",
+                    "description": "The root URL to begin the crawl.",
+                    "example": "docs.tavily.com"
+                  },
+                  "instructions": {
+                    "type": "string",
+                    "description": "Natural language instructions for the crawler. When specified, the mapping cost increases to 2 API credits per 10 successful pages instead of 1 API credit per 10 pages.",
+                    "example": "Find all pages about the Python SDK"
+                  },
+                  "chunks_per_source": {
+                    "type": "integer",
+                    "description": "Chunks are short content snippets (maximum 500 characters each) pulled directly from the source. Use `chunks_per_source` to define the maximum number of relevant chunks returned per source and to control the `raw_content` length. Chunks will appear in the `raw_content` field as: `<chunk 1> [...] <chunk 2> [...] <chunk 3>`. Available only when `instructions` are provided. Must be between 1 and 5.",
+                    "minimum": 1,
+                    "maximum": 5,
+                    "default": 3
+                  },
+                  "max_depth": {
+                    "type": "integer",
+                    "description": "Max depth of the crawl. Defines how far from the base URL the crawler can explore.",
+                    "default": 1,
+                    "minimum": 1,
+                    "maximum": 5
+                  },
+                  "max_breadth": {
+                    "type": "integer",
+                    "description": "Max number of links to follow per level of the tree (i.e., per page).",
+                    "default": 20,
+                    "minimum": 1,
+                    "maximum": 500
+                  },
+                  "limit": {
+                    "type": "integer",
+                    "description": "Total number of links the crawler will process before stopping.",
+                    "default": 50,
+                    "minimum": 1
+                  },
+                  "select_paths": {
+                    "type": "array",
+                    "description": "Regex patterns to select only URLs with specific path patterns (e.g., `/docs/.*`, `/api/v1.*`).",
+                    "items": {
+                      "type": "string"
+                    },
+                    "default": null
+                  },
+                  "select_domains": {
+                    "type": "array",
+                    "description": "Regex patterns to select crawling to specific domains or subdomains (e.g., `^docs\\.example\\.com$`).",
+                    "items": {
+                      "type": "string"
+                    },
+                    "default": null
+                  },
+                  "exclude_paths": {
+                    "type": "array",
+                    "description": "Regex patterns to exclude URLs with specific path patterns (e.g., `/private/.*`, `/admin/.*`).",
+                    "items": {
+                      "type": "string"
+                    },
+                    "default": null
+                  },
+                  "exclude_domains": {
+                    "type": "array",
+                    "description": "Regex patterns to exclude specific domains or subdomains from crawling (e.g., `^private\\.example\\.com$`).",
+                    "items": {
+                      "type": "string"
+                    },
+                    "default": null
+                  },
+                  "allow_external": {
+                    "type": "boolean",
+                    "description": "Whether to include external domain links in the final results list.",
+                    "default": true
+                  },
+                  "include_images": {
+                    "type": "boolean",
+                    "description": "Whether to include images in the crawl results.",
+                    "default": false
+                  },
+                  "extract_depth": {
+                    "type": "string",
+                    "description": "Advanced extraction retrieves more data, including tables and embedded content, with higher success but may increase latency. `basic` extraction costs 1 credit per 5 successful extractions, while `advanced` extraction costs 2 credits per 5 successful extractions.",
+                    "enum": [
+                      "basic",
+                      "advanced"
+                    ],
+                    "default": "basic"
+                  },
+                  "format": {
+                    "type": "string",
+                    "description": "The format of the extracted web page content. `markdown` returns content in markdown format. `text` returns plain text and may increase latency.",
+                    "enum": [
+                      "markdown",
+                      "text"
+                    ],
+                    "default": "markdown"
+                  },
+                  "include_favicon": {
+                    "type": "boolean",
+                    "description": "Whether to include the favicon URL for each result.",
+                    "default": false
+                  },
+                  "timeout": {
+                    "type": "number",
+                    "format": "float",
+                    "description": "Maximum time in seconds to wait for the crawl operation before timing out. Must be between 10 and 150 seconds.",
+                    "minimum": 10,
+                    "maximum": 150,
+                    "default": 150
+                  },
+                  "include_usage": {
+                    "type": "boolean",
+                    "description": "Whether to include credit usage information in the response. `NOTE:`The value may be 0 if the total use of /extract and /map have not yet reached minimum requirements. See our [Credits & Pricing documentation](https://docs.tavily.com/documentation/api-credits) for details.",
+                    "default": false
+                  }
+                },
+                "required": [
+                  "url"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Crawl results returned successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "base_url": {
+                      "type": "string",
+                      "description": "The base URL that was crawled.",
+                      "example": "docs.tavily.com"
+                    },
+                    "results": {
+                      "type": "array",
+                      "description": "A list of extracted content from the crawled URLs.",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "url": {
+                            "type": "string",
+                            "description": "The URL that was crawled.",
+                            "example": "https://docs.tavily.com"
+                          },
+                          "raw_content": {
+                            "type": "string",
+                            "description": "The full content extracted from the page. When `query` is provided, contains the top-ranked chunks joined by `[...]` separator."
+                          },
+                          "favicon": {
+                            "type": "string",
+                            "description": "The favicon URL for the result.",
+                            "example": "https://mintlify.s3-us-west-1.amazonaws.com/tavilyai/_generated/favicon/apple-touch-icon.png?v=3"
+                          }
+                        }
+                      },
+                      "example": [
+                        {
+                          "url": "https://docs.tavily.com/welcome",
+                          "raw_content": "Welcome - Tavily Docs\n\n[Tavily Docs home page![light logo](https://mintlify.s3.us-west-1.amazonaws.com/tavilyai/logo/light.svg)![dark logo](https://mintlify.s3.us-west-1.amazonaws.com/tavilyai/logo/dark.svg)](https://tavily.com/)\n\nSearch or ask...\n\nCtrl K\n\n- [Support](mailto:support@tavily.com)\n- [Get an API key](https://app.tavily.com)\n- [Get an API key](https://app.tavily.com)\n\nSearch...\n\nNavigation\n\n[Home](/welcome)[Documentation](/documentation/about)[SDKs](/sdk/python/quick-start)[Examples](/examples/use-cases/data-enrichment)[FAQ](/faq/faq)\n\nExplore our docs\n\nYour journey to state-of-the-art web search starts right here.\n\n[## Quickstart\n\nStart searching with Tavily in minutes](documentation/quickstart)[## API Reference\n\nStart using Tavily's powerful APIs](documentation/api-reference/endpoint/search)[## API Credits Overview\n\nLearn how to get and manage your Tavily API Credits](documentation/api-credits)[## Rate Limits\n\nLearn about Tavily's API rate limits for both development and production environments](documentation/rate-limits)[## Python\n\nGet started with our Python SDK, `tavily-python`](sdk/python/quick-start)[## Playground\n\nExplore Tavily's APIs with our interactive playground](https://app.tavily.com/playground)",
+                          "favicon": "https://mintlify.s3-us-west-1.amazonaws.com/tavilyai/_generated/favicon/apple-touch-icon.png?v=3"
+                        },
+                        {
+                          "url": "https://docs.tavily.com/documentation/api-credits",
+                          "raw_content": "Credits & Pricing - Tavily Docs\n\n[Tavily Docs home page![light logo](https://mintlify.s3.us-west-1.amazonaws.com/tavilyai/logo/light.svg)![dark logo](https://mintlify.s3.us-west-1.amazonaws.com/tavilyai/logo/dark.svg)](https://tavily.com/)\n\nSearch or ask...\n\nCtrl K\n\n- [Support](mailto:support@tavily.com)\n- [Get an API key](https://app.tavily.com)\n- [Get an API key](https://app.tavily.com)\n\nSearch...\n\nNavigation\n\nOverview\n\nCredits & Pricing\n\n[Home](/welcome)[Documentation](/documentation/about)[SDKs](/sdk/python/quick-start)[Examples](/examples/use-cases/data-enrichment)[FAQ](/faq/faq)\n\n- [API Playground](https://app.tavily.com/playground)\n- [Community](https://community.tavily.com)\n- [Blog](https://blog.tavily.com)\n\n##### Overview\n\n- [About](/documentation/about)\n- [Quickstart](/documentation/quickstart)\n- [Credits & Pricing](/documentation/api-credits)\n- [Rate Limits](/documentation/rate-limits)\n\n##### API Reference\n\n- [Introduction](/documentation/api-reference/introduction)\n- [POST\n\n  Tavily Search](/documentation/api-reference/endpoint/search)\n- [POST\n\n  Tavily Extract](/documentation/api-reference/endpoint/extract)\n- [POST\n\n  Tavily Crawl](/documentation/api-reference/endpoint/crawl)\n- [POST\n\n  Tavily Map](/documentation/api-reference/endpoint/map)\n\n##### Best Practices\n\n- [Best Practices for Search](/documentation/best-practices/best-practices-search)\n- [Best Practices for Extract](/documentation/best-practices/best-practices-extract)\n\n##### Tavily MCP Server\n\n- [Tavily MCP Server](/documentation/mcp)\n\n##### Integrations\n\n- [LangChain](/documentation/integrations/langchain)\n- [LlamaIndex](/documentation/integrations/llamaindex)\n- [Zapier](/documentation/integrations/zapier)\n- [Dify](/documentation/integrations/dify)\n- [Composio](/documentation/integrations/composio)\n- [Make](/documentation/integrations/make)\n- [Agno](/documentation/integrations/agno)\n- [Pydantic AI](/documentation/integrations/pydantic-ai)\n- [FlowiseAI](/documentation/integrations/flowise)\n\n##### Legal\n\n- [Security & Compliance](https://trust.tavily.com)\n- [Privacy Policy](https://tavily.com/privacy)\n\n##### Help\n\n- [Help Center](https://help.tavily.com)\n\n##### Tavily Search Crawler\n\n- [Tavily Search Crawler](/documentation/search-crawler)\n\nOverview\n\n# Credits & Pricing\n\nLearn how to get and manage your Tavily API Credits.\n\n## [\u200b](#free-api-credits) Free API Credits\n\n[## Get your free API key\n\nYou get 1,000 free API Credits every month.\n**No credit card required.**](https://app.tavily.com)\n\n## [\u200b](#pricing-overview) Pricing Overview\n\nTavily operates on a simple, credit-based model:\n\n- **Free**: 1,000 credits/month\n- **Pay-as-you-go**: $0.008 per credit (allows you to be charged per credit once your plan's credit limit is reached).\n- **Monthly plans**: $0.0075 - $0.005 per credit\n- **Enterprise**: Custom pricing and volume\n\n| **Plan** | **Credits per month** | **Monthly price** | **Price per credit** |\n| --- | --- | --- | --- |\n| **Researcher** | 1,000 | Free | - |\n| **Project** | 4,000 | $30 | $0.0075 |\n| **Bootstrap** | 15,000 | $100 | $0.0067 |\n| **Startup** | 38,000 | $220 | $0.0058 |\n| **Growth** | 100,000 | $500 | $0.005 |\n| **Pay as you go** | Per usage | $0.008 / Credit | $0.008 |\n| **Enterprise** | Custom | Custom | Custom |\n\nHead to [my plan](https://app.tavily.com/account/plan) to explore our different options and manage your plan.\n\n## [\u200b](#api-credits-costs) API Credits Costs\n\n### [\u200b](#tavily-search) Tavily Search\n\nYour [search depth](/api-reference/endpoint/search#body-search-depth) determines the cost of your request.\n\n- **Basic Search (`basic`):**\n  Each request costs **1 API credit**.\n- **Advanced Search (`advanced`):**\n  Each request costs **2 API credits**.\n\n### [\u200b](#tavily-extract) Tavily Extract\n\nThe number of successful URL extractions and your [extraction depth](/api-reference/endpoint/extract#body-extract-depth) determines the cost of your request. You never get charged if a URL extraction fails.\n\n- **Basic Extract (`basic`):**\n  Every 5 successful URL extractions cost **1 API credit**\n- **Advanced Extract (`advanced`):**\n  Every 5 successful URL extractions cost **2 API credits**\n\n[Quickstart](/documentation/quickstart)[Rate Limits](/documentation/rate-limits)\n\n[x](https://x.com/tavilyai)[github](https://github.com/tavily-ai)[linkedin](https://linkedin.com/company/tavily)[website](https://tavily.com)\n\n[Powered by Mintlify](https://mintlify.com/preview-request?utm_campaign=poweredBy&utm_medium=docs&utm_source=docs.tavily.com)\n\nOn this page\n\n- [Free API Credits](#free-api-credits)\n- [Pricing Overview](#pricing-overview)\n- [API Credits Costs](#api-credits-costs)\n- [Tavily Search](#tavily-search)\n- [Tavily Extract](#tavily-extract)",
+                          "favicon": "https://mintlify.s3-us-west-1.amazonaws.com/tavilyai/_generated/favicon/apple-touch-icon.png?v=3"
+                        },
+                        {
+                          "url": "https://docs.tavily.com/documentation/about",
+                          "raw_content": "Who are we?\n-----------\n\nWe're a team of AI researchers and developers passionate about helping you build the next generation of AI assistants. Our mission is to empower individuals and organizations with accurate, unbiased, and factual information.\n\nWhat is the Tavily Search Engine?\n---------------------------------\n\nBuilding an AI agent that leverages realtime online information is not a simple task. Scraping doesn't scale and requires expertise to refine, current search engine APIs don't provide explicit information to queries but simply potential related articles (which are not always related), and are not very customziable for AI agent needs. This is why we're excited to introduce the first search engine for AI agents - [Tavily](https://app.tavily.com/).\n\nTavily is a search engine optimized for LLMs, aimed at efficient, quick and persistent search results. Unlike other search APIs such as Serp or Google, Tavily focuses on optimizing search for AI developers and autonomous AI agents. We take care of all the burden of searching, scraping, filtering and extracting the most relevant information from online sources. All in a single API call!\n\nTo try the API in action, you can now use our hosted version on our [API Playground](https://app.tavily.com/playground).\n\nWhy choose Tavily?\n------------------\n\nTavily shines where others fail, with a Search API optimized for LLMs.\n\nHow does the Search API work?\n-----------------------------\n\nTraditional search APIs such as Google, Serp and Bing retrieve search results based on a user query. However, the results are sometimes irrelevant to the goal of the search, and return simple URLs and snippets of content which are not always relevant. Because of this, any developer would need to then scrape the sites to extract relevant content, filter irrelevant information, optimize the content to fit LLM context limits, and more. This task is a burden and requires a lot of time and effort to complete. The Tavily Search API takes care of all of this for you in a single API call.\n\nThe Tavily Search API aggregates up to 20 sites per a single API call, and uses proprietary AI to score, filter and rank the top most relevant sources and content to your task, query or goal. In addition, Tavily allows developers to add custom fields such as context and limit response tokens to enable the optimal search experience for LLMs.\n\nTavily can also help your AI agent make better decisions by including a short answer for cross-agent communication.\n\nGetting started\n---------------\n\n[Sign up](https://app.tavily.com/) for Tavily to get your API key. You get **1,000 free API Credits every month**. No credit card required.\n\n[Get your free API key --------------------- You get 1,000 free API Credits every month. **No credit card required.**](https://app.tavily.com/)Head to our [API Playground](https://app.tavily.com/playground) to familiarize yourself with our API.\n\nTo get started with Tavily's APIs and SDKs using code, head to our [Quickstart Guide](https://docs.tavily.com/guides/quickstart) and follow the steps.",
+                          "favicon": "https://mintlify.s3-us-west-1.amazonaws.com/tavilyai/_generated/favicon/apple-touch-icon.png?v=3"
+                        }
+                      ]
+                    },
+                    "response_time": {
+                      "type": "number",
+                      "format": "float",
+                      "description": "Time in seconds it took to complete the request.",
+                      "example": 1.23
+                    },
+                    "usage": {
+                      "type": "object",
+                      "description": "Credit usage details for the request.",
+                      "example": {
+                        "credits": 1
+                      }
+                    },
+                    "request_id": {
+                      "type": "string",
+                      "description": "A unique request identifier you can share with customer support to help resolve issues with specific requests.",
+                      "example": "123e4567-e89b-12d3-a456-426614174111"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request - Your request is invalid.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "[400] No starting url provided"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized - Your API key is wrong or missing.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Unauthorized: missing or invalid API key."
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden - URL is not supported.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "[403] URL is not supported"
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too Many Requests. Error messages and retry delays can vary by rate-limit rule.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Your request has been blocked due to excessive requests. Please reduce the rate of requests."
+                  }
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
+          },
+          "432": {
+            "description": "Key limit or Plan Limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "This request exceeds your plan's set usage limit. Please upgrade your plan or contact support@tavily.com"
+                  }
+                }
+              }
+            }
+          },
+          "433": {
+            "description": "PayGo limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "This request exceeds the pay-as-you-go limit. You can increase your limit on the Tavily dashboard."
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error - We had a problem with our server.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "[500] Internal server error"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "operationId": "crawl"
+      }
+    },
+    "/map": {
+      "post": {
+        "summary": "Initiate a web mapping from a base URL",
+        "description": "Tavily Map traverses websites like a graph and can explore hundreds of paths in parallel with intelligent discovery to generate comprehensive site maps.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-codeSamples": [
+          {
+            "lang": "python",
+            "label": "Python SDK",
+            "source": "from tavily import TavilyClient\n\ntavily_client = TavilyClient(api_key=\"tvly-YOUR_API_KEY\")\nresponse = tavily_client.map(\"https://docs.tavily.com\")\n\nprint(response)"
+          },
+          {
+            "lang": "javascript",
+            "label": "JavaScript SDK",
+            "source": "const { tavily } = require(\"@tavily/core\");\n\nconst tvly = tavily({ apiKey: \"tvly-YOUR_API_KEY\" });\nconst response = await tvly.map(\"https://docs.tavily.com\");\n\nconsole.log(response);"
+          }
+        ],
+        "requestBody": {
+          "description": "Parameters for the Tavily Map request.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "url": {
+                    "type": "string",
+                    "description": "The root URL to begin the mapping.",
+                    "example": "docs.tavily.com"
+                  },
+                  "instructions": {
+                    "type": "string",
+                    "description": "Natural language instructions for the crawler. When specified, the cost increases to 2 API credits per 10 successful pages instead of 1 API credit per 10 pages.",
+                    "example": "Find all pages about the Python SDK",
+                    "default": null
+                  },
+                  "max_depth": {
+                    "type": "integer",
+                    "description": "Max depth of the mapping. Defines how far from the base URL the crawler can explore.",
+                    "default": 1,
+                    "minimum": 1,
+                    "maximum": 5
+                  },
+                  "max_breadth": {
+                    "type": "integer",
+                    "description": "Max number of links to follow per level of the tree (i.e., per page).",
+                    "default": 20,
+                    "minimum": 1,
+                    "maximum": 500
+                  },
+                  "limit": {
+                    "type": "integer",
+                    "description": "Total number of links the crawler will process before stopping.",
+                    "default": 50,
+                    "minimum": 1
+                  },
+                  "select_paths": {
+                    "type": "array",
+                    "description": "Regex patterns to select only URLs with specific path patterns (e.g., `/docs/.*`, `/api/v1.*`).",
+                    "items": {
+                      "type": "string"
+                    },
+                    "default": null
+                  },
+                  "select_domains": {
+                    "type": "array",
+                    "description": "Regex patterns to select crawling to specific domains or subdomains (e.g., `^docs\\.example\\.com$`).",
+                    "items": {
+                      "type": "string"
+                    },
+                    "default": null
+                  },
+                  "exclude_paths": {
+                    "type": "array",
+                    "description": "Regex patterns to exclude URLs with specific path patterns (e.g., `/private/.*`, `/admin/.*`).",
+                    "items": {
+                      "type": "string"
+                    },
+                    "default": null
+                  },
+                  "exclude_domains": {
+                    "type": "array",
+                    "description": "Regex patterns to exclude specific domains or subdomains from crawling (e.g., `^private\\.example\\.com$`).",
+                    "items": {
+                      "type": "string"
+                    },
+                    "default": null
+                  },
+                  "allow_external": {
+                    "type": "boolean",
+                    "description": "Whether to include external domain links in the final results list.",
+                    "default": true
+                  },
+                  "timeout": {
+                    "type": "number",
+                    "format": "float",
+                    "description": "Maximum time in seconds to wait for the map operation before timing out. Must be between 10 and 150 seconds.",
+                    "minimum": 10,
+                    "maximum": 150,
+                    "default": 150
+                  },
+                  "include_usage": {
+                    "type": "boolean",
+                    "description": "Whether to include credit usage information in the response.`NOTE:`The value may be 0 if the total successful pages mapped has not yet reached 10 calls. See our [Credits & Pricing documentation](https://docs.tavily.com/documentation/api-credits) for details.",
+                    "default": false
+                  }
+                },
+                "required": [
+                  "url"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Map results returned successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "base_url": {
+                      "type": "string",
+                      "description": "The base URL that was mapped.",
+                      "example": "docs.tavily.com"
+                    },
+                    "results": {
+                      "type": "array",
+                      "description": "A list of URLs that were discovered during the mapping.",
+                      "items": {
+                        "type": "string",
+                        "example": "docs.tavily.com"
+                      },
+                      "example": [
+                        "https://docs.tavily.com/welcome",
+                        "https://docs.tavily.com/documentation/api-credits",
+                        "https://docs.tavily.com/documentation/about"
+                      ]
+                    },
+                    "response_time": {
+                      "type": "number",
+                      "format": "float",
+                      "description": "Time in seconds it took to complete the request.",
+                      "example": 1.23
+                    },
+                    "usage": {
+                      "type": "object",
+                      "description": "Credit usage details for the request.",
+                      "example": {
+                        "credits": 1
+                      }
+                    },
+                    "request_id": {
+                      "type": "string",
+                      "description": "A unique request identifier you can share with customer support to help resolve issues with specific requests.",
+                      "example": "123e4567-e89b-12d3-a456-426614174111"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request - Your request is invalid.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "[400] No starting url provided"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized - Your API key is wrong or missing.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Unauthorized: missing or invalid API key."
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden - URL is not supported.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "[403] URL is not supported"
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too Many Requests. Error messages and retry delays can vary by rate-limit rule.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Your request has been blocked due to excessive requests. Please reduce the rate of requests."
+                  }
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
+          },
+          "432": {
+            "description": "Key limit or Plan Limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "This request exceeds your plan's set usage limit. Please upgrade your plan or contact support@tavily.com"
+                  }
+                }
+              }
+            }
+          },
+          "433": {
+            "description": "PayGo limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "This request exceeds the pay-as-you-go limit. You can increase your limit on the Tavily dashboard."
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error - We had a problem with our server.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "[500] Internal server error"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "operationId": "map"
+      }
+    },
+    "/research": {
+      "post": {
+        "summary": "Initiate a research task",
+        "description": "Tavily Research performs comprehensive research on a given topic by conducting multiple searches, analyzing sources, and generating a detailed research report.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-codeSamples": [
+          {
+            "lang": "python",
+            "label": "Python SDK",
+            "source": "from tavily import TavilyClient\n\ntavily_client = TavilyClient(api_key=\"tvly-YOUR_API_KEY\")\nresponse = tavily_client.research(\"What are the latest developments in AI?\")\n\nprint(response)"
+          },
+          {
+            "lang": "javascript",
+            "label": "JavaScript SDK",
+            "source": "const { tavily } = require(\"@tavily/core\");\n\nconst tvly = tavily({ apiKey: \"tvly-YOUR_API_KEY\" });\nconst response = await tvly.research(\"What are the latest developments in AI?\");\n\nconsole.log(response);"
+          }
+        ],
+        "requestBody": {
+          "description": "Parameters for the Tavily Research request.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "input": {
+                    "type": "string",
+                    "description": "The research task or question to investigate.",
+                    "example": "What are the latest developments in AI?"
+                  },
+                  "model": {
+                    "type": "string",
+                    "description": "The model used by the research agent. \"mini\" is optimized for targeted, efficient research and works best for narrow or well-scoped questions. \"pro\" provides comprehensive, multi-angle research and is suited for complex topics that span multiple subtopics or domains",
+                    "enum": [
+                      "mini",
+                      "pro",
+                      "auto"
+                    ],
+                    "default": "auto"
+                  },
+                  "stream": {
+                    "type": "boolean",
+                    "description": "Whether to stream the research results as they are generated. When 'true', returns a Server-Sent Events (SSE) stream. See [Streaming documentation](/documentation/api-reference/endpoint/research-streaming) for details.",
+                    "default": false
+                  },
+                  "output_schema": {
+                    "type": "object",
+                    "description": "A JSON Schema object that defines the structure of the research output. When provided, the research response will be structured to match this schema, ensuring a predictable and validated output shape. Must include a 'properties' field, and may optionally include 'required' field.",
+                    "default": null,
+                    "properties": {
+                      "properties": {
+                        "type": "object",
+                        "description": "An object containing property definitions. Each key is a property name, and each value is a property schema.",
+                        "additionalProperties": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "enum": [
+                                "object",
+                                "string",
+                                "integer",
+                                "number",
+                                "array"
+                              ],
+                              "description": "The type of the property. Must be one of: object, string, integer, number, or array."
+                            },
+                            "description": {
+                              "type": "string",
+                              "description": "A description of the property."
+                            },
+                            "properties": {
+                              "type": "object",
+                              "description": "Required when type is 'object'. Recursive definition of object properties."
+                            },
+                            "items": {
+                              "type": "object",
+                              "description": "Required when type is 'array'. Defines the schema for array items."
+                            }
+                          },
+                          "required": [
+                            "type",
+                            "description"
+                          ]
+                        }
+                      },
+                      "required": {
+                        "type": "array",
+                        "description": "An array of property names that are required. At least one key from the properties object must be included.",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "example": {
+                      "properties": {
+                        "company": {
+                          "type": "string",
+                          "description": "The name of the company"
+                        },
+                        "key_metrics": {
+                          "type": "array",
+                          "description": "List of key performance metrics",
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        "financial_details": {
+                          "type": "object",
+                          "description": "Detailed financial breakdown",
+                          "properties": {
+                            "operating_income": {
+                              "type": "number",
+                              "description": "Operating income for the period"
+                            }
+                          }
+                        }
+                      },
+                      "required": [
+                        "company"
+                      ]
+                    }
+                  },
+                  "citation_format": {
+                    "type": "string",
+                    "description": "The format for citations in the research report.",
+                    "enum": [
+                      "numbered",
+                      "mla",
+                      "apa",
+                      "chicago"
+                    ],
+                    "default": "numbered"
+                  },
+                  "include_domains": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "maxItems": 20,
+                    "description": "Soft preference for sources. The research agent prioritizes these domains, but URLs from other domains can still appear in the final report. Matching is host-based and includes subdomains (e.g., `sec.gov` matches `sec.gov` and `data.sec.gov`). Maximum 20 entries.",
+                    "default": [],
+                    "example": [
+                      "sec.gov",
+                      "ec.europa.eu"
+                    ]
+                  },
+                  "exclude_domains": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "maxItems": 20,
+                    "description": "Hard blocklist. No URL from a listed domain or any of its subdomains appears in the response. Subdomain matching is downward only \u2014 blocking `medium.com` also blocks `blog.medium.com`, but blocking `blog.medium.com` leaves `medium.com` itself allowed. Maximum 20 entries.",
+                    "default": [],
+                    "example": [
+                      "reddit.com",
+                      "quora.com"
+                    ]
+                  },
+                  "output_length": {
+                    "type": "string",
+                    "description": "Typed control over response size. Ranges are targets, not hard caps \u2014 individual responses can fall outside when the question requires it.",
+                    "enum": [
+                      "short",
+                      "standard",
+                      "long"
+                    ],
+                    "default": "standard"
+                  },
+                  "files": {
+                    "type": "array",
+                    "description": "Attach files to the research request and the agent uses their contents as a source alongside the web. Each entry carries a filename and its base64-encoded contents. The agent reads the relevant parts of each file, grounds its answer in them, and cites any file it draws from.\n\nSupported file types: `.txt`, `.md`, `.json`.\n\nLimits: up to 5 files per request; max 80,000 words per text file; max 80,000 words combined across all files.",
+                    "maxItems": 5,
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "name": {
+                          "type": "string",
+                          "description": "The filename, including its extension (`.txt`, `.md`, or `.json`)."
+                        },
+                        "data": {
+                          "type": "string",
+                          "description": "The base64-encoded file contents."
+                        },
+                        "type": {
+                          "type": "string",
+                          "description": "The encoding of the `data` field.",
+                          "enum": [
+                            "base64"
+                          ],
+                          "default": "base64"
+                        }
+                      },
+                      "required": [
+                        "name",
+                        "data"
+                      ]
+                    },
+                    "example": [
+                      {
+                        "name": "q1-report.md",
+                        "data": "<base64-encoded file contents>",
+                        "type": "base64"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "input"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Research task queued successfully (when not streaming)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "request_id": {
+                      "type": "string",
+                      "description": "A unique identifier for the research task.",
+                      "example": "123e4567-e89b-12d3-a456-426614174111"
+                    },
+                    "created_at": {
+                      "type": "string",
+                      "description": "Timestamp when the research task was created.",
+                      "example": "2025-01-15T10:30:00Z"
+                    },
+                    "status": {
+                      "type": "string",
+                      "description": "The current status of the research task.",
+                      "example": "pending"
+                    },
+                    "input": {
+                      "type": "string",
+                      "description": "The research task or question investigated.",
+                      "example": "What are the latest developments in AI?"
+                    },
+                    "model": {
+                      "type": "string",
+                      "description": "The model used by the research agent.",
+                      "example": "mini"
+                    },
+                    "response_time": {
+                      "type": "integer",
+                      "description": "Time in seconds it took to complete the request.",
+                      "example": 1.23
+                    }
+                  },
+                  "required": [
+                    "request_id",
+                    "created_at",
+                    "status",
+                    "input",
+                    "model",
+                    "response_time"
+                  ]
+                },
+                "example": {
+                  "request_id": "123e4567-e89b-12d3-a456-426614174111",
+                  "created_at": "2025-01-15T10:30:00Z",
+                  "status": "pending",
+                  "input": "What are the latest developments in AI?",
+                  "model": "mini",
+                  "response_time": 1.23
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request - Your request is invalid.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Invalid model. Must be one of: mini, pro, auto"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized - Your API key is wrong or missing.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Unauthorized: missing or invalid API key."
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too Many Requests. Error messages and retry delays can vary by rate-limit rule.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Your request has been blocked due to excessive requests. Please reduce the rate of requests."
+                  }
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
+          },
+          "432": {
+            "description": "Key limit or Plan Limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "This request exceeds your plan's set usage limit. Please upgrade your plan or contact support@tavily.com"
+                  }
+                }
+              }
+            }
+          },
+          "433": {
+            "description": "PayGo limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "This request exceeds the pay-as-you-go limit. You can increase your limit on the Tavily dashboard."
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error - We had a problem with our server.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Error when executing research task"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "operationId": "createResearch"
+      }
+    },
+    "/research/{request_id}": {
+      "get": {
+        "summary": "Get research task status and results",
+        "description": "Retrieve the status and results of a research task using its request ID.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-codeSamples": [
+          {
+            "lang": "python",
+            "label": "Python SDK",
+            "source": "from tavily import TavilyClient\n\ntavily_client = TavilyClient(api_key=\"tvly-YOUR_API_KEY\")\nresponse = tavily_client.get_research(\"123e4567-e89b-12d3-a456-426614174111\")\n\nprint(response)"
+          },
+          {
+            "lang": "javascript",
+            "label": "JavaScript SDK",
+            "source": "const { tavily } = require(\"@tavily/core\");\n\nconst tvly = tavily({ apiKey: \"tvly-YOUR_API_KEY\" });\nconst response = await tvly.get_research(\"123e4567-e89b-12d3-a456-426614174111\");\n\nconsole.log(response);"
+          }
+        ],
+        "parameters": [
+          {
+            "name": "request_id",
+            "in": "path",
+            "required": true,
+            "description": "The unique identifier of the research task.",
+            "schema": {
+              "type": "string"
+            },
+            "example": "123e4567-e89b-12d3-a456-426614174111"
+          },
+          {
+            "name": "include_usage",
+            "in": "query",
+            "required": false,
+            "description": "Whether to include credit usage information in the response.",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Research task is not yet completed (pending or in_progress).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "request_id": {
+                      "type": "string",
+                      "description": "The unique identifier of the research task.",
+                      "example": "123e4567-e89b-12d3-a456-426614174111"
+                    },
+                    "status": {
+                      "type": "string",
+                      "description": "Current status of the research task.",
+                      "enum": [
+                        "pending",
+                        "in_progress"
+                      ]
+                    },
+                    "response_time": {
+                      "type": "integer",
+                      "description": "Time in seconds it took to complete the request.",
+                      "example": 1.23
+                    }
+                  },
+                  "required": [
+                    "request_id",
+                    "response_time",
+                    "status"
+                  ]
+                },
+                "example": {
+                  "request_id": "123e4567-e89b-12d3-a456-426614174111",
+                  "status": "in_progress",
+                  "response_time": 1.23
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Research task is completed or failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ResearchTaskCompleted"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ResearchTaskFailed"
+                    }
+                  ],
+                  "discriminator": {
+                    "propertyName": "status",
+                    "mapping": {
+                      "completed": "#/components/schemas/ResearchTaskCompleted",
+                      "failed": "#/components/schemas/ResearchTaskFailed"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized - Your API key is wrong or missing.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Unauthorized: missing or invalid API key."
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Research task not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Research task not found"
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error - We had a problem with our server.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Error getting research status"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "operationId": "getResearch"
+      }
+    },
+    "/feedback": {
+      "post": {
+        "summary": "Submit feedback on a search request or session",
+        "description": "Submit feedback on how relevant and useful Tavily's results were for your task.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-codeSamples": [
+          {
+            "lang": "python",
+            "label": "Python SDK",
+            "source": "from tavily import TavilyClient\n\ntavily_client = TavilyClient(api_key=\"tvly-YOUR_API_KEY\")\nresponse = tavily_client.feedback(\n    request_id=\"8442d8d0-8b74-4fca-a89e-5b1b6dd33295\",\n    agent_score=1,\n    comment=\"The top results answered the question directly.\",\n    used_ids=[\"a3f9c2-04\"],\n)\n\nprint(response)"
+          },
+          {
+            "lang": "javascript",
+            "label": "JavaScript SDK",
+            "source": "const { tavily } = require(\"@tavily/core\");\n\nconst tvly = tavily({ apiKey: \"tvly-YOUR_API_KEY\" });\nconst response = await tvly.feedback({\n  requestId: \"8442d8d0-8b74-4fca-a89e-5b1b6dd33295\",\n  agentScore: 1,\n  comment: \"The top results answered the question directly.\",\n  usedIds: [\"a3f9c2-04\"],\n});\n\nconsole.log(response);"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "request_id": {
+                    "type": "string",
+                    "maxLength": 200,
+                    "description": "The search request to give feedback on, as returned in the `request_id` field of the search response. When provided, the feedback applies to this request.",
+                    "example": "8442d8d0-8b74-4fca-a89e-5b1b6dd33295"
+                  },
+                  "session_id": {
+                    "type": "string",
+                    "maxLength": 200,
+                    "description": "The session to give feedback on — the value you sent in the `X-Session-Id` header. When `request_id` is omitted, the feedback applies to the whole session. Optional if `request_id` is provided.",
+                    "example": "5874812a-2e9b-43ea-8978-6cc9225b587b"
+                  },
+                  "agent_score": {
+                    "oneOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "string",
+                        "maxLength": 64
+                      }
+                    ],
+                    "description": "Overall score for how relevant and useful the results were for your task.",
+                    "example": 1
+                  },
+                  "human_score": {
+                    "oneOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "string",
+                        "maxLength": 64
+                      }
+                    ],
+                    "description": "Feedback from your end user, if you collect it.",
+                    "example": 1
+                  },
+                  "extra_scores": {
+                    "type": "array",
+                    "maxItems": 50,
+                    "description": "Additional labeled scores for the dimensions you care about.",
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "label",
+                        "value"
+                      ],
+                      "properties": {
+                        "label": {
+                          "type": "string",
+                          "maxLength": 64,
+                          "description": "Name of the dimension being scored.",
+                          "example": "freshness"
+                        },
+                        "value": {
+                          "oneOf": [
+                            {
+                              "type": "number"
+                            },
+                            {
+                              "type": "string",
+                              "maxLength": 64
+                            }
+                          ],
+                          "description": "A numeric score, or a short string label (max 64 characters).",
+                          "example": 0.8
+                        }
+                      }
+                    },
+                    "example": [
+                      {
+                        "label": "freshness",
+                        "value": 0.4
+                      },
+                      {
+                        "label": "authority",
+                        "value": 0.9
+                      }
+                    ]
+                  },
+                  "comment": {
+                    "type": "string",
+                    "maxLength": 10000,
+                    "description": "Free-text explanation of the feedback.",
+                    "example": "Results were authoritative but several were more than a year old."
+                  },
+                  "response_delivered": {
+                    "type": "string",
+                    "maxLength": 50000,
+                    "description": "The final answer you produced using the results.",
+                    "example": "Lionel Messi is an Argentine footballer born in 1987..."
+                  },
+                  "used_ids": {
+                    "type": "array",
+                    "maxItems": 100,
+                    "items": {
+                      "type": "string",
+                      "maxLength": 200
+                    },
+                    "description": "IDs of the results you actually used in your answer. Alternative to `used_urls`.",
+                    "example": [
+                      "a3f9c2-04",
+                      "a3f9c2-07"
+                    ]
+                  },
+                  "used_urls": {
+                    "type": "array",
+                    "maxItems": 100,
+                    "items": {
+                      "type": "string",
+                      "maxLength": 2000
+                    },
+                    "description": "URLs of the results you actually used in your answer. Alternative to `used_ids`.",
+                    "example": [
+                      "https://www.britannica.com/facts/Lionel-Messi"
+                    ]
+                  },
+                  "used_citations": {
+                    "type": "array",
+                    "maxItems": 100,
+                    "items": {
+                      "type": "string",
+                      "maxLength": 2000
+                    },
+                    "description": "The specific content snippets you quoted from the results.",
+                    "example": [
+                      "Messi is known for his exceptional dribbling skills, vision, and goal-scoring ability."
+                    ]
+                  },
+                  "urls_scores": {
+                    "type": "array",
+                    "maxItems": 100,
+                    "description": "Per-result feedback. Identify each result by `id` or `url`.",
+                    "items": {
+                      "type": "object",
+                      "description": "Feedback on a single result. Each item must include `id` or `url`.",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "maxLength": 200,
+                          "description": "The `id` of the result, as returned in the search response.",
+                          "example": "a3f9c2-04"
+                        },
+                        "url": {
+                          "type": "string",
+                          "maxLength": 2000,
+                          "description": "The URL of the result. Use instead of `id` when you don't have the result ID.",
+                          "example": "https://www.britannica.com/facts/Lionel-Messi"
+                        },
+                        "agent_score": {
+                          "oneOf": [
+                            {
+                              "type": "number"
+                            },
+                            {
+                              "type": "string",
+                              "maxLength": 64
+                            }
+                          ],
+                          "description": "Score for this specific result.",
+                          "example": 1
+                        },
+                        "scores": {
+                          "type": "array",
+                          "maxItems": 20,
+                          "description": "Additional labeled scores for this result.",
+                          "items": {
+                            "type": "object",
+                            "required": [
+                              "label",
+                              "value"
+                            ],
+                            "properties": {
+                              "label": {
+                                "type": "string",
+                                "maxLength": 64,
+                                "description": "Name of the dimension being scored.",
+                                "example": "freshness"
+                              },
+                              "value": {
+                                "oneOf": [
+                                  {
+                                    "type": "number"
+                                  },
+                                  {
+                                    "type": "string",
+                                    "maxLength": 64
+                                  }
+                                ],
+                                "description": "A numeric score, or a short string label (max 64 characters).",
+                                "example": 0.8
+                              }
+                            }
+                          }
+                        },
+                        "comment": {
+                          "type": "string",
+                          "maxLength": 2000,
+                          "description": "Free-text explanation of the feedback on this result."
+                        }
+                      }
+                    },
+                    "example": [
+                      {
+                        "id": "a3f9c2-04",
+                        "agent_score": 1,
+                        "comment": "Directly answered the question."
+                      },
+                      {
+                        "url": "https://example.com/stale-page",
+                        "agent_score": -1,
+                        "scores": [
+                          {
+                            "label": "freshness",
+                            "value": 0.1
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Feedback accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "description": "Whether the feedback was accepted.",
+                      "example": true
+                    },
+                    "feedback_id": {
+                      "type": "string",
+                      "description": "Unique identifier of this feedback submission.",
+                      "example": "f1c0f0a5-0f9b-4a62-9e0e-1b6b2f0a6d31"
+                    },
+                    "response_time": {
+                      "type": "number",
+                      "description": "Response time of this feedback request in seconds.",
+                      "example": 0.05
+                    }
+                  }
+                },
+                "example": {
+                  "success": true,
+                  "feedback_id": "f1c0f0a5-0f9b-4a62-9e0e-1b6b2f0a6d31",
+                  "response_time": 0.05
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request — neither `session_id` nor `request_id` was provided, or a `urls_scores` item is missing both `id` and `url`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "detail": {
+                      "type": "object",
+                      "properties": {
+                        "error": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                },
+                "example": {
+                  "detail": {
+                    "error": "Either session_id or request_id is required."
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized - Your API key is wrong or missing.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "detail": {
+                      "type": "object",
+                      "properties": {
+                        "error": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                },
+                "example": {
+                  "detail": {
+                    "error": "Unauthorized: missing or invalid API key."
+                  }
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Payload Too Large — the request body exceeds 256 KB.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "detail": {
+                      "type": "object",
+                      "properties": {
+                        "error": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                },
+                "example": {
+                  "detail": {
+                    "error": "Request body exceeds 262144 bytes."
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable Entity — a field failed validation (e.g. a list or string exceeds its maximum length).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "detail": {
+                      "type": "object",
+                      "properties": {
+                        "error": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                },
+                "example": {
+                  "detail": {
+                    "error": "Validation error in request body."
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "detail": {
+                      "type": "object",
+                      "properties": {
+                        "error": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                },
+                "example": {
+                  "detail": {
+                    "error": "Error when processing feedback"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/usage": {
+      "get": {
+        "summary": "Get API key and account usage details",
+        "description": "Get API key and account usage details",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-codeSamples": [],
+        "parameters": [
+          {
+            "name": "X-Project-ID",
+            "in": "header",
+            "required": false,
+            "description": "Optional project ID to scope the usage query to a specific project",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Usage details returned successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "key": {
+                      "type": "object",
+                      "properties": {
+                        "usage": {
+                          "type": "integer",
+                          "description": "Total credits used for this API key during the current billing cycle",
+                          "example": 150
+                        },
+                        "limit": {
+                          "type": "integer",
+                          "description": "Usage limit for the API key. Returns null if unlimited",
+                          "example": 1000
+                        },
+                        "search_usage": {
+                          "type": "integer",
+                          "description": "Search endpoint credits used for this API key during the current billing cycle",
+                          "example": 100
+                        },
+                        "extract_usage": {
+                          "type": "integer",
+                          "description": "Extract endpoint credits used for this API key during the current billing cycle",
+                          "example": 25
+                        },
+                        "crawl_usage": {
+                          "type": "integer",
+                          "description": "Crawl endpoint credits used for this API key during the current billing cycle",
+                          "example": 15
+                        },
+                        "map_usage": {
+                          "type": "integer",
+                          "description": "Map endpoint credits used for this API key during the current billing cycle",
+                          "example": 7
+                        },
+                        "research_usage": {
+                          "type": "integer",
+                          "description": "Research endpoint credits used for this API key during the current billing cycle",
+                          "example": 3
+                        }
+                      }
+                    },
+                    "account": {
+                      "type": "object",
+                      "description": "Account plan and usage information",
+                      "properties": {
+                        "current_plan": {
+                          "type": "string",
+                          "description": "The current subscription plan name",
+                          "example": "Bootstrap"
+                        },
+                        "plan_usage": {
+                          "type": "integer",
+                          "description": "Total credits used for this plan during the current billing cycle",
+                          "example": 500
+                        },
+                        "plan_limit": {
+                          "type": "integer",
+                          "description": "Usage limit for the current plan",
+                          "example": 15000
+                        },
+                        "paygo_usage": {
+                          "type": "integer",
+                          "description": "Current pay-as-you-go usage count",
+                          "example": 25
+                        },
+                        "paygo_limit": {
+                          "type": "integer",
+                          "description": "Pay-as-you-go usage limit",
+                          "example": 100
+                        },
+                        "search_usage": {
+                          "type": "integer",
+                          "description": "Search endpoint credits used for this plan during the current billing cycle",
+                          "example": 350
+                        },
+                        "extract_usage": {
+                          "type": "integer",
+                          "description": "Extract endpoint credits used for this plan during the current billing cycle",
+                          "example": 75
+                        },
+                        "crawl_usage": {
+                          "type": "integer",
+                          "description": "Crawl endpoint credits used for this plan during the current billing cycle",
+                          "example": 50
+                        },
+                        "map_usage": {
+                          "type": "integer",
+                          "description": "Map endpoint credits used for this plan during the current billing cycle",
+                          "example": 15
+                        },
+                        "research_usage": {
+                          "type": "integer",
+                          "description": "Research endpoint credits used for this plan during the current billing cycle",
+                          "example": 10
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized - Your API key is wrong or missing.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Unauthorized: missing or invalid API key."
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too Many Requests. Error messages and retry delays can vary by rate-limit rule.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Your request has been blocked due to excessive requests. Please reduce the rate of requests."
+                  }
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
+          }
+        },
+        "operationId": "getUsage"
+      }
+    },
+    "/logs": {
+      "post": {
+        "summary": "Get usage logs for your API keys",
+        "description": "Retrieve per-request usage logs for the API keys under your account or organization.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-codeSamples": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "limit": {
+                    "type": "integer",
+                    "default": 10,
+                    "minimum": 1,
+                    "maximum": 10000,
+                    "description": "Maximum number of logs to return, most recent first.",
+                    "example": 100
+                  },
+                  "start_date": {
+                    "type": "string",
+                    "format": "date",
+                    "description": "Inclusive start of the log window (YYYY-MM-DD).",
+                    "example": "2026-08-01"
+                  },
+                  "end_date": {
+                    "type": "string",
+                    "format": "date",
+                    "description": "Inclusive end of the log window (YYYY-MM-DD).",
+                    "example": "2026-08-07"
+                  },
+                  "endpoints": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "search",
+                        "extract",
+                        "map",
+                        "crawl",
+                        "research"
+                      ]
+                    },
+                    "description": "Only return logs for these endpoints. By default, logs for all endpoints are returned.",
+                    "example": [
+                      "search",
+                      "research"
+                    ]
+                  },
+                  "project_id": {
+                    "type": "string",
+                    "description": "Only return logs for a single project."
+                  },
+                  "filter_by_api_key": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "When `true`, return only logs for the API key provided in the Authorization header. When `false` (default), logs for all API keys under your account or organization are returned."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Usage logs returned successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "logs": {
+                      "type": "array",
+                      "description": "Matching log entries, most recent first. Log entries never include the input or output of the original request.",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "timestamp": {
+                            "type": "string",
+                            "format": "date-time",
+                            "description": "When the request was made",
+                            "example": "2026-08-06T13:14:34.739037+00:00"
+                          },
+                          "endpoint": {
+                            "type": "string",
+                            "enum": [
+                              "search",
+                              "extract",
+                              "map",
+                              "crawl",
+                              "research"
+                            ],
+                            "description": "Which Tavily API was called",
+                            "example": "search"
+                          },
+                          "depth": {
+                            "type": "string",
+                            "description": "The request depth (e.g. `basic`, `advanced`). For `research` requests, the model tier.",
+                            "example": "advanced"
+                          },
+                          "response_time": {
+                            "type": "number",
+                            "description": "Server-side response time in seconds",
+                            "example": 1.52
+                          },
+                          "credits": {
+                            "type": "number",
+                            "description": "API credits the request consumed",
+                            "example": 2.0
+                          },
+                          "api_key": {
+                            "type": "string",
+                            "description": "The API key that made the request, masked to its last 4 characters",
+                            "example": "****abcd"
+                          },
+                          "request_id": {
+                            "type": "string",
+                            "description": "Unique identifier of the original request",
+                            "example": "8442d8d0-8b74-4fca-a89e-5b1b6dd33295"
+                          }
+                        }
+                      }
+                    },
+                    "count": {
+                      "type": "integer",
+                      "description": "Number of log entries returned",
+                      "example": 100
+                    },
+                    "response_time": {
+                      "type": "number",
+                      "description": "Response time of this logs request in seconds",
+                      "example": 1.33
+                    },
+                    "request_id": {
+                      "type": "string",
+                      "description": "Unique identifier of this logs request",
+                      "example": "d98eaaf1-cf41-4234-bf23-6f1780fbcf73"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request \u2014 invalid endpoints value or date range.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Invalid endpoints: news. Valid endpoints are: search, extract, map, crawl, research"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized - Your API key is wrong or missing.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Unauthorized: missing or invalid API key."
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden \u2014 usage logs are only available to paying customers.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Access denied. Usage logs are only available to paying customers. Please upgrade your plan to access this feature."
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too Many Requests",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Your request has been blocked due to excessive requests. Please reduce the rate of requests"
+                  }
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Gateway Timeout \u2014 the logs query timed out.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Request timed out while fetching usage logs. Please contact our team at support@tavily.com."
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/org-usage": {
+      "post": {
+        "summary": "Get organization usage across all API keys",
+        "description": "Retrieve usage (credits), pay-as-you-go USD cost, and request counts for **every API key under an organization you own**, mirroring the platform's Usage analytics page.\n\nIdentify the organization by **name** in the request body. Authenticate with the organization owner's **personal API key** \u2014 the key from the owner's own personal account, **not** an organization or enterprise API key. Supports date-range, project, and depth filtering.",
+        "security": [
+          {
+            "ownerBearerAuth": []
+          }
+        ],
+        "x-codeSamples": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "organization_name"
+                ],
+                "properties": {
+                  "organization_name": {
+                    "type": "string",
+                    "description": "Exact organization name (case-sensitive). You must be the owner of this organization.",
+                    "example": "Acme Inc"
+                  },
+                  "start_date": {
+                    "type": "string",
+                    "format": "date",
+                    "description": "Inclusive start of the usage window (YYYY-MM-DD). Defaults to the start of the current billing cycle.",
+                    "example": "2026-05-01"
+                  },
+                  "end_date": {
+                    "type": "string",
+                    "format": "date",
+                    "description": "Inclusive end of the usage window (YYYY-MM-DD). Defaults to today.",
+                    "example": "2026-05-27"
+                  },
+                  "project_id": {
+                    "type": "string",
+                    "description": "Scope usage to a single project."
+                  },
+                  "depth": {
+                    "type": "string",
+                    "enum": [
+                      "basic",
+                      "advanced",
+                      "fast",
+                      "pro",
+                      "mini",
+                      "auto",
+                      "ultra-fast"
+                    ],
+                    "description": "Scope usage to a single request depth.",
+                    "example": "advanced"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Organization usage returned successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "organization": {
+                      "type": "object",
+                      "properties": {
+                        "name": {
+                          "type": "string",
+                          "example": "Acme Inc"
+                        },
+                        "filters": {
+                          "type": "object",
+                          "description": "Echo of the filters applied to this response",
+                          "properties": {
+                            "start_date": {
+                              "type": "string",
+                              "example": "2026-05-01"
+                            },
+                            "end_date": {
+                              "type": "string",
+                              "example": "2026-05-27"
+                            },
+                            "project_id": {
+                              "type": "string",
+                              "example": null
+                            },
+                            "depth": {
+                              "type": "string",
+                              "example": null
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "totals": {
+                      "type": "object",
+                      "description": "Aggregated usage across all keys in the organization for the selected window/filters",
+                      "properties": {
+                        "usage": {
+                          "type": "integer",
+                          "example": 1820
+                        },
+                        "paygo_cost_usd": {
+                          "type": "number",
+                          "example": 12.71
+                        },
+                        "request_count": {
+                          "type": "integer",
+                          "example": 1760
+                        },
+                        "by_type": {
+                          "$ref": "#/components/schemas/UsageByType"
+                        }
+                      }
+                    },
+                    "keys": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "key": {
+                            "type": "string",
+                            "description": "API key, masked to the last 5 characters",
+                            "example": "...AB3xQ"
+                          },
+                          "name": {
+                            "type": "string",
+                            "description": "Key name",
+                            "example": "production-key"
+                          },
+                          "usage": {
+                            "type": "integer",
+                            "example": 543
+                          },
+                          "paygo_cost_usd": {
+                            "type": "number",
+                            "example": 4.34
+                          },
+                          "request_count": {
+                            "type": "integer",
+                            "example": 528
+                          },
+                          "by_type": {
+                            "$ref": "#/components/schemas/UsageByType"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid start_date; expected format YYYY-MM-DD.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Invalid start_date; expected format YYYY-MM-DD."
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized: missing or invalid API key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Unauthorized: missing or invalid API key."
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Please authenticate with the organization owner's personal API key, not an organization API key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Please authenticate with the organization owner's personal API key, not an organization API key."
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Organization not found or access denied.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Organization not found or access denied."
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "organization_name is required.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "organization_name is required."
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many requests - Rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Your request has been blocked due to excessive requests. Please reduce the rate of requests."
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Internal server error"
+                  }
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Gateway timeout - the usage lookup took too long",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "detail": {
+                    "error": "Request timed out while fetching usage. Please try again or contact our team at support@tavily.com."
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "Bearer authentication header in the form Bearer <token>, where <token> is your Tavily API key (e.g., Bearer tvly-YOUR_API_KEY)."
+      },
+      "ownerBearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "Bearer authentication header in the form Bearer <token>. The token must be the **organization owner's personal API key** (from the owner's own personal account, not an organization key)."
+      }
+    },
+    "schemas": {
+      "ResearchTaskCompleted": {
+        "title": "Completed",
+        "type": "object",
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "description": "The unique identifier of the research task.",
+            "example": "123e4567-e89b-12d3-a456-426614174111"
+          },
+          "created_at": {
+            "type": "string",
+            "description": "Timestamp when the research task was created.",
+            "example": "2025-01-15T10:30:00Z"
+          },
+          "status": {
+            "type": "string",
+            "description": "The current status of the research task.",
+            "enum": [
+              "completed"
+            ]
+          },
+          "content": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object"
+              }
+            ],
+            "description": "The research report content. Can be a string or a structured object if output_schema was provided."
+          },
+          "sources": {
+            "type": "array",
+            "description": "List of sources used in the research.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "string",
+                  "description": "Title or name of the source.",
+                  "example": "Latest AI Developments"
+                },
+                "url": {
+                  "type": "string",
+                  "format": "uri",
+                  "description": "URL of the source.",
+                  "example": "https://example.com/ai-news"
+                },
+                "favicon": {
+                  "type": "string",
+                  "format": "uri",
+                  "description": "URL to the source's favicon.",
+                  "example": "https://example.com/favicon.ico"
+                }
+              }
+            }
+          },
+          "response_time": {
+            "type": "integer",
+            "description": "Time in seconds it took to complete the request.",
+            "example": 1.23
+          },
+          "usage": {
+            "type": "object",
+            "description": "Credit usage details for the request.",
+            "example": {
+              "credits": 16
+            }
+          }
+        },
+        "required": [
+          "request_id",
+          "created_at",
+          "status",
+          "content",
+          "sources",
+          "response_time"
+        ],
+        "example": {
+          "request_id": "123e4567-e89b-12d3-a456-426614174111",
+          "created_at": "2025-01-15T10:30:00Z",
+          "status": "completed",
+          "content": "Research Report: Latest Developments in AI\n\n## Executive Summary\n\nArtificial Intelligence has seen significant advancements in recent months, with major breakthroughs in large language models, multimodal AI systems, and real-world applications...",
+          "sources": [
+            {
+              "title": "Latest AI Developments",
+              "url": "https://example.com/ai-news",
+              "favicon": "https://example.com/favicon.ico"
+            },
+            {
+              "title": "AI Research Breakthroughs",
+              "url": "https://example.com/ai-research",
+              "favicon": "https://example.com/favicon.ico"
+            }
+          ],
+          "response_time": 1.23,
+          "usage": {
+            "credits": 16
+          }
+        }
+      },
+      "ResearchTaskFailed": {
+        "title": "Failed",
+        "type": "object",
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "description": "The unique identifier of the research task.",
+            "example": "123e4567-e89b-12d3-a456-426614174111"
+          },
+          "status": {
+            "type": "string",
+            "description": "The current status of the research task.",
+            "enum": [
+              "failed"
+            ]
+          },
+          "response_time": {
+            "type": "integer",
+            "description": "Time in seconds it took to complete the request.",
+            "example": 1.23
+          },
+          "usage": {
+            "type": "object",
+            "description": "Credit usage details for the request.",
+            "example": {
+              "credits": 16
+            }
+          }
+        },
+        "required": [
+          "request_id",
+          "status",
+          "response_time"
+        ],
+        "example": {
+          "request_id": "123e4567-e89b-12d3-a456-426614174111",
+          "status": "failed",
+          "usage": {
+            "credits": 0
+          }
+        }
+      },
+      "UsageMetrics": {
+        "type": "object",
+        "properties": {
+          "usage": {
+            "type": "integer",
+            "description": "Credits consumed",
+            "example": 543
+          },
+          "paygo_cost_usd": {
+            "type": "number",
+            "description": "Pay-as-you-go cost in USD (overage credits billed at the account's per-credit rate)",
+            "example": 4.34
+          },
+          "request_count": {
+            "type": "integer",
+            "description": "Number of requests",
+            "example": 528
+          }
+        }
+      },
+      "UsageByType": {
+        "type": "object",
+        "description": "Breakdown per request type",
+        "properties": {
+          "search": {
+            "$ref": "#/components/schemas/UsageMetrics"
+          },
+          "crawl": {
+            "$ref": "#/components/schemas/UsageMetrics"
+          },
+          "extract": {
+            "$ref": "#/components/schemas/UsageMetrics"
+          },
+          "map": {
+            "$ref": "#/components/schemas/UsageMetrics"
+          },
+          "research": {
+            "$ref": "#/components/schemas/UsageMetrics"
+          }
+        }
+      },
+      "ApiError": {
+        "type": "object",
+        "properties": {
+          "detail": {
+            "type": "object",
+            "properties": {
+              "error": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "ValidationError": {
+        "type": "object",
+        "properties": {
+          "detail": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "loc": {
+                  "type": "array",
+                  "items": {
+                    "oneOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "integer"
+                      }
+                    ]
+                  }
+                },
+                "msg": {
+                  "type": "string"
+                },
+                "type": {
+                  "type": "string"
+                },
+                "input": {},
+                "ctx": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "headers": {
+      "RetryAfter": {
+        "description": "When present, the number of seconds to wait before retrying. Read the returned value; the delay can vary.",
+        "schema": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "example": 60
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "Search"
+    },
+    {
+      "name": "Extract"
+    },
+    {
+      "name": "Crawl"
+    },
+    {
+      "name": "Map"
+    },
+    {
+      "name": "Research"
+    },
+    {
+      "name": "Feedback"
+    },
+    {
+      "name": "Usage"
+    },
+    {
+      "name": "Logs"
+    }
+  ]
+}

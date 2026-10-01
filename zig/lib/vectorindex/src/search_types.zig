@@ -188,6 +188,25 @@ pub const SearchProfile = struct {
     /// Exact completions that reused a generation-pinned location discovered
     /// by the bounded pass instead of repeating key/index lookup.
     rerank_vector_location_reuses: u64 = 0,
+    rerank_member_binding_hits: u64 = 0,
+    rerank_member_binding_batches: u64 = 0,
+    rerank_member_binding_mixed_batches: u64 = 0,
+    rerank_member_binding_bytes: u64 = 0,
+    rerank_read_batches: u64 = 0,
+    rerank_read_requests: u64 = 0,
+    rerank_read_helpers: u64 = 0,
+    rerank_read_denied: u64 = 0,
+    rerank_read_dispatch_ns: u64 = 0,
+    rerank_read_caller_ns: u64 = 0,
+    rerank_read_join_ns: u64 = 0,
+    rerank_read_worker_wall_ns: u64 = 0,
+    rerank_read_adaptive_inline_batches: u64 = 0,
+    rerank_read_adaptive_wide_batches: u64 = 0,
+    rerank_read_adaptive_probe_ns: u64 = 0,
+    rerank_read_worker_start_delay_ns: u64 = 0,
+    rerank_read_mapped_requests: u64 = 0,
+    rerank_read_mapped_bytes: u64 = 0,
+    rerank_member_binding_misses: u64 = 0,
     /// Candidates for which the matching immutable generation was installed
     /// but did not contain a usable exact vector.
     rerank_vector_block_misses: u64 = 0,

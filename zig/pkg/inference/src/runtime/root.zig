@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub const bounded_allocator = @import("bounded_allocator.zig");
 pub const distributed = @import("distributed.zig");
 pub const kv = @import("kv/root.zig");
 pub const moe = @import("moe/root.zig");

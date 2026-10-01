@@ -42,7 +42,7 @@ Backend and runtime design docs (linked below) describe how these work today; th
 - GGUF/GGML quantization format coverage and graph-execution partitioning — see [GGML.md](GGML.md)
 - Generic graph IR (tracing, compiler passes, execution backends, partitioning, caching, offline artifacts) — see [GRAPH.md](GRAPH.md)
 - TurboQuant KV cache codec — see [TURBOQUANT.md](TURBOQUANT.md)
-- Gemma 4 support, including MTP speculative decoding — see [GEMMA4.md](GEMMA4.md)
+- Gemma 4 support, including MTP speculative decoding — see [GEMMA4.md](models/gemma4/GEMMA4.md)
 - Document readers (OCR/layout/extraction pipelines) — see [READERS.md](READERS.md)
 - TTL ResultCache with stats
 - Model registry (local discovery, ModelRef parsing)
@@ -53,7 +53,7 @@ Backend and runtime design docs (linked below) describe how these work today; th
 - Reranking pipeline and `/api/rerank`
 - Native BERT/RoBERTa cross-encoder path
 - ColBERT late-interaction text reranker
-- ColQwen multimodal reranker and `/rerank_multimodal`
+- ColQwen multimodal reranker on `/rerank`
 - GLiNER2 native DeBERTa + span-head path
 - Document classification runtime (`/api/classify/document`, `/api/classify/document_tokens`)
 - LayoutLMv3 PEFT surface (LoRA bootstrap, train, inspect, materialize)
@@ -74,7 +74,7 @@ Backend and runtime design docs (linked below) describe how these work today; th
 
 ### Reranker and Multimodal Verification
 
-- [ ] **`/rerank_multimodal` smoke/regression surface** (request-level)
+- [ ] **Multimodal `/rerank` smoke/regression surface** (request-level)
 - [ ] **Unify text and multimodal late-interaction reporting semantics**
 - [ ] **Broader multimodal server-path regression coverage**
 - [ ] **Request orchestration semantics** for server-side distributed rerank execution
@@ -101,8 +101,7 @@ Backend and runtime design docs (linked below) describe how these work today; th
 | Endpoint | Status |
 |----------|--------|
 | `/api/embed` | Working (ONNX) |
-| `/api/rerank` | Working (ONNX + native BERT/RoBERTa + ColBERT) |
-| `/api/rerank_multimodal` | Working end-to-end; verification ongoing |
+| `/api/rerank` | Working (ONNX + native BERT/RoBERTa + ColBERT); multimodal ColQwen documents working end-to-end, verification ongoing |
 | `/api/generate` | Working (autoregressive, streaming, tool-calling) |
 | `/api/chunk` | Basic fixed chunking; semantic chunking pending |
 | `/api/extract` | GLiNER native path; parity validation pending |

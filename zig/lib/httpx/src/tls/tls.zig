@@ -305,13 +305,34 @@ pub const TlsSession = struct {
         } };
     }
 
+    pub const ReadError = TlsClient.ReadError || error{
+        Timeout,
+        Canceled,
+        Cancelled,
+        TlsTransportReadFailed,
+    };
+
+    fn classifyReadError(tls_error: ?TlsClient.ReadError, transport_error: ?anyerror) ReadError {
+        if (tls_error) |err| return err;
+        return switch (transport_error orelse error.ReadFailed) {
+            error.Timeout => error.Timeout,
+            error.Canceled => error.Canceled,
+            error.Cancelled => error.Cancelled,
+            else => error.TlsTransportReadFailed,
+        };
+    }
+
     /// Reads decrypted data from the session.
-    pub fn read(self: *Self, buffer: []u8) !usize {
+    pub fn read(self: *Self, buffer: []u8) ReadError!usize {
         if (buffer.len == 0) return 0;
-        const c = if (self.client) |*c| c else return error.NotConnected;
+        const c = if (self.client) |*c| c else return error.TlsTransportReadFailed;
+        if (self.net_in) |*reader| reader.last_read_error = null;
         const available = c.reader.peekGreedy(1) catch |err| switch (err) {
             error.EndOfStream => return 0,
-            else => return error.ReadFailed,
+            error.ReadFailed => return classifyReadError(
+                c.read_err,
+                if (self.net_in) |*reader| reader.last_read_error else null,
+            ),
         };
         const len = @min(buffer.len, available.len);
         @memcpy(buffer[0..len], available[0..len]);
@@ -449,4 +470,89 @@ test "parsePemCertificate decodes base64 payload" {
     try std.testing.expectEqual(@as(u8, 0x01), der[0]);
     try std.testing.expectEqual(@as(u8, 0x02), der[1]);
     try std.testing.expectEqual(@as(u8, 0x03), der[2]);
+}
+
+const ResidualTlsReadTest = struct {
+    fn fail(_: *Io.Reader, _: [][]u8) Io.Reader.Error!usize {
+        return error.ReadFailed;
+    }
+
+    fn readTransport(reader: *Io.Reader, _: [][]u8) Io.Reader.Error!usize {
+        const client: *TlsClient = @fieldParentPtr("reader", reader);
+        _ = try client.input.peekGreedy(1);
+        return error.EndOfStream;
+    }
+
+    const error_vtable = @import("../net/socket.zig").IoReaderHelpers.makeVTable(fail);
+    const transport_vtable = @import("../net/socket.zig").IoReaderHelpers.makeVTable(readTransport);
+
+    fn canceled(_: ?*anyopaque) bool {
+        return true;
+    }
+
+    fn transport(comptime cancel: bool) !void {
+        if (builtin.os.tag != .linux) return error.SkipZigTest;
+        const socket_mod = @import("../net/socket.zig");
+        var listener = try socket_mod.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, std.testing.io);
+        defer listener.deinit();
+        var sender = try Socket.connect(listener.getLocalAddress(), std.testing.io);
+        defer sender.close();
+        var accepted = try listener.accept();
+        defer accepted.socket.close();
+        // Exercise the timeout behavior without depending on the socket
+        // implementation fields, which differ between release branches.
+        try accepted.socket.setRecvTimeout(50);
+        if (cancel) accepted.socket.setRequestCancellation(canceled, null);
+        var session = TlsSession.init(TlsConfig.insecure(std.testing.allocator), std.testing.io);
+        defer session.deinit();
+        var net_buffer: [64]u8 = undefined;
+        var plaintext_buffer: [8]u8 = undefined;
+        session.net_in = SocketIoReader.init(&accepted.socket, &net_buffer);
+        var client: TlsClient = undefined;
+        client.input = &session.net_in.?.reader_iface;
+        client.read_err = null;
+        client.reader = .{ .vtable = &transport_vtable, .buffer = &plaintext_buffer, .seek = 0, .end = 0 };
+        session.client = client;
+        defer session.client = null;
+        var byte: [1]u8 = undefined;
+        const expected = if (cancel) error.Canceled else error.Timeout;
+        std.debug.print("RESIDUAL_RED TLS transport expects={s}\n", .{@errorName(expected)});
+        try std.testing.expectError(expected, session.read(&byte));
+    }
+};
+
+test "residual TLS read preserves terminal record errors" {
+    var session = TlsSession.init(TlsConfig.insecure(std.testing.allocator), std.testing.io);
+    defer session.deinit();
+    inline for (.{ error.TlsAlert, error.TlsBadLength, error.TlsBadRecordMac, error.TlsConnectionTruncated, error.TlsDecodeError, error.TlsRecordOverflow, error.TlsUnexpectedMessage, error.TlsIllegalParameter, error.TlsSequenceOverflow }) |expected| {
+        var client: TlsClient = undefined;
+        var plaintext_buffer: [8]u8 = undefined;
+        client.reader = .{ .vtable = &ResidualTlsReadTest.error_vtable, .buffer = &plaintext_buffer, .seek = 0, .end = 0 };
+        client.read_err = expected;
+        session.client = client;
+        defer session.client = null;
+        var byte: [1]u8 = undefined;
+        std.debug.print("RESIDUAL_RED TLS record expects={s}\n", .{@errorName(expected)});
+        try std.testing.expectError(expected, session.read(&byte));
+    }
+}
+
+test "residual TLS read preserves native socket timeout" {
+    try ResidualTlsReadTest.transport(false);
+}
+
+test "residual TLS read preserves request cancellation" {
+    try ResidualTlsReadTest.transport(true);
+}
+
+test "residual TLS EOF ignores stale terminal record error" {
+    var session = TlsSession.init(TlsConfig.insecure(std.testing.allocator), std.testing.io);
+    defer session.deinit();
+    var client: TlsClient = undefined;
+    client.reader = .fixed("");
+    client.read_err = error.TlsBadRecordMac;
+    session.client = client;
+    defer session.client = null;
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try session.read(&byte));
 }

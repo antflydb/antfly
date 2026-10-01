@@ -14,7 +14,15 @@
 
 const common = @import("common.zig");
 
-const tests = [_]common.TestSpec{
+// These CLI test bodies are also reachable from inference.zig. The shared
+// finetuning executable owns them; inference's default run excludes them.
+pub const inference_overlap_filters: []const []const u8 = &.{
+    "finetune.train.train_gliner2_autodiff.test.",
+    "finetune.tools.eval_gliner2_autodiff_adapter.test.",
+    "finetune.tools.eval_gliner2_autodiff_adapter_dataset.test.",
+};
+
+pub const specs = [_]common.TestSpec{
     .{
         .step_name = "test-layoutlmv3-finetune",
         .root_source_file = "src/finetune/test/test_layoutlmv3_finetune.zig",
@@ -33,7 +41,7 @@ const tests = [_]common.TestSpec{
         .step_name = "test-gliner2-data",
         .root_source_file = "src/finetune/test/test_gliner2_data.zig",
         .description = "Run isolated GLiNER2 finetune data tests",
-        .imports = &.{ .antfly_platform, .inference_finetune_data },
+        .imports = &.{ .antfly_platform, .inference_internal },
     },
     .{
         .step_name = "test-gliner2-e2e",
@@ -80,6 +88,7 @@ const tests = [_]common.TestSpec{
     .{
         .step_name = "test-gliner2-graph-cache",
         .root_source_file = "src/finetune_graph_cache_test_root.zig",
+        .covered_by_inference = true,
         .description = "Run GLiNER2 autodiff objective and graph-cache tests",
         .imports = &.{ .antfly_platform, .build_options, .ml, .onnx_graph, .pjrt, .inference_internal, .inference_hf_tokenizer, .protobuf, .inference_linalg },
         .native_link = .default,
@@ -106,6 +115,10 @@ const tests = [_]common.TestSpec{
     },
     .{
         .step_name = "test-gliner2-native-eval",
+        .focused_filters = &.{
+            "eval_gliner2_autodiff_adapter_dataset.test.",
+            "eval_gliner2_autodiff_adapter.test.",
+        },
         .root_source_file = "src/finetune/tools/eval_gliner2_autodiff_adapter_dataset.zig",
         .description = "Run GLiNER2 native full-task evaluator tests",
         .imports = &.{ .build_options, .ml, .inference_internal, .inference_hf_tokenizer, .inference_linalg },
@@ -114,11 +127,13 @@ const tests = [_]common.TestSpec{
     .{
         .step_name = "test-entity-cleanup-data",
         .root_source_file = "src/test_entity_cleanup_data.zig",
+        .covered_by_inference = true,
         .description = "Run isolated entity cleanup finetune data tests",
     },
     .{
         .step_name = "test-entity-cleanup-model",
         .root_source_file = "src/test_entity_cleanup_model.zig",
+        .covered_by_inference = true,
         .description = "Run isolated learned entity cleanup model tests",
         .imports = &.{ .build_options, .inference_hf_tokenizer },
         .native_link = .default,
@@ -140,19 +155,20 @@ const tests = [_]common.TestSpec{
     .{
         .step_name = "test-entity-cleanup",
         .root_source_file = "src/test_entity_cleanup_pipeline.zig",
+        .covered_by_inference = true,
         .description = "Run isolated learned entity cleanup pipeline tests",
     },
     .{
         .step_name = "test-reranker-data",
         .root_source_file = "src/finetune/test/test_reranker_data.zig",
         .description = "Run isolated reranker finetune data tests",
-        .imports = &.{.inference_finetune_data},
+        .imports = &.{.inference_internal},
     },
     .{
         .step_name = "test-fused-chunker-data",
         .root_source_file = "src/finetune/test/test_fused_chunker_data.zig",
         .description = "Run fused chunker data tests",
-        .imports = &.{.inference_finetune_data},
+        .imports = &.{.inference_internal},
     },
     .{
         .step_name = "test-fused-chunker",
@@ -194,15 +210,39 @@ const tests = [_]common.TestSpec{
         .step_name = "test-tokenizer-batch",
         .root_source_file = "src/finetune/test/test_tokenizer_batch.zig",
         .description = "Run TokenizerBatch wrapper tests",
-        .imports = &.{.inference_finetune_tokenizer_batch},
+        .imports = &.{.inference_internal},
     },
 };
 
 pub fn addTests(ctx: common.Context, name: []const u8) *@import("std").Build.Step {
     const aggregate = ctx.b.step(name, "Run focused fine-tuning tests and compile registered commands");
-    for (tests) |spec| {
-        const step = common.addTest(ctx, spec);
-        aggregate.dependOn(step);
+    const shared = common.sharedTests(ctx, &specs);
+    const run = ctx.b.addRunArtifact(shared);
+    run.setCwd(ctx.root orelse ctx.b.path("."));
+    addRuntimeSelection(ctx, run, &.{});
+    aggregate.dependOn(&run.step);
+    ctx.b.step(if (ctx.publish_targets) "test-finetune-unit" else "inference-finetune-unit-test", "Run the shared finetuning unit executable").dependOn(&run.step);
+    for (specs) |spec| {
+        if (spec.covered_by_inference) {
+            // Compatibility targets only: inference-test owns these tests in
+            // both root and standalone gates. Do not execute them twice.
+            if (ctx.publish_targets) _ = common.addTest(ctx, spec);
+        } else if (ctx.publish_targets) {
+            const focused = ctx.b.addRunArtifact(shared);
+            focused.setCwd(ctx.root orelse ctx.b.path("."));
+            const basename = @import("std").fs.path.stem(spec.root_source_file);
+            const filters = if (spec.focused_filters.len != 0) spec.focused_filters else &.{ctx.b.fmt("{s}.test", .{basename})};
+            addRuntimeSelection(ctx, focused, filters);
+            ctx.b.step(spec.step_name, spec.description).dependOn(&focused.step);
+        }
     }
     return aggregate;
+}
+
+fn addRuntimeSelection(ctx: common.Context, run: *@import("std").Build.Step.Run, defaults: []const []const u8) void {
+    const filters = @import("../test_filters.zig");
+    const args = ctx.args orelse &.{};
+    for (filters.select(ctx.b.allocator, args, defaults)) |filter|
+        run.addArgs(&.{ "--test-filter", filter });
+    filters.addRuntimeControls(run, args);
 }

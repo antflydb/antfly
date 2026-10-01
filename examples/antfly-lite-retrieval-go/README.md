@@ -23,8 +23,8 @@ GOWORK=off go run . --reset --db retrieval.aflite --backup retrieval.afb
 ```
 
 `--reset` removes the template files before running so the example exercises
-`antflylite.Create`. Without `--reset`, the template reopens `retrieval.aflite`
-with `antflylite.Open` and keeps the existing schema and indexes.
+`lite.Create`. Without `--reset`, the template reopens `retrieval.aflite`
+with `lite.Open` and keeps the existing schema and indexes.
 
 Use `retrieval.aflite` as the live embedded database. Use `retrieval.afb` for
 promotion, restore, or archival backup.

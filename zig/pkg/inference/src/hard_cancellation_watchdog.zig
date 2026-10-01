@@ -27,6 +27,22 @@ pub const HardCancellationWatchdog = struct {
     const Entry = struct {
         token: u64,
         control: execution_control_mod.MonitorControl,
+        cancellation_observed_ns: ?u64 = null,
+
+        fn shouldRestart(self: *Entry, now_ns: u64) bool {
+            self.control.check() catch |err| {
+                if (err == error.Cancelled or err == error.Canceled) {
+                    if (self.control.cancellation_grace_ns) |grace_ns| {
+                        const observed = self.cancellation_observed_ns orelse now_ns;
+                        self.cancellation_observed_ns = observed;
+                        return now_ns -| observed >= grace_ns;
+                    }
+                }
+                return true;
+            };
+            self.cancellation_observed_ns = null;
+            return false;
+        }
     };
 
     allocator: std.mem.Allocator,
@@ -104,23 +120,57 @@ pub const HardCancellationWatchdog = struct {
 
     fn run(self: *HardCancellationWatchdog, io: std.Io) std.Io.Cancelable!void {
         while (!self.stopping.load(.acquire)) {
-            var fatal: ?anyerror = null;
+            var fatal = false;
             spinLock(&self.mutex);
-            for (self.entries.items) |entry| {
-                entry.control.check() catch |err| {
-                    fatal = err;
+            const now_ns = platform.time.monotonicNs();
+            for (self.entries.items) |*entry| {
+                if (entry.shouldRestart(now_ns)) {
+                    fatal = true;
                     break;
-                };
+                }
             }
             self.mutex.unlock();
-            if (fatal) |err| {
-                std.log.err(
-                    "uninterruptible inference request expired; terminating supervised worker err={s}",
-                    .{@errorName(err)},
-                );
+            if (fatal) {
+                // A wedged worker may own stderr's lock, or its log consumer
+                // may have stopped reading. Exit86 is the parent diagnostic;
+                // no logging or other blocking IO may precede termination.
                 platform.inference_process_supervisor.restartWorker();
             }
             try io.sleep(std.Io.Duration.fromMilliseconds(10), .awake);
         }
     }
 };
+
+test "native call cancellation gets a bounded grace but deadlines stay hard" {
+    const State = struct {
+        cancelled: bool = true,
+        alternate_spelling: bool = false,
+        timed_out: bool = false,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.timed_out) return error.Timeout;
+            if (self.cancelled) return if (self.alternate_spelling) error.Canceled else error.Cancelled;
+        }
+    };
+    var state = State{};
+    var entry = HardCancellationWatchdog.Entry{
+        .token = 1,
+        .control = .{ .ptr = &state, .check_fn = State.check, .cancellation_grace_ns = 30 },
+    };
+    try std.testing.expect(!entry.shouldRestart(100));
+    try std.testing.expect(!entry.shouldRestart(129));
+    try std.testing.expect(entry.shouldRestart(130));
+    state.cancelled = false;
+    try std.testing.expect(!entry.shouldRestart(140));
+    try std.testing.expect(entry.cancellation_observed_ns == null);
+    state.timed_out = true;
+    try std.testing.expect(entry.shouldRestart(141));
+
+    state.timed_out = false;
+    state.cancelled = true;
+    state.alternate_spelling = true;
+    entry.cancellation_observed_ns = null;
+    try std.testing.expect(!entry.shouldRestart(200));
+    try std.testing.expect(!entry.shouldRestart(229));
+    try std.testing.expect(entry.shouldRestart(230));
+}

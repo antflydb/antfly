@@ -1,0 +1,29 @@
+{
+  "optimize": "Debug",
+  "rows": 20000,
+  "groups": 64,
+  "warmup_pairs": 1,
+  "samples": 7,
+  "repeated_scan_ns": [
+    846420000,
+    847962000,
+    847856000,
+    848591000,
+    847484000,
+    845024000,
+    848237000
+  ],
+  "partition_once_ns": [
+    15847000,
+    15904000,
+    15764000,
+    15677000,
+    15771000,
+    15796000,
+    15864000
+  ],
+  "repeated_p50_ms": 847.856,
+  "partition_p50_ms": 15.796,
+  "p50_speedup": 53.675360850848314,
+  "scope": "Same-binary key partitioning component; excludes HTTP, routing acquisition, and storage. No task-owned build, model, profiler, or second workload during timing."
+}

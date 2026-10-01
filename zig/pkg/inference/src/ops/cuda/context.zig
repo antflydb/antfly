@@ -86,6 +86,7 @@ pub const CudaContext = struct {
     stream: CUstream,
     info: DeviceInfo,
     stats: RuntimeStats = .{},
+    device_allocations: @import("allocation_budget.zig").Budget = .{},
     debug_graph_capture_active: bool = false,
     debug_graph_capture_id: usize = 0,
     debug_graph_capture_param_trace_count: usize = 0,

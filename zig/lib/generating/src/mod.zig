@@ -71,15 +71,19 @@ pub const ChatMessage = struct {
     content: ?ChatMessageContent = null,
     tool_calls: ?[]const ToolCall = null,
     tool_call_id: ?[]const u8 = null,
+    /// Opaque Google response parts, replayed only by Google adapters.
+    google_parts_json: ?[]const u8 = null,
 };
 
 pub const GenerateResult = struct {
     content: []const u8,
     tool_calls: []ToolCall = &.{},
+    google_parts_json: ?[]const u8 = null,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *GenerateResult) void {
         self.allocator.free(self.content);
+        if (self.google_parts_json) |parts| self.allocator.free(parts);
         for (self.tool_calls) |*tool_call| tool_call.deinit(self.allocator);
         if (self.tool_calls.len > 0) self.allocator.free(self.tool_calls);
         self.* = undefined;
@@ -90,9 +94,18 @@ pub const Provider = enum {
     gemini,
     vertex,
     openai,
+    openrouter,
     ollama,
     antfly,
     mock,
+
+    /// Adapter capability; the selected model must also support function calling.
+    pub fn supportsTools(self: Provider) bool {
+        return switch (self) {
+            .antfly, .openai, .openrouter, .ollama, .gemini, .vertex => true,
+            .mock => false,
+        };
+    }
 
     pub fn validate(self: Provider) !void {
         _ = self;
@@ -104,11 +117,15 @@ pub const Provider = enum {
 /// optional, and Ollama's native num_predict default is unbounded.
 pub const default_max_tokens: i64 = 256;
 
+pub const OpenAIReasoningEffort = openapi.OpenAIReasoningEffort;
+
 pub const OpenAIConfig = struct {
     model: []const u8,
     url: []const u8 = "https://api.openai.com/v1",
     api_key: ?[]const u8 = null,
 };
+
+pub const openrouter_default_url = "https://openrouter.ai/api/v1";
 
 pub const OllamaConfig = struct {
     model: []const u8,
@@ -134,6 +151,8 @@ pub const GeneratorConfig = struct {
     tools_json: ?[]const u8 = null,
     tool_choice_json: ?[]const u8 = null,
     max_tokens: i64 = default_max_tokens,
+    max_completion_tokens: ?i64 = null,
+    reasoning_effort: ?OpenAIReasoningEffort = null,
     temperature: ?f32 = null,
     top_p: ?f32 = null,
     top_k: ?i64 = null,
@@ -155,6 +174,8 @@ pub const GeneratorConfig = struct {
             .tools_json = if (self.tools_json) |value| try alloc.dupe(u8, value) else null,
             .tool_choice_json = if (self.tool_choice_json) |value| try alloc.dupe(u8, value) else null,
             .max_tokens = self.max_tokens,
+            .max_completion_tokens = self.max_completion_tokens,
+            .reasoning_effort = self.reasoning_effort,
             .temperature = self.temperature,
             .top_p = self.top_p,
             .top_k = self.top_k,
@@ -207,11 +228,18 @@ pub const GeneratorConfig = struct {
         if (self.model.len == 0 and self.provider != .mock) return error.InvalidGeneratorConfig;
         if (self.url.len == 0 and self.provider != .mock and self.provider != .antfly and self.provider != .vertex and self.provider != .gemini) return error.InvalidGeneratorConfig;
         if (self.max_tokens <= 0) return error.InvalidGeneratorConfig;
+        if (self.max_completion_tokens) |limit| if (limit <= 0) return error.InvalidGeneratorConfig;
+        if (self.provider != .openai and (self.max_completion_tokens != null or self.reasoning_effort != null)) return error.InvalidGeneratorConfig;
         if (self.temperature) |value| if (value < 0 or value > 2) return error.InvalidGeneratorConfig;
         if (self.top_p) |value| if (value < 0 or value > 1) return error.InvalidGeneratorConfig;
         if (self.top_k) |value| if (value <= 0) return error.InvalidGeneratorConfig;
         if (self.frequency_penalty) |value| if (value < -2 or value > 2) return error.InvalidGeneratorConfig;
         if (self.presence_penalty) |value| if (value < -2 or value > 2) return error.InvalidGeneratorConfig;
+    }
+
+    /// Budget charged to provider quotas, including reasoning when configured.
+    pub fn outputTokenBudget(self: GeneratorConfig) i64 {
+        return self.max_completion_tokens orelse self.max_tokens;
     }
 
     pub fn getModel(self: GeneratorConfig) []const u8 {
@@ -299,14 +327,18 @@ pub fn stringifyChainLinkAlloc(alloc: std.mem.Allocator, link: ChainLink) ![]u8 
 }
 
 pub fn configFromOpenApi(alloc: std.mem.Allocator, generated: openapi.GeneratorConfig) !GeneratorConfig {
+    const provider = try providerFromOpenApi(generated.provider);
+    if (generated.max_tokens != null and generated.max_completion_tokens != null) return error.InvalidGeneratorConfig;
     var cfg = GeneratorConfig{
         .rate_limit = generated.rate_limit,
-        .provider = try providerFromOpenApi(generated.provider),
+        .provider = provider,
         .model = if (generated.model) |model| try alloc.dupe(u8, model) else "",
         .url = if (generated.url) |url|
             try alloc.dupe(u8, url)
         else if (generated.api_url) |api_url|
             try alloc.dupe(u8, api_url)
+        else if (provider == .openrouter)
+            try alloc.dupe(u8, openrouter_default_url)
         else
             "",
         .api_key = if (generated.api_key) |api_key| try alloc.dupe(u8, api_key) else null,
@@ -314,6 +346,8 @@ pub fn configFromOpenApi(alloc: std.mem.Allocator, generated: openapi.GeneratorC
         .location = if (generated.location) |location| try alloc.dupe(u8, location) else null,
         .credentials_path = if (generated.credentials_path) |credentials_path| try alloc.dupe(u8, credentials_path) else null,
         .max_tokens = generated.max_tokens orelse default_max_tokens,
+        .max_completion_tokens = generated.max_completion_tokens,
+        .reasoning_effort = generated.reasoning_effort,
         .temperature = generated.temperature,
         .top_p = generated.top_p,
         .top_k = generated.top_k,
@@ -331,7 +365,7 @@ pub fn openApiFromConfig(cfg: GeneratorConfig) openapi.GeneratorConfig {
         .provider = providerToOpenApi(cfg.provider),
         .model = if (cfg.model.len > 0) cfg.model else null,
         .url = switch (cfg.provider) {
-            .openai, .ollama, .gemini, .vertex, .mock => if (cfg.url.len > 0) cfg.url else null,
+            .openai, .openrouter, .ollama, .gemini, .vertex, .mock => if (cfg.url.len > 0) cfg.url else null,
             .antfly => null,
         },
         .api_url = switch (cfg.provider) {
@@ -342,7 +376,9 @@ pub fn openApiFromConfig(cfg: GeneratorConfig) openapi.GeneratorConfig {
         .project_id = cfg.project_id,
         .location = cfg.location,
         .credentials_path = cfg.credentials_path,
-        .max_tokens = cfg.max_tokens,
+        .max_tokens = if (cfg.max_completion_tokens == null) cfg.max_tokens else null,
+        .max_completion_tokens = cfg.max_completion_tokens,
+        .reasoning_effort = cfg.reasoning_effort,
         .temperature = cfg.temperature,
         .top_p = cfg.top_p,
         .top_k = cfg.top_k,
@@ -602,6 +638,7 @@ fn providerFromOpenApi(provider: ?[]const u8) !Provider {
     if (std.mem.eql(u8, name, "gemini")) return .gemini;
     if (std.mem.eql(u8, name, "vertex")) return .vertex;
     if (std.mem.eql(u8, name, "openai")) return .openai;
+    if (std.mem.eql(u8, name, "openrouter")) return .openrouter;
     if (std.mem.eql(u8, name, "ollama")) return .ollama;
     if (std.mem.eql(u8, name, "antfly")) return .antfly;
     return error.UnsupportedGeneratorProvider;
@@ -662,6 +699,22 @@ test "generator config preserves explicit max_tokens" {
         \\{"provider":"openai","model":"gpt-4.1","url":"https://api.openai.com/v1","max_tokens":0}
     ;
     try std.testing.expectError(error.InvalidGeneratorConfig, parseConfigFromSlice(alloc, invalid));
+}
+
+test "openrouter generator config defaults to its OpenAI-compatible endpoint" {
+    const alloc = std.testing.allocator;
+    const raw =
+        \\{"provider":"openrouter","model":"openai/gpt-4o-mini","api_key":"${secret:openrouter.api_key}"}
+    ;
+    var cfg = try parseConfigFromSlice(alloc, raw);
+    defer cfg.deinit(alloc);
+    try std.testing.expectEqual(.openrouter, cfg.provider);
+    try std.testing.expectEqualStrings(openrouter_default_url, cfg.url);
+    try std.testing.expectEqualStrings("${secret:openrouter.api_key}", cfg.api_key orelse return error.TestUnexpectedResult);
+
+    const encoded = try stringifyConfigAlloc(alloc, cfg);
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"provider\":\"openrouter\"") != null);
 }
 
 test "generator config preserves sampling controls" {
@@ -895,4 +948,44 @@ test "generating config preserves shared rate limits through cloning and JSON" {
     try std.testing.expectEqualDeep(cfg.rate_limit, reparsed.rate_limit);
     try std.testing.expectEqual(.completion, reparsed.rate_limit.?.pacing.?);
     try std.testing.expectEqual(@as(?i64, 4), reparsed.rate_limit.?.max_concurrency);
+}
+
+test "generator config preserves OpenAI completion options through clone and round trip" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseConfigFromSlice(alloc,
+        \\{"provider":"openai","model":"gpt-5.6-luna","url":"https://api.openai.com/v1","max_completion_tokens":1024,"reasoning_effort":"none"}
+    );
+    defer cfg.deinit(alloc);
+    var cloned = try cfg.clone(alloc);
+    defer cloned.deinit(alloc);
+    try std.testing.expectEqual(@as(i64, 1024), cloned.outputTokenBudget());
+    try std.testing.expectEqual(OpenAIReasoningEffort.none, cloned.reasoning_effort.?);
+    const encoded = try stringifyConfigAlloc(alloc, cloned);
+    defer alloc.free(encoded);
+    const raw = try json.parseFromSlice(json.Value, alloc, encoded, .{});
+    defer raw.deinit();
+    try std.testing.expect(raw.value.object.get("max_tokens") == null or raw.value.object.get("max_tokens").? == .null);
+    var reparsed = try parseConfigFromSlice(alloc, encoded);
+    defer reparsed.deinit(alloc);
+    try std.testing.expectEqual(cfg.max_completion_tokens, reparsed.max_completion_tokens);
+    try std.testing.expectEqual(cfg.reasoning_effort, reparsed.reasoning_effort);
+}
+
+test "generator config rejects ambiguous and invalid OpenAI completion options" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{
+        \\{"provider":"openai","model":"m","url":"http://localhost","max_tokens":10,"max_completion_tokens":20}
+        ,
+        \\{"provider":"openai","model":"m","url":"http://localhost","max_completion_tokens":0}
+        ,
+        \\{"provider":"openai","model":"m","url":"http://localhost","max_completion_tokens":-1}
+        ,
+        \\{"provider":"ollama","model":"m","url":"http://localhost","max_completion_tokens":20}
+        ,
+        \\{"provider":"antfly","model":"m","reasoning_effort":"none"}
+        ,
+    }) |raw| try std.testing.expectError(error.InvalidGeneratorConfig, parseConfigFromSlice(alloc, raw));
+    try std.testing.expectError(error.UnexpectedToken, parseConfigFromSlice(alloc,
+        \\{"provider":"openai","model":"m","url":"http://localhost","reasoning_effort":"bogus"}
+    ));
 }

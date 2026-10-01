@@ -1791,8 +1791,8 @@ func TestDefault_StandaloneDefaults(t *testing.T) {
 	if !cluster.Spec.Standalone.Inference.Enabled {
 		t.Fatal("expected inference to default enabled for standalone mode")
 	}
-	if cluster.Spec.Standalone.Inference.APIURL != "http://0.0.0.0:11433" {
-		t.Fatalf("expected default inference API URL, got %q", cluster.Spec.Standalone.Inference.APIURL)
+	if cluster.Spec.Standalone.Inference.APIURL != "" {
+		t.Fatalf("expected no default inference API URL (embedded inference runs in-process), got %q", cluster.Spec.Standalone.Inference.APIURL)
 	}
 }
 
@@ -4058,5 +4058,17 @@ func baseStandaloneCluster() *AntflyCluster {
 			},
 			Config: "{}",
 		},
+	}
+}
+
+func TestLazyHAActivationRejectsSynchronousPolicy(t *testing.T) {
+	for _, mode := range []HADurabilityMode{HADurabilityModeRemoteWrite, HADurabilityModeRemoteApply} {
+		cluster := &AntflyCluster{Spec: AntflyClusterSpec{HighAvailability: &HighAvailabilitySpec{
+			Mode: HAModeHotStandby, ActivationPolicy: "OnFirstTable", SyncPolicy: &HASyncPolicy{Mode: mode},
+		}}}
+		err := cluster.validateHighAvailabilitySpec()
+		if err == nil || !strings.Contains(err.Error(), "requires Async durability") {
+			t.Fatalf("mode %s: expected synchronous bootstrap validation, got %v", mode, err)
+		}
 	}
 }

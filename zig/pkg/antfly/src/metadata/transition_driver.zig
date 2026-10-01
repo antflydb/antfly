@@ -83,6 +83,7 @@ pub const TransitionDriver = struct {
         runtime: TransitionRuntime,
         record: *transition_state.MergeTransitionRecord,
     ) !StepResult {
+        if (record.online != null) return error.OnlineMergeUnavailable;
         const observation = try runtime.observeMerge(record.*);
         return try stepMergeObserved(runtime, record, observation);
     }
@@ -92,6 +93,7 @@ pub const TransitionDriver = struct {
         record: *transition_state.MergeTransitionRecord,
         observation: transition_state.MergeObservation,
     ) !StepResult {
+        if (record.online != null) return error.OnlineMergeUnavailable;
         const decision = transition_controller.TransitionController.planMerge(record.*, observation);
         try runtime.execute(decision.action);
         record.phase = decision.next_phase;

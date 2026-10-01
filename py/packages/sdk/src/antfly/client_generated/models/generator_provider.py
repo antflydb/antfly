@@ -6,6 +6,7 @@ class GeneratorProvider(StrEnum):
     GEMINI = "gemini"
     OLLAMA = "ollama"
     OPENAI = "openai"
+    OPENROUTER = "openrouter"
     VERTEX = "vertex"
 
     def __str__(self) -> str:

@@ -92,6 +92,16 @@ const OpaqueApiHttpServer = struct {
             @panic("API kernel allocation failed");
     }
 
+    pub fn initWithProcessRequestAllocatorFallible(
+        owner_alloc: std.mem.Allocator,
+        cfg: server_mod.ApiHttpServerConfig,
+        source: server_mod.StatusSource,
+        read_source: ?table_reads.TableReadSource,
+        write_source: ?table_writes.TableWriteSource,
+    ) !OpaqueApiHttpServer {
+        return createOpaqueServer(owner_alloc, cfg, source, read_source, write_source, false);
+    }
+
     pub fn deinit(self: *OpaqueApiHttpServer) void {
         const boundary_allocator = self.boundary_allocator;
         const allocator = boundary_allocator.allocator;
@@ -206,6 +216,20 @@ fn createOpaqueServer(
 ) !OpaqueApiHttpServer {
     const functions = try validateFunctionTable();
     var cfg_copy = cfg;
+    const api_io = if (cfg.backend_runtime) |runtime| runtime.apiIo() else null;
+    const api_network_io = if (cfg.backend_runtime) |runtime| runtime.apiNetworkIo() else null;
+    const api_filesystem_io = if (cfg.backend_runtime) |runtime| runtime.apiFilesystemIo() else null;
+    const durable_io = if (cfg.backend_runtime) |runtime| runtime.io() else null;
+    const api_borrow: ?abi.native_abi.IoBorrow = if (api_io) |io| .init(&io) else null;
+    const api_network_borrow: ?abi.native_abi.IoBorrow = if (api_network_io) |io| .init(&io) else null;
+    const api_filesystem_borrow: ?abi.native_abi.IoBorrow = if (api_filesystem_io) |io| .init(&io) else null;
+    const durable_borrow: ?abi.native_abi.IoBorrow = if (durable_io) |io| .init(&io) else null;
+    const runtime_io: abi.RuntimeIoBorrows = .{
+        .api = if (api_borrow) |*borrow| borrow else null,
+        .api_network = if (api_network_borrow) |*borrow| borrow else null,
+        .api_filesystem = if (api_filesystem_borrow) |*borrow| borrow else null,
+        .durable = if (durable_borrow) |*borrow| borrow else null,
+    };
     var source_copy = source;
     var reads_copy = read_source;
     var writes_copy = write_source;
@@ -220,6 +244,7 @@ fn createOpaqueServer(
         .owner_alloc = &boundary_allocator.abi_allocator,
         .cfg = &cfg_copy,
         .cfg_contract = .of(server_mod.ApiHttpServerConfig),
+        .runtime_io = if (cfg.backend_runtime != null) &runtime_io else null,
         .source = &source_copy,
         .source_contract = .of(server_mod.StatusSource),
         .table_reads = &reads_copy,
@@ -408,13 +433,20 @@ const OpaqueHttpxHandler = struct {
             };
             try self.runtime_routes.append(alloc, route);
             errdefer _ = self.runtime_routes.pop();
-            try server.routeWithData(switch (entry.method) {
+            const method: httpx.Method = switch (entry.method) {
                 .get => .GET,
                 .post => .POST,
                 .put => .PUT,
                 .delete => .DELETE,
                 .patch => .PATCH,
-            }, path, runtimeApiHttpHandler, route);
+            };
+            if (method == .POST) {
+                if (@import("http_routes.zig").publicPostBodyLimit(path)) |limit| {
+                    try server.routeWithDataAndBodyLimit(method, path, runtimeApiHttpHandler, route, limit);
+                    continue;
+                }
+            }
+            try server.routeWithData(method, path, runtimeApiHttpHandler, route);
         }
     }
 

@@ -17,16 +17,36 @@ class ExtractionRelationEndpoint:
     Attributes:
         entity_index (int | Unset):
         id (str | Unset):
+        label (str | Unset): Entity type when the endpoint has a typed identity.
+        text (str | Unset): Version 2 endpoint surface, including endpoints absent from the entities list.
+        start (int | Unset):
+        end (int | Unset):
+        score (float | Unset):
     """
 
     entity_index: int | Unset = UNSET
     id: str | Unset = UNSET
+    label: str | Unset = UNSET
+    text: str | Unset = UNSET
+    start: int | Unset = UNSET
+    end: int | Unset = UNSET
+    score: float | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         entity_index = self.entity_index
 
         id = self.id
+
+        label = self.label
+
+        text = self.text
+
+        start = self.start
+
+        end = self.end
+
+        score = self.score
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -35,6 +55,16 @@ class ExtractionRelationEndpoint:
             field_dict["entity_index"] = entity_index
         if id is not UNSET:
             field_dict["id"] = id
+        if label is not UNSET:
+            field_dict["label"] = label
+        if text is not UNSET:
+            field_dict["text"] = text
+        if start is not UNSET:
+            field_dict["start"] = start
+        if end is not UNSET:
+            field_dict["end"] = end
+        if score is not UNSET:
+            field_dict["score"] = score
 
         return field_dict
 
@@ -45,9 +75,24 @@ class ExtractionRelationEndpoint:
 
         id = d.pop("id", UNSET)
 
+        label = d.pop("label", UNSET)
+
+        text = d.pop("text", UNSET)
+
+        start = d.pop("start", UNSET)
+
+        end = d.pop("end", UNSET)
+
+        score = d.pop("score", UNSET)
+
         extraction_relation_endpoint = cls(
             entity_index=entity_index,
             id=id,
+            label=label,
+            text=text,
+            start=start,
+            end=end,
+            score=score,
         )
 
         extraction_relation_endpoint.additional_properties = d

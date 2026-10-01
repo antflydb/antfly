@@ -17,7 +17,8 @@ class InferencePromptCacheConfig:
     """Native generator prompt KV cache configuration.
 
     Attributes:
-        enabled (bool | Unset): Enable inference-native prompt KV cache reuse for generator requests. Default: False.
+        enabled (bool | Unset): Enable inference-native prompt KV cache reuse for generator requests. On by default; set
+            false to disable. Default: True.
         mode (InferencePromptCacheConfigMode | Unset): Prompt KV cache implementation. `block_hash` (default) uses hash-
             addressed
             full KV blocks under prompt_cache_key with O(1) block lookup. `radix` is an
@@ -38,7 +39,7 @@ class InferencePromptCacheConfig:
              Default: 300000.
     """
 
-    enabled: bool | Unset = False
+    enabled: bool | Unset = True
     mode: InferencePromptCacheConfigMode | Unset = InferencePromptCacheConfigMode.BLOCK_HASH
     max_bytes_mb: int | Unset = 512
     min_tokens: int | Unset = 64

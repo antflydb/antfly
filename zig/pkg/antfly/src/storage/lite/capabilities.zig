@@ -71,6 +71,10 @@ const hosted_freestanding_available_inference_modes = [_][]const u8{
 
 pub const Capabilities = struct {
     freestanding_build: bool = builtin.os.tag == .freestanding,
+    // C ABI threading contract, like sqlite3_threadsafe(): "serialized"
+    // means any thread may call any function on a handle concurrently. See
+    // zig/CAPI.md "Thread Safety".
+    threading: []const u8 = "serialized",
     hosted_profile: bool = false,
     manual_maintenance: bool = false,
     background_enrichment_runtime: bool = true,
@@ -115,11 +119,41 @@ pub const InferenceStatus = struct {
     local_runtime_available: bool = false,
     caller_supplied_artifacts: bool = true,
     no_inference_configured_ok: bool = true,
+    // Resource budget overrides requested through `InferenceOpenOptions`, 0
+    // meaning automatic/unconfigured -- mirrors the CLI's
+    // `--inference-host-budget-mb`/`--inference-backend-budget-mb`/
+    // `--process-memory-budget-mb` knobs (see standalone/runtime.zig and
+    // inference_runtime/runtime.zig). `process_memory_limit_bytes` and
+    // `process_memory_limit_source` report the policy the embedded node
+    // actually resolved once started (see
+    // `inference_provider.createEmbeddedInferenceNode`); they stay at their
+    // zero-value/"automatic" defaults until then.
+    host_budget_mb: u32 = 0,
+    backend_budget_mb: u32 = 0,
+    combined_budget_mb: u32 = 0,
+    kv_budget_mb: u32 = 0,
+    scratch_budget_mb: u32 = 0,
+    process_memory_budget_mb: u32 = 0,
+    process_memory_limit_bytes: u64 = 0,
+    process_memory_limit_source: []const u8 = "automatic",
 };
 
 pub const InferenceOpenOptions = struct {
     remote_provider_configured: bool = false,
     local_runtime_configured: bool = false,
+    // Explicit resource-budget overrides for a local embedded runtime; 0
+    // requests the embedded node's own host-clamped defaults (see
+    // inference_provider.zig's `default_host_budget_mb` and friends),
+    // matching the CLI's `--inference-host-budget-mb`/
+    // `--inference-backend-budget-mb`/`--inference-combined-budget-mb`/
+    // `--inference-kv-budget-mb`/`--inference-scratch-budget-mb`/
+    // `--process-memory-budget-mb` semantics.
+    host_budget_mb: u32 = 0,
+    backend_budget_mb: u32 = 0,
+    combined_budget_mb: u32 = 0,
+    kv_budget_mb: u32 = 0,
+    scratch_budget_mb: u32 = 0,
+    process_memory_budget_mb: u32 = 0,
 };
 
 pub fn capabilitiesForProfile(profile: Profile) Capabilities {
@@ -210,5 +244,11 @@ pub fn inferenceStatusForProfileWithOptions(profile: Profile, opts: InferenceOpe
         .local_runtime_available = local_available,
         .caller_supplied_artifacts = caps.caller_supplied_artifacts,
         .no_inference_configured_ok = caps.no_inference_configured_ok,
+        .host_budget_mb = opts.host_budget_mb,
+        .backend_budget_mb = opts.backend_budget_mb,
+        .combined_budget_mb = opts.combined_budget_mb,
+        .kv_budget_mb = opts.kv_budget_mb,
+        .scratch_budget_mb = opts.scratch_budget_mb,
+        .process_memory_budget_mb = opts.process_memory_budget_mb,
     };
 }

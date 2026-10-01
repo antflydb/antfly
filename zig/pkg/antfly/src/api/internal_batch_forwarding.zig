@@ -16,6 +16,7 @@ const data_raft_protocol = @import("../common/data_raft_protocol.zig");
 const raft_mutation_forwarding = @import("raft_mutation_forwarding.zig");
 
 pub const raft_batch_protocol_version = data_raft_protocol.batch_protocol_version;
+pub const raft_batch_artifact_catalog_protocol_version = data_raft_protocol.batch_artifact_catalog_protocol_version;
 pub const raft_batch_timestamp_protocol_version = data_raft_protocol.batch_timestamp_protocol_version;
 pub const raft_batch_activation_barrier_protocol_version = data_raft_protocol.batch_activation_barrier_protocol_version;
 pub const raft_batch_merge_transition_protocol_version = data_raft_protocol.batch_merge_transition_protocol_version;
@@ -23,6 +24,13 @@ pub const raft_batch_split_delta_predecessor_protocol_version = data_raft_protoc
 pub const raft_batch_merge_artifacts_protocol_version = data_raft_protocol.batch_merge_artifacts_protocol_version;
 pub const raft_batch_merge_copy_attempt_protocol_version = data_raft_protocol.batch_merge_copy_attempt_protocol_version;
 pub const raft_batch_merge_retirements_protocol_version = data_raft_protocol.batch_merge_retirements_protocol_version;
+pub const raft_batch_merge_page_protocol_version = data_raft_protocol.batch_merge_page_protocol_version;
+pub const raft_batch_online_source_protocol_version = data_raft_protocol.batch_online_source_protocol_version;
+pub const raft_batch_source_pin_protocol_version = data_raft_protocol.batch_source_pin_protocol_version;
+pub const raft_batch_relational_transfer_protocol_version = data_raft_protocol.batch_relational_transfer_protocol_version;
+pub const raft_batch_source_scope_protocol_version = data_raft_protocol.batch_source_scope_protocol_version;
+pub const raft_batch_merge_chunk_protocol_version = data_raft_protocol.batch_merge_chunk_protocol_version;
+pub const raft_batch_merge_proof_adoption_protocol_version = data_raft_protocol.batch_merge_proof_adoption_protocol_version;
 const http_common = @import("../raft/transport/http_common.zig");
 
 pub const remaining_ms_header = "X-Antfly-Raft-Batch-Remaining-Ms";
@@ -30,6 +38,10 @@ pub const forwards_remaining_header = "X-Antfly-Raft-Batch-Forwards-Remaining";
 pub const campaign_allowed_header = "X-Antfly-Raft-Batch-Campaign-Allowed";
 pub const outcome_header = "X-Antfly-Raft-Batch-Outcome";
 pub const outcome_not_proposed_v1 = "not-proposed-v1";
+/// Exact internal rejection: the destination was reachable, but validation,
+/// catalog, topology, or storage could not admit this write before proposal.
+/// This is not evidence that its Raft leader route is unreachable.
+pub const admission_unavailable_body = "routed raft batch admission unavailable";
 pub const outcome_unknown_v1 = "unknown-v1";
 pub const outcome_committed_visibility_pending_v1 = "committed-visibility-pending-v1";
 pub const outcome_committed_repair_required_v1 = "committed-repair-required-v1";

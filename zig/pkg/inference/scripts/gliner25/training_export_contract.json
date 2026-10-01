@@ -1,0 +1,33 @@
+{
+  "note": "Pinned local loader and LoRA/DoRA sources; numerical package versions and Fastino checkout are additionally checked by oracle.prepare_runtime. This contract is separate from frozen evaluation helpers.",
+  "peft_loader_sources": {
+    "peft/config.py": {
+      "sha256": "398f82a13e8463e9d23de490f6d11951715e9202b27ddccae0d44f5624089951",
+      "size_bytes": 14889
+    },
+    "peft/peft_model.py": {
+      "sha256": "2307ebeb101baff53b19ce5a0f109885d99b64ab147d67cba19719b6097c3e10",
+      "size_bytes": 156704
+    },
+    "peft/tuners/lora/dora.py": {
+      "sha256": "07d514fd057d8aa9ec7b89bec3f3fbd04862951c1a8ff73153e833096481ecf5",
+      "size_bytes": 8480
+    },
+    "peft/tuners/lora/layer.py": {
+      "sha256": "39e2f6908c9f3faf4d2de2b6ecfdf44c96d2cae67b8155ed1b51bc67fb25b734",
+      "size_bytes": 97115
+    },
+    "peft/tuners/lora/variants.py": {
+      "sha256": "c477a90d68caa2d3d2ffa22266f32ad3ab1767f01d84250e5242f1fc29f202c2",
+      "size_bytes": 18921
+    },
+    "peft/utils/save_and_load.py": {
+      "sha256": "849282f01e69b7055cc499e67f279cde3f489421aea212f59f701f45755de26b",
+      "size_bytes": 34607
+    }
+  },
+  "peft_version": "0.17.1",
+  "scope": "gliner25_training_export_compatibility/v1",
+  "upstream_commit": "3c913c7369301133d3b7699252074c4303ada50e",
+  "version": 1
+}

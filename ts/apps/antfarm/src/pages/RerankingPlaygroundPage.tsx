@@ -194,7 +194,7 @@ const RerankingPlaygroundPage: React.FC = () => {
         body: JSON.stringify({
           model: selectedModel,
           query: query,
-          prompts: nonEmptyDocs,
+          documents: nonEmptyDocs,
         }),
         signal: abortControllerRef.current.signal,
       });

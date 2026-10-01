@@ -24,9 +24,47 @@ const std = @import("std");
 /// Version 5 adds conditional restore admission; ordinary job updates retain
 /// their existing wire format.
 /// Version 6 adds digest-conditional restore expiry.
-pub const current_version: u16 = 6;
+/// Versions 7–10 add system catalog publication, sparse store reports,
+/// membership-bound protocol activation, and resumable store inventories.
+/// Version 11 additionally requires relational topology, coordinated
+/// backup/restore/retirement, Scope-v2 sources, staged rewrite final cuts, and
+/// table storage metadata. Main's v10 decoders do not understand these commands.
+/// Version 12 decodes the durable SQL setting catalog transition. Version 13
+/// decodes inert native row-policy definitions; RLS activation is separate.
+/// Version 14 decodes the durable row-policy publication/owner-ACK transition.
+/// Version 15 decodes the durable fenced FK generation publication transition.
+/// Version 16 decodes initial FK creation. Version 17 decodes the physical
+/// store-root UUID extension in store registration records. Version 18 adds
+/// the exact physical-root Ed25519 verifier. Version 19 adds administrator
+/// enrollment, root-authenticated retirement ACKs, immutable artifact
+/// inventory bindings for online merge admission, and typed FK table locks
+/// distinguishing ordinary generation cuts from initial support reservation.
+/// Version 20 admits ordered direct-vector artifact merges. The entire ordered
+/// artifact workflow requires this capability, so a partial rolling upgrade
+/// cannot certify a source whose later pages an older voter cannot execute.
+pub const current_version: u16 = 20;
+pub const durable_activation_version: u16 = 9;
+pub const store_report_update_version: u16 = 8;
+// Preflight and final append require the same complete decoder capability.
+pub const relational_integrity_topology_version: u16 = coordinated_lifecycle_version;
+pub const coordinated_lifecycle_version: u16 = 11;
+pub const table_storage_metadata_version: u16 = 11;
+pub const source_scope_version: u16 = 11;
 pub const restore_job_admission_version: u16 = 5;
 pub const restore_job_expiry_version: u16 = 6;
+pub const system_catalog_version: u16 = 7;
+pub const sql_setting_catalog_version: u16 = 12;
+pub const sql_row_policy_catalog_version: u16 = 13;
+pub const sql_row_policy_publication_version: u16 = 14;
+// Generation table locks carry a typed owner discriminant from v19 onward;
+// an older metadata voter would persist the former untyped lock and permit
+// schema finalization through an active immutable publication cut.
+pub const fk_generation_publication_version: u16 = 19;
+pub const fk_initial_create_version: u16 = 19;
+pub const store_root_uuid_decoder_version: u16 = 17;
+pub const store_root_signing_decoder_version: u16 = 18;
+pub const store_root_enrollment_version: u16 = 19;
+pub const ordered_merge_artifact_version: u16 = 20;
 /// Minimum decoder capability required by the atomic create/drop wire format.
 /// Later, unrelated metadata features must not unnecessarily stop table DDL
 /// when a membership change temporarily includes a lower-capability peer.
@@ -165,3 +203,24 @@ test "range membership is order independent and table scoped" {
     try rhs.add(303);
     try std.testing.expect(!lhs.finish(7).eql(rhs.finish(7)));
 }
+
+/// Replicated proof that this exact incarnation and membership can decode a
+/// protocol. Terms are deliberately excluded: elections do not undo activation.
+pub const Activation = struct {
+    version: u16,
+    incarnation: @import("incarnation.zig").MetadataClusterIncarnation,
+    member_count: u32,
+    membership_fingerprint: @import("reallocation_request.zig").MembershipFingerprint,
+
+    pub fn satisfies(self: @This(), required: @This()) bool {
+        return self.version >= required.version and self.member_count == required.member_count and
+            std.meta.eql(self.incarnation, required.incarnation) and
+            std.meta.eql(self.membership_fingerprint, required.membership_fingerprint);
+    }
+};
+
+/// Resumable report generations and bounded retired-page collection.
+pub const store_report_baseline_version: u16 = 10;
+
+/// Atomic, bounded acknowledgements for local schema migration readiness.
+pub const schema_progress_batch_version: u16 = 10;

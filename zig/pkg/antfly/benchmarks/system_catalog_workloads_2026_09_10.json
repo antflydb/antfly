@@ -1,0 +1,1023 @@
+{
+  "date": "2026-09-10",
+  "baseline_production_sources": "7d977f090",
+  "updated_production_sources": "268b1ceb3",
+  "limitations": [
+    "Provisional shared-host observations: compiler processes were active at run boundaries; these are not isolated capacity measurements.",
+    "One updated redirect run and one baseline rerun timed out with an empty graph on a document shard. Failures are excluded from successful latency samples. Explicit shard readiness was added after the first timeout; it did not eliminate the baseline reproduction.",
+    "The completed redirect baseline predates the explicit shard readiness setup; that setup is outside measured intervals. Both runs use two warmup documents and five measured documents per size."
+  ],
+  "failed_runs": [
+    {
+      "workload": "redirects",
+      "binary": "after",
+      "failure": "Timed out with zero expected hydrated destinations at 10 mentions; before explicit shard waits."
+    },
+    {
+      "workload": "redirects",
+      "binary": "before",
+      "failure": "Timed out on source e:10:2; source accepted but its shard had zero graph edges, despite explicit shard readiness."
+    },
+    {
+      "workload": "cluster",
+      "binary": "after",
+      "table_count": 100,
+      "operation": "ndjson_repeated_target",
+      "failure": "HTTP 503 storage_read_temporarily_unavailable; run aborted without recording successful latency samples."
+    }
+  ],
+  "workloads": {
+    "wide": {
+      "before": {
+        "binary": "before",
+        "binary_sha256": "e35e00a0e903ab0e889f42bd34a7ac4430995ab67a932b49411ada49585a53f2",
+        "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+        "settings": {
+          "scenario": "catalog",
+          "deployment": "standalone",
+          "table_counts": [
+            10,
+            100
+          ],
+          "resolution_workload": "exact",
+          "schema_fields": 200,
+          "mentions": [
+            10,
+            100
+          ],
+          "documents": 5,
+          "concurrency": 8,
+          "samples": 30,
+          "warmup": 2,
+          "ndjson_lines": 20,
+          "poll_ms": 20,
+          "readiness_timeout": 115
+        },
+        "scenarios": {
+          "catalog": {
+            "deployment": "standalone",
+            "startup_ms": 618.683208245784,
+            "checkpoints": [
+              {
+                "table_count": 10,
+                "table_create": {
+                  "samples": 10,
+                  "p50_ms": 78.5686455,
+                  "p95_ms": 81.266041,
+                  "max_ms": 81.266041
+                },
+                "shard_readiness": {
+                  "samples": 10,
+                  "p50_ms": 0.0,
+                  "p95_ms": 0.0,
+                  "max_ms": 0.0
+                },
+                "operations": {
+                  "qualified_lookup": {
+                    "samples": 30,
+                    "p50_ms": 0.479,
+                    "p95_ms": 0.583,
+                    "max_ms": 0.596917
+                  },
+                  "qualified_query": {
+                    "samples": 30,
+                    "p50_ms": 1.054833,
+                    "p95_ms": 1.185292,
+                    "max_ms": 1.370791
+                  },
+                  "qualified_join": {
+                    "samples": 30,
+                    "p50_ms": 2.0568335,
+                    "p95_ms": 2.214167,
+                    "max_ms": 2.216291
+                  },
+                  "ndjson_repeated_target": {
+                    "samples": 30,
+                    "p50_ms": 14.266292,
+                    "p95_ms": 14.802,
+                    "max_ms": 14.983291
+                  },
+                  "scoped_listing": {
+                    "samples": 30,
+                    "p50_ms": 48.9284585,
+                    "p95_ms": 49.95575,
+                    "max_ms": 49.979708
+                  },
+                  "concurrent_qualified_lookup": {
+                    "samples": 240,
+                    "p50_ms": 1.9310835,
+                    "p95_ms": 3.874167,
+                    "max_ms": 4.903667,
+                    "concurrency": 8,
+                    "elapsed_seconds": 0.065430875,
+                    "requests_per_second": 3667.9931301545334
+                  },
+                  "table_rename": {
+                    "samples": 30,
+                    "p50_ms": 1.645792,
+                    "p95_ms": 1.774042,
+                    "max_ms": 1.818167
+                  }
+                }
+              },
+              {
+                "table_count": 100,
+                "table_create": {
+                  "samples": 90,
+                  "p50_ms": 88.59787499999999,
+                  "p95_ms": 140.753458,
+                  "max_ms": 197.351
+                },
+                "shard_readiness": {
+                  "samples": 90,
+                  "p50_ms": 0.0,
+                  "p95_ms": 0.0,
+                  "max_ms": 0.0
+                },
+                "operations": {
+                  "qualified_lookup": {
+                    "samples": 30,
+                    "p50_ms": 1.2583129999999998,
+                    "p95_ms": 1.441834,
+                    "max_ms": 1.447667
+                  },
+                  "qualified_query": {
+                    "samples": 30,
+                    "p50_ms": 2.4695,
+                    "p95_ms": 2.609459,
+                    "max_ms": 2.647333
+                  },
+                  "qualified_join": {
+                    "samples": 30,
+                    "p50_ms": 5.877583,
+                    "p95_ms": 6.910042,
+                    "max_ms": 7.824167
+                  },
+                  "ndjson_repeated_target": {
+                    "samples": 30,
+                    "p50_ms": 40.589334,
+                    "p95_ms": 42.218833,
+                    "max_ms": 42.959333
+                  },
+                  "scoped_listing": {
+                    "samples": 30,
+                    "p50_ms": 486.36531249999996,
+                    "p95_ms": 493.93325,
+                    "max_ms": 501.230541
+                  },
+                  "concurrent_qualified_lookup": {
+                    "samples": 240,
+                    "p50_ms": 4.2422505,
+                    "p95_ms": 13.7375,
+                    "max_ms": 24.466375,
+                    "concurrency": 8,
+                    "elapsed_seconds": 0.186239667,
+                    "requests_per_second": 1288.6620979621919
+                  },
+                  "table_rename": {
+                    "samples": 30,
+                    "p50_ms": 10.186021,
+                    "p95_ms": 11.227333,
+                    "max_ms": 11.384083
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "host_load": {
+          "compiler_active_at_start": true,
+          "compiler_active_at_end": true
+        }
+      },
+      "after": {
+        "binary": "after",
+        "binary_sha256": "033a1c20c8a3937ef21cf17d226ccc359a23a1e2343abfa78c9ca5ea1dbcc76c",
+        "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+        "settings": {
+          "scenario": "catalog",
+          "deployment": "standalone",
+          "table_counts": [
+            10,
+            100
+          ],
+          "resolution_workload": "exact",
+          "schema_fields": 200,
+          "mentions": [
+            10,
+            100
+          ],
+          "documents": 5,
+          "concurrency": 8,
+          "samples": 30,
+          "warmup": 2,
+          "ndjson_lines": 20,
+          "poll_ms": 20,
+          "readiness_timeout": 115
+        },
+        "scenarios": {
+          "catalog": {
+            "deployment": "standalone",
+            "startup_ms": 2276.5940418466926,
+            "checkpoints": [
+              {
+                "table_count": 10,
+                "table_create": {
+                  "samples": 10,
+                  "p50_ms": 80.33783349999999,
+                  "p95_ms": 103.679459,
+                  "max_ms": 103.679459
+                },
+                "shard_readiness": {
+                  "samples": 10,
+                  "p50_ms": 0.0,
+                  "p95_ms": 0.0,
+                  "max_ms": 0.0
+                },
+                "operations": {
+                  "qualified_lookup": {
+                    "samples": 30,
+                    "p50_ms": 0.49395849999999997,
+                    "p95_ms": 0.55725,
+                    "max_ms": 0.56075
+                  },
+                  "qualified_query": {
+                    "samples": 30,
+                    "p50_ms": 1.1404999999999998,
+                    "p95_ms": 1.269042,
+                    "max_ms": 1.302167
+                  },
+                  "qualified_join": {
+                    "samples": 30,
+                    "p50_ms": 2.2138125,
+                    "p95_ms": 2.617709,
+                    "max_ms": 2.625042
+                  },
+                  "ndjson_repeated_target": {
+                    "samples": 30,
+                    "p50_ms": 13.302771,
+                    "p95_ms": 13.800625,
+                    "max_ms": 13.836916
+                  },
+                  "scoped_listing": {
+                    "samples": 30,
+                    "p50_ms": 49.195563,
+                    "p95_ms": 51.056583,
+                    "max_ms": 51.947917
+                  },
+                  "concurrent_qualified_lookup": {
+                    "samples": 240,
+                    "p50_ms": 1.9602085,
+                    "p95_ms": 3.597167,
+                    "max_ms": 5.396666,
+                    "concurrency": 8,
+                    "elapsed_seconds": 0.065027791,
+                    "requests_per_second": 3690.7297066265096
+                  },
+                  "table_rename": {
+                    "samples": 30,
+                    "p50_ms": 1.6340835,
+                    "p95_ms": 1.776834,
+                    "max_ms": 1.812916
+                  }
+                }
+              },
+              {
+                "table_count": 100,
+                "table_create": {
+                  "samples": 90,
+                  "p50_ms": 87.82608350000001,
+                  "p95_ms": 121.245958,
+                  "max_ms": 126.180292
+                },
+                "shard_readiness": {
+                  "samples": 90,
+                  "p50_ms": 0.0,
+                  "p95_ms": 0.0,
+                  "max_ms": 0.0
+                },
+                "operations": {
+                  "qualified_lookup": {
+                    "samples": 30,
+                    "p50_ms": 1.2479580000000001,
+                    "p95_ms": 1.410459,
+                    "max_ms": 1.448375
+                  },
+                  "qualified_query": {
+                    "samples": 30,
+                    "p50_ms": 2.077542,
+                    "p95_ms": 2.341375,
+                    "max_ms": 2.49025
+                  },
+                  "qualified_join": {
+                    "samples": 30,
+                    "p50_ms": 5.0567705,
+                    "p95_ms": 5.501083,
+                    "max_ms": 5.907834
+                  },
+                  "ndjson_repeated_target": {
+                    "samples": 30,
+                    "p50_ms": 31.4263545,
+                    "p95_ms": 33.20375,
+                    "max_ms": 33.425333
+                  },
+                  "scoped_listing": {
+                    "samples": 30,
+                    "p50_ms": 483.99225,
+                    "p95_ms": 492.028334,
+                    "max_ms": 495.353
+                  },
+                  "concurrent_qualified_lookup": {
+                    "samples": 240,
+                    "p50_ms": 4.425791500000001,
+                    "p95_ms": 14.028416,
+                    "max_ms": 25.31825,
+                    "concurrency": 8,
+                    "elapsed_seconds": 0.186643208,
+                    "requests_per_second": 1285.87588357354
+                  },
+                  "table_rename": {
+                    "samples": 30,
+                    "p50_ms": 9.979937499999998,
+                    "p95_ms": 10.312542,
+                    "max_ms": 10.396
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "host_load": {
+          "compiler_active_at_start": true,
+          "compiler_active_at_end": true
+        }
+      }
+    },
+    "prefix": {
+      "before": {
+        "binary": "before",
+        "binary_sha256": "e35e00a0e903ab0e889f42bd34a7ac4430995ab67a932b49411ada49585a53f2",
+        "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+        "settings": {
+          "scenario": "resolution",
+          "deployment": "standalone",
+          "table_counts": [
+            10,
+            100
+          ],
+          "resolution_workload": "prefix",
+          "schema_fields": 0,
+          "mentions": [
+            10,
+            100
+          ],
+          "documents": 5,
+          "concurrency": 8,
+          "samples": 30,
+          "warmup": 2,
+          "ndjson_lines": 20,
+          "poll_ms": 20,
+          "readiness_timeout": 115
+        },
+        "scenarios": {
+          "resolution": {
+            "deployment": "3 metadata + 3 data nodes",
+            "startup_ms": 3862.177624832839,
+            "checkpoints": [
+              {
+                "mentions_per_document": 10,
+                "unique_entities": 10,
+                "workload": "prefix",
+                "seeded_entity_documents": 5,
+                "write_to_hydrated_graph": {
+                  "samples": 5,
+                  "p50_ms": 1001.4339159242809,
+                  "p95_ms": 1069.762208033353,
+                  "max_ms": 1069.762208033353
+                },
+                "readiness_poll_counts": [
+                  2,
+                  2,
+                  2,
+                  2,
+                  2
+                ],
+                "graph_topology_only": {
+                  "samples": 30,
+                  "p50_ms": 286.8598125,
+                  "p95_ms": 335.670041,
+                  "max_ms": 343.902375
+                },
+                "graph_with_documents": {
+                  "samples": 30,
+                  "p50_ms": 343.495188,
+                  "p95_ms": 413.805833,
+                  "max_ms": 443.937292
+                }
+              },
+              {
+                "mentions_per_document": 100,
+                "unique_entities": 10,
+                "workload": "prefix",
+                "seeded_entity_documents": 10,
+                "write_to_hydrated_graph": {
+                  "samples": 5,
+                  "p50_ms": 5870.4439592547715,
+                  "p95_ms": 5902.5666657835245,
+                  "max_ms": 5902.5666657835245
+                },
+                "readiness_poll_counts": [
+                  12,
+                  13,
+                  13,
+                  13,
+                  13
+                ],
+                "graph_topology_only": {
+                  "samples": 30,
+                  "p50_ms": 288.281167,
+                  "p95_ms": 369.968459,
+                  "max_ms": 420.699125
+                },
+                "graph_with_documents": {
+                  "samples": 30,
+                  "p50_ms": 388.6071875,
+                  "p95_ms": 490.826792,
+                  "max_ms": 538.6075
+                }
+              }
+            ]
+          }
+        },
+        "host_load": {
+          "compiler_active_at_start": true,
+          "compiler_active_at_end": true
+        }
+      },
+      "after": {
+        "binary": "after",
+        "binary_sha256": "033a1c20c8a3937ef21cf17d226ccc359a23a1e2343abfa78c9ca5ea1dbcc76c",
+        "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+        "settings": {
+          "scenario": "resolution",
+          "deployment": "standalone",
+          "table_counts": [
+            10,
+            100
+          ],
+          "resolution_workload": "prefix",
+          "schema_fields": 0,
+          "mentions": [
+            10,
+            100
+          ],
+          "documents": 5,
+          "concurrency": 8,
+          "samples": 30,
+          "warmup": 2,
+          "ndjson_lines": 20,
+          "poll_ms": 20,
+          "readiness_timeout": 115
+        },
+        "scenarios": {
+          "resolution": {
+            "deployment": "3 metadata + 3 data nodes",
+            "startup_ms": 3609.6727079711854,
+            "checkpoints": [
+              {
+                "mentions_per_document": 10,
+                "unique_entities": 10,
+                "workload": "prefix",
+                "seeded_entity_documents": 5,
+                "write_to_hydrated_graph": {
+                  "samples": 5,
+                  "p50_ms": 571.6065829619765,
+                  "p95_ms": 628.6566248163581,
+                  "max_ms": 628.6566248163581
+                },
+                "readiness_poll_counts": [
+                  1,
+                  1,
+                  1,
+                  1,
+                  1
+                ],
+                "graph_topology_only": {
+                  "samples": 30,
+                  "p50_ms": 285.359708,
+                  "p95_ms": 343.267375,
+                  "max_ms": 369.892875
+                },
+                "graph_with_documents": {
+                  "samples": 30,
+                  "p50_ms": 370.016104,
+                  "p95_ms": 472.12225,
+                  "max_ms": 473.371292
+                }
+              },
+              {
+                "mentions_per_document": 100,
+                "unique_entities": 10,
+                "workload": "prefix",
+                "seeded_entity_documents": 10,
+                "write_to_hydrated_graph": {
+                  "samples": 5,
+                  "p50_ms": 579.8266669735312,
+                  "p95_ms": 613.3991656824946,
+                  "max_ms": 613.3991656824946
+                },
+                "readiness_poll_counts": [
+                  1,
+                  1,
+                  1,
+                  1,
+                  1
+                ],
+                "graph_topology_only": {
+                  "samples": 30,
+                  "p50_ms": 308.26631199999997,
+                  "p95_ms": 369.899375,
+                  "max_ms": 385.71625
+                },
+                "graph_with_documents": {
+                  "samples": 30,
+                  "p50_ms": 376.184334,
+                  "p95_ms": 431.529458,
+                  "max_ms": 448.795041
+                }
+              }
+            ]
+          }
+        },
+        "host_load": {
+          "compiler_active_at_start": true,
+          "compiler_active_at_end": true
+        }
+      }
+    },
+    "redirects": {
+      "before": {
+        "binary": "before",
+        "binary_sha256": "e35e00a0e903ab0e889f42bd34a7ac4430995ab67a932b49411ada49585a53f2",
+        "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+        "settings": {
+          "scenario": "resolution",
+          "deployment": "standalone",
+          "table_counts": [
+            10,
+            100
+          ],
+          "resolution_workload": "redirects",
+          "schema_fields": 0,
+          "mentions": [
+            10,
+            100
+          ],
+          "documents": 5,
+          "concurrency": 8,
+          "samples": 30,
+          "warmup": 2,
+          "ndjson_lines": 20,
+          "poll_ms": 20,
+          "readiness_timeout": 115
+        },
+        "scenarios": {
+          "resolution": {
+            "deployment": "3 metadata + 3 data nodes",
+            "startup_ms": 3916.395124979317,
+            "checkpoints": [
+              {
+                "mentions_per_document": 10,
+                "unique_entities": 10,
+                "workload": "redirects",
+                "seeded_entity_documents": 20,
+                "write_to_hydrated_graph": {
+                  "samples": 5,
+                  "p50_ms": 913.8978333212435,
+                  "p95_ms": 1072.7755003608763,
+                  "max_ms": 1072.7755003608763
+                },
+                "readiness_poll_counts": [
+                  2,
+                  2,
+                  2,
+                  2,
+                  2
+                ],
+                "graph_topology_only": {
+                  "samples": 30,
+                  "p50_ms": 283.0119375,
+                  "p95_ms": 370.634084,
+                  "max_ms": 370.929959
+                },
+                "graph_with_documents": {
+                  "samples": 30,
+                  "p50_ms": 355.0768125,
+                  "p95_ms": 443.257083,
+                  "max_ms": 446.309709
+                }
+              },
+              {
+                "mentions_per_document": 100,
+                "unique_entities": 100,
+                "workload": "redirects",
+                "seeded_entity_documents": 200,
+                "write_to_hydrated_graph": {
+                  "samples": 5,
+                  "p50_ms": 5969.165957998484,
+                  "p95_ms": 6415.182875003666,
+                  "max_ms": 6415.182875003666
+                },
+                "readiness_poll_counts": [
+                  16,
+                  13,
+                  15,
+                  15,
+                  14
+                ],
+                "graph_topology_only": {
+                  "samples": 30,
+                  "p50_ms": 304.562896,
+                  "p95_ms": 361.253416,
+                  "max_ms": 381.834375
+                },
+                "graph_with_documents": {
+                  "samples": 30,
+                  "p50_ms": 340.926,
+                  "p95_ms": 419.85225,
+                  "max_ms": 445.017292
+                }
+              }
+            ]
+          }
+        },
+        "host_load": {
+          "compiler_active_at_start": true,
+          "compiler_active_at_end": true
+        }
+      },
+      "after": {
+        "binary": "after",
+        "binary_sha256": "033a1c20c8a3937ef21cf17d226ccc359a23a1e2343abfa78c9ca5ea1dbcc76c",
+        "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+        "settings": {
+          "scenario": "resolution",
+          "deployment": "standalone",
+          "table_counts": [
+            10,
+            100
+          ],
+          "resolution_workload": "redirects",
+          "schema_fields": 0,
+          "mentions": [
+            10,
+            100
+          ],
+          "documents": 5,
+          "concurrency": 8,
+          "samples": 30,
+          "warmup": 2,
+          "ndjson_lines": 20,
+          "poll_ms": 20,
+          "readiness_timeout": 115
+        },
+        "scenarios": {
+          "resolution": {
+            "deployment": "3 metadata + 3 data nodes",
+            "startup_ms": 3649.02479108423,
+            "checkpoints": [
+              {
+                "mentions_per_document": 10,
+                "unique_entities": 10,
+                "workload": "redirects",
+                "seeded_entity_documents": 20,
+                "write_to_hydrated_graph": {
+                  "samples": 5,
+                  "p50_ms": 461.3136248663068,
+                  "p95_ms": 589.5115830935538,
+                  "max_ms": 589.5115830935538
+                },
+                "readiness_poll_counts": [
+                  1,
+                  1,
+                  1,
+                  1,
+                  1
+                ],
+                "graph_topology_only": {
+                  "samples": 30,
+                  "p50_ms": 274.22110399999997,
+                  "p95_ms": 309.268709,
+                  "max_ms": 349.554041
+                },
+                "graph_with_documents": {
+                  "samples": 30,
+                  "p50_ms": 337.077979,
+                  "p95_ms": 447.983041,
+                  "max_ms": 463.716625
+                }
+              },
+              {
+                "mentions_per_document": 100,
+                "unique_entities": 100,
+                "workload": "redirects",
+                "seeded_entity_documents": 200,
+                "write_to_hydrated_graph": {
+                  "samples": 5,
+                  "p50_ms": 649.5072920806706,
+                  "p95_ms": 857.6887915842235,
+                  "max_ms": 857.6887915842235
+                },
+                "readiness_poll_counts": [
+                  1,
+                  1,
+                  1,
+                  1,
+                  1
+                ],
+                "graph_topology_only": {
+                  "samples": 30,
+                  "p50_ms": 284.2051455,
+                  "p95_ms": 345.781,
+                  "max_ms": 399.554083
+                },
+                "graph_with_documents": {
+                  "samples": 30,
+                  "p50_ms": 387.31372899999997,
+                  "p95_ms": 449.174208,
+                  "max_ms": 467.029042
+                }
+              }
+            ]
+          }
+        },
+        "host_load": {
+          "compiler_active_at_start": true,
+          "compiler_active_at_end": true
+        }
+      }
+    },
+    "cluster": {
+      "before": {
+        "binary": "before",
+        "binary_sha256": "e35e00a0e903ab0e889f42bd34a7ac4430995ab67a932b49411ada49585a53f2",
+        "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+        "settings": {
+          "scenario": "catalog",
+          "deployment": "cluster",
+          "table_counts": [
+            10,
+            100
+          ],
+          "resolution_workload": "exact",
+          "schema_fields": 0,
+          "mentions": [
+            10,
+            100
+          ],
+          "documents": 5,
+          "concurrency": 8,
+          "samples": 10,
+          "warmup": 2,
+          "ndjson_lines": 20,
+          "poll_ms": 20,
+          "readiness_timeout": 115
+        },
+        "scenarios": {
+          "catalog": {
+            "deployment": "cluster",
+            "startup_ms": 3263.293707743287,
+            "checkpoints": [
+              {
+                "table_count": 10,
+                "table_create": {
+                  "samples": 10,
+                  "p50_ms": 84.06706299999999,
+                  "p95_ms": 112.849875,
+                  "max_ms": 112.849875
+                },
+                "shard_readiness": {
+                  "samples": 10,
+                  "p50_ms": 821.7951254919171,
+                  "p95_ms": 1262.6874167472124,
+                  "max_ms": 1262.6874167472124
+                },
+                "operations": {
+                  "qualified_lookup": {
+                    "samples": 10,
+                    "p50_ms": 48.407666500000005,
+                    "p95_ms": 56.330959,
+                    "max_ms": 56.330959
+                  },
+                  "qualified_query": {
+                    "samples": 10,
+                    "p50_ms": 53.043937,
+                    "p95_ms": 59.177333,
+                    "max_ms": 59.177333
+                  },
+                  "qualified_join": {
+                    "samples": 10,
+                    "p50_ms": 57.672542,
+                    "p95_ms": 78.523291,
+                    "max_ms": 78.523291
+                  },
+                  "ndjson_repeated_target": {
+                    "samples": 10,
+                    "p50_ms": 542.1120415,
+                    "p95_ms": 556.835458,
+                    "max_ms": 556.835458
+                  },
+                  "scoped_listing": {
+                    "samples": 10,
+                    "p50_ms": 24.9409165,
+                    "p95_ms": 32.186959,
+                    "max_ms": 32.186959
+                  },
+                  "concurrent_qualified_lookup": {
+                    "samples": 80,
+                    "p50_ms": 52.390917,
+                    "p95_ms": 83.442625,
+                    "max_ms": 152.631959,
+                    "concurrency": 8,
+                    "elapsed_seconds": 0.597943,
+                    "requests_per_second": 133.79201696482775
+                  },
+                  "table_rename": {
+                    "samples": 10,
+                    "p50_ms": 34.3824795,
+                    "p95_ms": 52.405333,
+                    "max_ms": 52.405333
+                  }
+                }
+              },
+              {
+                "table_count": 100,
+                "table_create": {
+                  "samples": 90,
+                  "p50_ms": 112.1885,
+                  "p95_ms": 613.395083,
+                  "max_ms": 1325.095917
+                },
+                "shard_readiness": {
+                  "samples": 90,
+                  "p50_ms": 833.3861459977925,
+                  "p95_ms": 2182.193750049919,
+                  "max_ms": 3906.7575000226498
+                },
+                "operations": {
+                  "qualified_lookup": {
+                    "samples": 10,
+                    "p50_ms": 54.270688,
+                    "p95_ms": 704.132958,
+                    "max_ms": 704.132958
+                  },
+                  "qualified_query": {
+                    "samples": 10,
+                    "p50_ms": 37.724875,
+                    "p95_ms": 55.516625,
+                    "max_ms": 55.516625
+                  },
+                  "qualified_join": {
+                    "samples": 10,
+                    "p50_ms": 56.234104,
+                    "p95_ms": 554.499708,
+                    "max_ms": 554.499708
+                  },
+                  "ndjson_repeated_target": {
+                    "samples": 10,
+                    "p50_ms": 623.8498119999999,
+                    "p95_ms": 1273.912042,
+                    "max_ms": 1273.912042
+                  },
+                  "scoped_listing": {
+                    "samples": 10,
+                    "p50_ms": 73.616146,
+                    "p95_ms": 918.206292,
+                    "max_ms": 918.206292
+                  },
+                  "concurrent_qualified_lookup": {
+                    "samples": 80,
+                    "p50_ms": 53.325833,
+                    "p95_ms": 156.819833,
+                    "max_ms": 554.161875,
+                    "concurrency": 8,
+                    "elapsed_seconds": 1.127593,
+                    "requests_per_second": 70.9475848111863
+                  },
+                  "table_rename": {
+                    "samples": 10,
+                    "p50_ms": 381.967625,
+                    "p95_ms": 635.12575,
+                    "max_ms": 635.12575
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "host_load": {
+          "compiler_active_at_start": true,
+          "compiler_active_at_end": true
+        }
+      },
+      "after": {
+        "binary": "after",
+        "binary_sha256": "033a1c20c8a3937ef21cf17d226ccc359a23a1e2343abfa78c9ca5ea1dbcc76c",
+        "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+        "settings": {
+          "scenario": "catalog",
+          "deployment": "cluster",
+          "table_counts": [
+            10
+          ],
+          "resolution_workload": "exact",
+          "schema_fields": 0,
+          "mentions": [
+            10,
+            100
+          ],
+          "documents": 5,
+          "concurrency": 8,
+          "samples": 10,
+          "warmup": 2,
+          "ndjson_lines": 20,
+          "poll_ms": 20,
+          "readiness_timeout": 115
+        },
+        "scenarios": {
+          "catalog": {
+            "deployment": "cluster",
+            "startup_ms": 3704.9598754383624,
+            "checkpoints": [
+              {
+                "table_count": 10,
+                "table_create": {
+                  "samples": 10,
+                  "p50_ms": 68.3546255,
+                  "p95_ms": 96.797875,
+                  "max_ms": 96.797875
+                },
+                "shard_readiness": {
+                  "samples": 10,
+                  "p50_ms": 953.0599173158407,
+                  "p95_ms": 1197.6204169914126,
+                  "max_ms": 1197.6204169914126
+                },
+                "operations": {
+                  "qualified_lookup": {
+                    "samples": 10,
+                    "p50_ms": 28.1709585,
+                    "p95_ms": 52.538375,
+                    "max_ms": 52.538375
+                  },
+                  "qualified_query": {
+                    "samples": 10,
+                    "p50_ms": 51.846125,
+                    "p95_ms": 61.056083,
+                    "max_ms": 61.056083
+                  },
+                  "qualified_join": {
+                    "samples": 10,
+                    "p50_ms": 80.3187495,
+                    "p95_ms": 112.182,
+                    "max_ms": 112.182
+                  },
+                  "ndjson_repeated_target": {
+                    "samples": 10,
+                    "p50_ms": 672.081375,
+                    "p95_ms": 833.282875,
+                    "max_ms": 833.282875
+                  },
+                  "scoped_listing": {
+                    "samples": 10,
+                    "p50_ms": 24.3258955,
+                    "p95_ms": 38.317709,
+                    "max_ms": 38.317709
+                  },
+                  "concurrent_qualified_lookup": {
+                    "samples": 80,
+                    "p50_ms": 49.5753955,
+                    "p95_ms": 76.451917,
+                    "max_ms": 125.4645,
+                    "concurrency": 8,
+                    "elapsed_seconds": 0.49943475,
+                    "requests_per_second": 160.18108471627176
+                  },
+                  "table_rename": {
+                    "samples": 10,
+                    "p50_ms": 30.524729,
+                    "p95_ms": 46.614458,
+                    "max_ms": 46.614458
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "host_load": {
+          "compiler_activity_observed_during_run": true
+        }
+      }
+    }
+  }
+}

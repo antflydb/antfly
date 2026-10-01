@@ -75,6 +75,7 @@ pub const Config = struct {
     admission: AdmissionConfig = .{},
     graph_execution: graph_work_budget.Limits = .{},
     mcp: McpConfig = .{},
+    pgwire: ?PgwireConfig = null,
     backup: BackupConfig = .{},
     metadata: MetadataConfig = .{},
     storage: StorageConfig = .{},
@@ -100,6 +101,14 @@ pub const Config = struct {
     pub const McpConfig = struct {
         /// Zero disables the serialized MCP tool-result compatibility guard.
         max_tool_result_bytes: u32 = default_mcp_max_tool_result_bytes,
+    };
+
+    pub const PgwireConfig = struct {
+        enabled: bool = false,
+        bind_host: ?[]const u8 = null,
+        bind_port: u16 = 5432,
+        max_connections: u16 = 32,
+        externally_protected_transport: bool = false,
     };
 
     pub const BackupConfig = struct {
@@ -353,6 +362,22 @@ pub const Config = struct {
         kernel_jit: KernelJitConfig = .{},
         prompt_cache: PromptCacheConfig = .{},
         keep_alive: ?[]u8 = null,
+        // `keep_alive_ms` is not part of the shared openapi inference schema
+        // (only the `keep_alive` duration string is); it exists solely so
+        // `antfly inference run`'s config loader (parseRunConfig in
+        // inference_runtime/runtime.zig) can accept the operator's flat
+        // integer-millisecond spelling. Never populated by the generic
+        // `Config.parseFromSlice` openapi path.
+        keep_alive_ms: ?u64 = null,
+        // True only when `antfly inference run`'s merged config (nested
+        // `inference.prompt_cache` or the operator's flat top-level
+        // `prompt_cache`) explicitly set a `prompt_cache` object.
+        // `PromptCacheConfig.enabled` defaults to false once that object is
+        // present, but the run server's own built-in default is enabled=true;
+        // this flag lets callers keep that default when the key is absent
+        // entirely. Never populated by the generic `Config.parseFromSlice`
+        // openapi path.
+        prompt_cache_configured: bool = false,
         max_loaded_models: ?i64 = null,
 
         fn deinit(self: *InferenceConfig, alloc: std.mem.Allocator) void {
@@ -375,6 +400,7 @@ pub const Config = struct {
 
     pub const CorsConfig = struct {
         enabled: ?bool = null,
+        /// Omitted or empty origins deny cross-origin access; "*" is explicit opt-in.
         allowed_origins: ?[]const []u8 = null,
         allowed_methods: ?[]const []u8 = null,
         allowed_headers: ?[]const []u8 = null,
@@ -689,6 +715,11 @@ pub const Config = struct {
             else => return error.InvalidConfig,
         };
 
+        if (raw_root.get("secrets")) |value| {
+            var secret_config = try secrets.parseConfig(alloc, value);
+            secret_config.deinit();
+        }
+
         var parsed_tree = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{
             .allocate = .alloc_always,
         });
@@ -814,7 +845,32 @@ pub const Config = struct {
         else
             Config.InferenceConfig.KernelJitConfig{};
         errdefer kernel_jit.deinit(alloc);
+        var pgwire: ?PgwireConfig = null;
+        if (root.get("pgwire")) |value| {
+            try validateObjectMemberFields(root, "pgwire", &.{ "enabled", "bind_host", "bind_port", "max_connections", "externally_protected_transport" });
+            const object = switch (value) {
+                .object => |object| object,
+                else => return error.InvalidConfig,
+            };
+            const port = try optionalU32Field(object, "bind_port") orelse 5432;
+            const connections_count = try optionalU32Field(object, "max_connections") orelse 32;
+            if (port == 0 or port > 65535 or connections_count == 0 or connections_count > 65535) return error.InvalidConfig;
+            const host = if (object.get("bind_host")) |host| switch (host) {
+                .string => |string| string,
+                else => return error.InvalidConfig,
+            } else null;
+            if (host) |name| if (name.len == 0 or name.len > 253) return error.InvalidConfig;
+            pgwire = .{
+                .enabled = try optionalBoolField(object, "enabled") orelse false,
+                .bind_port = @intCast(port),
+                .max_connections = @intCast(connections_count),
+                .externally_protected_transport = try optionalBoolField(object, "externally_protected_transport") orelse false,
+                .bind_host = if (host) |name| try alloc.dupe(u8, name) else null,
+            };
+        }
+        errdefer if (pgwire) |wire| if (wire.bind_host) |host| alloc.free(host);
         return .{
+            .pgwire = pgwire,
             .registry = registry,
             .transcribers = transcribers,
             .readers = reader_registry,
@@ -1096,6 +1152,7 @@ pub const Config = struct {
     }
 
     pub fn deinit(self: *Config) void {
+        if (self.pgwire) |wire| if (wire.bind_host) |host| self.registry.allocator.free(host);
         if (self.tls) |*tls| tls.deinit(self.registry.allocator);
         if (self.cors) |*cors| cors.deinit(self.registry.allocator);
         self.metadata.deinit(self.registry.allocator);
@@ -2260,6 +2317,8 @@ pub fn parseInferencePreloadModels(
             .object => |entry| entry,
             else => return error.InvalidConfig,
         };
+        if (!objectContainsOnly(model_object, &.{ "kind", "name", "backend", "format", "quantization", "residency_mode", "memory_budget_mb" }))
+            return error.InvalidConfig;
         // Include the partially parsed entry in error cleanup as soon as any
         // owned fields can be allocated (e.g. a missing name after kind).
         out[i] = .{ .kind = &.{}, .name = &.{} };
@@ -2358,6 +2417,8 @@ const SecretResolutionContext = enum {
     connections,
     connection,
     external_io,
+    inference_connection,
+    inference_root,
     normal,
 };
 
@@ -2381,15 +2442,25 @@ fn resolveSecretReferencesInValue(
         .object => |*obj| {
             var it = obj.iterator();
             while (it.next()) |entry| {
+                // These subtrees are parsed from raw configuration and resolve
+                // operational credentials at use time, after native startup.
+                if (context == .config_root) {
+                    const key = entry.key_ptr.*;
+                    if (std.mem.eql(u8, key, "secrets") or std.mem.eql(u8, key, "generators") or
+                        std.mem.eql(u8, key, "embedders") or std.mem.eql(u8, key, "rerankers") or
+                        std.mem.eql(u8, key, "remote_content")) continue;
+                }
                 // External-I/O credentials are operational secrets: retain
                 // references in the immutable node config and resolve them at
                 // each backup, restore, or probe. This makes rotation effective
                 // without weakening bucket/prefix authorization. Other config
                 // secrets keep their established startup-resolution behavior.
                 const child_context: SecretResolutionContext = switch (context) {
-                    .config_root => if (std.mem.eql(u8, entry.key_ptr.*, "connections")) .connections else .normal,
+                    .config_root => if (std.mem.eql(u8, entry.key_ptr.*, "connections")) .connections else if (std.mem.eql(u8, entry.key_ptr.*, "inference")) .inference_root else .normal,
                     .connections => .connection,
-                    .connection => if (std.mem.eql(u8, entry.key_ptr.*, "external_io")) .external_io else .normal,
+                    .connection => if (std.mem.eql(u8, entry.key_ptr.*, "external_io")) .external_io else if (std.mem.eql(u8, entry.key_ptr.*, "inference") or std.mem.eql(u8, entry.key_ptr.*, "web_search")) .inference_connection else .normal,
+                    .inference_connection => if (std.mem.eql(u8, entry.key_ptr.*, "api_key")) continue else .normal,
+                    .inference_root => if (std.mem.eql(u8, entry.key_ptr.*, "api_key") or std.mem.eql(u8, entry.key_ptr.*, "s3_credentials")) continue else .normal,
                     .external_io => if (std.mem.eql(u8, entry.key_ptr.*, "credentials")) continue else .normal,
                     .normal => .normal,
                 };
@@ -2636,6 +2707,24 @@ test "common config parses inference preload" {
     try std.testing.expectEqualStrings("BAAI/bge-reranker", cfg.inference.preload[1].name);
     try std.testing.expectEqualStrings("native", cfg.inference.preload[1].backend.?);
     try std.testing.expectEqualStrings("onnx", cfg.inference.preload[1].format.?);
+}
+
+test "common config rejects model-specific and unknown preload tuning fields" {
+    const fields = .{
+        .{ "load_strategy", "\"pipeline\"" },
+        .{ "load_workers", "6" },
+        .{ "load_staging_mb", "384" },
+        .{ "prepared_pack", "\"required\"" },
+        .{ "drop_host_cache_after_load", "true" },
+        .{ "startup_strategy", "\"prefetch\"" },
+        .{ "prepared_pak", "\"required\"" },
+    };
+    inline for (fields) |field| {
+        try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(
+            std.testing.allocator,
+            "{\"inference\":{\"preload\":[{\"kind\":\"generator\",\"name\":\"gemma-a4b\",\"" ++ field[0] ++ "\":" ++ field[1] ++ "}]}}",
+        ));
+    }
 }
 
 test "common config rejects invalid prompt cache policy" {
@@ -3608,6 +3697,24 @@ test "common config parses the hot_standby section and the deprecated ha alias" 
     try std.testing.expectEqual(@as(u64, 2), both.ha.?.cluster_id.?);
 }
 
+test "common config parses bounded pgwire listener policy" {
+    var config = try Config.parseFromSlice(std.testing.allocator,
+        \\{"pgwire":{"enabled":true,"bind_host":"127.0.0.1","bind_port":15432,"max_connections":8}}
+    );
+    defer config.deinit();
+    try std.testing.expect(config.pgwire.?.enabled);
+    try std.testing.expectEqualStrings("127.0.0.1", config.pgwire.?.bind_host.?);
+    try std.testing.expectEqual(@as(u16, 15432), config.pgwire.?.bind_port);
+    try std.testing.expect(!config.pgwire.?.externally_protected_transport);
+    for ([_][]const u8{
+        \\{"pgwire":{"max_connections":0}}
+        ,
+        \\{"pgwire":{"bind_port":65536}}
+        ,
+        \\{"pgwire":{"allow_insecure":true}}
+    }) |raw| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator, raw));
+}
+
 test "common config parses bounded transaction session policy" {
     const alloc = std.testing.allocator;
     var cfg = try Config.parseFromSlice(alloc,
@@ -3645,4 +3752,36 @@ test "common config applies standalone shard defaults when standalone mode is se
     try std.testing.expectEqual(@as(u64, default_max_shard_size_bytes), cfg.shard_allocation.max_shard_size_bytes);
     try std.testing.expectEqual(@as(u32, default_max_shards_per_table), cfg.shard_allocation.max_shards_per_table);
     try std.testing.expect(cfg.shard_allocation.disable_shard_alloc);
+}
+
+test "common config bootstraps named secret sources before resolving credentials" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(dir);
+    const secret_path = try std.fmt.allocPrint(alloc, "{s}/secrets.json", .{dir});
+    defer alloc.free(secret_path);
+    const config_path = try std.fmt.allocPrint(alloc, "{s}/config.json", .{dir});
+    defer alloc.free(config_path);
+    try tmp.dir.writeFile(io, .{ .sub_path = "secrets.json", .data = "{\"secrets\":[{\"key\":\"test.key\",\"value\":\"credential\"}]}" });
+    const raw = try std.fmt.allocPrint(alloc,
+        \\{{"secrets":{{"sources":[{{"name":"platform","type":"file","path":"{s}"}}],"environment":false}},
+        \\"connections":{{"test":{{"kind":"inference","capabilities":["models.generate"],"inference":{{"provider":"openai","api_key":"${{secret:test.key}}"}}}}}}}}
+    , .{secret_path});
+    defer alloc.free(raw);
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = raw });
+    var store = (try secrets.initFromConfigPathWithIo(alloc, io, config_path, &.{})).?;
+    defer store.deinit();
+    var cfg = try loadFromPathWithSecretsForDeploymentWithIo(alloc, io, config_path, &store, .standalone);
+    defer cfg.deinit();
+    try std.testing.expect(!store.writable);
+    try std.testing.expect(!store.environment_enabled);
+    const resolved = (try store.getOwned(alloc, "test.key")).?;
+    defer alloc.free(resolved);
+    try std.testing.expectEqualStrings("credential", resolved);
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc, "{\"secrets\":{\"environment\":\"false\"}}"));
 }

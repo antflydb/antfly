@@ -128,6 +128,10 @@ pub const Builder = struct {
         return self.unaryOp(.sqrt, input);
     }
 
+    pub fn stopGradient(self: *Builder, input: NodeId) !NodeId {
+        return self.unaryOp(.stop_gradient, input);
+    }
+
     pub fn rsqrt(self: *Builder, input: NodeId) !NodeId {
         return self.unaryOp(.rsqrt, input);
     }
@@ -300,48 +304,48 @@ pub const Builder = struct {
 
     // ── Primitive Contraction ──────────────────────────────────────────
 
-    /// Standard 2D matmul: [M, K] x [K, N] -> [M, N]
+    /// Standard 2D matmul: [M, K] x [K, N] -> [M, N].
     pub fn matmul(self: *Builder, a: NodeId, b: NodeId) !NodeId {
-        const a_shape = self.graph.node(a).output_shape;
-        const b_shape = self.graph.node(b).output_shape;
-        const out_shape = Shape.init(a_shape.dtype, &.{
-            a_shape.dim(0),
-            b_shape.dim(1),
-        });
-        return self.graph.addNode(.{
-            .op = .{ .dot_general = .{
-                .lhs_contracting = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
-                .rhs_contracting = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
-                .num_contracting = 1,
-            } },
-            .output_shape = out_shape,
-            .inputs = .{ a, b, null_node, null_node },
-            .num_inputs = 2,
-        });
+        return self.matmul2DLayout(a, b, false, false);
     }
 
-    /// Batched matmul with a single leading batch dimension:
-    ///   [B, M, K] x [B, K, N] -> [B, M, N].
-    /// Both inputs must be 3-D and share the same batch dim. Used by
-    /// decomposed multi-head attention (Q @ K^T, probs @ V).
+    /// Dense contraction retaining either operand's physical storage.
+    pub fn matmul2DLayout(self: *Builder, a: NodeId, b: NodeId, lhs_transposed: bool, rhs_transposed: bool) !NodeId {
+        return self.matmulLayout(a, b, 2, lhs_transposed, rhs_transposed);
+    }
+
+    /// [B, M, K] x [B, K, N] -> [B, M, N], with a shared leading batch.
     pub fn matmul3D(self: *Builder, a: NodeId, b: NodeId) !NodeId {
+        return self.matmul3DLayout(a, b, false, false);
+    }
+
+    /// [B, M, K] x [B, N, K]^T -> [B, M, N], retaining RHS storage.
+    pub fn matmul3DTransB(self: *Builder, a: NodeId, b: NodeId) !NodeId {
+        return self.matmul3DLayout(a, b, false, true);
+    }
+
+    /// Batched contraction retaining either operand's physical storage.
+    pub fn matmul3DLayout(self: *Builder, a: NodeId, b: NodeId, lhs_transposed: bool, rhs_transposed: bool) !NodeId {
+        return self.matmulLayout(a, b, 3, lhs_transposed, rhs_transposed);
+    }
+
+    fn matmulLayout(self: *Builder, a: NodeId, b: NodeId, comptime rank: u8, lhs_transposed: bool, rhs_transposed: bool) !NodeId {
         const a_shape = self.graph.node(a).output_shape;
         const b_shape = self.graph.node(b).output_shape;
-        const out_shape = Shape.init(a_shape.dtype, &.{
-            a_shape.dim(0),
-            a_shape.dim(1),
-            b_shape.dim(2),
-        });
+        const lc: u8 = if (lhs_transposed) rank - 2 else rank - 1;
+        const rc: u8 = if (rhs_transposed) rank - 1 else rank - 2;
+        var dimensions: [rank]i64 = undefined;
+        if (rank == 3) dimensions[0] = a_shape.dim(0);
+        dimensions[rank - 2] = a_shape.dim(if (lhs_transposed) rank - 1 else rank - 2);
+        dimensions[rank - 1] = b_shape.dim(if (rhs_transposed) rank - 2 else rank - 1);
         return self.graph.addNode(.{
             .op = .{ .dot_general = .{
-                .lhs_contracting = .{ 2, 0, 0, 0, 0, 0, 0, 0 },
-                .rhs_contracting = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
-                .lhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
-                .rhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+                .lhs_contracting = .{ lc, 0, 0, 0, 0, 0, 0, 0 },
+                .rhs_contracting = .{ rc, 0, 0, 0, 0, 0, 0, 0 },
                 .num_contracting = 1,
-                .num_batch = 1,
+                .num_batch = if (rank == 3) 1 else 0,
             } },
-            .output_shape = out_shape,
+            .output_shape = Shape.init(a_shape.dtype, &dimensions),
             .inputs = .{ a, b, null_node, null_node },
             .num_inputs = 2,
         });
@@ -414,9 +418,10 @@ pub const Builder = struct {
             try self.reshape(input, Shape.init(input_shape.dtype, &.{ @intCast(rows), @intCast(in_dim) }))
         else
             input;
-        // Build decomposed subgraph: transpose(W) -> matmul -> add bias
-        const wt = try self.transpose(weight, &.{ 1, 0 });
-        const mm = try self.matmul(matmul_input, wt);
+        // W is stored as [out, in]. Contract its last axis directly instead
+        // of materializing W^T; device backends can consume this layout as a
+        // native linear and large frozen BF16 weights remain zero-copy.
+        const mm = try self.linearDotNoWeightTranspose(matmul_input, weight, rows, out_dim);
         const decomposed = try self.add(mm, bias);
 
         // Emit fused node
@@ -441,9 +446,7 @@ pub const Builder = struct {
             try self.reshape(input, Shape.init(input_shape.dtype, &.{ @intCast(rows), @intCast(in_dim) }))
         else
             input;
-        // Decomposed
-        const wt = try self.transpose(weight, &.{ 1, 0 });
-        const decomposed = try self.matmul(matmul_input, wt);
+        const decomposed = try self.linearDotNoWeightTranspose(matmul_input, weight, rows, out_dim);
 
         const out_shape = Shape.init(
             input_shape.dtype,
@@ -457,6 +460,29 @@ pub const Builder = struct {
             .vjp_alternate = decomposed,
         });
         return fused;
+    }
+
+    fn linearDotNoWeightTranspose(
+        self: *Builder,
+        input: NodeId,
+        weight: NodeId,
+        rows: u32,
+        out_dim: u32,
+    ) !NodeId {
+        return self.graph.addNode(.{
+            .op = .{ .dot_general = .{
+                .lhs_contracting = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
+                .rhs_contracting = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
+                .num_contracting = 1,
+                .num_batch = 0,
+            } },
+            .output_shape = Shape.init(
+                self.graph.node(input).output_shape.dtype,
+                &.{ @intCast(rows), @intCast(out_dim) },
+            ),
+            .inputs = .{ input, weight, null_node, null_node },
+            .num_inputs = 2,
+        });
     }
 
     /// Fused RMS normalization: x * rsqrt(mean(x^2) + eps) * weight.
@@ -531,6 +557,22 @@ pub const Builder = struct {
             .vjp_alternate = decomposed,
         });
         return fused;
+    }
+
+    /// Inclusive scan retaining the reference physical layout.
+    pub fn prefixScanV1(self: *Builder, input: NodeId, attrs: node_mod.PrefixScanAttrs) !NodeId {
+        const shape = try attrs.shape();
+        if (input >= self.graph.nodeCount() or !self.graph.node(input).output_shape.eq(shape)) return error.InvalidPrefixScanShape;
+        return self.graph.addNode(.{ .op = .{ .fused_prefix_scan_v1 = attrs }, .output_shape = shape, .inputs = .{ input, null_node, null_node, null_node }, .num_inputs = 1 });
+    }
+
+    /// CUDA reference features for externally selected, frozen span geometry.
+    /// Both inputs are metadata: their derivatives are intentionally zero.
+    pub fn frozenSpanFeaturesV1(self: *Builder, lengths: NodeId, counts: NodeId, attrs: node_mod.FrozenSpanFeaturesAttrs) !NodeId {
+        if (lengths >= self.graph.nodeCount() or counts >= self.graph.nodeCount()) return error.InvalidFrozenSpanFeaturesShape;
+        const shape = try attrs.shape();
+        try attrs.validate(shape, self.graph.node(lengths).output_shape, self.graph.node(counts).output_shape);
+        return self.graph.addNode(.{ .op = .{ .frozen_span_features_v1 = attrs }, .output_shape = shape, .inputs = .{ lengths, counts, null_node, null_node }, .num_inputs = 2 });
     }
 
     /// Fused SiLU/Swish activation: x * sigmoid(x).
@@ -698,6 +740,121 @@ pub const Builder = struct {
             .output_shape = out_shape,
             .inputs = .{ logits, labels, mask, null_node },
             .num_inputs = 3,
+            .vjp_alternate = null_node,
+        });
+    }
+
+    /// Project one hidden row through exactly two dynamically selected rows
+    /// of a frozen tied LM head. Backends must use the same resident precision
+    /// contract as their full vocabulary projection; the result is two raw
+    /// logits and the custom VJP returns d_hidden only.
+    pub fn selectedTiedHeadLogits(
+        self: *Builder,
+        hidden: NodeId,
+        weight: NodeId,
+        token_ids: NodeId,
+        attrs: node_mod.SelectedTiedHeadAttrs,
+    ) !NodeId {
+        if (!attrs.frozen_weight) return error.SelectedTiedHeadRequiresFrozenWeight;
+        const hidden_shape = self.graph.node(hidden).output_shape;
+        const weight_shape = self.graph.node(weight).output_shape;
+        const ids_shape = self.graph.node(token_ids).output_shape;
+        if (hidden_shape.rank() != 2 or weight_shape.rank() != 2 or ids_shape.rank() != 1) return error.ShapeMismatch;
+        if (hidden_shape.dtype != .f32 or weight_shape.dtype != .f32 or ids_shape.dtype != .f32) return error.DTypeMismatch;
+        if (hidden_shape.dim(0) != 1 or ids_shape.dim(0) != 2 or
+            hidden_shape.dim(1) <= 0 or weight_shape.dim(0) <= 0 or
+            hidden_shape.dim(1) != weight_shape.dim(1))
+        {
+            return error.ShapeMismatch;
+        }
+        const in_dim = std.math.cast(u32, hidden_shape.dim(1)) orelse return error.ShapeMismatch;
+        const vocab_size = std.math.cast(u32, weight_shape.dim(0)) orelse return error.ShapeMismatch;
+        if (attrs.in_dim != in_dim or attrs.vocab_size != vocab_size) return error.ShapeMismatch;
+
+        return self.graph.addNode(.{
+            .op = .{ .fused_selected_tied_head_logits = attrs },
+            .output_shape = Shape.init(.f32, &.{ 1, 2 }),
+            .inputs = .{ hidden, weight, token_ids, null_node },
+            .num_inputs = 3,
+            .vjp_alternate = null_node,
+        });
+    }
+
+    /// Saved forward state remains a normal graph value; consumers slice its
+    /// attended prefix and the strict VJP reuses the normalization suffix.
+    pub fn boundaryTrainingAttentionV1(self: *Builder, qkv: NodeId, mask: NodeId, attrs: node_mod.BoundaryTrainingAttentionAttrs) !NodeId {
+        const layout = try attrs.layout();
+        for ([_]NodeId{ qkv, mask }) |id|
+            if (id == null_node or id >= self.graph.nodes.items.len) return error.InvalidGraphDependency;
+        if (!self.graph.node(qkv).output_shape.eq(layout.qkvShape()) or !self.graph.node(mask).output_shape.eq(attrs.maskShape()))
+            return error.InvalidBoundaryTrainingAttentionShape;
+        return self.graph.addNode(.{ .op = .{ .fused_boundary_training_attention_v1 = attrs }, .output_shape = layout.savedShape(), .inputs = .{ qkv, mask, null_node, null_node }, .num_inputs = 2 });
+    }
+
+    /// ModernBERT training attention over packed [Q;K;V] rows; see
+    /// `ModernBertTrainingAttentionAttrs`. The i32 control is nondifferentiable.
+    pub fn modernBertTrainingAttentionV1(self: *Builder, qkv: NodeId, control: NodeId, attrs: node_mod.ModernBertTrainingAttentionAttrs) !NodeId {
+        const layout = try attrs.layout();
+        for ([_]NodeId{ qkv, control }) |id|
+            if (id == null_node or id >= self.graph.nodes.items.len) return error.InvalidGraphDependency;
+        if (!self.graph.node(qkv).output_shape.eq(layout.qkvShape()) or !self.graph.node(control).output_shape.eq(layout.controlShape()))
+            return error.InvalidModernBertTrainingAttentionShape;
+        return self.graph.addNode(.{
+            .op = .{ .fused_modernbert_training_attention_v1 = attrs },
+            .output_shape = layout.outputShape(),
+            .inputs = .{ qkv, control, null_node, null_node },
+            .num_inputs = 2,
+            .vjp_alternate = null_node,
+        });
+    }
+
+    /// Training-only tiled/replay attention. Integer control is immutable and
+    /// nondifferentiable; its physical storage must remain i32 on all backends.
+    pub fn debertaTrainingAttentionV1(
+        self: *Builder,
+        qkv: NodeId,
+        relative: NodeId,
+        control: NodeId,
+        attrs: node_mod.DebertaTrainingAttentionAttrs,
+    ) !NodeId {
+        const layout = try attrs.layout();
+        for ([_]NodeId{ qkv, relative, control }) |id|
+            if (id == null_node or id >= self.graph.nodes.items.len) return error.InvalidGraphDependency;
+        if (!self.graph.node(qkv).output_shape.eq(layout.qkvShape()) or
+            !self.graph.node(relative).output_shape.eq(layout.relativeShape()) or
+            !self.graph.node(control).output_shape.eq(layout.controlShape()))
+            return error.InvalidDebertaTrainingAttentionShape;
+        return self.graph.addNode(.{
+            .op = .{ .fused_deberta_training_attention_v1 = attrs },
+            .output_shape = layout.outputShape(),
+            .inputs = .{ qkv, relative, control, null_node },
+            .num_inputs = 3,
+            .vjp_alternate = null_node,
+        });
+    }
+
+    /// Training-only tiled/replay segment attention (global, sliding-window
+    /// local, and tree-packed layers all reduce to this via `ranges`+
+    /// `window`; see `SegmentTrainingAttentionAttrs`). `control` is
+    /// immutable and nondifferentiable; its physical storage must remain
+    /// i32 on all backends.
+    pub fn segmentTrainingAttentionV1(
+        self: *Builder,
+        qkv: NodeId,
+        control: NodeId,
+        attrs: node_mod.SegmentTrainingAttentionAttrs,
+    ) !NodeId {
+        const layout = try attrs.layout();
+        for ([_]NodeId{ qkv, control }) |id|
+            if (id == null_node or id >= self.graph.nodes.items.len) return error.InvalidGraphDependency;
+        if (!self.graph.node(qkv).output_shape.eq(layout.qkvShape()) or
+            !self.graph.node(control).output_shape.eq(layout.controlShape()))
+            return error.InvalidSegmentTrainingAttentionShape;
+        return self.graph.addNode(.{
+            .op = .{ .fused_segment_training_attention_v1 = attrs },
+            .output_shape = layout.outputShape(),
+            .inputs = .{ qkv, control, null_node, null_node },
+            .num_inputs = 2,
             .vjp_alternate = null_node,
         });
     }
@@ -985,8 +1142,7 @@ pub const Builder = struct {
     // ── Sigmoid (composed) ─────────────────────────────────────────────
     //
     // Same pattern silu uses internally: sigmoid(x) = 1 / (1 + exp(-x)).
-    // No fused IR node, so we just emit the decomposition; CSE in the
-    // pipeline can fuse later if it's worth it.
+    // Keep the default decomposition for existing backend profiles.
 
     pub fn sigmoid(self: *Builder, x: NodeId) !NodeId {
         const dtype = self.graph.node(x).output_shape.dtype;
@@ -995,6 +1151,20 @@ pub const Builder = struct {
         const exp_neg = try self.expOp(neg_x);
         const denom = try self.add(one, exp_neg);
         return self.div(one, denom);
+    }
+
+    /// Explicit FP32 sigmoid with a saved-output VJP. Requires backend support
+    /// for fused_sigmoid_backward; default sigmoid graphs remain decomposed.
+    pub fn sigmoidRetained(self: *Builder, x: NodeId) !NodeId {
+        if (x >= self.graph.nodeCount()) return error.InvalidSigmoidShape;
+        const shape = self.graph.node(x).output_shape;
+        if (shape.dtype != .f32) return error.InvalidSigmoidShape;
+        return self.graph.addNode(.{
+            .op = .{ .fused_sigmoid = {} },
+            .output_shape = shape,
+            .inputs = .{ x, null_node, null_node, null_node },
+            .num_inputs = 1,
+        });
     }
 
     // ── Scatter-add ────────────────────────────────────────────────────
@@ -1082,6 +1252,8 @@ test "Builder.linearNoBias reshapes rank-1 input in decomposition" {
 
     const matmul = g.node(result_node.vjp_alternate);
     try std.testing.expectEqual(OpCode.dot_general, std.meta.activeTag(matmul.op));
+    try std.testing.expectEqual(@as(u8, 1), matmul.op.dot_general.lhs_contracting[0]);
+    try std.testing.expectEqual(@as(u8, 1), matmul.op.dot_general.rhs_contracting[0]);
     const reshape = g.node(matmul.inputs[0]);
     try std.testing.expectEqual(OpCode.reshape, std.meta.activeTag(reshape.op));
     try std.testing.expectEqual(@as(i64, 1), reshape.output_shape.dim(0));
@@ -1202,6 +1374,34 @@ test "Builder.crossEntropyLoss produces scalar" {
 
     // Cross-entropy loss should produce a scalar
     try std.testing.expectEqual(@as(i64, 1), loss_node.output_shape.numElements() orelse 0);
+}
+
+test "Builder.selectedTiedHeadLogits validates frozen two-row contract" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const hidden = try b.parameter("hidden", Shape.init(.f32, &.{ 1, 4 }));
+    const weight = try b.parameter("weight", Shape.init(.f32, &.{ 5, 4 }));
+    const token_ids = try b.parameter("token_ids", Shape.init(.f32, &.{2}));
+    const attrs = node_mod.SelectedTiedHeadAttrs{
+        .in_dim = 4,
+        .vocab_size = 5,
+        .frozen_weight = true,
+    };
+    const logits = try b.selectedTiedHeadLogits(hidden, weight, token_ids, attrs);
+    const logits_node = g.node(logits);
+    try std.testing.expectEqual(.fused_selected_tied_head_logits, std.meta.activeTag(logits_node.op));
+    try std.testing.expect(logits_node.output_shape.eq(Shape.init(.f32, &.{ 1, 2 })));
+    try std.testing.expectEqual(null_node, logits_node.vjp_alternate);
+
+    var unfrozen = attrs;
+    unfrozen.frozen_weight = false;
+    try std.testing.expectError(
+        error.SelectedTiedHeadRequiresFrozenWeight,
+        b.selectedTiedHeadLogits(hidden, weight, token_ids, unfrozen),
+    );
 }
 
 test "Builder.mseLoss produces scalar" {

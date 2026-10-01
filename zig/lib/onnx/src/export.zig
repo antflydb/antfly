@@ -716,9 +716,7 @@ fn exportGraphResultMaybeStream(
     defer if (lowered) |*l| l.deinit();
 
     const effective_graph: *const Graph = if (opts.lower_fused) blk: {
-        lowered = ml.graph.lower.lower(alloc, graph) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-        };
+        lowered = try ml.graph.lower.lower(alloc, graph);
         break :blk &lowered.?.graph;
     } else graph;
 
@@ -825,6 +823,7 @@ fn exportGraphResultMaybeStream(
         const n = effective_graph.node(@intCast(i));
         switch (n.op) {
             .reduce_sum, .reduce_max, .reduce_mean => effective_opset_version = @max(effective_opset_version, 21),
+            .average_pool => effective_opset_version = @max(effective_opset_version, 19),
             else => {},
         }
         switch (n.op) {
@@ -2153,6 +2152,7 @@ fn mapOp(alloc: Allocator, graph: *const Graph, n: *const Node) !OpMapping {
         .concat_prim => |a| try intAttrOp(alloc, "Concat", "axis", a.axis),
         .range => simpleOp("Range"),
         .shape_of => |a| try shapeOfOp(alloc, a),
+        .size_of => simpleOp("Size"),
         .gather => |a| try intAttrOp(alloc, if (a.elements) "GatherElements" else "Gather", "axis", a.axis),
         .scatter_add => simpleOp("ScatterElements"),
 
@@ -2161,6 +2161,7 @@ fn mapOp(alloc: Allocator, graph: *const Graph, n: *const Node) !OpMapping {
 
         // Convolution
         .conv_general => |a| try convOp(alloc, a),
+        .average_pool => |a| try averagePoolOp(alloc, &a),
 
         // Type conversion
         .convert_dtype => |a| try castOp(alloc, a),
@@ -2302,19 +2303,63 @@ fn convOp(alloc: Allocator, a: ml.graph.node.ConvAttrs) !OpMapping {
     var strides = try alloc.alloc(i64, a.num_spatial);
     for (0..a.num_spatial) |i| strides[i] = @intCast(a.strides[i]);
     try attrs_list.append(alloc, .{ .name = "strides", .ints = strides, .attr_type = .ints });
+    // dilations
+    var dilations = try alloc.alloc(i64, a.num_spatial);
+    for (0..a.num_spatial) |i| dilations[i] = @intCast(a.dilations[i]);
+    try attrs_list.append(alloc, .{ .name = "dilations", .ints = dilations, .attr_type = .ints });
 
     // pads (ONNX uses [begin_0, begin_1, ..., end_0, end_1, ...])
     var pads = try alloc.alloc(i64, @as(usize, a.num_spatial) * 2);
     for (0..a.num_spatial) |i| pads[i] = @intCast(a.padding[i][0]);
     for (0..a.num_spatial) |i| pads[a.num_spatial + i] = @intCast(a.padding[i][1]);
     try attrs_list.append(alloc, .{ .name = "pads", .ints = pads, .attr_type = .ints });
+    if (a.transposed) {
+        var output_padding = try alloc.alloc(i64, a.num_spatial);
+        for (0..a.num_spatial) |i| output_padding[i] = @intCast(a.output_padding[i]);
+        try attrs_list.append(alloc, .{ .name = "output_padding", .ints = output_padding, .attr_type = .ints });
+    }
 
     // group
     if (a.groups > 1) {
         try attrs_list.append(alloc, .{ .name = "group", .i = @intCast(a.groups), .attr_type = .int });
     }
 
-    return .{ .op_type = "Conv", .attrs = try attrs_list.toOwnedSlice(alloc) };
+    return .{ .op_type = if (a.transposed) "ConvTranspose" else "Conv", .attrs = try attrs_list.toOwnedSlice(alloc) };
+}
+
+fn averagePoolOp(alloc: Allocator, a: *const ml.graph.node.AveragePoolAttrs) !OpMapping {
+    const kernel = try alloc.alloc(i64, a.num_spatial);
+    errdefer alloc.free(kernel);
+    const strides = try alloc.alloc(i64, a.num_spatial);
+    errdefer alloc.free(strides);
+    const dilations = try alloc.alloc(i64, a.num_spatial);
+    errdefer alloc.free(dilations);
+    const pads = try alloc.alloc(i64, if (a.auto_pad == .explicit) @as(usize, a.num_spatial) * 2 else 0);
+    errdefer alloc.free(pads);
+    for (0..a.num_spatial) |axis| {
+        kernel[axis] = a.kernel[axis];
+        strides[axis] = a.strides[axis];
+        dilations[axis] = a.dilations[axis];
+        if (pads.len != 0) {
+            pads[axis] = a.padding[axis][0];
+            pads[a.num_spatial + axis] = a.padding[axis][1];
+        }
+    }
+    const attrs = try alloc.alloc(AttributeProto, 5);
+    attrs[0] = .{ .name = "kernel_shape", .ints = kernel, .attr_type = .ints };
+    attrs[1] = .{ .name = "strides", .ints = strides, .attr_type = .ints };
+    attrs[2] = .{ .name = "dilations", .ints = dilations, .attr_type = .ints };
+    attrs[3] = if (a.auto_pad == .explicit)
+        .{ .name = "pads", .ints = pads, .attr_type = .ints }
+    else
+        .{ .name = "auto_pad", .s = switch (a.auto_pad) {
+            .valid => "VALID",
+            .same_upper => "SAME_UPPER",
+            .same_lower => "SAME_LOWER",
+            .explicit => unreachable,
+        }, .attr_type = .string };
+    attrs[4] = .{ .name = "count_include_pad", .i = @intFromBool(a.count_include_pad), .attr_type = .int };
+    return .{ .op_type = "AveragePool", .attrs = attrs };
 }
 
 fn castOp(alloc: Allocator, a: ml.graph.node.ConvertDTypeAttrs) !OpMapping {
@@ -2909,6 +2954,21 @@ test "exportGraph roundtrip — export then import" {
 
     try std.testing.expect(model.graph() != null);
     try std.testing.expectEqual(@as(u64, 17), model.opsetVersion());
+}
+
+test "exportGraph with lower_fused preserves graph validation errors" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("input", Shape.init(.f32, &.{2}));
+    const output = try builder.mul(input, input);
+    try graph.markOutput(output);
+
+    graph.nodes.items[output].inputs[0] = output;
+    try std.testing.expectError(error.CyclicGraph, exportGraph(a, &graph, .{ .lower_fused = true }));
+    graph.nodes.items[output].inputs[0] = @intCast(graph.nodes.items.len);
+    try std.testing.expectError(error.InvalidGraphDependency, exportGraph(a, &graph, .{ .lower_fused = true }));
 }
 
 test "exportGraph with lower_fused decomposes fused ops" {

@@ -14,9 +14,12 @@ const std = @import("std");
 const Crc32 = @import("antfly_hash").Crc32;
 
 pub const manifest_schema_version: u32 = 1;
-pub const afb_reader_version: u32 = 4;
-pub const retirement_reader_version: u32 = 4;
-pub const relationship_reader_version: u32 = 3;
+pub const afb_reader_version: u32 = 7;
+pub const base_afb_reader_version: u32 = 2;
+pub const source_generation_admission_reader_version: u32 = 3;
+pub const source_proof_reader_version: u32 = 5;
+pub const relationship_reader_version: u32 = 6;
+pub const retirement_reader_version: u32 = 7;
 pub const max_manifest_bytes: usize = 16 * 1024 * 1024;
 pub const max_objects: usize = 1_000_000;
 pub const max_path_bytes: usize = 4096;
@@ -34,7 +37,7 @@ pub const Encryption = struct {
 };
 
 pub const Compatibility = struct {
-    min_afb_reader: u32 = 2,
+    min_afb_reader: u32 = base_afb_reader_version,
     storage_engine: []const u8 = "",
     min_antfly_version: []const u8 = "",
 };
@@ -125,7 +128,10 @@ pub fn parseManifest(alloc: std.mem.Allocator, encoded: []const u8) !ParsedManif
     var parsed = std.json.parseFromSlice(Manifest, alloc, encoded, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = false,
-    }) catch return error.InvalidBackupManifest;
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidBackupManifest,
+    };
     errdefer parsed.deinit();
     try validateManifest(parsed.value);
     return parsed;
@@ -369,6 +375,10 @@ pub const FooterIndexEntry = struct {
     stored_size_bytes: u64,
 };
 
+pub fn decodeFooterIndexEntry(encoded: *const [48]u8) FooterIndexEntry {
+    return .{ .sha256 = encoded[0..32].*, .header_offset = std.mem.readInt(u64, encoded[32..40], .little), .stored_size_bytes = std.mem.readInt(u64, encoded[40..48], .little) };
+}
+
 pub const Trailer = struct {
     footer_offset: u64,
     footer_payload_size: u64,
@@ -432,11 +442,7 @@ pub fn decodeFooterIndexAlloc(alloc: std.mem.Allocator, encoded: []const u8) ![]
     const entries = try alloc.alloc(FooterIndexEntry, count);
     var pos: usize = 4;
     for (entries) |*entry| {
-        entry.* = .{
-            .sha256 = encoded[pos..][0..std.crypto.hash.sha2.Sha256.digest_length].*,
-            .header_offset = std.mem.readInt(u64, encoded[pos + std.crypto.hash.sha2.Sha256.digest_length ..][0..8], .little),
-            .stored_size_bytes = std.mem.readInt(u64, encoded[pos + std.crypto.hash.sha2.Sha256.digest_length + 8 ..][0..8], .little),
-        };
+        entry.* = decodeFooterIndexEntry(encoded[pos..][0..48]);
         pos += entry_size;
     }
     return entries;

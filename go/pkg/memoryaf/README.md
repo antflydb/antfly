@@ -126,7 +126,7 @@ The older `source` field still exists, but it is best treated as free-form origi
 3. Preserve the canonical document identity in `source_backend`, `source_id`, `source_path`, `source_url`, `source_version`, and `section_path`.
 4. Keep the markdown file or external object as the source of truth; use `memoryaf` as the searchable memory/index layer.
 
-See [docsaf-integration.md](./docsaf-integration.md) for the backend mapping conventions.
+See [docsaf-integration.md](docsaf-integration.md) for the backend mapping conventions.
 
 ## Dashboard
 

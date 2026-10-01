@@ -20,6 +20,7 @@ const platform_clock = platform.clock;
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("../../../common/fs_paths.zig");
 const CancellationToken = @import("../../../common/cancellation.zig").CancellationToken;
+const full_text_index_defaults = @import("../../../common/full_text_index_defaults.zig");
 const native_artifact_sink = @import("../../native_artifact_sink.zig");
 const native_backup = @import("../native_backup.zig");
 const process_memory = @import("antfly_platform").process_memory;
@@ -43,7 +44,9 @@ const resolver_catalog = @import("resolver_catalog.zig");
 pub const ResolverConfig = resolver_catalog.ResolverConfig;
 const enrichment_types = @import("../enrichment/enrichment_types.zig");
 const enrichment_artifact_codec = @import("../enrichment/artifact_codec.zig");
+const graph_edge_contender = @import("../graph_edge_contender.zig");
 const enrichment_config_validation = @import("../enrichment/config_validation.zig");
+const enrichment_neighbor_context = @import("../enrichment/neighbor_context.zig");
 const asset_producer_mod = @import("../enrichment/asset_producer.zig");
 const backfill_state_mod = @import("../backfill_state.zig");
 const db_config = @import("../config.zig");
@@ -62,14 +65,6 @@ const schema_api = @import("../../../schema/mod.zig");
 const schema_registry_mod = @import("../schema_registry.zig");
 const analysis_mod = @import("../../../search/analysis.zig");
 const ttl_mod = @import("../../ttl.zig");
-const lmdb = if (storage_build_options.lmdb_enabled or builtin.is_test) @import("../../lmdb.zig") else struct {
-    pub const CommitPublishPhase = enum {
-        before_publish,
-        after_data_sync,
-        after_meta_write,
-        after_meta_sync,
-    };
-};
 const mapper = @import("../document_mapper.zig");
 const relational_store = @import("../relational_store.zig");
 const relational_row_codec = @import("../algebraic/relational_row_codec.zig");
@@ -150,7 +145,7 @@ const repair_shadow_root_prefix = ".repair-shadow-";
 const canonical_algebraic_generation = "canonical";
 const repair_shadow_in_progress_file = ".antfly-repair-shadow-in-progress";
 const repair_shadow_in_progress_magic = "antfly-repair-shadow-in-progress-v1\n";
-var fresh_dense_native_generation_nonce: std.atomic.Value(u64) = .init(1);
+var fresh_dense_native_generation_nonce: @import("antfly_platform").atomic.Value(u64) = .init(1);
 
 const RepairShadowCleanupTestHook = struct {
     context: *anyopaque,
@@ -293,6 +288,10 @@ pub var test_inject_generated_artifact_cleanup_error: ?anyerror = null;
 pub var test_generated_artifact_cleanup_failures_remaining: std.atomic.Value(u32) = .init(0);
 pub var test_vector_block_primary_snapshot_builds: usize = 0;
 pub var test_before_vector_block_primary_snapshot_build: ?struct {
+    ctx: *anyopaque,
+    call: *const fn (*anyopaque) anyerror!void,
+} = null;
+pub var test_before_source_vector_checkpoint: ?struct {
     ctx: *anyopaque,
     call: *const fn (*anyopaque) anyerror!void,
 } = null;
@@ -1256,7 +1255,8 @@ const SharedVectorBlockGeneration = struct {
     alloc: Allocator,
     opened: vector_block_store_mod.Opened,
     source_snapshot: ?vector_block_store_mod.Opened = null,
-    refs: std.atomic.Value(u64) = .init(1),
+    member_bindings: ?*vector_block_store_mod.member_bindings.Cache = null,
+    refs: @import("antfly_platform").atomic.Value(u64) = .init(1),
 
     fn create(alloc: Allocator, opened: vector_block_store_mod.Opened) !*SharedVectorBlockGeneration {
         const generation = try alloc.create(SharedVectorBlockGeneration);
@@ -1274,6 +1274,7 @@ const SharedVectorBlockGeneration = struct {
     fn release(self: *SharedVectorBlockGeneration) void {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
         const alloc = self.alloc;
+        if (self.member_bindings) |bindings| bindings.deinit();
         self.opened.deinit();
         if (self.source_snapshot) |*snapshot| snapshot.deinit();
         alloc.destroy(self);
@@ -1374,21 +1375,24 @@ pub const IndexManager = struct {
     // posting state for this same source transaction. Ordinary maintenance
     // must never infer mutation identity from cardinality and a merely newer
     // generation.
-    vector_block_stable_tip_sequence: std.atomic.Value(u64) = .init(0),
+    vector_block_stable_tip_sequence: @import("antfly_platform").atomic.Value(u64) = .init(0),
     vector_block_stable_tip_index: std.atomic.Value(usize) = .init(0),
     vector_block_generation: ?*SharedVectorBlockGeneration = null,
     /// Wake deferred posting acceleration for same-sequence vector rebuilds
     /// as well as new source writes. No borrowed pointer/ABA identity escapes.
-    vector_block_publication_revision: std.atomic.Value(u64) = .init(1),
+    vector_block_publication_revision: @import("antfly_platform").atomic.Value(u64) = .init(1),
     // Once a source transaction changes dense artifacts, an older immutable
     // base must never receive later coverage-only watermarks. Keeping CURRENT
     // at its last genuinely covered sequence is also the crash-safe dirty
     // marker: restart can prove that a replacement base is required without
     // relying on this process-local bit.
     vector_block_projection_dirty: std.atomic.Value(bool) = .init(false),
-    vector_block_candidate_sequence: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    vector_block_candidate_since_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    vector_block_candidate_sequence: @import("antfly_platform").atomic.Value(u64) = @import("antfly_platform").atomic.Value(u64).init(0),
+    vector_block_candidate_since_ns: @import("antfly_platform").atomic.Value(u64) = @import("antfly_platform").atomic.Value(u64).init(0),
     catalog_mutex: apply_rw_lock_mod.ApplyRwLock = .{},
+    /// Bound by the physical DB before index load. Unpublished/shadow managers
+    /// do not inherit the serving root's projection evidence authority.
+    artifact_projection_root: u128 = 0,
     /// 0 = idle, 1 = queued/running, 2 = rerun requested while active.
     repair_cleanup_state: std.atomic.Value(u8) = .init(0),
     /// Durable generated-artifact cleanup uses the same single-flight shape,
@@ -1399,19 +1403,19 @@ pub const IndexManager = struct {
     // compacting an older schema generation) for CPU, mmap residency, and the
     // shared text-merge resource budget.
     text_backfill_active: std.atomic.Value(u32) = .init(0),
-    next_text_index_instance_id: std.atomic.Value(u64) = .init(1),
+    next_text_index_instance_id: @import("antfly_platform").atomic.Value(u64) = .init(1),
     /// Process-local generation of the extraction plan consumed by writes.
     /// Prepared batches compare this scalar instead of rereading and hashing
     /// the serialized catalog under the DB apply lock.
-    write_plan_generation: std.atomic.Value(u64) = .init(1),
+    write_plan_generation: @import("antfly_platform").atomic.Value(u64) = .init(1),
     write_plan_cache_mutex: std.Io.Mutex = .init,
     /// Non-zero while one request is constructing the immutable plan for a
     /// cold generation. Publication is rare; acquisitions remain lock-free
     /// apart from the short cache pointer fence and never duplicate the owned
     /// catalog clone under a thundering herd.
-    write_plan_build_generation: std.atomic.Value(u64) = .init(0),
+    write_plan_build_generation: @import("antfly_platform").atomic.Value(u64) = .init(0),
     write_plan_cache: ?*WritePlanSnapshotEpoch = null,
-    next_dense_capture_incarnation: std.atomic.Value(u64) = .init(1),
+    next_dense_capture_incarnation: @import("antfly_platform").atomic.Value(u64) = .init(1),
     load_parallelism: ?usize = null,
     full_text_pending_bytes_accounted: u64 = 0,
     text_indexes: std.ArrayListUnmanaged(TextIndex),
@@ -1432,8 +1436,18 @@ pub const IndexManager = struct {
     /// page quanta, while unrelated catalog readers and writers no longer wait
     /// for an entire maintenance drain.
     graph_metric_schedule_pins: std.atomic.Value(usize) = .init(0),
+    /// Workers acquire shared before catalog/index apply; primary publishers
+    /// acquire exclusive under DB apply, without retaining a catalog lease. This fences
+    /// primary contributor reads through commit while preserving worker
+    /// parallelism across indexes. Never acquire DB apply from a shared holder.
+    graph_primary_publication: apply_rw_lock_mod.ApplyRwLock = .{},
+    graph_artifact_rebuild_pending: bool = false, // protected by catalog_mutex
     graph_metric_schedule_pin_mutex: std.Io.Mutex = .init,
     graph_metric_schedule_pins_drained: std.Io.Condition = .init,
+    /// Changed only while catalog admission is exclusive after a durable
+    /// rewrite-source begin/cancel commits. Reads and worker snapshots check
+    /// it under their own admission lease; the seal verifies old pins drained.
+    graph_retirement_closed: std.atomic.Value(bool) = .init(false),
     algebraic_indexes: std.ArrayListUnmanaged(AlgebraicIndex),
     enrichments: std.ArrayListUnmanaged(enrichment_catalog.EnrichmentConfig),
     resolvers: std.ArrayListUnmanaged(resolver_catalog.ResolverConfig) = .empty,
@@ -1450,7 +1464,7 @@ pub const IndexManager = struct {
     /// A fresh value is assigned on every insertion, including same-name,
     /// same-config recreation, so detached work never derives identity from
     /// mutable record contents. Zero remains reserved as "no incarnation".
-    next_failed_index_load_incarnation_id: std.atomic.Value(u64) = .init(1),
+    next_failed_index_load_incarnation_id: @import("antfly_platform").atomic.Value(u64) = .init(1),
     /// Stable resident retry ring. Every quarantined index is safe to reopen,
     /// even when destructive reconstruction requires operator authorization.
     /// Entries borrow the owned map keys and are updated under catalog_mutex.
@@ -2085,6 +2099,17 @@ pub const IndexManager = struct {
     pub const DenseIndex = struct {
         apply_mutex: *std.atomic.Mutex,
         capture_incarnation: u64 = 0,
+        /// A certificate is checked against the resident HBC generation once.
+        /// Later live writes may change active_count before the next checkpoint;
+        /// they must not revoke an already validated serving snapshot.
+        serving_certificate_mutex: std.atomic.Mutex = .unlocked,
+        verified_serving_certificate: ?struct {
+            capture_incarnation: u64,
+            applied_sequence: u64,
+            generation: u64,
+            config_hash: u64,
+            published_count: u64,
+        } = null,
         config: types.IndexConfig,
         field_name: []u8,
         dims: u32,
@@ -2116,6 +2141,41 @@ pub const IndexManager = struct {
         vector_loader_context: ?*DenseVectorLoadContext = null,
         ordinal_vector_ids: std.AutoHashMapUnmanaged(doc_identity.DocOrdinal, u64) = .empty,
         vector_ordinals: std.AutoHashMapUnmanaged(u64, doc_identity.DocOrdinal) = .empty,
+
+        fn matchesVerifiedServingCertificate(self: *const DenseIndex, checkpoint: apply_state.ProjectionCheckpoint, certified_count: u64) bool {
+            const verified = self.verified_serving_certificate orelse return false;
+            return verified.capture_incarnation == self.capture_incarnation and
+                verified.applied_sequence == checkpoint.applied_sequence and
+                verified.generation == checkpoint.generation and
+                verified.config_hash == checkpoint.config_hash and
+                verified.published_count == certified_count;
+        }
+
+        /// Only an open or publication boundary may establish this proof.
+        pub fn validateServingCertificate(self: *DenseIndex, checkpoint: apply_state.ProjectionCheckpoint) bool {
+            const certified_count = checkpoint.published_count orelse return false;
+            while (!self.serving_certificate_mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.serving_certificate_mutex.unlock();
+            if (self.matchesVerifiedServingCertificate(checkpoint, certified_count)) return true;
+            if (self.index.stats().active_count != certified_count) return false;
+            self.verified_serving_certificate = .{
+                .capture_incarnation = self.capture_incarnation,
+                .applied_sequence = checkpoint.applied_sequence,
+                .generation = checkpoint.generation,
+                .config_hash = checkpoint.config_hash,
+                .published_count = certified_count,
+            };
+            return true;
+        }
+
+        /// Status reads must never turn a previously failed certificate into
+        /// a valid one just because later live writes reach the same count.
+        pub fn hasValidatedServingCertificate(self: *DenseIndex, checkpoint: apply_state.ProjectionCheckpoint) bool {
+            const certified_count = checkpoint.published_count orelse return false;
+            while (!self.serving_certificate_mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.serving_certificate_mutex.unlock();
+            return self.matchesVerifiedServingCertificate(checkpoint, certified_count);
+        }
     };
 
     const DenseVectorLoadContext = struct {
@@ -2144,6 +2204,12 @@ pub const IndexManager = struct {
         context: *DenseVectorLoadContext,
         read_txn: ?docstore_mod.DocStore.Txn = null,
         read_txn_kind: ReadTxnKind = .probe,
+        /// The DB snapshot owns this reference independently of per-wave
+        /// location reuse. Clearing a wave must not switch source generations.
+        snapshot_generation: ?*SharedVectorBlockGeneration = null,
+        // Never open a current primary transaction after the apply fence was
+        // released. A native miss restarts the complete DB query instead.
+        snapshot_native_only: bool = false,
         txn_override: ?docstore_mod.DocStore.Batch.BatchTxn = null,
         raw_cache: std.StringHashMapUnmanaged([]const u8) = .empty,
         vector_cache: std.AutoHashMapUnmanaged(u64, []f32) = .empty,
@@ -2171,6 +2237,12 @@ pub const IndexManager = struct {
         raw_cache_misses: u64 = 0,
         raw_batch_reads: u64 = 0,
         raw_scalar_reads: u64 = 0,
+        source_batch_reads: source_payload_mod.DenseReadStats = .{},
+        matrix_generation_attempts: u64 = 0,
+        matrix_generation_rejections: u64 = 0,
+        matrix_generation_vectors: u64 = 0,
+        matrix_captured_vectors: u64 = 0,
+        matrix_fallback_vectors: u64 = 0,
         raw_cache_key_bytes: u64 = 0,
         raw_read_value_bytes: u64 = 0,
         vector_cache_hits: u64 = 0,
@@ -2188,6 +2260,17 @@ pub const IndexManager = struct {
         const MaxRawReadLimitBytes: u64 = 64 * 1024 * 1024;
 
         fn deinit(self: *@This()) void {
+            if (benchMetricsEnabled() and (self.matrix_generation_attempts != 0 or self.matrix_captured_vectors != 0)) {
+                const batch = self.source_batch_reads;
+                std.log.info("antfly_bench_dense_matrix_load index={s} generation_attempts={d} generation_rejections={d} generation_vectors={d} fallback_vectors={d} source_batches={d} source_vectors={d} source_bytes={d} source_lock_wait_ns={d} source_locked_ns={d} scratch_fallbacks={d} primary_lookup_ns={d} payload_consume_ns={d} positional_batches={d} positional_bytes={d} lease_fallbacks={d} captured_vectors={d}", .{
+                    self.context.index_name,        self.matrix_generation_attempts, self.matrix_generation_rejections,
+                    self.matrix_generation_vectors, self.matrix_fallback_vectors,    batch.batches,
+                    batch.vectors,                  batch.bytes,                     batch.lock_wait_ns,
+                    batch.locked_ns,                batch.scratch_fallbacks,         batch.primary_lookup_ns,
+                    batch.payload_consume_ns,       batch.positional_batches,        batch.positional_bytes,
+                    batch.lease_fallbacks,          self.matrix_captured_vectors,
+                });
+            }
             if (getenv("ANTFLY_DEBUG_DENSE_VECTOR_LOAD_SESSION") != null and self.raw_cache_hits + self.raw_cache_misses + self.vector_cache_hits + self.vector_cache_misses >= 128) {
                 std.log.debug(
                     "dense vector load session raw_hits={} raw_misses={} vector_hits={} vector_misses={} cached_keys={} cached_vectors={} raw_key_bytes={} raw_value_bytes={} cached_vector_bytes={} index={s}",
@@ -2219,6 +2302,7 @@ pub const IndexManager = struct {
             if (self.residual_budget) |*budget| budget.deinit();
             self.context.manager.observeDenseWorkingBytes(self.working_slice, &self.working_bytes_current, 0);
             if (self.read_txn) |*txn| txn.abort();
+            if (self.snapshot_generation) |generation| generation.release();
             if (self.decoded_residency_lease) |*lease| lease.deinit();
             self.* = undefined;
         }
@@ -2413,6 +2497,7 @@ pub const IndexManager = struct {
         }
 
         fn getTxn(self: *@This(), store: *docstore_mod.DocStore) !*docstore_mod.DocStore.Txn {
+            if (self.snapshot_native_only) return error.DenseSnapshotNeedsPrimary;
             if (self.read_txn == null) {
                 self.read_txn = switch (self.read_txn_kind) {
                     .probe => try store.beginProbeTxnWithBlockCacheAdmission(self.block_cache_admission),
@@ -2747,6 +2832,7 @@ pub const IndexManager = struct {
         metric_configs: []graph_mod.GraphMetricConfig,
         artifact_sources: []GraphArtifactSource = &.{},
         max_edges_per_document: u32 = 0,
+        ttl_duration_ns: u64 = 0,
         rebuild_root_path: []u8,
         index: graph_mod.GraphIndex,
     };
@@ -2787,6 +2873,35 @@ pub const IndexManager = struct {
 
     pub fn init(alloc: Allocator, base_path: []const u8) !IndexManager {
         return try initWithOptions(alloc, base_path, .{});
+    }
+
+    /// A primary publisher must hold DB apply (or exclusive lifecycle admission)
+    /// before acquiring exclusive publication. Source replay acquires shared
+    /// before catalog/index apply and never acquires DB apply inside the lease.
+    /// Release exclusive publication before projection or visibility waits.
+    pub const GraphPrimaryPublicationLease = struct {
+        manager: *IndexManager,
+        mode: enum { primary, replay },
+        active: bool = true,
+
+        pub fn release(self: *@This()) void {
+            if (!self.active) return;
+            self.active = false;
+            switch (self.mode) {
+                .primary => self.manager.graph_primary_publication.unlockExclusive(),
+                .replay => self.manager.graph_primary_publication.unlockShared(),
+            }
+        }
+    };
+
+    pub fn beginGraphPrimaryMutation(self: *IndexManager) GraphPrimaryPublicationLease {
+        self.graph_primary_publication.lockExclusive();
+        return .{ .manager = self, .mode = .primary };
+    }
+
+    pub fn beginGraphSourceReplay(self: *IndexManager) GraphPrimaryPublicationLease {
+        self.graph_primary_publication.lockShared();
+        return .{ .manager = self, .mode = .replay };
     }
 
     pub const ManagedIndexApplyGuard = struct {
@@ -3014,6 +3129,29 @@ pub const IndexManager = struct {
             .manager = self,
             .mutex = mutex,
         };
+    }
+
+    // Keep publication, cleanup, and pointer validation on the same adapter
+    // as backend open. Resolve at use time so option setters stay consistent;
+    // text main and WAL adapters may intentionally be different.
+    fn effectiveTextMainStorage(self: *const IndexManager) ?lsm_backend_mod.Storage {
+        return self.text_lsm_storage orelse self.text_main_lsm_options.storage;
+    }
+
+    fn effectiveDenseStorage(self: *const IndexManager) ?lsm_backend_mod.Storage {
+        return self.dense_lsm_storage orelse self.dense_lsm_options.storage;
+    }
+
+    fn effectiveSparseStorage(self: *const IndexManager) ?lsm_backend_mod.Storage {
+        return self.sparse_lsm_storage orelse self.sparse_lsm_options.storage;
+    }
+
+    fn effectiveGraphStorage(self: *const IndexManager) ?lsm_backend_mod.Storage {
+        return self.graph_lsm_storage orelse self.graph_reverse_lsm_options.storage;
+    }
+
+    fn effectiveTextWalStorage(self: *const IndexManager) ?lsm_backend_mod.Storage {
+        return self.text_lsm_storage orelse self.text_wal_lsm_options.storage;
     }
 
     pub fn setTextMainBackend(self: *IndexManager, backend: persistent_mod.MainBackend) void {
@@ -3544,12 +3682,14 @@ pub const IndexManager = struct {
         entry: *const DenseIndex,
         metadata: []const u8,
     ) ![]u8 {
-        if (entry.embedding_names.len != 0) {
-            if (!embeddingArtifactKeyMatchesAnySource(metadata, entry.embedding_names))
-                return error.InvalidEmbeddingArtifactSource;
+        return denseVectorArtifactKeyForFamilyAlloc(alloc, entry.embedding_names, denseVectorArtifactNameAt(entry, 0), metadata);
+    }
+
+    fn denseVectorArtifactKeyForFamilyAlloc(alloc: Allocator, names: []const []const u8, artifact_name: []const u8, metadata: []const u8) ![]u8 {
+        if (names.len != 0) {
+            if (!embeddingArtifactKeyMatchesAnySource(metadata, names)) return error.InvalidEmbeddingArtifactSource;
             return try alloc.dupe(u8, metadata);
         }
-        const artifact_name = denseVectorArtifactNameAt(entry, 0);
         if (internal_keys.isInternalUserKey(metadata))
             return try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, metadata, artifact_name);
         return try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, metadata, artifact_name);
@@ -3708,6 +3848,12 @@ pub const IndexManager = struct {
     }
 
     fn acquireVectorBlockGeneration(self: *IndexManager) ?*SharedVectorBlockGeneration {
+        if (active_dense_vector_load_session) |session| {
+            if (session.context.manager == self) if (session.snapshot_generation) |generation| {
+                generation.retain();
+                return generation;
+            };
+        }
         self.lockAtomicWithBackoff(&self.vector_block_generation_mu);
         defer self.vector_block_generation_mu.unlock();
         const generation = self.vector_block_generation orelse return null;
@@ -3971,6 +4117,23 @@ pub const IndexManager = struct {
 
     fn installVectorBlockGeneration(self: *IndexManager, generation: *SharedVectorBlockGeneration) void {
         generation.opened.resource_manager = self.resource_manager;
+        if (generation.opened.external_payloads) |source| if (self.resource_manager) |resources| {
+            if (resources.dense_member_bindings and generation.member_bindings == null and
+                generation.opened.scorePrecision() == .authoritative_float32)
+            {
+                // Size from immutable reader counts, never a corpus traversal.
+                // Small tables avoid paying the 40 MiB maximum. Allocation is
+                // lazy per stripe and globally admitted/reclaimable.
+                var rows: usize = 0;
+                for (source.readers) |reader| rows +|= reader.count;
+                const capacity = std.math.ceilPowerOfTwo(usize, @max(1024, @min(1048576, rows *| 4))) catch 1048576;
+                generation.member_bindings = vector_block_store_mod.member_bindings.Cache.create(
+                    std.heap.page_allocator,
+                    capacity,
+                    resources,
+                ) catch null;
+            }
+        };
         self.lockAtomicWithBackoff(&self.vector_block_generation_mu);
         const previous = self.vector_block_generation;
         self.vector_block_generation = generation;
@@ -4250,7 +4413,6 @@ pub const IndexManager = struct {
         if (!vectorBlockGenerationExactAtSequence(current, covered_source_sequence)) return false;
         if (current.opened.baseOnlyVectorCount() != null) return false;
         try self.sealVectorBlockWal();
-        if (self.source_payload_store) |source| try source.checkpoint();
         const sealed_current = self.acquireVectorBlockGeneration() orelse return error.VectorBlockStoreRequiresReopen;
         current.release();
         current = sealed_current;
@@ -4267,6 +4429,9 @@ pub const IndexManager = struct {
         // builds. Capture continues appending while immutable shards stage.
         self.vector_block_build_mu.unlock();
         locked = false;
+        // The ANN cut is pinned already. Source checkpoint construction must
+        // not hold ANN capture exclusion while it stages its own generation.
+        try self.checkpointSourceVectorStore();
         var opened = try current.opened.clone(build_alloc);
         defer opened.deinit();
         if (builtin.is_test) if (test_before_vector_block_primary_snapshot_build) |hook| try hook.call(hook.ctx);
@@ -4339,6 +4504,13 @@ pub const IndexManager = struct {
         return error.VectorBlockSnapshotAdvancedWithoutWal;
     }
 
+    fn checkpointSourceVectorStore(self: *IndexManager) !void {
+        if (self.source_payload_store) |source| {
+            if (builtin.is_test) if (test_before_source_vector_checkpoint) |hook| try hook.call(hook.ctx);
+            try source.checkpoint();
+        }
+    }
+
     fn loadVectorBlockGenerationIfPresent(self: *IndexManager, read_only: bool) !void {
         if (self.vector_block_storage == null) return;
         if (self.acquireVectorBlockGeneration()) |current| {
@@ -4357,6 +4529,8 @@ pub const IndexManager = struct {
             break :blk true;
         };
         if (!current_exists) {
+            // A reader may open while the writer is staging its first base.
+            // Only the writer can distinguish live staging from crash debt.
             if (read_only) return;
             // A crash may leave first-generation blocks before CURRENT. Avoid
             // creating vector state for tables that have never staged it, but
@@ -4374,9 +4548,11 @@ pub const IndexManager = struct {
             try vector_block_store_mod.Store.openWithBlocks(self.alloc, self.vector_block_storage.?, root);
         var opened_owned = true;
         errdefer if (opened_owned) opened.deinit();
-        if (!read_only) _ = opened.store.reclaimUnreferencedFiles() catch |err| {
-            std.log.warn("shared vector-block startup cleanup deferred root={s} err={s}", .{ root, @errorName(err) });
-        };
+        if (!read_only) {
+            _ = opened.store.reclaimUnreferencedFiles() catch |err| {
+                std.log.warn("shared vector-block startup cleanup deferred root={s} err={s}", .{ root, @errorName(err) });
+            };
+        }
         if (opened.store.manifest == null) {
             opened.deinit();
             opened_owned = false;
@@ -4388,7 +4564,28 @@ pub const IndexManager = struct {
     }
 
     pub fn ensureVectorBlockBaseAtAppliedSequence(self: *IndexManager, name: []const u8, applied_sequence: u64) !void {
+        return self.ensureVectorBlockBaseAtAppliedSequenceWithEncoding(name, applied_sequence, false);
+    }
+
+    fn vectorBlockUsesDesiredEncoding(self: *IndexManager) bool {
+        const generation = self.acquireVectorBlockGeneration() orelse return false;
+        defer generation.release();
+        return generation.opened.usesBaseEncoding(self.vectorBlockStorageEncoding());
+    }
+
+    pub fn sourceMigrationServingComplete(self: *IndexManager) bool {
+        if (self.dense_indexes.items.len == 0) return true;
+        if (self.source_payload_store == null or !self.vectorBlockUsesDesiredEncoding()) return false;
+        for (self.dense_indexes.items) |*entry| {
+            if (!entry.native_physical_v2 or !self.vectorBlockReadyForDenseIndex(entry.config.name) or
+                self.repairUnavailable(entry.config.name)) return false;
+        }
+        return true;
+    }
+
+    fn ensureVectorBlockBaseAtAppliedSequenceWithEncoding(self: *IndexManager, name: []const u8, applied_sequence: u64, require_storage_encoding: bool) !void {
         if (self.vector_block_storage == null) return;
+        const converting = require_storage_encoding and !self.vectorBlockUsesDesiredEncoding();
         const entry = self.denseIndex(name) orelse return error.IndexNotFound;
         if (entry.index.experimentalPostingDurableAppliedSequence()) |posting_sequence| {
             // A stable source snapshot may legitimately be ahead of the last
@@ -4442,7 +4639,7 @@ pub const IndexManager = struct {
         // maintenance lane. The empty-bootstrap exception remains enforced
         // by vectorBlockGenerationReadyAtSequenceAndCount, so initial
         // publication still produces a cardinality-certified base.
-        if (self.vectorBlockReadyAtSequenceAndCount(
+        if (!converting and self.vectorBlockReadyAtSequenceAndCount(
             applied_sequence,
             entry,
             entry.index.stats().active_count,
@@ -4456,7 +4653,7 @@ pub const IndexManager = struct {
         // without cloning/scanning primary LSM artifacts. Missing, lossy, or
         // sequence-mismatched native state falls through to the pinned primary
         // snapshot repair path below.
-        if (try self.compactVectorBlockGenerationAtStableTip(entry, applied_sequence)) return;
+        if (!converting and try self.compactVectorBlockGenerationAtStableTip(entry, applied_sequence)) return;
 
         // Only one snapshot builder may reserve the next immutable generation.
         // Ordinary WAL appends continue under vector_block_build_mu while the
@@ -4546,7 +4743,7 @@ pub const IndexManager = struct {
         defer store.deinit();
         if (store.manifest != null and store.covered_source_sequence == applied_sequence) {
             try self.loadVectorBlockGenerationIfPresent(false);
-            if (self.vectorBlockReadyAtSequenceAndCount(
+            if (!converting and self.vectorBlockReadyAtSequenceAndCount(
                 applied_sequence,
                 entry,
                 entry.index.stats().active_count,
@@ -4905,7 +5102,7 @@ pub const IndexManager = struct {
     ) bool {
         if (native_physical_v2) return true;
         if (!self.configuredDenseNativePostingStoreSupported()) return false;
-        if (!nativeBackupStoragePublicationCompatible(self.dense_lsm_storage)) return false;
+        if (!nativeBackupStoragePublicationCompatible(self.effectiveDenseStorage())) return false;
         if (self.dense_native_migration_policy_source) |source| {
             if (!source.authorityPermitted()) return false;
         }
@@ -4937,7 +5134,7 @@ pub const IndexManager = struct {
         // authority until their adapter exposes an equivalent staged
         // generation/promote contract; repeatedly scheduling an impossible
         // migration only creates permanent repair debt.
-        if (!nativeBackupStoragePublicationCompatible(self.dense_lsm_storage)) return false;
+        if (!nativeBackupStoragePublicationCompatible(self.effectiveDenseStorage())) return false;
         if (self.dense_native_migration_policy_source) |source| {
             if (!source.authorityPermitted()) return false;
         }
@@ -5308,6 +5505,11 @@ pub const IndexManager = struct {
         return self.write_plan_generation.load(.acquire);
     }
 
+    /// Publish only after the owning catalog transaction has committed.
+    pub fn invalidateWritePlanSnapshot(self: *IndexManager) void {
+        _ = self.write_plan_generation.fetchAdd(1, .release);
+    }
+
     pub const AssetContentTypeSnapshot = struct {
         const Entry = struct {
             name: []u8,
@@ -5384,11 +5586,13 @@ pub const IndexManager = struct {
         index_name: []u8,
         field_name: []u8,
         dims: u32,
+        coverage_generation: u64 = 0,
     };
 
     pub const SparseFieldWritePlan = struct {
         index_name: []u8,
         field_name: []u8,
+        coverage_generation: u64 = 0,
     };
 
     pub const GraphFieldEdgeWritePlan = struct {
@@ -5408,6 +5612,11 @@ pub const IndexManager = struct {
     pub const WritePlanSnapshot = struct {
         alloc: Allocator,
         generation: u64,
+        /// Catalog bytes and provider templates are captured under the same
+        /// publication fence. Worker authorization never joins this epoch to
+        /// generation numbers borrowed from the mutable manager.
+        artifact_catalogs: ?@import("../artifact_inventory.zig").Catalogs = null,
+        catalog_empty: [3]bool = @splat(false),
         /// Artifact-only text indexes consume generated records, not base rows.
         has_text_consumers: bool = false,
         text_requires_root: bool = true,
@@ -5419,12 +5628,17 @@ pub const IndexManager = struct {
         /// Per-row planning only substitutes the document identity and removes
         /// consumers already satisfied by explicit/direct vectors.
         generated_templates: []enrichment_types.GeneratedEnrichmentRequest,
+        /// Catalog-wide completion requirements include projections and
+        /// resolver/promotion work that never appears in the provider queue.
+        completion_plan: ?@import("../artifact_completion_plan.zig").Plan = null,
         /// For each chunk template, indexes of embedding templates consuming
         /// its artifact. Compiling this adjacency once avoids an all-template
         /// scan for every chunk of every row.
         chunk_dependents: [][]u32,
 
         pub fn deinit(self: *WritePlanSnapshot) void {
+            if (self.completion_plan) |*plan| plan.deinit();
+            if (self.artifact_catalogs) |*catalogs| catalogs.deinit(self.alloc);
             for (self.text_fields) |field| self.alloc.free(field);
             if (self.text_fields.len != 0) self.alloc.free(self.text_fields);
             for (self.dense_fields) |field| {
@@ -5458,6 +5672,26 @@ pub const IndexManager = struct {
             return null;
         }
 
+        pub fn coverageGeneration(self: WritePlanSnapshot, index_name: []const u8) ?u64 {
+            for (self.dense_fields) |field| if (std.mem.eql(u8, field.index_name, index_name)) return field.coverage_generation;
+            for (self.sparse_fields) |field| if (std.mem.eql(u8, field.index_name, index_name)) return field.coverage_generation;
+            return self.graphCoverageGeneration(index_name);
+        }
+
+        /// Definition identity only, not a materialization-readiness vote.
+        /// Repair/load readiness can change independently of this epoch and
+        /// must be checked by the admission barrier, not cached here.
+        pub fn matchesArtifactInventory(self: WritePlanSnapshot, expected: @import("../artifact_inventory.zig").Catalogs) bool {
+            const actual = self.artifact_catalogs orelse return false;
+            inline for (.{ "indexes", "enrichments", "resolvers" }, 0..) |field, index| {
+                const bytes = @field(expected, field);
+                if (bytes.len == 0) {
+                    if (!self.catalog_empty[index]) return false;
+                } else if (!std.mem.eql(u8, bytes, @field(actual, field))) return false;
+            }
+            return true;
+        }
+
         fn cloneDense(alloc: Allocator, entry: DenseIndex) !DenseFieldWritePlan {
             const index_name = try alloc.dupe(u8, entry.config.name);
             errdefer alloc.free(index_name);
@@ -5465,6 +5699,7 @@ pub const IndexManager = struct {
                 .index_name = index_name,
                 .field_name = try alloc.dupe(u8, entry.field_name),
                 .dims = entry.dims,
+                .coverage_generation = coverageGenerationForConfig(entry.config),
             };
         }
 
@@ -5474,6 +5709,7 @@ pub const IndexManager = struct {
             return .{
                 .index_name = index_name,
                 .field_name = try alloc.dupe(u8, entry.field_name),
+                .coverage_generation = coverageGenerationForConfig(entry.config),
             };
         }
 
@@ -5608,7 +5844,7 @@ pub const IndexManager = struct {
         ) bool {
             const request = self.generated_templates[template_index];
             if (request.kind != .chunk_text) return false;
-            if (request.persist_artifact or request.full_text_index or request.consumer_indexes.len > 0) return true;
+            if (request.independently_required or request.full_text_index or request.consumer_indexes.len > 0) return true;
             for (self.chunk_dependents[template_index]) |dependent_index| {
                 const consumer = self.generated_templates[dependent_index];
                 if (!generatedEmbeddingRequired(extracted, consumer)) continue;
@@ -5850,9 +6086,19 @@ pub const IndexManager = struct {
             }
             chunk_dependents_initialized += 1;
         }
+        const catalog_indexes = try serializeCatalog(alloc, self);
+        errdefer alloc.free(catalog_indexes);
+        const catalog_enrichments = try enrichment_catalog.serializeCatalog(alloc, self.enrichments.items);
+        errdefer alloc.free(catalog_enrichments);
+        const catalog_resolvers = try resolver_catalog.serializeCatalog(alloc, self.resolvers.items);
+        errdefer alloc.free(catalog_resolvers);
+        var completion_plan = try @import("../artifact_completion_plan.zig").Plan.init(alloc, .{ .indexes = catalog_indexes, .enrichments = catalog_enrichments, .resolvers = catalog_resolvers }, generated_templates);
+        errdefer completion_plan.deinit();
         return .{
             .alloc = alloc,
             .generation = self.writePlanGeneration(),
+            .artifact_catalogs = .{ .indexes = catalog_indexes, .enrichments = catalog_enrichments, .resolvers = catalog_resolvers },
+            .catalog_empty = .{ self.count() == 0, self.enrichments.items.len == 0, self.resolvers.items.len == 0 },
             .has_text_consumers = blk: {
                 for (self.text_indexes.items) |*entry| {
                     if (!textEntryHasExplicitArtifactSources(entry)) break :blk true;
@@ -5863,6 +6109,7 @@ pub const IndexManager = struct {
             .sparse_fields = sparse_fields,
             .graph_fields = graph_fields,
             .generated_templates = generated_templates,
+            .completion_plan = completion_plan,
             .chunk_dependents = chunk_dependents,
             .text_requires_root = text_requires_root,
             .text_fields = try text_fields.toOwnedSlice(alloc),
@@ -6001,6 +6248,38 @@ pub const IndexManager = struct {
         try std.testing.expectEqual(@as(u32, 77), views.transient.?.version());
     }
 
+    test "ordered artifact inventory producer plan pins catalog bytes with compiled templates" {
+        const alloc = std.testing.allocator;
+        var manager = try IndexManager.init(alloc, ".");
+        defer manager.deinit();
+        var first = try manager.acquireWritePlanSnapshot();
+        defer first.release();
+        try std.testing.expect(first.plan().matchesArtifactInventory(.{}));
+        try std.testing.expect(first.plan().matchesArtifactInventory(first.plan().artifact_catalogs.?));
+        try manager.enrichments.ensureUnusedCapacity(alloc, 1);
+        manager.enrichments.appendAssumeCapacity(try enrichment_catalog.EnrichmentConfig.clone(alloc, .{ .name = "extraction", .kind = .asset, .source_field = "body" }));
+        _ = manager.write_plan_generation.fetchAdd(1, .release);
+        var next = try manager.acquireWritePlanSnapshot();
+        defer next.release();
+        try std.testing.expect(next.plan() != first.plan());
+        try std.testing.expect(!next.plan().matchesArtifactInventory(.{}));
+        try std.testing.expect(!next.plan().matchesArtifactInventory(first.plan().artifact_catalogs.?));
+        try std.testing.expect(!first.plan().matchesArtifactInventory(next.plan().artifact_catalogs.?));
+        try std.testing.expect(next.plan().matchesArtifactInventory(next.plan().artifact_catalogs.?));
+        try std.testing.expectEqual(@as(usize, 0), first.plan().generated_templates.len);
+        try std.testing.expectEqual(@as(usize, 1), next.plan().generated_templates.len);
+        try std.testing.expectEqualStrings("extraction", next.plan().generated_templates[0].artifact_name);
+        try std.testing.expectEqual(@as(usize, 1), first.plan().completion_plan.?.nodes.len);
+        try std.testing.expectEqual(@as(usize, 2), next.plan().completion_plan.?.nodes.len);
+        const first_requirements = try first.plan().completion_plan.?.page(null);
+        try std.testing.expectError(error.ArtifactCatalogDrift, next.plan().completion_plan.?.page(first_requirements.cursor));
+        // Missing catalogs may mean an empty definition, never a wildcard
+        // accepting a producer whose immutable template was just added.
+        var missing = next.plan().artifact_catalogs.?;
+        missing.enrichments = "";
+        try std.testing.expect(!next.plan().matchesArtifactInventory(missing));
+    }
+
     test "borrowed generated row plan preserves chunk consumer routing" {
         var consumers = [_][]u8{ @constCast("text-index"), @constCast("graph-index") };
         var templates = [_]enrichment_types.GeneratedEnrichmentRequest{.{
@@ -6123,7 +6402,7 @@ pub const IndexManager = struct {
             .no_meta_sync = self.relaxed_split_durability,
         }, .{
             .backend_options = self.dense_lsm_options,
-            .storage = self.dense_lsm_storage,
+            .storage = self.effectiveDenseStorage(),
             .cache = self.lsm_cache,
             .root_generation = self.lsm_root_generation,
         });
@@ -6148,11 +6427,13 @@ pub const IndexManager = struct {
         }
         entry.index.setExternalVectorLoader(vector_loader_context, loadDenseVectorForHbc);
         entry.index.setExternalVectorScratchLoader(vector_loader_context, loadDenseVectorForHbcIntoScratch);
+        entry.index.setExternalPreviousVectorScratchLoader(vector_loader_context, loadPreviousDenseVectorForHbcIntoScratch);
         entry.index.setExternalVectorBatchScratchLoader(vector_loader_context, loadDenseVectorsForHbcBatch);
         entry.index.setExternalVectorBatchTransformedMatrixLoader(vector_loader_context, loadDenseVectorsForHbcBatchIntoTransformedMatrix);
         entry.index.setExternalVectorBatchDistanceLoader(vector_loader_context, scoreDenseVectorsForHbcBatch);
         entry.index.setExternalVectorBatchBoundedDistanceLoader(vector_loader_context, scoreDenseVectorsForHbcBatchBounded);
         entry.index.setExternalVectorBatchLocatedDistanceLoader(vector_loader_context, scoreDenseVectorsFromNativeLocations);
+        entry.index.external_vector_batch_resolved_distance_loader = scoreDenseVectorsUnified;
         entry.index.setExternalVectorBoundedDistanceAvailable(vector_loader_context, denseVectorBoundedProjectionAvailable);
         configureDensePostingProjectionBuild(entry.index, vector_loader_context);
         self.attachVectorBlockResidencyPolicy(entry.index);
@@ -6188,6 +6469,8 @@ pub const IndexManager = struct {
         const path = try self.activeIndexPath(index_name);
         defer self.alloc.free(path);
 
+        if (self.primary_store) |store| try apply_state.invalidateProjectionCompletion(self.alloc, store);
+
         entry.index.close();
         if (entry.vector_loader_context) |ctx| {
             ctx.deinit(self.alloc);
@@ -6205,6 +6488,8 @@ pub const IndexManager = struct {
         const path = try self.activeIndexPath(index_name);
         defer self.alloc.free(path);
 
+        if (self.primary_store) |store| try apply_state.invalidateProjectionCompletion(self.alloc, store);
+
         entry.index.close();
         deleteIndexDirIfPresent(path);
 
@@ -6214,60 +6499,66 @@ pub const IndexManager = struct {
             .no_sync = self.relaxed_split_durability,
             .no_meta_sync = self.relaxed_split_durability,
             .backend = self.sparse_backend,
-            .lsm_storage = self.sparse_lsm_storage,
+            .lsm_storage = self.effectiveSparseStorage(),
             .lsm_cache = self.lsm_cache,
             .lsm_options = self.sparse_lsm_options,
             .lsm_root_generation = self.lsm_root_generation,
         });
     }
 
+    /// Blocks new catalog readers/scheduler snapshots and drains workers that
+    /// already released the catalog lock while retaining graph lifetime pins.
+    /// Keep this lease until replay, sync and durable publication complete.
+    pub const GraphArtifactRebuildLease = struct {
+        manager: *IndexManager,
+
+        pub fn reset(self: *@This(), index_name: []const u8) !void {
+            const entry = self.manager.graphIndex(index_name) orelse return error.IndexNotFound;
+            try entry.index.resetForArtifactRebuild();
+            entry.index.reconcileOwnershipRange(self.manager.byte_range.start, self.manager.byte_range.end);
+        }
+
+        pub fn complete(self: *@This()) void {
+            self.manager.graph_artifact_rebuild_pending = false;
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.manager.catalog_mutex.unlockExclusive();
+            self.* = undefined;
+        }
+    };
+
+    pub fn beginGraphArtifactRebuild(self: *IndexManager) GraphArtifactRebuildLease {
+        self.catalog_mutex.lockExclusive();
+        self.waitForGraphMetricSchedulePins();
+        self.graph_artifact_rebuild_pending = true;
+        return .{ .manager = self };
+    }
+
     pub fn resetGraphIndexForArtifactRebuild(self: *IndexManager, index_name: []const u8) !void {
-        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
-        const path = try self.activeIndexPath(index_name);
-        defer self.alloc.free(path);
-
-        var graph_cfg = try parseGraphConfig(self.alloc, entry.config.config_json);
-        defer graph_cfg.deinit(self.alloc);
-
-        const forward_path = try std.fmt.allocPrint(self.alloc, "{s}/forward", .{path});
-        defer self.alloc.free(forward_path);
-        const reverse_path = try std.fmt.allocPrint(self.alloc, "{s}/reverse", .{path});
-        defer self.alloc.free(reverse_path);
-        const zforward = try self.alloc.dupeZ(u8, forward_path);
-        defer self.alloc.free(zforward);
-        const zreverse = try self.alloc.dupeZ(u8, reverse_path);
-        defer self.alloc.free(zreverse);
-
-        entry.index.close();
-        deleteIndexDirIfPresent(path);
-
-        entry.index = try graph_mod.GraphIndex.openWithPrivateStores(self.alloc, zforward, zreverse, entry.config.name, .{
-            .managed_ownership_range = true,
-            .no_sync = self.relaxed_split_durability,
-            .no_meta_sync = self.relaxed_split_durability,
-            .reverse_backend = self.graph_reverse_backend,
-            .reverse_lsm_storage = self.graph_lsm_storage,
-            .reverse_lsm_cache = self.lsm_cache,
-            .reverse_lsm_options = self.graph_reverse_lsm_options,
-            .reverse_lsm_root_generation = self.lsm_root_generation,
-            .edge_type_configs = entry.edge_type_configs,
-            .rebuild_root_path = path,
-            .rebuild_owner_generation = coverageGenerationForConfig(entry.config),
-            .algebraic_semiring_traversal = graph_cfg.algebraic_semiring_traversal,
-        });
-        entry.index.reconcileOwnershipRange(self.byte_range.start, self.byte_range.end);
+        var lease = self.beginGraphArtifactRebuild();
+        defer lease.deinit();
+        try lease.reset(index_name);
+        lease.complete();
     }
 
     pub fn resetFullTextIndexForArtifactRebuild(self: *IndexManager, store: *docstore_mod.DocStore, index_name: []const u8) !u64 {
         const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
         const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
 
-        try entry.persistent.resetAllForRebuild();
+        var checkpoint = try apply_state.loadProjectionCheckpointWithSidecar(self.alloc, self.checkpointIo(), store, self.applied_sequence_checkpoint_path, entry.config.name);
+        checkpoint.status = .rebuilding;
+        checkpoint.generation = std.math.add(u64, checkpoint.generation, 1) catch return error.ResourceLimitExceeded;
+        checkpoint.config_hash = types.indexConfigHash(entry.config);
+        // A crash anywhere after this boundary leaves explicit repair debt,
+        // never an old clean watermark attached to an empty physical index.
+        try apply_state.saveProjectionCheckpointWithSidecar(self.alloc, self.checkpointIo(), store, self.applied_sequence_checkpoint_path, entry.config.name, checkpoint);
         try rebuild_state.updateWithIo(self.checkpointIo(), "");
+        try entry.persistent.resetAllForRebuild();
         try self.backfillTextIndex(store, entry, null);
         try entry.persistent.sync(true);
         try self.saveBackfilledAppliedSequence(store, entry.config);
-        var checkpoint = try apply_state.loadProjectionCheckpointWithSidecar(
+        checkpoint = try apply_state.loadProjectionCheckpointWithSidecar(
             self.alloc,
             self.checkpointIo(),
             store,
@@ -6304,17 +6595,46 @@ pub const IndexManager = struct {
         cancel_check: ?types.RepairCancelCheck,
         capacity_check: ?types.RepairCapacityCheck,
     ) !u64 {
+        var slice = try self.rebuildFullTextIndexFromReadTxnSlice(store, read_txn, index_name, null, .{
+            .cancel_check = cancel_check,
+            .capacity_check = capacity_check,
+        });
+        defer slice.deinit(self.alloc);
+        std.debug.assert(slice.resume_key == null);
+        return slice.rebuilt;
+    }
+
+    pub const FullTextRebuildSlice = struct {
+        rebuilt: u64,
+        resume_key: ?[]u8 = null,
+
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
+            if (self.resume_key) |key| alloc.free(key);
+        }
+    };
+
+    /// The candidate is private. Sync its page before returning a cursor that
+    /// the durable repair intent can publish; reopening never resets a prefix.
+    pub fn rebuildFullTextIndexFromReadTxnSlice(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        read_txn: *docstore_mod.DocStore.Txn,
+        index_name: []const u8,
+        resume_from: ?[]const u8,
+        options: types.ArtifactRepairRunOptions,
+    ) !FullTextRebuildSlice {
         const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
         const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
-
-        try checkRepairCancelled(cancel_check);
-        try entry.persistent.resetAllForRebuild();
-        try rebuild_state.updateWithIo(self.checkpointIo(), "");
-        try self.backfillTextIndexFromReadTxn(store, read_txn, entry, null, cancel_check, capacity_check);
-        try checkRepairCancelled(cancel_check);
+        try checkRepairCancelled(options.cancel_check);
+        if (resume_from == null) {
+            try entry.persistent.resetAllForRebuild();
+            try rebuild_state.updateWithIo(self.checkpointIo(), "");
+        }
+        const cursor = try self.backfillTextIndexFromReadTxn(store, read_txn, entry, resume_from, options.cancel_check, options.capacity_check, options.yield_check);
+        errdefer if (cursor) |key| self.alloc.free(key);
+        try checkRepairCancelled(options.cancel_check);
         try entry.persistent.sync(true);
-
-        return entry.persistent.snapshot().liveDocCount();
+        return .{ .rebuilt = entry.persistent.snapshot().liveDocCount(), .resume_key = cursor };
     }
 
     pub fn clearDenseHbcCaches(self: *IndexManager) void {
@@ -6389,7 +6709,7 @@ pub const IndexManager = struct {
         // Manually configured managers may not own an executor. Their worker
         // sweeps are normally synchronous; retain the established teardown
         // fallback for a structural mutation racing such a sweep.
-        while (self.graph_metric_schedule_pins.load(.acquire) != 0) std.Thread.yield() catch {};
+        while (self.graph_metric_schedule_pins.load(.acquire) != 0) @import("antfly_platform").time.yieldNow();
     }
 
     pub fn deinit(self: *IndexManager) void {
@@ -6613,6 +6933,13 @@ pub const IndexManager = struct {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
         return self.failed_index_loads.count() > 0;
+    }
+
+    pub fn firstFailedIndexLoadName(self: *IndexManager, alloc: Allocator) !?[]u8 {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        var iterator = self.failed_index_loads.keyIterator();
+        return if (iterator.next()) |name| try alloc.dupe(u8, name.*) else null;
     }
 
     pub const FailedIndexLoadSummary = struct {
@@ -7892,6 +8219,10 @@ pub const IndexManager = struct {
         for (self.algebraic_indexes.items) |*entry| try entry.index.sync(force);
     }
 
+    pub fn syncGraphIndexes(self: *IndexManager, force: bool) !void {
+        for (self.graph_indexes.items) |*entry| try entry.index.sync(force);
+    }
+
     pub fn nativeBackupBackendId(self: *IndexManager, name: []const u8, kind: types.IndexKind) []const u8 {
         return switch (kind) {
             .full_text => @tagName(self.text_main_backend),
@@ -7912,19 +8243,19 @@ pub const IndexManager = struct {
     /// immutable files that remain stable after capture admission reopens.
     pub fn nativeBackupSupportsImmutableCheckpoint(self: *IndexManager, name: []const u8, kind: types.IndexKind) bool {
         return switch (kind) {
-            .full_text => self.text_main_backend == .lsm and nativeBackupStoragePublicationCompatible(self.text_lsm_storage),
+            .full_text => self.text_main_backend == .lsm and nativeBackupStoragePublicationCompatible(self.effectiveTextMainStorage()),
             .dense_vector => if (self.denseIndex(name)) |entry|
                 if (entry.index.experimentalPostingWalAuthoritative())
                     // Native postings are the projection authority. Shared
                     // vector blocks are optional acceleration and therefore
                     // must not make an otherwise complete backup unsupported.
-                    nativeBackupStoragePublicationCompatible(self.dense_lsm_storage)
+                    nativeBackupStoragePublicationCompatible(self.effectiveDenseStorage())
                 else
-                    self.dense_storage_backend == .lsm and nativeBackupStoragePublicationCompatible(self.dense_lsm_storage)
+                    self.dense_storage_backend == .lsm and nativeBackupStoragePublicationCompatible(self.effectiveDenseStorage())
             else
                 false,
-            .sparse_vector => self.sparse_backend == .lsm and nativeBackupStoragePublicationCompatible(self.sparse_lsm_storage),
-            .graph => self.graph_reverse_backend == .lsm and nativeBackupStoragePublicationCompatible(self.graph_lsm_storage),
+            .sparse_vector => self.sparse_backend == .lsm and nativeBackupStoragePublicationCompatible(self.effectiveSparseStorage()),
+            .graph => self.graph_reverse_backend == .lsm and nativeBackupStoragePublicationCompatible(self.effectiveGraphStorage()),
             .algebraic => true,
         };
     }
@@ -7941,6 +8272,26 @@ pub const IndexManager = struct {
         alloc: Allocator,
         artifacts: std.ArrayListUnmanaged(Artifact) = .empty,
         native_files: ?native_backup.PinnedGeneratedArtifacts = null,
+
+        pub fn walPrefixBytes(self: *const NativeBackupCheckpoints) !u64 {
+            return if (self.native_files) |*files| try files.walPrefixBytes() else 0;
+        }
+
+        pub fn seal(self: *NativeBackupCheckpoints, io: std.Io, root: []const u8, cancellation: CancellationToken, wal_budget: u64) !u64 {
+            if (try self.walPrefixBytes() > wal_budget) return error.BackupSealWalBudgetExceeded;
+            var total: u64 = 0;
+            for (self.artifacts.items) |*artifact| {
+                const destination = try std.fmt.allocPrint(self.alloc, "{s}/indexes/{s}/{s}", .{ root, artifact.index_name, artifact.backend_root });
+                defer self.alloc.free(destination);
+                const bytes = switch (artifact.checkpoint) {
+                    .lsm => |*checkpoint| try checkpoint.seal(io, destination, cancellation),
+                    .text_segments => |*checkpoint| try checkpoint.seal(self.alloc, io, destination, cancellation),
+                };
+                total = std.math.add(u64, total, bytes) catch return error.FileTooBig;
+            }
+            if (self.native_files) |*files| total = std.math.add(u64, total, try files.seal(root, cancellation, wal_budget)) catch return error.FileTooBig;
+            return total;
+        }
 
         const Artifact = struct {
             index_name: []u8,
@@ -8624,6 +8975,130 @@ pub const IndexManager = struct {
         }
     }
 
+    pub const FullTextProjectionGuard = struct {
+        alloc: Allocator,
+        apply_guard: ManagedIndexApplyGuard,
+        snapshot: *const apply_state.ProjectionSnapshot,
+        admission_key: []u8,
+        index_name: []const u8,
+        seal: @import("../../projection_seal.zig").Seal,
+        checkpoint: apply_state.ProjectionCheckpoint,
+
+        pub fn deinit(self: *@This()) void {
+            self.alloc.free(self.admission_key);
+            self.apply_guard.unlock();
+            self.* = undefined;
+        }
+
+        /// The checkpoint snapshot must outlive this guard. Call in the same
+        /// primary transaction that publishes the aggregate evidence record.
+        pub fn requireCurrent(self: *const @This(), txn: anytype) !void {
+            try self.snapshot.requireCurrent(txn);
+            if (self.apply_guard.manager.artifact_projection_root != self.seal.root) return error.EnrichmentSourceChanged;
+            _ = txn.get(self.admission_key) catch |err| switch (err) {
+                error.NotFound => return,
+                else => return err,
+            };
+            return error.EnrichmentSourceChanged;
+        }
+    };
+
+    /// Validate a physical full-text generation against one coherently loaded
+    /// sidecar. Catalog/admission/apply acquisition uses try-locks after the
+    /// file lease: replay publishers can acquire them in the opposite order. The
+    /// returned guard retains catalog/apply ownership through final primary
+    /// publication; no filesystem work belongs in that primary transaction.
+    pub fn tryValidateFullTextProjection(
+        self: *IndexManager,
+        alloc: Allocator,
+        snapshot: *const apply_state.ProjectionSnapshot,
+        index_name: []const u8,
+        expected_generation: u64,
+    ) !?FullTextProjectionGuard {
+        return self.tryValidateFullTextProjectionWithAdoptionHint(alloc, snapshot, index_name, expected_generation, null);
+    }
+
+    /// Missing or incompatible proof on an otherwise clean, idle generation
+    /// needs a baseline build. Imported physical data cannot adopt another
+    /// root's evidence. Contention or existing repair never creates a hint.
+    pub fn tryValidateFullTextProjectionWithAdoptionHint(
+        self: *IndexManager,
+        alloc: Allocator,
+        snapshot: *const apply_state.ProjectionSnapshot,
+        index_name: []const u8,
+        expected_generation: u64,
+        needs_adoption: ?*bool,
+    ) !?FullTextProjectionGuard {
+        if (needs_adoption) |hint| hint.* = false;
+        if (self.artifact_projection_root == 0 or !self.catalog_mutex.tryLockShared()) return null;
+        var catalog_owned = true;
+        defer if (catalog_owned) self.catalog_mutex.unlockShared();
+        const entry = self.textIndexEntry(index_name) orelse return null;
+        if (entry.config.coverage_generation != expected_generation) return null;
+        // Progressive query serviceability is not corpus-wide completion.
+        if (self.repair_unavailable_indexes.get(index_name)) |slot| if (slot.retained()) return null;
+        if (!self.managed_admission_mutex.tryLock()) return null;
+        const pending = self.managed_admission_indexes.contains(index_name);
+        self.managed_admission_mutex.unlock();
+        if (pending or !entry.apply_mutex.tryLock()) return null;
+        var apply_owned = true;
+        defer if (apply_owned) entry.apply_mutex.unlock();
+        const checkpoint = snapshot.get(index_name) orelse return null;
+        const config_hash = types.indexConfigHash(entry.config);
+        if (checkpoint.status != .clean or checkpoint.config_hash != config_hash) return null;
+        var rebuilding = try self.rebuildState(.full_text, entry.rebuild_root_path, entry.config).loadWithIo(alloc, self.checkpointIo());
+        defer rebuilding.deinit(alloc);
+        if (rebuilding != .absent) return null;
+        const loaded_seal = entry.persistent.loadProjectionSeal(alloc) catch |err| switch (err) {
+            // Rebuild from source; never reconstruct physical completeness
+            // from a plausible sidecar when the generation's proof is lost.
+            error.InvalidProjectionSeal => null,
+            else => return err,
+        };
+        const seal = loaded_seal orelse {
+            if (needs_adoption) |hint| hint.* = true;
+            return null;
+        };
+        if (seal.root != self.artifact_projection_root or
+            !std.mem.eql(u8, &seal.namespace, &snapshot.authority.namespace) or
+            seal.generation != expected_generation or seal.config_hash != config_hash or
+            seal.applied_sequence < checkpoint.applied_sequence)
+        {
+            // The clean sidecar is not authority to relabel physical proof.
+            // Reconstruct under the current owner and publish a new seal only
+            // after the ordinary snapshot/catch-up activation fences pass.
+            if (needs_adoption) |hint| hint.* = true;
+            return null;
+        }
+        const admission_key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, index_name);
+        catalog_owned = false;
+        apply_owned = false;
+        return .{ .alloc = alloc, .apply_guard = .{ .manager = self, .mutex = entry.apply_mutex }, .snapshot = snapshot, .admission_key = admission_key, .index_name = entry.config.name, .seal = seal, .checkpoint = checkpoint };
+    }
+
+    pub fn publishFullTextReplaySeal(self: *IndexManager, update: apply_state.AppliedSequenceUpdate) !void {
+        if (self.artifact_projection_root == 0) return;
+        const store = self.primary_store orelse return;
+        const namespace = blk: {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            const selected = (try @import("../artifact_publication.zig").authority(&read)) orelse return;
+            break :blk selected.namespace;
+        };
+        var guard = try self.lockManagedIndexApply(.{ .name = update.index_name, .kind = .full_text });
+        defer guard.unlock();
+        const entry = self.textIndexEntry(update.index_name) orelse return error.IndexNotFound;
+        const config_hash = types.indexConfigHash(entry.config);
+        if (update.config_hash != config_hash) return error.ArtifactCatalogDrift;
+        try entry.persistent.publishProjectionSeal(.{
+            .root = self.artifact_projection_root,
+            .namespace = namespace,
+            .generation = entry.config.coverage_generation,
+            .config_hash = config_hash,
+            .applied_sequence = update.sequence,
+        });
+    }
+
     pub fn saveDenseProjectionCheckpointMetadata(
         self: *IndexManager,
         index_name: []const u8,
@@ -8641,6 +9116,9 @@ pub const IndexManager = struct {
             .generation = checkpoint.generation,
             .config_hash = checkpoint.config_hash,
         });
+        // Verify at publication time. A status request may arrive only after
+        // the next live mutation has already advanced the resident count.
+        _ = entry.validateServingCertificate(checkpoint);
     }
 
     pub fn denseProjectionCheckpointMetadata(
@@ -8725,8 +9203,6 @@ pub const IndexManager = struct {
         stats.text_indexes = @intCast(self.text_indexes.items.len);
         for (self.text_indexes.items) |*entry| {
             const persistent_memory = entry.persistent.memoryStatsSnapshot();
-            stats.configured_lmdb_main_map_bytes +|= persistent_memory.configured_lmdb_main_map_bytes;
-            stats.configured_lmdb_wal_map_bytes +|= persistent_memory.configured_lmdb_wal_map_bytes;
             stats.text_segment_estimated_resident_bytes +|= persistent_memory.segment_estimated_resident_bytes;
             stats.text_segment_recently_touched_bytes +|= persistent_memory.segment_recently_touched_bytes;
             stats.text_segment_cold_mapped_bytes +|= persistent_memory.segment_cold_mapped_bytes;
@@ -8866,7 +9342,7 @@ pub const IndexManager = struct {
         const footprint_after_lsm_resource_gap = memory.footprint_bytes -| lsm_resource_used;
 
         std.log.info(
-            "antfly_bench_memory_attribution label={s} source_docs={d} projection_docs={d} batch_segments={d} rss_bytes={d} footprint_bytes={d} peak_footprint_bytes={d} malloc_available={any} malloc_allocated_bytes={d} malloc_zone_bytes={d} text_indexes={d} text_segments={d} text_segment_bytes={d} mapped_segment_bytes={d} text_mmap_segment_bytes={d} text_heap_segment_bytes={d} text_max_segment_bytes={d} text_segment_estimated_resident_bytes={d} text_segment_recently_touched_bytes={d} text_segment_cold_mapped_bytes={d} text_segment_residency_evictions={d} configured_lmdb_main_map_bytes={d} configured_lmdb_wal_map_bytes={d}",
+            "antfly_bench_memory_attribution label={s} source_docs={d} projection_docs={d} batch_segments={d} rss_bytes={d} footprint_bytes={d} peak_footprint_bytes={d} malloc_available={any} malloc_allocated_bytes={d} malloc_zone_bytes={d} text_indexes={d} text_segments={d} text_segment_bytes={d} mapped_segment_bytes={d} text_mmap_segment_bytes={d} text_heap_segment_bytes={d} text_max_segment_bytes={d} text_segment_estimated_resident_bytes={d} text_segment_recently_touched_bytes={d} text_segment_cold_mapped_bytes={d} text_segment_residency_evictions={d}",
             .{
                 label,
                 source_docs,
@@ -8889,8 +9365,6 @@ pub const IndexManager = struct {
                 text_stats.text_segment_recently_touched_bytes,
                 text_stats.text_segment_cold_mapped_bytes,
                 text_stats.text_segment_residency_evictions,
-                text_stats.configured_lmdb_main_map_bytes,
-                text_stats.configured_lmdb_wal_map_bytes,
             },
         );
         std.log.info(
@@ -9319,6 +9793,14 @@ pub const IndexManager = struct {
     fn graphMetricWorkerSnapshotAlloc(self: *IndexManager) !GraphMetricWorkerSnapshot {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
+        if (self.graph_retirement_closed.load(.acquire)) return error.IntegrityTopologyBusy;
+        if (self.graph_artifact_rebuild_pending) {
+            const entries = try self.alloc.alloc(GraphMetricWorkerSnapshotEntry, 0);
+            errdefer self.alloc.free(entries);
+            const names = try self.alloc.alloc(u8, 0);
+            _ = self.graph_metric_schedule_pins.fetchAdd(1, .acq_rel);
+            return .{ .manager = self, .entries = entries, .names = names };
+        }
         const metric_count = self.graphMetricScheduleEntryCount();
         const entry_count = metric_count + self.graph_indexes.items.len;
         const entries = try self.alloc.alloc(GraphMetricWorkerSnapshotEntry, entry_count);
@@ -9600,6 +10082,9 @@ pub const IndexManager = struct {
         self: *IndexManager,
         options: GraphMetricDegreeCanaryOptions,
     ) !GraphMetricDegreeCanaryDecision {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        if (self.graph_artifact_rebuild_pending) return .{};
         var decision = GraphMetricDegreeCanaryDecision{
             .max_control_records = options.max_control_records,
         };
@@ -9644,6 +10129,7 @@ pub const IndexManager = struct {
     ) !GraphMetricPlannedAutoIdleDecision {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
+        if (self.graph_artifact_rebuild_pending) return .{};
         var decision = GraphMetricPlannedAutoIdleDecision{};
         for (self.graph_indexes.items) |*entry| {
             const index_active_builds = try graphMetricIndexActiveBuilds(entry);
@@ -9759,6 +10245,8 @@ pub const IndexManager = struct {
     ) !GraphMetricPlannedSchedulerSweepResult {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
+        if (self.graph_retirement_closed.load(.acquire)) return error.IntegrityTopologyBusy;
+        if (self.graph_artifact_rebuild_pending) return .{};
         return try self.runGraphMetricPlannedCoordinatorSweepUnlocked(options);
     }
 
@@ -10215,6 +10703,213 @@ pub const IndexManager = struct {
         return total_steps;
     }
 
+    pub const PostingRefreshCapture = union(enum) {
+        prepared: *hbc_mod.HBCIndex.PreparedPostingRefresh,
+        deferred,
+        synchronous_required,
+    };
+
+    /// This input owns generations and artifact-family strings, not catalog,
+    /// index or loader-context pointers. A dropped/recreated index cannot
+    /// change its reads; publication independently checks incarnation/epoch.
+    const DetachedPostingInput = struct {
+        source: *SharedVectorBlockGeneration,
+        metadata: hbc_mod.HBCIndex.PostingMetadataSnapshot,
+        artifact_name: []const u8,
+        embedding_names: []const []const u8,
+        io: ?std.Io,
+
+        fn release(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.metadata.deinit();
+            self.source.release();
+        }
+
+        fn artifactKey(self: *@This(), alloc: Allocator, metadata: []const u8) ![]u8 {
+            return denseVectorArtifactKeyForFamilyAlloc(alloc, self.embedding_names, self.artifact_name, metadata);
+        }
+
+        fn load(ptr: *anyopaque, prepared: *hbc_mod.HBCIndex.PreparedPostingRefresh) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const leaf = prepared.nodes.get(prepared.leaf_id) orelse return error.NotFound;
+            if (prepared.vectors.len == 0) return;
+            const dims = prepared.config.dims;
+            const Lookup = struct {
+                id: u64,
+                position: usize,
+                fn lessThan(_: void, a: @This(), b: @This()) bool {
+                    return a.id < b.id;
+                }
+            };
+            const opened = &self.source.opened;
+            const stride = try vector_block_mod.encodedVectorBytesLen(.float32, dims);
+            var offset: usize = 0;
+            while (offset < leaf.members.len) {
+                const wave_count = @min(@as(usize, 256), leaf.members.len - offset);
+                const ids = leaf.members[offset..][0..wave_count];
+                var locations: [256]?vector_block_store_mod.LocatedValue = @splat(null);
+                var misses: [256]Lookup = undefined;
+                var missing_ids: [256]u64 = undefined;
+                var metadata: [256]?[]const u8 = undefined;
+                var missing_count: usize = 0;
+                const metadata_started = platform_time.monotonicNs();
+                for (ids, 0..) |id, pos| {
+                    if (self.source.member_bindings) |bindings| {
+                        if (bindings.get(prepared.identity, id)) |row|
+                            locations[pos] = opened.bindSourceRow(row) catch null;
+                    }
+                    if (locations[pos] != null) {
+                        prepared.binding_hits += 1;
+                    } else {
+                        misses[missing_count] = .{ .id = id, .position = pos };
+                        missing_count += 1;
+                    }
+                }
+                std.mem.sort(Lookup, misses[0..missing_count], {}, Lookup.lessThan);
+                for (misses[0..missing_count], 0..) |miss, i| missing_ids[i] = miss.id;
+                try self.metadata.getManySorted(missing_ids[0..missing_count], metadata[0..missing_count]);
+                for (misses[0..missing_count], metadata[0..missing_count]) |miss, doc| {
+                    const key = try self.artifactKey(prepared.alloc, doc orelse return error.PreparedInputUnavailable);
+                    const found = try opened.locateHashed(key, vector_block_mod.keyHash(key), self.metadata.source_sequence, null);
+                    locations[miss.position] = switch (found) {
+                        .vector => |location| location,
+                        .missing, .tombstone => return error.PreparedInputUnavailable,
+                    };
+                }
+                prepared.metadata_ns += platform_time.monotonicNs() -| metadata_started;
+                const requests = try prepared.alloc.alloc(vector_block_store_mod.ExactReadRequest, wave_count);
+                const payload = try prepared.alloc.alloc(u8, try std.math.mul(usize, stride, wave_count));
+                for (requests, 0..) |*request, pos| request.* = .{
+                    .located = locations[pos].?,
+                    .scratch = payload[pos * stride ..][0..stride],
+                    .result_position = pos,
+                };
+                opened.orderExactReadsByLocation(requests);
+                const read_started = platform_time.monotonicNs();
+                _ = try opened.readExactIntoBatch(self.io, requests);
+                prepared.read_ns += platform_time.monotonicNs() -| read_started;
+                const decode = try prepared.alloc.alloc(f32, dims);
+                for (requests) |request| {
+                    if (request.err) |err| return err;
+                    const value = request.value orelse return error.PreparedInputUnavailable;
+                    if (value.dims != dims) return error.InvalidVectorDimensions;
+                    const pos = request.result_position;
+                    const out = prepared.vectors[(offset + pos) * dims ..][0..dims];
+                    // Native float32 bytes usually borrow a mapped view. Keep
+                    // decoding scratch separate from in-place transforms.
+                    const vector = value.vectorView() orelse try value.decodeExactInto(decode);
+                    _ = prepared.rot.transform(vector, out);
+                    if (prepared.config.metric == .cosine) _ = vector_mod.normalize(out);
+                    if (self.source.member_bindings) |bindings|
+                        if (opened.sourceRow(request.located)) |row| bindings.put(prepared.identity, ids[pos], row);
+                    prepared.input_rows += 1;
+                }
+                offset += wave_count;
+            }
+        }
+    };
+
+    pub fn captureDensePostingRefresh(self: *IndexManager) !?*hbc_mod.HBCIndex.PreparedPostingRefresh {
+        return switch (try self.captureDensePostingRefreshWithOutcome()) {
+            .prepared => |prepared| prepared,
+            .deferred, .synchronous_required => null,
+        };
+    }
+
+    pub fn captureDensePostingRefreshWithOutcome(self: *IndexManager) !PostingRefreshCapture {
+        var synchronous_required = false;
+        for (self.dense_indexes.items) |*entry| {
+            if (!entry.apply_mutex.tryLock()) continue;
+            defer entry.apply_mutex.unlock();
+            if (!entry.index.postingRefreshPending()) continue;
+            if (entry.index.resource_manager) |resources| if (resources.shouldDeferPostingRefreshForForegroundWrites()) continue;
+            if (entry.index.treeLinkRepairPending() or
+                (if (entry.index.resource_manager) |resources| resources.dense_posting_row_deltas else @import("../../dense_perf_experiments.zig").enabled("ANTFLY_EXPERIMENT_POSTING_ROW_DELTAS")))
+            {
+                synchronous_required = true;
+                continue;
+            }
+            var metadata = entry.index.capturePostingMetadataSnapshot();
+            defer if (metadata) |*snapshot| snapshot.deinit();
+            var source = self.acquireVectorBlockGeneration();
+            defer if (source) |generation| generation.release();
+            const detached = metadata != null and source != null and
+                !self.vector_block_projection_dirty.load(.acquire) and
+                source.?.opened.scorePrecision() == .authoritative_float32 and
+                vectorBlockGenerationExactAtSequence(source.?, metadata.?.source_sequence);
+            const prepared = (try entry.index.capturePostingRefreshWithOptions(entry.capture_incarnation, detached)) orelse continue;
+            errdefer prepared.deinit();
+            prepared.index_name = try prepared.alloc.dupe(u8, entry.config.name);
+            if (detached) {
+                const input = try prepared.alloc.create(DetachedPostingInput);
+                const names = try prepared.alloc.alloc([]const u8, entry.embedding_names.len);
+                for (entry.embedding_names, 0..) |name, i| names[i] = try prepared.alloc.dupe(u8, name);
+                input.* = .{
+                    .source = source.?,
+                    .metadata = metadata.?,
+                    .artifact_name = try prepared.alloc.dupe(u8, denseVectorArtifactNameAt(entry, 0)),
+                    .embedding_names = names,
+                    .io = self.io,
+                };
+                prepared.input = .{ .ctx = input, .load = DetachedPostingInput.load, .release = DetachedPostingInput.release };
+                source = null;
+                metadata = null;
+            }
+            return .{ .prepared = prepared };
+        }
+        return if (synchronous_required) .synchronous_required else .deferred;
+    }
+
+    pub fn publishPreparedDensePostingRefresh(self: *IndexManager, prepared: *hbc_mod.HBCIndex.PreparedPostingRefresh) !hbc_mod.HBCIndex.PostingRefreshProgress {
+        const entry = self.denseIndex(prepared.index_name) orelse return .{ .pending = true };
+        if (entry.capture_incarnation != prepared.identity or !entry.apply_mutex.tryLock()) return .{ .pending = true };
+        defer entry.apply_mutex.unlock();
+        const repaired = try entry.index.publishPreparedPostingRefresh(prepared);
+        return .{ .pending = true, .scanned = 1, .repaired = @intFromBool(repaired), .yield_after_page = entry.index.shouldDeferOptionalPostingMaintenance() };
+    }
+
+    pub fn refreshDensePostingPayloadPage(self: *IndexManager, allow_mutation: bool) !hbc_mod.HBCIndex.PostingRefreshProgress {
+        var total: hbc_mod.HBCIndex.PostingRefreshProgress = .{};
+        for (self.dense_indexes.items) |*entry| {
+            if (!entry.apply_mutex.tryLock()) {
+                total.pending = true;
+                continue;
+            }
+            defer entry.apply_mutex.unlock();
+            const foreground = entry.index.shouldDeferOptionalPostingMaintenance();
+            total.yield_after_page = total.yield_after_page or (foreground and allow_mutation);
+            // Preserve the existing flagged structural-repair lane. It is
+            // separate from the ordinary payload page budget and remains
+            // optional under foreground pressure.
+            if (entry.index.treeLinkRepairPending()) {
+                if (foreground) {
+                    total.pending = true;
+                    continue;
+                }
+                if (!allow_mutation) {
+                    total.needs_write = true;
+                    total.pending = true;
+                    continue;
+                }
+                if (try entry.index.maybeRepairTreeLinks(dense_link_repair_max_nodes)) |repair| {
+                    total.repaired += @intCast(repair.repaired());
+                    total.pending = total.pending or !repair.completed;
+                }
+            }
+            const page = try entry.index.refreshPostingPayloadPageWithOptions(
+                if (foreground) 32 else 128,
+                if (foreground) 1 else 8,
+                true,
+                allow_mutation,
+            );
+            total.repaired += page.repaired;
+            total.scanned += page.scanned;
+            total.pending = total.pending or page.pending;
+            total.needs_write = total.needs_write or page.needs_write;
+        }
+        return total;
+    }
+
     /// Drains query-visible posting repair debt at an explicit idle boundary.
     /// Each repair call remains bounded and cooperatively yields to foreground
     /// queries, but a lifecycle fence must not return after only the first
@@ -10309,6 +11004,10 @@ pub const IndexManager = struct {
     }
 
     pub const OnlineVectorBlockPublicationOptions = struct {
+        /// Source ownership conversion calls this only after physical primary
+        /// values are all references. Preserve healthy serving while replacing
+        /// the old full-payload exact-vector plane.
+        require_storage_encoding: bool = false,
         cancel_check: ?types.RepairCancelCheck = null,
         /// The repair owner has verified terminal source-outcome coverage for
         /// this rebuilding index. This permits staging only; serving and the
@@ -10352,7 +11051,9 @@ pub const IndexManager = struct {
             if (options.only_index) |name| if (!std.mem.eql(u8, name, entry.config.name)) continue;
             if (self.repairUnavailable(entry.config.name) and
                 !(options.covered_rebuilding_index != null and std.mem.eql(u8, options.covered_rebuilding_index.?, entry.config.name))) continue;
-            if (self.vectorBlockReadyForDenseIndex(entry.config.name) and !entry.index.nativePostingAccelerationPending()) continue;
+            const healthy = self.vectorBlockReadyForDenseIndex(entry.config.name);
+            if (healthy and !entry.index.nativePostingAccelerationPending() and
+                (!options.require_storage_encoding or self.vectorBlockUsesDesiredEncoding())) continue;
             const sequence = entry.index.experimentalPostingDurableAppliedSequence() orelse continue;
             if (sequence != primary.lastReplaySequence(0)) {
                 deferred = true;
@@ -10372,16 +11073,20 @@ pub const IndexManager = struct {
                     continue;
                 }
             }
-            if (self.vector_block_stable_tip_finalizing.cmpxchgStrong(false, true, .acq_rel, .acquire) != null)
-                return .{ .published = published, .deferred = true };
-            self.vector_block_stable_tip_index.store(@intFromPtr(entry), .release);
-            self.vector_block_stable_tip_sequence.store(sequence, .release);
-            defer {
+            // Healthy replacements are serialized by the DB projection owner
+            // and base-staging reservation. They do not close serving admission.
+            if (!healthy) {
+                if (self.vector_block_stable_tip_finalizing.cmpxchgStrong(false, true, .acq_rel, .acquire) != null)
+                    return .{ .published = published, .deferred = true };
+                self.vector_block_stable_tip_index.store(@intFromPtr(entry), .release);
+                self.vector_block_stable_tip_sequence.store(sequence, .release);
+            }
+            defer if (!healthy) {
                 self.vector_block_stable_tip_sequence.store(0, .release);
                 self.vector_block_stable_tip_index.store(0, .release);
                 self.vector_block_stable_tip_finalizing.store(false, .release);
-            }
-            self.ensureVectorBlockBaseAtAppliedSequence(entry.config.name, sequence) catch |err| switch (err) {
+            };
+            self.ensureVectorBlockBaseAtAppliedSequenceWithEncoding(entry.config.name, sequence, options.require_storage_encoding) catch |err| switch (err) {
                 error.PostingCheckpointSequenceMismatch,
                 error.VectorBlockSnapshotAdvancedWithoutWal,
                 error.VectorBlockGenerationReservationLost,
@@ -10826,6 +11531,7 @@ pub const IndexManager = struct {
 
     pub fn setIo(self: *IndexManager, io: ?std.Io) void {
         self.io = io;
+        self.graph_primary_publication.io = io;
         for (self.text_indexes.items) |*entry| {
             entry.io = self.checkpointIo();
             entry.persistent.io = io;
@@ -10834,7 +11540,10 @@ pub const IndexManager = struct {
     }
 
     pub fn checkpointIo(self: *const IndexManager) std.Io {
-        return self.io orelse std.Io.Threaded.global_single_threaded.io();
+        return self.io orelse if (comptime builtin.os.tag == .freestanding)
+            .failing
+        else
+            std.Io.Threaded.global_single_threaded.io();
     }
 
     /// Binds rebuild cursors to the same storage backend as their index kind.
@@ -10847,10 +11556,10 @@ pub const IndexManager = struct {
         cfg: types.IndexConfig,
     ) backfill_state_mod.RebuildState {
         const storage = switch (kind) {
-            .full_text => self.text_lsm_storage,
-            .dense_vector => self.dense_lsm_storage,
-            .sparse_vector => self.sparse_lsm_storage,
-            .graph => self.graph_lsm_storage,
+            .full_text => self.effectiveTextMainStorage(),
+            .dense_vector => self.effectiveDenseStorage(),
+            .sparse_vector => self.effectiveSparseStorage(),
+            .graph => self.effectiveGraphStorage(),
             .algebraic => null,
         };
         return backfill_state_mod.RebuildState.initOwned(
@@ -10919,7 +11628,7 @@ pub const IndexManager = struct {
         try self.prepareStorageForFreshCatalogEntry(store, stored_cfg);
         try self.provisionConfiguredIndexDirDurable(stored_cfg);
 
-        const create_fresh_native_v2 = if (comptime @TypeOf(store) == *docstore_mod.DocStore)
+        const create_fresh_native_v2 = if (comptime @TypeOf(store) == *docstore_mod.DocStore and builtin.os.tag != .freestanding)
             self.freshDenseNativeV2Permitted(stored_cfg)
         else
             false;
@@ -10955,7 +11664,7 @@ pub const IndexManager = struct {
         errdefer {
             self.removeInMemory(stored_cfg.name);
         }
-        if (comptime @TypeOf(store) == *docstore_mod.DocStore) {
+        if (comptime @TypeOf(store) == *docstore_mod.DocStore and builtin.os.tag != .freestanding) {
             if (fresh_native_generation) |*generation| {
                 try self.completeFreshDenseNativeGeneration(
                     store,
@@ -11210,9 +11919,45 @@ pub const IndexManager = struct {
         updated_no_backfill,
     };
 
+    pub fn resolverConfigMatches(self: *IndexManager, cfg: resolver_catalog.ResolverConfig) bool {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        const existing = self.getResolver(cfg.name) orelse return false;
+        return existing.eql(cfg);
+    }
+
+    fn resolverLabelSetsEqual(a: []const []const u8, b: []const []const u8) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |as, bs| if (!std.mem.eql(u8, as, bs)) return false;
+        return true;
+    }
+
+    /// Label-routing admission: labeled resolvers sharing a source artifact
+    /// must claim disjoint label sets, otherwise the mention partition is
+    /// ambiguous. Catch-alls (empty `labels`) are unrestricted — multiple
+    /// catch-alls per artifact remain admitted for compatibility with
+    /// intentional double-resolution setups, and each catch-all skips the
+    /// labels claimed by labeled siblings at runtime. Caller holds the
+    /// catalog mutex.
+    fn resolverLabelRoutingConflicts(self: *const IndexManager, cfg: resolver_catalog.ResolverConfig) bool {
+        if (cfg.labels.len == 0) return false;
+        for (self.resolvers.items) |entry| {
+            if (std.mem.eql(u8, entry.name, cfg.name)) continue;
+            if (entry.labels.len == 0) continue;
+            if (!std.mem.eql(u8, entry.source_artifact, cfg.source_artifact)) continue;
+            if (!entry.source_artifact_kind.matches(cfg.source_artifact_kind) and
+                !cfg.source_artifact_kind.matches(entry.source_artifact_kind)) continue;
+            for (entry.labels) |claimed| {
+                if (cfg.resolvesLabel(claimed)) return true;
+            }
+        }
+        return false;
+    }
+
     fn resolverMaterialConfigChanged(existing: resolver_catalog.ResolverConfig, next: resolver_catalog.ResolverConfig) bool {
         return !std.mem.eql(u8, existing.table, next.table) or
             !std.mem.eql(u8, existing.key_template, next.key_template) or
+            !resolverLabelSetsEqual(existing.labels, next.labels) or
             existing.type_must_match != next.type_must_match or
             !std.mem.eql(u8, existing.scorer_json, next.scorer_json) or
             !std.mem.eql(u8, existing.candidate_search, next.candidate_search) or
@@ -11224,6 +11969,10 @@ pub const IndexManager = struct {
             existing.fusion_trust != next.fusion_trust or
             existing.fusion_prior != next.fusion_prior or
             existing.fusion_prior_weight != next.fusion_prior_weight or
+            // A changed admission floor re-resolves the corpus: raising it
+            // must retire existing low-confidence resolutions and their
+            // edges, not leave them in place until an unrelated change.
+            existing.min_confidence != next.min_confidence or
             existing.config_generation != next.config_generation;
     }
 
@@ -11232,6 +11981,7 @@ pub const IndexManager = struct {
         defer self.catalog_mutex.unlockExclusive();
         if (self.getResolver(cfg.name) != null) return error.ResolverAlreadyExists;
         if (self.resolverResolutionArtifactInUse(cfg.resolution_artifact, null)) return error.ResolverArtifactAlreadyExists;
+        if (self.resolverLabelRoutingConflicts(cfg)) return error.ResolverLabelRoutingConflict;
 
         const checkpoint = self.resolvers.items.len;
         errdefer self.truncateResolvers(checkpoint);
@@ -11248,10 +11998,12 @@ pub const IndexManager = struct {
         defer self.catalog_mutex.unlockExclusive();
         for (self.resolvers.items) |*entry| {
             if (!std.mem.eql(u8, entry.name, cfg.name)) continue;
+            if (entry.eql(cfg)) return .updated_no_backfill;
             if (!std.mem.eql(u8, entry.source_artifact, cfg.source_artifact)) return error.ResolverSourceArtifactImmutable;
             if (entry.source_artifact_kind != cfg.source_artifact_kind) return error.ResolverSourceArtifactImmutable;
             if (!std.mem.eql(u8, entry.resolution_artifact, cfg.resolution_artifact)) return error.ResolverArtifactImmutable;
             if (self.resolverResolutionArtifactInUse(cfg.resolution_artifact, cfg.name)) return error.ResolverArtifactAlreadyExists;
+            if (self.resolverLabelRoutingConflicts(cfg)) return error.ResolverLabelRoutingConflict;
             const material_changed = resolverMaterialConfigChanged(entry.*, cfg);
             var previous = entry.*;
             entry.* = try resolver_catalog.ResolverConfig.clone(self.alloc, cfg);
@@ -11264,6 +12016,7 @@ pub const IndexManager = struct {
             return if (material_changed) .updated_backfill_required else .updated_no_backfill;
         }
         if (self.resolverResolutionArtifactInUse(cfg.resolution_artifact, null)) return error.ResolverArtifactAlreadyExists;
+        if (self.resolverLabelRoutingConflicts(cfg)) return error.ResolverLabelRoutingConflict;
         const checkpoint = self.resolvers.items.len;
         errdefer self.truncateResolvers(checkpoint);
         try self.resolvers.append(self.alloc, try resolver_catalog.ResolverConfig.clone(self.alloc, cfg));
@@ -12831,6 +13584,59 @@ pub const IndexManager = struct {
         return self.cached_has_generated_enrichment_targets.load(.acquire);
     }
 
+    /// Which adjacency orientations asset enrichments sample from one graph
+    /// index via `neighbor_context`. `out` means some enrichment samples a
+    /// document's outgoing edges (direction `out` or `both`), `in` means some
+    /// enrichment samples reverse edges (direction `in` or `both`).
+    pub const NeighborContextDirections = struct {
+        out: bool = false,
+        in: bool = false,
+
+        pub fn any(self: @This()) bool {
+            return self.out or self.in;
+        }
+    };
+
+    /// Read-only scheduling lookup for graph-edge mutations: does any
+    /// admitted asset enrichment sample `neighbor_context` adjacency from the
+    /// named graph index, and in which orientations? An edge write or delete
+    /// on a referenced index must wake the enrichment worker for the affected
+    /// documents, because the sampled adjacency participates in the producer
+    /// skip-state hash. Catalogs hold few enrichments and the stored
+    /// neighbor-context JSON is small and admission-validated, so this parses
+    /// on demand instead of maintaining another invalidated cache; callers on
+    /// the batch-apply path memoize per index name. A stored config that no
+    /// longer parses contributes nothing (fail open-empty, matching the
+    /// runtime's empty-neighbors fallback).
+    pub fn assetNeighborContextDirectionsForGraphIndex(
+        self: *const IndexManager,
+        alloc: Allocator,
+        graph_index_name: []const u8,
+    ) !NeighborContextDirections {
+        var directions: NeighborContextDirections = .{};
+        if (graph_index_name.len == 0) return directions;
+        for (self.enrichments.items) |entry| {
+            if (entry.kind != .asset) continue;
+            if (entry.neighbor_context_json.len == 0) continue;
+            var context = enrichment_neighbor_context.parseConfigJson(alloc, entry.neighbor_context_json) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => continue,
+            };
+            defer context.deinit(alloc);
+            if (!std.mem.eql(u8, context.graph_index, graph_index_name)) continue;
+            switch (context.direction) {
+                .out => directions.out = true,
+                .in => directions.in = true,
+                .both => {
+                    directions.out = true;
+                    directions.in = true;
+                },
+            }
+            if (directions.out and directions.in) break;
+        }
+        return directions;
+    }
+
     pub fn has(self: *const IndexManager, name: []const u8) bool {
         return self.get(name) != null;
     }
@@ -13137,34 +13943,63 @@ pub const IndexManager = struct {
             requests.deinit(alloc);
         }
 
-        for (self.enrichments.items) |entry| {
-            if (entry.kind != .asset) continue;
-            try requests.append(alloc, .{
-                .kind = .asset,
-                .index_name = try alloc.dupe(u8, entry.name),
-                .artifact_name = try alloc.dupe(u8, entry.name),
-                .doc_key = try alloc.dupe(u8, doc_key),
-                .source_field = try alloc.dupe(u8, entry.source_field),
-                .source_template = if (entry.source_template.len > 0) try alloc.dupe(u8, entry.source_template) else "",
-                .full_text_index = entry.full_text_index,
-                .content_type = if (entry.content_type.len > 0) try alloc.dupe(u8, entry.content_type) else "",
-                .producer_json = if (entry.producer_json.len > 0) try alloc.dupe(u8, entry.producer_json) else "",
-                .execution_json = if (entry.execution_json.len > 0) try alloc.dupe(u8, entry.execution_json) else "",
-            });
+        // Assets are emitted upstream-first so a consumer that names another
+        // asset via `source_artifact_name` runs after its producer in the
+        // same quantum. Entries whose upstream cannot be scheduled first
+        // (defensive: admission rejects cycles) fall out in catalog order.
+        const asset_emitted = try alloc.alloc(bool, self.enrichments.items.len);
+        defer alloc.free(asset_emitted);
+        @memset(asset_emitted, false);
+        var emit_final_pass = false;
+        emit_loop: while (true) {
+            var emit_progress = false;
+            for (self.enrichments.items, 0..) |entry, entry_index| {
+                if (entry.kind != .asset or asset_emitted[entry_index]) continue;
+                if (!emit_final_pass and entry.source_artifact_name.len > 0) {
+                    var upstream_pending = false;
+                    for (self.enrichments.items, 0..) |candidate, candidate_index| {
+                        if (candidate.kind != .asset or asset_emitted[candidate_index]) continue;
+                        if (candidate_index == entry_index) continue;
+                        if (std.mem.eql(u8, candidate.name, entry.source_artifact_name)) {
+                            upstream_pending = true;
+                            break;
+                        }
+                    }
+                    if (upstream_pending) continue;
+                }
+                asset_emitted[entry_index] = true;
+                emit_progress = true;
+                try requests.append(alloc, .{
+                    .kind = .asset,
+                    .index_name = try alloc.dupe(u8, entry.name),
+                    .artifact_name = try alloc.dupe(u8, entry.name),
+                    .doc_key = try alloc.dupe(u8, doc_key),
+                    .source_field = try alloc.dupe(u8, entry.source_field),
+                    .source_template = if (entry.source_template.len > 0) try alloc.dupe(u8, entry.source_template) else "",
+                    .upstream_artifact_name = if (entry.source_artifact_name.len > 0) try alloc.dupe(u8, entry.source_artifact_name) else "",
+                    .full_text_index = entry.full_text_index,
+                    .content_type = if (entry.content_type.len > 0) try alloc.dupe(u8, entry.content_type) else "",
+                    .producer_json = if (entry.producer_json.len > 0) try alloc.dupe(u8, entry.producer_json) else "",
+                    .neighbor_context_json = if (entry.neighbor_context_json.len > 0) try alloc.dupe(u8, entry.neighbor_context_json) else "",
+                    .execution_json = if (entry.execution_json.len > 0) try alloc.dupe(u8, entry.execution_json) else "",
+                });
+            }
+            if (emit_final_pass) break :emit_loop;
+            if (!emit_progress) emit_final_pass = true;
         }
 
         for (self.text_indexes.items) |entry| {
             if (entry.chunk_name) |chunk_name| {
                 if (self.getEnrichment(.chunk, chunk_name)) |chunk_cfg| {
                     if (chunk_cfg.source_artifact_name.len == 0) {
-                        try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, true, false);
+                        try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, true, false, true);
                     }
                 }
             }
             for (entry.source_artifact_names) |artifact_name| {
                 const chunk_cfg = self.getEnrichment(.chunk, artifact_name) orelse continue;
                 if (chunk_cfg.source_artifact_name.len > 0) continue;
-                try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, true, false);
+                try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, true, false, true);
             }
         }
 
@@ -13172,7 +14007,7 @@ pub const IndexManager = struct {
             for (entry.artifact_sources) |source| {
                 const chunk_cfg = self.getEnrichment(.chunk, source.artifact_name) orelse continue;
                 if (chunk_cfg.source_artifact_name.len > 0) continue;
-                try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, false, true);
+                try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, false, true, true);
             }
         }
 
@@ -13237,21 +14072,8 @@ pub const IndexManager = struct {
                     if (embedding_cfg.expected_dims > 0 and embedding_cfg.expected_dims != entry.dims) continue;
                     if (embedding_cfg.source_artifact_name.len > 0) {
                         const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
-                        if (chunk_cfg.source_artifact_name.len == 0 and !hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
-                            try requests.append(alloc, .{
-                                .kind = .chunk_text,
-                                .index_name = try alloc.dupe(u8, entry.config.name),
-                                .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
-                                .doc_key = try alloc.dupe(u8, doc_key),
-                                .source_field = try alloc.dupe(u8, chunk_cfg.source_field),
-                                .source_template = if (chunk_cfg.source_template.len > 0) try alloc.dupe(u8, chunk_cfg.source_template) else "",
-                                .chunk_size = chunk_cfg.chunk_size,
-                                .chunk_overlap = chunk_cfg.chunk_overlap,
-                                .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
-                                .full_text_index = chunk_cfg.full_text_index,
-                                .execution_json = if (chunk_cfg.execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.execution_json) else "",
-                            });
-                        }
+                        if (chunk_cfg.source_artifact_name.len == 0)
+                            try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, false, true, false);
                         if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
                             try requests.append(alloc, .{
                                 .kind = .dense_embedding,
@@ -13259,7 +14081,11 @@ pub const IndexManager = struct {
                                 .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
                                 .embedding_name = try alloc.dupe(u8, embedding_name),
                                 .embedding_input = embedding_cfg.embedding_input,
-                                .input_kind = embeddingInputKindForChunkEnrichment(chunk_cfg),
+                                // A named embedding producer consumes the
+                                // chunk artifact emitted by a separate
+                                // producer, even when that chunk producer
+                                // itself reads the parent document directly.
+                                .input_kind = .materialized_chunks,
                                 .doc_key = try alloc.dupe(u8, doc_key),
                                 .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
                                 .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
@@ -13351,28 +14177,15 @@ pub const IndexManager = struct {
                     if (embedding_cfg.expected_dims != 0) continue;
                     if (embedding_cfg.source_artifact_name.len > 0) {
                         const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
-                        if (chunk_cfg.source_artifact_name.len == 0 and !hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
-                            try requests.append(alloc, .{
-                                .kind = .chunk_text,
-                                .index_name = try alloc.dupe(u8, entry.config.name),
-                                .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
-                                .doc_key = try alloc.dupe(u8, doc_key),
-                                .source_field = try alloc.dupe(u8, chunk_cfg.source_field),
-                                .source_template = if (chunk_cfg.source_template.len > 0) try alloc.dupe(u8, chunk_cfg.source_template) else "",
-                                .chunk_size = chunk_cfg.chunk_size,
-                                .chunk_overlap = chunk_cfg.chunk_overlap,
-                                .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
-                                .full_text_index = chunk_cfg.full_text_index,
-                                .execution_json = if (chunk_cfg.execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.execution_json) else "",
-                            });
-                        }
+                        if (chunk_cfg.source_artifact_name.len == 0)
+                            try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, false, true, false);
                         if (!hasGeneratedSparseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
                             try requests.append(alloc, .{
                                 .kind = .sparse_embedding,
                                 .index_name = try alloc.dupe(u8, entry.config.name),
                                 .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
                                 .embedding_name = try alloc.dupe(u8, embedding_name),
-                                .input_kind = embeddingInputKindForChunkEnrichment(chunk_cfg),
+                                .input_kind = .materialized_chunks,
                                 .doc_key = try alloc.dupe(u8, doc_key),
                                 .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
                                 .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
@@ -13408,8 +14221,9 @@ pub const IndexManager = struct {
             if (request.input_kind == .materialized_chunks and request.artifact_name.len > 0) {
                 const chunk_cfg = self.getEnrichment(.chunk, request.artifact_name) orelse
                     return error.InvalidIndexConfig;
-                if (chunk_cfg.source_artifact_name.len == 0) return error.InvalidIndexConfig;
-                request.upstream_artifact_name = try alloc.dupe(u8, chunk_cfg.source_artifact_name);
+                if (chunk_cfg.source_artifact_name.len > 0) {
+                    request.upstream_artifact_name = try alloc.dupe(u8, chunk_cfg.source_artifact_name);
+                }
             }
             request.consumer_indexes = switch (request.kind) {
                 .asset => try self.textIndexesForChunk(
@@ -13561,18 +14375,29 @@ pub const IndexManager = struct {
         }
 
         if (self.text_indexes.items.len == 1) return &self.text_indexes.items[0].persistent;
+        // Every table (and, since Antfly Lite creation provisions it too,
+        // every Lite database) carries the default full-text index
+        // alongside any additional named indexes. When the caller does not
+        // disambiguate and there is more than one candidate, prefer the
+        // default rather than failing closed the way an HTTP request path
+        // that never resolved a primary index would.
+        if (self.textIndexEntryByName(full_text_index_defaults.default_full_text_index_name)) |entry| return &entry.persistent;
         return null;
     }
 
     pub fn textIndexEntry(self: *IndexManager, name: ?[]const u8) ?*TextIndex {
         if (name) |index_name| {
-            for (self.text_indexes.items) |*entry| {
-                if (std.mem.eql(u8, entry.config.name, index_name)) return entry;
-            }
-            return null;
+            return self.textIndexEntryByName(index_name);
         }
 
         if (self.text_indexes.items.len == 1) return &self.text_indexes.items[0];
+        return self.textIndexEntryByName(full_text_index_defaults.default_full_text_index_name);
+    }
+
+    fn textIndexEntryByName(self: *IndexManager, index_name: []const u8) ?*TextIndex {
+        for (self.text_indexes.items) |*entry| {
+            if (std.mem.eql(u8, entry.config.name, index_name)) return entry;
+        }
         return null;
     }
 
@@ -14571,11 +15396,23 @@ pub const IndexManager = struct {
 
     pub fn pruneTextSplitRange(self: *IndexManager, split_key: []const u8) !void {
         for (self.text_indexes.items) |*entry| {
+            self.lockAtomicWithBackoff(entry.apply_mutex);
+            defer entry.apply_mutex.unlock();
             const plan = try entry.persistent.classifyActiveSegmentsForSplit(self.alloc, split_key);
             defer {
                 for (plan) |*plan_entry| plan_entry.deinit(self.alloc);
                 self.alloc.free(plan);
             }
+            const changes = for (plan) |part| {
+                if (part.class != .left_only) break true;
+            } else false;
+            if (!changes) continue;
+            // A mixed split uses segment replacement, but unlike compaction
+            // does not preserve the old corpus. Revoke before either kind of
+            // pruning, including a crash before the first catalog mutation.
+            if (self.primary_store) |store| try apply_state.invalidateProjectionCompletion(self.alloc, store);
+            try entry.persistent.deleteGenerationMetadata(@import("../../projection_seal.zig").metadata_key);
+            try entry.persistent.syncMain(true);
 
             var remove_ids = std.ArrayListUnmanaged(u64).empty;
             defer remove_ids.deinit(self.alloc);
@@ -14719,6 +15556,13 @@ pub const IndexManager = struct {
             if (!entry.index.ownershipCleanupPending()) continue;
             _ = try entry.index.pruneOwnedRangePage();
             return true;
+        }
+        return false;
+    }
+
+    pub fn graphOwnershipCleanupPending(self: *const IndexManager) bool {
+        for (self.graph_indexes.items) |*entry| {
+            if (entry.index.ownershipCleanupPending()) return true;
         }
         return false;
     }
@@ -14897,9 +15741,9 @@ pub const IndexManager = struct {
     }
 
     fn denseVectorBlockPreferredEncoding() vector_block_store_mod.Encoding {
-        // Float16 is the compact candidate plane. Exact public reranking must
-        // complete against authoritative float32 values before publication.
-        const raw_z = getenv("ANTFLY_HBC_VECTOR_BLOCK_ENCODING") orelse return .float16;
+        // Match the qualified float32 source and exact-mapped serving path.
+        // Float16 remains an explicit experiment with exact residual reads.
+        const raw_z = getenv("ANTFLY_HBC_VECTOR_BLOCK_ENCODING") orelse return .float32;
         const raw = std.mem.span(raw_z);
         return if (std.ascii.eqlIgnoreCase(raw, "float16") or std.ascii.eqlIgnoreCase(raw, "f16"))
             .float16
@@ -15537,6 +16381,85 @@ pub const IndexManager = struct {
         }
 
         try entry.index.finishBulkIngestSessionWithOptions(options);
+    }
+
+    /// Owns the ANN generation, exact payload source and primary metadata
+    /// transaction of a DB query. Activation is synchronous and thread-local;
+    /// helper tasks only borrow immutable read requests and never this scope.
+    pub const DenseReadSnapshot = struct {
+        entry: *DenseIndex,
+        ann: hbc_mod.HBCIndex.QuerySnapshot,
+        source: DenseVectorLoadSession,
+        previous: ?*DenseVectorLoadSession = null,
+        active: bool = false,
+
+        pub fn activate(self: *@This()) void {
+            std.debug.assert(!self.active);
+            self.previous = active_dense_vector_load_session;
+            active_dense_vector_load_session = &self.source;
+            self.ann.activate();
+            self.active = true;
+        }
+        pub fn deactivate(self: *@This()) void {
+            std.debug.assert(self.active and active_dense_vector_load_session == &self.source);
+            self.ann.deactivate();
+            active_dense_vector_load_session = self.previous;
+            self.active = false;
+        }
+        pub fn deinit(self: *@This()) void {
+            std.debug.assert(!self.active);
+            self.source.deinit();
+            self.ann.deinit();
+            self.* = undefined;
+        }
+        pub fn lookupDocKey(self: *@This(), vector_id: u64) !?[]u8 {
+            if (self.source.snapshot_native_only) return error.DenseSnapshotNeedsPrimary;
+            return self.source.context.manager.lookupDenseDocKeyByVectorIdTxn(&self.source.read_txn.?, self.entry.config.name, vector_id);
+        }
+    };
+
+    /// Called under the DB apply read fence and an index catalog lease. Only
+    /// a caught-up, authoritative float32 source can enter this fast path.
+    pub fn captureDenseReadSnapshot(self: *IndexManager, entry: *DenseIndex, sequence: u64) !?DenseReadSnapshot {
+        if (active_dense_vector_load_session != null) return null;
+        const store = self.primary_store orelse return null;
+        const context = entry.vector_loader_context orelse return null;
+        var ann = entry.index.captureQuerySnapshot() orelse return null;
+        var ann_owned = true;
+        defer if (ann_owned) ann.deinit();
+        if (ann.sourceSequence() != sequence) return null;
+        const generation = self.acquireVectorBlockGeneration() orelse return null;
+        var generation_owned = true;
+        defer if (generation_owned) generation.release();
+        if (!vectorBlockGenerationExactAtSequence(generation, sequence) or
+            generation.opened.scorePrecision() != .authoritative_float32) return null;
+        const native_only = if (self.resource_manager) |rm| rm.dense_query_snapshot_native_only else false;
+        // The short probe proves the committed primary boundary without
+        // cloning a metadata view that a complete native query never reads.
+        // All source-dependent fallbacks are forbidden in this scope.
+        var txn = if (native_only) try store.beginProbeTxn() else try store.beginReadTxn();
+        var txn_owned = true;
+        defer if (txn_owned) txn.abort();
+        if (try store.lastReplaySequenceFromTxn(&txn, 0) != sequence) return null;
+        if (native_only) txn.abort();
+        txn_owned = false;
+        ann_owned = false;
+        generation_owned = false;
+        return .{
+            .entry = entry,
+            .ann = ann,
+            .source = .{
+                .context = context,
+                .read_txn = if (native_only) null else txn,
+                .read_txn_kind = .snapshot,
+                .snapshot_generation = generation,
+                .snapshot_native_only = native_only,
+                .working_slice = .dense_search_working_set,
+                .recycle_raw_reads = false,
+                .cache_raw_values = false,
+                .cache_vectors = false,
+            },
+        };
     }
 
     pub fn searchDenseEntryWithRequest(
@@ -16356,6 +17279,53 @@ pub const IndexManager = struct {
 
     pub fn hasGraphIndexes(self: *const IndexManager) bool {
         return self.graph_indexes.items.len > 0;
+    }
+
+    pub fn graphRetirementAdmissionOpen(self: *const IndexManager) bool {
+        return !self.graph_retirement_closed.load(.acquire);
+    }
+
+    /// Call only while holding catalog_mutex exclusively. The Raft apply
+    /// thread uses tryLockExclusive and returns StorageBusy on contention;
+    /// it never waits for a graph worker to finish under the Raft mutex.
+    pub fn setGraphRetirementAdmissionAssumeCatalogLock(self: *IndexManager, open: bool) void {
+        self.graph_retirement_closed.store(!open, .release);
+    }
+
+    pub fn graphRetirementPinsDrainedAssumeCatalogLock(self: *IndexManager) bool {
+        return self.graph_metric_schedule_pins.load(.acquire) == 0;
+    }
+
+    /// An owner-local graph declaration fingerprint for generation retirement.
+    /// Capture the loaded definitions under the catalog lock; metadata must
+    /// derive the same value from its table record before sealing this owner.
+    pub fn graphRetirementConfigDigest(self: *IndexManager, alloc: Allocator) !?@import("../graph_retirement_config.zig").Digest {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        return self.graphRetirementConfigDigestAssumeCatalogLock(alloc);
+    }
+
+    pub fn graphRetirementConfigDigestAssumeCatalogLock(self: *IndexManager, alloc: Allocator) !?@import("../graph_retirement_config.zig").Digest {
+        if (self.graph_indexes.items.len == 0) return null;
+        const configs = blk: {
+            const snapshot = try alloc.alloc(types.IndexConfig, self.graph_indexes.items.len);
+            errdefer alloc.free(snapshot);
+            var cloned: usize = 0;
+            errdefer for (snapshot[0..cloned]) |*config| config.deinit(alloc);
+            for (self.graph_indexes.items, snapshot) |entry, *config| {
+                config.* = try types.IndexConfig.clone(alloc, entry.config);
+                cloned += 1;
+            }
+            break :blk snapshot;
+        };
+        defer types.freeIndexConfigs(alloc, configs);
+        return @import("../graph_retirement_config.zig").fromLoaded(alloc, configs);
+    }
+
+    test "graph retirement digest loaded owner snapshot requires a graph index" {
+        var manager = try IndexManager.init(std.testing.allocator, ".");
+        defer manager.deinit();
+        try std.testing.expect((try manager.graphRetirementConfigDigest(std.testing.allocator)) == null);
     }
 
     pub fn graphIndexes(self: *const IndexManager) []const GraphIndex {
@@ -17452,6 +18422,15 @@ pub const IndexManager = struct {
         }
     }
 
+    /// Split retirement runs before the owner's primary artifact leaves this
+    /// shard. Its TTL snapshot must be withdrawn explicitly: ordinary deletes
+    /// re-read that artifact to reconcile concurrent contender updates.
+    pub fn retireSplitGraphOwners(self: *IndexManager, deletes: []const types.GraphEdgeDelete) !void {
+        for (self.graph_indexes.items) |*entry| {
+            try self.applyGraphMutationsEntryMode(entry, &.{}, deletes, .retire_owner);
+        }
+    }
+
     pub fn applyGraphMutations(self: *IndexManager, writes: []const types.GraphEdgeWrite, deletes: []const types.GraphEdgeDelete) !void {
         if (writes.len == 0 and deletes.len == 0) return;
 
@@ -18270,7 +19249,8 @@ pub const IndexManager = struct {
         resume_from: ?[]const u8,
         cancel_check: ?types.RepairCancelCheck,
         capacity_check: ?types.RepairCapacityCheck,
-    ) !void {
+        yield_check: ?types.RepairYieldCheck,
+    ) !?[]u8 {
         self.beginTextBackfill();
         defer self.endTextBackfill();
         const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
@@ -18312,6 +19292,7 @@ pub const IndexManager = struct {
                 identity_txn: *docstore_mod.DocStore.Txn,
                 check: ?types.RepairCancelCheck,
                 capacity: ?types.RepairCapacityCheck,
+                resumable: bool,
             ) !void {
                 try checkRepairCancelled(check);
                 if (capacity) |admission| try admission.boundary();
@@ -18325,12 +19306,20 @@ pub const IndexManager = struct {
                 defer manager.alloc.free(ordinals);
                 for (docs_buf.items, ordinals) |*doc, ordinal| doc.doc_ordinal = ordinal;
 
+                var page = @import("../../persistent.zig").PersistentIndex.RebuildPage{
+                    .index = &text_entry.persistent,
+                    .cursor = last_doc_key,
+                };
+                if (resumable) try page.begin();
+                defer page.deinit();
                 const stats = try manager.indexTextProjectionDocsMaybeChunked(doc_store, text_entry, docs_buf.items);
+                if (resumable) try page.commit();
                 try manager.finalizeTextBatchMutations(text_entry, .{
                     .compact_text = false,
-                    .compact_text_segment_threshold = text_backfill_compact_segment_threshold,
+                    .compact_text_segment_threshold = if (resumable) null else text_backfill_compact_segment_threshold,
+                    .defer_text_compaction = resumable,
                 }, stats);
-                try rebuild.updateWithIo(manager.checkpointIo(), last_doc_key);
+                if (!resumable) try rebuild.updateWithIo(manager.checkpointIo(), last_doc_key);
                 for (docs_buf.items) |doc| {
                     manager.alloc.free(@constCast(doc.key));
                     manager.alloc.free(@constCast(doc.value));
@@ -18349,10 +19338,22 @@ pub const IndexManager = struct {
             }
         }.run;
 
-        var scan_lower_buf: ?[]u8 = if (resume_from) |buf| try self.alloc.dupe(u8, buf) else null;
+        const durable_cursor = try entry.persistent.rebuildCursorAlloc(self.alloc);
+        const resumable = yield_check != null or durable_cursor != null;
+        defer if (durable_cursor) |cursor| self.alloc.free(cursor);
+        // The candidate page transaction is authoritative if the separate
+        // primary repair-intent cursor was not persisted before a crash.
+        const effective_resume = if (durable_cursor) |cursor|
+            if (resume_from == null or std.mem.order(u8, cursor, resume_from.?) == .gt) cursor else resume_from
+        else
+            resume_from;
+        var scan_lower_buf: ?[]u8 = if (effective_resume) |buf| try self.alloc.dupe(u8, buf) else null;
         defer if (scan_lower_buf) |buf| self.alloc.free(buf);
-        const backfill_doc_limit = if (@import("builtin").is_test) test_text_backfill_batch_size orelse text_backfill_batch_size else text_backfill_batch_size;
-        const backfill_source_target_bytes = textProjectionSourceBuildTargetBytes();
+        const configured_doc_limit = if (@import("builtin").is_test) test_text_backfill_batch_size orelse text_backfill_batch_size else text_backfill_batch_size;
+        // Bulk throughput settings are not scheduler quanta. Bound both rows
+        // and retained source bytes before checking the repair deadline.
+        const backfill_doc_limit = if (yield_check != null) @min(configured_doc_limit, 256) else configured_doc_limit;
+        const backfill_source_target_bytes = if (yield_check != null) @min(textProjectionSourceBuildTargetBytes(), 256 * 1024) else textProjectionSourceBuildTargetBytes();
         const scan_budget_per_page = @max(backfill_doc_limit * 2, 256);
         var reached_end = false;
 
@@ -18481,15 +19482,26 @@ pub const IndexManager = struct {
                     read_txn,
                     cancel_check,
                     capacity_check,
+                    resumable,
                 );
                 if (batch_last_doc_key) |old| self.alloc.free(old);
                 batch_last_doc_key = null;
             }
+            if (!reached_end) if (yield_check) |check| {
+                if (check.requested()) {
+                    try entry.persistent.sync(true);
+                    try entry.persistent.checkpointLsmWalAfterDurableBoundary();
+                    return try self.alloc.dupe(u8, scan_lower_buf.?);
+                }
+            };
         }
 
-        if (flushed_batches > 0) try self.compactTextIndex(&entry.persistent, activeTextMergePolicy());
+        // Cooperative builds leave merging to the normal bounded text merge
+        // scheduler instead of adding a whole-index compaction to their tail.
+        if (flushed_batches > 0 and !resumable) try self.compactTextIndex(&entry.persistent, activeTextMergePolicy());
         if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clearWithIo(self.checkpointIo());
         if (flushed_batches > 0) try entry.persistent.checkpointLsmWalAfterDurableBoundary();
+        return null;
     }
 
     fn indexPath(self: *const IndexManager, name: []const u8) ![]u8 {
@@ -18498,10 +19510,10 @@ pub const IndexManager = struct {
 
     fn provisionConfiguredIndexDirDurable(self: *IndexManager, cfg: types.IndexConfig) !void {
         const storage = switch (cfg.kind) {
-            .full_text => self.text_lsm_storage,
-            .dense_vector => self.dense_lsm_storage,
-            .sparse_vector => self.sparse_lsm_storage,
-            .graph => self.graph_lsm_storage,
+            .full_text => self.effectiveTextMainStorage(),
+            .dense_vector => self.effectiveDenseStorage(),
+            .sparse_vector => self.effectiveSparseStorage(),
+            .graph => self.effectiveGraphStorage(),
             .algebraic => return,
         };
         const path = try self.indexPath(cfg.name);
@@ -18535,7 +19547,7 @@ pub const IndexManager = struct {
         // (Lite, object storage, modeled devices) may use the native posting
         // format, but cannot safely share that locator unless it explicitly
         // proves its logical paths are the host paths being published.
-        if (!nativeBackupStoragePublicationCompatible(self.dense_lsm_storage)) return false;
+        if (!nativeBackupStoragePublicationCompatible(self.effectiveDenseStorage())) return false;
         if (self.dense_native_migration_policy_source) |source| return source.authorityPermitted();
         return true;
     }
@@ -18550,6 +19562,7 @@ pub const IndexManager = struct {
         self: *IndexManager,
         cfg: types.IndexConfig,
     ) !FreshDenseNativeGeneration {
+        if (builtin.os.tag == .freestanding) return error.DenseNativeV2NotPermitted;
         if (!self.freshDenseNativeV2Permitted(cfg)) return error.DenseNativeV2NotPermitted;
         try fs_paths.createDirPathPortable(self.checkpointIo(), self.base_path);
 
@@ -18635,6 +19648,8 @@ pub const IndexManager = struct {
         cfg: types.IndexConfig,
         generation: *const FreshDenseNativeGeneration,
     ) void {
+        // Browser indexes never allocate a native filesystem generation.
+        if (builtin.os.tag == .freestanding) return;
         const canonical_path = self.indexPath(cfg.name) catch return;
         defer self.alloc.free(canonical_path);
         self.clearActiveIndexRootPointer(canonical_path) catch {};
@@ -18937,7 +19952,7 @@ pub const IndexManager = struct {
             &.{ index_path, "posting-segments", posting_segment_store_mod.authority_name },
         );
         defer self.alloc.free(marker_path);
-        const authority = if (self.dense_lsm_storage) |storage|
+        const authority = if (self.effectiveDenseStorage()) |storage|
             storage.readFileAlloc(
                 self.alloc,
                 marker_path,
@@ -19021,7 +20036,7 @@ pub const IndexManager = struct {
     /// Returns the authenticated physical root currently selected for an
     /// index. Callers that retain this path across a mutation must also hold
     /// the appropriate catalog/structural lease.
-    pub fn activeIndexPath(self: *const IndexManager, name: []const u8) ![]u8 {
+    pub fn activeIndexPath(self: *const IndexManager, name: []const u8) anyerror![]u8 {
         const canonical_path = try self.indexPath(name);
         errdefer self.alloc.free(canonical_path);
         if (try self.readActiveIndexRootPointer(canonical_path, name)) |relative_active_path| {
@@ -19093,13 +20108,17 @@ pub const IndexManager = struct {
         defer self.alloc.free(relative_active_path);
         const active_path = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ self.base_path, relative_active_path });
         errdefer self.alloc.free(active_path);
-        _ = try index_generation_manifest.validateReady(
-            self.alloc,
-            active_path,
-            null,
-            cfg.name,
-            types.indexConfigHash(cfg),
-        );
+        if (comptime builtin.os.tag == .freestanding) {
+            return error.UnsupportedPlatform;
+        } else {
+            _ = try index_generation_manifest.validateReady(
+                self.alloc,
+                active_path,
+                null,
+                cfg.name,
+                types.indexConfigHash(cfg),
+            );
+        }
         self.alloc.free(canonical_path);
         return active_path;
     }
@@ -19479,22 +20498,22 @@ pub const IndexManager = struct {
 
         switch (cfg.kind) {
             .full_text => {
-                if (self.text_lsm_storage == null) {
+                if (self.effectiveTextMainStorage() == null) {
                     try ensureIndexDir(self.alloc, self.base_path, path);
                 }
             },
             .dense_vector => {
-                if (self.dense_lsm_storage == null) {
+                if (self.effectiveDenseStorage() == null) {
                     try ensureIndexDir(self.alloc, self.base_path, path);
                 }
             },
             .sparse_vector => {
-                if (self.sparse_lsm_storage == null) {
+                if (self.effectiveSparseStorage() == null) {
                     try ensureIndexDir(self.alloc, self.base_path, path);
                 }
             },
             .graph => {
-                if (self.graph_lsm_storage == null) {
+                if (self.effectiveGraphStorage() == null) {
                     try ensureIndexDir(self.alloc, self.base_path, path);
                 }
             },
@@ -19569,8 +20588,8 @@ pub const IndexManager = struct {
                     .path = zpath,
                     .io = self.io,
                     .main_backend = self.text_main_backend,
-                    .main_lsm_storage = self.text_lsm_storage,
-                    .wal_storage = self.text_lsm_storage,
+                    .main_lsm_storage = self.effectiveTextMainStorage(),
+                    .wal_storage = self.effectiveTextWalStorage(),
                     .main_lsm_options = self.text_main_lsm_options,
                     .wal_lsm_options = self.text_wal_lsm_options,
                     .lsm_cache = self.lsm_cache,
@@ -19690,6 +20709,7 @@ pub const IndexManager = struct {
 
                 var rebuild_from_scratch_after_interruption = false;
                 if (allow_full_text_backfill and resume_from != null) {
+                    try apply_state.invalidateProjectionCompletion(self.alloc, store);
                     try entry.persistent.resetAllForRebuild();
                     self.alloc.free(resume_from.?);
                     resume_from = null;
@@ -19821,7 +20841,7 @@ pub const IndexManager = struct {
                     .no_meta_sync = self.relaxed_split_durability,
                 }, .{
                     .backend_options = self.dense_lsm_options,
-                    .storage = self.dense_lsm_storage,
+                    .storage = self.effectiveDenseStorage(),
                     .cache = self.lsm_cache,
                     .root_generation = self.lsm_root_generation,
                 });
@@ -19857,11 +20877,13 @@ pub const IndexManager = struct {
                 vector_loader_context_initialized = true;
                 index.setExternalVectorLoader(vector_loader_context, loadDenseVectorForHbc);
                 index.setExternalVectorScratchLoader(vector_loader_context, loadDenseVectorForHbcIntoScratch);
+                index.setExternalPreviousVectorScratchLoader(vector_loader_context, loadPreviousDenseVectorForHbcIntoScratch);
                 index.setExternalVectorBatchScratchLoader(vector_loader_context, loadDenseVectorsForHbcBatch);
                 index.setExternalVectorBatchTransformedMatrixLoader(vector_loader_context, loadDenseVectorsForHbcBatchIntoTransformedMatrix);
                 index.setExternalVectorBatchDistanceLoader(vector_loader_context, scoreDenseVectorsForHbcBatch);
                 index.setExternalVectorBatchBoundedDistanceLoader(vector_loader_context, scoreDenseVectorsForHbcBatchBounded);
                 index.setExternalVectorBatchLocatedDistanceLoader(vector_loader_context, scoreDenseVectorsFromNativeLocations);
+                index.external_vector_batch_resolved_distance_loader = scoreDenseVectorsUnified;
                 index.setExternalVectorBoundedDistanceAvailable(vector_loader_context, denseVectorBoundedProjectionAvailable);
                 configureDensePostingProjectionBuild(index, vector_loader_context);
                 self.attachVectorBlockResidencyPolicy(index);
@@ -20061,7 +21083,7 @@ pub const IndexManager = struct {
                     .no_sync = self.relaxed_split_durability,
                     .no_meta_sync = self.relaxed_split_durability,
                     .backend = self.sparse_backend,
-                    .lsm_storage = self.sparse_lsm_storage,
+                    .lsm_storage = self.effectiveSparseStorage(),
                     .lsm_cache = self.lsm_cache,
                     .lsm_options = self.sparse_lsm_options,
                     .lsm_root_generation = self.lsm_root_generation,
@@ -20159,7 +21181,7 @@ pub const IndexManager = struct {
                 defer self.alloc.free(forward_path);
                 const reverse_path = try std.fmt.allocPrint(self.alloc, "{s}/reverse", .{path});
                 defer self.alloc.free(reverse_path);
-                const reverse_store_missing = if (self.graph_lsm_storage != null) false else if (comptime builtin.os.tag == .freestanding) true else blk: {
+                const reverse_store_missing = if (self.effectiveGraphStorage() != null) false else if (comptime builtin.os.tag == .freestanding) true else blk: {
                     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
                     defer io_impl.deinit();
                     var reverse_dir = std.Io.Dir.cwd().openDir(io_impl.io(), reverse_path, .{}) catch |err| switch (err) {
@@ -20183,7 +21205,7 @@ pub const IndexManager = struct {
                     .no_sync = self.relaxed_split_durability,
                     .no_meta_sync = self.relaxed_split_durability,
                     .reverse_backend = self.graph_reverse_backend,
-                    .reverse_lsm_storage = self.graph_lsm_storage,
+                    .reverse_lsm_storage = self.effectiveGraphStorage(),
                     .reverse_lsm_cache = self.lsm_cache,
                     .reverse_lsm_options = self.graph_reverse_lsm_options,
                     .reverse_lsm_root_generation = self.lsm_root_generation,
@@ -20192,6 +21214,7 @@ pub const IndexManager = struct {
                     .rebuild_root_path = path,
                     .rebuild_owner_generation = coverageGenerationForConfig(cfg),
                     .algebraic_semiring_traversal = graph_cfg.algebraic_semiring_traversal,
+                    .ttl_duration_ns = graph_cfg.ttl_duration_ns,
                 });
                 var index_moved = false;
                 errdefer if (!index_moved) index.close();
@@ -20207,6 +21230,7 @@ pub const IndexManager = struct {
                     .metric_configs = graph_cfg.metric_configs,
                     .artifact_sources = graph_cfg.artifact_sources,
                     .max_edges_per_document = graph_cfg.max_edges_per_document,
+                    .ttl_duration_ns = graph_cfg.ttl_duration_ns,
                     .rebuild_root_path = try self.alloc.dupe(u8, path),
                     .index = index,
                 };
@@ -20245,6 +21269,13 @@ pub const IndexManager = struct {
                         resume_from,
                     );
                     backfill_ns += elapsedSince(backfill_started_ns);
+                }
+
+                if (graphEntryHasContributors(&entry) and !try entry.index.contributionOrderingReady()) {
+                    if (read_only) return error.GraphContributorMigrationRequired;
+                    const ordering_started_ns = nowNs();
+                    try self.backfillGraphContributorOrdering(self.primary_store orelse return error.MissingPrimaryStore, &entry);
+                    backfill_ns += elapsedSince(ordering_started_ns);
                 }
 
                 if (openProfileEnabled()) {
@@ -20306,6 +21337,84 @@ pub const IndexManager = struct {
         }
     }
 
+    pub fn alignRowDerivedArtifactCatalog(self: *IndexManager, txn: anytype, expected: @import("../artifact_inventory.zig").Catalogs, configs: []const types.IndexConfig) !void {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        if (self.count() != configs.len or self.text_indexes.items.len + self.dense_indexes.items.len + self.sparse_indexes.items.len != configs.len or self.resolvers.items.len != 0 or self.failed_index_loads.count() != 0) return error.ArtifactCatalogDrift;
+        const desired_producers = if (expected.enrichments.len == 0) try self.alloc.alloc(enrichment_catalog.EnrichmentConfig, 0) else try enrichment_catalog.deserializeCatalog(self.alloc, expected.enrichments);
+        defer {
+            for (desired_producers) |*producer| producer.deinit(self.alloc);
+            self.alloc.free(desired_producers);
+        }
+        if (desired_producers.len != self.enrichments.items.len) return error.ArtifactCatalogDrift;
+        var producer_positions = std.StringHashMap(usize).init(self.alloc);
+        defer producer_positions.deinit();
+        try producer_positions.ensureTotalCapacity(@intCast(desired_producers.len));
+        for (self.enrichments.items, 0..) |producer, position| {
+            const slot = try producer_positions.getOrPut(producer.name);
+            if (slot.found_existing) return error.ArtifactCatalogDrift;
+            slot.value_ptr.* = position;
+        }
+        for (desired_producers) |producer| {
+            const position = producer_positions.get(producer.name) orelse return error.ArtifactCatalogDrift;
+            if (!try enrichmentDefinitionsEqual(self.alloc, producer, self.enrichments.items[position])) return error.ArtifactCatalogDrift;
+        }
+        // Validate every generation before changing even the in-memory order.
+        for (configs) |config| {
+            var matched = false;
+            inline for (.{ self.text_indexes.items, self.dense_indexes.items, self.sparse_indexes.items }) |entries| {
+                for (entries) |entry| {
+                    if (config.kind == entry.config.kind and std.mem.eql(u8, config.name, entry.config.name) and coverageGenerationForConfig(config) == coverageGenerationForConfig(entry.config) and std.mem.eql(u8, config.config_json, entry.config.config_json)) matched = true;
+                }
+            }
+            if (!matched) return error.ArtifactCatalogDrift;
+        }
+        inline for (.{ &self.text_indexes, &self.dense_indexes, &self.sparse_indexes }, .{ types.IndexKind.full_text, types.IndexKind.dense_vector, types.IndexKind.sparse_vector }) |entries, kind| {
+            var i: usize = 0;
+            for (configs) |config| {
+                if (config.kind != kind) continue;
+                for (entries.items[i..], i..) |entry, j| {
+                    if (std.mem.eql(u8, entry.config.name, config.name)) {
+                        std.mem.swap(@TypeOf(entries.items[0]), &entries.items[i], &entries.items[j]);
+                        break;
+                    }
+                }
+                i += 1;
+            }
+        }
+        for (desired_producers, 0..) |producer, position| {
+            const previous = producer_positions.get(producer.name).?;
+            if (previous == position) continue;
+            std.mem.swap(enrichment_catalog.EnrichmentConfig, &self.enrichments.items[position], &self.enrichments.items[previous]);
+            producer_positions.getPtr(self.enrichments.items[position].name).?.* = position;
+            producer_positions.getPtr(self.enrichments.items[previous].name).?.* = previous;
+        }
+        inline for (.{ index_catalog_key, enrichment_catalog_key, resolver_catalog_key }, .{ expected.indexes, expected.enrichments, expected.resolvers }) |key, value| {
+            if (value.len != 0) try txn.put(key, value) else txn.delete(key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        }
+        try @import("../artifact_inventory.zig").refresh(txn);
+    }
+
+    pub fn matchesArtifactInventory(self: *IndexManager, expected: @import("../artifact_inventory.zig").Catalogs) !bool {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        if (self.failed_index_loads.count() != 0 or self.status_only_index_configs.len != 0) return false;
+        var repairs = self.repair_unavailable_indexes.valueIterator();
+        while (repairs.next()) |slot| if (slot.blocked()) return false;
+        const indexes = try serializeCatalog(self.alloc, self);
+        defer self.alloc.free(indexes);
+        const enrichments = try enrichment_catalog.serializeCatalog(self.alloc, self.enrichments.items);
+        defer self.alloc.free(enrichments);
+        const resolvers = try resolver_catalog.serializeCatalog(self.alloc, self.resolvers.items);
+        defer self.alloc.free(resolvers);
+        return (if (expected.indexes.len == 0) self.count() == 0 else std.mem.eql(u8, expected.indexes, indexes)) and
+            (if (expected.enrichments.len == 0) self.enrichments.items.len == 0 else std.mem.eql(u8, expected.enrichments, enrichments)) and
+            (if (expected.resolvers.len == 0) self.resolvers.items.len == 0 else std.mem.eql(u8, expected.resolvers, resolvers));
+    }
+
     fn persistCatalog(self: *IndexManager, store: anytype) !void {
         try self.persistCatalogWithAtomicMutation(store, null);
     }
@@ -20321,7 +21430,9 @@ pub const IndexManager = struct {
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
+        try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, index_catalog_key, data);
         try txn.put(index_catalog_key, data);
+        try @import("../artifact_inventory.zig").refresh(&txn);
         if (atomic_mutation) |mutation| switch (mutation) {
             .put => |write| try txn.put(write.key, write.value),
             .delete => |key| txn.delete(key) catch |err| switch (err) {
@@ -20352,7 +21463,10 @@ pub const IndexManager = struct {
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
+        try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, index_catalog_key, data);
+        try @import("../artifact_projection_certificate.zig").remove(&txn, excluded_name);
         try txn.put(index_catalog_key, data);
+        try @import("../artifact_inventory.zig").refresh(&txn);
         if (atomic_mutation) |mutation| switch (mutation) {
             .put => |write| try txn.put(write.key, write.value),
             .delete => |key| txn.delete(key) catch |err| switch (err) {
@@ -20398,7 +21512,9 @@ pub const IndexManager = struct {
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
+        try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, enrichment_catalog_key, data);
         try txn.put(enrichment_catalog_key, data);
+        try @import("../artifact_inventory.zig").refresh(&txn);
         try txn.commit();
         // Enrichment definitions are part of the immutable foreground write
         // plan just as much as index definitions. Advance only after durable
@@ -20440,7 +21556,10 @@ pub const IndexManager = struct {
         errdefer txn.abort();
         try txn.put(enrichment_catalog_key, enrichment_data);
         try txn.put(resolver_catalog_key, resolver_data);
+        try @import("../artifact_inventory.zig").refresh(&txn);
+        try @import("../artifact_inventory.zig").invalidateOrdered(&txn);
         try txn.commit();
+        self.invalidateWritePlanSnapshot();
         self.storeGeneratedEnrichmentTargetCache(try self.computeGeneratedEnrichmentTargetCache());
     }
 
@@ -20476,12 +21595,15 @@ pub const IndexManager = struct {
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
+        try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog_key, data);
         try txn.put(resolver_catalog_key, data);
+        try @import("../artifact_inventory.zig").refresh(&txn);
         if (mode == .mark_reresolve_dirty) {
             try txn.put(resolver_catalog.reresolve_resume_key, "");
             try txn.put(resolver_catalog.reresolve_repair_resume_key, "");
         }
         try txn.commit();
+        self.invalidateWritePlanSnapshot();
     }
 
     fn ensureShorthandEnrichments(self: *IndexManager, cfg: types.IndexConfig) !bool {
@@ -20623,8 +21745,10 @@ pub const IndexManager = struct {
         if (self.getEnrichment(.asset, cfg.name)) |existing| {
             if (!std.mem.eql(u8, existing.source_field, cfg.source_field) or
                 !std.mem.eql(u8, existing.source_template, cfg.source_template) or
+                !std.mem.eql(u8, existing.source_artifact_name, cfg.source_artifact_name) or
                 !std.mem.eql(u8, existing.content_type, cfg.content_type) or
                 !try enrichment_config_validation.producerJsonValuesEqual(self.alloc, existing.producer_json, cfg.producer_json) or
+                !std.mem.eql(u8, existing.neighbor_context_json, cfg.neighbor_context_json) or
                 !std.mem.eql(u8, existing.execution_json, cfg.execution_json))
             {
                 return error.ConflictingEnrichmentConfig;
@@ -20637,7 +21761,9 @@ pub const IndexManager = struct {
     }
 
     fn validateEnrichmentConfig(self: *const IndexManager, cfg: enrichment_catalog.EnrichmentConfig) !void {
-        if (cfg.name.len == 0 or (cfg.source_field.len == 0 and cfg.source_template.len == 0)) return error.InvalidEnrichmentConfig;
+        if (cfg.name.len == 0) return error.InvalidEnrichmentConfig;
+        const consumes_asset_artifact = cfg.kind == .asset and cfg.source_artifact_name.len > 0;
+        if (cfg.source_field.len == 0 and cfg.source_template.len == 0 and !consumes_asset_artifact) return error.InvalidEnrichmentConfig;
         if (cfg.execution_json.len > 0) _ = try enrichment_types.parseExecutionPolicyJson(self.alloc, cfg.execution_json);
         if (cfg.full_text_index and cfg.kind == .embedding) return error.InvalidEnrichmentConfig;
         switch (cfg.kind) {
@@ -20659,6 +21785,27 @@ pub const IndexManager = struct {
             },
             .asset => {
                 try enrichment_config_validation.validateAssetProducerConfig(self.alloc, cfg.producer_json);
+                if (cfg.neighbor_context_json.len > 0) {
+                    var context = try enrichment_neighbor_context.parseConfigJson(self.alloc, cfg.neighbor_context_json);
+                    context.deinit(self.alloc);
+                }
+                if (cfg.source_artifact_name.len > 0) {
+                    // Asset-consumes-asset: the upstream chain must resolve
+                    // to admitted assets and terminate without revisiting
+                    // this config. Cycles that exclude `cfg` are caught when
+                    // their own members are validated.
+                    if (cfg.source_field.len > 0 or cfg.source_template.len > 0) return error.InvalidEnrichmentConfig;
+                    try enrichment_config_validation.validateUpstreamAssetProducer(self.alloc, cfg.producer_json);
+                    var hops: usize = 0;
+                    var current: []const u8 = cfg.source_artifact_name;
+                    while (current.len > 0) {
+                        if (std.mem.eql(u8, current, cfg.name)) return error.InvalidEnrichmentConfig;
+                        const upstream = self.getEnrichment(.asset, current) orelse return error.InvalidEnrichmentConfig;
+                        current = upstream.source_artifact_name;
+                        hops += 1;
+                        if (hops > self.enrichments.items.len) return error.InvalidEnrichmentConfig;
+                    }
+                }
             },
         }
     }
@@ -20850,41 +21997,41 @@ pub const IndexManager = struct {
         defer task_alloc.free(deleted_docs);
         for (task.source, 0..) |source, i| deleted_docs[i] = source.deleted;
 
-        if (task.persistent.prepareMergedSegmentToFileWithAllocatorsAndDeletes(
-            task_alloc,
-            task.mergeAllocator(),
-            task.snapshot,
-            task.merge_indices,
-            deleted_docs,
-        )) |prepared| {
-            var output_bytes: u64 = 0;
-            for (prepared) |*segment| output_bytes +|= @intCast(segment.data.bytes().len);
-            logTextMergeTaskMemory("after_build", task, output_bytes);
-            task.discardSourceCleanPages();
-            logTextMergeTaskMemory("after_source_discard", task, output_bytes);
-            var result = TextMergeResult{
-                .prepared_segments = prepared,
-                .prepared_owner = task.persistent,
-                .owned_alloc = task.mergeAllocator(),
-                .elapsed_ns = platform_time.monotonicNs() -| started_ns,
-                .peak_task_alloc_bytes = @intCast(task.deletion_state.budget.peakTaskLiveBytes()),
-            };
-            errdefer result.deinit(alloc);
-            return result;
-        } else |err| switch (err) {
-            error.EmptySegment => return .{
-                .segments = &.{},
-                .elapsed_ns = platform_time.monotonicNs() -| started_ns,
-                .peak_task_alloc_bytes = @intCast(task.deletion_state.budget.peakTaskLiveBytes()),
-            },
-            error.Unsupported => {},
-            else => {
-                if (task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
-                if (builtin.os.tag != .freestanding) {
+        if (comptime builtin.os.tag != .freestanding) {
+            if (task.persistent.prepareMergedSegmentToFileWithAllocatorsAndDeletes(
+                task_alloc,
+                task.mergeAllocator(),
+                task.snapshot,
+                task.merge_indices,
+                deleted_docs,
+            )) |prepared| {
+                var output_bytes: u64 = 0;
+                for (prepared) |*segment| output_bytes +|= @intCast(segment.data.bytes().len);
+                logTextMergeTaskMemory("after_build", task, output_bytes);
+                task.discardSourceCleanPages();
+                logTextMergeTaskMemory("after_source_discard", task, output_bytes);
+                var result = TextMergeResult{
+                    .prepared_segments = prepared,
+                    .prepared_owner = task.persistent,
+                    .owned_alloc = task.mergeAllocator(),
+                    .elapsed_ns = platform_time.monotonicNs() -| started_ns,
+                    .peak_task_alloc_bytes = @intCast(task.deletion_state.budget.peakTaskLiveBytes()),
+                };
+                errdefer result.deinit(alloc);
+                return result;
+            } else |err| switch (err) {
+                error.EmptySegment => return .{
+                    .segments = &.{},
+                    .elapsed_ns = platform_time.monotonicNs() -| started_ns,
+                    .peak_task_alloc_bytes = @intCast(task.deletion_state.budget.peakTaskLiveBytes()),
+                },
+                error.Unsupported => {},
+                else => {
+                    if (task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
                     std.log.err("scheduled text merge file-backed build failed index={s}: {s}", .{ task.index_name, @errorName(err) });
-                }
-                return err;
-            },
+                    return err;
+                },
+            }
         }
 
         const merged = merger_mod.mergeSegmentsBounded(task_alloc, task.snapshot, task.merge_indices, .{
@@ -23778,7 +24925,7 @@ pub const IndexManager = struct {
     ) ![]const u32 {
         const bench_profile = getenv("ANTFLY_BENCH_QUERY_PROFILE") != null;
         const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-        var runtime_store_ns: u64 = 0;
+        const runtime_store_ns: u64 = 0;
         var primary_txn_ns: u64 = 0;
         var sparse_txn_ns: u64 = 0;
         var doc_id_ns: u64 = 0;
@@ -23849,14 +24996,9 @@ pub const IndexManager = struct {
         }
 
         const primary_txn_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-        var txn = try store.beginProbeTxn();
+        var txn = try store.beginReadTxn();
         defer txn.abort();
         if (bench_profile) primary_txn_ns = platform_time.monotonicNs() - primary_txn_start_ns;
-
-        const runtime_store_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-        var runtime_store = try initRuntimeStore(self.alloc, store);
-        defer runtime_store.deinit();
-        if (bench_profile) runtime_store_ns = platform_time.monotonicNs() - runtime_store_start_ns;
 
         var out = std.ArrayListUnmanaged(u32).empty;
         errdefer out.deinit(alloc);
@@ -23865,37 +25007,47 @@ pub const IndexManager = struct {
         for (ordinals) |ordinal| {
             const parent_doc_id = (try doc_identity.lookupDocIdTxn(self.alloc, &txn, ordinal)) orelse continue;
             defer self.alloc.free(parent_doc_id);
-            const prefix = if (entry.embedding_names.len > 0)
-                try internal_keys.documentExactPrefixAlloc(self.alloc, parent_doc_id)
-            else
-                try internal_keys.artifactNamedPrefixAlloc(self.alloc, parent_doc_id, "chunk", entry.chunk_name.?);
+            if (entry.embedding_names.len == 0) {
+                var chunks = try @import("../artifact_chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).openNamed(alloc, &txn, parent_doc_id, entry.chunk_name.?);
+                defer chunks.close();
+                while (try chunks.next()) |row| {
+                    if (!internal_keys.matchesChunkArtifactName(row.key, entry.chunk_name.?)) continue;
+                    try appendSparseProjectionDocNum(alloc, entry, &sparse_txn, row.key, &seen, &out);
+                }
+                continue;
+            }
+            const prefix = try internal_keys.documentExactPrefixAlloc(self.alloc, parent_doc_id);
             defer self.alloc.free(prefix);
-            const upper = try internal_keys.nextPrefixAlloc(self.alloc, prefix);
-            defer if (upper) |buf| self.alloc.free(buf);
-            const chunk_rows = try backend_scan.scanRange(alloc, &runtime_store.store, prefix, if (upper) |buf| buf else "");
-            defer backend_scan.freeResults(alloc, chunk_rows);
-            for (chunk_rows) |row| {
-                if (entry.embedding_names.len > 0) {
-                    var matches_source = false;
-                    for (entry.embedding_names) |embedding_name| {
-                        if ((internal_keys.isEmbeddingArtifactKey(row.key) and internal_keys.matchesEmbeddingArtifactName(row.key, embedding_name)) or
-                            (internal_keys.isDerivedEmbeddingArtifactKey(row.key) and internal_keys.matchesDerivedEmbeddingArtifactName(row.key, embedding_name)))
-                        {
-                            matches_source = true;
-                            break;
-                        }
+            var cursor = try txn.openPhysicalCursorAdapter();
+            defer cursor.close();
+            var item = try cursor.seekAtOrAfter(prefix);
+            while (item) |row| : (item = try cursor.next()) {
+                if (!std.mem.startsWith(u8, row.key, prefix)) break;
+                var matches_source = false;
+                for (entry.embedding_names) |embedding_name| {
+                    if ((internal_keys.isEmbeddingArtifactKey(row.key) and internal_keys.matchesEmbeddingArtifactName(row.key, embedding_name)) or
+                        (internal_keys.isDerivedEmbeddingArtifactKey(row.key) and internal_keys.matchesDerivedEmbeddingArtifactName(row.key, embedding_name)))
+                    {
+                        matches_source = true;
+                        break;
                     }
-                    if (!matches_source) continue;
-                } else if (!internal_keys.isChunkArtifactRecordKey(row.key)) continue;
-                const doc_num = (entry.index.debugDocNumForDocId(row.key) catch |err| switch (err) {
-                    error.DocNumOverflow => continue,
-                    else => return err,
-                }) orelse continue;
-                const gop = try seen.getOrPut(alloc, doc_num);
-                if (!gop.found_existing) try out.append(alloc, doc_num);
+                }
+                if (!matches_source) continue;
+                try appendSparseProjectionDocNum(alloc, entry, &sparse_txn, row.key, &seen, &out);
             }
         }
         return try out.toOwnedSlice(alloc);
+    }
+
+    fn appendSparseProjectionDocNum(alloc: Allocator, entry: *SparseIndex, txn: anytype, key: []const u8, seen: *std.AutoHashMapUnmanaged(u32, void), out: *std.ArrayListUnmanaged(u32)) !void {
+        // Reuse the query's sparse snapshot, rather than opening one per member
+        // and potentially mixing mappings from different index generations.
+        const doc_num = (entry.index.docNumForDocIdTxn(txn, key) catch |err| switch (err) {
+            error.DocNumOverflow => return,
+            else => return err,
+        }) orelse return;
+        const gop = try seen.getOrPut(alloc, doc_num);
+        if (!gop.found_existing) try out.append(alloc, doc_num);
     }
 
     fn lookupSparseProjectionDocIdsForOrdinalsAlloc(alloc: Allocator, txn: anytype, ordinals: []const doc_identity.DocOrdinal) ![]const []const u8 {
@@ -23955,13 +25107,138 @@ pub const IndexManager = struct {
         writes: []const types.GraphEdgeWrite,
         deletes: []const types.GraphEdgeDelete,
     ) !void {
+        return self.applyGraphMutationsEntryMode(entry, writes, deletes, .reconcile);
+    }
+
+    const GraphSnapshotMode = enum { reconcile, retire_owner };
+
+    fn graphEntryHasContributors(entry: *const GraphIndex) bool {
+        if (entry.artifact_sources.len != 0) return true;
+        for (entry.edge_type_configs) |edge_type| {
+            if (edge_type.field_name != null) return true;
+        }
+        return false;
+    }
+
+    /// Older non-TTL projections did not retain contributor order. Populate
+    /// it before publishing the opened index, using bounded per-artifact
+    /// scratch space. Interrupted opens repeat this idempotent scan; the
+    /// completion marker never precedes durable contributor snapshots.
+    fn backfillGraphContributorOrdering(self: *IndexManager, primary: *docstore_mod.DocStore, entry: *GraphIndex) !void {
+        const State = struct {
+            manager: *IndexManager,
+            primary: *docstore_mod.DocStore,
+            entry: *GraphIndex,
+
+            fn visit(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                if (!internal_keys.isGraphEdgeArtifactKey(key)) return .@"continue";
+                var scratch = std.heap.ArenaAllocator.init(state.manager.alloc);
+                defer scratch.deinit();
+                const alloc = scratch.allocator();
+                const parsed = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(alloc, key)) orelse return .@"continue";
+                if (!std.mem.eql(u8, parsed.index_name, state.entry.config.name) or
+                    !state.manager.keyInRange(parsed.doc_key)) return .@"continue";
+                const edge = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, value);
+                if (edge.generation != state.entry.config.coverage_generation) return .@"continue";
+                try migrateLegacyDirectGraphContribution(alloc, state.primary, state.entry, parsed.doc_key, key, value);
+                var snapshots = std.ArrayListUnmanaged(graph_mod.ContributionSnapshot).empty;
+                try appendGraphContributionSnapshot(
+                    alloc,
+                    state.primary,
+                    state.entry,
+                    parsed.source_node orelse parsed.doc_key,
+                    parsed.edge_type,
+                    parsed.target_doc_key,
+                    parsed.doc_key,
+                    parsed.edge_id,
+                    if (parsed.edge_id.len > 0 and parsed.logical_source.len > 0) parsed.doc_key else "",
+                    &snapshots,
+                );
+                try state.entry.index.replaceContributionSnapshots(snapshots.items);
+                return .@"continue";
+            }
+        };
+        var state = State{ .manager = self, .primary = primary, .entry = entry };
+        try primary.scanWithContext("", "", .{}, &state, State.visit);
+        // Recovered contributors are primary state, not disposable projection
+        // metadata. They must survive before publishing migration completion.
+        try primary.sync(true);
+        try entry.index.publishContributionOrderingReady();
+    }
+
+    fn migrateLegacyDirectGraphContribution(
+        alloc: Allocator,
+        primary: *docstore_mod.DocStore,
+        entry: *GraphIndex,
+        owner: []const u8,
+        artifact_key: []const u8,
+        artifact: []const u8,
+    ) !void {
+        if (entry.ttl_duration_ns != 0 or entry.artifact_sources.len == 0) return;
+        const generation = entry.config.coverage_generation;
+        const prefix = try internal_keys.graphGlobalEdgeContenderEdgePrefixAlloc(alloc, entry.config.name, generation, artifact_key);
+        const rows = try primary.scanPrefix(alloc, prefix);
+        const projected = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, artifact);
+        var matches_source = false;
+        for (rows) |row| {
+            const contender = (try graph_edge_contender.decode(row.value, generation)) orelse return error.InvalidGraphEdgeContender;
+            const expected = try internal_keys.graphGlobalEdgeContenderKeyAlloc(alloc, entry.config.name, generation, artifact_key, contender.source_priority, contender.state_key);
+            if (!std.mem.eql(u8, expected, row.key) or !std.mem.eql(u8, contender.edge_key, artifact_key)) return error.InvalidGraphEdgeContender;
+            if (contender.source_priority == graph_mod.direct_source_priority) return;
+            const source = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, contender.payload);
+            if (source.generation != generation) return error.InvalidGraphEdgeContender;
+            if (projected.weight == source.weight and projected.created_at == source.created_at and
+                projected.updated_at == source.updated_at and projected.ttl_created_ns == source.ttl_created_ns and
+                std.mem.eql(u8, projected.metadata_json, source.metadata_json)) matches_source = true;
+        }
+        // Legacy writes recorded no direct provenance. A visible artifact
+        // unexplained by any source is retained as an independent direct
+        // contributor. Matching source payloads retain their source identity.
+        if (matches_source) return;
+        const state_key = try internal_keys.graphDirectStateKeyAlloc(alloc, owner, entry.config.name);
+        const local_key = try internal_keys.graphEdgeContenderKeyAlloc(alloc, owner, entry.config.name, artifact_key, state_key);
+        const global_key = try internal_keys.graphGlobalEdgeContenderKeyAlloc(alloc, entry.config.name, generation, artifact_key, @intCast(graph_mod.direct_source_priority), state_key);
+        const local_value = try graph_edge_contender.encodeAlloc(alloc, generation, @intCast(graph_mod.direct_source_priority), artifact_key, state_key, "");
+        const global_value = try graph_edge_contender.encodeAlloc(alloc, generation, @intCast(graph_mod.direct_source_priority), artifact_key, state_key, artifact);
+        const local_prefix = try internal_keys.graphEdgeContenderEdgePrefixAlloc(alloc, owner, entry.config.name, artifact_key);
+        const local_rows = try primary.scanPrefix(alloc, local_prefix);
+        var existing_member = false;
+        for (local_rows) |row| {
+            if ((try graph_edge_contender.decode(row.value, generation)) != null) existing_member = true;
+        }
+        const count_key = try internal_keys.graphEdgeContenderCountKeyAlloc(alloc, owner, entry.config.name);
+        const count_raw = primary.get(alloc, count_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        const visible_count = if (count_raw) |raw| (try graph_edge_contender.decodeVisibleCount(raw, generation)) orelse 0 else 0;
+        if (existing_member and visible_count == 0) return error.InvalidGraphEdgeContenderCount;
+        const next_count = if (existing_member) visible_count else try std.math.add(usize, visible_count, 1);
+        const count_value = try graph_edge_contender.encodeVisibleCount(generation, next_count);
+        // Membership, payload, and cardinality commit together. Repeating an
+        // interrupted migration observes the direct contender and is a no-op.
+        try primary.putBatch(&.{
+            .{ .key = local_key, .value = local_value },
+            .{ .key = global_key, .value = global_value },
+            .{ .key = count_key, .value = &count_value },
+        }, &.{});
+    }
+
+    fn applyGraphMutationsEntryMode(
+        self: *IndexManager,
+        entry: *GraphIndex,
+        writes: []const types.GraphEdgeWrite,
+        deletes: []const types.GraphEdgeDelete,
+        snapshot_mode: GraphSnapshotMode,
+    ) !void {
         var batch_writes = std.ArrayListUnmanaged(graph_mod.BatchWrite).empty;
         defer batch_writes.deinit(self.alloc);
         var batch_deletes = std.ArrayListUnmanaged(graph_mod.BatchDelete).empty;
         defer batch_deletes.deinit(self.alloc);
 
         for (writes) |write| {
-            if (!self.keyInRange(if (write.owner_document.len > 0) write.owner_document else write.source)) continue;
+            if (!self.keyInRange(if (write.owner_document.len > 0) write.owner_document else if (write.owner.len > 0) write.owner else write.source)) continue;
             if (!std.mem.eql(u8, write.index_name, entry.config.name)) continue;
             try batch_writes.append(self.alloc, .{
                 .source = write.source,
@@ -23972,12 +25249,14 @@ pub const IndexManager = struct {
                 .weight = write.weight,
                 .created_at = write.created_at,
                 .updated_at = write.updated_at,
+                .ttl_created_ns = write.ttl_created_ns,
                 .metadata_json = write.metadata_json,
+                .owner = write.owner,
             });
         }
 
         for (deletes) |delete| {
-            if (!self.keyInRange(if (delete.owner_document.len > 0) delete.owner_document else delete.source)) continue;
+            if (!self.keyInRange(if (delete.owner_document.len > 0) delete.owner_document else if (delete.owner.len > 0) delete.owner else delete.source)) continue;
             if (!std.mem.eql(u8, delete.index_name, entry.config.name)) continue;
             try batch_deletes.append(self.alloc, .{
                 .source = delete.source,
@@ -23985,10 +25264,103 @@ pub const IndexManager = struct {
                 .edge_type = delete.edge_type,
                 .edge_id = delete.edge_id,
                 .owner_document = delete.owner_document,
+                .owner = delete.owner,
+                .preserve_if_member = snapshot_mode == .retire_owner and delete.owner.len == 0 and delete.edge_id.len == 0,
             });
         }
 
         try entry.index.batchApply(batch_writes.items, batch_deletes.items);
+        if (entry.ttl_duration_ns != 0 or graphEntryHasContributors(entry)) {
+            const primary = self.primary_store orelse return error.MissingPrimaryStore;
+            var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            var snapshots = std.ArrayListUnmanaged(graph_mod.ContributionSnapshot).empty;
+            for (batch_writes.items) |write| {
+                try appendGraphContributionSnapshot(arena, primary, entry, write.source, write.edge_type, write.target, write.owner, write.edge_id, write.owner_document, &snapshots);
+            }
+            for (batch_deletes.items) |delete| {
+                if (snapshot_mode == .retire_owner) {
+                    try snapshots.append(arena, .{
+                        .source = delete.source,
+                        .target = delete.target,
+                        .edge_type = delete.edge_type,
+                        .edge_id = delete.edge_id,
+                        .owner_document = delete.owner_document,
+                        .owner = if (delete.owner_document.len > 0) delete.owner_document else if (delete.owner.len > 0) delete.owner else delete.source,
+                        .contributions = &.{},
+                    });
+                } else {
+                    try appendGraphContributionSnapshot(arena, primary, entry, delete.source, delete.edge_type, delete.target, delete.owner, delete.edge_id, delete.owner_document, &snapshots);
+                }
+            }
+            try entry.index.replaceContributionSnapshots(snapshots.items);
+        }
+    }
+
+    fn appendGraphContributionSnapshot(
+        alloc: Allocator,
+        primary: *docstore_mod.DocStore,
+        entry: *GraphIndex,
+        source: []const u8,
+        edge_type: []const u8,
+        target: []const u8,
+        owner: []const u8,
+        edge_id: []const u8,
+        owner_document: []const u8,
+        snapshots: *std.ArrayListUnmanaged(graph_mod.ContributionSnapshot),
+    ) !void {
+        const artifact_key = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, if (owner_document.len > 0) owner_document else if (owner.len > 0) owner else source, entry.config.name, edge_type, target, source, edge_id);
+        const raw = primary.get(alloc, artifact_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        var contributors = std.ArrayListUnmanaged(graph_mod.EdgeContribution).empty;
+        if (raw) |artifact| {
+            const prefix = try internal_keys.graphGlobalEdgeContenderEdgePrefixAlloc(alloc, entry.config.name, entry.config.coverage_generation, artifact_key);
+            const rows = try primary.scanPrefix(alloc, prefix);
+            if (rows.len > 0) {
+                for (rows) |row| {
+                    const contender = (try graph_edge_contender.decode(row.value, entry.config.coverage_generation)) orelse continue;
+                    if (!std.mem.eql(u8, contender.edge_key, artifact_key)) return error.InvalidGraphEdgeContender;
+                    const edge = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, contender.payload);
+                    if (edge.generation != entry.config.coverage_generation) return error.InvalidGraphEdgeContender;
+                    if (entry.ttl_duration_ns != 0 and edge.ttl_created_ns == 0) return error.GraphEdgeTtlMigrationRequired;
+                    try contributors.append(alloc, .{
+                        .state_key = try alloc.dupe(u8, contender.state_key),
+                        .source_priority = @intCast(contender.source_priority),
+                        .weight = edge.weight,
+                        .created_at = edge.created_at,
+                        .updated_at = edge.updated_at,
+                        .ttl_created_ns = edge.ttl_created_ns,
+                        .metadata_json = edge.metadata_json,
+                    });
+                }
+            } else {
+                const edge = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, artifact);
+                if (edge.generation == entry.config.coverage_generation) {
+                    if (entry.ttl_duration_ns != 0 and edge.ttl_created_ns == 0) return error.GraphEdgeTtlMigrationRequired;
+                    try contributors.append(alloc, .{
+                        .state_key = "",
+                        .source_priority = std.math.maxInt(u64),
+                        .weight = edge.weight,
+                        .created_at = edge.created_at,
+                        .updated_at = edge.updated_at,
+                        .ttl_created_ns = edge.ttl_created_ns,
+                        .metadata_json = edge.metadata_json,
+                    });
+                }
+            }
+        }
+        try snapshots.append(alloc, .{
+            .source = source,
+            .edge_type = edge_type,
+            .target = target,
+            .edge_id = edge_id,
+            .owner_document = owner_document,
+            .owner = if (owner_document.len > 0) owner_document else if (owner.len > 0) owner else source,
+            .contributions = try contributors.toOwnedSlice(alloc),
+        });
     }
 
     fn applyDenseEmbeddingWritesEntry(
@@ -24714,7 +26086,11 @@ pub const IndexManager = struct {
             const skip_vector_store = entry.index.hasExternalVectorLoader();
             const bulk_options: hbc_mod.BulkBuildOptions = .{
                 .skip_vector_store = skip_vector_store,
-                .algo = if (batch_options.mode == .bulk_ingest) .recursive else null,
+                // Keep the historical bootstrap policy as the control. The
+                // experiment honors the persisted index builder, using the same
+                // input batch, memory admission, replay and publication path.
+                .algo = if (batch_options.mode == .bulk_ingest and
+                    !(if (self.resource_manager) |rm| rm.dense_configured_bulk_build else false)) .recursive else null,
             };
             entry.index.bulkBuildWithMetadataOptions(items, bulk_options) catch |err| switch (err) {
                 error.IndexNotEmpty => {
@@ -25248,7 +26624,7 @@ pub const IndexManager = struct {
             },
         );
         std.log.info(
-            "antfly_bench_hbc_write_timing phase={s} index={s} transform_ms={d} find_leaf_ms={d} store_vector_ms={d} mutate_leaf_ms={d} refresh_quantized_ms={d} quantized_vector_load_ms={d} quantized_compute_ms={d} quantized_store_ms={d} quantized_encode_ms={d} quantized_put_ms={d} save_node_ms={d} save_split_range_ms={d} update_parent_ms={d} split_leaf_ms={d} split_internal_ms={d} commit_ms={d} flush_metadata_ms={d} bulk_build_store_ms={d} bulk_build_tree_ms={d}",
+            "antfly_bench_hbc_write_timing phase={s} index={s} transform_ms={d} find_leaf_ms={d} store_vector_ms={d} mutate_leaf_ms={d} refresh_quantized_ms={d} quantized_vector_load_ms={d} quantized_leaf_vector_load_ms={d} quantized_internal_child_load_ms={d} matrix_metadata_lookup_ms={d} matrix_external_load_ms={d} quantized_compute_ms={d} quantized_store_ms={d} quantized_encode_ms={d} quantized_put_ms={d} save_node_ms={d} save_split_range_ms={d} update_parent_ms={d} split_leaf_ms={d} split_internal_ms={d} commit_ms={d} flush_metadata_ms={d} bulk_build_store_ms={d} bulk_build_tree_ms={d}",
             .{
                 phase,
                 entry.config.name,
@@ -25258,6 +26634,10 @@ pub const IndexManager = struct {
                 nsToMs(deltaU64(after_profile.insert_mutate_leaf_ns, before_profile.insert_mutate_leaf_ns)),
                 nsToMs(deltaU64(after_profile.refresh_quantized_ns, before_profile.refresh_quantized_ns)),
                 nsToMs(deltaU64(after_profile.quantized_vector_load_ns, before_profile.quantized_vector_load_ns)),
+                nsToMs(deltaU64(after_profile.quantized_leaf_vector_load_ns, before_profile.quantized_leaf_vector_load_ns)),
+                nsToMs(deltaU64(after_profile.quantized_internal_child_load_ns, before_profile.quantized_internal_child_load_ns)),
+                nsToMs(deltaU64(after_profile.matrix_metadata_lookup_ns, before_profile.matrix_metadata_lookup_ns)),
+                nsToMs(deltaU64(after_profile.matrix_external_load_ns, before_profile.matrix_external_load_ns)),
                 nsToMs(deltaU64(after_profile.quantized_compute_ns, before_profile.quantized_compute_ns)),
                 nsToMs(deltaU64(after_profile.quantized_store_ns, before_profile.quantized_store_ns)),
                 nsToMs(deltaU64(after_profile.quantized_encode_ns, before_profile.quantized_encode_ns)),
@@ -25432,16 +26812,27 @@ pub const IndexManager = struct {
         source_key: ?[]const u8,
         vector: []const f32,
     ) !void {
-        _ = parent_doc_key;
-        _ = source_field;
-        _ = source_key;
         const artifact_key = if (internal_keys.isInternalUserKey(base_key))
             try internal_keys.derivedEmbeddingArtifactKeyAlloc(self.alloc, base_key, artifact_name)
         else
             try internal_keys.embeddingArtifactKeyForDocumentAlloc(self.alloc, base_key, artifact_name);
         defer self.alloc.free(artifact_key);
-        const payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(self.alloc, null, vector);
+        // This path persists vectors extracted directly from stored fields for
+        // indexes without an embedding producer. Preserve authored origin on
+        // rebuild/replay too; internal derived members are not user ingress.
+        const authored = !internal_keys.isInternalUserKey(base_key) and
+            std.mem.eql(u8, base_key, parent_doc_key) and
+            std.mem.eql(u8, source_field, "_embeddings") and source_key == null;
+        const payload = if (authored)
+            try enrichment_artifact_codec.encodeAuthoredDenseEmbeddingAlloc(self.alloc, vector)
+        else
+            try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(self.alloc, null, vector);
         defer self.alloc.free(payload);
+        const existing = txn.get(artifact_key) catch |err| if (err == error.NotFound) null else return err;
+        // Projection replay must not mint a new source-artifact revision for
+        // the exact ingress postimage it is consuming. Besides avoiding a WAL
+        // rewrite, this preserves its writer-bound acceptance certificate.
+        if (existing) |raw| if (std.mem.eql(u8, raw, payload)) return;
         try txn.put(artifact_key, payload);
     }
 
@@ -25500,6 +26891,30 @@ pub const IndexManager = struct {
             session.cacheDecodedVector(entry.index, vector_id, vector);
         }
         return vector;
+    }
+
+    fn loadPreviousDenseVectorForHbcIntoScratch(ctx: *anyopaque, _: u64, metadata: []const u8, scratch: []f32) ![]const f32 {
+        const loader: *DenseVectorLoadContext = @ptrCast(@alignCast(ctx));
+        const manager = loader.manager;
+        const entry = manager.denseIndex(loader.index_name) orelse return error.IndexNotFound;
+        const base = entry.index.exactVectorReplayBaseSequence() orelse return error.NotFound;
+        const generation = manager.acquireVectorBlockGeneration() orelse return error.NotFound;
+        defer generation.release();
+        if (manager.vector_block_projection_dirty.load(.acquire) or
+            !vectorBlockGenerationExactAtSequence(generation, base)) return error.NotFound;
+        const key = try denseVectorArtifactKeyForMetadataAlloc(manager.alloc, entry, metadata);
+        defer manager.alloc.free(key);
+        const found = try generation.opened.get(key, base, null);
+        const value = switch (found) {
+            .vector => |value| value,
+            .missing, .tombstone => return error.NotFound,
+        };
+        if (value.dims != entry.dims) return error.InvalidVectorDimensions;
+        // The generation lease ends on return. Never return its borrowed
+        // mmap/WAL pointer to the caller's centroid/no-op calculation.
+        const decoded = try value.decodeExactInto(scratch);
+        if (decoded.ptr != scratch.ptr) @memcpy(scratch[0..decoded.len], decoded);
+        return scratch[0..decoded.len];
     }
 
     fn loadDenseVectorForHbcIntoScratch(ctx: *anyopaque, vector_id: u64, metadata: []const u8, scratch: []f32) ![]const f32 {
@@ -25704,10 +27119,41 @@ pub const IndexManager = struct {
         index: *hbc_mod.HBCIndex,
         transform: hbc_mod.HBCIndex.ExternalVectorTransformFn,
     ) !void {
+        const replay_reads = if (getenv("ANTFLY_SOURCE_VECTOR_REPLAY_READS")) |raw|
+            std.mem.eql(u8, std.mem.span(raw), "1")
+        else
+            true;
+        return loadDenseVectorsForHbcBatchIntoTransformedMatrixWithReplay(
+            ctx,
+            vector_ids,
+            metadata,
+            matrix_positions,
+            matrix,
+            scratch,
+            dims,
+            index,
+            transform,
+            replay_reads,
+        );
+    }
+
+    fn loadDenseVectorsForHbcBatchIntoTransformedMatrixWithReplay(
+        ctx: *anyopaque,
+        vector_ids: []const u64,
+        metadata: []const ?[]const u8,
+        matrix_positions: []const usize,
+        matrix: []f32,
+        scratch: []f32,
+        dims: usize,
+        index: *hbc_mod.HBCIndex,
+        transform: hbc_mod.HBCIndex.ExternalVectorTransformFn,
+        replay_reads: bool,
+    ) !void {
         const loader: *DenseVectorLoadContext = @ptrCast(@alignCast(ctx));
         const manager = loader.manager;
         const store = manager.primary_store orelse return error.NotFound;
         const entry = manager.denseIndex(loader.index_name) orelse return error.IndexNotFound;
+        const replay_base = if (replay_reads) entry.index.exactVectorReplayBaseSequence() else null;
         if (vector_ids.len != metadata.len or vector_ids.len != matrix_positions.len) return error.InvalidArgument;
         if (dims == 0) return error.InvalidVectorDimensions;
         if (scratch.len < dims) return error.BufferTooSmall;
@@ -25730,6 +27176,17 @@ pub const IndexManager = struct {
             const matrix_start = std.math.mul(usize, matrix_pos, dims) catch return error.BufferTooSmall;
             const matrix_end = std.math.add(usize, matrix_start, dims) catch return error.BufferTooSmall;
             if (matrix_end > matrix.len) return error.BufferTooSmall;
+            if (replay_base != null) {
+                if (entry.index.exactVectorReplayMutation(vector_ids[i])) |mutation| {
+                    if (mutation.kind == .tombstone) return error.NotFound;
+                    const doc_key = maybe_doc_key orelse return error.NotFound;
+                    if (!std.mem.eql(u8, mutation.metadata, doc_key)) return error.NotFound;
+                    if (mutation.vector.len != dims) return error.InvalidVectorDimensions;
+                    _ = transform(index, mutation.vector, matrix[matrix_start..matrix_end]);
+                    if (load_session) |session| session.matrix_captured_vectors += 1;
+                    continue;
+                }
+            }
             if (load_session) |session| {
                 if (session.getVector(vector_ids[i])) |cached| {
                     if (cached.len != dims) return error.InvalidVectorDimensions;
@@ -25752,6 +27209,8 @@ pub const IndexManager = struct {
         }
         if (key_count == 0) return;
 
+        if (load_session) |session| session.matrix_generation_attempts += 1;
+
         // A published exact-vector generation is already the immutable source
         // plane needed by topology construction and posting splits. Re-reading
         // the same artifacts through the primary LSM would duplicate cache
@@ -25763,6 +27222,20 @@ pub const IndexManager = struct {
         const vector_block_generation = blk: {
             const posting_sequence = entry.index.experimentalPostingDurableAppliedSequence() orelse break :blk null;
             const generation = manager.acquireVectorBlockGeneration() orelse break :blk null;
+            if (replay_base) |base| {
+                // Exact capture certifies every changed vector before its
+                // topology mutation. Unchanged keys may therefore use the
+                // immutable generation at that capture's base, including an
+                // initial WAL/delta layout with no serving base yet. Never
+                // substitute a newer generation or relax public readiness.
+                if (manager.vector_block_projection_dirty.load(.acquire) or
+                    !vectorBlockGenerationExactAtSequence(generation, base))
+                {
+                    generation.release();
+                    break :blk null;
+                }
+                break :blk generation;
+            }
             const vector_sequence = generation.opened.store.covered_source_sequence;
             const owns_stable_tip = manager.vector_block_stable_tip_finalizing.load(.acquire) and
                 manager.vector_block_stable_tip_index.load(.acquire) == @intFromPtr(entry);
@@ -25788,6 +27261,9 @@ pub const IndexManager = struct {
             break :blk generation;
         };
         defer if (vector_block_generation) |generation| generation.release();
+        if (vector_block_generation == null) {
+            if (load_session) |session| session.matrix_generation_rejections += 1;
+        }
         if (vector_block_generation) |generation| {
             const shard_count = generation.opened.store.manifest.?.shard_count;
             std.mem.sort(DenseArtifactReadKey, artifact_reads[0..key_count], shard_count, DenseArtifactReadKey.blockLessThan);
@@ -25824,6 +27300,7 @@ pub const IndexManager = struct {
                 const vector = value.vectorView() orelse try value.decodeExactInto(scratch);
                 _ = transform(index, vector, matrix[matrix_start..matrix_end]);
             }
+            if (load_session) |session| session.matrix_generation_vectors += key_count - remaining_count;
             key_count = remaining_count;
             if (key_count == 0) return;
         }
@@ -25836,6 +27313,67 @@ pub const IndexManager = struct {
 
         const raw_values = try manager.alloc.alloc(?[]const u8, key_count);
         defer manager.alloc.free(raw_values);
+        if (load_session) |session| session.matrix_fallback_vectors += key_count;
+        const batch_source_reads = if (getenv("ANTFLY_SOURCE_VECTOR_BATCH_READS")) |raw| std.mem.eql(u8, std.mem.span(raw), "1") else true;
+        if (manager.source_payload_store != null and batch_source_reads) {
+            const Sink = struct {
+                reads: []const DenseArtifactReadKey,
+                ids: []const u64,
+                positions: []const usize,
+                matrix: []f32,
+                dims: usize,
+                index: *hbc_mod.HBCIndex,
+                transform: hbc_mod.HBCIndex.ExternalVectorTransformFn,
+                session: ?*DenseVectorLoadSession,
+
+                fn put(ptr: *anyopaque, position: usize, vector: []const f32) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (vector.len != self.dims) return error.InvalidVectorDimensions;
+                    const slot = self.reads[position].position;
+                    const start = self.positions[slot] * self.dims; // Bounds checked before any reads.
+                    _ = self.transform(self.index, vector, self.matrix[start..][0..self.dims]);
+                    if (self.session) |session| {
+                        try session.cacheVector(self.ids[slot], vector);
+                        session.cacheDecodedVector(self.index, self.ids[slot], vector);
+                    }
+                }
+            };
+            var sink: Sink = .{ .reads = artifact_reads[0..key_count], .ids = vector_ids, .positions = matrix_positions, .matrix = matrix, .dims = dims, .index = index, .transform = transform, .session = load_session };
+            var budget: ?resource_manager_mod.BudgetedAllocator = if (manager.resource_manager) |resources|
+                resource_manager_mod.BudgetedAllocator.initReclaiming(resources, if (load_session) |session| session.working_slice else .dense_apply_working_set, manager.alloc, 1)
+            else
+                null;
+            defer if (budget) |*value| value.deinit();
+            const batch_alloc = if (budget) |*value| value.allocator() else manager.alloc;
+            var local_txn: ?docstore_mod.DocStore.Txn = null;
+            defer if (local_txn) |*txn| txn.abort();
+            const txn = if (load_session) |session| blk: {
+                session.recycleRawReadStateIfNeeded();
+                session.ensureDecodedResidencyCapacity(key_count, dims);
+                session.raw_batch_reads += 1;
+                session.raw_cache_misses += key_count;
+                break :blk if (session.txn_override != null) null else try session.getTxn(store);
+            } else blk: {
+                local_txn = try store.beginProbeTxn();
+                break :blk &local_txn.?;
+            };
+            const batch_result = if (txn) |read|
+                read.consumeDenseManySorted(batch_alloc, artifact_keys, raw_values, dims, .{ .ptr = &sink, .put = Sink.put, .scratch = scratch, .io = manager.io })
+            else
+                load_session.?.txn_override.?.consumeDenseManySorted(batch_alloc, artifact_keys, raw_values, dims, .{ .ptr = &sink, .put = Sink.put, .scratch = scratch, .io = manager.io });
+            const batch_stats = batch_result catch |err| {
+                if (err == error.OutOfMemory) if (budget) |*value| {
+                    if (value.denied()) return error.ResourceBudgetExceeded;
+                };
+                if (isRecoverableEmbeddingArtifactError(err)) return error.NotFound;
+                return err;
+            };
+            if (load_session) |session| {
+                session.source_batch_reads.add(batch_stats);
+                session.noteRawValuesLoaded(raw_values);
+            }
+            return;
+        }
         if (load_session) |session| {
             session.ensureDecodedResidencyCapacity(key_count, dims);
             try session.getManySorted(store, artifact_keys, raw_values);
@@ -25896,10 +27434,17 @@ pub const IndexManager = struct {
             }
         }
         const generation = loader.manager.acquireVectorBlockGeneration() orelse return false;
-        defer generation.release();
-        return generation.opened.store.covered_source_sequence == sequence and
+        const supported = generation.opened.store.covered_source_sequence == sequence and
             (generation.opened.scorePrecision() == .bounded_float16 or
                 generation.opened.scorePrecision() == .authoritative_float32_with_bounded_float16);
+        if (supported) if (active_dense_vector_load_session) |session| {
+            if (session.context == loader) {
+                session.pinNativeVectorGeneration(generation, sequence);
+                return true;
+            }
+        };
+        generation.release();
+        return supported;
     }
 
     fn beginDenseVectorProjectionBuild(ctx: *anyopaque, source_sequence: u64) !void {
@@ -26131,6 +27676,154 @@ pub const IndexManager = struct {
         };
     }
 
+    fn scoreDenseVectorsUnified(
+        ctx: *anyopaque,
+        vector_ids: []const u64,
+        resolver: hbc_mod.HBCIndex.ExternalVectorMetadataResolver,
+        query: []const f32,
+        query_measure: f32,
+        metric: vector_mod.DistanceMetric,
+        distances: []f32,
+        batch_scratch: []f32,
+        dims: usize,
+        scratch: hbc_mod.HBCIndex.ExternalVectorBatchDistanceScratch,
+        profile: ?*hbc_mod.SearchProfile,
+    ) !bool {
+        const loader: *DenseVectorLoadContext = @ptrCast(@alignCast(ctx));
+        const manager = loader.manager;
+        const resources = manager.resource_manager orelse return false;
+        if (!resources.dense_unified_fetch or vector_ids.len == 0 or vector_ids.len > 256) return false;
+        const session = active_dense_vector_load_session orelse return false;
+        if (session.context != loader) return false;
+        const sequence = scratch.source_sequence orelse return false;
+        if (session.native_vector_generation != null and session.native_vector_source_sequence != sequence) return false;
+        var release = session.native_vector_generation == null;
+        const generation = session.native_vector_generation orelse manager.acquireVectorBlockGeneration() orelse return false;
+        defer if (release) generation.release();
+        if (generation.opened.store.covered_source_sequence != sequence or generation.opened.scorePrecision() != .authoritative_float32) return false;
+        const bindings = generation.member_bindings orelse return false;
+        const entry = manager.denseIndex(loader.index_name) orelse return false;
+        if (query.len != dims or dims == 0 or distances.len != vector_ids.len) return error.InvalidArgument;
+        if (batch_scratch.len < try std.math.mul(usize, dims, vector_ids.len)) return error.BufferTooSmall;
+        if (release) {
+            session.pinNativeVectorGeneration(generation, sequence);
+            release = false;
+        }
+        @memset(distances, std.math.inf(f32));
+        var metadata: [256]?[]const u8 = @splat(null);
+        var missing_ids: [256]u64 = undefined;
+        var missing_positions: [256]usize = undefined;
+        var missing_metadata: [256]?[]const u8 = undefined;
+        var missing_count: usize = 0;
+        // Release the read arena before invoking the ordinary fallback, which
+        // acquires its own bounded scratch. Resolver views belong to the txn.
+        {
+            const pooled = if (session.working_slice == .dense_search_working_set) try manager.native_read_scratch.acquire() else null;
+            defer if (pooled) |slot| manager.native_read_scratch.release(slot) else session.endResidualScratch();
+            const alloc = if (pooled) |slot| slot.allocator() else session.beginResidualScratch();
+            const locations = try alloc.alloc(?vector_block_store_mod.LocatedValue, vector_ids.len);
+            @memset(locations, null);
+            for (vector_ids, 0..) |id, i| {
+                if (bindings.get(entry.capture_incarnation, id)) |row| locations[i] = generation.opened.bindSourceRow(row) catch null;
+                if (locations[i] == null) {
+                    missing_ids[missing_count] = id;
+                    missing_positions[missing_count] = i;
+                    missing_count += 1;
+                }
+            }
+            const hits = vector_ids.len - missing_count;
+            if (profile) |p| {
+                p.rerank_member_binding_batches += 1;
+                p.rerank_member_binding_mixed_batches += @intFromBool(hits > 0 and missing_count > 0);
+                p.rerank_member_binding_misses += missing_count;
+                p.rerank_member_binding_bytes = @max(p.rerank_member_binding_bytes, bindings.resident_bytes.load(.monotonic));
+            }
+            if (missing_count != 0) try resolver.resolve(resolver.ctx, missing_ids[0..missing_count], missing_metadata[0..missing_count]);
+            const key_start = platform_time.monotonicNs();
+            for (missing_positions[0..missing_count], missing_metadata[0..missing_count]) |pos, doc| {
+                metadata[pos] = doc;
+                const key = try denseVectorArtifactKeyForMetadataAlloc(alloc, entry, doc orelse continue);
+                const found = generation.opened.locateHashed(key, vector_block_mod.keyHash(key), sequence, null) catch continue;
+                locations[pos] = switch (found) {
+                    .vector => |v| v,
+                    .missing, .tombstone => null,
+                };
+            }
+            if (profile) |p| p.rerank_artifact_key_ns += platform_time.monotonicNs() - key_start;
+            const read_start = platform_time.monotonicNs();
+            const requests = try alloc.alloc(vector_block_store_mod.ExactReadRequest, vector_ids.len);
+            const stride = try vector_block_mod.encodedVectorBytesLen(.float32, dims);
+            const payload = try alloc.alloc(u8, try std.math.mul(usize, stride, vector_ids.len));
+            var request_count: usize = 0;
+            for (locations, 0..) |maybe_location, pos| {
+                const location = maybe_location orelse continue;
+                requests[request_count] = .{ .located = location, .scratch = payload[pos * stride ..][0..stride], .result_position = pos };
+                request_count += 1;
+            }
+            if (resources.dense_physical_rerank_order and request_count > 1) {
+                generation.opened.orderExactReadsByLocation(requests[0..request_count]);
+                resources.notePhysicallyOrderedReads(request_count);
+            }
+            const stats = try generation.opened.readExactIntoBatch(manager.io, requests[0..request_count]);
+            if (profile) |p| {
+                p.rerank_vector_physical_reads += stats.physical_reads;
+                p.rerank_vector_physical_bytes += stats.physical_bytes;
+                p.rerank_read_batches += stats.dispatch.batches;
+                p.rerank_read_requests += stats.dispatch.requests;
+                p.rerank_read_helpers += stats.dispatch.helpers;
+                p.rerank_read_denied += stats.dispatch.denied;
+                p.rerank_read_dispatch_ns += stats.dispatch.dispatch_ns;
+                p.rerank_read_caller_ns += stats.dispatch.caller_ns;
+                p.rerank_read_join_ns += stats.dispatch.join_ns;
+                p.rerank_read_worker_wall_ns += stats.dispatch.worker_wall_ns;
+                p.rerank_read_adaptive_inline_batches +|= stats.dispatch.adaptive_inline_batches;
+                p.rerank_read_adaptive_wide_batches +|= stats.dispatch.adaptive_wide_batches;
+                p.rerank_read_adaptive_probe_ns +|= stats.dispatch.adaptive_probe_ns;
+                p.rerank_read_worker_start_delay_ns += stats.dispatch.worker_start_delay_ns;
+                p.rerank_read_mapped_requests += stats.dispatch.mapped_requests;
+                p.rerank_read_mapped_bytes += stats.dispatch.mapped_bytes;
+            }
+            for (requests[0..request_count]) |request| {
+                const value = request.value orelse continue;
+                if (value.dims != dims) continue;
+                const pos = request.result_position;
+                const distance_start = platform_time.monotonicNs();
+                distances[pos] = try exactVectorBlockDistance(value, query, query_measure, metric, batch_scratch[pos * dims ..][0..dims]);
+                if (metadata[pos] != null) if (generation.opened.sourceRow(request.located)) |row| bindings.put(entry.capture_incarnation, vector_ids[pos], row);
+                if (profile) |p| {
+                    const elapsed = platform_time.monotonicNs() - distance_start;
+                    p.rerank_member_binding_hits += @intFromBool(metadata[pos] == null);
+                    p.rerank_vector_location_reuses += @intFromBool(metadata[pos] == null);
+                    p.rerank_vector_block_hits += 1;
+                    p.rerank_vector_projection_reads += 1;
+                    p.rerank_vector_projection_bytes += request.located.projectionBytes();
+                    p.rerank_artifact_cache_hits += 1;
+                    p.rerank_artifact_distance_ns += elapsed;
+                    p.rerank_distance_ns += elapsed;
+                }
+            }
+            if (profile) |p| p.rerank_artifact_read_ns += platform_time.monotonicNs() - read_start;
+        }
+        missing_count = 0;
+        for (distances, 0..) |distance, pos| {
+            if (std.math.isFinite(distance)) continue;
+            missing_ids[missing_count] = vector_ids[pos];
+            missing_positions[missing_count] = pos;
+            missing_count += 1;
+        }
+        if (missing_count != 0) {
+            // Includes invalid bindings/read errors: preserve authoritative
+            // fallback, rather than manufacturing an artifact key from a hint.
+            try resolver.resolve(resolver.ctx, missing_ids[0..missing_count], missing_metadata[0..missing_count]);
+            var fallback_distances: [256]f32 = undefined;
+            var fallback_scratch = scratch;
+            fallback_scratch.bounded_projections = &.{}; // float32 has no residual
+            try scoreDenseVectorsForHbcBatch(ctx, missing_ids[0..missing_count], missing_metadata[0..missing_count], query, query_measure, metric, fallback_distances[0..missing_count], batch_scratch, dims, fallback_scratch, profile);
+            for (missing_positions[0..missing_count], fallback_distances[0..missing_count]) |pos, distance| distances[pos] = distance;
+        }
+        return true;
+    }
+
     fn scoreDenseVectorsFromNativeLocations(
         ctx: *anyopaque,
         vector_ids: []const u64,
@@ -26170,8 +27863,16 @@ pub const IndexManager = struct {
             break :blk current;
         };
         defer if (release_generation) generation.release();
-        if (generation.opened.store.covered_source_sequence != sequence or
-            generation.opened.scorePrecision() != .authoritative_float32_with_bounded_float16) return;
+        if (generation.opened.store.covered_source_sequence != sequence) return;
+        if (generation.opened.scorePrecision() == .authoritative_float32) {
+            if (generation.member_bindings == null) return;
+            if (release_generation) {
+                session.pinNativeVectorGeneration(generation, sequence);
+                release_generation = false;
+            }
+            return scoreDenseVectorsFromMemberBindings(loader, session, generation, vector_ids, query, query_measure, metric, distances, batch_scratch, dims, profile);
+        }
+        if (generation.opened.scorePrecision() != .authoritative_float32_with_bounded_float16) return;
 
         const pooled = if (session.working_slice == .dense_search_working_set)
             try loader.manager.native_read_scratch.acquire()
@@ -26259,6 +27960,112 @@ pub const IndexManager = struct {
             }
         }
         if (profile) |p| p.rerank_artifact_read_ns += platform_time.monotonicNs() - read_start;
+    }
+
+    fn scoreDenseVectorsFromMemberBindings(
+        loader: *DenseVectorLoadContext,
+        session: *DenseVectorLoadSession,
+        generation: *SharedVectorBlockGeneration,
+        vector_ids: []const u64,
+        query: []const f32,
+        query_measure: f32,
+        metric: vector_mod.DistanceMetric,
+        distances: []f32,
+        batch_scratch: []f32,
+        dims: usize,
+        profile: ?*hbc_mod.SearchProfile,
+    ) !void {
+        const bindings = generation.member_bindings orelse return;
+        const entry = loader.manager.denseIndex(loader.index_name) orelse return;
+        // Bound temporary state independently of the caller's rerank width.
+        var begin: usize = 0;
+        while (begin < vector_ids.len) {
+            const end = @min(vector_ids.len, begin + 256);
+            var rows: [256]?vector_block_store_mod.member_bindings.Row = undefined;
+            var hit_count: usize = 0;
+            const read_start = platform_time.monotonicNs();
+            for (vector_ids[begin..end], 0..) |id, i| {
+                rows[i] = bindings.get(entry.capture_incarnation, id);
+                hit_count += @intFromBool(rows[i] != null);
+            }
+            if (profile) |p| {
+                p.rerank_member_binding_misses +|= @intCast(end - begin - hit_count);
+                p.rerank_member_binding_batches += 1;
+                p.rerank_member_binding_mixed_batches += @intFromBool(hit_count > 0 and hit_count < end - begin);
+                p.rerank_member_binding_bytes = @max(p.rerank_member_binding_bytes, bindings.resident_bytes.load(.monotonic));
+            }
+            if (hit_count == 0) {
+                if (profile) |p| p.rerank_artifact_read_ns += platform_time.monotonicNs() - read_start;
+                begin = end;
+                continue;
+            }
+            const pooled = if (session.working_slice == .dense_search_working_set)
+                try loader.manager.native_read_scratch.acquire()
+            else
+                null;
+            defer if (pooled) |slot| loader.manager.native_read_scratch.release(slot) else session.endResidualScratch();
+            const alloc = if (pooled) |slot| slot.allocator() else session.beginResidualScratch();
+            const requests = alloc.alloc(vector_block_store_mod.ExactReadRequest, hit_count) catch |err|
+                return if (pooled) |slot| slot.allocationError(err) else session.residualAllocationError(err);
+            const stride = try vector_block_mod.encodedVectorBytesLen(.float32, dims);
+            const bytes = try std.math.mul(usize, hit_count, stride);
+            const payload = alloc.alloc(u8, bytes) catch |err|
+                return if (pooled) |slot| slot.allocationError(err) else session.residualAllocationError(err);
+            var request_count: usize = 0;
+            for (rows[0 .. end - begin], 0..) |maybe_row, i| {
+                const row = maybe_row orelse continue;
+                const location = generation.opened.bindSourceRow(row) catch continue;
+                requests[request_count] = .{
+                    .located = location,
+                    .scratch = payload[request_count * stride ..][0..stride],
+                    .result_position = begin + i,
+                };
+                request_count += 1;
+            }
+            if (loader.manager.resource_manager) |resources| if (resources.dense_physical_rerank_order and request_count > 1) {
+                generation.opened.orderExactReadsByLocation(requests[0..request_count]);
+                resources.notePhysicallyOrderedReads(request_count);
+            };
+            const stats = try generation.opened.readExactIntoBatch(loader.manager.io, requests[0..request_count]);
+            if (profile) |p| {
+                p.rerank_vector_physical_reads +|= stats.physical_reads;
+                p.rerank_read_batches +|= stats.dispatch.batches;
+                p.rerank_read_requests +|= stats.dispatch.requests;
+                p.rerank_read_helpers +|= stats.dispatch.helpers;
+                p.rerank_read_denied +|= stats.dispatch.denied;
+                p.rerank_read_dispatch_ns +|= stats.dispatch.dispatch_ns;
+                p.rerank_read_caller_ns +|= stats.dispatch.caller_ns;
+                p.rerank_read_join_ns +|= stats.dispatch.join_ns;
+                p.rerank_read_worker_wall_ns +|= stats.dispatch.worker_wall_ns;
+                p.rerank_read_adaptive_inline_batches +|= stats.dispatch.adaptive_inline_batches;
+                p.rerank_read_adaptive_wide_batches +|= stats.dispatch.adaptive_wide_batches;
+                p.rerank_read_adaptive_probe_ns +|= stats.dispatch.adaptive_probe_ns;
+                p.rerank_read_worker_start_delay_ns +|= stats.dispatch.worker_start_delay_ns;
+                p.rerank_read_mapped_requests +|= stats.dispatch.mapped_requests;
+                p.rerank_read_mapped_bytes +|= stats.dispatch.mapped_bytes;
+                p.rerank_vector_physical_bytes +|= stats.physical_bytes;
+            }
+            for (requests[0..request_count]) |request| {
+                const value = request.value orelse continue;
+                if (value.dims != dims) continue;
+                const slot = request.result_position;
+                const distance_start = platform_time.monotonicNs();
+                distances[slot] = try exactVectorBlockDistance(value, query, query_measure, metric, batch_scratch[slot * dims ..][0..dims]);
+                if (profile) |p| {
+                    const elapsed = platform_time.monotonicNs() - distance_start;
+                    p.rerank_member_binding_hits += 1;
+                    p.rerank_vector_location_reuses += 1;
+                    p.rerank_vector_block_hits += 1;
+                    p.rerank_vector_projection_reads += 1;
+                    p.rerank_vector_projection_bytes +|= request.located.projectionBytes();
+                    p.rerank_artifact_cache_hits += 1;
+                    p.rerank_artifact_distance_ns += elapsed;
+                    p.rerank_distance_ns += elapsed;
+                }
+            }
+            if (profile) |p| p.rerank_artifact_read_ns += platform_time.monotonicNs() - read_start;
+            begin = end;
+        }
     }
 
     fn scoreDenseVectorsForHbcBatch(
@@ -26611,7 +28418,6 @@ pub const IndexManager = struct {
             @memset(values, null);
             const projections = try key_alloc.alloc(?vector_block_store_mod.LoadedProjection, key_count);
             @memset(projections, null);
-            const request_positions = try key_alloc.alloc(usize, key_count);
             const residual_request_positions = try key_alloc.alloc(usize, key_count);
             const used_borrowed_projection = try key_alloc.alloc(bool, key_count);
             @memset(used_borrowed_projection, false);
@@ -26646,7 +28452,7 @@ pub const IndexManager = struct {
                 const payload_start = std.math.mul(usize, artifact_pos, vector_block_payload_stride) catch return error.BufferTooSmall;
                 const payload = vector_block_payload_scratch[payload_start..][0..vector_block_payload_stride];
                 if (error_bounds != null) {
-                    projection_requests[request_count] = .{ .located = location, .scratch = payload };
+                    projection_requests[request_count] = .{ .located = location, .scratch = payload, .result_position = artifact_pos };
                 } else {
                     const slot = artifact_read.position;
                     if (location.residualBytes() != 0 and scratch.bounded_projections.len == vector_ids.len) {
@@ -26671,12 +28477,17 @@ pub const IndexManager = struct {
                             }
                         }
                     }
-                    exact_requests[request_count] = .{ .located = location, .scratch = payload };
+                    exact_requests[request_count] = .{ .located = location, .scratch = payload, .result_position = artifact_pos };
                 }
-                request_positions[request_count] = artifact_pos;
                 request_count += 1;
             }
             if (error_bounds != null) {
+                if (generation.opened.external_payloads != null and request_count > 1) {
+                    if (manager.resource_manager) |resources| if (resources.dense_physical_rerank_order) {
+                        generation.opened.orderProjectionReadsByLocation(projection_requests[0..request_count]);
+                        resources.notePhysicallyOrderedReads(request_count);
+                    };
+                }
                 const borrow_enabled = if (manager.resource_manager) |resources| resources.dense_projection_borrow_enabled else false;
                 const read_stats = if (if (borrow_enabled) load_session else null) |session|
                     try generation.opened.readProjectionsIntoBatchBorrowed(manager.io, projection_requests[0..request_count], &session.native_projection_borrows, session.projectionBorrowAllocator())
@@ -26686,7 +28497,8 @@ pub const IndexManager = struct {
                     p.rerank_vector_physical_reads +|= read_stats.physical_reads;
                     p.rerank_vector_physical_bytes +|= read_stats.physical_bytes;
                 }
-                for (projection_requests[0..request_count], request_positions[0..request_count]) |request, artifact_pos| {
+                for (projection_requests[0..request_count]) |request| {
+                    const artifact_pos = request.result_position;
                     const value = request.value orelse continue;
                     if (request.borrowed) if (profile) |p| {
                         p.rerank_vector_projection_borrows += 1;
@@ -26695,17 +28507,37 @@ pub const IndexManager = struct {
                     projections[artifact_pos] = .{ .located = request.located, .value = value, .borrowed = request.borrowed };
                 }
             } else {
+                if (generation.opened.external_payloads != null and request_count > 1) {
+                    if (manager.resource_manager) |resources| if (resources.dense_physical_rerank_order) {
+                        generation.opened.orderExactReadsByLocation(exact_requests[0..request_count]);
+                        resources.notePhysicallyOrderedReads(request_count);
+                    };
+                }
                 const residual_stats = try generation.opened.readExactResidualsIntoBatch(manager.io, residual_requests[0..residual_request_count]);
                 const read_stats = try generation.opened.readExactIntoBatch(manager.io, exact_requests[0..request_count]);
                 if (profile) |p| {
                     p.rerank_vector_physical_reads +|= residual_stats.physical_reads +| read_stats.physical_reads;
+                    p.rerank_read_batches +|= read_stats.dispatch.batches;
+                    p.rerank_read_requests +|= read_stats.dispatch.requests;
+                    p.rerank_read_helpers +|= read_stats.dispatch.helpers;
+                    p.rerank_read_denied +|= read_stats.dispatch.denied;
+                    p.rerank_read_dispatch_ns +|= read_stats.dispatch.dispatch_ns;
+                    p.rerank_read_caller_ns +|= read_stats.dispatch.caller_ns;
+                    p.rerank_read_join_ns +|= read_stats.dispatch.join_ns;
+                    p.rerank_read_worker_wall_ns +|= read_stats.dispatch.worker_wall_ns;
+                    p.rerank_read_adaptive_inline_batches +|= read_stats.dispatch.adaptive_inline_batches;
+                    p.rerank_read_adaptive_wide_batches +|= read_stats.dispatch.adaptive_wide_batches;
+                    p.rerank_read_adaptive_probe_ns +|= read_stats.dispatch.adaptive_probe_ns;
+                    p.rerank_read_worker_start_delay_ns +|= read_stats.dispatch.worker_start_delay_ns;
+                    p.rerank_read_mapped_requests +|= read_stats.dispatch.mapped_requests;
+                    p.rerank_read_mapped_bytes +|= read_stats.dispatch.mapped_bytes;
                     p.rerank_vector_physical_bytes +|= residual_stats.physical_bytes +| read_stats.physical_bytes;
                 }
                 for (residual_requests[0..residual_request_count], residual_request_positions[0..residual_request_count]) |request, artifact_pos| {
                     values[artifact_pos] = request.value;
                 }
-                for (exact_requests[0..request_count], request_positions[0..request_count]) |request, artifact_pos| {
-                    values[artifact_pos] = request.value;
+                for (exact_requests[0..request_count]) |request| {
+                    values[request.result_position] = request.value;
                 }
             }
 
@@ -26730,6 +28562,10 @@ pub const IndexManager = struct {
                     continue;
                 }
                 const slot = artifact_read.position;
+                if (generation.member_bindings) |bindings| {
+                    if (generation.opened.sourceRow(location)) |row|
+                        bindings.put(entry.capture_incarnation, vector_ids[slot], row);
+                }
                 const vector_start = std.math.mul(usize, slot, dims) catch return error.BufferTooSmall;
                 const vector_scratch = batch_scratch[vector_start .. vector_start + dims];
                 const distance_start = platform_time.monotonicNs();
@@ -28193,6 +30029,7 @@ fn isPrimaryDocumentCandidate(key: []const u8) bool {
 
 fn newCoverageGeneration(runtime_io: ?std.Io) !u64 {
     if (runtime_io) |io| return try coverage_identity.generate(io);
+    if (builtin.os.tag == .freestanding) return try coverage_identity.generate(.failing);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     return try coverage_identity.generate(io_impl.io());
@@ -28300,7 +30137,7 @@ fn serializeCatalogExcluding(alloc: Allocator, manager: *const IndexManager, exc
     return try out.toOwnedSlice(alloc);
 }
 
-fn deserializeCatalog(alloc: Allocator, data: []const u8) ![]types.IndexConfig {
+pub fn deserializeCatalog(alloc: Allocator, data: []const u8) ![]types.IndexConfig {
     if (data.len < 12 or !std.mem.eql(u8, data[0..4], "AIDX")) return error.InvalidIndexCatalog;
 
     var pos: usize = 4;
@@ -28607,6 +30444,116 @@ pub fn denseConfigRequiresArtifactCoverage(alloc: Allocator, cfg: types.IndexCon
     return dense_cfg.external or dense_cfg.embedding_name != null or dense_cfg.embedding_names.len > 0 or generator != null;
 }
 
+/// The first online vector family has no asynchronous/external producer.
+/// Keep this classifier next to normal index parsing so admission and repair
+/// agree on ownership; merely being a vector index is not a capability.
+pub fn onlineDirectVectorConfig(alloc: Allocator, cfg: types.IndexConfig) !bool {
+    if (cfg.kind != .dense_vector and cfg.kind != .sparse_vector) return false;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, cfg.config_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidIndexConfig;
+    const root = parsed.value.object;
+    if (root.contains("generator") or root.contains("embedding_name")) return false;
+    const field = root.get("field") orelse return false;
+    if (field != .string or field.string.len == 0) return false;
+    if (cfg.kind == .dense_vector) {
+        const dims = root.get("dims") orelse return false;
+        if (dims != .integer or dims.integer <= 0 or dims.integer > std.math.maxInt(u16)) return false;
+        const config = try parseDenseConfig(alloc, cfg.config_json);
+        defer config.deinit(alloc);
+        return !config.external and config.embedding_name == null and config.embedding_names.len == 0;
+    }
+    const config = try parseSparseConfig(alloc, cfg.config_json);
+    defer config.deinit(alloc);
+    return !config.external and config.embedding_name == null and config.embedding_names.len == 0;
+}
+
+/// Definition classifier only. Ordered producer authority, baseline coverage,
+/// and protocol-15 transfer readiness are separate admission requirements.
+pub fn onlineBaseEmbeddingProducer(cfg: enrichment_catalog.EnrichmentConfig) bool {
+    return cfg.kind == .embedding and cfg.embedding_input == .text and
+        cfg.source_artifact_name.len == 0 and cfg.neighbor_context_json.len == 0 and
+        cfg.chunk_size == 0 and cfg.chunk_overlap == 0 and cfg.chunker_json.len == 0 and
+        (cfg.source_field.len != 0 or cfg.source_template.len != 0);
+}
+
+pub fn enrichmentDefinitionsEqual(alloc: Allocator, left: enrichment_catalog.EnrichmentConfig, right: enrichment_catalog.EnrichmentConfig) !bool {
+    const a = try std.json.Stringify.valueAlloc(alloc, left, .{});
+    defer alloc.free(a);
+    const b = try std.json.Stringify.valueAlloc(alloc, right, .{});
+    defer alloc.free(b);
+    return std.mem.eql(u8, a, b);
+}
+
+pub fn onlineBaseGeneratedVectorConfig(alloc: Allocator, cfg: types.IndexConfig, producers: []const enrichment_catalog.EnrichmentConfig) !bool {
+    if (cfg.kind != .dense_vector and cfg.kind != .sparse_vector) return false;
+    const generator = if (cfg.kind == .dense_vector)
+        try parseDenseGeneratorConfig(alloc, cfg.config_json)
+    else
+        try parseSparseGeneratorConfig(alloc, cfg.config_json);
+    defer if (generator) |value| value.deinit(alloc);
+    if (generator) |value| {
+        if (generatorHasChunking(value) or value.embedding_input != .text or
+            (value.source_field.len == 0 and value.source_template.len == 0)) return false;
+    }
+    if (cfg.kind == .dense_vector) {
+        const config = try parseDenseConfig(alloc, cfg.config_json);
+        defer config.deinit(alloc);
+        if (config.external) return false;
+        if (generator != null) return config.embedding_names.len == 0 and config.embedding_name == null;
+        const names: []const []const u8 = if (config.embedding_names.len != 0) config.embedding_names else if (config.embedding_name) |name| &.{name} else return false;
+        for (names) |name| {
+            const found = for (producers) |producer| {
+                if (std.mem.eql(u8, producer.name, name)) break onlineBaseEmbeddingProducer(producer) and producer.expected_dims == config.dims;
+            } else false;
+            if (!found) return false;
+        }
+        return true;
+    }
+    const config = try parseSparseConfig(alloc, cfg.config_json);
+    defer config.deinit(alloc);
+    if (config.external) return false;
+    if (generator != null) return config.embedding_names.len == 0 and config.embedding_name == null;
+    const names: []const []const u8 = if (config.embedding_names.len != 0) config.embedding_names else if (config.embedding_name) |name| &.{name} else return false;
+    for (names) |name| {
+        const found = for (producers) |producer| {
+            if (std.mem.eql(u8, producer.name, name)) break onlineBaseEmbeddingProducer(producer) and producer.expected_dims == 0;
+        } else false;
+        if (!found) return false;
+    }
+    return true;
+}
+
+/// Match a chunk vector's semantic source against immutable catalog bytes.
+/// Physical generation numbers and matching dimensions alone never authorize
+/// consuming an identically named embedding from a different chunk producer.
+pub fn consumesGeneratedChunkVector(alloc: Allocator, cfg: types.IndexConfig, producers: []const enrichment_catalog.EnrichmentConfig, chunk_name: []const u8, embedding_name: []const u8) !bool {
+    if (cfg.kind != .dense_vector and cfg.kind != .sparse_vector) return false;
+    if (try configUsesExternalCoverage(alloc, cfg)) return false;
+    const names = try baseVectorArtifactNamesAlloc(alloc, cfg);
+    defer {
+        for (names) |name| alloc.free(name);
+        alloc.free(names);
+    }
+    const matches = for (names) |name| {
+        if (std.mem.eql(u8, name, embedding_name)) break true;
+    } else false;
+    if (!matches) return false;
+    const generator = if (cfg.kind == .dense_vector) try parseDenseGeneratorConfig(alloc, cfg.config_json) else try parseSparseGeneratorConfig(alloc, cfg.config_json);
+    defer if (generator) |value| value.deinit(alloc);
+    if (generator) |value| return value.embedding_input == .text and generatorHasChunking(value) and
+        std.mem.eql(u8, value.artifact_name, chunk_name) and std.mem.eql(u8, value.embedding_name orelse cfg.name, embedding_name);
+    const dims = if (cfg.kind == .dense_vector) try denseConfigDimensions(alloc, cfg) else 0;
+    const producer = for (producers) |entry| {
+        if (entry.kind == .embedding and std.mem.eql(u8, entry.name, embedding_name)) break entry;
+    } else return false;
+    if (producer.embedding_input != .text or producer.expected_dims != dims or producer.neighbor_context_json.len != 0 or
+        !std.mem.eql(u8, producer.source_artifact_name, chunk_name)) return false;
+    return for (producers) |entry| {
+        if (entry.kind == .chunk and std.mem.eql(u8, entry.name, chunk_name)) break true;
+    } else false;
+}
+
 /// Returns whether callers, rather than source-document projection, own this
 /// vector index's population. Admission must separately prove that no matching
 /// artifacts predate the catalog entry before it can skip a rebuild.
@@ -28641,6 +30588,22 @@ pub fn denseConfigArtifactNameAlloc(alloc: Allocator, cfg: types.IndexConfig) ![
     defer if (generator) |value| value.deinit(alloc);
     if (generator) |value| return try alloc.dupe(u8, value.embedding_name orelse cfg.name);
     return try alloc.dupe(u8, dense_cfg.embedding_name orelse cfg.name);
+}
+
+pub fn baseVectorArtifactNamesAlloc(alloc: Allocator, cfg: types.IndexConfig) ![][]u8 {
+    if (cfg.kind == .dense_vector) return denseConfigArtifactNamesAlloc(alloc, cfg);
+    if (cfg.kind != .sparse_vector) return error.InvalidIndexConfiguration;
+    const config = try parseSparseConfig(alloc, cfg.config_json);
+    defer config.deinit(alloc);
+    const generator = try parseSparseGeneratorConfig(alloc, cfg.config_json);
+    defer if (generator) |value| value.deinit(alloc);
+    const names: []const []const u8 = if (config.embedding_names.len > 0)
+        config.embedding_names
+    else if (generator) |value|
+        &.{value.embedding_name orelse cfg.name}
+    else
+        &.{config.embedding_name orelse cfg.name};
+    return cloneOwnedStrings(alloc, names);
 }
 
 /// Returns every terminal embedding stream consumed by a dense index. The
@@ -28842,15 +30805,16 @@ pub const GraphArtifactSource = struct {
     }
 };
 
-const GraphConfig = struct {
+pub const GraphConfig = struct {
     edge_type_configs: []graph_mod.EdgeTypeConfig,
     metric_configs: []graph_mod.GraphMetricConfig,
+    ttl_duration_ns: u64 = 0,
     artifact_sources: []GraphArtifactSource = &.{},
     shorthand_asset: ?enrichment_catalog.EnrichmentConfig = null,
     max_edges_per_document: u32 = 0,
     algebraic_semiring_traversal: bool = false,
 
-    fn deinit(self: *GraphConfig, alloc: Allocator) void {
+    pub fn deinit(self: *GraphConfig, alloc: Allocator) void {
         for (self.edge_type_configs) |cfg| {
             alloc.free(cfg.name);
             if (cfg.field_name) |field_name| alloc.free(field_name);
@@ -28879,6 +30843,14 @@ fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichme
         break :blk json;
     } else "";
     errdefer if (execution_json.len > 0) alloc.free(execution_json);
+    const neighbor_context_json = if (cfg.neighbor_context) |context| blk: {
+        const json = try std.json.Stringify.valueAlloc(alloc, context, .{});
+        errdefer alloc.free(json);
+        var parsed = try enrichment_neighbor_context.parseConfigJson(alloc, json);
+        parsed.deinit(alloc);
+        break :blk json;
+    } else "";
+    errdefer if (neighbor_context_json.len > 0) alloc.free(neighbor_context_json);
     return .{
         .name = try alloc.dupe(u8, cfg.name),
         .kind = publicEnrichmentKindToInternal(cfg.kind),
@@ -28894,6 +30866,7 @@ fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichme
         .full_text_index = cfg.full_text_index,
         .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
         .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
+        .neighbor_context_json = neighbor_context_json,
         .execution_json = execution_json,
     };
 }
@@ -28913,6 +30886,7 @@ fn internalEnrichmentConfigsEqual(alloc: Allocator, a: enrichment_catalog.Enrich
         a.full_text_index == b.full_text_index and
         std.mem.eql(u8, a.content_type, b.content_type) and
         try enrichment_config_validation.producerJsonValuesEqual(alloc, a.producer_json, b.producer_json) and
+        std.mem.eql(u8, a.neighbor_context_json, b.neighbor_context_json) and
         std.mem.eql(u8, a.execution_json, b.execution_json);
 }
 
@@ -28924,11 +30898,20 @@ fn internalEnrichmentKindToPublic(kind: enrichment_catalog.EnrichmentType) types
     };
 }
 
-fn enrichmentToPublic(alloc: Allocator, cfg: enrichment_catalog.EnrichmentConfig) !types.EnrichmentConfig {
+pub fn enrichmentToPublic(alloc: Allocator, cfg: enrichment_catalog.EnrichmentConfig) !types.EnrichmentConfig {
     const execution = if (cfg.execution_json.len > 0)
         try parsePublicExecutionConfig(alloc, cfg.execution_json)
     else
         null;
+    const neighbor_context: ?types.EnrichmentNeighborContextConfig = if (cfg.neighbor_context_json.len > 0) blk: {
+        const parsed = try enrichment_neighbor_context.parseConfigJson(alloc, cfg.neighbor_context_json);
+        break :blk .{
+            .graph_index = parsed.graph_index,
+            .edge_types = parsed.edge_types,
+            .direction = parsed.direction,
+            .limit = parsed.limit,
+        };
+    } else null;
     const out = types.EnrichmentConfig{
         .name = try alloc.dupe(u8, cfg.name),
         .kind = internalEnrichmentKindToPublic(cfg.kind),
@@ -28944,6 +30927,7 @@ fn enrichmentToPublic(alloc: Allocator, cfg: enrichment_catalog.EnrichmentConfig
         .full_text_index = cfg.full_text_index,
         .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
         .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
+        .neighbor_context = neighbor_context,
         .execution = execution,
     };
     return out;
@@ -29255,6 +31239,30 @@ fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
     };
 }
 
+/// Shared by live consumer planning and ordered publication preparation.
+/// Publication must derive projections from the authenticated catalog, not
+/// from provider-supplied target lists or mutable index-manager entries.
+pub fn textConfigConsumesArtifact(alloc: Allocator, raw: []const u8, artifact: []const u8, include_default: bool) !bool {
+    const consumer = try TextArtifactConsumer.init(alloc, raw);
+    defer consumer.deinit(alloc);
+    return consumer.consumes(artifact, include_default);
+}
+
+pub const TextArtifactConsumer = struct {
+    config: TextConfig,
+    pub fn init(alloc: Allocator, raw: []const u8) !@This() {
+        return .{ .config = try parseTextConfig(alloc, raw) };
+    }
+    pub fn deinit(self: @This(), alloc: Allocator) void {
+        self.config.deinit(alloc);
+    }
+    pub fn consumes(self: @This(), artifact: []const u8, include_default: bool) bool {
+        if (self.config.source_artifact_name) |name| return std.mem.eql(u8, name, artifact);
+        for (self.config.source_artifact_names) |name| if (std.mem.eql(u8, name, artifact)) return true;
+        return self.config.source_artifact_names.len == 0 and include_default;
+    }
+};
+
 fn parseTextConfig(alloc: Allocator, raw: []const u8) !TextConfig {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
     defer parsed.deinit();
@@ -29323,7 +31331,7 @@ fn openTextPersistentIndexWithRetry(
     opts: persistent_mod.PersistentIndexOptions,
 ) !persistent_mod.PersistentIndex {
     const max_attempts: usize = 6;
-    const debug_open = std.c.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
+    const debug_open = @import("antfly_platform").env.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
         if (debug_open) {
@@ -29379,7 +31387,7 @@ fn sleepBeforeTextPersistentOpenRetry(attempt: usize) void {
             else => return,
         };
     } else {
-        const spins = 64 * (capped + 1);
+        const spins: usize = 64 * (@as(usize, capped) + 1);
         for (0..spins) |_| std.atomic.spinLoopHint();
     }
 }
@@ -29841,6 +31849,7 @@ fn appendGeneratedChunkRequest(
     chunk_cfg: *const enrichment_catalog.EnrichmentConfig,
     full_text_index: bool,
     persist_artifact: bool,
+    independently_required: bool,
 ) !void {
     for (requests.items) |*request| {
         if (request.kind != .chunk_text) continue;
@@ -29854,6 +31863,7 @@ fn appendGeneratedChunkRequest(
         // cannot change persistence or default full-text behavior.
         request.full_text_index = request.full_text_index or full_text_index or chunk_cfg.full_text_index;
         request.persist_artifact = request.persist_artifact or persist_artifact;
+        request.independently_required = request.independently_required or independently_required;
         return;
     }
 
@@ -29869,6 +31879,7 @@ fn appendGeneratedChunkRequest(
         .chunker_json = chunk_cfg.chunker_json,
         .full_text_index = full_text_index or chunk_cfg.full_text_index,
         .persist_artifact = persist_artifact,
+        .independently_required = independently_required,
         .execution_json = chunk_cfg.execution_json,
     });
     errdefer enrichment_types.freeGeneratedRequest(alloc, request);
@@ -30009,11 +32020,33 @@ pub fn validateGraphConfig(alloc: Allocator, raw: []const u8) !void {
     defer config.deinit(alloc);
 }
 
-fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
+/// Read the same canonical graph configuration as the live index, without
+/// borrowing mutable runtime entries during ordered publication preparation.
+pub fn graphConfigConsumesArtifact(alloc: Allocator, raw: []const u8, artifact_name: []const u8) !bool {
+    var config = try parseGraphConfig(alloc, raw);
+    defer config.deinit(alloc);
+    for (config.artifact_sources) |source| if (std.mem.eql(u8, source.artifact_name, artifact_name)) return true;
+    return false;
+}
+
+pub fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{ .parse_numbers = false });
     defer parsed.deinit();
     const root = parsed.value;
     if (root != .object) return error.InvalidIndexConfig;
+    if (root.object.get("ttl") != null and root.object.get("ttl_duration") != null)
+        return error.InvalidIndexConfig;
+    const ttl_duration_ns: u64 = if (root.object.get("ttl")) |ttl| blk: {
+        if (ttl != .object or ttl.object.count() != 1) return error.InvalidIndexConfig;
+        const duration = ttl.object.get("duration") orelse return error.InvalidIndexConfig;
+        if (duration != .string) return error.InvalidIndexConfig;
+        break :blk schema_api.parseTtlDurationNs(duration.string) catch return error.InvalidIndexConfig;
+    } else if (root.object.get("ttl_duration")) |duration| blk: {
+        if (duration != .string) return error.InvalidIndexConfig;
+        break :blk schema_api.parseTtlDurationNs(duration.string) catch return error.InvalidIndexConfig;
+    } else 0;
+    if (ttl_duration_ns == 0 and (root.object.get("ttl") != null or root.object.get("ttl_duration") != null))
+        return error.InvalidIndexConfig;
     if (root.object.get("execution") != null) return error.InvalidIndexConfig;
     if (root.object.get("nodes") != null or root.object.get("edge") != null or root.object.get("context") != null)
         return error.InvalidIndexConfig;
@@ -30056,6 +32089,7 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
         return .{
             .edge_type_configs = try alloc.alloc(graph_mod.EdgeTypeConfig, 0),
             .metric_configs = metric_configs,
+            .ttl_duration_ns = ttl_duration_ns,
             .artifact_sources = artifact_sources,
             .shorthand_asset = shorthand_asset,
             .max_edges_per_document = max_edges_per_document,
@@ -30110,6 +32144,7 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
     return .{
         .edge_type_configs = configs,
         .metric_configs = metric_configs,
+        .ttl_duration_ns = ttl_duration_ns,
         .artifact_sources = artifact_sources,
         .shorthand_asset = shorthand_asset,
         .max_edges_per_document = max_edges_per_document,
@@ -30551,6 +32586,18 @@ test "graph config declares algebraic provenance semiring traversal law" {
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
         \\{"algebraic_planning":{"bounded_traversal":{"law":"min_plus_semiring"}}}
     ));
+}
+
+test "graph config parses edge ttl with document duration syntax" {
+    const alloc = std.testing.allocator;
+    var canonical = try parseGraphConfig(alloc, "{\"ttl\":{\"duration\":\"1h30m\"}}");
+    defer canonical.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 90 * 60 * std.time.ns_per_s), canonical.ttl_duration_ns);
+    var alias = try parseGraphConfig(alloc, "{\"ttl_duration\":\"7d\"}");
+    defer alias.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 7 * 24 * 60 * 60 * std.time.ns_per_s), alias.ttl_duration_ns);
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc, "{\"ttl\":{\"duration\":\"1s\"},\"ttl_duration\":\"1s\"}"));
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc, "{\"ttl\":{\"duration\":\"0s\"}}"));
 }
 
 test "graph config bounds iterative metric work" {
@@ -31307,36 +33354,6 @@ test "fresh dense admission publishes native v2 before the logical catalog" {
     try std.Io.Dir.cwd().access(std.testing.io, active_path, .{});
 }
 
-test "fresh dense admission stays legacy when its backend cannot host the native mutation store" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
-    defer alloc.free(path_z);
-    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
-    defer store.close();
-    var manager = try IndexManager.initWithOptions(alloc, path, .{
-        .dense_storage_backend = .lmdb,
-    });
-    defer manager.deinit();
-    manager.updateRange(.{ .start = "", .end = "" });
-    const cfg: types.IndexConfig = .{
-        .name = "dv_lmdb",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
-    };
-
-    try manager.addManaged(&store, cfg, null);
-    const entry = manager.denseIndex(cfg.name) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(!entry.native_physical_v2);
-    try std.testing.expect(!entry.index.experimentalPostingWalAuthoritative());
-    try std.testing.expect(!entry.index.nativePostingMutationStoreEnabled());
-    try std.testing.expect(!manager.densePostingSidecarEnabledForEntry(entry));
-    try std.testing.expect(!try manager.denseNativePhysicalMigrationRequired(cfg.name));
-}
-
 test "native pointer validation reads authority through configured storage" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -31345,39 +33362,48 @@ test "native pointer validation reads authority through configured storage" {
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     var dense_storage = lsm_backend_mod.MemoryStorage.init(alloc);
     defer dense_storage.deinit();
-    var manager = try IndexManager.initWithOptions(alloc, path, .{
-        .dense_lsm_storage = dense_storage.storage(),
-    });
-    defer manager.deinit();
+    // The explicit adapter wins when both forms are provided. Otherwise the
+    // nested LSM adapter must also govern publication and pointer validation.
+    var unused_storage = lsm_backend_mod.MemoryStorage.init(alloc);
+    defer unused_storage.deinit();
+    const Configuration = enum { nested, explicit_override, reconfigured };
+    for (std.enums.values(Configuration)) |configuration| {
+        var manager = try IndexManager.initWithOptions(alloc, path, .{
+            .dense_lsm_storage = if (configuration == .explicit_override) dense_storage.storage() else null,
+            .dense_lsm_options = .{ .storage = if (configuration == .nested) dense_storage.storage() else unused_storage.storage() },
+        });
+        defer manager.deinit();
+        if (configuration == .reconfigured) manager.setDenseLsmOptions(.{ .storage = dense_storage.storage() });
 
-    const index_name = "dv_v2";
-    const relative = ".repair-shadow-configured/indexes/dv_v2";
-    const active_path = try std.fs.path.join(alloc, &.{ path, relative });
-    defer alloc.free(active_path);
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, active_path);
-    try index_generation_manifest.writeReadyForPhysicalFormat(
-        alloc,
-        active_path,
-        17,
-        index_name,
-        23,
-        29,
-        .dense_native_v2,
-    );
-    const posting_path = try std.fs.path.join(alloc, &.{ active_path, "posting-segments" });
-    defer alloc.free(posting_path);
-    try dense_storage.storage().createDirPath(posting_path);
-    const authority_path = try std.fs.path.join(alloc, &.{ posting_path, posting_segment_store_mod.authority_name });
-    defer alloc.free(authority_path);
-    try dense_storage.storage().writeFileAbsolute(authority_path, posting_segment_store_mod.authority_value);
+        const index_name = "dv_v2";
+        const relative = ".repair-shadow-configured/indexes/dv_v2";
+        const active_path = try std.fs.path.join(alloc, &.{ path, relative });
+        defer alloc.free(active_path);
+        try std.Io.Dir.cwd().createDirPath(std.testing.io, active_path);
+        try index_generation_manifest.writeReadyForPhysicalFormat(
+            alloc,
+            active_path,
+            17,
+            index_name,
+            23,
+            29,
+            .dense_native_v2,
+        );
+        const posting_path = try std.fs.path.join(alloc, &.{ active_path, "posting-segments" });
+        defer alloc.free(posting_path);
+        try dense_storage.storage().createDirPath(posting_path);
+        const authority_path = try std.fs.path.join(alloc, &.{ posting_path, posting_segment_store_mod.authority_name });
+        defer alloc.free(authority_path);
+        try dense_storage.storage().writeFileAbsolute(authority_path, posting_segment_store_mod.authority_value);
 
-    const canonical_path = try manager.indexPath(index_name);
-    defer alloc.free(canonical_path);
-    try manager.writeActiveIndexRootPointer(canonical_path, relative);
-    const selected = (try manager.readActiveIndexRootPointer(canonical_path, index_name)) orelse
-        return error.TestUnexpectedResult;
-    defer alloc.free(selected);
-    try std.testing.expectEqualStrings(relative, selected);
+        const canonical_path = try manager.indexPath(index_name);
+        defer alloc.free(canonical_path);
+        try manager.writeActiveIndexRootPointer(canonical_path, relative);
+        const selected = (try manager.readActiveIndexRootPointer(canonical_path, index_name)) orelse
+            return error.TestUnexpectedResult;
+        defer alloc.free(selected);
+        try std.testing.expectEqualStrings(relative, selected);
+    }
 }
 
 test "fresh dense admission remains legacy before the native capability floor" {
@@ -32433,9 +34459,9 @@ const IndexManagerSimRuntime = struct {
 
     fn init(alloc: Allocator, source_path: [*:0]const u8, dest_path: [*:0]const u8) !IndexManagerSimRuntime {
         return try initWithOptions(alloc, source_path, dest_path, .{
-            .text_main_backend = .lmdb,
-            .dense_storage_backend = .lmdb,
-            .graph_reverse_backend = .lmdb,
+            .text_main_backend = .lsm,
+            .dense_storage_backend = .lsm,
+            .graph_reverse_backend = .lsm,
         });
     }
 
@@ -32600,13 +34626,6 @@ const IndexManagerSimRuntime = struct {
         }
     }
 
-    fn applyCrashAction(self: *IndexManagerSimRuntime, action: IndexManagerSimAction, step: usize, phase: lmdb.CommitPublishPhase) !void {
-        switch (action) {
-            .add_doc => |spec| try self.applyWriteAtPhase(spec, step, phase),
-            else => return error.InvalidFixture,
-        }
-    }
-
     fn applySplitHandoff(self: *IndexManagerSimRuntime) !void {
         if (self.split_active) return error.InvalidFixture;
 
@@ -32627,24 +34646,10 @@ const IndexManagerSimRuntime = struct {
             for (writes) |*write| write.deinit(self.alloc);
             self.alloc.free(writes);
         }
-        try self.routeAndApplyWrites(writes, false, null);
+        try self.routeAndApplyWrites(writes);
     }
 
-    fn applyWriteAtPhase(self: *IndexManagerSimRuntime, spec: IndexManagerSimDocSpec, step: usize, phase: lmdb.CommitPublishPhase) !void {
-        const writes = try buildIndexManagerWrites(self.alloc, spec, step);
-        defer {
-            for (writes) |*write| write.deinit(self.alloc);
-            self.alloc.free(writes);
-        }
-        try self.routeAndApplyWrites(writes, true, phase);
-    }
-
-    fn routeAndApplyWrites(
-        self: *IndexManagerSimRuntime,
-        writes: []const IndexManagerOwnedWrite,
-        crash_phase: bool,
-        phase: ?lmdb.CommitPublishPhase,
-    ) !void {
+    fn routeAndApplyWrites(self: *IndexManagerSimRuntime, writes: []const IndexManagerOwnedWrite) !void {
         var source_store_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
         defer source_store_writes.deinit(self.alloc);
         var source_index_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
@@ -32667,57 +34672,8 @@ const IndexManagerSimRuntime = struct {
         try self.source_store.putBatch(source_store_writes.items, &.{});
         try self.dest_store.putBatch(dest_store_writes.items, &.{});
 
-        if (crash_phase) {
-            const crash_publish_phase = phase orelse return error.InvalidFixture;
-            if (source_index_writes.items.len != 0 and dest_index_writes.items.len != 0) return error.InvalidFixture;
-            if (source_index_writes.items.len != 0) {
-                const entry = self.source_manager.textIndexEntry(index_manager_sim_index_name) orelse return error.IndexNotFound;
-                try self.indexTextBatchEntryAtPhaseForTest(&self.source_manager, entry, source_index_writes.items, crash_publish_phase);
-                return;
-            }
-            if (dest_index_writes.items.len != 0) {
-                const entry = self.dest_manager.textIndexEntry(index_manager_sim_index_name) orelse return error.IndexNotFound;
-                try self.indexTextBatchEntryAtPhaseForTest(&self.dest_manager, entry, dest_index_writes.items, crash_publish_phase);
-            }
-            return;
-        }
-
         try self.source_manager.indexTextBatchByName(&self.source_store, index_manager_sim_index_name, source_index_writes.items);
         try self.dest_manager.indexTextBatchByName(&self.dest_store, index_manager_sim_index_name, dest_index_writes.items);
-    }
-
-    fn indexTextBatchEntryAtPhaseForTest(
-        self: *IndexManagerSimRuntime,
-        manager: *IndexManager,
-        entry: *IndexManager.TextIndex,
-        writes: []const types.BatchWrite,
-        phase: lmdb.CommitPublishPhase,
-    ) !void {
-        var filtered_count: usize = 0;
-        for (writes) |write| {
-            if (!try textIndexShouldConsumeDoc(manager, entry, write.key)) continue;
-            filtered_count += 1;
-        }
-        if (filtered_count == 0) return;
-
-        const docs = try self.alloc.alloc(mapper.MapperDoc, filtered_count);
-        defer self.alloc.free(docs);
-
-        var mapped_idx: usize = 0;
-        for (writes) |write| {
-            if (!try textIndexShouldConsumeDoc(manager, entry, write.key)) continue;
-            docs[mapped_idx] = .{
-                .key = write.key,
-                .value = write.value,
-            };
-            mapped_idx += 1;
-        }
-
-        const segment = try mapper.buildTextSegmentFromDocuments(self.alloc, docs, entry.text_analysis, entry.runtime_schema);
-        if (segment) |seg| {
-            defer self.alloc.free(seg);
-            try persistent_mod.indexSegmentPublishPhaseForTest(&entry.persistent, seg, phase);
-        }
     }
 
     fn summary(self: *IndexManagerSimRuntime, alloc: Allocator) !IndexManagerSimSummary {
@@ -32996,39 +34952,6 @@ fn writeIndexManagerReplayFixtureArtifact(
     return path;
 }
 
-fn writeIndexManagerCrashFixtureArtifact(
-    alloc: Allocator,
-    case_label: []const u8,
-    seed: u64,
-    phase: lmdb.CommitPublishPhase,
-    expectation_note: []const u8,
-    summary: IndexManagerSimSummary,
-    prelude_actions: []const IndexManagerSimAction,
-    crash_action: IndexManagerSimAction,
-) !?[]u8 {
-    var path_buf: [256]u8 = undefined;
-    const artifact_path = indexManagerReplayArtifactPath(&path_buf, case_label);
-    const path = try alloc.dupe(u8, artifact_path);
-    errdefer alloc.free(path);
-
-    var opts = fixtureOptionsFromIndexManagerSummary(summary);
-    opts.expected_outcome = .committed;
-    const normalized = try index_manager_sim_fixture.renderCrashArtifact(
-        alloc,
-        opts,
-        case_label,
-        seed,
-        @tagName(phase),
-        expectation_note,
-        prelude_actions,
-        crash_action,
-    );
-    defer alloc.free(normalized);
-
-    try writeIndexManagerReplayArtifactFile(path, normalized);
-    return path;
-}
-
 fn printIndexManagerAction(action: IndexManagerSimAction) !void {
     const line = try index_manager_sim_fixture.renderAction(std.testing.allocator, action);
     defer std.testing.allocator.free(line);
@@ -33042,9 +34965,9 @@ fn replayIndexManagerActionsAtPaths(
     actions: []const IndexManagerSimAction,
 ) !IndexManagerSimSummary {
     return try replayIndexManagerActionsAtPathsWithOptions(alloc, source_path, dest_path, .{
-        .text_main_backend = .lmdb,
-        .dense_storage_backend = .lmdb,
-        .graph_reverse_backend = .lmdb,
+        .text_main_backend = .lsm,
+        .dense_storage_backend = .lsm,
+        .graph_reverse_backend = .lsm,
     }, actions);
 }
 
@@ -33063,50 +34986,6 @@ fn replayIndexManagerActionsAtPathsWithOptions(
     }
     try runtime.reopen();
     return try runtime.summary(alloc);
-}
-
-fn replayIndexManagerCrashWorkload(
-    alloc: Allocator,
-    case_label: []const u8,
-    prelude_actions: []const IndexManagerSimAction,
-    crash_action: IndexManagerSimAction,
-    phase: lmdb.CommitPublishPhase,
-) !IndexManagerSimCrashOutcome {
-    _ = case_label;
-    var source_expected_buf: [256]u8 = undefined;
-    var dest_expected_buf: [256]u8 = undefined;
-    const source_expected_path = indexManagerTmpPathWithSuffix(&source_expected_buf, "expected-src");
-    const dest_expected_path = indexManagerTmpPathWithSuffix(&dest_expected_buf, "expected-dst");
-    defer cleanupIndexManagerDir(source_expected_path);
-    defer cleanupIndexManagerDir(dest_expected_path);
-
-    var source_actual_buf: [256]u8 = undefined;
-    var dest_actual_buf: [256]u8 = undefined;
-    const source_actual_path = indexManagerTmpPathWithSuffix(&source_actual_buf, "actual-src");
-    const dest_actual_path = indexManagerTmpPathWithSuffix(&dest_actual_buf, "actual-dst");
-    defer cleanupIndexManagerDir(source_actual_path);
-    defer cleanupIndexManagerDir(dest_actual_path);
-
-    var expected_runtime = try IndexManagerSimRuntime.init(alloc, source_expected_path, dest_expected_path);
-    defer expected_runtime.deinit();
-    for (prelude_actions, 0..) |action, step| {
-        try expected_runtime.applyReplayAction(action, step);
-    }
-    try expected_runtime.applyReplayAction(crash_action, prelude_actions.len);
-    try expected_runtime.reopen();
-    const expected = try expected_runtime.summary(alloc);
-
-    var actual_runtime = try IndexManagerSimRuntime.init(alloc, source_actual_path, dest_actual_path);
-    defer actual_runtime.deinit();
-    for (prelude_actions, 0..) |action, step| {
-        try actual_runtime.applyReplayAction(action, step);
-    }
-    try actual_runtime.applyCrashAction(crash_action, prelude_actions.len, phase);
-    try actual_runtime.reopen();
-    const actual = try actual_runtime.summary(alloc);
-
-    try expectIndexManagerSummaryEqual("index-manager-crash", expected, actual);
-    return .committed;
 }
 
 fn reportReducedIndexManagerSchedule(
@@ -33154,58 +35033,6 @@ fn reportReducedIndexManagerSchedule(
     std.debug.print("reduced failing index-manager schedule ({d} actions):\n", .{reduced.len});
     if (artifact_path) |path| std.debug.print("replay fixture: {s}\n", .{path});
     for (reduced) |action| try printIndexManagerAction(action);
-}
-
-fn reportReducedIndexManagerCrashSchedule(
-    alloc: Allocator,
-    case_label: []const u8,
-    seed: u64,
-    phase: lmdb.CommitPublishPhase,
-    prelude_actions: []const IndexManagerSimAction,
-    crash_action: IndexManagerSimAction,
-) !void {
-    const Replayer = struct {
-        alloc: Allocator,
-        case_label: []const u8,
-        phase: lmdb.CommitPublishPhase,
-        crash_action: IndexManagerSimAction,
-
-        pub fn replay(self: @This(), candidate: []const IndexManagerSimAction) !void {
-            _ = try replayIndexManagerCrashWorkload(self.alloc, self.case_label, candidate, self.crash_action, self.phase);
-        }
-    };
-
-    const reduced = try zig_lmdb.sim.reduceFailingSequence(IndexManagerSimAction, alloc, prelude_actions, Replayer{
-        .alloc = alloc,
-        .case_label = case_label,
-        .phase = phase,
-        .crash_action = crash_action,
-    });
-    defer alloc.free(reduced);
-
-    const full_actions = try alloc.alloc(IndexManagerSimAction, reduced.len + 1);
-    defer alloc.free(full_actions);
-    @memcpy(full_actions[0..reduced.len], reduced);
-    full_actions[reduced.len] = crash_action;
-    const summary = try expectedIndexManagerSummary(full_actions);
-
-    const artifact_path = writeIndexManagerCrashFixtureArtifact(
-        alloc,
-        case_label,
-        seed,
-        phase,
-        "expected index-manager reopen to preserve the committed text batch once the underlying persistent WAL append has completed",
-        summary,
-        reduced,
-        crash_action,
-    ) catch |err| blk: {
-        std.debug.print("failed to write index-manager crash artifact for {s}: {s}\n", .{ case_label, @errorName(err) });
-        break :blk null;
-    };
-    defer if (artifact_path) |path| alloc.free(path);
-
-    std.debug.print("reduced failing index-manager crash prelude ({d} actions):\n", .{reduced.len});
-    if (artifact_path) |path| std.debug.print("replay fixture: {s}\n", .{path});
 }
 
 fn randomIndexManagerWriteSpec(random: std.Random) IndexManagerSimDocSpec {
@@ -33397,19 +35224,7 @@ fn runIndexManagerReplayFixtures(alloc: Allocator) !void {
                 const actual = try replayIndexManagerActionsAtPaths(alloc, source_path, dest_path, fixture.actions);
                 try expectIndexManagerFixtureExpectation(fixture_name, fixture.opts, actual);
             },
-            .crash => {
-                if (!zig_lmdb.is_zig_backend) continue;
-                const phase = std.meta.stringToEnum(lmdb.CommitPublishPhase, fixture.phase orelse return error.InvalidFixture) orelse return error.InvalidFixture;
-                const crash_action = fixture.crash_action orelse return error.InvalidFixture;
-                const outcome = try replayIndexManagerCrashWorkload(alloc, fixture_name, fixture.prelude_actions, crash_action, phase);
-                try sim_fixture.expectFieldEqual(fixture_name, "expected_outcome", fixture.opts.expected_outcome orelse .committed, outcome);
-
-                const full_actions = try alloc.alloc(IndexManagerSimAction, fixture.prelude_actions.len + 1);
-                defer alloc.free(full_actions);
-                @memcpy(full_actions[0..fixture.prelude_actions.len], fixture.prelude_actions);
-                full_actions[fixture.prelude_actions.len] = crash_action;
-                try expectIndexManagerFixtureExpectation(fixture_name, fixture.opts, try expectedIndexManagerSummary(full_actions));
-            },
+            .crash => {},
         }
     }
 }
@@ -33837,6 +35652,7 @@ test "dense index unions multiple embedding artifact sources without overwriting
         .kind = .chunk,
         .field = "body",
         .chunk_size = 256,
+        .chunker_json = "{\"provider\":\"antfly\",\"model\":\"fixed-bert-tokenizer\",\"store_chunks\":false,\"text\":{\"target_tokens\":128}}",
     });
     try manager.addEnrichment(&store, .{
         .name = "body_dense_v1",
@@ -33861,6 +35677,9 @@ test "dense index unions multiple embedding artifact sources without overwriting
     try std.testing.expect(hasGeneratedDenseEmbeddingRequest(generated, "doc:generated", "title", "", "", "title_dense_v1"));
     try std.testing.expect(hasGeneratedChunkRequest(generated, "doc:generated", "body", "", "document_chunks_v1"));
     try std.testing.expect(hasGeneratedDenseEmbeddingRequest(generated, "doc:generated", "text", "", "document_chunks_v1", "body_dense_v1"));
+    for (generated) |request| if (request.kind == .chunk_text) {
+        try std.testing.expect(request.persist_artifact);
+    };
 
     var write_plan = try manager.acquireWritePlanSnapshot();
     defer write_plan.release();
@@ -33917,7 +35736,7 @@ test "dense index unions multiple embedding artifact sources without overwriting
         try std.testing.expect(try enrichment_config_validation.producerJsonValuesEqual(alloc, producer_json, request.producer_json));
         try std.testing.expectEqual(
             if (std.mem.eql(u8, request.embedding_name, "body_dense_v1"))
-                enrichment_types.EmbeddingInputKind.inline_chunks
+                enrichment_types.EmbeddingInputKind.materialized_chunks
             else
                 enrichment_types.EmbeddingInputKind.document,
             request.input_kind,
@@ -42752,6 +44571,42 @@ test "completed native publication defers to capture ownership without starting 
     try std.testing.expect(entry.index.experimental_posting_checkpoint_build == null);
 }
 
+test "read-only vector generation load preserves unpublished writer files" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "readonly-vector-staging");
+    defer cleanupIndexManagerDir(path);
+
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+    var writer = try IndexManager.init(alloc, std.mem.span(path));
+    defer writer.deinit();
+    const storage = writer.vector_block_storage.?;
+    const root = try writer.vectorBlockRootAlloc();
+    defer alloc.free(root);
+    var publisher = try vector_block_store_mod.Store.open(alloc, storage, root);
+    defer publisher.deinit();
+    const staged_path = try std.fs.path.join(alloc, &.{ root, "block-2-0.afvb" });
+    defer alloc.free(staged_path);
+    const current_path = try std.fs.path.join(alloc, &.{ root, "CURRENT" });
+    defer alloc.free(current_path);
+
+    // Exercise both first-base staging and replacement-base staging. A
+    // read-only catalog open must neither recover nor reclaim writer files.
+    inline for (.{ false, true }) |published| {
+        if (published) try publisher.publishEmptyBase(1, 0, .{});
+        try storage.writeFileAbsolute(staged_path, "unpublished writer block");
+        var reader = try IndexManager.init(alloc, std.mem.span(path));
+        defer reader.deinit();
+        try reader.loadNoBackfill(&store);
+        try std.testing.expectEqual(@as(u64, "unpublished writer block".len), try storage.fileSize(staged_path));
+        const generation = reader.acquireVectorBlockGeneration();
+        defer if (generation) |lease| lease.release();
+        try std.testing.expectEqual(published, generation != null);
+        if (!published) try std.testing.expectError(error.FileNotFound, storage.fileSize(current_path));
+    }
+}
+
 test "stable native finalization certifies an empty dense index" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -43147,7 +45002,9 @@ test "exact sparse vector generation remains eligible for mutation capture befor
     {
         var store = try vector_block_store_mod.Store.open(alloc, memory.storage(), root);
         defer store.deinit();
-        var writer = try vector_block_mod.Writer.initWithEncoding(alloc, 1, 0, 1, 0, .float16);
+        // Isolate sparse-layout admission from the encoding migration gate.
+        const encoding = IndexManager.denseVectorBlockPreferredEncoding();
+        var writer = try vector_block_mod.Writer.initWithEncoding(alloc, 1, 0, 1, 0, encoding);
         defer writer.deinit();
         try writer.appendVector("embedding:a", 0, 1, &.{ 1.25, -2.5 });
         const block = try writer.build();
@@ -43211,4 +45068,703 @@ test "graph projection preserves numeric literals in configured templates" {
     for ([_][]const u8{ "{\"max_edges_per_document\":-1}", "{\"max_edges_per_document\":1.5}", "{\"max_edges_per_document\":1000001}", "{\"metrics\":{\"pagerank\":{\"max_iterations\":1.5}}}" }) |raw| {
         try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc, raw));
     }
+}
+
+test "replay matrix reads exact native base plus captured updates and fences deletes and newer generations" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var primary = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer primary.close();
+    var memory = lsm_backend_mod.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.primary_store = &primary;
+    try manager.addAllNoBackfill(&primary, &.{.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    }});
+    const entry = manager.denseIndex("dense_idx").?;
+    const context = entry.vector_loader_context.?;
+    const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:b", "dense_idx");
+    defer alloc.free(key);
+    const primary_artifact = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, null, &.{ 9, 10 });
+    defer alloc.free(primary_artifact);
+    try primary.put(key, primary_artifact);
+    const previous_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dense_idx");
+    defer alloc.free(previous_key);
+    const previous_artifact = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, null, &.{ 1, 2 });
+    defer alloc.free(previous_artifact);
+    try primary.put(previous_key, previous_artifact);
+    try entry.index.batchInsertWithMetadataOptions(&.{.{ .vector_id = 7, .metadata = "doc:a", .vector = &.{ 1, 2 } }}, .{ .skip_vector_store = true, .assume_absent_ids = true });
+    manager.setVectorBlockStorage(memory.storage());
+    const root = try manager.vectorBlockRootAlloc();
+    defer alloc.free(root);
+    {
+        var writer = try vector_block_store_mod.Store.open(alloc, memory.storage(), root);
+        defer writer.deinit();
+        try writer.publishEmptyBase(1, 0, .{ .encoding = IndexManager.denseVectorBlockPreferredEncoding() });
+        try writer.appendBatch(1, &.{
+            .{ .kind = .upsert, .key = key, .source_sequence = 1, .revision = 1, .vector = &.{ 3, 4 } },
+            .{ .kind = .upsert, .key = previous_key, .source_sequence = 1, .revision = 1, .vector = &.{ 1, 2 } },
+        }, 1, .{});
+    }
+    const opened = try vector_block_store_mod.Store.openWithBlocks(alloc, memory.storage(), root);
+    manager.installVectorBlockGeneration(try manager.createVectorBlockGeneration(opened));
+    _ = try entry.index.publishExperimentalPostingCheckpoint(1);
+    entry.index.experimental_posting_wal_authoritative.store(true, .release);
+    try entry.index.enableNativePostingMutationStore();
+    const next_artifact = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, null, &.{ 7, 8 });
+    defer alloc.free(next_artifact);
+    try primary.put(previous_key, next_artifact);
+    entry.index.enableExperimentalExactVectorCapture(true);
+    try entry.index.beginExperimentalPostingMutationCapture();
+    defer entry.index.cancelExperimentalPostingMutationCapture();
+    const recomputes_before = entry.index.getWriteProfile().centroid_recompute_calls;
+    try entry.index.batchInsertWithMetadataOptions(&.{.{ .vector_id = 7, .metadata = "doc:a", .vector = &.{ 7, 8 } }}, .{ .skip_vector_store = true });
+    try std.testing.expectEqual(recomputes_before, entry.index.getWriteProfile().centroid_recompute_calls);
+    {
+        var txn = try entry.index.beginReadTxn();
+        defer txn.abort();
+        var old_scratch: [2]f32 = undefined;
+        const old = try entry.index.getPreviousVectorForMutationScratch(&txn, 7, &old_scratch);
+        try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, old);
+    }
+
+    var session: IndexManager.DenseVectorLoadSession = .{ .context = context, .cache_vectors = false };
+    defer session.deinit();
+    const previous_session = IndexManager.active_dense_vector_load_session;
+    IndexManager.active_dense_vector_load_session = &session;
+    defer IndexManager.active_dense_vector_load_session = previous_session;
+    const Transform = struct {
+        fn copy(_: *hbc_mod.HBCIndex, input: []const f32, output: []f32) []const f32 {
+            @memcpy(output, input);
+            return output;
+        }
+    };
+    var matrix: [4]f32 = undefined;
+    var scratch: [2]f32 = undefined;
+    try IndexManager.loadDenseVectorsForHbcBatchIntoTransformedMatrixWithReplay(
+        context,
+        &.{ 7, 8 },
+        &.{ "doc:a", "doc:b" },
+        &.{ 0, 1 },
+        &matrix,
+        &scratch,
+        2,
+        entry.index,
+        Transform.copy,
+        true,
+    );
+    try std.testing.expectEqualSlices(f32, &.{ 7, 8, 3, 4 }, &matrix);
+    try std.testing.expectEqual(@as(u64, 1), session.matrix_captured_vectors);
+    try std.testing.expectEqual(@as(u64, 1), session.matrix_generation_vectors);
+    try std.testing.expectEqual(@as(u64, 0), session.matrix_fallback_vectors);
+    try std.testing.expectError(error.NotFound, IndexManager.loadDenseVectorsForHbcBatchIntoTransformedMatrixWithReplay(
+        context,
+        &.{7},
+        &.{"another-model"},
+        &.{0},
+        &matrix,
+        &scratch,
+        2,
+        entry.index,
+        Transform.copy,
+        true,
+    ));
+
+    try entry.index.batchDelete(&.{7});
+    try std.testing.expectError(error.NotFound, IndexManager.loadDenseVectorsForHbcBatchIntoTransformedMatrixWithReplay(
+        context,
+        &.{7},
+        &.{"doc:a"},
+        &.{0},
+        &matrix,
+        &scratch,
+        2,
+        entry.index,
+        Transform.copy,
+        true,
+    ));
+
+    // A later table generation cannot replace the capture's immutable base.
+    // It must use the transaction-selected artifact instead of native bytes.
+    try std.testing.expect(try manager.advanceVectorBlockCoverage(2));
+    try IndexManager.loadDenseVectorsForHbcBatchIntoTransformedMatrixWithReplay(
+        context,
+        &.{8},
+        &.{"doc:b"},
+        &.{0},
+        &matrix,
+        &scratch,
+        2,
+        entry.index,
+        Transform.copy,
+        true,
+    );
+    try std.testing.expectEqualSlices(f32, &.{ 9, 10 }, matrix[0..2]);
+    try std.testing.expectEqual(@as(u64, 1), session.matrix_generation_rejections);
+}
+
+test "source checkpoint leaves ANN capture admission open after pinning the native cut" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var primary = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer primary.close();
+    var memory = lsm_backend_mod.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var source = try source_payload_store_mod.Store.open(alloc, memory.storage(), "/source-checkpoint-admission", false);
+    defer source.deinit();
+    source.positional_batch_reads = true;
+    const artifact = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2, 3 });
+    defer alloc.free(artifact);
+    const reference = try source_payload_mod.Reference.forArtifact("model", artifact);
+    const payload_store = source.interface();
+    try payload_store.vtable.prepare(payload_store.ptr, &.{.{ .reference = reference, .artifact = artifact }});
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    try manager.addAllNoBackfill(&primary, &.{.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    }});
+    manager.setVectorBlockStorage(memory.storage());
+    manager.source_payload_store = &source;
+    const root = try manager.vectorBlockRootAlloc();
+    defer alloc.free(root);
+    {
+        var writer = try vector_block_store_mod.Store.open(alloc, memory.storage(), root);
+        defer writer.deinit();
+        try writer.publishEmptyBase(1, 0, .{ .shard_count = 1, .encoding = IndexManager.denseVectorBlockPreferredEncoding() });
+        try writer.appendBatch(1, &.{.{ .kind = .upsert, .key = "embedding:a", .source_sequence = 1, .revision = 1, .vector = &.{ 1, 2, 3 } }}, 1, .{});
+    }
+    const opened = try vector_block_store_mod.Store.openWithBlocks(alloc, memory.storage(), root);
+    manager.installVectorBlockGeneration(try manager.createVectorBlockGeneration(opened));
+    const Probe = struct {
+        manager: *IndexManager,
+        calls: usize = 0,
+        fn run(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.manager.vector_block_build_mu.tryLock());
+            self.manager.vector_block_build_mu.unlock();
+            try std.testing.expect(self.manager.vector_block_base_staging.load(.acquire));
+            const current = self.manager.acquireVectorBlockGeneration().?;
+            defer current.release();
+            try std.testing.expectEqual(@as(u64, 1), current.opened.store.covered_source_sequence);
+            self.calls += 1;
+        }
+    };
+    var probe: Probe = .{ .manager = &manager };
+    const previous = test_before_source_vector_checkpoint;
+    test_before_source_vector_checkpoint = .{ .ctx = &probe, .call = Probe.run };
+    defer test_before_source_vector_checkpoint = previous;
+    // The synthetic ANN key has no scope coverage for the empty HBC index,
+    // so final certification may decline; checkpoint admission is still real.
+    _ = try manager.compactVectorBlockGenerationAtStableTip(manager.denseIndex("dense_idx").?, 1);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expect(!source.checkpoint_running);
+}
+
+test "native member bindings preserve updates deletes old readers and restart" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var primary = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer primary.close();
+    var memory = lsm_backend_mod.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var resources = resource_manager_mod.ResourceManager.init(.{});
+    defer resources.deinit(alloc);
+    resources.dense_unified_fetch = true;
+    resources.dense_read_profile = true;
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.primary_store = &primary;
+    manager.resource_manager = &resources;
+    try manager.addAllNoBackfill(&primary, &.{.{
+        .name = "model",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    }});
+    const entry = manager.denseIndex("model").?;
+    const context = entry.vector_loader_context.?;
+    const key_a = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "model");
+    defer alloc.free(key_a);
+    const key_b = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:b", "model");
+    defer alloc.free(key_b);
+    const digests = [_][32]u8{ @splat(1), @splat(2), @splat(3) };
+    var source_store = try vector_block_store_mod.Store.open(alloc, memory.storage(), "/member-source");
+    defer source_store.deinit();
+    var writer = try vector_block_mod.Writer.initWithEncoding(alloc, 1, 0, 1, 1, .float32);
+    defer writer.deinit();
+    var order = [_]usize{ 0, 1, 2 };
+    const SourceOrder = struct {
+        fn less(d: *const [3][32]u8, a: usize, b: usize) bool {
+            return vector_block_mod.keyHash(&d[a]) < vector_block_mod.keyHash(&d[b]);
+        }
+    };
+    std.mem.sort(usize, &order, &digests, SourceOrder.less);
+    const vectors = [_][2]f32{ .{ 1, 2 }, .{ 3, 4 }, .{ 7, 8 } };
+    for (order) |id| try writer.appendVector(&digests[id], 1, 1, &vectors[id]);
+    const block = try writer.build();
+    defer alloc.free(block);
+    source_store.covered_source_sequence = 1;
+    try source_store.publishGeneration(1, 1, &.{.{ .shard_id = 0, .bytes = block }}, true);
+    var ann = try vector_block_store_mod.Store.open(alloc, memory.storage(), "/member-ann");
+    defer ann.deinit();
+    try ann.publishEmptyBase(1, 0, .{ .encoding = .artifact_reference });
+    try ann.appendBatch(1, &.{
+        .{ .kind = .upsert, .key = key_a, .source_sequence = 1, .revision = 11, .reference = .{ .digest = digests[0], .dims = 2 } },
+        .{ .kind = .upsert, .key = key_b, .source_sequence = 1, .revision = 12, .reference = .{ .digest = digests[1], .dims = 2 } },
+    }, 1, .{});
+    const Helpers = struct {
+        fn install(m: *IndexManager, storage: lsm_backend_mod.Storage) !void {
+            const opened = try vector_block_store_mod.Store.openWithBlocks(m.alloc, storage, "/member-ann");
+            const gen = try SharedVectorBlockGeneration.create(m.alloc, opened);
+            errdefer gen.release();
+            gen.source_snapshot = try vector_block_store_mod.Store.openWithBlocks(m.alloc, storage, "/member-source");
+            gen.opened.external_payloads = &gen.source_snapshot.?;
+            gen.opened.resource_manager = m.resource_manager;
+            gen.member_bindings = try vector_block_store_mod.member_bindings.Cache.create(m.alloc, 1024, null);
+            m.installVectorBlockGeneration(gen);
+        }
+        fn located(ctx: *IndexManager.DenseVectorLoadContext, sequence: u64, profile: *hbc_mod.SearchProfile) ![2]f32 {
+            var distances: [2]f32 = undefined;
+            var scratch: [4]f32 = undefined;
+            try IndexManager.scoreDenseVectorsFromNativeLocations(ctx, &.{ 17, 19 }, &.{ null, null }, &.{ 0, 0 }, 0, .l2_squared, &distances, &scratch, 2, sequence, profile);
+            return distances;
+        }
+        fn unified(ctx: *IndexManager.DenseVectorLoadContext, sequence: u64, ids: []const u64, expected_metadata: usize) ![2]f32 {
+            const Resolver = struct {
+                visited: usize = 0,
+                fn resolve(ptr: *anyopaque, requested: []const u64, out: []?[]const u8) !void {
+                    const r: *@This() = @ptrCast(@alignCast(ptr));
+                    r.visited += requested.len;
+                    for (requested, out) |id, *doc| doc.* = if (id == 17) "doc:a" else "doc:b";
+                }
+            };
+            var resolver: Resolver = .{};
+            var distances: [2]f32 = undefined;
+            var scratch: [4]f32 = undefined;
+            var keys: [2][]const u8 = undefined;
+            var raw: [2]?[]const u8 = undefined;
+            var views: [2][]const f32 = undefined;
+            var profile: hbc_mod.SearchProfile = .{};
+            try std.testing.expect(try IndexManager.scoreDenseVectorsUnified(ctx, ids, .{ .ctx = &resolver, .resolve = Resolver.resolve }, &.{ 0, 0 }, 0, .l2_squared, &distances, &scratch, 2, .{ .artifact_keys = &keys, .raw_values = &raw, .vector_views = &views, .source_sequence = sequence }, &profile));
+            try std.testing.expectEqual(expected_metadata, resolver.visited);
+            if (expected_metadata < 2) try std.testing.expectEqual(@as(u64, 1), profile.rerank_read_batches);
+            return distances;
+        }
+        fn populate(ctx: *IndexManager.DenseVectorLoadContext, sequence: u64) ![2]f32 {
+            var distances: [2]f32 = undefined;
+            var scratch: [4]f32 = undefined;
+            var keys: [2][]const u8 = undefined;
+            var raw: [2]?[]const u8 = undefined;
+            var views: [2][]const f32 = undefined;
+            try IndexManager.scoreDenseVectorsForHbcBatch(ctx, &.{ 17, 19 }, &.{ "doc:a", "doc:b" }, &.{ 0, 0 }, 0, .l2_squared, &distances, &scratch, 2, .{ .artifact_keys = &keys, .raw_values = &raw, .vector_views = &views, .source_sequence = sequence }, null);
+            return distances;
+        }
+    };
+    try Helpers.install(&manager, memory.storage());
+    var old_session: IndexManager.DenseVectorLoadSession = .{ .context = context, .cache_vectors = false };
+    defer old_session.deinit();
+    const previous = IndexManager.active_dense_vector_load_session;
+    defer IndexManager.active_dense_vector_load_session = previous;
+    IndexManager.active_dense_vector_load_session = &old_session;
+    var profile: hbc_mod.SearchProfile = .{};
+    const cold = try Helpers.located(context, 1, &profile);
+    try std.testing.expectEqual(std.math.inf(f32), cold[0]);
+    try std.testing.expectEqualSlices(f32, &.{ 5, 25 }, &(try Helpers.populate(context, 1)));
+    try std.testing.expectEqualSlices(f32, &.{ 5, 25 }, &(try Helpers.located(context, 1, &profile)));
+    try std.testing.expectEqual(@as(u64, 2), profile.rerank_member_binding_hits);
+    // Warm hit plus a previously unseen member referencing the same artifact.
+    // Both join one payload wave, with metadata fetched only for the miss.
+    try std.testing.expectEqualSlices(f32, &.{ 5, 25 }, &(try Helpers.unified(context, 1, &.{ 17, 23 }, 1)));
+    resources.dense_exact_mapped = true;
+    try std.testing.expectEqualSlices(f32, &.{ 25, 5 }, &(try Helpers.unified(context, 1, &.{ 23, 17 }, 0)));
+
+    try ann.appendBatch(2, &.{
+        .{ .kind = .upsert, .key = key_a, .source_sequence = 2, .revision = 21, .reference = .{ .digest = digests[2], .dims = 2 } },
+        .{ .kind = .tombstone, .key = key_b, .source_sequence = 2, .revision = 22 },
+    }, 2, .{});
+    try Helpers.install(&manager, memory.storage());
+    try std.testing.expectEqualSlices(f32, &.{ 5, 25 }, &(try Helpers.located(context, 1, &profile)));
+    try std.testing.expectEqualSlices(f32, &.{ 5, 25 }, &(try Helpers.unified(context, 1, &.{ 17, 23 }, 0)));
+    var next_session: IndexManager.DenseVectorLoadSession = .{ .context = context, .cache_vectors = false };
+    defer next_session.deinit();
+    IndexManager.active_dense_vector_load_session = &next_session;
+    const next_cold = try Helpers.located(context, 2, &profile);
+    try std.testing.expectEqual(std.math.inf(f32), next_cold[0]);
+    try std.testing.expectEqualSlices(f32, &.{ 113, std.math.inf(f32) }, &(try Helpers.unified(context, 2, &.{ 17, 19 }, 3)));
+    try std.testing.expectEqualSlices(f32, &.{ 113, std.math.inf(f32) }, &(try Helpers.populate(context, 2)));
+    try std.testing.expectEqualSlices(f32, &.{ 113, std.math.inf(f32) }, &(try Helpers.located(context, 2, &profile)));
+    try std.testing.expectEqual(std.math.inf(f32), (try Helpers.located(context, 1, &profile))[0]);
+    // Reopening durable stores creates no persisted binding state. Refill only
+    // after resolving the new snapshot's authoritative artifact reference.
+    try Helpers.install(&manager, memory.storage());
+    var restarted: IndexManager.DenseVectorLoadSession = .{ .context = context, .cache_vectors = false };
+    defer restarted.deinit();
+    IndexManager.active_dense_vector_load_session = &restarted;
+    try std.testing.expectEqual(std.math.inf(f32), (try Helpers.located(context, 2, &profile))[0]);
+    try std.testing.expectEqualSlices(f32, &.{ 113, std.math.inf(f32) }, &(try Helpers.unified(context, 2, &.{ 17, 19 }, 3)));
+    try std.testing.expectEqualSlices(f32, &.{ 113, std.math.inf(f32) }, &(try Helpers.populate(context, 2)));
+    try std.testing.expectEqualSlices(f32, &.{ 113, std.math.inf(f32) }, &(try Helpers.located(context, 2, &profile)));
+}
+
+test "dense query bundle pins primary metadata and exact source through replacement" {
+    if (IndexManager.denseVectorBlockPreferredEncoding() != .float32) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var primary = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer primary.close();
+    var memory = lsm_backend_mod.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.primary_store = &primary;
+    try manager.addAllNoBackfill(&primary, &.{.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true,\"centroid_directory_mode\":\"flat_rabitq\"}",
+    }});
+    const entry = manager.denseIndex("dense_idx").?;
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dense_idx");
+    defer alloc.free(artifact_key);
+    const mapping_key = try denseVectorIdMappingKey(alloc, "dense_idx", 1);
+    defer alloc.free(mapping_key);
+    try primary.put(mapping_key, "doc:a");
+    const artifact = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, null, &.{ 1, 2 });
+    defer alloc.free(artifact);
+    try primary.put(artifact_key, artifact);
+    try primary.ensureReplayNextSequenceAtLeast(2);
+    try entry.index.batchInsertWithMetadataOptions(&.{.{ .vector_id = 1, .metadata = "doc:a", .vector = &.{ 1, 2 } }}, .{ .skip_vector_store = true });
+    entry.index.setExperimentalPostingAuthorityTransitionPermitted(true);
+    try entry.index.finalizeExperimentalPostingGenerationAtAppliedSequence(1, .{ .flatten = false, .make_authoritative = true });
+    manager.setVectorBlockStorage(memory.storage());
+    const root = try manager.vectorBlockRootAlloc();
+    defer alloc.free(root);
+    {
+        var writer = try vector_block_store_mod.Store.open(alloc, memory.storage(), root);
+        defer writer.deinit();
+        try writer.publishEmptyBase(1, 0, .{ .encoding = .float32 });
+        try writer.appendBatch(1, &.{.{ .kind = .upsert, .key = artifact_key, .source_sequence = 1, .revision = 1, .vector = &.{ 1, 2 } }}, 1, .{});
+    }
+    manager.installVectorBlockGeneration(try manager.createVectorBlockGeneration(try vector_block_store_mod.Store.openWithBlocks(alloc, memory.storage(), root)));
+    try std.testing.expect((try manager.captureDenseReadSnapshot(entry, 0)) == null);
+    var captured = (try manager.captureDenseReadSnapshot(entry, 1)) orelse return error.MissingDenseQueryBundle;
+    defer captured.deinit();
+    try primary.put(mapping_key, "replacement");
+    const replacement = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, null, &.{ 9, 10 });
+    defer alloc.free(replacement);
+    try primary.put(artifact_key, replacement);
+    try primary.ensureReplayNextSequenceAtLeast(3);
+    {
+        var writer = try vector_block_store_mod.Store.open(alloc, memory.storage(), root);
+        defer writer.deinit();
+        try writer.appendBatch(2, &.{.{ .kind = .upsert, .key = artifact_key, .source_sequence = 2, .revision = 2, .vector = &.{ 9, 10 } }}, 2, .{});
+    }
+    manager.installVectorBlockGeneration(try manager.createVectorBlockGeneration(try vector_block_store_mod.Store.openWithBlocks(alloc, memory.storage(), root)));
+    captured.activate();
+    defer captured.deactivate();
+    const key = (try captured.lookupDocKey(1)).?;
+    defer alloc.free(key);
+    try std.testing.expectEqualStrings("doc:a", key);
+    const pinned = manager.acquireVectorBlockGeneration().?;
+    defer pinned.release();
+    try std.testing.expectEqual(@as(u64, 1), pinned.opened.store.covered_source_sequence);
+    var results = try manager.searchDenseEntryWithRequest(entry, .{ .query = &.{ 1, 2 }, .k = 1 });
+    defer results.deinit();
+    try std.testing.expectEqual(@as(usize, 1), results.getHits().len);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), results.getHits()[0].distance, 0.001);
+}
+
+test "DB query snapshot activates for public single-dense request envelopes" {
+    try testPublicDenseSnapshot(false);
+    try testPublicDenseSnapshot(true);
+}
+
+fn testPublicDenseSnapshot(native_only: bool) !void {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    if (IndexManager.denseVectorBlockPreferredEncoding() != .float32) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
+    var resources = resource_manager_mod.ResourceManager.init(.{});
+    defer resources.deinit(alloc);
+    resources.dense_query_snapshot = true;
+    resources.dense_query_snapshot_native_only = native_only;
+    const expected_route = if (native_only) "hbc_snapshot_native" else "hbc_snapshot";
+    var memory = lsm_backend_mod.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var db = try DB.open(alloc, path, .{
+        .resource_manager = &resources,
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }} });
+    const primary = db.core.store;
+    const manager = db.core.index_manager;
+    try manager.addAllNoBackfill(primary, &.{.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"rerank_policy\":\"always\",\"external\":true,\"centroid_directory_mode\":\"flat_rabitq\"}",
+    }});
+    const entry = manager.denseIndex("dense_idx").?;
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dense_idx");
+    defer alloc.free(artifact_key);
+    const mapping_key = try denseVectorIdMappingKey(alloc, "dense_idx", 1);
+    defer alloc.free(mapping_key);
+    try primary.put(mapping_key, "doc:a");
+    const artifact = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, null, &.{ 1, 2 });
+    defer alloc.free(artifact);
+    try primary.put(artifact_key, artifact);
+    try primary.ensureReplayNextSequenceAtLeast(2);
+    try entry.index.batchInsertWithMetadataOptions(&.{.{ .vector_id = 1, .metadata = "doc:a", .vector = &.{ 1, 2 } }}, .{ .skip_vector_store = true });
+    entry.index.setExperimentalPostingAuthorityTransitionPermitted(true);
+    try entry.index.finalizeExperimentalPostingGenerationAtAppliedSequence(1, .{ .flatten = false, .make_authoritative = true });
+    manager.setVectorBlockStorage(memory.storage());
+    const root = try manager.vectorBlockRootAlloc();
+    defer alloc.free(root);
+    {
+        var writer = try vector_block_store_mod.Store.open(alloc, memory.storage(), root);
+        defer writer.deinit();
+        try writer.publishEmptyBase(1, 0, .{ .encoding = .float32 });
+        try writer.appendBatch(1, &.{.{ .kind = .upsert, .key = artifact_key, .source_sequence = 1, .revision = 1, .vector = &.{ 1, 2 } }}, 1, .{});
+    }
+    manager.installVectorBlockGeneration(try manager.createVectorBlockGeneration(try vector_block_store_mod.Store.openWithBlocks(alloc, memory.storage(), root)));
+    const dense: types.DenseKnnQuery = .{ .vector = &.{ 1, 2 }, .k = 1 };
+    const req: types.SearchRequest = .{ .dense_queries = &.{.{ .name = "vec", .index_name = "dense_idx", .query = dense }}, .include_stored = false, .include_all_fields = false, .limit = 1 };
+    {
+        var result = try db.searchWithDenseProfile(alloc, req);
+        defer result.result.deinit();
+        try std.testing.expectEqualStrings(expected_route, result.dense_profile.?.search_route);
+        try std.testing.expectEqual(@as(usize, 1), result.request.dense_queries.len);
+        try std.testing.expectEqual(@as(u32, 1), result.result.total_hits);
+    }
+    {
+        var result = try db.searchWithCapturedRequest(alloc, req);
+        defer result.result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.request.dense_queries.len);
+        try std.testing.expectEqual(@as(u32, 1), result.result.total_hits);
+    }
+    {
+        // Profile adapters carry the vector separately after unpacking the
+        // one-query envelope, leaving req.query as match_all.
+        var result = try db.searchDenseProfiledWithCapturedRequest(alloc, .{ .index_name = "dense_idx", .include_stored = false, .limit = 1 }, dense);
+        defer result.profiled.result.deinit();
+        try std.testing.expectEqualStrings(expected_route, result.profiled.profile.search_route);
+    }
+    if (native_only) {
+        var bundle = (try manager.captureDenseReadSnapshot(entry, 1)).?;
+        defer bundle.deinit();
+        try std.testing.expect(bundle.source.read_txn == null);
+        try std.testing.expectError(error.DenseSnapshotNeedsPrimary, bundle.source.getTxn(primary));
+        try std.testing.expectError(error.DenseSnapshotNeedsPrimary, bundle.lookupDocKey(1));
+    }
+    // All public adapters checked admission before waiting for apply. A
+    // portable publication can close that gate during the wait, even though
+    // the previously published snapshot still appears complete and searchable.
+    const PendingQuery = struct {
+        db: *DB,
+        req: types.SearchRequest,
+        dense: types.DenseKnnQuery,
+        adapter: enum { profile, captured, dense_profile },
+        failure: ?anyerror = null,
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(ctx: *@This()) void {
+            defer ctx.done.store(true, .release);
+            ctx.search() catch |err| {
+                ctx.failure = err;
+            };
+        }
+
+        fn search(ctx: *@This()) !void {
+            switch (ctx.adapter) {
+                .profile => {
+                    var result = try ctx.db.searchWithDenseProfile(std.testing.allocator, ctx.req);
+                    defer result.result.deinit();
+                },
+                .captured => {
+                    var result = try ctx.db.searchWithCapturedRequest(std.testing.allocator, ctx.req);
+                    defer result.result.deinit();
+                },
+                .dense_profile => {
+                    var result = try ctx.db.searchDenseProfiledWithCapturedRequest(std.testing.allocator, .{ .index_name = "dense_idx", .include_stored = false, .limit = 1 }, ctx.dense);
+                    defer result.profiled.result.deinit();
+                },
+            }
+        }
+    };
+    inline for (.{ .profile, .captured, .dense_profile }) |adapter| {
+        var query: PendingQuery = .{ .db = &db, .req = req, .dense = dense, .adapter = adapter };
+        db.core.lockApply();
+        const thread = std.Thread.spawn(.{}, PendingQuery.run, .{&query}) catch |err| {
+            db.core.unlockApply();
+            return err;
+        };
+        const deadline = platform_time.monotonicNs() +| 10 * std.time.ns_per_s;
+        while (db.core.apply_mutex.shared_waiters.load(.acquire) == 0 and
+            !query.done.load(.acquire) and platform_time.monotonicNs() < deadline)
+        {
+            std.atomic.spinLoopHint();
+        }
+        const waited = db.core.apply_mutex.shared_waiters.load(.acquire) != 0;
+        db.async_context.portable_runtime_activation_pending.store(true, .release);
+        defer db.async_context.portable_runtime_activation_pending.store(false, .release);
+        db.core.unlockApply();
+        thread.join();
+        try std.testing.expect(waited);
+        try std.testing.expectEqual(@as(?anyerror, error.PortableRuntimeActivationPending), query.failure);
+    }
+    if (native_only) {
+        // An incomplete native source must abandon the whole captured query
+        // before the existing locked path consults authoritative primary data.
+        const incomplete_root = try std.fmt.allocPrint(alloc, "{s}-incomplete", .{root});
+        defer alloc.free(incomplete_root);
+        var writer = try vector_block_store_mod.Store.open(alloc, memory.storage(), incomplete_root);
+        defer writer.deinit();
+        try writer.publishEmptyBase(1, 1, .{ .encoding = .float32 });
+        manager.installVectorBlockGeneration(try manager.createVectorBlockGeneration(try vector_block_store_mod.Store.openWithBlocks(alloc, memory.storage(), incomplete_root)));
+        var result = try db.searchWithDenseProfile(alloc, req);
+        defer result.result.deinit();
+        try std.testing.expectEqual(@as(u32, 1), result.result.total_hits);
+        if (result.dense_profile) |profile| try std.testing.expect(!std.mem.startsWith(u8, profile.search_route, "hbc_snapshot"));
+    }
+    try db.batch(.{ .deletes = &.{"doc:a"} });
+    var after_delete = try db.searchWithDenseProfile(alloc, req);
+    defer after_delete.result.deinit();
+    if (after_delete.dense_profile) |profile| try std.testing.expect(!std.mem.startsWith(u8, profile.search_route, "hbc_snapshot"));
+    try std.testing.expectEqual(@as(u32, 0), after_delete.result.total_hits);
+}
+
+test "detached posting input pins native references across source replacement and index removal" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path_z = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
+    defer alloc.free(path_z);
+    var primary = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer primary.close();
+    var memory = lsm_backend_mod.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var manager = try IndexManager.init(alloc, path_z);
+    defer manager.deinit();
+    manager.primary_store = &primary;
+    try manager.addAllNoBackfill(&primary, &.{.{
+        .name = "model",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    }});
+    const entry = manager.denseIndex("model").?;
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "model");
+    defer alloc.free(artifact_key);
+    try entry.index.batchInsertWithMetadataOptions(&.{.{ .vector_id = 1, .metadata = "doc:a", .vector = &.{ 1, 2 } }}, .{ .skip_vector_store = true });
+    entry.index.setExperimentalPostingAuthorityTransitionPermitted(true);
+    try entry.index.finalizeExperimentalPostingGenerationAtAppliedSequence(1, .{ .flatten = false, .make_authoritative = true });
+    try entry.index.markNodePostingDirtyForTest(entry.index.metadata.root_node);
+    const digest: [32]u8 = @splat(42);
+    var source = try vector_block_store_mod.Store.open(alloc, memory.storage(), "/detached-source");
+    defer source.deinit();
+    var block_writer = try vector_block_mod.Writer.initWithEncoding(alloc, 1, 0, 1, 1, .float32);
+    defer block_writer.deinit();
+    try block_writer.appendVector(&digest, 1, 1, &.{ 1, 2 });
+    const block = try block_writer.build();
+    defer alloc.free(block);
+    source.covered_source_sequence = 1;
+    try source.publishGeneration(1, 1, &.{.{ .shard_id = 0, .bytes = block }}, true);
+    var ann = try vector_block_store_mod.Store.open(alloc, memory.storage(), "/detached-ann");
+    defer ann.deinit();
+    try ann.publishEmptyBase(1, 0, .{ .encoding = .artifact_reference });
+    try ann.appendBatch(1, &.{.{ .kind = .upsert, .key = artifact_key, .source_sequence = 1, .revision = 1, .reference = .{ .digest = digest, .dims = 2 } }}, 1, .{});
+    const gen = try SharedVectorBlockGeneration.create(alloc, try vector_block_store_mod.Store.openWithBlocks(alloc, memory.storage(), "/detached-ann"));
+    gen.source_snapshot = try vector_block_store_mod.Store.openWithBlocks(alloc, memory.storage(), "/detached-source");
+    gen.opened.external_payloads = &gen.source_snapshot.?;
+    gen.member_bindings = try vector_block_store_mod.member_bindings.Cache.create(alloc, 1024, null);
+    manager.installVectorBlockGeneration(gen);
+    try std.testing.expect(entry.apply_mutex.tryLock());
+    const busy = try manager.captureDensePostingRefreshWithOutcome();
+    entry.apply_mutex.unlock();
+    try std.testing.expect(busy == .deferred);
+    const prepared = (try manager.captureDensePostingRefresh()).?;
+    defer prepared.deinit();
+    try std.testing.expect(prepared.detached and prepared.input != null);
+    try std.testing.expectEqual(@as(usize, 0), prepared.input_rows);
+    try std.testing.expect(entry.apply_mutex.tryLock());
+    entry.apply_mutex.unlock();
+    // CURRENT now contains a tombstone. Detached work must retain the old
+    // source and old metadata, never consult this replacement generation.
+    try ann.appendBatch(2, &.{.{ .kind = .tombstone, .key = artifact_key, .source_sequence = 2, .revision = 2 }}, 2, .{});
+    const next = try SharedVectorBlockGeneration.create(alloc, try vector_block_store_mod.Store.openWithBlocks(alloc, memory.storage(), "/detached-ann"));
+    manager.installVectorBlockGeneration(next);
+    try std.testing.expect(try manager.remove(&primary, "model"));
+    try prepared.build();
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, prepared.vectors);
+    try std.testing.expectEqual(@as(usize, 1), prepared.input_rows);
+    try std.testing.expect(prepared.input == null);
+    const result = try manager.publishPreparedDensePostingRefresh(prepared);
+    try std.testing.expectEqual(@as(usize, 0), result.repaired);
+}
+
+test "graph artifact rebuild lease drains scheduler pins and excludes new snapshots" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var manager = try IndexManager.init(std.testing.allocator, ".");
+    defer manager.deinit();
+    var snapshot = try manager.graphMetricWorkerSnapshotAlloc();
+    const Pending = struct {
+        manager: *IndexManager,
+        acquired: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        fn run(ctx: *@This()) void {
+            var lease = ctx.manager.beginGraphArtifactRebuild();
+            defer lease.deinit();
+            ctx.acquired.store(true, .release);
+            while (!ctx.release.load(.acquire)) @import("antfly_platform").time.yieldNow();
+            lease.complete();
+        }
+    };
+    var pending = Pending{ .manager = &manager };
+    const thread = try std.Thread.spawn(.{}, Pending.run, .{&pending});
+    defer {
+        pending.release.store(true, .release);
+        thread.join();
+    }
+    // Once the writer owns the catalog it must still wait for this pin.
+    while (manager.catalog_mutex.tryLockShared()) {
+        manager.catalog_mutex.unlockShared();
+        @import("antfly_platform").time.yieldNow();
+    }
+    const acquired_while_pinned = pending.acquired.load(.acquire);
+    snapshot.deinit();
+    try std.testing.expect(!acquired_while_pinned);
+    while (!pending.acquired.load(.acquire)) @import("antfly_platform").time.yieldNow();
+    try std.testing.expect(!manager.catalog_mutex.tryLockShared());
+    pending.release.store(true, .release);
 }

@@ -16,6 +16,8 @@ const provisioned_source = @import("storage/kernel_owner_provisioned_source_test
 
 test {
     _ = provisioned_source;
+    _ = @import("api/kernel_owner_source.zig");
+    _ = antfly_sources.table_writes.consumer_tests;
 }
 
 /// Implementation source choices for this compilation root.

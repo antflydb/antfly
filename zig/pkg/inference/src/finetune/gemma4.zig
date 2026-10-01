@@ -1128,13 +1128,13 @@ fn cachedPrepareMediaTokenCount(
 
     const tokens = switch (kind) {
         .image => blk: {
-            var projected = try gemma4_projector.encodeProjectedImages(cb, allocator, gguf_projector_path, &.{bytes});
+            var projected = try gemma4_projector.encodeProjectedImagesFromPath(cb, allocator, gguf_projector_path, &.{bytes});
             defer projected.deinit();
             if (projected.tokens_per_image.len != 1) return error.InvalidPreparedPrompt;
             break :blk projected.tokens_per_image[0];
         },
         .audio => blk: {
-            var projected = try gemma4_projector.encodeProjectedAudio(cb, allocator, gguf_projector_path, &.{bytes});
+            var projected = try gemma4_projector.encodeProjectedAudioFromPath(cb, allocator, gguf_projector_path, &.{bytes});
             defer projected.deinit();
             if (projected.tokens_per_audio.len != 1) return error.InvalidPreparedPrompt;
             break :blk projected.tokens_per_audio[0];

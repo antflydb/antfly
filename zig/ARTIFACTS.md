@@ -494,9 +494,12 @@ All sources in one index must have the same dense dimension and inhabit a
 compatible vector space. `vector_space` is optional. When every source omits
 it, Antfly compares the durable canonical semantic producer identity stored on
 every embedding enrichment: provider, model, effective normalized endpoint and
-region, dense/sparse mode, multimodal mode, input type, and truncation. Unknown
-or incompatible producers are rejected. Credentials, pacing, retries, and
-batch limits are execution settings and are excluded from that identity.
+region, dense/sparse mode, input type, and truncation. Unknown or incompatible
+producers are rejected. Credentials, pacing, retries, and batch limits are
+execution settings and are excluded from that identity. So are the input types
+a model accepts (the embedder's `inputs`, or its discovered capabilities):
+they decide what may be sent, not which vectors come back. Identities written
+before this carry a `multimodal` field, which is still accepted and ignored.
 
 To combine intentionally compatible but distinct or externally produced
 embeddings, every source must declare the same non-empty `vector_space` on its

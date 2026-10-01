@@ -1,0 +1,141 @@
+{
+  "source_head": "c9c9c7faf51c4f9a35abe02ef1c1899229cc9f15",
+  "optimization": "Debug",
+  "allocator": "std.testing.allocator",
+  "page_documents": 256,
+  "timed_work": "Delete-by-ID (baseline only), segment publication, metadata durability; segment construction and final verification excluded",
+  "stages": [
+    {
+      "layout": "in-memory LSM with inline segments",
+      "binary_sha256": "971757d751b896ad22920a5efcef8fa3a74478de9b3e86a0fa19f3bf349e97a6",
+      "rows": [
+        {
+          "documents": 16384,
+          "atomic_page": false,
+          "publication_ns": 2877983000,
+          "segments": 64
+        },
+        {
+          "documents": 16384,
+          "atomic_page": true,
+          "publication_ns": 2591614000,
+          "segments": 64
+        },
+        {
+          "documents": 65536,
+          "atomic_page": false,
+          "publication_ns": 24659700000,
+          "segments": 256
+        },
+        {
+          "documents": 65536,
+          "atomic_page": true,
+          "publication_ns": 22135074000,
+          "segments": 256
+        },
+        {
+          "documents": 131072,
+          "atomic_page": false,
+          "publication_ns": 85964528000,
+          "segments": 512
+        },
+        {
+          "documents": 131072,
+          "atomic_page": true,
+          "publication_ns": 82801073000,
+          "segments": 512
+        }
+      ],
+      "exact_count_checks_passed": true,
+      "notes": "Before the subsequent incremental field-statistics optimization; one sample per path and size."
+    },
+    {
+      "layout": "production file-backed LSM with durable segment files",
+      "binary_sha256": "050c36d27e25bda0e0012088ba951a8975dab6c61bdf0615a8f3a734b2b7f71f",
+      "rows": [
+        {
+          "documents": 16384,
+          "atomic_page": false,
+          "publication_ns": 3414224000,
+          "segments": 64
+        },
+        {
+          "documents": 16384,
+          "atomic_page": true,
+          "publication_ns": 3043063000,
+          "segments": 64
+        },
+        {
+          "documents": 65536,
+          "atomic_page": false,
+          "publication_ns": 16903680000,
+          "segments": 256
+        },
+        {
+          "documents": 65536,
+          "atomic_page": true,
+          "publication_ns": 12968543000,
+          "segments": 256
+        },
+        {
+          "documents": 131072,
+          "atomic_page": false,
+          "publication_ns": 38248877000,
+          "segments": 512
+        },
+        {
+          "documents": 131072,
+          "atomic_page": true,
+          "publication_ns": 29401937000,
+          "segments": 512
+        }
+      ],
+      "exact_count_checks_passed": true,
+      "notes": "Before the subsequent incremental field-statistics optimization; one sample per path and size."
+    },
+    {
+      "layout": "production file-backed LSM with durable segment files",
+      "binary_sha256": "b37de53add1200c798f82888e156f6d3e2ef961425a702327be5aac7b90a6f4a",
+      "rows": [
+        {
+          "documents": 16384,
+          "atomic_page": false,
+          "publication_ns": 2805237000,
+          "segments": 64
+        },
+        {
+          "documents": 16384,
+          "atomic_page": true,
+          "publication_ns": 2542072000,
+          "segments": 64
+        },
+        {
+          "documents": 65536,
+          "atomic_page": false,
+          "publication_ns": 14603631000,
+          "segments": 256
+        },
+        {
+          "documents": 65536,
+          "atomic_page": true,
+          "publication_ns": 12125504000,
+          "segments": 256
+        },
+        {
+          "documents": 131072,
+          "atomic_page": false,
+          "publication_ns": 37920490000,
+          "segments": 512
+        },
+        {
+          "documents": 131072,
+          "atomic_page": true,
+          "publication_ns": 29371838000,
+          "segments": 512
+        }
+      ],
+      "exact_count_checks_passed": true,
+      "notes": "Final implementation with incremental append field totals on both comparison paths; one sample per path and size. Regression also checks field totals after reopen and a subsequent append."
+    }
+  ]
+}

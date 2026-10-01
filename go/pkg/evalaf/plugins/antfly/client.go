@@ -59,6 +59,40 @@ func (c *Client) CreateRetrievalAgentTargetFunc(tables []string) eval.TargetFunc
 	}
 }
 
+// CallResearchAgent calls the Antfly ResearchAgent endpoint and returns the full
+// bounded research result: plan, findings, evidence, report, citations, and
+// verification. It always requests the non-streaming JSON response, since
+// evaluators need the complete result rather than incremental SSE progress.
+func (c *Client) CallResearchAgent(ctx context.Context, req antfly.ResearchAgentRequest) (*antfly.ResearchAgentResult, error) {
+	req.Stream = false
+	return c.ResearchAgent(ctx, req)
+}
+
+// CreateResearchAgentTargetFunc creates a target function for evaluating Antfly's
+// ResearchAgent endpoint. Unlike CreateRetrievalAgentTargetFunc, the target output
+// is the full *antfly.ResearchAgentResult rather than a generated string, so the
+// research evaluators (citation coverage/precision, sub-question coverage,
+// evidence diversity) can inspect the plan, evidence registry, and verification
+// pass. Evaluators that expect prose can still read Output.Report.Markdown.
+func (c *Client) CreateResearchAgentTargetFunc(tables []string) eval.TargetFunc {
+	return func(ctx context.Context, example eval.Example) (any, error) {
+		query, ok := example.Input.(string)
+		if !ok {
+			return nil, fmt.Errorf("input must be a string")
+		}
+
+		queries := make([]antfly.RetrievalQueryRequest, len(tables))
+		for i, table := range tables {
+			queries[i] = antfly.RetrievalQueryRequest{Table: table}
+		}
+
+		return c.CallResearchAgent(ctx, antfly.ResearchAgentRequest{
+			Query:   query,
+			Queries: queries,
+		})
+	}
+}
+
 // CreateRetrievalAgentClassificationTargetFunc creates a target function that returns
 // classification metadata (route_type, confidence) along with the answer.
 func (c *Client) CreateRetrievalAgentClassificationTargetFunc(tables []string) eval.TargetFunc {

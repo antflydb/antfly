@@ -1,0 +1,19 @@
+{
+  "name": "indexes_schema_enrichments",
+  "description": "Index, schema, and enrichment administration, including delete of a missing name.",
+  "open": {"create": true, "no_sync": true},
+  "steps": [
+    {"op": "add_index", "config": {"name": "ft_body_v1", "kind": "full_text", "config_json": "{}"}},
+    {"op": "list_indexes", "expect": {"contains": ["ft_body_v1", "full_text_index_v0"]}},
+    {"op": "delete_index", "name": "ft_body_v1", "expect": {"equals": true}},
+    {"op": "delete_index", "name": "ft_body_v1", "expect": {"equals": false}},
+    {"op": "list_indexes", "expect": {"not_contains": ["ft_body_v1"]}},
+    {"op": "add_index", "config": {"name": "bad", "kind": "no_such_kind", "config_json": "{}"}, "expect": {"error": "ANTFLY_INVALID_ARGUMENT"}},
+    {"op": "set_schema", "schema": {"version": 1, "default_type": "doc", "document_schemas": {"doc": {"schema": {"type": "object", "required": ["title"]}}}}},
+    {"op": "get_schema", "expect": {"json_subset": {"default_type": "doc", "document_schemas": {"doc": {"schema": {"required": ["title"]}}}}}},
+    {"op": "add_enrichment", "config": {"name": "body_chunks_v1", "kind": "chunk", "field": "body", "chunk_size": 8, "chunk_overlap": 2}},
+    {"op": "list_enrichments", "expect": {"contains": ["body_chunks_v1"]}},
+    {"op": "delete_enrichment", "kind": "chunk", "name": "body_chunks_v1", "expect": {"equals": true}},
+    {"op": "delete_enrichment", "kind": "chunk", "name": "body_chunks_v1", "expect": {"equals": false}}
+  ]
+}

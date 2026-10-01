@@ -8,7 +8,7 @@ from attrs import field as _attrs_field
 
 from ..models.linkup_search_config_depth import LinkupSearchConfigDepth
 from ..models.linkup_search_config_output_type import LinkupSearchConfigOutputType
-from ..models.web_search_provider import WebSearchProvider
+from ..models.linkup_search_config_provider import LinkupSearchConfigProvider
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="LinkupSearchConfig")
@@ -28,7 +28,7 @@ class LinkupSearchConfig:
     **Docs:** https://docs.linkup.so
 
         Attributes:
-            provider (WebSearchProvider): The web search provider to use.
+            provider (LinkupSearchConfigProvider): The web search provider to use.
 
                 - **exa**: Exa neural/semantic web search API
                 - **serper**: Serper.dev Google Search API (simpler setup)
@@ -47,21 +47,18 @@ class LinkupSearchConfig:
             serving_config (str | Unset): Agent Search serving config ID for provider vertex. Defaults to default_config.
             credentials_path (str | Unset): Service account JSON path for provider vertex. Shared Vertex credential field;
                 see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
-            max_results (int | Unset): Maximum number of search results to return Default: 5.
-            timeout_ms (int | Unset): Request timeout in milliseconds Default: 10000.
-            safe_search (bool | Unset): Enable safe search filtering Default: True.
+            max_results (int | Unset): Maximum number of search results to return
+            timeout_ms (int | Unset): Request timeout in milliseconds
+            safe_search (bool | Unset): Enable safe search filtering
             language (str | Unset): Preferred language for results (e.g., 'en', 'es', 'fr') Example: en.
             region (str | Unset): Preferred region for results (e.g., 'us', 'uk', 'de') Example: us.
-            include_content (bool | Unset): Ask the provider to return extracted page content when supported Default: False.
-            include_highlights (bool | Unset): Ask the provider to return highlighted passages when supported Default:
-                False.
-            depth (LinkupSearchConfigDepth | Unset): Search depth to request from Linkup Default:
-                LinkupSearchConfigDepth.STANDARD.
-            output_type (LinkupSearchConfigOutputType | Unset): Linkup response shape to request Default:
-                LinkupSearchConfigOutputType.SEARCHRESULTS.
+            include_content (bool | Unset): Ask the provider to return extracted page content when supported
+            include_highlights (bool | Unset): Ask the provider to return highlighted passages when supported
+            depth (LinkupSearchConfigDepth | Unset): Search depth to request from Linkup
+            output_type (LinkupSearchConfigOutputType | Unset): Linkup response shape to request
     """
 
-    provider: WebSearchProvider
+    provider: LinkupSearchConfigProvider
     api_key: str | Unset = UNSET
     endpoint: str | Unset = UNSET
     project_id: str | Unset = UNSET
@@ -69,15 +66,15 @@ class LinkupSearchConfig:
     data_store: str | Unset = UNSET
     serving_config: str | Unset = UNSET
     credentials_path: str | Unset = UNSET
-    max_results: int | Unset = 5
-    timeout_ms: int | Unset = 10000
-    safe_search: bool | Unset = True
+    max_results: int | Unset = UNSET
+    timeout_ms: int | Unset = UNSET
+    safe_search: bool | Unset = UNSET
     language: str | Unset = UNSET
     region: str | Unset = UNSET
-    include_content: bool | Unset = False
-    include_highlights: bool | Unset = False
-    depth: LinkupSearchConfigDepth | Unset = LinkupSearchConfigDepth.STANDARD
-    output_type: LinkupSearchConfigOutputType | Unset = LinkupSearchConfigOutputType.SEARCHRESULTS
+    include_content: bool | Unset = UNSET
+    include_highlights: bool | Unset = UNSET
+    depth: LinkupSearchConfigDepth | Unset = UNSET
+    output_type: LinkupSearchConfigOutputType | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -164,7 +161,7 @@ class LinkupSearchConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        provider = WebSearchProvider(d.pop("provider"))
+        provider = LinkupSearchConfigProvider(d.pop("provider"))
 
         api_key = d.pop("api_key", UNSET)
 

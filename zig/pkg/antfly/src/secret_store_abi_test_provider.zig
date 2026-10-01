@@ -71,3 +71,43 @@ export fn secret_store_abi_destroy(store: *secrets.FileStore) callconv(.c) void 
     store.deinit();
     allocator.destroy(store);
 }
+
+const secret_contract = @import("common/secret_contract.zig");
+const secret_record = @import("common/secret_record.zig");
+const FoundationFixture = struct {
+    var context: u8 = 0;
+    fn resolve(_: *anyopaque, alloc: std.mem.Allocator, scope: []const u8, _: []const u8, _: secret_contract.ReadOptions) !secret_contract.Lookup {
+        if (std.mem.eql(u8, scope, "unavailable")) return error.Unavailable;
+        return .{ .revision = 9, .value = .{ .revision = 8, .secret = .{ .bytes = try alloc.dupe(u8, "archive-secret") } } };
+    }
+    fn list(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: secret_contract.ReadOptions) !secret_contract.Listing {
+        const key = try alloc.dupe(u8, "token");
+        errdefer alloc.free(key);
+        const entries = try alloc.alloc(secret_contract.Metadata, 1);
+        entries[0] = .{ .key = key, .revision = 8 };
+        return .{ .revision = 9, .entries = entries };
+    }
+    fn refresh(_: *anyopaque, _: []const u8) !secret_contract.Health {
+        return .{ .revision = 9, .stale = true, .available = false };
+    }
+    fn put(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8, expected: secret_contract.ExpectedRevision) !secret_contract.Mutation {
+        try expected.check(8);
+        return .{ .revision = 10 };
+    }
+    fn remove(_: *anyopaque, _: []const u8, _: []const u8, expected: secret_contract.ExpectedRevision) !secret_contract.Mutation {
+        try expected.check(8);
+        return .{ .revision = 10 };
+    }
+    fn wrap(_: *anyopaque, _: std.mem.Allocator, _: secret_contract.Identity, _: *const secret_record.DataKey) !secret_record.WrappedKey {
+        return error.Unavailable;
+    }
+    fn unwrap(_: *anyopaque, _: secret_contract.Identity, _: []const u8, _: []const u8, _: *secret_record.DataKey) !void {
+        return error.Unavailable;
+    }
+};
+
+export fn secret_foundation_abi_handles(source: *secret_contract.Source, writer: *secret_contract.NativeStore.Writer, keys: *secret_record.KeyProvider) callconv(.c) void {
+    source.* = .{ .ptr = &FoundationFixture.context, .vtable = &.{ .resolve = FoundationFixture.resolve, .list_metadata = FoundationFixture.list, .refresh = FoundationFixture.refresh } };
+    writer.* = .{ .ptr = &FoundationFixture.context, .vtable = &.{ .put = FoundationFixture.put, .remove_override = FoundationFixture.remove } };
+    keys.* = .{ .ptr = &FoundationFixture.context, .vtable = &.{ .wrap = FoundationFixture.wrap, .unwrap = FoundationFixture.unwrap } };
+}

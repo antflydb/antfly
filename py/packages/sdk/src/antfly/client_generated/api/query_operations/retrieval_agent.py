@@ -355,7 +355,8 @@ def sync_detailed(
     Args:
         body (RetrievalAgentRequest): Request for the retrieval agent. Queries define which tables
             and indexes
-            to search, each as a QueryRequest with optional tree search configuration.
+            to search, each as an ordinary QueryRequest. Optional tree or graph exploration
+            is configured by steps.retrieval.navigation, targeting one query by index.
 
             **Pipeline mode** (default, max_internal_iterations=0): Queries are executed
             directly without an LLM tool-calling loop.
@@ -451,7 +452,8 @@ def sync(
     Args:
         body (RetrievalAgentRequest): Request for the retrieval agent. Queries define which tables
             and indexes
-            to search, each as a QueryRequest with optional tree search configuration.
+            to search, each as an ordinary QueryRequest. Optional tree or graph exploration
+            is configured by steps.retrieval.navigation, targeting one query by index.
 
             **Pipeline mode** (default, max_internal_iterations=0): Queries are executed
             directly without an LLM tool-calling loop.
@@ -541,7 +543,8 @@ async def asyncio_detailed(
     Args:
         body (RetrievalAgentRequest): Request for the retrieval agent. Queries define which tables
             and indexes
-            to search, each as a QueryRequest with optional tree search configuration.
+            to search, each as an ordinary QueryRequest. Optional tree or graph exploration
+            is configured by steps.retrieval.navigation, targeting one query by index.
 
             **Pipeline mode** (default, max_internal_iterations=0): Queries are executed
             directly without an LLM tool-calling loop.
@@ -635,7 +638,8 @@ async def asyncio(
     Args:
         body (RetrievalAgentRequest): Request for the retrieval agent. Queries define which tables
             and indexes
-            to search, each as a QueryRequest with optional tree search configuration.
+            to search, each as an ordinary QueryRequest. Optional tree or graph exploration
+            is configured by steps.retrieval.navigation, targeting one query by index.
 
             **Pipeline mode** (default, max_internal_iterations=0): Queries are executed
             directly without an LLM tool-calling loop.

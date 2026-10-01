@@ -1,0 +1,17 @@
+{
+ "schemaVersion": 1,
+ "permalinkBase": "https://github.com/antflydb/antfly/blob/main",
+ "models": [
+  "gemma4-e2b",
+  "gemma4-e4b",
+  "gliner2",
+  "gliner25",
+  "qwen3-embedding",
+  "qwen3-vl"
+ ],
+ "counts": {
+  "opKinds": 74,
+  "kernels": 460,
+  "routes": 25
+ }
+}

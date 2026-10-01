@@ -20,6 +20,8 @@ test {
     _ = @import("storage/db_split_vopr.zig");
     _ = @import("storage/db/promotion_runtime.zig");
     _ = @import("storage/db/resolution_runtime.zig");
+    _ = @import("storage/db/relational_index_catalog.zig");
+    _ = @import("storage/db/relational_index_gc.zig");
 }
 
 pub const antfly_sources = struct {

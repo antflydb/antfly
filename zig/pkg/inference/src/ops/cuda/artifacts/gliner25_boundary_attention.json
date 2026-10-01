@@ -1,0 +1,20 @@
+{
+  "artifacts": {
+    "gliner25_boundary_attention_backward.cubin": "05a8a833d7bd4c778c2fba11a1058358b7e8d702a70af3d03ae72759d4731132",
+    "gliner25_boundary_attention_backward.sm80.cubin": "c7383d2e8bff4bf978957e90a00da8f14909837e71e7a98db1e4125ab3bd6c51",
+    "gliner25_boundary_attention_forward.cubin": "ee2118ca61311d70668f1ba0a63540d4e84c41e6b87a2b311db63d68e4fac61f",
+    "gliner25_boundary_attention_forward.sm80.cubin": "37fb96ad2579196f328df613fd5d7b6a025efe9872531d4d5433f0e073653a5e"
+  },
+  "compiler": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2026 NVIDIA Corporation\nBuilt on Thu_Mar_19_11:12:51_PM_PDT_2026\nCuda compilation tools, release 13.2, V13.2.78\nBuild cuda_13.2.r13.2/compiler.37668154_0",
+  "options": [
+    "-std=c++17",
+    "-O3",
+    "-DNDEBUG",
+    "--fmad=false"
+  ],
+  "profile": "gliner25_boundary_attention_native_d32_v1",
+  "source_sha256": {
+    "gliner25_boundary_attention_backward.cu": "e2edced0430a0965b95501d9bfe1290613d0b1eb3ebdc59f065a604ca65bbff0",
+    "gliner25_boundary_attention_forward.cu": "25e6e8dc5bb441136ae1d19b7ea7d8fe5cfcef6db792e02176564e16745656a9"
+  }
+}

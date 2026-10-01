@@ -192,3 +192,27 @@ def test_graph_fact_projection_preserves_arbitrary_source_and_edge_id() -> None:
     )[0]
     assert source["nodes"]["source"] == "{{ _item.source }}"
     assert source["edge"]["edge_id"] == "{{ _doc.key }}"
+
+
+def test_openrouter_index_configuration_round_trips() -> None:
+    from antfly.client_generated.models.create_embeddings_index_request import (
+        CreateEmbeddingsIndexRequest,
+    )
+    from antfly.client_generated.models.open_router_embedder_config import (
+        OpenRouterEmbedderConfig,
+    )
+
+    body = {
+        "type": "embeddings",
+        "field": "body",
+        "embedder": {
+            "provider": "openrouter",
+            "model": "openai/text-embedding-3-small",
+            "url": "https://gateway.example/api/v1",
+            "api_key": "${secret:team.router}",
+            "dimensions": 3,
+        },
+    }
+    parsed = CreateEmbeddingsIndexRequest.from_dict(body)
+    assert isinstance(parsed.embedder, OpenRouterEmbedderConfig)
+    assert parsed.to_dict() == body

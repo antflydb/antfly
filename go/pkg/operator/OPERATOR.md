@@ -95,6 +95,38 @@ runtime contract is `/antfly inference pull <model-ref> --models-dir /models`,
 with `--tasks` and `--capabilities` added when the model preload spec declares
 them.
 
+Preload order is significant: the runtime warms `preload` entries sequentially,
+in list order, at startup. The InferencePool controller emits entries ordered
+by `models.preload[].priority` (`high` before `medium` before `low`; ties keep
+declaration order), so higher-priority models finish loading, and become
+servable, first. `priority` does not influence eviction under `lazy` or
+`bounded` loading strategies — the runtime has no priority-aware eviction, only
+idle-timeout (`keepAlive`) and LRU-bounded (`maxLoadedModels`) policies.
+
+### Standalone Inference
+
+`spec.standalone.inference.enabled` (default `true`) controls whether the
+standalone pod runs Antfly's embedded, in-process inference provider.
+`spec.standalone.inference.apiURL` must stay empty for that embedded provider
+to run: a non-empty `apiURL` is a hard isolation contract in the Zig runtime —
+it disables the embedded provider, preloads, and the `/ai/v1` routes, and
+standalone expects a real listener at that address instead. The operator
+therefore never invents an `apiURL` default; it only ever emits one when the
+user (or `spec.config`) explicitly sets it, to point standalone at an
+external/shared inference endpoint. `status.standaloneStatus.inferenceReady`
+tracks the standalone pod's own readiness, which is an accurate proxy for
+embedded-provider health but not for the reachability of a user-supplied
+external endpoint.
+
+### Process Memory Budget
+
+Standalone and InferencePool pods commonly run Burstable (memory request below
+limit), where Kubernetes does not otherwise expose the intended operating
+envelope to the container. When a pod has an explicit memory limit, the
+operator sets `ANTFLY_PROCESS_MEMORY_BUDGET_MB` to roughly 90% of that limit
+(in MiB) on the runtime container, so the process throttles itself ahead of
+the kernel OOM killer. No value is set when the pod has no memory limit.
+
 ## Storage Resize
 
 Antfly storage changes are grow-only.

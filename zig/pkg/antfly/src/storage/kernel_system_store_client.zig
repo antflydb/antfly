@@ -215,8 +215,14 @@ fn writeDelete(ptr: *anyopaque, key: []const u8) !void {
     try statusToError(abi.antfly_storage_system_write_delete(ptr, .fromSlice(key)));
 }
 
-fn writeOpenCursor(_: std.mem.Allocator, _: *anyopaque) !backend.Cursor {
-    return error.Unsupported;
+fn writeOpenCursor(allocator: std.mem.Allocator, ptr: *anyopaque) !backend.Cursor {
+    var handle: ?*anyopaque = null;
+    try statusToError(abi.antfly_storage_system_write_open_cursor(ptr, &handle));
+    return .{
+        .allocator = allocator,
+        .ptr = handle orelse return error.StorageKernelFailure,
+        .vtable = &cursor_vtable,
+    };
 }
 
 fn storeBeginBatch(allocator: std.mem.Allocator, ptr: *anyopaque) !backend.Batch {

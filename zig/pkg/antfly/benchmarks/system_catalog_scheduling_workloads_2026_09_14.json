@@ -1,0 +1,161 @@
+{
+  "source_commit": "0528208791beabb5ccc255bae0bfa27a45c44731",
+  "main_commit": "2032ed7d871ee8bbb8bdaf31824677ec045df556",
+  "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "optimize": "Debug",
+  "allocator": "std.heap.c_allocator",
+  "server_sha256": "09f761e926b1ebc60baca15bb1057ab0a9320d0f85b4ab8163b050087c4f232d",
+  "commands": [
+    "ANTFLY_CATALOG_REPORT_BENCH=1 python3 tools/run_bounded_zig_build.py build antfly-system-catalog-report-bench",
+    "ANTFLY_CATALOG_REPORT_BENCH=1 python3 tools/run_bounded_zig_build.py build antfly-system-catalog-finalization-test"
+  ],
+  "runtime_cache": [
+    {
+      "groups": 1000,
+      "indexes_per_group": 32,
+      "shared": false,
+      "median_ns": 11473000,
+      "samples_ns_sorted": [
+        11326000,
+        11374000,
+        11392000,
+        11402000,
+        11473000,
+        11480000,
+        11511000,
+        11524000,
+        11543000
+      ],
+      "warmup_samples": 1,
+      "measured_samples": 9
+    },
+    {
+      "groups": 1000,
+      "indexes_per_group": 32,
+      "shared": true,
+      "median_ns": 1075000,
+      "samples_ns_sorted": [
+        942000,
+        946000,
+        954000,
+        1040000,
+        1075000,
+        1075000,
+        1081000,
+        1084000,
+        1115000
+      ],
+      "warmup_samples": 1,
+      "measured_samples": 9
+    },
+    {
+      "groups": 10000,
+      "indexes_per_group": 32,
+      "shared": false,
+      "median_ns": 114894000,
+      "samples_ns_sorted": [
+        113321000,
+        113705000,
+        114042000,
+        114294000,
+        114894000,
+        114910000,
+        115273000,
+        115499000,
+        116042000
+      ],
+      "warmup_samples": 1,
+      "measured_samples": 9
+    },
+    {
+      "groups": 10000,
+      "indexes_per_group": 32,
+      "shared": true,
+      "median_ns": 11642000,
+      "samples_ns_sorted": [
+        11319000,
+        11336000,
+        11414000,
+        11444000,
+        11642000,
+        11650000,
+        11666000,
+        11882000,
+        11886000
+      ],
+      "warmup_samples": 1,
+      "measured_samples": 9
+    }
+  ],
+  "migration_finalization": [
+    {
+      "tables": 101,
+      "ranges": 1000,
+      "placements": 3000,
+      "scan_samples_ns": [
+        2779695000,
+        2717083000,
+        2736945000,
+        2908947000,
+        2882745000
+      ],
+      "indexed_samples_ns": [
+        2127000,
+        2097000,
+        2214000,
+        2272000,
+        2072000
+      ],
+      "scan_median_ns": 2779695000,
+      "indexed_median_ns": 2127000,
+      "warmup_samples": 1,
+      "measured_samples": 5
+    }
+  ],
+  "executables": [
+    {
+      "benchmark": "report",
+      "path": "./.zig-cache/o/b97b0f08968dc4f3b22e9c12f1660d19/test",
+      "sha256": "9884f73732e4a438424f80680caf6dd10b0c864f6f6c44e441cb8d39ae2bc701"
+    },
+    {
+      "benchmark": "report",
+      "path": "./.zig-cache/o/6bdbf14ea52e27b36d0ca1925e4b2303/test",
+      "sha256": "eac6f73b22b6ad527bba2a180dee1e78f836e2b94f2b39a6dcf4657df2b5c041"
+    },
+    {
+      "benchmark": "finalization",
+      "path": "./.zig-cache/o/0ab809922d3f2c0ea0bf4ef9e5c5478c/test",
+      "sha256": "764103660b907c7ac1e401ff895abc0b9baaf8e0717c12d0c497c31726a2f863"
+    }
+  ],
+  "limitations": [
+    "Local Debug component comparisons; no production latency or hosted-shard capacity claim.",
+    "Benchmark commands ran sequentially after functional validation, without concurrent task-owned builds or E2Es.",
+    "Runtime cache: one warmup and nine samples, emitted in sorted order. Timing includes capture and release; fixture and publisher construction are excluded. The fixture repeats 32 index descriptors per group.",
+    "Migration finalization: one warmup and five paired samples. New path includes schema parsing, index construction, and result equality checks. Reference excludes schema parsing. New index destruction is excluded; reference per-call temporary host-list destruction is included.",
+    "Both component comparisons exclude HTTP, Raft, storage I/O, and document rebuilding.",
+    "The publisher retains the acknowledged leaves during cache measurements; final publisher-owned leaf destruction is outside the timed interval."
+  ],
+  "run_order": [
+    "finalization",
+    "report"
+  ],
+  "functional_validation": {
+    "source_commit": "98f043a7b31470333bb374867361a1bee776f496",
+    "e2e_tests_passed": 10,
+    "e2e_suite_seconds": 96.9,
+    "production_simulations_passed": 2,
+    "runtime_regressions_passed": 12,
+    "concurrent_migration": {
+      "scenario": "concurrent_tenant_schema_migrations",
+      "tables": 3,
+      "shards_per_table": 2,
+      "replicas_per_shard": 3,
+      "documents_per_table": 30,
+      "migration_and_validation_ms": 4224.510290659964
+    },
+    "note": "One functional run, not an end-to-end latency distribution. The later source commit changes only benchmark step execution, without changing server code."
+  }
+}

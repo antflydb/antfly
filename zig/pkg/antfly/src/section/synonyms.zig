@@ -12,7 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! Synonym section using Vellum FST and Roaring bitmaps.
+//! Synonym section using an FST and Roaring bitmaps.
 //!
 //! Maps synonym terms to synonym groups. Each group contains a set of
 //! equivalent term IDs (offsets into the main inverted index FST).
@@ -22,8 +22,8 @@
 //!   [group_0: roaring bitmap bytes (length-prefixed)]
 //!   [group_1: roaring bitmap bytes (length-prefixed)]
 //!   ...
-//!   [vellumLen: u32 LE]
-//!   [vellum FST data]  — maps synonym term → group ID
+//!   [fstLen: u32 LE]
+//!   [FST data]        — maps synonym term → group ID
 //!
 //! Usage: look up a query term in the synonym FST. If found, get the
 //! group ID, then load the roaring bitmap for that group to get all
@@ -31,7 +31,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const vellum = @import("antfly_vellum");
+const fst = @import("antfly_fst");
 const roaring = @import("../encoding/roaring.zig");
 
 // ============================================================================
@@ -119,7 +119,7 @@ pub const SynonymWriter = struct {
             }
         }.lessThan);
 
-        var fst_builder = try vellum.Builder.init(self.alloc, .{});
+        var fst_builder = try fst.Builder.init(self.alloc, .{});
         defer fst_builder.deinit();
         for (sorted_terms) |term| {
             const gid = self.term_to_group.get(term).?;
@@ -146,7 +146,7 @@ pub const SynonymReader = struct {
     num_groups: u32,
     groups_data_start: usize,
     group_offsets: []usize, // start offset of each group's bitmap data
-    fst: vellum.FST,
+    fst: fst.FST,
 
     pub fn init(alloc: Allocator, data: []const u8) !SynonymReader {
         if (data.len < 4) return error.InvalidData;
@@ -166,7 +166,7 @@ pub const SynonymReader = struct {
         // Read FST
         const fst_len = std.mem.readInt(u32, data[pos..][0..4], .little);
         pos += 4;
-        const fst = try vellum.FST.load(data[pos..][0..fst_len]);
+        const dict = try fst.FST.load(data[pos..][0..fst_len]);
 
         return .{
             .alloc = alloc,
@@ -174,7 +174,7 @@ pub const SynonymReader = struct {
             .num_groups = num_groups,
             .groups_data_start = 4,
             .group_offsets = group_offsets,
-            .fst = fst,
+            .fst = dict,
         };
     }
 

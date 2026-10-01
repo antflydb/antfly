@@ -103,6 +103,7 @@ def test_last(cli_server, setup_probe):
     assert phase != "call", "injected call failure"
 """)
     env = os.environ.copy()
+    # The nested pytest run must not add its repeated probe names to a CI lane.
     env.update(
         PYTHONPATH=str(Path(e2e_conftest.__file__).parent),
         PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",
@@ -110,7 +111,11 @@ def test_last(cli_server, setup_probe):
         ANTFLY_E2E_PRESERVE_ROOT="1" if preservation == "always" else "0",
         ANTFLY_E2E_PRESERVE_ROOT_ON_FAILURE=("1" if preservation == "failure" else "0"),
     )
+    nested_duration_file = tmp_path / "nested-durations.json"
+    env["ANTFLY_E2E_DURATION_FILE"] = str(nested_duration_file)
     env.pop("PYTEST_ADDOPTS", None)
+    env.pop("ANTFLY_E2E_REPORT_DIR", None)
+    env.pop("ANTFLY_E2E_SHARD_PLAN", None)
     result = subprocess.run(
         [
             sys.executable,
@@ -132,6 +137,7 @@ def test_last(cli_server, setup_probe):
         timeout=30,
     )
     output = result.stdout + result.stderr
+    assert not nested_duration_file.exists(), output
     assert "INTERNALERROR" not in output, output
     assert result.returncode == (0 if failure_phase == "none" else 1), output
     if failure_phase != "none":
@@ -502,13 +508,22 @@ def _seed_cluster(monkeypatch, outcomes):
             response.headers.update(headers[0])
         return response
 
+    def get(url, **kwargs):
+        # Create admission tests start with an absent, uniquely named table.
+        response = requests.Response()
+        response.status_code = 404
+        response._content = b"table not found"
+        response.url = url
+        response.request = requests.Request("GET", url).prepare()
+        return response
+
     return (
         SimpleNamespace(
             data_api_urls=["http://localhost/db/v1"],
             assert_processes_alive=lambda: None,
             debug_logs=lambda: "cluster write diagnostics",
         ),
-        SimpleNamespace(post=post),
+        SimpleNamespace(post=post, get=get),
         calls,
     )
 
@@ -522,11 +537,20 @@ def _create_not_admitted():
 
 
 @pytest.mark.parametrize("success_status", [200, 202])
+@pytest.mark.parametrize(
+    "rejection_body",
+    [
+        _create_not_admitted()[1],
+        b"metadata cluster upgrade in progress; retry later",
+        b"metadata mutation deadline exceeded before admission; retry later",
+    ],
+)
 def test_cluster_create_retries_only_proven_non_admission(
-    monkeypatch, capsys, success_status
+    monkeypatch, capsys, success_status, rejection_body
 ):
     cluster, session, calls = _seed_cluster(
-        monkeypatch, [_create_not_admitted(), (success_status, b"{}")]
+        monkeypatch,
+        [(503, rejection_body, _create_not_admitted()[2]), (success_status, b"{}")],
     )
     definition = {"num_shards": 3, "description": "backup"}
     assert (
@@ -580,6 +604,15 @@ def test_cluster_create_retries_only_proven_non_admission(
             503,
             b'{"code":"different_error","retryable":true}',
             _create_not_admitted()[2],
+        ),
+        (503, b"metadata cluster upgrade in progress; retry later"),
+        (
+            503,
+            b"metadata cluster upgrade in progress; retry later",
+            {
+                **_create_not_admitted()[2],
+                "X-Antfly-Raft-Mutation-Outcome": "unknown-v1",
+            },
         ),
         (503, b"malformed response", _create_not_admitted()[2]),
         (500, b"internal failure"),
@@ -658,13 +691,25 @@ def test_cluster_seed_waits_for_precommit_write_admission(monkeypatch):
 def test_cluster_seed_preserves_non_admission_failures(monkeypatch, outcome):
     cluster, session, calls = _seed_cluster(monkeypatch, [outcome])
     with pytest.raises(AssertionError, match="cluster write diagnostics") as failure:
-        backups._seed_cluster_docs_when_writable(cluster, session, "docs", {})
+        backups._seed_cluster_docs_when_writable(
+            cluster, session, "docs", {"doc:a": {"title": "a"}}
+        )
     if isinstance(outcome, Exception):
-        assert failure.value.__cause__ is outcome
+        # The mutation helper deliberately shields transport failures from the
+        # read-polling retry policy, while retaining the original exception.
+        assert isinstance(failure.value.__cause__, AssertionError)
+        assert failure.value.__cause__.__cause__ is outcome
     else:
         assert f"last_status={outcome[0]}" in str(failure.value)
         assert outcome[1].decode() in str(failure.value)
     assert len(calls) == 1
+
+
+def test_cluster_seed_rejects_empty_expectations_without_sending(monkeypatch):
+    cluster, session, calls = _seed_cluster(monkeypatch, [])
+    with pytest.raises(AssertionError, match="expected a nonempty batch"):
+        backups._seed_cluster_docs_when_writable(cluster, session, "docs", {})
+    assert calls == []
 
 
 def test_cluster_seed_deadline_retains_cluster_diagnostics(monkeypatch):
@@ -673,7 +718,7 @@ def test_cluster_seed_deadline_retains_cluster_diagnostics(monkeypatch):
     )
     with pytest.raises(AssertionError, match="cluster write diagnostics"):
         backups._seed_cluster_docs_when_writable(
-            cluster, session, "docs", {}, timeout_s=0.25
+            cluster, session, "docs", {"doc:a": {"title": "a"}}, timeout_s=0.25
         )
     assert len(calls) == 3
     assert calls[-1]["timeout"] < calls[0]["timeout"]
@@ -688,7 +733,9 @@ def test_cluster_seed_stops_when_server_exits(monkeypatch):
 
     cluster.assert_processes_alive = assert_alive
     with pytest.raises(RuntimeError, match="data server exited"):
-        backups._seed_cluster_docs_when_writable(cluster, session, "docs", {})
+        backups._seed_cluster_docs_when_writable(
+            cluster, session, "docs", {"doc:a": {"title": "a"}}
+        )
     assert len(calls) == 1
 
 
@@ -724,3 +771,255 @@ def test_wait_until_preserves_nonretryable_service_unavailable():
         helpers.wait_until(probe, timeout_s=1.0)
 
     assert raised.value is expected
+
+
+@pytest.mark.parametrize("visible", [True, False])
+def test_cluster_seed_observes_uncertain_commit_without_replaying(monkeypatch, visible):
+    cluster, session, calls = _seed_cluster(
+        monkeypatch,
+        [(409, b'{"code":"transaction_outcome_unknown","retryable":false}')],
+    )
+    docs = {"a": {"title": "a"}, "b": {"title": "b"}}
+    reads = []
+
+    def lookup(_session, _url, _table, key, **_kwargs):
+        reads.append(key)
+        return docs[key] if visible or key == "a" else {"title": "wrong"}
+
+    monkeypatch.setattr(backups, "_lookup_doc_from_url", lookup)
+    if visible:
+        assert (
+            backups._seed_cluster_docs_when_writable(
+                cluster, session, "docs", docs, timeout_s=0.25
+            )
+            is None
+        )
+        assert reads == ["a", "b"]
+    else:
+        with pytest.raises(
+            AssertionError, match="did not expose every expected document mutation"
+        ):
+            backups._seed_cluster_docs_when_writable(
+                cluster, session, "docs", docs, timeout_s=0.25
+            )
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("absent", [True, False])
+def test_cluster_delete_observes_uncertain_commit_without_replaying(
+    monkeypatch, absent
+):
+    cluster, session, calls = _seed_cluster(
+        monkeypatch,
+        [
+            (
+                409,
+                b"table mutation outcome is unknown; observe table state before retrying",
+                {"X-Antfly-Raft-Mutation-Outcome": "unknown-v1"},
+            )
+        ],
+    )
+    session.delete = session.post
+    observations = []
+
+    def check(table, table_id, group_ids):
+        observations.append((table, table_id, group_ids))
+        return absent
+
+    cluster.table_absent_on_all_metadata_nodes = check
+    if absent:
+        backups._delete_cluster_table_and_observe(
+            cluster, session, "docs", 7, {71, 72, 73}, timeout_s=0.5
+        )
+    else:
+        with pytest.raises(AssertionError, match="table remained in metadata"):
+            backups._delete_cluster_table_and_observe(
+                cluster, session, "docs", 7, {71, 72, 73}, timeout_s=0.5
+            )
+    assert observations
+    assert all(item == ("docs", 7, {71, 72, 73}) for item in observations)
+    assert len(calls) == 1
+
+
+def test_cluster_delete_rejects_unknown_without_outcome_contract(monkeypatch):
+    cluster, session, calls = _seed_cluster(
+        monkeypatch,
+        [
+            (
+                409,
+                b"table mutation outcome is unknown; observe table state before retrying",
+            )
+        ],
+    )
+    session.delete = session.post
+    with pytest.raises(AssertionError, match="delete="):
+        backups._delete_cluster_table_and_observe(cluster, session, "docs", 7, {71})
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "status,body",
+    [
+        (204, b""),
+        (202, b'{"status":"committed_visibility_pending"}'),
+        (202, b'{"status":"committed_repair_required"}'),
+        (202, b'{"status":"committed_repair_unavailable"}'),
+    ],
+)
+def test_cluster_delete_waits_for_visibility_after_committed_response(
+    monkeypatch, status, body
+):
+    cluster, session, calls = _seed_cluster(monkeypatch, [(status, body)])
+    session.delete = session.post
+    observations = iter([False, True])
+    cluster.table_absent_on_all_metadata_nodes = lambda *_args: next(observations)
+    backups._delete_cluster_table_and_observe(
+        cluster, session, "docs", 7, {71}, timeout_s=1.0
+    )
+    assert len(calls) == 1
+
+
+def _replicated_cluster_snapshot(table_id=7, groups=(71, 72, 73)):
+    return {
+        "tables": [{"table_id": table_id, "name": "docs"}],
+        "ranges": [{"table_id": table_id, "group_id": group} for group in groups],
+        "placement_intents": [
+            {"record": {"group_id": group, "local_node_id": node}}
+            for group in groups
+            for node in (4, 5, 6)
+        ],
+        "merged_group_statuses": [
+            {
+                "group_id": group,
+                "leader_known": True,
+                "voter_count_known": True,
+                "voter_count": 3,
+                "healthy_voter_reports": 3,
+            }
+            for group in groups
+        ],
+    }
+
+
+def test_cluster_replication_returns_topology_without_a_second_probe():
+    observations = iter(
+        [[_replicated_cluster_snapshot() for _ in range(3)], [None] * 3]
+    )
+    cluster = SimpleNamespace(
+        assert_processes_alive=lambda: None,
+        metadata_snapshots=lambda: next(observations),
+    )
+    topology = backups.ThreeByThreeBackupCluster.fully_replicated_topology(
+        cluster, "docs"
+    )
+    assert topology == (7, {71, 72, 73})
+    # A later transient probe failure cannot invalidate the completed observation.
+    assert (
+        backups.ThreeByThreeBackupCluster.fully_replicated_topology(cluster, "docs")
+        is None
+    )
+    assert topology == (7, {71, 72, 73})
+
+
+@pytest.mark.parametrize(
+    "defect", ["table_identity", "group_identity", "placement", "health", "missing"]
+)
+def test_cluster_replication_requires_matching_ready_topology_on_every_node(defect):
+    snapshots = [_replicated_cluster_snapshot() for _ in range(3)]
+    if defect == "table_identity":
+        snapshots[2] = _replicated_cluster_snapshot(table_id=8)
+    elif defect == "group_identity":
+        snapshots[2] = _replicated_cluster_snapshot(groups=(81, 82, 83))
+    elif defect == "placement":
+        snapshots[2]["placement_intents"].pop()
+    elif defect == "health":
+        snapshots[2]["merged_group_statuses"][0]["healthy_voter_reports"] = 2
+    else:
+        snapshots[2] = None
+    cluster = SimpleNamespace(
+        assert_processes_alive=lambda: None, metadata_snapshots=lambda: snapshots
+    )
+    assert (
+        backups.ThreeByThreeBackupCluster.fully_replicated_topology(cluster, "docs")
+        is None
+    )
+
+
+def test_startup_rejects_foreign_response_when_own_process_exits(monkeypatch):
+    class Process:
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+    process = Process()
+
+    def foreign_response(*args, **kwargs):
+        process.returncode = 1  # Our bind failed while another server answered.
+        return SimpleNamespace(ok=True, status_code=200)
+
+    monkeypatch.setattr(e2e_conftest.requests, "get", foreign_response)
+    assert not e2e_conftest.wait_for_server(
+        "http://127.0.0.1:12345", processes=[("server", process)], timeout=1
+    )
+
+
+def test_startup_requires_own_listener_acknowledgement(monkeypatch):
+    calls = []
+    bound = False
+
+    def response(*args, **kwargs):
+        calls.append(True)
+        return SimpleNamespace(ok=True, status_code=200)
+
+    monkeypatch.setattr(e2e_conftest.requests, "get", response)
+    assert not e2e_conftest.wait_for_server(
+        "http://127.0.0.1:12345", timeout=0.01, listener_ready=lambda: bound
+    )
+    assert not calls  # Never send test traffic to an unacknowledged listener.
+    bound = True
+    assert e2e_conftest.wait_for_server(
+        "http://127.0.0.1:12345", timeout=1, listener_ready=lambda: bound
+    )
+    assert len(calls) == 2
+
+
+def test_listener_startup_proof_excludes_previous_process_log(tmp_path):
+    path = tmp_path / "server.log"
+    message = "standalone public api listening on http://127.0.0.1:12345"
+    path.write_text(message + "\n")
+    offset = path.stat().st_size
+    assert not e2e_conftest._log_contains_since(path, offset, message)
+    with path.open("a") as log:
+        log.write("new process starting\n" + message + "\n")
+    assert e2e_conftest._log_contains_since(path, offset, message)
+
+
+def test_scaling_readiness_rejects_process_exit_during_second_foreign_reply(
+    monkeypatch,
+):
+    import test_scaling
+
+    replies = [0]
+
+    class Process:
+        returncode = 1
+
+        def poll(self):
+            return 1 if replies[0] >= 2 else None
+
+    def get(*args, **kwargs):
+        replies[0] += 1
+        return SimpleNamespace(ok=True)
+
+    cluster = object.__new__(test_scaling.MultiNodeScalingCluster)
+    cluster.data_proc_by_node_id = {101: Process()}
+    cluster.startup_timeout = lambda value: value
+    cluster.data_api_url_for_node = lambda node: "http://foreign/db/v1"
+    cluster.debug_logs = lambda: "owned child lost the listener"
+    monkeypatch.setattr(test_scaling.requests, "get", get)
+    with pytest.raises(RuntimeError, match="exited before becoming ready"):
+        cluster._wait_for_data_nodes_http(
+            [{"id": 101}], public_api=True, max_timeout_s=2, label="Data API"
+        )
+    assert replies[0] == 2

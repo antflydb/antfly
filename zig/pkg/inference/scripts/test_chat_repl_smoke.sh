@@ -68,7 +68,7 @@ grep -qi 'Seine' "$LOG_FILE" || fail "second turn did not answer Seine from cont
 [[ "$(grep -c 'tok/s' "$LOG_FILE")" -ge 2 ]] || fail "expected a stats footer for both turns"
 
 # KV prefix reuse is opt-in until the cache attach path is fixed (see
-# GEMMA4.md "Chat REPL"); exercise it only when explicitly requested.
+# models/gemma4/GEMMA4.md "Chat REPL"); exercise it only when explicitly requested.
 if [[ "${ANTFLY_INFERENCE_CHAT_SMOKE_PROMPT_CACHE:-0}" == "1" ]]; then
   printf 'What is the capital of France? Answer briefly, then name one famous museum there.\nWhich river runs through that city?\n/bye\n' |
     "$ANTFLY_BIN" chat "$MODEL_DIR" \

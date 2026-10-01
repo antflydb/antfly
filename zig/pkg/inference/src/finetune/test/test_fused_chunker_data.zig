@@ -13,5 +13,5 @@
 // limitations under the License.
 
 test {
-    _ = @import("inference_finetune_data").fused_chunker_data;
+    _ = @import("inference_internal").finetune.fused_chunker_data;
 }

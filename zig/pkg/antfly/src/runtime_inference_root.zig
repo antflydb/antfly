@@ -124,6 +124,19 @@ fn standaloneInferenceRequestAdmissionStats(
     out.* = standalone_inference_host.linkedInferenceRequestAdmissionStats(handle);
 }
 
+fn standaloneInferencePullModel(context: *const standalone_inference_bridge.PullModelContext) callconv(.c) standalone_inference_bridge.Status {
+    if (!standalone_inference_bridge.validContext(
+        standalone_inference_bridge.PullModelContext,
+        context.abi_version,
+        context.struct_size,
+    ))
+        return standalone_inference_bridge.statusFromError(error.UnsupportedVersion);
+    standalone_inference_host.linkedInferencePullModel(context) catch |err| {
+        return standalone_inference_bridge.statusFromError(err);
+    };
+    return .ok;
+}
+
 fn standaloneInferenceDestroy(handle: *anyopaque) callconv(.c) void {
     standalone_inference_host.linkedInferenceDestroy(handle);
 }
@@ -134,7 +147,8 @@ const standalone_inference_function_table: standalone_inference_bridge.FunctionT
     .capabilities = standalone_inference_bridge.Capability.provider |
         standalone_inference_bridge.Capability.route_manifest |
         standalone_inference_bridge.Capability.resource_budget |
-        standalone_inference_bridge.Capability.request_admission,
+        standalone_inference_bridge.Capability.request_admission |
+        standalone_inference_bridge.Capability.model_pull,
     .create = &standaloneInferenceCreate,
     .configure = &standaloneInferenceConfigure,
     .invoke_provider = &standaloneInferenceInvokeProvider,
@@ -146,6 +160,7 @@ const standalone_inference_function_table: standalone_inference_bridge.FunctionT
     .release_request = &standaloneInferenceReleaseRequest,
     .request_admission_stats = &standaloneInferenceRequestAdmissionStats,
     .destroy = &standaloneInferenceDestroy,
+    .pull_model = &standaloneInferencePullModel,
 };
 
 fn standaloneInferenceGetFunctionTable() callconv(.c) *const standalone_inference_bridge.FunctionTable {

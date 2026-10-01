@@ -1,0 +1,262 @@
+{
+  "version": 1,
+  "scope": "gliner25_trained_artifact_inputs/v1",
+  "source_commit": "3c913c7369301133d3b7699252074c4303ada50e",
+  "requests": {
+    "size_bytes": 3467,
+    "sha256": "030c979419cee5fd209ba6a6f23f2e0cc7744e396d4bf3357925651293f5fe5f"
+  },
+  "offset_unit": "unicode_codepoints",
+  "word_splitter": "whitespace",
+  "threshold": 0.5,
+  "cases": [
+    {
+      "id": "mixed_tasks",
+      "kind": "extract",
+      "text": "John works at Apple. Alice works at Google.",
+      "schema": {
+        "entities": [
+          "person",
+          "organization"
+        ],
+        "classifications": [
+          {
+            "name": "sentiment",
+            "labels": [
+              "positive",
+              "negative"
+            ]
+          }
+        ],
+        "relations": [
+          {
+            "type": "works_for"
+          }
+        ]
+      }
+    },
+    {
+      "id": "unicode_offsets",
+      "kind": "extract",
+      "text": "İpek works at Apple in 東京. 🙂 Alice visits café é.",
+      "schema": {
+        "entities": [
+          "person",
+          "location"
+        ],
+        "entity_definitions": {
+          "person": {
+            "description": "A named person"
+          },
+          "location": {
+            "description": "A named place"
+          }
+        }
+      }
+    },
+    {
+      "id": "entity_attributes",
+      "kind": "extract",
+      "text": "The iPhone camera is good. The battery is bad.",
+      "schema": {
+        "entities": [
+          "product"
+        ],
+        "entity_attributes": {
+          "sentiment": {
+            "labels": [
+              "positive",
+              "negative",
+              "neutral"
+            ],
+            "applies_to": [
+              "product"
+            ],
+            "qualify_labels": true
+          },
+          "condition": {
+            "labels": [
+              "working",
+              "broken"
+            ],
+            "multi_label": true,
+            "threshold": 0.5,
+            "qualify_labels": true
+          }
+        }
+      }
+    },
+    {
+      "id": "legacy_structure",
+      "kind": "extract",
+      "text": "John works at Apple. Alice works at Google.",
+      "schema": {
+        "structures": {
+          "employment": {
+            "fields": {
+              "person": {
+                "type": "str"
+              },
+              "organization": {
+                "type": "list"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "record_natural",
+      "kind": "extract",
+      "text": "John works at Apple. Alice works at Google.",
+      "schema": {
+        "structures": {
+          "employment": {
+            "mode": "natural",
+            "anchor": "person",
+            "occurrence_policy": "latent_all",
+            "fields": {
+              "person": {
+                "type": "str",
+                "cardinality": "required_one"
+              },
+              "organization": {
+                "type": "str",
+                "exclusive": true
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "record_latent",
+      "kind": "extract",
+      "text": "John works at Apple. Alice works at Google.",
+      "schema": {
+        "structures": {
+          "employment": {
+            "mode": "latent",
+            "fields": {
+              "person": {
+                "type": "str"
+              },
+              "organization": {
+                "type": "str"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "record_anchorless",
+      "kind": "extract",
+      "text": "John works at Apple. Alice works at Google.",
+      "schema": {
+        "structures": {
+          "employment": {
+            "mode": "anchorless",
+            "fields": {
+              "person": {
+                "type": "str"
+              },
+              "organization": {
+                "type": "str"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "enum_field",
+      "kind": "extract",
+      "text": "The iPhone camera is good.",
+      "schema": {
+        "structures": {
+          "review": {
+            "fields": {
+              "product": {
+                "type": "str"
+              },
+              "sentiment": {
+                "type": "str",
+                "choices": [
+                  "positive",
+                  "negative"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "constrained_classification",
+      "kind": "classification",
+      "text": "Delete the temporary file.",
+      "schema": {
+        "classifications": [
+          {
+            "name": "intent",
+            "labels": [
+              "read",
+              "delete"
+            ],
+            "min_labels": 1,
+            "max_labels": 1
+          },
+          {
+            "name": "effects",
+            "labels": [
+              "read_only",
+              "delete"
+            ],
+            "min_labels": 1,
+            "max_labels": 1
+          }
+        ],
+        "classification_constraints": [
+          {
+            "type": "Implies",
+            "cond": {
+              "type": "LabelRef",
+              "task": "intent",
+              "label": "delete"
+            },
+            "then": {
+              "type": "LabelRef",
+              "task": "effects",
+              "label": "delete"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "joint_ie",
+      "kind": "joint_ie",
+      "text": "John works at Apple. Alice works at Google.",
+      "schema": {
+        "joint_ie": {
+          "entities": {
+            "person": {},
+            "organization": {}
+          },
+          "relations": {
+            "works_for": {
+              "head": [
+                "person"
+              ],
+              "tail": [
+                "organization"
+              ],
+              "max_per_head": 1
+            }
+          }
+        }
+      }
+    }
+  ]
+}

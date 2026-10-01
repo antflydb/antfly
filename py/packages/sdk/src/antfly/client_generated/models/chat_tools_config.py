@@ -10,8 +10,14 @@ from ..models.chat_tool_name import ChatToolName
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.brave_search_config import BraveSearchConfig
+    from ..models.exa_search_config import ExaSearchConfig
     from ..models.fetch_config import FetchConfig
-    from ..models.web_search_config import WebSearchConfig
+    from ..models.linkup_search_config import LinkupSearchConfig
+    from ..models.serper_search_config import SerperSearchConfig
+    from ..models.tavily_search_config import TavilySearchConfig
+    from ..models.vertex_search_config import VertexSearchConfig
+    from ..models.you_search_config import YouSearchConfig
 
 
 T = TypeVar("T", bound="ChatToolsConfig")
@@ -33,19 +39,9 @@ class ChatToolsConfig:
                 retrieval
                 tools available for the request.
                  Example: ['add_filter', 'semantic_search', 'web_search'].
-            web_search_config (WebSearchConfig | Unset): A unified configuration for web search providers.
-
-                Each provider has specific configuration requirements. Use the appropriate
-                provider-specific config or set common options at the top level.
-
-                **Environment Variables (fallbacks):**
-                - EXA_API_KEY
-                - SERPER_API_KEY
-                - TAVILY_API_KEY
-                - BRAVE_API_KEY
-                - YOU_API_KEY
-                - LINKUP_API_KEY
-                - GOOGLE_APPLICATION_CREDENTIALS, GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION
+            web_search_config (BraveSearchConfig | ExaSearchConfig | LinkupSearchConfig | SerperSearchConfig |
+                TavilySearchConfig | Unset | VertexSearchConfig | YouSearchConfig): Provider-specific inline web search
+                configuration.
             web_search_connection (str | Unset): Name of a configured connections.<id> resource with kind web_search.
                 Request-level tool options may reduce scope, but cannot expand the
                 connection's configured capabilities or policy.
@@ -70,13 +66,29 @@ class ChatToolsConfig:
     """
 
     enabled_tools: list[ChatToolName] | Unset = UNSET
-    web_search_config: WebSearchConfig | Unset = UNSET
+    web_search_config: (
+        BraveSearchConfig
+        | ExaSearchConfig
+        | LinkupSearchConfig
+        | SerperSearchConfig
+        | TavilySearchConfig
+        | Unset
+        | VertexSearchConfig
+        | YouSearchConfig
+    ) = UNSET
     web_search_connection: str | Unset = UNSET
     fetch_config: FetchConfig | Unset = UNSET
     max_tool_iterations: int | Unset = 5
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.brave_search_config import BraveSearchConfig
+        from ..models.exa_search_config import ExaSearchConfig
+        from ..models.linkup_search_config import LinkupSearchConfig
+        from ..models.serper_search_config import SerperSearchConfig
+        from ..models.tavily_search_config import TavilySearchConfig
+        from ..models.you_search_config import YouSearchConfig
+
         enabled_tools: list[str] | Unset = UNSET
         if not isinstance(self.enabled_tools, Unset):
             enabled_tools = []
@@ -84,8 +96,22 @@ class ChatToolsConfig:
                 enabled_tools_item = enabled_tools_item_data.value
                 enabled_tools.append(enabled_tools_item)
 
-        web_search_config: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.web_search_config, Unset):
+        web_search_config: dict[str, Any] | Unset
+        if isinstance(self.web_search_config, Unset):
+            web_search_config = UNSET
+        elif isinstance(self.web_search_config, ExaSearchConfig):
+            web_search_config = self.web_search_config.to_dict()
+        elif isinstance(self.web_search_config, SerperSearchConfig):
+            web_search_config = self.web_search_config.to_dict()
+        elif isinstance(self.web_search_config, TavilySearchConfig):
+            web_search_config = self.web_search_config.to_dict()
+        elif isinstance(self.web_search_config, BraveSearchConfig):
+            web_search_config = self.web_search_config.to_dict()
+        elif isinstance(self.web_search_config, YouSearchConfig):
+            web_search_config = self.web_search_config.to_dict()
+        elif isinstance(self.web_search_config, LinkupSearchConfig):
+            web_search_config = self.web_search_config.to_dict()
+        else:
             web_search_config = self.web_search_config.to_dict()
 
         web_search_connection = self.web_search_connection
@@ -114,8 +140,14 @@ class ChatToolsConfig:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.brave_search_config import BraveSearchConfig
+        from ..models.exa_search_config import ExaSearchConfig
         from ..models.fetch_config import FetchConfig
-        from ..models.web_search_config import WebSearchConfig
+        from ..models.linkup_search_config import LinkupSearchConfig
+        from ..models.serper_search_config import SerperSearchConfig
+        from ..models.tavily_search_config import TavilySearchConfig
+        from ..models.vertex_search_config import VertexSearchConfig
+        from ..models.you_search_config import YouSearchConfig
 
         d = dict(src_dict)
         _enabled_tools = d.pop("enabled_tools", UNSET)
@@ -127,12 +159,75 @@ class ChatToolsConfig:
 
                 enabled_tools.append(enabled_tools_item)
 
-        _web_search_config = d.pop("web_search_config", UNSET)
-        web_search_config: WebSearchConfig | Unset
-        if isinstance(_web_search_config, Unset):
-            web_search_config = UNSET
-        else:
-            web_search_config = WebSearchConfig.from_dict(_web_search_config)
+        def _parse_web_search_config(
+            data: object,
+        ) -> (
+            BraveSearchConfig
+            | ExaSearchConfig
+            | LinkupSearchConfig
+            | SerperSearchConfig
+            | TavilySearchConfig
+            | Unset
+            | VertexSearchConfig
+            | YouSearchConfig
+        ):
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_web_search_provider_config_type_0 = ExaSearchConfig.from_dict(data)
+
+                return componentsschemas_web_search_provider_config_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_web_search_provider_config_type_1 = SerperSearchConfig.from_dict(data)
+
+                return componentsschemas_web_search_provider_config_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_web_search_provider_config_type_2 = TavilySearchConfig.from_dict(data)
+
+                return componentsschemas_web_search_provider_config_type_2
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_web_search_provider_config_type_3 = BraveSearchConfig.from_dict(data)
+
+                return componentsschemas_web_search_provider_config_type_3
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_web_search_provider_config_type_4 = YouSearchConfig.from_dict(data)
+
+                return componentsschemas_web_search_provider_config_type_4
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_web_search_provider_config_type_5 = LinkupSearchConfig.from_dict(data)
+
+                return componentsschemas_web_search_provider_config_type_5
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            if not isinstance(data, dict):
+                raise TypeError()
+            componentsschemas_web_search_provider_config_type_6 = VertexSearchConfig.from_dict(data)
+
+            return componentsschemas_web_search_provider_config_type_6
+
+        web_search_config = _parse_web_search_config(d.pop("web_search_config", UNSET))
 
         web_search_connection = d.pop("web_search_connection", UNSET)
 

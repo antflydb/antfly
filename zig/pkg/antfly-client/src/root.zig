@@ -29,6 +29,62 @@ test "antfly client pkg compiles" {
     _ = @import("client.zig");
 }
 
+test "SQL client preserves typed parameters receipts and forbids replay" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const Assert = struct {
+        fn request(info: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer secret", info.header("Authorization").?);
+            var body = try std.json.parseFromSlice(types.SQLRequest, std.testing.allocator, info.body, .{ .parse_numbers = false });
+            defer body.deinit();
+            try std.testing.expectEqualStrings("SELECT id FROM things WHERE id=$1", body.value.statement);
+            try std.testing.expectEqualStrings("9007199254740993", body.value.parameters.?[0].number_string);
+            try std.testing.expectEqualStrings("explicit", body.value.database.?);
+            try std.testing.expectEqualStrings("app", body.value.namespace.?);
+        }
+    };
+    const cases = [_]struct { status: u16, body: []const u8, malformed: bool = false }{
+        .{ .status = 200, .body = "{\"columns\":[{\"name\":\"id\",\"type\":\"integer\"}],\"rows\":[[\"9007199254740993\"]],\"rows_affected\":0,\"command_tag\":\"SELECT\"}" },
+        .{ .status = 503, .body = "{\"code\":\"40003\",\"message\":\"unknown commit\",\"transaction_id\":\"0123456789abcdef0123456789abcdef\",\"retryable\":false}" },
+        .{ .status = 200, .body = "{\"columns\":[],\"rows\":[[1]],\"rows_affected\":0,\"command_tag\":\"SELECT\"}", .malformed = true },
+    };
+    for (cases) |case| for ([_]bool{ false, true }) |generated| {
+        // The generated type decoder intentionally leaves ordinal semantic
+        // validation to the convenience method, but replay policy is shared.
+        if (generated and case.malformed) continue;
+        var server = try httpx.TestServer.start(alloc, io, &.{.{ .method = .POST, .path = "/db/v1/sql", .respond = .{ .status = case.status, .body = case.body }, .assert_request = Assert.request }});
+        defer server.deinit();
+        var serving = try io.concurrent(httpx.TestServer.handleOne, .{&server});
+        defer serving.cancel(io) catch {};
+        var http = httpx.Client.initWithConfig(alloc, io, .{
+            .retry_policy = .{ .retry_only_idempotent = false, .max_retries = 3, .initial_delay_ms = 0 },
+            .timeouts = .{ .request_ms = 1000 },
+        });
+        defer http.deinit();
+        var client = try AntflyClient.init(alloc, &http, server.baseUrl());
+        defer client.deinit();
+        try client.setBearer("secret");
+        client.catalog_scope = .{ .database = "fallback", .namespace = "app" };
+        const request: types.SQLRequest = .{ .statement = "SELECT id FROM things WHERE id=$1", .parameters = &.{.{ .number_string = "9007199254740993" }}, .database = "explicit" };
+        if (case.malformed) {
+            try std.testing.expectError(error.InvalidApiResponse, client.executeSQL(request));
+        } else {
+            var raw_request = request;
+            raw_request.namespace = "app";
+            var response = try if (generated) client.inner.executeSQL(raw_request) else client.executeSQL(request);
+            defer response.deinit();
+            try std.testing.expectEqual(case.status, response.status_code);
+            if (case.status == 200) {
+                try std.testing.expectEqualStrings("9007199254740993", response.data.?.value.rows[0][0].string);
+            } else {
+                try std.testing.expectEqualStrings(case.body, response.err_body.?);
+            }
+        }
+        try serving.await(io);
+        try std.testing.expectEqual(@as(usize, 1), server.route_hits[0]);
+    };
+}
+
 test "get index response timeout bounds the complete HTTP request" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -98,6 +154,36 @@ test "get index response timeout bounds the complete HTTP request" {
     try std.testing.expect(timed_out.load(.acquire));
     try std.testing.expect(!unexpected.load(.acquire));
     try std.testing.expect(!succeeded.load(.acquire));
+}
+
+test "SQL prepared client forbids replay and preserves exact owner identity" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const id = "0123456789abcdef0123456789abcdef";
+    inline for (.{ "prepare", "execute", "close" }) |operation| {
+        const path = if (comptime std.mem.eql(u8, operation, "prepare")) "/db/v1/sql/prepared" else if (comptime std.mem.eql(u8, operation, "execute")) "/db/v1/sql/prepared/" ++ id ++ "/execute" else "/db/v1/sql/prepared/" ++ id;
+        const method: httpx.Method = if (comptime std.mem.eql(u8, operation, "close")) .DELETE else .POST;
+        for ([_]u16{ 200, 503 }) |status| {
+            const success = if (comptime std.mem.eql(u8, operation, "prepare")) "{\"prepared_id\":\"" ++ id ++ "\",\"owner_node_id\":\"9007199254740993\",\"expires_at_ms\":123,\"columns\":[],\"parameter_types\":[]}" else if (comptime std.mem.eql(u8, operation, "execute")) "{\"columns\":[],\"rows\":[],\"rows_affected\":0,\"command_tag\":\"SELECT 0\"}" else "{}";
+            const body = if (status == 200) success else "{\"code\":\"40003\",\"message\":\"do not replay\",\"retryable\":false}";
+            var server = try httpx.TestServer.start(alloc, io, &.{.{ .method = method, .path = path, .respond = .{ .status = status, .body = body } }});
+            defer server.deinit();
+            var serving = try io.concurrent(httpx.TestServer.handleOne, .{&server});
+            defer serving.cancel(io) catch {};
+            var http = httpx.Client.initWithConfig(alloc, io, .{ .retry_policy = .{ .retry_only_idempotent = false, .max_retries = 3, .initial_delay_ms = 0 }, .timeouts = .{ .request_ms = 1000 } });
+            defer http.deinit();
+            var client = try AntflyClient.init(alloc, &http, server.baseUrl());
+            defer client.deinit();
+            var response = try if (comptime std.mem.eql(u8, operation, "prepare")) client.prepareSQL(.{ .statement = "SELECT 1" }) else if (comptime std.mem.eql(u8, operation, "execute")) client.executePreparedSQL(id, .{}) else client.closePreparedSQL(id);
+            defer response.deinit();
+            try std.testing.expectEqual(status, response.status_code);
+            if (comptime std.mem.eql(u8, operation, "prepare")) {
+                if (status == 200) try std.testing.expectEqualStrings("9007199254740993", response.data.?.value.owner_node_id);
+            }
+            try serving.await(io);
+            try std.testing.expectEqual(@as(usize, 1), server.route_hits[0]);
+        }
+    }
 }
 
 test "list indexes response timeout bounds readiness preflight" {

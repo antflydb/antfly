@@ -1,0 +1,35 @@
+{
+  "openapi": "3.0.3",
+  "info": {"title": "Status-aware responses", "version": "1"},
+  "paths": {
+    "/schema": {"patch": {
+      "operationId": "patchSchema",
+      "responses": {
+        "200": {"description": "Synchronous", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Table"}}}},
+        "202": {"description": "Accepted", "content": {"application/json": {"schema": {"oneOf": [
+          {"$ref": "#/components/schemas/RestoreJob"}, {"$ref": "#/components/schemas/CommittedMutationOutcome"}
+        ]}}}},
+        "204": {"description": "No content"}
+      }
+    }},
+    "/wildcard": {"get": {
+      "operationId": "wildcard",
+      "responses": {
+        "200": {"description": "Table", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Table"}}}},
+        "2XX": {"description": "Job", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RestoreJob"}}}}
+      }
+    }},
+    "/same": {"get": {"operationId": "same", "responses": {
+      "200": {"description": "Table", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Table"}}}},
+      "202": {"description": "Same table accepted", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Table"}}}}
+    }}},
+    "/single": {"get": {"operationId": "single", "responses": {
+      "200": {"description": "Table", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Table"}}}}
+    }}}
+  },
+  "components": {"schemas": {
+    "Table": {"type": "object", "required": ["name"], "properties": {"name": {"type": "string"}}},
+    "RestoreJob": {"type": "object", "required": ["job_id"], "properties": {"job_id": {"type": "string"}}},
+    "CommittedMutationOutcome": {"type": "object", "required": ["commit_id"], "properties": {"commit_id": {"type": "string"}}}
+  }}
+}

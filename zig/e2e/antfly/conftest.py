@@ -48,10 +48,11 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Literal
 from urllib.parse import quote, unquote, urlparse
 
 import pytest
@@ -116,7 +117,35 @@ def finish_create_table(api, table_name: str, response, *, timeout_s: float = 30
     )
 
 
+def annotate_metadata_table_names(
+    snapshot: dict[str, Any], public_api_urls: list[str], *, timeout_s: float = 1.0
+) -> dict[str, Any]:
+    """Join public labels to physical metadata by immutable ID for diagnostics.
+
+    Keep ``name`` untouched: internal mutation routes must use storage names.
+    Polling callers retry if public catalog visibility is temporarily behind.
+    """
+    if not any(
+        str(table.get("name", "")).startswith("table:")
+        for table in snapshot.get("tables", [])
+    ):
+        return snapshot
+    for base in public_api_urls:
+        try:
+            response = requests.get(base.rstrip("/") + "/tables", timeout=timeout_s)
+            response.raise_for_status()
+            names = {int(table["table_id"]): table["name"] for table in response.json()}
+            for table in snapshot.get("tables", []):
+                if int(table.get("table_id", 0)) in names:
+                    table["logical_name"] = names[int(table["table_id"])]
+            return snapshot
+        except (requests.RequestException, ValueError, KeyError, TypeError):
+            continue
+    return snapshot
+
+
 E2E_BACKUP_CONNECTION = "e2e-backups"
+AUTH_BOOTSTRAP_PASSWORD = "e2e-bootstrap-password"
 ANTFLY_PUBLIC_API_ROOT = "/db/v1"
 ANTFLY_INTERNAL_API_ROOT = "/internal/v1"
 INFERENCE_PUBLIC_API_ROOT = "/ai/v1"
@@ -139,6 +168,11 @@ os.environ.setdefault(
     "antfly-e2e-dedicated-internal-service-secret-v1",
 )
 os.environ.setdefault("ANTFLY_INTERNAL_SERVICE_ISSUER", "antfly-e2e")
+os.environ.setdefault(
+    "ANTFLY_SETTING_AUTHORITY_SECRET",
+    "antfly-e2e-setting-authority-secret-v1",
+)
+os.environ.setdefault("ANTFLY_SETTING_AUTHORITY_ISSUER", "antfly-e2e")
 
 
 def internal_service_headers() -> dict[str, str]:
@@ -295,15 +329,21 @@ def wait_for_server(
     *,
     allow_unauthorized: bool = False,
     processes: list[tuple[str, subprocess.Popen[Any]]] | None = None,
+    listener_ready: Callable[[], bool] | None = None,
 ) -> bool:
     deadline = time.monotonic() + timeout
     consecutive_successes = 0
     while time.monotonic() < deadline:
         if _dead_process_statuses(processes):
             return False
+        if listener_ready is not None and not listener_ready():
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+            continue
         try:
             request_timeout = max(0.1, min(2.0, deadline - time.monotonic()))
             resp = requests.get(f"{url}{path}", timeout=request_timeout)
+            if _dead_process_statuses(processes):
+                return False
             if resp.ok:
                 consecutive_successes += 1
                 if consecutive_successes >= 2:
@@ -667,7 +707,11 @@ def ready_serverless_build_status(status: dict[str, Any]) -> dict[str, Any] | No
 
 
 def _wait_for_restore_job(
-    get_job: Callable[[str], Any], accepted: dict[str, Any], *, timeout_s: float = 120.0
+    get_job: Callable[[str], Any],
+    accepted: dict[str, Any],
+    *,
+    timeout_s: float = 120.0,
+    debug_logs: Callable[[], str] | None = None,
 ) -> dict[str, Any]:
     job_id = accepted.get("job_id")
     if not isinstance(job_id, str) or not job_id:
@@ -683,11 +727,13 @@ def _wait_for_restore_job(
             return result if isinstance(result, dict) else job
         if phase in {"failed", "cancelled"}:
             raise AssertionError(
-                f"restore job {job_id} ended in {phase}: {job.get('error')}"
+                f"restore job {job_id} ended in {phase}: {job.get('error')}\n"
+                f"{debug_logs() if debug_logs else ''}"
             )
         if time.monotonic() >= deadline:
             raise AssertionError(
-                f"restore job {job_id} did not complete within {timeout_s}s: {job}"
+                f"restore job {job_id} did not complete within {timeout_s}s: {job}\n"
+                f"{_bounded_failure_log_tail(debug_logs()) if debug_logs else ''}"
             )
         time.sleep(0.1)
 
@@ -776,6 +822,13 @@ def _server_processes(server_ref: Any) -> list[tuple[str, subprocess.Popen[Any]]
     return processes
 
 
+def _log_contains_since(path: Path, offset: int, message: str) -> bool:
+    """Read only this process incarnation's startup output."""
+    with path.open("rb") as log:
+        log.seek(offset)
+        return message.encode() in log.read()
+
+
 def _read_log_tail(path: Path, *, limit: int = 200000) -> str:
     if not path.exists():
         return ""
@@ -847,7 +900,7 @@ class AntflyServer:
         except BaseException:
             self.stop()
             raise
-        if not wait_for_server(self.url):
+        if not wait_for_server(self.url, processes=[("server", self.proc)]):
             self.stop()
             out = _read_log_tail(self.log_path)
             raise RuntimeError(f"Server failed to start at {self.url}\n{out}")
@@ -903,7 +956,7 @@ class PublicAntflyServer:
         except BaseException:
             self.stop()
             raise
-        if not wait_for_server(self.url):
+        if not wait_for_server(self.url, processes=[("server", self.proc)]):
             self.stop()
             out = _read_log_tail(self.log_path)
             raise RuntimeError(
@@ -941,7 +994,7 @@ class PublicAntflyServer:
                 cwd=self.root,
             ),
         )
-        if not wait_for_server(self.url):
+        if not wait_for_server(self.url, processes=[("server", self.proc)]):
             out = _read_log_tail(self.log_path)
             self.stop()
             raise RuntimeError(
@@ -1206,6 +1259,14 @@ class StatefulAntflyServer:
             (self.port, self.data_raft_port),
             lambda: subprocess.Popen(
                 data_command,
+                env=(
+                    {
+                        **os.environ,
+                        "ANTFLY_BOOTSTRAP_ADMIN_PASSWORD": AUTH_BOOTSTRAP_PASSWORD,
+                    }
+                    if self.auth_enabled
+                    else None
+                ),
                 stdout=self.data_log_file,
                 stderr=subprocess.STDOUT,
                 cwd=self.root,
@@ -1337,6 +1398,7 @@ class StandaloneAntflyServer:
     def _start_process(self, *, truncate_logs: bool) -> None:
         if truncate_logs:
             self.log_file = self.log_path.open("w")
+        log_start = self.log_path.stat().st_size
         command = _standalone_stateful_command(
             self.binary, host=self.host, port=self.port, root=self.root
         )
@@ -1349,7 +1411,15 @@ class StandaloneAntflyServer:
                 cwd=self.root,
             ),
         )
-        if not wait_for_server(self.api_url):
+        if not wait_for_server(
+            self.api_url,
+            processes=[("server", self.proc)],
+            listener_ready=lambda: _log_contains_since(
+                self.log_path,
+                log_start,
+                f"standalone public api listening on {self.url}",
+            ),
+        ):
             self.stop()
             out = _read_log_tail(self.log_path)
             raise RuntimeError(
@@ -2936,7 +3006,8 @@ def stateful_api(request: pytest.FixtureRequest):
                 raise AssertionError(
                     "artifact corruption is only available for locally managed stateful servers"
                 )
-            internal_url = f"{server.url}{antfly_internal_api_path(f'/tables/{table_name}/corrupt-embedding-artifact')}"
+            encoded_name = quote(table_name, safe="")
+            internal_url = f"{server.url}{antfly_internal_api_path(f'/tables/{encoded_name}/corrupt-embedding-artifact')}"
             try:
                 with self._request_lock:
                     self._check(
@@ -2944,6 +3015,7 @@ def stateful_api(request: pytest.FixtureRequest):
                             internal_url,
                             headers=internal_service_headers(),
                             json={
+                                "logical_table": True,
                                 "doc_key": doc_key,
                                 "index_name": index_name,
                             },
@@ -3140,12 +3212,19 @@ def stateful_api(request: pytest.FixtureRequest):
                         timeout=120,
                     )
                 accepted = self._check(response)
-                return _wait_for_restore_job(self.get, accepted)
+                return _wait_for_restore_job(
+                    self.get, accepted, debug_logs=self.debug_logs
+                )
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
         def cluster_backup(
-            self, *, backup_id: str, location: str, table_names: list[str] | None = None
+            self,
+            *,
+            backup_id: str,
+            location: str,
+            table_names: list[str] | None = None,
+            backup_format: str | None = None,
         ) -> dict:
             payload: dict[str, object] = {
                 "backup_id": backup_id,
@@ -3154,6 +3233,8 @@ def stateful_api(request: pytest.FixtureRequest):
             }
             if table_names is not None:
                 payload["table_names"] = table_names
+            if backup_format is not None:
+                payload["format"] = backup_format
             try:
                 with self._request_lock:
                     return self._check(
@@ -3184,7 +3265,9 @@ def stateful_api(request: pytest.FixtureRequest):
                     accepted = self._check(
                         self.s.post(f"{self.url}/restore", json=payload, timeout=120)
                     )
-                return _wait_for_restore_job(self.get, accepted)
+                return _wait_for_restore_job(
+                    self.get, accepted, debug_logs=self.debug_logs
+                )
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
@@ -3369,7 +3452,7 @@ def stateful_api(request: pytest.FixtureRequest):
                 "POST", f"/transactions/{transaction_id}/commit", payload or None
             )
             if response.status_code not in (200, 409):
-                response.raise_for_status()
+                self._check(response)
             return response.status_code, self._decode(response)
 
         def abort_transaction_session(self, transaction_id: str) -> dict:
@@ -3401,11 +3484,6 @@ def stateful_api(request: pytest.FixtureRequest):
 
         def delete_index(self, table_name: str, index_name: str) -> dict:
             return self.delete(f"/tables/{table_name}/indexes/{index_name}")
-
-        def debug_logs(self) -> str:
-            if self._server is None:
-                return ""
-            return self._server.debug_logs().strip()
 
     api = PublicApi(session, base, server)
     yield api
@@ -3568,8 +3646,18 @@ def backup_api(request: pytest.FixtureRequest):
             num_shards: int = 1,
             description: str | None = None,
             indexes: dict[str, dict] | None = None,
+            storage: dict[str, str] | None = None,
         ) -> dict:
-            payload: dict[str, object] = {"num_shards": num_shards}
+            # Backup qualification still requires primary ownership until
+            # snapshots preserve source-vector reference closure.
+            payload: dict[str, object] = {
+                "num_shards": num_shards,
+                "storage": (
+                    storage
+                    if storage is not None
+                    else {"dense_embeddings": "primary_lsm"}
+                ),
+            }
             if description is not None:
                 payload["description"] = description
             if indexes is not None:
@@ -3759,12 +3847,19 @@ def backup_api(request: pytest.FixtureRequest):
                         timeout=120,
                     )
                 accepted = self._check(response)
-                return _wait_for_restore_job(self.get, accepted)
+                return _wait_for_restore_job(
+                    self.get, accepted, debug_logs=self.debug_logs
+                )
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
         def cluster_backup(
-            self, *, backup_id: str, location: str, table_names: list[str] | None = None
+            self,
+            *,
+            backup_id: str,
+            location: str,
+            table_names: list[str] | None = None,
+            backup_format: str | None = None,
         ) -> dict:
             payload: dict[str, object] = {
                 "backup_id": backup_id,
@@ -3773,6 +3868,8 @@ def backup_api(request: pytest.FixtureRequest):
             }
             if table_names is not None:
                 payload["table_names"] = table_names
+            if backup_format is not None:
+                payload["format"] = backup_format
             try:
                 with self._request_lock:
                     return self._check(
@@ -3803,7 +3900,9 @@ def backup_api(request: pytest.FixtureRequest):
                     accepted = self._check(
                         self.s.post(f"{self.url}/restore", json=payload, timeout=120)
                     )
-                return _wait_for_restore_job(self.get, accepted)
+                return _wait_for_restore_job(
+                    self.get, accepted, debug_logs=self.debug_logs
+                )
             except requests.RequestException as err:
                 self._raise_request_error(err)
 

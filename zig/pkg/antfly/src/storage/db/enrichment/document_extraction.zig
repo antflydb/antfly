@@ -105,6 +105,8 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
                 }
             };
 
+            pub const PageBox = @import("antfly_pdf").reader.PageBox;
+
             pub const TextOutputSpan = struct {
                 start: usize,
                 end: usize,
@@ -163,6 +165,7 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
         pub const RenderedPageRasterBatch = @import("antfly_pdf").RenderedPageRasterBatch;
 
         pub const RenderQuality = @import("antfly_pdf").RenderQuality;
+        pub const nativeRasterBboxToPagePoints = @import("antfly_pdf").nativeRasterBboxToPagePoints;
         pub const RenderProfile = enum { exact, ocr };
         // Keep the erased executor ABI identical in unit/minimal builds even
         // though the rendering functions themselves are stubbed.
@@ -686,6 +689,282 @@ pub const TextRegion = struct {
     bbox: [4]f64,
 };
 
+pub const OcrRegionCoordinateSpace = enum {
+    unknown,
+    image_pixels_top_left,
+};
+
+/// Borrowed Reader region metadata. The runtime parser owns `text`; this type
+/// only defines the validated handoff into document coordinates.
+pub const OcrReaderRegion = struct {
+    text: []const u8,
+    bbox: ?[4]f64 = null,
+    coordinate_space: OcrRegionCoordinateSpace = .unknown,
+};
+
+/// One transcript phrase: the byte range it occupies in the unit text and
+/// its offsets in the recording, so chunks cut from the text can carry the
+/// moment they came from.
+pub const TranscriptSpan = struct {
+    char_start: u32,
+    char_end: u32,
+    start_ms: u64,
+    end_ms: u64,
+    /// Which speaker said this, when the provider diarized the recording:
+    /// an index into the speakers of this transcript, numbered in order of
+    /// first appearance. Providers label speakers differently (`SPEAKER_00`
+    /// locally, a bare number from Vertex), so the index is what is stored
+    /// and `speakerLabel` renders it; keeping the span free of owned text
+    /// also keeps every caller that copies or frees spans unchanged.
+    speaker_index: ?u8 = null,
+};
+
+/// The stable label for a speaker index: `SPEAKER_00`, `SPEAKER_01`, ...
+/// The buffer must hold at least 11 bytes.
+pub fn speakerLabel(buf: []u8, index: u8) []const u8 {
+    return std.fmt.bufPrint(buf, "SPEAKER_{d:0>2}", .{index}) catch unreachable;
+}
+
+/// Speakers named in `spans`, as a count: indexes run 0..count-1.
+pub fn transcriptSpeakerCount(spans: []const TranscriptSpan) u8 {
+    var count: u8 = 0;
+    for (spans) |span| {
+        if (span.speaker_index) |index| count = @max(count, index +| 1);
+    }
+    return count;
+}
+
+/// A word as a provider reports it inside a phrase, with its offsets.
+pub const TranscriptWordInput = struct {
+    text: []const u8,
+    start_ms: u64,
+    end_ms: u64,
+};
+
+/// A transcript phrase as a provider reports it: text plus its offsets, and
+/// the timed words inside it when the provider has them.
+pub const TranscriptSegmentInput = struct {
+    text: []const u8,
+    start_ms: u64,
+    end_ms: u64,
+    words: []const TranscriptWordInput = &.{},
+    /// The provider's speaker label for this phrase, if it diarized.
+    speaker: ?[]const u8 = null,
+};
+
+/// Locates each phrase inside the transcript text, in order, and returns the
+/// spans found. Providers join phrases with single spaces, so a sequential
+/// search from the previous phrase's end recovers the byte ranges without
+/// assuming exact join rules; the walk stops at the first phrase that cannot
+/// be found, since later offsets would be unreliable.
+///
+/// A phrase that carries timed words is split at sentence ends (`.`, `?`,
+/// `!`) into finer spans, each timed by its first and last word. Whisper
+/// often returns one phrase for a whole 30 s window, and a chunk cut from the
+/// middle of it would otherwise inherit the entire window's range.
+pub fn transcriptSpansFromSegmentsAlloc(alloc: Allocator, text: []const u8, segments: []const TranscriptSegmentInput) ![]TranscriptSpan {
+    var spans = std.ArrayListUnmanaged(TranscriptSpan).empty;
+    errdefer spans.deinit(alloc);
+    var speakers = SpeakerIndexer{};
+    var cursor: usize = 0;
+    // The cursor is a verified position only while every phrase so far has
+    // been found: it is the end of the last one. A phrase the provider
+    // worded differently from the transcript breaks that, because the text
+    // it covered is still ahead of the cursor and nothing says how much.
+    var cursor_verified = true;
+    for (segments) |segment| {
+        const phrase = std.mem.trim(u8, segment.text, " \t\r\n");
+        if (phrase.len == 0) continue;
+        const found = std.mem.indexOfPos(u8, text, cursor, phrase) orelse {
+            // Skipping costs this phrase its timing; abandoning the walk
+            // would cost every later phrase too.
+            cursor_verified = false;
+            continue;
+        };
+        if (!cursor_verified) {
+            // With the cursor adrift, the first match may belong to text the
+            // skipped phrase covered. Only a phrase that occurs once in
+            // what is left is certainly the right one; anything repeated
+            // stays untimed rather than being pinned to the wrong moment.
+            if (std.mem.indexOfPos(u8, text, found + 1, phrase) != null) continue;
+            cursor_verified = true;
+        }
+        const start = found;
+        const end = start + phrase.len;
+        const segment_end_ms = @max(segment.end_ms, segment.start_ms);
+        const speaker_index = speakers.indexOf(segment.speaker);
+        if (!try appendWordSentenceSpans(alloc, &spans, text[0..end], start, segment, segment_end_ms, speaker_index)) {
+            try spans.append(alloc, .{
+                .char_start = std.math.cast(u32, start) orelse break,
+                .char_end = std.math.cast(u32, end) orelse break,
+                .start_ms = segment.start_ms,
+                .end_ms = segment_end_ms,
+                .speaker_index = speaker_index,
+            });
+        }
+        cursor = end;
+    }
+    return try spans.toOwnedSlice(alloc);
+}
+
+/// Numbers speaker labels in order of first appearance. The labels
+/// themselves are borrowed from the provider's response, which outlives the
+/// call, and only the resulting index is stored.
+const SpeakerIndexer = struct {
+    labels: [max_speakers][]const u8 = undefined,
+    count: u8 = 0,
+
+    /// A transcript with more distinct speakers than this is a provider
+    /// fault, not a meeting; the rest go unlabelled rather than growing the
+    /// table without bound.
+    const max_speakers: u8 = 64;
+
+    fn indexOf(self: *SpeakerIndexer, label: ?[]const u8) ?u8 {
+        const raw = label orelse return null;
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) return null;
+        for (self.labels[0..self.count], 0..) |known, i| {
+            if (std.mem.eql(u8, known, trimmed)) return @intCast(i);
+        }
+        if (self.count == max_speakers) return null;
+        self.labels[self.count] = trimmed;
+        self.count += 1;
+        return self.count - 1;
+    }
+};
+
+/// Splits one phrase into sentence spans using its timed words. Returns
+/// false, appending nothing, when the phrase has no usable words, so the
+/// caller falls back to a single span for the whole phrase.
+fn appendWordSentenceSpans(
+    alloc: Allocator,
+    spans: *std.ArrayListUnmanaged(TranscriptSpan),
+    text: []const u8,
+    phrase_start: usize,
+    segment: TranscriptSegmentInput,
+    segment_end_ms: u64,
+    speaker_index: ?u8,
+) !bool {
+    if (segment.words.len == 0) return false;
+    const first_len = spans.items.len;
+    errdefer spans.shrinkRetainingCapacity(first_len);
+    var cursor = phrase_start;
+    var group_start: ?usize = null;
+    var group_start_ms: u64 = 0;
+    var group_end: usize = 0;
+    var group_end_ms: u64 = 0;
+    var located: usize = 0;
+    for (segment.words, 0..) |word, index| {
+        const spelled = std.mem.trim(u8, word.text, " \t\r\n");
+        if (spelled.len == 0) continue;
+        const start = std.mem.indexOfPos(u8, text, cursor, spelled) orelse break;
+        const end = start + spelled.len;
+        located += 1;
+        if (group_start == null) {
+            group_start = start;
+            group_start_ms = @min(@max(word.start_ms, segment.start_ms), segment_end_ms);
+        }
+        group_end = end;
+        group_end_ms = @min(@max(word.end_ms, group_start_ms), segment_end_ms);
+        cursor = end;
+        const last = index + 1 == segment.words.len;
+        if (last or endsSentence(spelled)) {
+            try spans.append(alloc, .{
+                .char_start = std.math.cast(u32, group_start.?) orelse return error.Overflow,
+                .char_end = std.math.cast(u32, group_end) orelse return error.Overflow,
+                .start_ms = group_start_ms,
+                .end_ms = group_end_ms,
+                .speaker_index = speaker_index,
+            });
+            group_start = null;
+        }
+    }
+    if (group_start) |start| {
+        try spans.append(alloc, .{
+            .char_start = std.math.cast(u32, start) orelse return error.Overflow,
+            .char_end = std.math.cast(u32, group_end) orelse return error.Overflow,
+            .start_ms = group_start_ms,
+            .end_ms = group_end_ms,
+            .speaker_index = speaker_index,
+        });
+    }
+    if (located == 0) {
+        spans.shrinkRetainingCapacity(first_len);
+        return false;
+    }
+    return true;
+}
+
+fn endsSentence(word: []const u8) bool {
+    var i = word.len;
+    while (i > 0) : (i -= 1) {
+        switch (word[i - 1]) {
+            '"', '\'', ')', ']' => continue,
+            '.', '?', '!' => return true,
+            else => return false,
+        }
+    }
+    return false;
+}
+
+/// Gives every chunk cut from a transcribed unit the recording offsets of
+/// the phrases it overlaps: the start of the first overlapping phrase and
+/// the end of the last. Chunks without byte offsets, and units without
+/// spans, are left untouched.
+pub fn applyTranscriptTiming(unit: Unit, chunks: anytype) void {
+    if (unit.transcript_spans.len == 0) return;
+    for (chunks) |*chunk| {
+        const start = chunk.start_offset orelse continue;
+        const end = chunk.end_offset orelse continue;
+        if (end <= start) continue;
+        var first: ?u64 = null;
+        var last: ?u64 = null;
+        var speaker: ?u8 = null;
+        var one_speaker = true;
+        // Text this chunk contains that no span accounts for is speech by
+        // somebody: a phrase the provider worded differently is skipped
+        // when spans are built, and crediting the chunk to the speakers on
+        // either side of it would put words in their mouths.
+        var covered_to = start;
+        for (unit.transcript_spans) |span| {
+            if (span.char_end <= start or span.char_start >= end) continue;
+            if (first == null) first = span.start_ms;
+            last = span.end_ms;
+            if (span.char_start > covered_to and
+                !isBlankRange(unit.text, covered_to, span.char_start)) one_speaker = false;
+            covered_to = @max(covered_to, span.char_end);
+            if (span.speaker_index) |index| {
+                if (speaker) |known| {
+                    if (known != index) one_speaker = false;
+                } else {
+                    speaker = index;
+                }
+            } else {
+                one_speaker = false;
+            }
+        }
+        if (covered_to < end and !isBlankRange(unit.text, covered_to, end)) one_speaker = false;
+        if (first) |value| chunk.start_time_ms = @floatFromInt(value);
+        if (last) |value| chunk.end_time_ms = @floatFromInt(value);
+        // A chunk that straddles a turn, or holds speech no span claims,
+        // belongs to no single speaker: it is left unattributed rather than
+        // credited to whoever spoke around it.
+        if (one_speaker) {
+            if (speaker) |index| chunk.speaker_index = index;
+        }
+    }
+}
+
+/// Whether `text[from..to)` holds nothing but whitespace. Offsets past the
+/// end of the text count as blank: there is no speech there to attribute.
+fn isBlankRange(text: []const u8, from: u32, to: u32) bool {
+    if (to <= from or from >= text.len) return true;
+    const limit = @min(@as(usize, to), text.len);
+    for (text[from..limit]) |byte| {
+        if (!std.ascii.isWhitespace(byte)) return false;
+    }
+    return true;
+}
 pub const Unit = struct {
     unit_id: []u8,
     unit_type: []u8,
@@ -711,6 +990,8 @@ pub const Unit = struct {
     ocr_bbox: ?[4]f64 = null,
     transcript_used: bool = false,
     transcript_confidence: ?f64 = null,
+    /// Phrase timing for transcribed units; empty for everything else.
+    transcript_spans: []TranscriptSpan = &.{},
     extraction_warning: ?[]u8 = null,
     page_number: ?u32 = null,
     page_label: ?[]u8 = null,
@@ -735,9 +1016,74 @@ pub const Unit = struct {
         if (self.ocr_failure_stage) |value| alloc.free(value);
         if (self.page_label) |value| alloc.free(value);
         if (self.text_regions.len > 0) alloc.free(self.text_regions);
+        if (self.transcript_spans.len > 0) alloc.free(self.transcript_spans);
         self.* = undefined;
     }
 };
+
+/// Align known Reader regions to OCR UTF-8 text and invert the exact native PDF
+/// raster transform. Unknown Reader conventions and compatibility-renderer
+/// pixels deliberately remain ungrounded rather than receiving guessed boxes.
+///
+/// `grounded_text_len` limits alignment to a byte-identical OCR prefix. The
+/// numeric-row hybrid uses this to leave appended embedded rows ungrounded.
+pub fn mapOcrReaderRegionsAlloc(
+    alloc: Allocator,
+    final_text: []const u8,
+    grounded_text_len: usize,
+    regions: []const OcrReaderRegion,
+    unit: Unit,
+) ![]TextRegion {
+    if (regions.len == 0 or grounded_text_len == 0 or grounded_text_len > final_text.len or
+        !std.unicode.utf8ValidateSlice(final_text) or !isUtf8Boundary(final_text, grounded_text_len))
+        return &.{};
+    if (unit.extraction_warning) |warning| {
+        if (std.mem.indexOf(u8, warning, "pdf_render_quality:compatibility_backend:") != null)
+            return &.{};
+    }
+    const page_bbox = unit.page_bbox orelse return &.{};
+    const effective_dpi = unit.ocr_effective_render_dpi orelse return &.{};
+    const raster_width = unit.ocr_rendered_width orelse return &.{};
+    const raster_height = unit.ocr_rendered_height orelse return &.{};
+    const page_box = pdf.reader.PageBox{
+        .min_x = page_bbox[0],
+        .min_y = page_bbox[1],
+        .max_x = page_bbox[2],
+        .max_y = page_bbox[3],
+    };
+
+    var mapped = std.ArrayListUnmanaged(TextRegion).empty;
+    defer mapped.deinit(alloc);
+    var search_offset: usize = 0;
+    const grounded_text = final_text[0..grounded_text_len];
+    for (regions) |region| {
+        if (region.text.len == 0 or !std.unicode.utf8ValidateSlice(region.text)) continue;
+        const start = std.mem.indexOfPos(u8, grounded_text, search_offset, region.text) orelse continue;
+        const end = start + region.text.len;
+        if (!isUtf8Boundary(grounded_text, start) or !isUtf8Boundary(grounded_text, end)) continue;
+        // A rejected box must still consume its text occurrence. Otherwise a
+        // later repeated line would attach its box to an earlier ungrounded line.
+        search_offset = end;
+        if (region.coordinate_space != .image_pixels_top_left) continue;
+        const page_region = pdf.nativeRasterBboxToPagePoints(
+            page_box,
+            effective_dpi,
+            raster_width,
+            raster_height,
+            unit.page_rotation,
+            region.bbox orelse continue,
+        ) orelse continue;
+        const span_start = std.math.cast(u32, start) orelse continue;
+        const span_end = std.math.cast(u32, end) orelse continue;
+        try mapped.append(alloc, .{ .span = .{ span_start, span_end }, .bbox = page_region });
+    }
+    return try mapped.toOwnedSlice(alloc);
+}
+
+fn isUtf8Boundary(text: []const u8, offset: usize) bool {
+    return offset <= text.len and
+        (offset == 0 or offset == text.len or text[offset] & 0xc0 != 0x80);
+}
 
 pub const Result = struct {
     content_type: []u8,
@@ -943,6 +1289,8 @@ pub const OcrQuality = struct {
     corrupted_line_ratio: f64 = 0,
     replacement_char_ratio: f64 = 0,
     trimmed_len: usize = 0,
+    /// Valid UTF-8 codepoints, excluding ASCII whitespace.
+    non_whitespace_chars: usize = 0,
 
     pub fn needsFallback(self: OcrQuality) bool {
         return self.too_short or self.garbled or self.font_corrupted or self.replacement_corrupted;
@@ -992,6 +1340,7 @@ pub fn assessOcrQuality(text: []const u8, config: OcrQualityConfig) OcrQuality {
         var iter = valid_view.iterator();
         while (iter.nextCodepoint()) |cp| {
             codepoints += 1;
+            if (cp >= 0x80 or !std.ascii.isWhitespace(@intCast(cp))) out.non_whitespace_chars += 1;
             if (cp == 0xfffd) replacements += 1;
         }
     } else {
@@ -1094,6 +1443,11 @@ pub fn preferOcrText(embedded: OcrQuality, ocr: OcrQuality) bool {
     // quality failure (for example embedded `.garbled` versus OCR
     // `.too_short`) and the ratio tie-breakers favor the one-character OCR.
     if (ocr.too_short and !embedded.too_short) return false;
+    // Fragmentation does not make decoded content expendable. A cleaner
+    // partial transcription must not erase most of a page. Count characters
+    // without whitespace so faithful reconstruction can still join fragments.
+    if (!embedded.font_corrupted and !embedded.replacement_corrupted and
+        ocr.non_whitespace_chars *| 2 < embedded.non_whitespace_chars) return false;
     if (embedded.needsFallback() != ocr.needsFallback()) return !ocr.needsFallback();
     if (embedded.failureCount() != ocr.failureCount()) return ocr.failureCount() < embedded.failureCount();
     if (embedded.replacement_char_ratio != ocr.replacement_char_ratio) return ocr.replacement_char_ratio < embedded.replacement_char_ratio;
@@ -1102,9 +1456,9 @@ pub fn preferOcrText(embedded: OcrQuality, ocr: OcrQuality) bool {
     return ocr.trimmed_len > embedded.trimmed_len;
 }
 
-/// Content-aware merger policy for numeric tables. Vision OCR can improve
-/// prose quality while silently dropping dense cells; when embedded PDF text
-/// contains a substantial numeric table, require the OCR candidate to retain
+/// Content-aware merger policy for numeric records. Vision OCR can improve
+/// prose quality while silently dropping values; when embedded PDF text
+/// contains substantial numeric content, require the OCR candidate to retain
 /// most of its numeric-token occurrences before replacing it.
 pub fn preferOcrTextForContentAlloc(alloc: Allocator, embedded_text: []const u8, ocr_text: []const u8, embedded: OcrQuality, ocr: OcrQuality) !bool {
     return (try chooseOcrTextForContentAlloc(alloc, embedded_text, ocr_text, embedded, ocr)) != .embedded;
@@ -1133,9 +1487,9 @@ pub fn chooseOcrTextForContentAlloc(alloc: Allocator, embedded_text: []const u8,
     return .ocr;
 }
 
-/// Append only numeric-rich embedded lines containing occurrences absent from
-/// OCR. Candidate token counts are consumed in document order, so repeated
-/// values are handled as a multiset instead of being mistaken for one match.
+/// Append embedded lines containing numeric occurrences absent from OCR.
+/// Candidate token counts are consumed in document order, so repeated and
+/// signed values are handled as a multiset instead of one set membership.
 pub fn mergeOcrWithEmbeddedNumericRowsAlloc(alloc: Allocator, embedded_text: []const u8, ocr_text: []const u8) ![]u8 {
     return try mergeOcrWithEmbeddedNumericRowsWithLimitsAlloc(
         alloc,
@@ -1160,22 +1514,29 @@ fn mergeOcrWithEmbeddedNumericRowsWithLimitsAlloc(
     while (tokens.next()) |raw| {
         const token = normalizedNumericToken(raw) orelse continue;
         reference_occurrences +|= 1;
-        if (reference_occurrences > max_token_occurrences) return try alloc.dupe(u8, embedded_text);
+        if (reference_occurrences > max_token_occurrences)
+            return try appendOcrWithEmbeddedNumericRowsAlloc(alloc, ocr_text, embedded_text);
         const entry = try candidate_counts.getOrPut(alloc, token);
         if (!entry.found_existing) {
-            if (candidate_counts.count() > max_unique_tokens) return try alloc.dupe(u8, embedded_text);
+            if (candidate_counts.count() > max_unique_tokens)
+                return try appendOcrWithEmbeddedNumericRowsAlloc(alloc, ocr_text, embedded_text);
             entry.value_ptr.* = 0;
         }
     }
+    var candidate_occurrences: usize = 0;
     tokens = std.mem.tokenizeAny(u8, ocr_text, &std.ascii.whitespace);
     while (tokens.next()) |raw| {
         const token = normalizedNumericToken(raw) orelse continue;
+        candidate_occurrences +|= 1;
+        if (candidate_occurrences > max_token_occurrences)
+            return try appendOcrWithEmbeddedNumericRowsAlloc(alloc, ocr_text, embedded_text);
         if (candidate_counts.getPtr(token)) |count| count.* +|= 1;
     }
 
     var retained = std.ArrayList(u8).empty;
     defer retained.deinit(alloc);
     var previous_line: ?[]const u8 = null;
+    var previous_line_has_numeric = false;
     var previous_appended = false;
     var lines = std.mem.splitScalar(u8, embedded_text, '\n');
     while (lines.next()) |raw_line| {
@@ -1194,8 +1555,11 @@ fn mergeOcrWithEmbeddedNumericRowsWithLimitsAlloc(
             }
             missing_count += 1;
         }
-        if (numeric_count >= 2 and missing_count > 0) {
-            if (!previous_appended) if (previous_line) |header| {
+        if (missing_count > 0) {
+            // Retain the complete source line, even when OCR matched some of
+            // its values: isolated normalized tokens lose labels, currency,
+            // percentages, and the relationships between values.
+            if (!previous_appended and !previous_line_has_numeric) if (previous_line) |header| {
                 if (header.len > 0) {
                     try retained.appendSlice(alloc, header);
                     try retained.append(alloc, '\n');
@@ -1208,12 +1572,17 @@ fn mergeOcrWithEmbeddedNumericRowsWithLimitsAlloc(
             previous_appended = false;
         }
         previous_line = line;
+        previous_line_has_numeric = numeric_count > 0;
     }
     if (retained.items.len == 0) return try alloc.dupe(u8, ocr_text);
+    return try appendOcrWithEmbeddedNumericRowsAlloc(alloc, ocr_text, retained.items);
+}
+
+fn appendOcrWithEmbeddedNumericRowsAlloc(alloc: Allocator, ocr_text: []const u8, embedded_rows: []const u8) ![]u8 {
     return try std.fmt.allocPrint(
         alloc,
-        "{s}\n\n--- Embedded PDF table rows preserved for numeric accuracy ---\n{s}",
-        .{ std.mem.trimEnd(u8, ocr_text, &std.ascii.whitespace), std.mem.trimEnd(u8, retained.items, &std.ascii.whitespace) },
+        "{s}\n\n--- Embedded PDF rows preserved for numeric accuracy ---\n{s}",
+        .{ std.mem.trimEnd(u8, ocr_text, &std.ascii.whitespace), std.mem.trimEnd(u8, embedded_rows, &std.ascii.whitespace) },
     );
 }
 
@@ -1260,9 +1629,13 @@ fn numericTokenRecallAllocWithLimits(
     if (reference_count == 0) return .{ .reference_count = 0, .recall = 1.0 };
 
     var matched: usize = 0;
+    var candidate_count: usize = 0;
     tokens = std.mem.tokenizeAny(u8, candidate, &std.ascii.whitespace);
     while (tokens.next()) |raw| {
         const token = normalizedNumericToken(raw) orelse continue;
+        candidate_count +|= 1;
+        if (candidate_count > max_token_occurrences)
+            return .{ .reference_count = reference_count, .recall = 0, .complete = false };
         if (remaining.getPtr(token)) |count| if (count.* > 0) {
             count.* -= 1;
             matched += 1;
@@ -2487,6 +2860,69 @@ test "PDF text regions use reconstructed output spans" {
     try std.testing.expectEqual(@as(usize, 0), unaligned_regions.len);
 }
 
+test "OCR Reader regions align repeated UTF-8 text monotonically and require native pixel geometry" {
+    const alloc = std.testing.allocator;
+    const text = "écho\nécho\n東京";
+    const unit = Unit{
+        .unit_id = @constCast("page:000001"),
+        .unit_type = @constCast("page"),
+        .text = @constCast(text),
+        .method = @constCast("ocr_text"),
+        .ocr_effective_render_dpi = 72,
+        .ocr_rendered_width = 100,
+        .ocr_rendered_height = 100,
+        .page_bbox = .{ 0.25, -5, 100.25, 95 },
+        .page_rotation = 0,
+    };
+    const reader_regions = [_]OcrReaderRegion{
+        .{ .text = "écho", .bbox = .{ 10, 10, 30, 20 }, .coordinate_space = .image_pixels_top_left },
+        .{ .text = "écho", .bbox = .{ 10, 30, 30, 40 }, .coordinate_space = .image_pixels_top_left },
+        .{ .text = "東京", .bbox = .{ 20, 60, 50, 80 }, .coordinate_space = .image_pixels_top_left },
+    };
+    const mapped = try mapOcrReaderRegionsAlloc(alloc, text, text.len, &reader_regions, unit);
+    defer alloc.free(mapped);
+    try std.testing.expectEqual(@as(usize, 3), mapped.len);
+    try std.testing.expectEqual([2]u32{ 0, 5 }, mapped[0].span);
+    try std.testing.expectEqual([2]u32{ 6, 11 }, mapped[1].span);
+    try std.testing.expectEqual([2]u32{ 12, 18 }, mapped[2].span);
+    try std.testing.expectEqual([4]f64{ 10.25, 75, 30.25, 85 }, mapped[0].bbox);
+    try std.testing.expectEqual([4]f64{ 10.25, 55, 30.25, 65 }, mapped[1].bbox);
+
+    const prefix_only = try mapOcrReaderRegionsAlloc(alloc, text, 11, &reader_regions, unit);
+    defer alloc.free(prefix_only);
+    try std.testing.expectEqual(@as(usize, 2), prefix_only.len);
+
+    var compatibility = unit;
+    compatibility.extraction_warning = @constCast("pdf_render_quality:compatibility_backend:fallback_groups=0:reason=none");
+    const unavailable = try mapOcrReaderRegionsAlloc(alloc, text, text.len, &reader_regions, compatibility);
+    try std.testing.expectEqual(@as(usize, 0), unavailable.len);
+}
+
+test "OCR Reader region mapping is allocation-failure safe" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            const unit = Unit{
+                .unit_id = @constCast("page:000001"),
+                .unit_type = @constCast("page"),
+                .text = @constCast("first\nsecond"),
+                .method = @constCast("ocr_text"),
+                .ocr_effective_render_dpi = 72,
+                .ocr_rendered_width = 100,
+                .ocr_rendered_height = 100,
+                .page_bbox = .{ 0, 0, 100, 100 },
+            };
+            const regions = [_]OcrReaderRegion{
+                .{ .text = "first", .bbox = .{ 10, 10, 40, 20 }, .coordinate_space = .image_pixels_top_left },
+                .{ .text = "second", .bbox = .{ 10, 30, 50, 40 }, .coordinate_space = .image_pixels_top_left },
+            };
+            const mapped = try mapOcrReaderRegionsAlloc(alloc, unit.text, unit.text.len, &regions, unit);
+            defer alloc.free(mapped);
+            try std.testing.expectEqual(@as(usize, 2), mapped.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
 fn extractSingleTextUnitAlloc(
     alloc: Allocator,
     bytes: []const u8,
@@ -3624,22 +4060,53 @@ fn isImageContent(content_type: []const u8, filename: []const u8, source_url: []
         (std.mem.startsWith(u8, bytes, "RIFF") and bytes.len >= 12 and std.mem.eql(u8, bytes[8..12], "WEBP"));
 }
 
+/// Whether a source is something the transcription route can decode.
+///
+/// Recordings do not always arrive labelled `audio/*`: a browser recorder,
+/// Zoom or OBS writes WebM/Matroska that a server serves as `video/webm`,
+/// and a phone or screen recording arrives as MP4/QuickTime. Those carry an
+/// audio track the decoder reads, so they take the audio route; a container
+/// with no audio track fails there rather than being filed as an
+/// unsupported document.
 fn isAudioContent(content_type: []const u8, filename: []const u8, source_url: []const u8, bytes: []const u8) bool {
     if (contentTypeStartsWith(content_type, "audio/")) return true;
-    if (hasExtension(filename, ".mp3") or hasExtension(source_url, ".mp3") or
-        hasExtension(filename, ".wav") or hasExtension(source_url, ".wav") or
-        hasExtension(filename, ".m4a") or hasExtension(source_url, ".m4a") or
-        hasExtension(filename, ".aac") or hasExtension(source_url, ".aac") or
-        hasExtension(filename, ".ogg") or hasExtension(source_url, ".ogg") or
-        hasExtension(filename, ".opus") or hasExtension(source_url, ".opus") or
-        hasExtension(filename, ".flac") or hasExtension(source_url, ".flac"))
+    // Containers that carry an audio track, whichever way they are labelled.
+    if (contentTypeEquals(content_type, "video/webm") or
+        contentTypeEquals(content_type, "video/x-matroska") or
+        contentTypeEquals(content_type, "video/mp4") or
+        contentTypeEquals(content_type, "video/quicktime") or
+        contentTypeEquals(content_type, "application/ogg") or
+        contentTypeEquals(content_type, "application/x-matroska"))
     {
         return true;
     }
-    return std.mem.startsWith(u8, bytes, "ID3") or
+    const media_extensions = [_][]const u8{
+        ".mp3", ".wav",  ".m4a",  ".m4b",  ".aac",  ".ogg",
+        ".oga", ".opus", ".flac", ".aif",  ".aiff", ".aifc",
+        ".caf", ".au",   ".snd",  ".webm", ".weba", ".mkv",
+        ".mka", ".mp4",  ".m4v",  ".mov",
+    };
+    for (media_extensions) |extension| {
+        if (hasExtension(filename, extension) or hasExtension(source_url, extension)) return true;
+    }
+    if (std.mem.startsWith(u8, bytes, "ID3") or
         std.mem.startsWith(u8, bytes, "OggS") or
         std.mem.startsWith(u8, bytes, "fLaC") or
-        (std.mem.startsWith(u8, bytes, "RIFF") and bytes.len >= 12 and std.mem.eql(u8, bytes[8..12], "WAVE"));
+        // EBML: WebM and Matroska.
+        std.mem.startsWith(u8, bytes, "\x1a\x45\xdf\xa3"))
+    {
+        return true;
+    }
+    if (bytes.len >= 12) {
+        // RIFF/WAVE, ISO base media (MP4, M4A, MOV), AIFF and CAF.
+        if (std.mem.startsWith(u8, bytes, "RIFF") and std.mem.eql(u8, bytes[8..12], "WAVE")) return true;
+        if (std.mem.eql(u8, bytes[4..8], "ftyp")) return true;
+        if (std.mem.startsWith(u8, bytes, "FORM") and
+            (std.mem.eql(u8, bytes[8..12], "AIFF") or std.mem.eql(u8, bytes[8..12], "AIFC"))) return true;
+        if (std.mem.startsWith(u8, bytes, "caff")) return true;
+        if (std.mem.startsWith(u8, bytes, ".snd")) return true;
+    }
+    return false;
 }
 
 fn isDocxContent(content_type: []const u8, filename: []const u8, source_url: []const u8) bool {
@@ -4590,7 +5057,8 @@ test "numeric recall limits preserve embedded text without exhausting scratch me
         100,
     );
     defer std.testing.allocator.free(merged);
-    try std.testing.expectEqualStrings("row 101 102 103", merged);
+    try std.testing.expect(std.mem.startsWith(u8, merged, "row 101"));
+    try std.testing.expect(std.mem.indexOf(u8, merged, "row 101 102 103") != null);
 }
 
 test "PDF render quality warning preserves prior diagnostics and fallback reason" {
@@ -4782,4 +5250,449 @@ test "OCR prompt echo detection covers Florence task and canonical prompts" {
     try std.testing.expect(isOcrPromptEcho("what is the text in the image", florence_ocr_prompt));
     try std.testing.expect(isOcrPromptEcho("TRANSCRIBE this page faithfully!", "Transcribe this page faithfully."));
     try std.testing.expect(!isOcrPromptEcho("Invoice total: $123.45", florence_ocr_prompt));
+}
+
+test "OCR numeric hybrid preserves fragmented single-value lines" {
+    const alloc = std.testing.allocator;
+    const config = OcrQualityConfig{};
+    const embedded_text =
+        \\Classified references
+        \\Alpha listing
+        \\101
+        \\Bravo listing
+        \\202
+        \\Charlie listing
+        \\303
+        \\Delta listing
+        \\404
+        \\Echo listing
+        \\505
+        \\Foxtrot listing
+        \\606
+        \\Golf listing
+        \\707
+        \\Hotel listing
+        \\808
+    ;
+    const ocr_text = "The OCR transcription makes every classified listing readable and preserves the descriptive prose, but the small reference values are absent from the clearer transcription.";
+    const embedded_quality = assessOcrQuality(embedded_text, config);
+    const ocr_quality = assessOcrQuality(ocr_text, config);
+    try std.testing.expectEqual(
+        OcrTextChoice.ocr_with_embedded_numeric_rows,
+        try chooseOcrTextForContentAlloc(alloc, embedded_text, ocr_text, embedded_quality, ocr_quality),
+    );
+
+    const merged = try mergeOcrWithEmbeddedNumericRowsAlloc(alloc, embedded_text, ocr_text);
+    defer alloc.free(merged);
+    const exact_ocr_prefix = std.mem.trimEnd(u8, ocr_text, &std.ascii.whitespace);
+    try std.testing.expect(std.mem.startsWith(u8, merged, exact_ocr_prefix));
+    inline for (.{ "101", "202", "303", "404", "505", "606", "707", "808" }) |value|
+        try std.testing.expect(std.mem.indexOf(u8, merged, value) != null);
+}
+
+test "OCR numeric hybrid preserves signed duplicate values and source row context" {
+    const alloc = std.testing.allocator;
+    const embedded_text =
+        \\Ledger
+        \\-12
+        \\-12
+        \\+12
+        \\Account Alpha 101 $40 5%
+    ;
+    const ocr_text = "Readable ledger transcription retained debit -12 and account 101.";
+
+    const merged = try mergeOcrWithEmbeddedNumericRowsAlloc(alloc, embedded_text, ocr_text);
+    defer alloc.free(merged);
+    try std.testing.expect(std.mem.startsWith(u8, merged, ocr_text));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, merged, "-12"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, merged, "+12"));
+    try std.testing.expect(std.mem.indexOf(u8, merged, "Account Alpha 101 $40 5%") != null);
+}
+
+test "numeric hybrid bounds candidate accounting and preserves OCR provenance on fallback" {
+    const candidate_limited = try numericTokenRecallAllocWithLimits(
+        std.testing.allocator,
+        "101 202",
+        "101 101 101",
+        10,
+        2,
+    );
+    try std.testing.expect(!candidate_limited.complete);
+
+    const ocr_text = "OCR retained 101";
+    const merged = try mergeOcrWithEmbeddedNumericRowsWithLimitsAlloc(
+        std.testing.allocator,
+        "row 101 202",
+        ocr_text,
+        1,
+        100,
+    );
+    defer std.testing.allocator.free(merged);
+    try std.testing.expect(std.mem.startsWith(u8, merged, ocr_text));
+    try std.testing.expect(std.mem.indexOf(u8, merged, "row 101 202") != null);
+}
+
+test "OCR selection rejects partial transcription without rejecting whitespace reconstruction" {
+    const alloc = std.testing.allocator;
+    const config = OcrQualityConfig{};
+    const partial = "Project Alpha retains the original delivery records.";
+    const complete = partial ++
+        " The supplier delivered all requested materials to the receiving warehouse." ++
+        " Each package has a recorded destination and a responsible contact." ++
+        " The following instructions describe inspection, storage, and dispatch.";
+    var fragmented = std.ArrayListUnmanaged(u8).empty;
+    defer fragmented.deinit(alloc);
+    for (complete) |byte| {
+        try fragmented.append(alloc, byte);
+        try fragmented.append(alloc, '\n');
+    }
+    const embedded_quality = assessOcrQuality(fragmented.items, config);
+    const partial_quality = assessOcrQuality(partial, config);
+    try std.testing.expectEqual(
+        OcrTextChoice.embedded,
+        try chooseOcrTextForContentAlloc(alloc, fragmented.items, partial, embedded_quality, partial_quality),
+    );
+    try std.testing.expectEqual(
+        OcrTextChoice.ocr,
+        try chooseOcrTextForContentAlloc(alloc, fragmented.items, complete, embedded_quality, assessOcrQuality(complete, config)),
+    );
+    // A shorter usable transcription can still replace genuinely undecodable
+    // source text; the content-retention guard is not a blanket length rule.
+    const undecodable = "\u{fffd}" ** 200;
+    try std.testing.expectEqual(
+        OcrTextChoice.ocr,
+        try chooseOcrTextForContentAlloc(alloc, undecodable, partial, assessOcrQuality(undecodable, config), partial_quality),
+    );
+}
+
+test "transcript spans locate provider segments inside the joined transcript" {
+    const alloc = std.testing.allocator;
+    const text = "Hello there. How are you? I am fine.";
+    const segments = [_]TranscriptSegmentInput{
+        .{ .text = " Hello there.", .start_ms = 0, .end_ms = 900 },
+        .{ .text = "How are you?", .start_ms = 900, .end_ms = 1800 },
+        .{ .text = "", .start_ms = 1800, .end_ms = 1800 },
+        .{ .text = "I am fine.", .start_ms = 2000, .end_ms = 1500 },
+        .{ .text = "never said", .start_ms = 3000, .end_ms = 4000 },
+    };
+    const spans = try transcriptSpansFromSegmentsAlloc(alloc, text, &segments);
+    defer alloc.free(spans);
+    try std.testing.expectEqual(@as(usize, 3), spans.len);
+    try std.testing.expectEqual(TranscriptSpan{ .char_start = 0, .char_end = 12, .start_ms = 0, .end_ms = 900 }, spans[0]);
+    try std.testing.expectEqual(TranscriptSpan{ .char_start = 13, .char_end = 25, .start_ms = 900, .end_ms = 1800 }, spans[1]);
+    // An inverted segment keeps its start and never ends before it.
+    try std.testing.expectEqual(TranscriptSpan{ .char_start = 26, .char_end = 36, .start_ms = 2000, .end_ms = 2000 }, spans[2]);
+}
+
+test "transcript spans split a timed phrase at sentence ends using its words" {
+    const alloc = std.testing.allocator;
+    const text = "Okay, let's start. First item is the date. Any questions?";
+    const words = [_]TranscriptWordInput{
+        .{ .text = "Okay,", .start_ms = 0, .end_ms = 300 },
+        .{ .text = "let's", .start_ms = 300, .end_ms = 600 },
+        .{ .text = "start.", .start_ms = 600, .end_ms = 1000 },
+        .{ .text = "First", .start_ms = 1400, .end_ms = 1700 },
+        .{ .text = "item", .start_ms = 1700, .end_ms = 1900 },
+        .{ .text = "is", .start_ms = 1900, .end_ms = 2000 },
+        .{ .text = "the", .start_ms = 2000, .end_ms = 2100 },
+        .{ .text = "date.", .start_ms = 2100, .end_ms = 2500 },
+        .{ .text = "Any", .start_ms = 3000, .end_ms = 3200 },
+        .{ .text = "questions?", .start_ms = 3200, .end_ms = 9000 },
+    };
+    const segments = [_]TranscriptSegmentInput{
+        .{ .text = text, .start_ms = 0, .end_ms = 4000, .words = &words },
+    };
+    const spans = try transcriptSpansFromSegmentsAlloc(alloc, text, &segments);
+    defer alloc.free(spans);
+    try std.testing.expectEqual(@as(usize, 3), spans.len);
+    try std.testing.expectEqual(TranscriptSpan{ .char_start = 0, .char_end = 18, .start_ms = 0, .end_ms = 1000 }, spans[0]);
+    try std.testing.expectEqual(TranscriptSpan{ .char_start = 19, .char_end = 42, .start_ms = 1400, .end_ms = 2500 }, spans[1]);
+    // Word timing never escapes the phrase it belongs to.
+    try std.testing.expectEqual(TranscriptSpan{ .char_start = 43, .char_end = 57, .start_ms = 3000, .end_ms = 4000 }, spans[2]);
+
+    // Words that cannot be located leave the phrase as one span.
+    const stray = [_]TranscriptWordInput{.{ .text = "missing", .start_ms = 0, .end_ms = 100 }};
+    const fallback = [_]TranscriptSegmentInput{
+        .{ .text = text, .start_ms = 0, .end_ms = 4000, .words = &stray },
+    };
+    const single = try transcriptSpansFromSegmentsAlloc(alloc, text, &fallback);
+    defer alloc.free(single);
+    try std.testing.expectEqual(@as(usize, 1), single.len);
+    try std.testing.expectEqual(TranscriptSpan{ .char_start = 0, .char_end = 57, .start_ms = 0, .end_ms = 4000 }, single[0]);
+}
+
+test "recordings in video containers take the transcription route" {
+    // A browser recorder, Zoom or OBS writes WebM the server labels
+    // video/webm; a phone writes MP4. Both carry the audio track the
+    // decoder reads, so both must route to transcription rather than being
+    // filed as an unsupported document.
+    const ebml = "\x1a\x45\xdf\xa3\x01\x00\x00\x00\x00\x00\x00\x23";
+    const mp4 = "\x00\x00\x00\x20ftypisom";
+    try std.testing.expect(isAudioContent("video/webm", "", "", ebml));
+    try std.testing.expect(isAudioContent("video/x-matroska", "", "", ebml));
+    try std.testing.expect(isAudioContent("video/mp4", "", "", mp4));
+    try std.testing.expect(isAudioContent("video/quicktime", "", "", mp4));
+    // Unlabelled downloads are recognised by name or by signature.
+    try std.testing.expect(isAudioContent("application/octet-stream", "call.webm", "", ""));
+    try std.testing.expect(isAudioContent("application/octet-stream", "", "https://example.com/call.mkv?sig=1", ""));
+    try std.testing.expect(isAudioContent("application/octet-stream", "", "", ebml));
+    try std.testing.expect(isAudioContent("application/octet-stream", "", "", mp4));
+    // The formats that were already routed keep working.
+    try std.testing.expect(isAudioContent("audio/mpeg", "", "", ""));
+    try std.testing.expect(isAudioContent("", "memo.m4a", "", ""));
+    try std.testing.expect(isAudioContent("", "", "", "OggS"));
+    try std.testing.expect(isAudioContent("", "", "", "RIFF\x00\x00\x00\x00WAVE"));
+    // Documents still are not audio.
+    try std.testing.expect(!isAudioContent("application/pdf", "report.pdf", "", "%PDF-1.4"));
+    try std.testing.expect(!isAudioContent("text/plain", "notes.txt", "", "hello"));
+}
+
+test "speech no span claims blocks chunk attribution" {
+    const alloc = std.testing.allocator;
+    // The provider worded the middle phrase differently from its own
+    // transcript, so it has no span. A chunk covering the whole transcript
+    // holds that unclaimed speech: attributing it to the speaker on either
+    // side would credit A with what B said.
+    const text = "Hello. $20. Bye.";
+    const segments = [_]TranscriptSegmentInput{
+        .{ .text = "Hello.", .start_ms = 0, .end_ms = 500, .speaker = "A" },
+        .{ .text = "twenty dollars.", .start_ms = 500, .end_ms = 1500, .speaker = "B" },
+        .{ .text = "Bye.", .start_ms = 1500, .end_ms = 2000, .speaker = "A" },
+    };
+    const spans = try transcriptSpansFromSegmentsAlloc(alloc, text, &segments);
+    defer alloc.free(spans);
+    try std.testing.expectEqual(@as(usize, 2), spans.len);
+
+    const TestChunk = struct {
+        start_offset: ?u32 = null,
+        end_offset: ?u32 = null,
+        start_time_ms: ?f32 = null,
+        end_time_ms: ?f32 = null,
+        speaker_index: ?u8 = null,
+    };
+    const unit = Unit{
+        .unit_id = @constCast("audio:000001"),
+        .unit_type = @constCast("audio"),
+        .text = @constCast(text),
+        .method = @constCast("transcription"),
+        .transcript_spans = spans,
+    };
+    var chunks = [_]TestChunk{
+        // The whole transcript, including the phrase nothing claims.
+        .{ .start_offset = 0, .end_offset = 16 },
+        // Just the opening, which one span covers completely.
+        .{ .start_offset = 0, .end_offset = 6 },
+        // The closing, reached across the unclaimed middle.
+        .{ .start_offset = 12, .end_offset = 16 },
+    };
+    applyTranscriptTiming(unit, &chunks);
+
+    try std.testing.expectEqual(@as(?u8, null), chunks[0].speaker_index);
+    // Timing still brackets what is known, which is a true range.
+    try std.testing.expectEqual(@as(?f32, 0), chunks[0].start_time_ms);
+    try std.testing.expectEqual(@as(?f32, 2000), chunks[0].end_time_ms);
+    try std.testing.expectEqual(@as(?u8, 0), chunks[1].speaker_index);
+    try std.testing.expectEqual(@as(?u8, 0), chunks[2].speaker_index);
+}
+
+test "whitespace between phrases does not block attribution" {
+    const alloc = std.testing.allocator;
+    // Providers join phrases with spaces and punctuation of their own, and
+    // a gap of those is not somebody else talking.
+    const text = "Hello there.   And hello again.";
+    const segments = [_]TranscriptSegmentInput{
+        .{ .text = "Hello there.", .start_ms = 0, .end_ms = 500, .speaker = "A" },
+        .{ .text = "And hello again.", .start_ms = 600, .end_ms = 1200, .speaker = "A" },
+    };
+    const spans = try transcriptSpansFromSegmentsAlloc(alloc, text, &segments);
+    defer alloc.free(spans);
+
+    const TestChunk = struct {
+        start_offset: ?u32 = null,
+        end_offset: ?u32 = null,
+        start_time_ms: ?f32 = null,
+        end_time_ms: ?f32 = null,
+        speaker_index: ?u8 = null,
+    };
+    const unit = Unit{
+        .unit_id = @constCast("audio:000001"),
+        .unit_type = @constCast("audio"),
+        .text = @constCast(text),
+        .method = @constCast("transcription"),
+        .transcript_spans = spans,
+    };
+    var chunks = [_]TestChunk{.{ .start_offset = 0, .end_offset = @intCast(text.len) }};
+    applyTranscriptTiming(unit, &chunks);
+    try std.testing.expectEqual(@as(?u8, 0), chunks[0].speaker_index);
+}
+
+test "a repeated phrase after a mismatch stays untimed" {
+    const alloc = std.testing.allocator;
+    // The provider worded its own transcript differently, so the phrases
+    // before this one could not be located and the cursor no longer marks
+    // where the next phrase begins. "Yes." appears twice: pinning it to the
+    // first occurrence would give the closing "Yes." the opening's moment
+    // and speaker, so it is left untimed instead.
+    const text = "Yes. $20. Yes.";
+    const segments = [_]TranscriptSegmentInput{
+        .{ .text = "Yeah.", .start_ms = 0, .end_ms = 500, .speaker = "A" },
+        .{ .text = "twenty dollars.", .start_ms = 500, .end_ms = 1500, .speaker = "B" },
+        .{ .text = "Yes.", .start_ms = 1500, .end_ms = 2000, .speaker = "A" },
+    };
+    const spans = try transcriptSpansFromSegmentsAlloc(alloc, text, &segments);
+    defer alloc.free(spans);
+    try std.testing.expectEqual(@as(usize, 0), spans.len);
+
+    // A phrase that occurs only once is certainly the right one, so it
+    // re-anchors the walk and what follows is timed again.
+    const recovering = [_]TranscriptSegmentInput{
+        .{ .text = "Yeah.", .start_ms = 0, .end_ms = 500, .speaker = "A" },
+        .{ .text = "twenty dollars.", .start_ms = 500, .end_ms = 1500, .speaker = "B" },
+        .{ .text = "No thanks.", .start_ms = 1500, .end_ms = 2000, .speaker = "A" },
+        .{ .text = "Bye.", .start_ms = 2000, .end_ms = 2500, .speaker = "B" },
+    };
+    const recovered = try transcriptSpansFromSegmentsAlloc(alloc, "Yes. $20. No thanks. Bye.", &recovering);
+    defer alloc.free(recovered);
+    try std.testing.expectEqual(@as(usize, 2), recovered.len);
+    try std.testing.expectEqual(@as(u32, 10), recovered[0].char_start);
+    try std.testing.expectEqual(@as(u64, 1500), recovered[0].start_ms);
+    try std.testing.expectEqual(@as(u32, 21), recovered[1].char_start);
+    try std.testing.expectEqual(@as(u64, 2000), recovered[1].start_ms);
+
+    // With every phrase located, a repeat is not ambiguous at all: the
+    // cursor says which one is meant.
+    const located = [_]TranscriptSegmentInput{
+        .{ .text = "Yes.", .start_ms = 0, .end_ms = 500, .speaker = "A" },
+        .{ .text = "$20.", .start_ms = 500, .end_ms = 1500, .speaker = "B" },
+        .{ .text = "Yes.", .start_ms = 1500, .end_ms = 2000, .speaker = "A" },
+    };
+    const all = try transcriptSpansFromSegmentsAlloc(alloc, text, &located);
+    defer alloc.free(all);
+    try std.testing.expectEqual(@as(usize, 3), all.len);
+    try std.testing.expectEqual(@as(u32, 0), all[0].char_start);
+    try std.testing.expectEqual(@as(u32, 10), all[2].char_start);
+    try std.testing.expectEqual(@as(u64, 1500), all[2].start_ms);
+}
+
+test "an unlocatable phrase costs only its own timing" {
+    const alloc = std.testing.allocator;
+    const text = "alpha alpha alpha. gamma gamma gamma.";
+    const segments = [_]TranscriptSegmentInput{
+        .{ .text = "alpha alpha alpha.", .start_ms = 0, .end_ms = 1000, .speaker = "A" },
+        // The provider reworded this one, so it appears nowhere in the text.
+        .{ .text = "beta beta beta.", .start_ms = 1000, .end_ms = 2000, .speaker = "B" },
+        .{ .text = "gamma gamma gamma.", .start_ms = 2000, .end_ms = 3000, .speaker = "A" },
+    };
+    const spans = try transcriptSpansFromSegmentsAlloc(alloc, text, &segments);
+    defer alloc.free(spans);
+
+    try std.testing.expectEqual(@as(usize, 2), spans.len);
+    try std.testing.expectEqual(@as(u32, 0), spans[0].char_start);
+    try std.testing.expectEqual(@as(u64, 2000), spans[1].start_ms);
+    try std.testing.expectEqual(@as(u32, 19), spans[1].char_start);
+    // Both located phrases are the same speaker, numbered from what was found.
+    try std.testing.expectEqual(@as(?u8, 0), spans[0].speaker_index);
+    try std.testing.expectEqual(@as(?u8, 0), spans[1].speaker_index);
+}
+
+test "diarized phrases carry their speaker into spans and chunks" {
+    const alloc = std.testing.allocator;
+    const text = "alpha alpha alpha. beta beta beta. alpha again.";
+    const segments = [_]TranscriptSegmentInput{
+        .{ .text = "alpha alpha alpha.", .start_ms = 0, .end_ms = 1000, .speaker = "SPEAKER_00" },
+        .{ .text = "beta beta beta.", .start_ms = 1000, .end_ms = 2000, .speaker = "SPEAKER_01" },
+        // A provider that labels speakers its own way is numbered the same
+        // way: in order of first appearance.
+        .{ .text = "alpha again.", .start_ms = 2000, .end_ms = 3000, .speaker = "SPEAKER_00" },
+    };
+    const spans = try transcriptSpansFromSegmentsAlloc(alloc, text, &segments);
+    defer alloc.free(spans);
+    try std.testing.expectEqual(@as(usize, 3), spans.len);
+    try std.testing.expectEqual(@as(?u8, 0), spans[0].speaker_index);
+    try std.testing.expectEqual(@as(?u8, 1), spans[1].speaker_index);
+    try std.testing.expectEqual(@as(?u8, 0), spans[2].speaker_index);
+    try std.testing.expectEqual(@as(u8, 2), transcriptSpeakerCount(spans));
+
+    var label_buf: [11]u8 = undefined;
+    try std.testing.expectEqualStrings("SPEAKER_01", speakerLabel(&label_buf, 1));
+
+    const TestChunk = struct {
+        start_offset: ?u32 = null,
+        end_offset: ?u32 = null,
+        start_time_ms: ?f32 = null,
+        end_time_ms: ?f32 = null,
+        speaker_index: ?u8 = null,
+    };
+    const unit = Unit{
+        .unit_id = @constCast("audio:000001"),
+        .unit_type = @constCast("audio"),
+        .text = @constCast(text),
+        .method = @constCast("transcription"),
+        .transcript_spans = spans,
+    };
+    var chunks = [_]TestChunk{
+        .{ .start_offset = 0, .end_offset = 18 },
+        .{ .start_offset = 19, .end_offset = 33 },
+        // Straddles the turn, so it belongs to neither speaker.
+        .{ .start_offset = 0, .end_offset = 33 },
+    };
+    applyTranscriptTiming(unit, &chunks);
+    try std.testing.expectEqual(@as(?u8, 0), chunks[0].speaker_index);
+    try std.testing.expectEqual(@as(?u8, 1), chunks[1].speaker_index);
+    try std.testing.expectEqual(@as(?u8, null), chunks[2].speaker_index);
+
+    // An undiarized transcript leaves every chunk unattributed.
+    const plain_segments = [_]TranscriptSegmentInput{
+        .{ .text = "alpha alpha alpha.", .start_ms = 0, .end_ms = 1000 },
+    };
+    const plain_spans = try transcriptSpansFromSegmentsAlloc(alloc, text, &plain_segments);
+    defer alloc.free(plain_spans);
+    try std.testing.expectEqual(@as(?u8, null), plain_spans[0].speaker_index);
+    try std.testing.expectEqual(@as(u8, 0), transcriptSpeakerCount(plain_spans));
+}
+
+test "transcript timing stamps chunks with the phrases they overlap" {
+    const TestChunk = struct {
+        start_offset: ?u32 = null,
+        end_offset: ?u32 = null,
+        start_time_ms: ?f32 = null,
+        end_time_ms: ?f32 = null,
+        speaker_index: ?u8 = null,
+    };
+    var spans = [_]TranscriptSpan{
+        .{ .char_start = 0, .char_end = 12, .start_ms = 0, .end_ms = 900 },
+        .{ .char_start = 13, .char_end = 25, .start_ms = 900, .end_ms = 1800 },
+        .{ .char_start = 26, .char_end = 36, .start_ms = 2000, .end_ms = 2600 },
+    };
+    const unit = Unit{
+        .unit_id = @constCast("audio:000001"),
+        .unit_type = @constCast("audio"),
+        .text = @constCast("Hello there. How are you? I am fine."),
+        .method = @constCast("transcription"),
+        .transcript_spans = &spans,
+    };
+    var chunks = [_]TestChunk{
+        .{ .start_offset = 0, .end_offset = 20 },
+        .{ .start_offset = 20, .end_offset = 36 },
+        .{ .start_offset = 12, .end_offset = 13 },
+        .{},
+    };
+    applyTranscriptTiming(unit, &chunks);
+    try std.testing.expectEqual(@as(?f32, 0), chunks[0].start_time_ms);
+    try std.testing.expectEqual(@as(?f32, 1800), chunks[0].end_time_ms);
+    try std.testing.expectEqual(@as(?f32, 900), chunks[1].start_time_ms);
+    try std.testing.expectEqual(@as(?f32, 2600), chunks[1].end_time_ms);
+    // The separator between phrases belongs to no span.
+    try std.testing.expectEqual(@as(?f32, null), chunks[2].start_time_ms);
+    try std.testing.expectEqual(@as(?f32, null), chunks[3].start_time_ms);
+
+    const untimed = Unit{
+        .unit_id = @constCast("document:000001"),
+        .unit_type = @constCast("document"),
+        .text = @constCast("plain"),
+        .method = @constCast("text"),
+    };
+    var plain = [_]TestChunk{.{ .start_offset = 0, .end_offset = 5 }};
+    applyTranscriptTiming(untimed, &plain);
+    try std.testing.expectEqual(@as(?f32, null), plain[0].start_time_ms);
 }

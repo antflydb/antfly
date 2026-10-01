@@ -5,6 +5,27 @@ clusters running in Standalone mode. It is separate from the Raft metadata HA pa
 hot standby is a single-primary data-plane strategy with one or more standby
 processes receiving and applying HA WAL records.
 
+## Optional activation after the first table
+
+Configure `spec.highAvailability.activationPolicy: OnFirstTable` to retain the
+HA topology without planning initial slot, seed, or promotion work until the
+primary reports a table. This policy supports asynchronous durability only;
+`RemoteWrite` and `RemoteApply` require the default `Eager` activation because
+table creation itself participates in synchronous replication.
+
+While waiting, `HAAvailable=False` and `HAAutomaticFailoverReady=False` have the
+reason `WaitingForTables`. The primary's authenticated status must explicitly
+report catalog readiness; an older runtime or unavailable observation cannot
+activate this opt-in policy. `status.haStatus.activationStarted` persists the
+transition. Existing slots, executed actions, and promotion receipts also prove
+activation, so adopting an existing topology or deleting its last table does not
+turn protection off. Normal initialization and protection conditions take over
+when seeding starts. Primary WAL capture, fencing, and configured write policy
+remain enabled throughout. This policy defers operator HA actions; it does not
+scale down separately declared cluster pods or PVCs.
+
+The default remains eager activation, including empty whole-instance seeds.
+
 ## Control Surfaces
 
 Use the typed admin API for normal automation:
@@ -210,6 +231,24 @@ the reseed action instead of silently dropping required records or holding
 unbounded retention.
 
 ### Portable seed artifacts
+
+Portable seed Job logs may contain complete leading `warning: ` diagnostic
+lines before their machine-readable receipt (including with runtime v0.2.3).
+The operator strips only those leading lines and decodes the entire remaining
+body as one receipt. Unknown activation fields, extra JSON documents, trailing
+diagnostics, and mismatched identity/digest evidence remain rejected.
+
+For a succeeded Job whose receipt was not collected, reconciliation re-reads
+its original succeeded pod logs before validating the activation target. It
+keeps the completed attempt and defers TTL cleanup until receipt evidence is
+valid; it does not rerun activation merely because the receipt is missing.
+An operator-only upgrade can recover such an attempt if the Job and its
+succeeded pod logs remain available and the topology, generation, target PVC
+incarnation, and digest bindings still match. Normal dependency and target
+cleanup reconciliation must finish before startup is authorized. If those
+logs have already been removed, this recovery path has no evidence to collect;
+do not fabricate a receipt or bypass the startup gate.
+
 
 Configure `standbys[*].seedArtifact` when the source backup and the standby do
 not share a filesystem. The same path is used for initial bootstrap and reseed:

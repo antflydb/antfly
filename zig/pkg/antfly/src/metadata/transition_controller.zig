@@ -89,6 +89,7 @@ pub const TransitionController = struct {
         record: transition_state.MergeTransitionRecord,
         observation: transition_state.MergeObservation,
     ) MergeExecutionState {
+        if (record.online != null) return .{ .tag = .replay_blocked, .next_phase = record.phase, .action = .none, .observation = observation };
         const tag = mergeTag(record, observation);
         const decision = mergeDecisionForTag(tag, record, observation);
         return .{
@@ -103,6 +104,7 @@ pub const TransitionController = struct {
         record: transition_state.MergeTransitionRecord,
         observation: transition_state.MergeObservation,
     ) TransitionDecision {
+        if (record.online != null) return .{ .next_phase = record.phase, .action = .none };
         return mergeDecisionForTag(mergeTag(record, observation), record, observation);
     }
 

@@ -1,0 +1,763 @@
+{
+  "production_source_commit": "dfaff83e8",
+  "build_head": "23e4258b5",
+  "built_from_working_tree_before_commit": true,
+  "base_main": "3ea6fcead",
+  "integration_merge": "cff4ef7be",
+  "merged_main": "a3515eb85",
+  "host": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+  "compiler": "Zig 0.16.0",
+  "components": {
+    "optimization": "ReleaseFast",
+    "allocator": "c_allocator",
+    "command": "env ANTFLY_CATALOG_REPORT_BENCH=1 zig build antfly-system-catalog-report-bench -Doptimize=ReleaseFast -j1 --summary all",
+    "rows": [
+      {
+        "kind": "COLLECTION_BENCH",
+        "groups": 100,
+        "indexed": false,
+        "p50_ms": 0.006
+      },
+      {
+        "kind": "COLLECTION_BENCH",
+        "groups": 100,
+        "indexed": true,
+        "p50_ms": 0.002
+      },
+      {
+        "kind": "COLLECTION_BENCH",
+        "groups": 1000,
+        "indexed": false,
+        "p50_ms": 0.443
+      },
+      {
+        "kind": "COLLECTION_BENCH",
+        "groups": 1000,
+        "indexed": true,
+        "p50_ms": 0.015
+      },
+      {
+        "kind": "COLLECTION_BENCH",
+        "groups": 10000,
+        "indexed": false,
+        "p50_ms": 49.923
+      },
+      {
+        "kind": "COLLECTION_BENCH",
+        "groups": 10000,
+        "indexed": true,
+        "p50_ms": 0.127
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 100,
+        "scenario": "cached_heartbeat",
+        "apply_p50_ms": 0.255,
+        "wal_bytes_per_apply": 304,
+        "full_record_bytes": 82218,
+        "command_bytes": 82224
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 100,
+        "scenario": "fresh_clocks",
+        "apply_p50_ms": 0.242,
+        "wal_bytes_per_apply": 4280,
+        "full_record_bytes": 82218,
+        "command_bytes": 82224
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 100,
+        "scenario": "one_group_change",
+        "apply_p50_ms": 0.234,
+        "wal_bytes_per_apply": 10111,
+        "full_record_bytes": 82218,
+        "command_bytes": 82224
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 100,
+        "scenario": "all_groups_change",
+        "apply_p50_ms": 0.225,
+        "wal_bytes_per_apply": 15886,
+        "full_record_bytes": 82218,
+        "command_bytes": 82224
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 100,
+        "scenario": "referenced_runtime",
+        "apply_p50_ms": 0.151,
+        "wal_bytes_per_apply": 304,
+        "full_record_bytes": 82218,
+        "command_bytes": 12424
+      },
+      {
+        "kind": "SPARSE_REPORT_BENCH",
+        "groups": 100,
+        "runtime_changed": false,
+        "apply_p50_ms": 0.131,
+        "wal_bytes_per_apply": 10232,
+        "command_bytes": 1125
+      },
+      {
+        "kind": "SPARSE_REPORT_BENCH",
+        "groups": 100,
+        "runtime_changed": true,
+        "apply_p50_ms": 0.174,
+        "wal_bytes_per_apply": 59417,
+        "command_bytes": 1125
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 100,
+        "full_store_read_p50_ms": 0.036
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 100,
+        "full_store_read_allocations": 412,
+        "full_store_read_allocated_bytes": 114887
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 100,
+        "placement_drain_read_p50_ms": 0.0065
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 1000,
+        "scenario": "cached_heartbeat",
+        "apply_p50_ms": 1.298,
+        "wal_bytes_per_apply": 304,
+        "full_record_bytes": 821118,
+        "command_bytes": 821124
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 1000,
+        "scenario": "fresh_clocks",
+        "apply_p50_ms": 1.132,
+        "wal_bytes_per_apply": 35324,
+        "full_record_bytes": 821118,
+        "command_bytes": 821124
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 1000,
+        "scenario": "one_group_change",
+        "apply_p50_ms": 1.163,
+        "wal_bytes_per_apply": 10111,
+        "full_record_bytes": 821118,
+        "command_bytes": 821124
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 1000,
+        "scenario": "all_groups_change",
+        "apply_p50_ms": 1.129,
+        "wal_bytes_per_apply": 153766,
+        "full_record_bytes": 821118,
+        "command_bytes": 821124
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 1000,
+        "scenario": "referenced_runtime",
+        "apply_p50_ms": 0.455,
+        "wal_bytes_per_apply": 304,
+        "full_record_bytes": 821118,
+        "command_bytes": 123124
+      },
+      {
+        "kind": "SPARSE_REPORT_BENCH",
+        "groups": 1000,
+        "runtime_changed": false,
+        "apply_p50_ms": 0.152,
+        "wal_bytes_per_apply": 10232,
+        "command_bytes": 1125
+      },
+      {
+        "kind": "SPARSE_REPORT_BENCH",
+        "groups": 1000,
+        "runtime_changed": true,
+        "apply_p50_ms": 0.176,
+        "wal_bytes_per_apply": 59417,
+        "command_bytes": 1125
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 1000,
+        "full_store_read_p50_ms": 0.311
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 1000,
+        "full_store_read_allocations": 4014,
+        "full_store_read_allocated_bytes": 1216197
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 1000,
+        "placement_drain_read_p50_ms": 0.00625
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 10000,
+        "scenario": "cached_heartbeat",
+        "apply_p50_ms": 14.966,
+        "wal_bytes_per_apply": 304,
+        "full_record_bytes": 8210118,
+        "command_bytes": 8210124
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 10000,
+        "scenario": "fresh_clocks",
+        "apply_p50_ms": 20.043,
+        "wal_bytes_per_apply": 347228,
+        "full_record_bytes": 8210118,
+        "command_bytes": 8210124
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 10000,
+        "scenario": "one_group_change",
+        "apply_p50_ms": 16.297,
+        "wal_bytes_per_apply": 10111,
+        "full_record_bytes": 8210118,
+        "command_bytes": 8210124
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 10000,
+        "scenario": "all_groups_change",
+        "apply_p50_ms": 20.331,
+        "wal_bytes_per_apply": 1533295,
+        "full_record_bytes": 8210118,
+        "command_bytes": 8210124
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 10000,
+        "scenario": "referenced_runtime",
+        "apply_p50_ms": 7.991,
+        "wal_bytes_per_apply": 304,
+        "full_record_bytes": 8210118,
+        "command_bytes": 1230124
+      },
+      {
+        "kind": "SPARSE_REPORT_BENCH",
+        "groups": 10000,
+        "runtime_changed": false,
+        "apply_p50_ms": 0.168,
+        "wal_bytes_per_apply": 10232,
+        "command_bytes": 1125
+      },
+      {
+        "kind": "SPARSE_REPORT_BENCH",
+        "groups": 10000,
+        "runtime_changed": true,
+        "apply_p50_ms": 0.179,
+        "wal_bytes_per_apply": 59417,
+        "command_bytes": 1125
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 10000,
+        "full_store_read_p50_ms": 3.632
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 10000,
+        "full_store_read_allocations": 40015,
+        "full_store_read_allocated_bytes": 12609697
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 10000,
+        "placement_drain_read_p50_ms": 0.00565
+      },
+      {
+        "kind": "REPAIR_ADMISSION_BENCH",
+        "groups": 1000,
+        "repair": false,
+        "p50_ms": 0.001
+      },
+      {
+        "kind": "REPAIR_ADMISSION_BENCH",
+        "groups": 1000,
+        "repair": true,
+        "p50_ms": 0.557
+      },
+      {
+        "kind": "REPAIR_ADMISSION_BENCH",
+        "groups": 10000,
+        "repair": false,
+        "p50_ms": 0.011
+      },
+      {
+        "kind": "REPAIR_ADMISSION_BENCH",
+        "groups": 10000,
+        "repair": true,
+        "p50_ms": 5.525
+      },
+      {
+        "kind": "PUBLISHER_BENCH",
+        "groups": 100,
+        "sparse": false,
+        "p50_ms": 0.234,
+        "http_bytes": 361351
+      },
+      {
+        "kind": "PUBLISHER_BENCH",
+        "groups": 100,
+        "sparse": true,
+        "p50_ms": 0.014,
+        "http_bytes": 4262
+      },
+      {
+        "kind": "PUBLISHER_BENCH",
+        "groups": 1000,
+        "sparse": false,
+        "p50_ms": 2.623,
+        "http_bytes": 3610552
+      },
+      {
+        "kind": "PUBLISHER_BENCH",
+        "groups": 1000,
+        "sparse": true,
+        "p50_ms": 0.111,
+        "http_bytes": 4262
+      },
+      {
+        "kind": "PUBLISHER_BENCH",
+        "groups": 10000,
+        "sparse": false,
+        "p50_ms": 24.942,
+        "http_bytes": 36127753
+      },
+      {
+        "kind": "PUBLISHER_BENCH",
+        "groups": 10000,
+        "sparse": true,
+        "p50_ms": 1.337,
+        "http_bytes": 4262
+      },
+      {
+        "kind": "ACTIVITY_BENCH",
+        "groups": 1000,
+        "compact": false,
+        "p50_ms": 2.571,
+        "total_http_bytes": 3903907,
+        "max_request_bytes": 3903907,
+        "requests": 1
+      },
+      {
+        "kind": "ACTIVITY_BENCH",
+        "groups": 1000,
+        "compact": true,
+        "p50_ms": 0.309,
+        "total_http_bytes": 293457,
+        "max_request_bytes": 150178,
+        "requests": 2
+      },
+      {
+        "kind": "ACTIVITY_BENCH",
+        "groups": 10000,
+        "compact": false,
+        "p50_ms": 25.757,
+        "total_http_bytes": 39048908,
+        "max_request_bytes": 39048908,
+        "requests": 1
+      },
+      {
+        "kind": "ACTIVITY_BENCH",
+        "groups": 10000,
+        "compact": true,
+        "p50_ms": 3.402,
+        "total_http_bytes": 2944534,
+        "max_request_bytes": 150798,
+        "requests": 20
+      },
+      {
+        "kind": "ADMISSION_CACHE_BENCH",
+        "stores": 1,
+        "groups_per_store": 100,
+        "selected": false,
+        "p50_ms": 0.042
+      },
+      {
+        "kind": "ADMISSION_CACHE_BENCH",
+        "stores": 1,
+        "groups_per_store": 100,
+        "selected": true,
+        "p50_ms": 0.037
+      },
+      {
+        "kind": "ADMISSION_CACHE_BENCH",
+        "stores": 10,
+        "groups_per_store": 100,
+        "selected": false,
+        "p50_ms": 0.335
+      },
+      {
+        "kind": "ADMISSION_CACHE_BENCH",
+        "stores": 10,
+        "groups_per_store": 100,
+        "selected": true,
+        "p50_ms": 0.032
+      },
+      {
+        "kind": "ADMISSION_CACHE_BENCH",
+        "stores": 100,
+        "groups_per_store": 100,
+        "selected": false,
+        "p50_ms": 2.274
+      },
+      {
+        "kind": "ADMISSION_CACHE_BENCH",
+        "stores": 100,
+        "groups_per_store": 100,
+        "selected": true,
+        "p50_ms": 0.018
+      },
+      {
+        "kind": "ADMISSION_PLAN_BENCH",
+        "groups": 100,
+        "header_change": false,
+        "single_pass": false,
+        "p50_ms": 0.156,
+        "allocations": 763
+      },
+      {
+        "kind": "ADMISSION_PLAN_BENCH",
+        "groups": 100,
+        "header_change": false,
+        "single_pass": true,
+        "p50_ms": 0.063,
+        "allocations": 33
+      },
+      {
+        "kind": "ADMISSION_PLAN_BENCH",
+        "groups": 100,
+        "header_change": true,
+        "single_pass": false,
+        "p50_ms": 0.155,
+        "allocations": 1465
+      },
+      {
+        "kind": "ADMISSION_PLAN_BENCH",
+        "groups": 100,
+        "header_change": true,
+        "single_pass": true,
+        "p50_ms": 0.079,
+        "allocations": 736
+      },
+      {
+        "kind": "ADMISSION_PLAN_BENCH",
+        "groups": 1000,
+        "header_change": false,
+        "single_pass": false,
+        "p50_ms": 1.703,
+        "allocations": 7111
+      },
+      {
+        "kind": "ADMISSION_PLAN_BENCH",
+        "groups": 1000,
+        "header_change": false,
+        "single_pass": true,
+        "p50_ms": 0.71,
+        "allocations": 57
+      },
+      {
+        "kind": "ADMISSION_PLAN_BENCH",
+        "groups": 1000,
+        "header_change": true,
+        "single_pass": false,
+        "p50_ms": 1.594,
+        "allocations": 14113
+      },
+      {
+        "kind": "ADMISSION_PLAN_BENCH",
+        "groups": 1000,
+        "header_change": true,
+        "single_pass": true,
+        "p50_ms": 0.76,
+        "allocations": 7060
+      },
+      {
+        "kind": "ADMISSION_PLAN_BENCH",
+        "groups": 10000,
+        "header_change": false,
+        "single_pass": false,
+        "p50_ms": 13.637,
+        "allocations": 70147
+      },
+      {
+        "kind": "ADMISSION_PLAN_BENCH",
+        "groups": 10000,
+        "header_change": false,
+        "single_pass": true,
+        "p50_ms": 5.947,
+        "allocations": 75
+      },
+      {
+        "kind": "ADMISSION_PLAN_BENCH",
+        "groups": 10000,
+        "header_change": true,
+        "single_pass": false,
+        "p50_ms": 14.076,
+        "allocations": 140149
+      },
+      {
+        "kind": "ADMISSION_PLAN_BENCH",
+        "groups": 10000,
+        "header_change": true,
+        "single_pass": true,
+        "p50_ms": 7.369,
+        "allocations": 70078
+      },
+      {
+        "kind": "RECONCILE_VIEW_BENCH",
+        "stores": 1,
+        "groups_per_store": 100,
+        "shared": false,
+        "p50_ms": 0.013
+      },
+      {
+        "kind": "RECONCILE_VIEW_BENCH",
+        "stores": 1,
+        "groups_per_store": 100,
+        "shared": true,
+        "p50_ms": 3.7e-05
+      },
+      {
+        "kind": "RECONCILE_VIEW_BENCH",
+        "stores": 10,
+        "groups_per_store": 100,
+        "shared": false,
+        "p50_ms": 0.133
+      },
+      {
+        "kind": "RECONCILE_VIEW_BENCH",
+        "stores": 10,
+        "groups_per_store": 100,
+        "shared": true,
+        "p50_ms": 0.000113
+      },
+      {
+        "kind": "RECONCILE_VIEW_BENCH",
+        "stores": 100,
+        "groups_per_store": 100,
+        "shared": false,
+        "p50_ms": 1.477
+      },
+      {
+        "kind": "RECONCILE_VIEW_BENCH",
+        "stores": 100,
+        "groups_per_store": 100,
+        "shared": true,
+        "p50_ms": 0.001191
+      },
+      {
+        "kind": "GROUP_CACHE_BENCH",
+        "groups": 100,
+        "sparse": false,
+        "refresh_p50_ms": 0.033,
+        "allocations": 920
+      },
+      {
+        "kind": "GROUP_CACHE_BENCH",
+        "groups": 100,
+        "sparse": true,
+        "refresh_p50_ms": 0.006,
+        "allocations": 24
+      },
+      {
+        "kind": "GROUP_CACHE_BENCH",
+        "groups": 1000,
+        "sparse": false,
+        "refresh_p50_ms": 0.342,
+        "allocations": 9028
+      },
+      {
+        "kind": "GROUP_CACHE_BENCH",
+        "groups": 1000,
+        "sparse": true,
+        "refresh_p50_ms": 0.058,
+        "allocations": 29
+      },
+      {
+        "kind": "GROUP_CACHE_BENCH",
+        "groups": 10000,
+        "sparse": false,
+        "refresh_p50_ms": 5.23,
+        "allocations": 90037
+      },
+      {
+        "kind": "GROUP_CACHE_BENCH",
+        "groups": 10000,
+        "sparse": true,
+        "refresh_p50_ms": 2.107,
+        "allocations": 32
+      }
+    ]
+  },
+  "cluster": {
+    "optimization": "Debug",
+    "before": {
+      "binary_sha256": "b31c035c96cd50f591e27fc1c58f96da41dae9f5b8524fbeee34593faa274eea",
+      "workload": {
+        "startup_ms": 3766.2141248583794,
+        "reporters": 8,
+        "groups_per_reporter": 100,
+        "wire": "previous",
+        "metadata_replicas": 3,
+        "checkpoints": [
+          {
+            "mode": "runtime_changes",
+            "reports": {
+              "samples": 240,
+              "p50_ms": 123.8853545,
+              "p95_ms": 990.835416,
+              "max_ms": 3015.149
+            },
+            "reports_per_second": 23.570542456146406,
+            "namespace_create_drop": {
+              "samples": 30,
+              "p50_ms": 192.40358300000003,
+              "p95_ms": 1186.68925,
+              "max_ms": 1209.7885
+            }
+          },
+          {
+            "mode": "activity_only",
+            "reports": {
+              "samples": 240,
+              "p50_ms": 78.96697950000001,
+              "p95_ms": 635.02425,
+              "max_ms": 1830.273
+            },
+            "reports_per_second": 37.052815932727036,
+            "namespace_create_drop": {
+              "samples": 30,
+              "p50_ms": 159.061896,
+              "p95_ms": 1053.638958,
+              "max_ms": 1620.400958
+            }
+          }
+        ]
+      }
+    },
+    "after": {
+      "binary_sha256": "3321911220555a36a19d5a1bae0560f60a12586061a25e322275b31ae62c5cb8",
+      "workload": {
+        "startup_ms": 5740.269916597754,
+        "reporters": 8,
+        "groups_per_reporter": 100,
+        "wire": "compact",
+        "metadata_replicas": 3,
+        "checkpoints": [
+          {
+            "mode": "runtime_changes",
+            "reports": {
+              "samples": 240,
+              "p50_ms": 98.385354,
+              "p95_ms": 163.4995,
+              "max_ms": 226.012042
+            },
+            "reports_per_second": 72.96340053581632,
+            "namespace_create_drop": {
+              "samples": 30,
+              "p50_ms": 119.0373955,
+              "p95_ms": 202.978875,
+              "max_ms": 224.848834
+            }
+          },
+          {
+            "mode": "activity_only",
+            "reports": {
+              "samples": 240,
+              "p50_ms": 49.622271,
+              "p95_ms": 79.371917,
+              "max_ms": 132.515542
+            },
+            "reports_per_second": 161.97906932956178,
+            "namespace_create_drop": {
+              "samples": 30,
+              "p50_ms": 102.4809165,
+              "p95_ms": 132.006209,
+              "max_ms": 132.4405
+            }
+          }
+        ]
+      }
+    },
+    "merged_verification": {
+      "binary_sha256": "488c4ad1eeef201b6b7ce143caeb74cfd253e2177cf3823cbf79ecd4716c5111",
+      "workload": {
+        "startup_ms": 3737.5047500245273,
+        "reporters": 8,
+        "groups_per_reporter": 100,
+        "wire": "compact",
+        "metadata_replicas": 3,
+        "checkpoints": [
+          {
+            "mode": "runtime_changes",
+            "reports": {
+              "samples": 240,
+              "p50_ms": 102.6968335,
+              "p95_ms": 152.739625,
+              "max_ms": 196.475833
+            },
+            "reports_per_second": 75.10581608724831,
+            "namespace_create_drop": {
+              "samples": 30,
+              "p50_ms": 130.53170849999998,
+              "p95_ms": 166.850291,
+              "max_ms": 174.297542
+            }
+          },
+          {
+            "mode": "activity_only",
+            "reports": {
+              "samples": 240,
+              "p50_ms": 52.456396,
+              "p95_ms": 79.023625,
+              "max_ms": 131.338167
+            },
+            "reports_per_second": 138.30094980486373,
+            "namespace_create_drop": {
+              "samples": 30,
+              "p50_ms": 105.8900415,
+              "p95_ms": 135.819667,
+              "max_ms": 156.783667
+            }
+          }
+        ]
+      }
+    }
+  },
+  "limitations": [
+    "Component comparisons use the same binary; full cache refresh includes cloning and immutable lease publication, not storage reads.",
+    "The cluster runs were sequential with no task-owned compilation or E2Es running; unrelated host activity and thermal state were uncontrolled.",
+    "Cluster setup is excluded. Results include Python HTTP client and metadata leader-discovery overhead. No warmup is discarded.",
+    "Each cluster case has 240 successful reports and 30 namespace create/drop pairs. Stores are synthetic and non-live; three real metadata replicas process their reports.",
+    "These paired measurements precede merge cff4ef7be, keeping main constant at 3ea6fcead. The merged branch is verified separately.",
+    "The full inventory JSON limit remains 32 MiB. Compact telemetry batches do not change full-baseline transfer semantics.",
+    "Sparse cache publication retains nested group payloads but still rebuilds flat arrays and group maps; it is not O(1) in total group count."
+  ],
+  "validation": {
+    "merged_head": "cff4ef7be",
+    "storage_tests": 84,
+    "catalog_tests": 37,
+    "catalog_transport_tests": 9,
+    "metadata_service_tests": 129,
+    "catalog_api_tests": 60,
+    "component_test_executions_before_merge": 22,
+    "merged_e2es": 21,
+    "selections_overlap": true
+  }
+}

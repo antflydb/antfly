@@ -63,12 +63,12 @@ pub const RecoverableRetryStats = struct {
 };
 
 pub const RecoverableRetryCounters = struct {
-    total: std.atomic.Value(u64) = .init(0),
-    writer_locked: std.atomic.Value(u64) = .init(0),
-    resource_budget: std.atomic.Value(u64) = .init(0),
-    replay_document_not_visible: std.atomic.Value(u64) = .init(0),
-    artifact_repair_required: std.atomic.Value(u64) = .init(0),
-    not_found: std.atomic.Value(u64) = .init(0),
+    total: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    writer_locked: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    resource_budget: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    replay_document_not_visible: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    artifact_repair_required: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    not_found: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
     pub fn record(self: *@This(), err: anyerror) void {
         _ = self.total.fetchAdd(1, .monotonic);

@@ -14,6 +14,7 @@
 
 //! Host-owned replaceable inference process. Only wire values cross the pipes.
 const std = @import("std");
+const builtin = @import("builtin");
 const rpc = @import("inference_worker_rpc.zig");
 pub const wire = @import("inference_worker_wire.zig");
 const bridge = @import("inference_bridge.zig");
@@ -224,7 +225,7 @@ pub const Client = struct {
         if (self.budget == null) return error.ResourceOwnerNotConfigured;
         const worker = try self.alloc.create(Worker);
         errdefer self.alloc.destroy(worker);
-        const executable = try std.process.executablePathAlloc(self.io, self.alloc);
+        const executable = try resolveWorkerExecutable(self.alloc, self.io);
         defer self.alloc.free(executable);
         const child = try std.process.spawn(self.io, .{
             .argv = &.{ executable, "inference", "_worker" },
@@ -310,6 +311,96 @@ fn callSegments(endpoint: *rpc.Endpoint, operation: wire.Operation, options: []c
     defer parsed.deinit();
     if (!parsed.value.status.isOk()) return bridge.errorFromStatus(parsed.value.status);
     return response;
+}
+
+/// Explicit override for the worker executable. Takes priority over every
+/// other resolution step; see `resolveWorkerExecutable`.
+const worker_executable_env = "ANTFLY_INFERENCE_WORKER";
+const antfly_binary_name = if (builtin.target.os.tag == .windows) "antfly.exe" else "antfly";
+
+/// Layout shared by glibc, musl, and Darwin's libc; sufficient to recover the
+/// path of the image an address was loaded from.
+const DlInfo = extern struct {
+    fname: [*:0]const u8,
+    fbase: ?*anyopaque,
+    sname: ?[*:0]const u8,
+    saddr: ?*anyopaque,
+};
+extern "c" fn dladdr(addr: ?*const anyopaque, info: *DlInfo) c_int;
+
+fn isSharedLibraryName(name: []const u8) bool {
+    return std.mem.endsWith(u8, name, ".dylib") or
+        std.mem.endsWith(u8, name, ".so") or
+        std.mem.indexOf(u8, name, ".so.") != null or
+        std.mem.endsWith(u8, name, ".dll");
+}
+
+fn fileExists(io: std.Io, path: []const u8) bool {
+    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return true;
+}
+
+/// Path of the image (shared library or main executable) this code was
+/// loaded from, independent of argv[0] -- which belongs to whatever process
+/// linked libantfly and is meaningless as a worker executable candidate.
+fn selfImagePathAlloc(alloc: std.mem.Allocator) ![]u8 {
+    if (comptime !builtin.link_libc) return error.Unsupported;
+    var info: DlInfo = undefined;
+    const anchor: *const anyopaque = @ptrCast(&selfImagePathAlloc);
+    if (dladdr(anchor, &info) == 0) return error.Unsupported;
+    return alloc.dupe(u8, std.mem.sliceTo(info.fname, 0));
+}
+
+fn findOnPathAlloc(alloc: std.mem.Allocator, io: std.Io, name: []const u8) !?[]u8 {
+    const path_var = platform.env.getenvSlice("PATH") orelse return null;
+    const sep: u8 = if (builtin.target.os.tag == .windows) ';' else ':';
+    var it = std.mem.tokenizeScalar(u8, path_var, sep);
+    while (it.next()) |dir| {
+        const candidate = try std.fs.path.join(alloc, &.{ dir, name });
+        if (fileExists(io, candidate)) return candidate;
+        alloc.free(candidate);
+    }
+    return null;
+}
+
+/// Resolves the executable used to spawn the sandboxed inference worker
+/// (`<exe> inference _worker`, host-owned and replaceable so a crashing GPU
+/// driver call or unabortable native session load cannot take the caller
+/// down with it -- see `BackendRuntime.requiresProcessIsolation`). The
+/// `antfly` CLI binary re-execs itself, which is correct: `argv[0]` names the
+/// `antfly` binary the user launched. A library host (libantfly linked into a
+/// Go test binary, `examples/dogfood`, or any other consumer) has no such
+/// self: its `argv[0]` is the host binary, not an `antfly` executable that
+/// understands `inference _worker`. Resolution order:
+///
+///  1. `ANTFLY_INFERENCE_WORKER`, an explicit override naming the worker
+///     executable directly.
+///  2. The image this code was loaded from, via `dladdr`: for the statically
+///     linked `antfly` binary this resolves to itself (unchanged behavior);
+///     for a shared `libantfly`, it resolves to the `.dylib`/`.so`, next to
+///     which we look for a sibling `antfly` binary.
+///  3. `antfly` on `PATH`.
+fn resolveWorkerExecutable(alloc: std.mem.Allocator, io: std.Io) ![]u8 {
+    if (platform.env.getenvSlice(worker_executable_env)) |override| {
+        if (override.len == 0) return error.InferenceWorkerExecutableNotConfigured;
+        return alloc.dupe(u8, override);
+    }
+    if (selfImagePathAlloc(alloc)) |self_path| {
+        defer alloc.free(self_path);
+        const basename = std.fs.path.basename(self_path);
+        if (!isSharedLibraryName(basename)) return alloc.dupe(u8, self_path);
+        const dir = std.fs.path.dirname(self_path) orelse ".";
+        const candidate = try std.fs.path.join(alloc, &.{ dir, antfly_binary_name });
+        if (fileExists(io, candidate)) return candidate;
+        alloc.free(candidate);
+    } else |_| {}
+    if (try findOnPathAlloc(alloc, io, antfly_binary_name)) |path| return path;
+    std.log.err(
+        "no inference worker executable found for the embedded runtime; set {s} to the path " ++
+            "of the `antfly` binary, or place an `antfly` binary next to the loaded libantfly or on PATH",
+        .{worker_executable_env},
+    );
+    return error.InferenceWorkerExecutableNotConfigured;
 }
 
 fn call(endpoint: *rpc.Endpoint, operation: wire.Operation, data: []const u8, control: rpc.Control) ![]u8 {

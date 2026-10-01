@@ -32,6 +32,34 @@ def positive_finite(value: Any) -> bool:
     )
 
 
+def restart_recall_comparison(rows, before_label, cold_label, warm_label):
+    """Compare recovery on unchanged data, independently of pre-churn recall."""
+    recalls = {}
+    for label in (before_label, cold_label, warm_label):
+        matches = [row for row in rows if row.get("label") == label]
+        if len(matches) != 1:
+            raise ValueError(
+                f"expected one recall result for {label}, got {len(matches)}"
+            )
+        recall = matches[0].get("recall")
+        if not positive_finite(recall) or recall > 1:
+            raise ValueError(f"invalid recall for {label}: {recall}")
+        recalls[label] = recall
+    before = recalls[before_label]
+    cold_delta = recalls[cold_label] - before
+    warm_delta = recalls[warm_label] - before
+    return {
+        "before_restart_recall": before,
+        "cold_recall": recalls[cold_label],
+        "warm_recall": recalls[warm_label],
+        "cold_delta": cold_delta,
+        "warm_delta": warm_delta,
+        # Allow one unit at the client's four-decimal reporting precision.
+        "tolerance": 0.0001,
+        "qualified": max(abs(cold_delta), abs(warm_delta)) <= 0.0001 + 1e-12,
+    }
+
+
 def validate_metrics(
     result: dict[str, Any],
     expected_load_count: int,

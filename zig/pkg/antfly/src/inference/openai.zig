@@ -31,6 +31,9 @@ pub const Provider = struct {
     tools_json: ?[]const u8 = null,
     tool_choice_json: ?[]const u8 = null,
     max_tokens: ?i64 = null,
+    use_openai_schema: bool = false,
+    max_completion_tokens: ?i64 = null,
+    reasoning_effort: ?[]const u8 = null,
     temperature: ?f32 = null,
     top_p: ?f32 = null,
     top_k: ?i64 = null,
@@ -77,6 +80,12 @@ pub const Provider = struct {
 
     pub fn setMaxTokens(self: *Provider, max_tokens: i64) void {
         self.max_tokens = max_tokens;
+    }
+
+    pub fn setCompletionOptions(self: *Provider, max_completion_tokens: ?i64, reasoning_effort: ?[]const u8) void {
+        self.use_openai_schema = true;
+        self.max_completion_tokens = max_completion_tokens;
+        self.reasoning_effort = reasoning_effort;
     }
 
     pub fn setMaxResponseBytes(self: *Provider, max_response_bytes: ?usize) void {
@@ -171,6 +180,76 @@ pub const Provider = struct {
         };
     }
 
+    /// Use the upstream generated request for OpenAI. Compatible servers retain
+    /// the shared wire encoder and their non-OpenAI sampling extensions.
+    fn chatRequestJsonAlloc(self: *const Provider, alloc: std.mem.Allocator, model: []const u8, messages: []const inference.ChatMessage) ![]u8 {
+        const options = inference.ChatRequestOptions{
+            .tools_json = self.tools_json,
+            .tool_choice_json = self.tool_choice_json,
+            .max_tokens = self.max_tokens,
+            .temperature = self.temperature,
+            .top_p = self.top_p,
+            .top_k = self.top_k,
+            .frequency_penalty = self.frequency_penalty,
+            .presence_penalty = self.presence_penalty,
+        };
+        if (!self.use_openai_schema) return inference.chatRequestJsonWithOptionsAlloc(alloc, model, messages, .openai_compatible, options);
+
+        // Reuse multimodal/tool message adaptation, then let the generated
+        // upstream type own provider parameter names and optional-field encoding.
+        const envelope = try inference.chatRequestJsonWithOptionsAlloc(alloc, model, messages, .openai_compatible, .{
+            .tools_json = self.tools_json,
+            .tool_choice_json = self.tool_choice_json,
+        });
+        defer alloc.free(envelope);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, envelope, .{});
+        defer parsed.deinit();
+        const wire_messages = try alloc.alloc(openai_api.types.ChatCompletionRequestMessage, messages.len);
+        defer alloc.free(wire_messages);
+        for (messages, parsed.value.object.get("messages").?.array.items, wire_messages) |message, raw, *wire| {
+            const obj = raw.object;
+            const content = obj.get("content") orelse .null;
+            // Construct the generated union directly: its schema discriminator
+            // names are not the role strings used by Chat Completions.
+            wire.* = switch (message.role) {
+                .system => .{ .chat_completion_request_system_message = .{ .role = "system", .content = content } },
+                .user => .{ .chat_completion_request_user_message = .{ .role = "user", .content = content } },
+                .assistant => .{ .chat_completion_request_assistant_message = .{
+                    .role = "assistant",
+                    .content = obj.get("content"),
+                    .tool_calls = if (obj.get("tool_calls")) |calls| calls.array.items else null,
+                } },
+                .tool => .{ .chat_completion_request_tool_message = .{
+                    .role = "tool",
+                    .content = content,
+                    .tool_call_id = message.tool_call_id orelse return error.InvalidGeneratorConfig,
+                } },
+            };
+        }
+        var request = openai_api.types.CreateChatCompletionRequest{
+            .model = .{ .string = model },
+            .messages = wire_messages,
+            .tools = if (parsed.value.object.get("tools")) |tools| tools.array.items else null,
+            .tool_choice = parsed.value.object.get("tool_choice"),
+        };
+        if (self.max_completion_tokens) |limit| {
+            request.max_completion_tokens = .{ .value = limit };
+        } else if (self.max_tokens) |limit| request.max_tokens = .{ .value = limit };
+        if (self.reasoning_effort) |effort| request.reasoning_effort = .{ .string = effort };
+        if (self.temperature) |value| request.temperature = .{ .float = value };
+        if (self.top_p) |value| request.top_p = .{ .float = value };
+        if (self.frequency_penalty) |value| request.frequency_penalty = .{ .value = value };
+        if (self.presence_penalty) |value| request.presence_penalty = .{ .value = value };
+        const encoded = try httpx.json.Json.stringify(alloc, request);
+        // Some custom OpenAI endpoints accept top_k, which is not in the
+        // upstream schema. Preserve that existing opt-in extension.
+        if (self.top_k) |value| {
+            defer alloc.free(encoded);
+            return std.fmt.allocPrint(alloc, "{s},\"top_k\":{d}}}", .{ encoded[0 .. encoded.len - 1], value });
+        }
+        return encoded;
+    }
+
     fn generateImpl(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, messages: []const inference.ChatMessage) anyerror!inference.GenerateResult {
         const self: *Provider = @ptrCast(@alignCast(ptr));
 
@@ -191,16 +270,7 @@ pub const Provider = struct {
 
         const url = try std.fmt.allocPrint(self.allocator, "{s}/chat/completions", .{self.base_url});
         defer self.allocator.free(url);
-        const json_body = try inference.chatRequestJsonWithOptionsAlloc(self.allocator, model, messages, .openai_compatible, .{
-            .tools_json = self.tools_json,
-            .tool_choice_json = self.tool_choice_json,
-            .max_tokens = self.max_tokens,
-            .temperature = self.temperature,
-            .top_p = self.top_p,
-            .top_k = self.top_k,
-            .frequency_penalty = self.frequency_penalty,
-            .presence_penalty = self.presence_penalty,
-        });
+        const json_body = try self.chatRequestJsonAlloc(self.allocator, model, messages);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{
             .attempt_observer = self.attempt_observer,

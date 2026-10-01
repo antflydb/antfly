@@ -140,7 +140,7 @@ pub const SegmentShared = struct {
     /// intact when this transitions to cold; only clean file-backed pages are
     /// advised away. A subsequent query marks the segment resident again.
     mapped_residency_state: std.atomic.Value(u8) = .init(mapped_residency_cold),
-    last_mapped_access_ns: std.atomic.Value(u64) = .init(0),
+    last_mapped_access_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
     active_mapped_readers: std.atomic.Value(u32) = .init(0),
     /// Deletion bitmap shared by every snapshot referencing this segment.
     /// `deletion_lock` protects the bitmap's reallocatable containers. The
@@ -227,11 +227,19 @@ pub const TypedDocValuesFieldCoverage = struct {
         // The winner can spend meaningful time validating and decompressing a
         // large column. Park concurrent request workers instead of repeatedly
         // yielding them for the duration of that scan.
-        std.Io.Threaded.mutexLock(&self.initialization_mutex);
+        if (comptime builtin.os.tag == .freestanding) {
+            self.initialization_mutex.lockUncancelable(.failing);
+        } else {
+            std.Io.Threaded.mutexLock(&self.initialization_mutex);
+        }
     }
 
     fn unlockInitialization(self: *TypedDocValuesFieldCoverage) void {
-        std.Io.Threaded.mutexUnlock(&self.initialization_mutex);
+        if (comptime builtin.os.tag == .freestanding) {
+            self.initialization_mutex.unlock(.failing);
+        } else {
+            std.Io.Threaded.mutexUnlock(&self.initialization_mutex);
+        }
     }
 
     fn status(self: *const TypedDocValuesFieldCoverage) TypedDocValuesCoverageStatus {
@@ -1398,7 +1406,7 @@ pub const IndexWriter = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     mapped_residency_mu: std.atomic.Mutex,
     mapped_residency_accounted_bytes: u64,
-    mapped_residency_next_check_ns: std.atomic.Value(u64),
+    mapped_residency_next_check_ns: @import("antfly_platform").atomic.Value(u64),
     mapped_residency_evictions: u64,
 
     /// A completely allocated replacement snapshot held behind the writer
@@ -2060,8 +2068,16 @@ pub const IndexWriter = struct {
             idx += 1;
         }
 
-        var global_field_lens = try self.buildGlobalFieldLens(new_segments);
+        // Appends retain every old segment, so their field-name storage and
+        // aggregate totals remain valid. Read only the newly added segments.
+        var global_field_lens = if (old_ids.len == 0)
+            try cloneGlobalFieldLens(self.alloc, old.global_total_field_len)
+        else
+            try self.buildGlobalFieldLens(new_segments);
         errdefer global_field_lens.deinit(self.alloc);
+        if (old_ids.len == 0) for (replacement_readers) |*reader| {
+            try addSegmentFieldLens(self.alloc, &global_field_lens, reader);
+        };
         const new_snap = try self.alloc.create(IndexSnapshot);
         new_snap.* = .{
             .alloc = self.alloc,
@@ -2671,7 +2687,8 @@ test "multi-segment search merges per-segment top-k globally" {
     defer alloc.free(results.hits);
 
     try std.testing.expectEqual(@as(usize, 2), results.hits.len);
-    try std.testing.expectEqual(scorer_mod.TotalHitsRelation.gte, results.total_relation);
+    try std.testing.expectEqual(@as(u32, 4), results.total_count);
+    try std.testing.expectEqual(scorer_mod.TotalHitsRelation.exact, results.total_relation);
     try std.testing.expectEqual(@as(u32, 0), results.hits[0].doc_id);
     try std.testing.expectEqual(@as(u32, 2), results.hits[1].doc_id);
     try std.testing.expect(results.hits[0].score >= results.hits[1].score);

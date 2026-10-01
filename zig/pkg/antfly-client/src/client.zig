@@ -17,6 +17,9 @@ const openapi = @import("antfly_client_openapi");
 const httpx = @import("httpx");
 
 const retrieval_agent_timeout_ms = 300_000;
+/// Research runs and job advances are bounded by the request's declared
+/// budget (at most 30 minutes); allow that plus transport slack.
+const research_agent_timeout_ms = 1_860_000;
 
 pub const ApiError = struct {
     status_code: u16,
@@ -35,6 +38,8 @@ pub const ApiError = struct {
 pub const AntflyClient = struct {
     inner: openapi.Client,
     allocator: std.mem.Allocator,
+    /// Borrowed explicit scope for table operations; table names stay literal.
+    catalog_scope: ?struct { database: []const u8 = "default", namespace: []const u8 = "public" } = null,
 
     pub fn init(allocator: std.mem.Allocator, http: *httpx.Client, base_url: []const u8) !AntflyClient {
         // Store the server root URL. The generated public client owns the
@@ -87,22 +92,41 @@ pub const AntflyClient = struct {
         self.inner.auth_header = .{ "Authorization", header_val };
     }
 
+    pub fn tablePathAlloc(self: *const AntflyClient, table: []const u8) ![]u8 {
+        const name = try httpx.PercentEncoding.encode(self.allocator, table);
+        defer self.allocator.free(name);
+        if (self.catalog_scope) |scope| {
+            const database = try httpx.PercentEncoding.encode(self.allocator, scope.database);
+            defer self.allocator.free(database);
+            const namespace = try httpx.PercentEncoding.encode(self.allocator, scope.namespace);
+            defer self.allocator.free(namespace);
+            return std.fmt.allocPrint(self.allocator, "/db/v1/databases/{s}/namespaces/{s}/tables/{s}", .{ database, namespace, name });
+        }
+        return std.fmt.allocPrint(self.allocator, "/db/v1/tables/{s}", .{name});
+    }
+
     // --- Table operations ---
 
     pub fn createTable(self: *AntflyClient, table_name: []const u8, body: openapi.types.CreateTableRequest) !void {
+        if (self.catalog_scope) |scope| {
+            var resp = try self.inner.createNamespaceTable(scope.database, scope.namespace, table_name, body);
+            defer resp.deinit();
+            if (resp.status_code >= 300) return self.apiErrorFromResponse(&resp);
+            return;
+        }
         var resp = try self.inner.createTable(table_name, body);
         defer resp.deinit();
         if (resp.status_code >= 300) return self.apiErrorFromResponse(&resp);
     }
 
     pub fn dropTable(self: *AntflyClient, table_name: []const u8) !void {
-        var resp = try self.inner.dropTable(table_name);
+        var resp = try (if (self.catalog_scope) |scope| self.inner.dropNamespaceTable(scope.database, scope.namespace, table_name) else self.inner.dropTable(table_name));
         defer resp.deinit();
         if (resp.status_code >= 300) return self.apiErrorFromResponse(&resp);
     }
 
     pub fn getTable(self: *AntflyClient, table_name: []const u8) !openapi.ApiResponse(openapi.types.TableStatus) {
-        var resp = try self.inner.getTable(table_name);
+        var resp = try (if (self.catalog_scope) |scope| self.inner.getNamespaceTable(scope.database, scope.namespace, table_name) else self.inner.getTable(table_name));
         if (resp.status_code >= 300) {
             defer resp.deinit();
             return self.apiErrorFromResponse(&resp);
@@ -111,7 +135,7 @@ pub const AntflyClient = struct {
     }
 
     pub fn listTables(self: *AntflyClient) !openapi.ApiResponse([]const openapi.types.TableStatus) {
-        var resp = try self.inner.listTables(.{});
+        var resp = try (if (self.catalog_scope) |scope| self.inner.listNamespaceTables(scope.database, scope.namespace, .{}) else self.inner.listTables(.{}));
         if (resp.status_code >= 300) {
             defer resp.deinit();
             return self.apiErrorFromResponse(&resp);
@@ -126,7 +150,7 @@ pub const AntflyClient = struct {
     pub const CreatedIndex = openapi.types.CreatedIndex;
 
     pub fn createIndex(self: *AntflyClient, table_name: []const u8, index_name: []const u8, body: CreateIndexRequest) !openapi.ApiResponse(CreatedIndex) {
-        var resp = try self.inner.createIndex(table_name, index_name, body);
+        var resp = if (self.catalog_scope) |scope| try self.inner.createNamespaceTableIndex(scope.database, scope.namespace, table_name, index_name, body) else try self.inner.createIndex(table_name, index_name, body);
         if (resp.status_code >= 300) {
             defer resp.deinit();
             return self.apiErrorFromResponse(&resp);
@@ -135,7 +159,7 @@ pub const AntflyClient = struct {
     }
 
     pub fn dropIndex(self: *AntflyClient, table_name: []const u8, index_name: []const u8) !void {
-        var resp = try self.inner.dropIndex(table_name, index_name);
+        var resp = try (if (self.catalog_scope) |scope| self.inner.dropNamespaceTableIndex(scope.database, scope.namespace, table_name, index_name) else self.inner.dropIndex(table_name, index_name));
         defer resp.deinit();
         if (resp.status_code >= 300) return self.apiErrorFromResponse(&resp);
     }
@@ -149,11 +173,29 @@ pub const AntflyClient = struct {
         return resp;
     }
 
+    pub fn retryIndex(self: *AntflyClient, table_name: []const u8, index_name: []const u8, body: openapi.types.IndexMaintenanceRequest) !openapi.ApiResponse(openapi.types.IndexMaintenanceResponse) {
+        var resp = try self.inner.retryIndex(table_name, index_name, body);
+        if (resp.status_code >= 300) {
+            defer resp.deinit();
+            return self.apiErrorFromResponse(&resp);
+        }
+        return resp;
+    }
+
+    pub fn repairIndex(self: *AntflyClient, table_name: []const u8, index_name: []const u8, body: openapi.types.IndexMaintenanceRequest) !openapi.ApiResponse(openapi.types.IndexMaintenanceResponse) {
+        var resp = try self.inner.repairIndex(table_name, index_name, body);
+        if (resp.status_code >= 300) {
+            defer resp.deinit();
+            return self.apiErrorFromResponse(&resp);
+        }
+        return resp;
+    }
+
     /// Returns the typed HTTP response without converting non-2xx statuses to
     /// `error.ApiError`. Long-running readiness commands use this to classify
     /// retryable status codes without weakening normal one-shot API behavior.
     pub fn getIndexResponse(self: *AntflyClient, table_name: []const u8, index_name: []const u8) !openapi.ApiResponse(openapi.types.IndexStatus) {
-        return self.inner.getIndex(table_name, index_name);
+        return (if (self.catalog_scope) |scope| self.inner.getNamespaceTableIndex(scope.database, scope.namespace, table_name, index_name) else self.inner.getIndex(table_name, index_name));
     }
 
     /// Equivalent to `getIndexResponse`, but bounds the complete HTTP request.
@@ -165,14 +207,14 @@ pub const AntflyClient = struct {
         index_name: []const u8,
         timeout_ms: u64,
     ) !openapi.ApiResponse(openapi.types.IndexStatus) {
-        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
-        defer self.allocator.free(encoded_table_name);
+        const table_path = try self.tablePathAlloc(table_name);
+        defer self.allocator.free(table_path);
         const encoded_index_name = try httpx.PercentEncoding.encode(self.allocator, index_name);
         defer self.allocator.free(encoded_index_name);
         const url = try std.fmt.allocPrint(
             self.allocator,
-            "{s}/db/v1/tables/{s}/indexes/{s}",
-            .{ self.inner.base_url, encoded_table_name, encoded_index_name },
+            "{s}{s}/indexes/{s}",
+            .{ self.inner.base_url, table_path, encoded_index_name },
         );
         defer self.allocator.free(url);
         const headers: ?[]const [2][]const u8 = if (self.inner.auth_header) |*header|
@@ -187,7 +229,7 @@ pub const AntflyClient = struct {
     }
 
     pub fn listIndexes(self: *AntflyClient, table_name: []const u8) !openapi.ApiResponse([]const openapi.types.IndexStatus) {
-        var resp = try self.inner.listIndexes(table_name);
+        var resp = try (if (self.catalog_scope) |scope| self.inner.listNamespaceTableIndexes(scope.database, scope.namespace, table_name) else self.inner.listIndexes(table_name));
         if (resp.status_code >= 300) {
             defer resp.deinit();
             return self.apiErrorFromResponse(&resp);
@@ -203,12 +245,12 @@ pub const AntflyClient = struct {
         table_name: []const u8,
         timeout_ms: u64,
     ) !openapi.ApiResponse([]const openapi.types.IndexStatus) {
-        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
-        defer self.allocator.free(encoded_table_name);
+        const table_path = try self.tablePathAlloc(table_name);
+        defer self.allocator.free(table_path);
         const url = try std.fmt.allocPrint(
             self.allocator,
-            "{s}/db/v1/tables/{s}/indexes",
-            .{ self.inner.base_url, encoded_table_name },
+            "{s}{s}/indexes",
+            .{ self.inner.base_url, table_path },
         );
         defer self.allocator.free(url);
         const headers: ?[]const [2][]const u8 = if (self.inner.auth_header) |*header|
@@ -224,6 +266,67 @@ pub const AntflyClient = struct {
 
     // --- Query operations ---
 
+    /// SQL may mutate data. Preserve structured errors/commit receipts and
+    /// forbid automatic replay or redirect, regardless of the borrowed HTTP
+    /// client's global policy. Callers reconcile ambiguous outcomes explicitly.
+    pub fn executeSQL(self: *AntflyClient, body: openapi.types.SQLRequest) !openapi.ApiResponse(openapi.types.SQLResponse) {
+        var request = body;
+        if (self.catalog_scope) |scope| {
+            request.database = request.database orelse scope.database;
+            request.namespace = request.namespace orelse scope.namespace;
+        }
+        return validateSqlResponse(try self.sqlPost(openapi.types.SQLResponse, "/db/v1/sql", request));
+    }
+
+    pub fn prepareSQL(self: *AntflyClient, body: openapi.types.SQLPrepareRequest) !openapi.ApiResponse(openapi.types.SQLPreparedResponse) {
+        var request = body;
+        if (self.catalog_scope) |scope| {
+            request.database = request.database orelse scope.database;
+            request.namespace = request.namespace orelse scope.namespace;
+        }
+        return self.sqlPost(openapi.types.SQLPreparedResponse, "/db/v1/sql/prepared", request);
+    }
+
+    pub fn executePreparedSQL(self: *AntflyClient, prepared_id: []const u8, body: openapi.types.SQLPreparedExecutionRequest) !openapi.ApiResponse(openapi.types.SQLResponse) {
+        const encoded_id = try httpx.PercentEncoding.encode(self.allocator, prepared_id);
+        defer self.allocator.free(encoded_id);
+        const path = try std.fmt.allocPrint(self.allocator, "/db/v1/sql/prepared/{s}/execute", .{encoded_id});
+        defer self.allocator.free(path);
+        return validateSqlResponse(try self.sqlPost(openapi.types.SQLResponse, path, body));
+    }
+
+    pub fn closePreparedSQL(self: *AntflyClient, prepared_id: []const u8) !openapi.ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
+        return self.inner.closePreparedSQL(prepared_id);
+    }
+
+    fn sqlPost(self: *AntflyClient, comptime T: type, path: []const u8, request: anytype) !openapi.ApiResponse(T) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ self.inner.base_url, path });
+        defer self.allocator.free(url);
+        const encoded = try httpx.json.Json.stringifyRequest(self.allocator, request);
+        defer self.allocator.free(encoded);
+        if (encoded.len > 4 << 20) return error.SqlRequestTooLarge;
+        const headers: ?[]const [2][]const u8 = if (self.inner.auth_header) |*header| @as(*const [1][2][]const u8, header) else null;
+        var response = try self.inner.http.post(url, .{
+            .json = encoded,
+            .headers = headers,
+            .max_response_size = 16 << 20,
+            .max_retries = 0,
+            .follow_redirects = false,
+            .cookies_enabled = false,
+        });
+        return openapi.ApiResponse(T).fromResponse(self.allocator, &response);
+    }
+
+    fn validateSqlResponse(response: openapi.ApiResponse(openapi.types.SQLResponse)) !openapi.ApiResponse(openapi.types.SQLResponse) {
+        var result = response;
+        errdefer result.deinit();
+        if (result.data) |data| {
+            if (data.value.rows.len > 4096) return error.InvalidApiResponse;
+            for (data.value.rows) |row| if (row.len != data.value.columns.len) return error.InvalidApiResponse;
+        }
+        return result;
+    }
+
     pub fn query(self: *AntflyClient, body: openapi.types.QueryRequest) !openapi.ApiResponse(openapi.types.QueryResponses) {
         var resp = try self.queryCanonicalPath("/db/v1/query", body);
         if (resp.status_code >= 300) {
@@ -234,9 +337,9 @@ pub const AntflyClient = struct {
     }
 
     pub fn queryTable(self: *AntflyClient, table_name: []const u8, body: openapi.types.QueryRequest) !openapi.ApiResponse(openapi.types.QueryResponses) {
-        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
-        defer self.allocator.free(encoded_table_name);
-        const path = try std.fmt.allocPrint(self.allocator, "/db/v1/tables/{s}/query", .{encoded_table_name});
+        const table_path = try self.tablePathAlloc(table_name);
+        defer self.allocator.free(table_path);
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/query", .{table_path});
         defer self.allocator.free(path);
         var resp = try self.queryCanonicalPath(path, body);
         if (resp.status_code >= 300) {
@@ -273,7 +376,7 @@ pub const AntflyClient = struct {
         key: []const u8,
         params: openapi.client.LookupKeyParams,
     ) !openapi.ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
-        var resp = try self.inner.lookupKey(table_name, key, params);
+        var resp = try (if (self.catalog_scope) |scope| self.inner.lookupNamespaceTableDocument(scope.database, scope.namespace, table_name, key, .{ .fields = params.fields, .consistency = params.consistency }) else self.inner.lookupKey(table_name, key, params));
         if (resp.status_code >= 300) {
             defer resp.deinit();
             return self.apiErrorFromResponse(&resp);
@@ -417,7 +520,9 @@ pub const AntflyClient = struct {
     // --- Batch operations ---
 
     pub fn batch(self: *AntflyClient, table_name: []const u8, body: openapi.types.BatchRequest) !openapi.ApiResponse(openapi.types.BatchResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/batch", .{ self.inner.base_url, table_name });
+        const table_path = try self.tablePathAlloc(table_name);
+        defer self.allocator.free(table_path);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}{s}/batch", .{ self.inner.base_url, table_path });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, BatchRequestWire{ .inner = body });
         defer self.allocator.free(json_body);
@@ -440,7 +545,7 @@ pub const AntflyClient = struct {
     };
 
     pub fn backupTable(self: *AntflyClient, table_name: []const u8, body: openapi.types.BackupRequest) !void {
-        var resp = try self.inner.backupTable(table_name, body);
+        var resp = try (if (self.catalog_scope) |scope| self.inner.backupNamespaceTable(scope.database, scope.namespace, table_name, body) else self.inner.backupTable(table_name, body));
         defer resp.deinit();
         if (resp.status_code >= 300) return self.apiErrorFromResponse(&resp);
     }
@@ -450,7 +555,7 @@ pub const AntflyClient = struct {
     }
 
     pub fn restoreTableWithOptions(self: *AntflyClient, table_name: []const u8, body: openapi.types.RestoreRequest, options: RestoreOptions) !openapi.ApiResponse(openapi.types.RestoreJob) {
-        var resp = try self.inner.restoreTable(table_name, body, options.idempotency_key);
+        var resp = try (if (self.catalog_scope) |scope| self.inner.restoreNamespaceTable(scope.database, scope.namespace, table_name, body, options.idempotency_key) else self.inner.restoreTable(table_name, body, options.idempotency_key));
         if (resp.status_code >= 300) {
             defer resp.deinit();
             return self.apiErrorFromResponse(&resp);
@@ -563,6 +668,108 @@ pub const AntflyClient = struct {
             .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null,
             .allocator = self.allocator,
         };
+    }
+
+    pub fn researchAgent(self: *AntflyClient, body: openapi.types.ResearchAgentRequest) !openapi.client.RawResponse {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/agents/research", .{self.inner.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var auth_headers: ?[1][2][]const u8 = null;
+        if (self.inner.auth_header) |h| auth_headers = .{h};
+        var resp = try self.inner.http.post(url, .{
+            .json = json_body,
+            .headers = if (auth_headers) |*h| h[0..] else null,
+            .timeout_ms = research_agent_timeout_ms,
+        });
+        defer resp.deinit();
+        return .{
+            .status_code = resp.status.code,
+            .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null,
+            .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null,
+            .allocator = self.allocator,
+        };
+    }
+
+    /// Execute a research-agent request while forwarding SSE bytes as they
+    /// arrive. The body has already been written to `writer`.
+    pub fn researchAgentToWriter(
+        self: *AntflyClient,
+        body: openapi.types.ResearchAgentRequest,
+        writer: anytype,
+    ) !openapi.client.RawResponse {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/agents/research", .{self.inner.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var auth_headers: ?[1][2][]const u8 = null;
+        if (self.inner.auth_header) |h| auth_headers = .{h};
+        var resp = try self.inner.http.requestToWriter(.POST, url, .{
+            .json = json_body,
+            .headers = if (auth_headers) |*h| h[0..] else null,
+            .timeout_ms = research_agent_timeout_ms,
+        }, writer, null, null);
+        defer resp.deinit();
+        return .{
+            .status_code = resp.status.code,
+            .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null,
+            .allocator = self.allocator,
+        };
+    }
+
+    /// Start or advance a durable research job. Both may run model phases, so
+    /// they use the research timeout. A 409 (another advance holds the lease)
+    /// is returned to the caller rather than treated as an error.
+    fn researchJobPost(self: *AntflyClient, url: []const u8, json_body: ?[]const u8) !openapi.ApiResponse(openapi.types.ResearchJob) {
+        var auth_headers: ?[1][2][]const u8 = null;
+        if (self.inner.auth_header) |h| auth_headers = .{h};
+        var resp = try self.inner.http.post(url, .{
+            .json = json_body,
+            .headers = if (auth_headers) |*h| h[0..] else null,
+            .timeout_ms = research_agent_timeout_ms,
+        });
+        var parsed = try openapi.ApiResponse(openapi.types.ResearchJob).fromResponse(self.allocator, &resp);
+        if (parsed.status_code >= 300 and parsed.status_code != 409) {
+            defer parsed.deinit();
+            return self.apiErrorFromResponse(&parsed);
+        }
+        return parsed;
+    }
+
+    pub fn startResearchJob(self: *AntflyClient, body: openapi.types.ResearchJobStartRequest) !openapi.ApiResponse(openapi.types.ResearchJob) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/agents/research/jobs", .{self.inner.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        return self.researchJobPost(url, json_body);
+    }
+
+    pub fn advanceResearchJob(self: *AntflyClient, job_id: []const u8, max_phases: ?i64) !openapi.ApiResponse(openapi.types.ResearchJob) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/agents/research/jobs/{s}/advance", .{ self.inner.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, openapi.types.ResearchJobAdvanceRequest{ .max_phases = max_phases });
+        defer self.allocator.free(json_body);
+        return self.researchJobPost(url, json_body);
+    }
+
+    pub fn getResearchJob(self: *AntflyClient, job_id: []const u8) !openapi.ApiResponse(openapi.types.ResearchJob) {
+        var resp = try self.inner.getResearchJob(job_id);
+        if (resp.status_code >= 300) {
+            defer resp.deinit();
+            return self.apiErrorFromResponse(&resp);
+        }
+        return resp;
+    }
+
+    pub fn cancelResearchJob(self: *AntflyClient, job_id: []const u8) !openapi.ApiResponse(openapi.types.ResearchJob) {
+        var resp = try self.inner.cancelResearchJob(job_id);
+        if (resp.status_code >= 300) {
+            defer resp.deinit();
+            return self.apiErrorFromResponse(&resp);
+        }
+        return resp;
     }
 
     pub fn queryBuilder(self: *AntflyClient, body: openapi.types.QueryBuilderRequest) !openapi.ApiResponse(openapi.types.QueryBuilderResult) {

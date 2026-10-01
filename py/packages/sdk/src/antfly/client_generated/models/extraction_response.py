@@ -7,6 +7,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.extraction_response_object import ExtractionResponseObject
+from ..models.extraction_schema_version import ExtractionSchemaVersion
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -24,12 +25,16 @@ class ExtractionResponse:
         object_ (ExtractionResponseObject):
         model (str):
         data (list[ExtractionObject]):
+        schema_version (ExtractionSchemaVersion | Unset): Omission preserves the legacy extraction contract. Version 2
+            opts into strict mixed-task schemas, per-input replacements and explicit offsets; the selected model/runtime
+            must support every requested feature.
         usage (ExtractionResponseUsage | Unset):
     """
 
     object_: ExtractionResponseObject
     model: str
     data: list[ExtractionObject]
+    schema_version: ExtractionSchemaVersion | Unset = UNSET
     usage: ExtractionResponseUsage | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -42,6 +47,10 @@ class ExtractionResponse:
         for data_item_data in self.data:
             data_item = data_item_data.to_dict()
             data.append(data_item)
+
+        schema_version: int | Unset = UNSET
+        if not isinstance(self.schema_version, Unset):
+            schema_version = self.schema_version.value
 
         usage: dict[str, Any] | Unset = UNSET
         if not isinstance(self.usage, Unset):
@@ -56,6 +65,8 @@ class ExtractionResponse:
                 "data": data,
             }
         )
+        if schema_version is not UNSET:
+            field_dict["schema_version"] = schema_version
         if usage is not UNSET:
             field_dict["usage"] = usage
 
@@ -78,6 +89,13 @@ class ExtractionResponse:
 
             data.append(data_item)
 
+        _schema_version = d.pop("schema_version", UNSET)
+        schema_version: ExtractionSchemaVersion | Unset
+        if isinstance(_schema_version, Unset):
+            schema_version = UNSET
+        else:
+            schema_version = ExtractionSchemaVersion(_schema_version)
+
         _usage = d.pop("usage", UNSET)
         usage: ExtractionResponseUsage | Unset
         if isinstance(_usage, Unset):
@@ -89,6 +107,7 @@ class ExtractionResponse:
             object_=object_,
             model=model,
             data=data,
+            schema_version=schema_version,
             usage=usage,
         )
 

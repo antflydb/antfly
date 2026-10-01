@@ -143,6 +143,7 @@ class McpSchemaFragmentTests(unittest.TestCase):
         }
         allowed_child_fields = {
             "table",
+            "table_target",
             "fields",
             "hierarchy",
             "limit",
@@ -180,6 +181,7 @@ class McpSchemaFragmentTests(unittest.TestCase):
             ("offset", 0),
             ("search_before", []),
             ("analyses", {"pca": True}),
+            ("highlight", {}),
             ("limit", 101),
             ("search_after", ["position-only"]),
             ("order_by", [{"field": "_hierarchy.position", "desc": True}]),

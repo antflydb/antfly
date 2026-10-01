@@ -463,6 +463,16 @@ pub const Model = struct {
         allocator: std.mem.Allocator,
         dim_overrides: ?*const DimOverrides,
     ) ConvertError!ConvertResult {
+        return self.convertToGraphWithInputShapes(allocator, dim_overrides, null);
+    }
+
+    /// Bind complete input shapes, including unnamed dynamic dimensions.
+    pub fn convertToGraphWithInputShapes(
+        self: *Model,
+        allocator: std.mem.Allocator,
+        dim_overrides: ?*const DimOverrides,
+        input_shapes: ?*const std.StringHashMapUnmanaged(Shape),
+    ) ConvertError!ConvertResult {
         const onnx_graph = self.graph() orelse return error.OutputNotFound;
 
         var inference_graph = Graph.init(allocator);
@@ -480,7 +490,8 @@ pub const Model = struct {
             if (input.name.len == 0) continue;
             if (self.initializer_map.contains(input.name)) continue;
 
-            const shape = inputShapeWithOverrides(input, dim_overrides) orelse Shape.init(.f32, &.{1});
+            const shape = (if (input_shapes) |shapes| shapes.get(input.name) else null) orelse
+                inputShapeWithOverrides(input, dim_overrides) orelse Shape.init(.f32, &.{1});
             const node_id = try builder.parameter(input.name, shape);
             try converted.put(allocator, input.name, node_id);
             try param_names.append(allocator, input.name);
@@ -1822,4 +1833,72 @@ test "integration: clipclap text_model emits fused_sdpa" {
     }
 
     try std.testing.expect(sdpa_count > 0);
+}
+
+test "Model.convertToGraphWithInputShapes binds unnamed request dimensions" {
+    const allocator = std.testing.allocator;
+
+    // Build ONNX graph: Identity(x) → y, with x of shape [batch, seq_len, 768]
+    var node_inputs = [_][]const u8{"x"};
+    var node_outputs = [_][]const u8{"y"};
+    var nodes = [_]NodeProto{
+        .{ .op_type = "Identity", .inputs = &node_inputs, .outputs = &node_outputs },
+    };
+
+    var in_dims = [_]proto.TensorShapeProto.Dimension{
+        .{},
+        .{},
+        .{ .dim_value = 768 },
+    };
+    const in_shape_proto = proto.TensorShapeProto{ .dims = &in_dims };
+    const in_tensor_type = proto.TensorTypeProto{
+        .elem_type = .float32,
+        .shape = in_shape_proto,
+    };
+    const in_type_proto = proto.TypeProto{ .tensor_type = in_tensor_type };
+
+    var input_infos = [_]ValueInfoProto{
+        .{ .name = "x", .type_proto = in_type_proto },
+    };
+    var output_infos = [_]ValueInfoProto{
+        .{ .name = "y" },
+    };
+    const graph_proto = GraphProto{
+        .nodes = &nodes,
+        .inputs = &input_infos,
+        .outputs = &output_infos,
+    };
+    _ = &nodes;
+    _ = &in_dims;
+    _ = &input_infos;
+    _ = &output_infos;
+
+    var model = try Model.init(allocator, .{ .graph = graph_proto });
+    defer {
+        model.output_to_node.deinit(allocator);
+        model.initializer_map.deinit(allocator);
+        model.input_set.deinit(allocator);
+    }
+
+    var overrides: std.StringHashMapUnmanaged(Shape) = .empty;
+    defer overrides.deinit(allocator);
+    try overrides.put(allocator, "x", Shape.init(.f32, &.{ 4, 64, 768 }));
+
+    var result = try model.convertToGraphWithInputShapes(allocator, null, &overrides);
+    defer result.deinit(allocator);
+
+    // Find the parameter node for x and check its concrete shape
+    var found = false;
+    const count = result.graph.nodeCount();
+    for (0..count) |i| {
+        const n = result.graph.node(@intCast(i));
+        if (n.op == .parameter) {
+            try std.testing.expectEqual(@as(u8, 3), n.output_shape.rank());
+            try std.testing.expectEqual(@as(i64, 4), n.output_shape.dim(0));
+            try std.testing.expectEqual(@as(i64, 64), n.output_shape.dim(1));
+            try std.testing.expectEqual(@as(i64, 768), n.output_shape.dim(2));
+            found = true;
+        }
+    }
+    try std.testing.expect(found);
 }

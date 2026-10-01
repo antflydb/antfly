@@ -1,8 +1,155 @@
-# Antfly Authorization Design
+# Antfly Authorization
 
-This document describes the intended Antfly data-plane authorization model. It
-is provider-neutral: Antfly can receive principal context from an embedded auth
-module, a trusted gateway, a managed control plane, or a self-hosted deployment.
+This document describes Antfly's data-plane authorization model: what is
+implemented today, then the design for join-aware enforcement that is still
+planned. The model is provider-neutral: Antfly can receive principal context
+from its built-in user manager, a trusted gateway, a managed control plane, or
+a self-hosted deployment.
+
+## Secure Deployment
+
+Local quickstarts disable authentication and bind to loopback. Docker examples
+keep the application listening on `0.0.0.0` inside the container but publish
+host ports on `127.0.0.1`. Do not remove that host binding until you have
+configured authentication and TLS termination at a trusted reverse proxy.
+Metrics and auxiliary development services should also remain private.
+
+To enable built-in authentication, use `--auth true` or `"enable_auth": true`
+in the config file. On first startup, supply a unique administrator password
+through `ANTFLY_BOOTSTRAP_ADMIN_PASSWORD` (12 to 72 bytes). For example:
+
+```sh
+export ANTFLY_BOOTSTRAP_ADMIN_PASSWORD="$(openssl rand -base64 24)"
+# Save the generated password securely before removing the environment variable.
+antfly standalone --auth true
+```
+
+For Docker, forward the variable without putting its value in command arguments:
+
+```sh
+docker run -p 127.0.0.1:8080:8080 \
+  --env ANTFLY_BOOTSTRAP_ADMIN_PASSWORD \
+  -v antfly-data:/antflydb \
+  ghcr.io/antflydb/antfly:latest \
+  standalone --host 0.0.0.0 --data-dir /antflydb --auth true
+```
+
+The administrator username is `admin`. The password is stored as a hash;
+Antfly never logs it. The bootstrap variable can be removed after successful
+initialization. Subsequent startups preserve an existing non-default password,
+even if the variable changes; use the authenticated user-management API to
+rotate credentials. Configure each node's local auth store as appropriate for
+your distributed deployment; bootstrap is not a cluster-wide password update.
+
+**Upgrade from legacy defaults:** an auth-enabled instance with the old
+`admin:admin` credential refuses to start without a valid bootstrap password.
+Supplying the variable replaces that known default while preserving permissions.
+HA primary and standby startup never rewrites credentials from a portable seed;
+rotate legacy credentials before capturing a replacement HA seed.
+
+Built-in authentication also applies to MCP tools on `/mcp/v1`, served on the
+same public port. A separately configured trusted-principal gateway is another
+supported authentication boundary. CORS is a browser access policy, not an
+authentication mechanism: enabling CORS without `allowed_origins` grants no
+cross-origin access. Configure exact trusted origins; `"*"` requires explicit
+opt-in and cannot be combined with credentialed CORS.
+
+### Local files in remote templates
+
+`remoteText`, `remotePDF`, `remoteMedia`, and other file download callers deny
+`file://` unless `remote_content.security.allowed_paths` explicitly allows
+the target. Omitted and empty path lists deny local file access. To permit an
+intentional ingestion directory:
+
+```json
+{
+  "remote_content": {
+    "security": {
+      "allowed_paths": ["/srv/antfly/ingest"]
+    }
+  }
+}
+```
+
+Use a dedicated directory containing only data that authorized callers may
+read. Canonical path checks reject sibling-prefix and symlink escapes. An
+allowlist grants access to readable files beneath it; authentication alone does
+not make arbitrary local paths appropriate template inputs. Private-IP blocking
+continues to protect HTTP downloads and does not authorize local files.
+
+## Current Implementation
+
+### Credentials
+
+When `auth_enabled` is true, public routes authenticate through the built-in
+user manager (`/auth/v1`) with one of:
+
+- `Authorization: Basic <base64(username:password)>`
+- `Authorization: ApiKey <base64(key_id:key_secret)>`
+- `Authorization: Bearer <base64(key_id:key_secret)>`
+
+An API key can only narrow its owner's permissions, and that narrowing is
+re-applied on every use.
+
+### Trusted Principal Tokens
+
+A gateway in front of Antfly can instead send an HS256-signed JWT in the
+`X-Antfly-Trusted-Principal` header. Antfly verifies it with the keystore secret
+`antfly.trusted_principal.secret` and, when `antfly.trusted_principal.issuer` is
+set, requires a matching `iss`. The claims are:
+
+```json
+{
+  "iss": "gateway",
+  "sub": "user_123",
+  "exp": 1790000000,
+  "iat": 1789996400,
+  "tables": ["orders", "customers"],
+  "operations": ["read"],
+  "row_filter": {
+    "orders": { "term": { "tenant_id": { "$auth": "metadata.tenant_id" } } },
+    "*": { "term": { "region": "na" } }
+  },
+  "metadata": { "tenant_id": "tenant_abc" }
+}
+```
+
+- `sub` and `exp` are required; a token whose `iat` is more than 60 seconds in
+  the future is rejected.
+- `admin: true` grants admin on every table. Otherwise `operations` (`read`,
+  `write`, `admin`, or `*`) is granted on each table in `tables`, or on every
+  table when `tables` is absent or empty.
+- `row_filter` maps a table name, or `*` for every table, to a row filter.
+- `metadata` supplies the values that `$auth` references resolve against.
+
+### Row Filters
+
+Row filters are query JSON stored per table, with `*` as a fallback for every
+table. They are attached to users, roles, and groups through
+`/auth/v1/users/{user}/row-filters/{table}` and
+`/auth/v1/subjects/{subject}/row-filters/{table}`, or carried in a trusted
+principal token. A filter references trusted values with `$auth` nodes:
+
+```json
+{ "term": { "tenant_id": { "$auth": "metadata.tenant_id" } } }
+```
+
+`$auth` accepts `username`, `roles` (the user's inherited role and group
+subjects, for array-aware operators such as `terms`), and `metadata.<path>`.
+Filters are validated before they are stored.
+
+At read time, Antfly:
+
+1. Selects the table-specific filter if one exists, and otherwise the `*`
+   filter. The two are not combined.
+2. Combines filters from the same table with `AND`: the user's own filter, the
+   filters of every role and group the user inherits, and an API key's own
+   filter.
+3. Resolves `$auth` references against the authenticated identity.
+4. Combines the result with the caller's query with `AND`.
+
+Queries, document scans, lookups, and retrieval-agent queries apply these
+filters. In a join, the right table's filter is applied as well.
 
 ## Goals
 
@@ -22,13 +169,21 @@ The authorization system should support:
   retrieval workflows.
 - Fail-closed behavior when policy context is missing or invalid.
 
-## Principal Context
+## Planned: Join-Aware Enforcement
+
+The rest of this document is the design for enforcing authorization inside the
+query planner, for cross-table queries such as SQL joins, subqueries, and views.
+It is not implemented yet. Where it differs from the current behavior above,
+the current behavior is what Antfly does today.
+
+### Principal Context
 
 Requests should carry a trusted principal context. The context may be created by
 Antfly itself or by a trusted component in front of Antfly, but clients must not
 be able to forge it.
 
-Example:
+Proposed shape (the shipped token claims are listed under Trusted Principal
+Tokens above):
 
 ```json
 {
@@ -62,7 +217,7 @@ Example:
 The trusted context should include enough information for Antfly to authorize
 without making per-row callbacks to an external policy service.
 
-## Operations
+### Operations
 
 Antfly should distinguish at least:
 
@@ -74,7 +229,7 @@ Antfly should distinguish at least:
 Authorization should be checked against the operation actually executed, not
 only the HTTP method or top-level API route.
 
-## Row Filters
+### Row Filters
 
 Row filters are mandatory security predicates. They are not user preferences,
 default filters, or ranking hints.
@@ -99,7 +254,7 @@ Before execution, Antfly should compile the template against:
 Unknown fields, missing attributes, unsupported operators, and type mismatches
 must fail closed.
 
-## Join-Aware Enforcement
+### Join-Aware Enforcement
 
 A cross-table query is a request against every table it references. A principal
 with access to one table must not be able to infer restricted rows from another
@@ -113,8 +268,10 @@ Antfly should enforce joins with these rules:
 - Each table's row filter must be attached to that table's logical scan node.
 - Filters must be bound through the table alias used in the query plan.
 - User predicates and security predicates combine with `AND`.
-- Multiple grant filters for the same table and operation combine with `OR`,
-  then the result is `AND`ed with the caller's predicate.
+- Multiple grant filters for the same table and operation combine with `AND`
+  today (see Row Filters above), then the result is `AND`ed with the caller's
+  predicate. Whether separate grants should instead widen access with `OR` is
+  an open design question.
 - If any referenced table lacks permission, deny the entire query.
 - Outer joins must filter the restricted side before join evaluation while
   preserving normal join semantics for rows that pass authorization.
@@ -125,7 +282,7 @@ Antfly should enforce joins with these rules:
   nodes or be denied unless Antfly can prove the saved object already carries an
   equivalent authorization policy.
 
-## Planning Boundary
+### Planning Boundary
 
 Authorization should run after parsing and before physical planning or
 execution.
@@ -145,7 +302,7 @@ handle joins safely. Rewriting request bodies at a proxy or route layer is not
 sufficient for cross-table authorization because it cannot reliably see every
 logical table access.
 
-## Performance
+### Performance
 
 The authorization path should be efficient enough for production query traffic.
 
@@ -159,7 +316,7 @@ Recommended approach:
 - Avoid per-row calls to external authorization systems.
 - Include policy IDs or versions in audit metadata for explainability.
 
-## V1 Implementation Checklist
+### V1 Implementation Checklist
 
 For a first join-aware version:
 

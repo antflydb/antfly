@@ -183,15 +183,15 @@ func (r *AntflyCluster) Default() {
 	}
 
 	if r.Spec.Standalone.Inference == nil {
+		// Leave APIURL unset: standalone runs its embedded, in-process inference
+		// provider by default. A set inference.apiURL is a hard isolation
+		// contract in the runtime (it disables the embedded provider, preloads,
+		// and /ai/v1 routes), so the operator must never invent one — only an
+		// explicit user-supplied apiURL should point standalone at an
+		// external/shared inference endpoint.
 		r.Spec.Standalone.Inference = &StandaloneInferenceSpec{
 			Enabled: true,
-			APIURL:  "http://0.0.0.0:11433",
 		}
-		return
-	}
-
-	if r.Spec.Standalone.Inference.APIURL == "" {
-		r.Spec.Standalone.Inference.APIURL = "http://0.0.0.0:11433"
 	}
 }
 
@@ -1442,6 +1442,13 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		return nil
 	}
 
+	if ha.ActivationPolicy != "" && ha.ActivationPolicy != "Eager" && ha.ActivationPolicy != "OnFirstTable" {
+		return fmt.Errorf("spec.highAvailability.activationPolicy must be Eager or OnFirstTable")
+	}
+	if ha.ActivationPolicy == "OnFirstTable" && ha.SyncPolicy.modeOrDefault() != HADurabilityModeAsync {
+		return fmt.Errorf("spec.highAvailability.activationPolicy OnFirstTable requires Async durability; synchronous table creation requires eager standby activation")
+	}
+
 	var errors []string
 	names := map[string]struct{}{}
 	desiredNames := map[string]struct{}{}
@@ -2254,7 +2261,7 @@ func highAvailabilityHasManagedConfig(ha *HighAvailabilitySpec) bool {
 	if ha == nil {
 		return false
 	}
-	return len(ha.Standbys) > 0 ||
+	return ha.ActivationPolicy != "" || len(ha.Standbys) > 0 ||
 		ha.Identity != nil ||
 		ha.Admin != nil ||
 		ha.Runtime != nil ||
@@ -2372,10 +2379,10 @@ func (r *AntflyCluster) validateStandaloneConfig() error {
 		return nil
 	}
 
-	if standalone.Inference != nil && standalone.Inference.Enabled && strings.TrimSpace(standalone.Inference.APIURL) == "" {
-		return fmt.Errorf("spec.standalone.inference.apiURL must be set when inference is enabled")
-	}
-
+	// An empty apiURL is the normal, expected configuration: standalone runs
+	// its embedded, in-process inference provider and never binds a separate
+	// inference listener. apiURL is only required when the user explicitly
+	// points standalone at an external/shared inference endpoint.
 	if standalone.Inference != nil && strings.TrimSpace(standalone.Inference.APIURL) != "" {
 		parsed, err := url.Parse(standalone.Inference.APIURL)
 		if err != nil {

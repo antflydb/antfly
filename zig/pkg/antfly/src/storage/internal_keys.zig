@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const Sha256 = @import("antfly_hash").Sha256;
 const coverage_identity = @import("coverage_identity.zig");
 const Allocator = std.mem.Allocator;
 
@@ -24,6 +25,8 @@ pub const replay_all_kind: u8 = 0xfe;
 pub const primary_kind: u8 = 0x10;
 pub const ttl_kind: u8 = 0x11;
 pub const relational_row_kind: u8 = 0x12;
+/// One reverse ownership record per document/physical relational index.
+pub const relational_index_reverse_kind: u8 = 0x13;
 pub const relational_columnar_manifest_key = "\x00\x00__columnar__:manifest";
 pub const relational_columnar_prefix = "\x00\x00__columnar__:";
 pub const relational_columnar_dirty_prefix = relational_columnar_prefix ++ "dirty:";
@@ -89,11 +92,35 @@ pub const document_extraction_unit_spool_kind: u8 = 0x41;
 /// These attempts and their registry must stay outside document ranges: shard
 /// transfer must not copy temporary rows without their recovery metadata.
 pub const shared_pdf_consumer_kind: u8 = 0x42;
+/// Companion row of a resolution artifact recording the entity keys its
+/// canonical mentions last promoted (local id -> doc ref). The promoter
+/// diffs it on replay so a re-keyed mention tombstones the previously
+/// promoted document with a merged_into redirect instead of orphaning it.
+pub const promoted_keys_state_kind: u8 = 0x44;
+/// Ordered producer output-set inventory. Kept outside public artifact keys,
+/// but inside the owning document range for snapshot/retained transfer.
+pub const producer_stream_manifest_kind: u8 = 0x45;
+pub const producer_generation_row_kind: u8 = 0x46;
+pub const producer_generation_head_kind: u8 = 0x47;
+pub const producer_generation_state_kind: u8 = 0x48;
+pub const producer_generation_clock_kind: u8 = 0x49;
+/// Extraction output generations must not alias chunk streams with the same
+/// producer name. Their rows contain the extraction's named output directory.
+pub const extraction_stream_manifest_kind: u8 = 0x4a;
+pub const extraction_generation_row_kind: u8 = 0x4b;
+pub const extraction_generation_head_kind: u8 = 0x4c;
+pub const extraction_generation_state_kind: u8 = 0x4d;
+pub const extraction_generation_clock_kind: u8 = 0x4e;
+pub const extraction_generation_name_kind: u8 = 0x4f;
+pub const extraction_generation_ordinal_kind: u8 = 0x50;
+pub const extraction_generation_directory_kind: u8 = 0x51;
 /// Store-wide index of outstanding shared-PDF attempts. Recovery is independent
 /// of document existence and the current enrichment configuration.
 pub const shared_pdf_consumer_attempt_prefix = [_]u8{ replay_namespace, 0xff, 0x43 };
 pub const graph_edge_contender_count_kind: u8 = 0x00;
 pub const graph_edge_contender_record_kind: u8 = 0x01;
+pub const graph_edge_ttl_lifetime_kind: u8 = 0x02;
+pub const graph_edge_ttl_tombstone_kind: u8 = 0x03;
 pub const derived_coverage_outcome_marker_kind: u8 = 0x00;
 pub const derived_coverage_outcome_count_kind: u8 = 0xff;
 
@@ -143,6 +170,10 @@ pub const artifact_source_revision_kind: u8 = 0x3e;
 /// ordered by source priority and state identity so winner fallback can stop at
 /// the first surviving record.
 pub const graph_global_edge_contender_kind: u8 = 0x3f;
+/// Deadline-first accelerator for graph contribution expiration. The source
+/// contender and lifetime remain document-owned; cleanup validates them under
+/// the primary writer before acting on an index entry.
+pub const graph_edge_expiration_index_prefix = [_]u8{ replay_namespace, 0xff, 0x44 };
 pub const table_storage_settings_key = [_]u8{ replay_namespace, 0xff, 0x40 };
 pub const enrichment_terminal_failure_generation_counter_key = [_]u8{
     replay_namespace,
@@ -250,6 +281,19 @@ pub fn findComponentTerminator(key: []const u8, start: usize) ?usize {
         return null;
     }
     return null;
+}
+
+/// Exclusive cut after one document's complete physical key family. The
+/// terminator ends in zero, so incrementing its final byte cannot overflow or
+/// skip a logical key extending this one (including embedded NUL/0xff bytes).
+/// `key` must not alias `out`; callers can reuse the buffer across cursor seeks.
+pub fn documentPrefixSuccessor(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8) ![]const u8 {
+    if (key.len == 0 or key[0] != user_namespace) return error.InvalidInternalUserKey;
+    const end = (findComponentTerminator(key, 1) orelse return error.InvalidInternalUserKey) + 2;
+    try out.resize(alloc, end);
+    @memcpy(out.items, key[0..end]);
+    out.items[end - 1] = 1;
+    return out.items;
 }
 
 pub fn decodeBodyAlloc(alloc: Allocator, body: []const u8) ![]u8 {
@@ -542,6 +586,14 @@ pub fn graphEdgeContenderRootPrefixAlloc(alloc: Allocator, doc_key: []const u8) 
     return try list.toOwnedSlice(alloc);
 }
 
+pub fn graphGlobalEdgeContenderRootPrefixAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, graph_global_edge_contender_kind);
+    return try list.toOwnedSlice(alloc);
+}
+
 pub fn graphEdgeContenderIndexPrefixAlloc(alloc: Allocator, doc_key: []const u8, index_name: []const u8) ![]u8 {
     var list = std.ArrayListUnmanaged(u8).empty;
     defer list.deinit(alloc);
@@ -573,8 +625,8 @@ pub fn graphEdgeContenderEdgePrefixAlloc(
     try list.append(alloc, graph_edge_contender_kind);
     try appendEncodedComponent(&list, alloc, index_name);
     try list.append(alloc, graph_edge_contender_record_kind);
-    var edge_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(edge_key, &edge_digest, .{});
+    var edge_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(edge_key, &edge_digest, .{});
     try appendEncodedComponent(&list, alloc, &edge_digest);
     return try list.toOwnedSlice(alloc);
 }
@@ -592,12 +644,74 @@ pub fn graphEdgeContenderKeyAlloc(
     try list.append(alloc, graph_edge_contender_kind);
     try appendEncodedComponent(&list, alloc, index_name);
     try list.append(alloc, graph_edge_contender_record_kind);
-    var edge_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(edge_key, &edge_digest, .{});
+    var edge_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(edge_key, &edge_digest, .{});
     try appendEncodedComponent(&list, alloc, &edge_digest);
-    var state_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(state_key, &state_digest, .{});
+    var state_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(state_key, &state_digest, .{});
     try appendEncodedComponent(&list, alloc, &state_digest);
+    return try list.toOwnedSlice(alloc);
+}
+
+/// Durable source-specific lifetime survives a paged contender rebuild. It
+/// remains under the owning document prefix for split, merge, and backup.
+pub fn graphEdgeTtlLifetimeKeyAlloc(
+    alloc: Allocator,
+    edge_key: []const u8,
+    index_name: []const u8,
+    generation: u64,
+    state_key: []const u8,
+) ![]u8 {
+    if (!isGraphEdgeArtifactKey(edge_key)) return error.InvalidInternalUserKey;
+    const doc_term = findComponentTerminator(edge_key, 1) orelse return error.InvalidInternalUserKey;
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, edge_key[0 .. doc_term + 2]);
+    try list.append(alloc, graph_edge_contender_kind);
+    try appendEncodedComponent(&list, alloc, index_name);
+    try list.append(alloc, graph_edge_ttl_lifetime_kind);
+    var generation_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &generation_buf, generation, .big);
+    try list.appendSlice(alloc, &generation_buf);
+    var edge_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(edge_key, &edge_digest, .{});
+    try appendEncodedComponent(&list, alloc, &edge_digest);
+    var state_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(state_key, &state_digest, .{});
+    try appendEncodedComponent(&list, alloc, &state_digest);
+    return try list.toOwnedSlice(alloc);
+}
+
+/// An expired source revision stays suppressed while its producer asset is
+/// unchanged. Like lifetime rows, tombstones follow their owning document
+/// through backup and range movement.
+pub fn graphEdgeTtlTombstoneKeyAlloc(
+    alloc: Allocator,
+    edge_key: []const u8,
+    index_name: []const u8,
+    generation: u64,
+    state_key: []const u8,
+) ![]u8 {
+    const lifetime = try graphEdgeTtlLifetimeKeyAlloc(alloc, edge_key, index_name, generation, state_key);
+    errdefer alloc.free(lifetime);
+    const doc_term = findComponentTerminator(lifetime, 1) orelse return error.InvalidInternalUserKey;
+    const index_term = findComponentTerminator(lifetime, doc_term + 3) orelse return error.InvalidInternalUserKey;
+    lifetime[index_term + 2] = graph_edge_ttl_tombstone_kind;
+    return lifetime;
+}
+
+/// Synthetic owner identity for explicit graph writes on a sourced graph
+/// index. It uses the existing document-local graph-state namespace so split,
+/// merge, and backup carry the same stable contributor identity.
+pub const graph_direct_state_name = "\x00direct";
+
+pub fn graphDirectStateKeyAlloc(alloc: Allocator, doc_key: []const u8, index_name: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, graph_asset_state_kind);
+    try appendEncodedComponent(&list, alloc, index_name);
+    try appendEncodedComponent(&list, alloc, graph_direct_state_name);
     return try list.toOwnedSlice(alloc);
 }
 
@@ -631,8 +745,8 @@ pub fn graphGlobalEdgeContenderEdgePrefixAlloc(
     var generation_buf: [@sizeOf(u64)]u8 = undefined;
     std.mem.writeInt(u64, &generation_buf, generation, .big);
     try list.appendSlice(alloc, &generation_buf);
-    var edge_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(edge_key, &edge_digest, .{});
+    var edge_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(edge_key, &edge_digest, .{});
     try appendEncodedComponent(&list, alloc, &edge_digest);
     return try list.toOwnedSlice(alloc);
 }
@@ -680,6 +794,21 @@ pub fn matchesGraphGlobalEdgeContenderIndexName(key: []const u8, index_name: []c
     if (!isGraphGlobalEdgeContenderKey(key)) return false;
     const doc_term = findComponentTerminator(key, 1) orelse return false;
     return componentEquals(key, doc_term + 2 + 1, index_name);
+}
+
+/// Move an authenticated contender into a receiver's physical incarnation.
+/// Logical edge/state hashes remain unchanged; only the fenced generation is
+/// owner-local. Tombstones use this same operation as live records.
+pub fn rebindGraphGlobalEdgeContenderKeyAlloc(alloc: Allocator, key: []const u8, source_generation: u64, receiver_generation: u64) ![]u8 {
+    if (!isGraphGlobalEdgeContenderKey(key) or source_generation == 0 or receiver_generation == 0)
+        return error.InvalidGraphEdgeContender;
+    const doc_end = (findComponentTerminator(key, 1) orelse unreachable) + 2;
+    const generation_offset = (findComponentTerminator(key, doc_end + 1) orelse unreachable) + 2;
+    if (std.mem.readInt(u64, key[generation_offset..][0..8], .big) != source_generation)
+        return error.GraphGenerationMismatch;
+    const rebound = try alloc.dupe(u8, key);
+    std.mem.writeInt(u64, rebound[generation_offset..][0..8], receiver_generation, .big);
+    return rebound;
 }
 
 pub fn artifactTypePrefixAlloc(alloc: Allocator, doc_key: []const u8, artifact_type: []const u8) ![]u8 {
@@ -1461,7 +1590,14 @@ pub fn appendGraphRelationshipSuffix(list: *std.ArrayListUnmanaged(u8), alloc: A
 /// admission. Reject unknown versions and trailing bytes instead of truncating.
 pub fn parseGraphRelationshipSuffix(key: []const u8, start: usize) ?GraphRelationshipSuffix {
     if (start == key.len) return .{};
-    if (start > key.len or key[start] != 1) return null;
+    if (start > key.len) return null;
+    const legacy_end = findComponentTerminator(key, start) orelse return null;
+    if (legacy_end + 2 == key.len) return .{ .logical_source = key[start..legacy_end] };
+    if (key[start] != 1) {
+        const source_end = findComponentTerminator(key, start) orelse return null;
+        if (source_end + 2 != key.len) return null;
+        return .{ .logical_source = key[start..source_end] };
+    }
     var pos = start + 1;
     const id_end = findComponentTerminator(key, pos) orelse return null;
     if (id_end == pos) return null;
@@ -1476,6 +1612,7 @@ pub fn parseGraphRelationshipSuffix(key: []const u8, start: usize) ?GraphRelatio
 }
 
 pub fn graphRelationshipArtifactKeyAlloc(alloc: Allocator, owner: []const u8, index_name: []const u8, edge_type: []const u8, target: []const u8, source: []const u8, edge_id: []const u8) ![]u8 {
+    if (edge_id.len == 0) return graphEdgeArtifactKeyWithSourceAlloc(alloc, owner, index_name, edge_type, target, source);
     const base = try graphEdgeArtifactKeyAlloc(alloc, owner, index_name, edge_type, target);
     defer alloc.free(base);
     var list = std.ArrayListUnmanaged(u8).empty;
@@ -1483,6 +1620,33 @@ pub fn graphRelationshipArtifactKeyAlloc(alloc: Allocator, owner: []const u8, in
     try list.appendSlice(alloc, base);
     try appendGraphRelationshipSuffix(&list, alloc, .{ .edge_id = edge_id, .logical_source = if (std.mem.eql(u8, owner, source)) "" else source });
     return list.toOwnedSlice(alloc);
+}
+
+/// Graph edge artifact key with an explicit topological source node distinct
+/// from the owning document. Ownership (routing, retirement, replacement
+/// manifests, split ranges) stays with `doc_key` — the leading component —
+/// while replay applies the edge from `source_node` (e.g. a resolver-minted
+/// canonical entity key for autoschema entity->entity relations, see
+/// zig/AUTOSCHEMA.md). A source equal to the owner encodes as the legacy
+/// five-component key so unchanged producers keep byte-identical rows.
+pub fn graphEdgeArtifactKeyWithSourceAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    index_name: []const u8,
+    edge_type: []const u8,
+    target_doc_key: []const u8,
+    source_node: []const u8,
+) ![]u8 {
+    if (std.mem.eql(u8, source_node, doc_key))
+        return graphEdgeArtifactKeyAlloc(alloc, doc_key, index_name, edge_type, target_doc_key);
+    const base = try graphEdgeArtifactKeyAlloc(alloc, doc_key, index_name, edge_type, target_doc_key);
+    defer alloc.free(base);
+    const out = try alloc.alloc(u8, base.len + encodedComponentLen(source_node));
+    errdefer alloc.free(out);
+    @memcpy(out[0..base.len], base);
+    const written = encodeComponent(out[base.len..], source_node);
+    std.debug.assert(base.len + written == out.len);
+    return out;
 }
 
 pub fn derivedEmbeddingBaseKeyAlloc(alloc: Allocator, key: []const u8) !?[]u8 {
@@ -1520,6 +1684,14 @@ pub fn isRelationalRowKey(key: []const u8) bool {
 
 pub fn isStoredDocumentRowKey(key: []const u8) bool {
     return isPrimaryDocumentKey(key) or isRelationalRowKey(key);
+}
+
+pub fn isRelationalIndexReverseKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const term = findComponentTerminator(key, 1) orelse return false;
+    const start = term + 3;
+    if (start > key.len or key.len - start != 12 or key[term + 2] != relational_index_reverse_kind) return false;
+    return std.mem.readInt(u64, key[start..][0..8], .big) != 0;
 }
 
 pub fn isTtlKey(key: []const u8) bool {
@@ -1835,12 +2007,102 @@ pub fn isGraphEdgeContenderKey(key: []const u8) bool {
     pos = index_term + 2;
     if (pos >= key.len) return false;
     if (key[pos] == graph_edge_contender_count_kind) return pos + 1 == key.len;
-    if (key[pos] != graph_edge_contender_record_kind) return false;
-    pos += 1;
+    if (key[pos] == graph_edge_ttl_lifetime_kind or key[pos] == graph_edge_ttl_tombstone_kind) {
+        pos += 1;
+        if (key.len - pos < @sizeOf(u64)) return false;
+        pos += @sizeOf(u64);
+    } else if (key[pos] == graph_edge_contender_record_kind) {
+        pos += 1;
+    } else return false;
     const edge_term = findComponentTerminator(key, pos) orelse return false;
     pos = edge_term + 2;
     const state_term = findComponentTerminator(key, pos) orelse return false;
     return state_term + 2 == key.len;
+}
+
+pub fn isGraphEdgeTtlLifetimeKey(key: []const u8) bool {
+    if (!isGraphEdgeContenderKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    const index_start = doc_term + 2 + 1;
+    const index_term = findComponentTerminator(key, index_start) orelse return false;
+    return key[index_term + 2] == graph_edge_ttl_lifetime_kind;
+}
+
+pub fn isGraphEdgeTtlTombstoneKey(key: []const u8) bool {
+    if (!isGraphEdgeContenderKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    const index_start = doc_term + 2 + 1;
+    const index_term = findComponentTerminator(key, index_start) orelse return false;
+    return key[index_term + 2] == graph_edge_ttl_tombstone_kind;
+}
+
+pub fn graphEdgeTtlStateKeyGeneration(key: []const u8) !u64 {
+    if (!isGraphEdgeTtlLifetimeKey(key) and !isGraphEdgeTtlTombstoneKey(key)) return error.InvalidInternalUserKey;
+    const doc_term = findComponentTerminator(key, 1) orelse return error.InvalidInternalUserKey;
+    const index_term = findComponentTerminator(key, doc_term + 3) orelse return error.InvalidInternalUserKey;
+    const generation_pos = index_term + 3;
+    return std.mem.readInt(u64, key[generation_pos..][0..8], .big);
+}
+
+pub fn rebindGraphEdgeTtlStateKeyGenerationAlloc(alloc: Allocator, key: []const u8, generation: u64) ![]u8 {
+    if (!isGraphEdgeTtlLifetimeKey(key) and !isGraphEdgeTtlTombstoneKey(key)) return error.InvalidInternalUserKey;
+    const doc_term = findComponentTerminator(key, 1) orelse return error.InvalidInternalUserKey;
+    const index_term = findComponentTerminator(key, doc_term + 3) orelse return error.InvalidInternalUserKey;
+    const out = try alloc.dupe(u8, key);
+    std.mem.writeInt(u64, out[index_term + 3 ..][0..8], generation, .big);
+    return out;
+}
+
+/// TTL state and global contributors share an authenticated edge digest.
+/// Probe only that edge's contributors when an imported state row arrives;
+/// no document-wide reverse scan or reversible hash encoding is required.
+pub fn graphGlobalEdgeContenderPrefixForTtlStateAlloc(alloc: Allocator, key: []const u8) ![]u8 {
+    if (!isGraphEdgeTtlLifetimeKey(key) and !isGraphEdgeTtlTombstoneKey(key)) return error.InvalidInternalUserKey;
+    const doc_term = findComponentTerminator(key, 1) orelse return error.InvalidInternalUserKey;
+    const index_term = findComponentTerminator(key, doc_term + 3) orelse return error.InvalidInternalUserKey;
+    const generation_pos = index_term + 3;
+    const edge_term = findComponentTerminator(key, generation_pos + 8) orelse return error.InvalidInternalUserKey;
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, key[0 .. doc_term + 2]);
+    try list.append(alloc, graph_global_edge_contender_kind);
+    try list.appendSlice(alloc, key[doc_term + 3 .. index_term + 2]);
+    try list.appendSlice(alloc, key[generation_pos .. edge_term + 2]);
+    return list.toOwnedSlice(alloc);
+}
+
+test "graph edge ttl lifetime key follows owner and index" {
+    const alloc = std.testing.allocator;
+    const edge = try graphEdgeArtifactKeyAlloc(alloc, "doc:a", "links", "cites", "doc:b");
+    defer alloc.free(edge);
+    const key = try graphEdgeTtlLifetimeKeyAlloc(alloc, edge, "links", 7, "source:one");
+    defer alloc.free(key);
+    try std.testing.expect(isGraphEdgeTtlLifetimeKey(key));
+    try std.testing.expect(isGraphEdgeContenderKey(key));
+    try std.testing.expect(matchesGraphEdgeContenderIndexName(key, "links"));
+    const owner_prefix = try graphEdgeContenderRootPrefixAlloc(alloc, "doc:a");
+    defer alloc.free(owner_prefix);
+    try std.testing.expect(std.mem.startsWith(u8, key, owner_prefix));
+    const tombstone = try graphEdgeTtlTombstoneKeyAlloc(alloc, edge, "links", 7, "source:one");
+    defer alloc.free(tombstone);
+    try std.testing.expect(isGraphEdgeTtlTombstoneKey(tombstone));
+    try std.testing.expect(isGraphEdgeContenderKey(tombstone));
+    try std.testing.expect(matchesGraphEdgeContenderIndexName(tombstone, "links"));
+    try std.testing.expect(std.mem.startsWith(u8, tombstone, owner_prefix));
+    const rebound = try rebindGraphEdgeTtlStateKeyGenerationAlloc(alloc, tombstone, 9);
+    defer alloc.free(rebound);
+    try std.testing.expectEqual(@as(u64, 7), try graphEdgeTtlStateKeyGeneration(tombstone));
+    try std.testing.expectEqual(@as(u64, 9), try graphEdgeTtlStateKeyGeneration(rebound));
+    const expected_rebound = try graphEdgeTtlTombstoneKeyAlloc(alloc, edge, "links", 9, "source:one");
+    defer alloc.free(expected_rebound);
+    try std.testing.expectEqualSlices(u8, expected_rebound, rebound);
+    const global_prefix = try graphGlobalEdgeContenderEdgePrefixAlloc(alloc, "links", 7, edge);
+    defer alloc.free(global_prefix);
+    for ([_][]const u8{ key, tombstone }) |state| {
+        const from_state = try graphGlobalEdgeContenderPrefixForTtlStateAlloc(alloc, state);
+        defer alloc.free(from_state);
+        try std.testing.expectEqualSlices(u8, global_prefix, from_state);
+    }
 }
 
 pub fn matchesGraphEdgeContenderIndexName(key: []const u8, index_name: []const u8) bool {
@@ -1935,6 +2197,84 @@ pub fn isDocumentUnitArtifactRecordKey(key: []const u8) bool {
     pos += 1;
     const unit_term = findComponentTerminator(key, pos) orelse return false;
     return unit_term + 2 == key.len;
+}
+
+/// Logical, document-owned cached producer results that can cross a restore
+/// namespace unchanged. Projection ownership, coverage counters, temporary
+/// producer attempts, and store/identity metadata must be rebuilt, not copied.
+/// Match complete encodings so a valid prefix never authorizes arbitrary state.
+pub fn isRestoreArtifactKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    const kind_pos = doc_term + 2;
+    if (kind_pos >= key.len) return false;
+    const name_pos = kind_pos + 1;
+    switch (key[kind_pos]) {
+        asset_state_kind, document_unit_navigation_summary_kind => {
+            const name_term = findComponentTerminator(key, name_pos) orelse return false;
+            return name_term + 2 == key.len;
+        },
+        document_unit_navigation_block_kind => {
+            const name_term = findComponentTerminator(key, name_pos) orelse return false;
+            return key.len - (name_term + 2) == @sizeOf(u32);
+        },
+        artifact_kind => {
+            if (componentEquals(key, name_pos, "embedding")) return isEmbeddingArtifactKey(key);
+            if (componentEquals(key, name_pos, "chunk")) {
+                if (isChunkArtifactRecordKey(key)) return true;
+                if (!isDerivedEmbeddingArtifactKey(key)) return false;
+                const type_term = findComponentTerminator(key, name_pos).?;
+                const artifact_term = findComponentTerminator(key, type_term + 2) orelse return false;
+                var pos = artifact_term + 2;
+                if (pos < key.len and key[pos] == document_unit_record_kind) {
+                    pos = (findComponentTerminator(key, pos + 1) orelse return false) + 2;
+                }
+                return pos < key.len and key[pos] == chunk_record_kind;
+            }
+            if (componentEquals(key, name_pos, "asset")) {
+                if (isAssetArtifactKey(key) or isDocumentUnitArtifactRecordKey(key)) return true;
+                if (!isDerivedEmbeddingArtifactKey(key)) return false;
+                const type_term = findComponentTerminator(key, name_pos).?;
+                const artifact_term = findComponentTerminator(key, type_term + 2) orelse return false;
+                var pos = artifact_term + 2;
+                if (pos < key.len and key[pos] == document_unit_record_kind) {
+                    pos = (findComponentTerminator(key, pos + 1) orelse return false) + 2;
+                }
+                return pos < key.len and key[pos] == derived_embedding_kind;
+            }
+            return false;
+        },
+        else => return false,
+    }
+}
+
+test "restore artifacts admit only complete logical producer cache records" {
+    const accepted = [_][]const u8{
+        "\x01doc\x00\x00\x20embedding\x00\x00vec\x00\x00",
+        "\x01doc\x00\x00\x20chunk\x00\x00body\x00\x00\x30\x00\x00\x00\x03",
+        "\x01doc\x00\x00\x20chunk\x00\x00body\x00\x00\x30\x00\x00\x00\x03\x31vec\x00\x00",
+        "\x01doc\x00\x00\x20asset\x00\x00pages\x00\x00",
+        "\x01doc\x00\x00\x20asset\x00\x00pages\x00\x00\x35page1\x00\x00",
+        "\x01doc\x00\x00\x20asset\x00\x00pages\x00\x00\x35page1\x00\x00\x31vec\x00\x00",
+        "\x01doc\x00\x00\x33pages\x00\x00",
+        "\x01doc\x00\x00\x37pages\x00\x00",
+        "\x01doc\x00\x00\x38pages\x00\x00\x00\x00\x00\x03",
+        "\x01doc\x00\xffid\x00\x00\x20asset\x00\x00pages\x00\xffname\x00\x00",
+    };
+    for (accepted) |key| {
+        try std.testing.expect(isRestoreArtifactKey(key));
+        const extended = try std.mem.concat(std.testing.allocator, u8, &.{ key, "\x00" });
+        defer std.testing.allocator.free(extended);
+        try std.testing.expect(!isRestoreArtifactKey(extended));
+        try std.testing.expect(!isRestoreArtifactKey(key[0 .. key.len - 1]));
+    }
+    const rejected = [_][]const u8{
+        "",                                                               "doc",                                                         "\x01doc",                                                                          "\x01doc\x00\x00",                               "\x01doc\x00\x00\x10",
+        "\x01doc\x00\x00\x12",                                            "\x01doc\x00\x00\x13index\x00\x00",                            "\x01doc\x00\x00\x34graph\x00\x00asset\x00\x00",                                    "\x01doc\x00\x00\x36index\x00\x00",              "\x01doc\x00\x00\x39graph\x00\x00",
+        "\x01doc\x00\x00\x3fgraph\x00\x00",                               "\x01doc\x00\x00\x40pages\x00\x00",                            "\x01doc\x00\x00\x41pages\x00\x00",                                                 "\x01doc\x00\x00\x20graph\x00\x00edges\x00\x00", "\x01doc\x00\x00\x20resolution\x00\x00entities\x00\x00",
+        "\x01doc\x00\x00\x20unknown\x00\x00asset\x00\x00\x31vec\x00\x00", "\x01doc\x00\x00\x20chunk\x00\x00body\x00\x00\x31vec\x00\x00", "\x01doc\x00\x00\x20asset\x00\x00pages\x00\x00\x30\x00\x00\x00\x03\x31vec\x00\x00", &replay_meta_init_key,                           &identity_namespace_key,
+    };
+    for (rejected) |key| try std.testing.expect(!isRestoreArtifactKey(key));
 }
 
 /// Parent-owned compact hierarchy summary. Keeping navigation metadata outside
@@ -2132,7 +2472,7 @@ pub fn artifactNameView(key: []const u8) !?[]const u8 {
 pub fn parseGraphEdgeArtifactKeyAlloc(
     alloc: Allocator,
     key: []const u8,
-) !?struct { doc_key: []u8, index_name: []u8, edge_type: []u8, target_doc_key: []u8, edge_id: []u8, logical_source: []u8 } {
+) !?struct { doc_key: []u8, index_name: []u8, edge_type: []u8, target_doc_key: []u8, edge_id: []u8, logical_source: []u8, source_node: ?[]u8 = null } {
     if (!isGraphEdgeArtifactKey(key)) return null;
 
     const doc_term = findComponentTerminator(key, 1).?;
@@ -2172,6 +2512,7 @@ pub fn parseGraphEdgeArtifactKeyAlloc(
         .target_doc_key = target_doc_key,
         .edge_id = edge_id,
         .logical_source = logical_source,
+        .source_node = if (logical_source.len > 0) logical_source else null,
     };
 }
 
@@ -2678,6 +3019,34 @@ test "graph edge artifact key round trip" {
     try std.testing.expectEqualStrings("gr_v1", parsed.index_name);
     try std.testing.expectEqualStrings("links", parsed.edge_type);
     try std.testing.expectEqualStrings("doc:b", parsed.target_doc_key);
+    try std.testing.expect(parsed.source_node == null);
+}
+
+test "graph edge artifact key carries an explicit source node" {
+    const alloc = std.testing.allocator;
+
+    // Source equal to the owner degrades to the legacy five-component key.
+    const legacy = try graphEdgeArtifactKeyWithSourceAlloc(alloc, "doc:a", "gr_v1", "works_at", "org/antfly", "doc:a");
+    defer alloc.free(legacy);
+    const plain = try graphEdgeArtifactKeyAlloc(alloc, "doc:a", "gr_v1", "works_at", "org/antfly");
+    defer alloc.free(plain);
+    try std.testing.expectEqualSlices(u8, plain, legacy);
+
+    const key = try graphEdgeArtifactKeyWithSourceAlloc(alloc, "doc:a", "gr_v1", "works_at", "org/antfly", "person/ada");
+    defer alloc.free(key);
+    try std.testing.expect(isGraphEdgeArtifactKey(key));
+    try std.testing.expect(matchesGraphEdgeIndexName(key, "gr_v1"));
+
+    const parsed = (try parseGraphEdgeArtifactKeyAlloc(alloc, key)).?;
+    defer alloc.free(parsed.doc_key);
+    defer alloc.free(parsed.index_name);
+    defer alloc.free(parsed.edge_type);
+    defer alloc.free(parsed.target_doc_key);
+    defer if (parsed.source_node) |source| alloc.free(source);
+    try std.testing.expectEqualStrings("doc:a", parsed.doc_key);
+    try std.testing.expectEqualStrings("works_at", parsed.edge_type);
+    try std.testing.expectEqualStrings("org/antfly", parsed.target_doc_key);
+    try std.testing.expectEqualStrings("person/ada", parsed.source_node.?);
 }
 
 test "graph asset state key matches exact index name" {
@@ -3089,4 +3458,15 @@ test "graph relationship artifact identity is versioned and owner scoped" {
     defer alloc.free(corrupt);
     try std.testing.expect(!isGraphEdgeArtifactKey(corrupt));
     try std.testing.expectError(error.InvalidGraphEdges, graphRelationshipArtifactKeyAlloc(alloc, "fact", "facts", "RELATES_TO", "b", "a", ""));
+}
+
+/// Allocation-free format admission for primary artifact transfers.
+pub fn graphArtifactHasRelationshipId(key: []const u8) bool {
+    if (!isGraphEdgeArtifactKey(key)) return false;
+    var pos = findComponentTerminator(key, 1).? + 3;
+    pos = findComponentTerminator(key, pos).? + 2;
+    pos = findComponentTerminator(key, pos).? + 3;
+    pos = findComponentTerminator(key, pos).? + 2;
+    pos = findComponentTerminator(key, pos).? + 2;
+    return parseGraphRelationshipSuffix(key, pos).?.edge_id.len != 0;
 }

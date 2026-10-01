@@ -248,6 +248,7 @@ pub const CatalogService = struct {
         read_schema_json: []const u8,
         indexes_json: []const u8,
     ) !bool {
+        try @import("storage_capabilities.zig").requireDefinition(self.alloc, schema_json, read_schema_json, indexes_json);
         const namespace = try self.defaultServingNamespaceAlloc(table_name);
         defer self.alloc.free(namespace);
         return try self.store.ensureTable(
@@ -295,12 +296,14 @@ pub const CatalogService = struct {
     pub fn ensureTableWritesAllowed(self: *CatalogService, table_name: []const u8) !void {
         var table = (try self.getTableAlloc(self.alloc, table_name)) orelse return error.NamespaceNotFound;
         defer table.deinit(self.alloc);
+        try @import("storage_capabilities.zig").requireDefinition(self.alloc, table.schema_json, table.read_schema_json, table.indexes_json);
         try ensureSchemaWritesAllowedAlloc(self.alloc, table.schema_json);
     }
 
     pub fn ensureNamespaceWritesAllowed(self: *CatalogService, namespace: []const u8) !void {
         var table = (try self.getTableForNamespaceAlloc(self.alloc, namespace)) orelse return;
         defer table.deinit(self.alloc);
+        try @import("storage_capabilities.zig").requireDefinition(self.alloc, table.schema_json, table.read_schema_json, table.indexes_json);
         try ensureSchemaWritesAllowedAlloc(self.alloc, table.schema_json);
     }
 
@@ -311,6 +314,7 @@ pub const CatalogService = struct {
         read_schema_json: []const u8,
         indexes_json: []const u8,
     ) !bool {
+        try @import("storage_capabilities.zig").requireDefinition(self.alloc, schema_json, read_schema_json, indexes_json);
         return try self.store.setTableDefinition(table_name, schema_json, read_schema_json, indexes_json);
     }
 
@@ -5634,6 +5638,20 @@ test "serverless catalog status stays local and write admission rejects read-onl
     try std.testing.expectError(error.ExternalTableReadOnly, catalog.ensureTableWritesAllowed("events"));
     try std.testing.expectError(error.ExternalTableReadOnly, catalog.ensureNamespaceWritesAllowed("events"));
     try std.testing.expectError(error.ExternalSourcePlanResolverUnavailable, catalog.buildTable("events"));
+
+    // Reject both newly declared and already-persisted unsupported semantics.
+    try std.testing.expectError(error.RelationalStorageUnavailable, catalog.ensureTableWithDefinition("unsupported", 1, .{}, "{\"storage_mode\":\"relational\"}", "", "{}"));
+    try std.testing.expect((try catalog.getTableAlloc(alloc, "unsupported")) == null);
+    const unsupported = [_]struct { read_schema: []const u8, indexes: []const u8 }{
+        .{ .read_schema = "{\"storage_mode\":\"relational\"}", .indexes = "{}" },
+        .{ .read_schema = "", .indexes = "{\"ordered\":{\"type\":\"relational\"}}" },
+    };
+    for (unsupported) |definition| {
+        try std.testing.expect(try test_catalog_store.setTableDefinition("events", "{}", definition.read_schema, definition.indexes));
+        try std.testing.expectError(error.RelationalStorageUnavailable, catalog.ensureTableWritesAllowed("events"));
+        try std.testing.expectError(error.RelationalStorageUnavailable, catalog.ensureNamespaceWritesAllowed("events"));
+    }
+    try std.testing.expect(try catalog.setTableDefinition("events", current_schema, "", "{}"));
 
     // A selector is not a resolved inventory. Neither current nor explicit
     // pins may create a partial external HEAD without the resolver capability.

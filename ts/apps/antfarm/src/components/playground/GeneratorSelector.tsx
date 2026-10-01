@@ -21,6 +21,7 @@ export const GENERATOR_PROVIDER_DEFAULTS: Partial<Record<GeneratorProvider, stri
   ollama: "llama3.3:70b",
   gemini: "gemini-2.5-flash",
   openai: "gpt-4.1",
+  openrouter: "openai/gpt-4o-mini",
   vertex: "gemini-2.5-flash",
 };
 
@@ -29,6 +30,7 @@ export const GENERATOR_PROVIDER_LABELS: Partial<Record<GeneratorProvider, string
   ollama: "Ollama (Local)",
   gemini: "Google AI (Gemini)",
   openai: "OpenAI",
+  openrouter: "OpenRouter",
   vertex: "Google Cloud Vertex AI",
 };
 
@@ -44,6 +46,7 @@ export const QUERY_BUILDER_PROVIDERS: GeneratorProvider[] = [
   "gemini",
   "vertex",
   "openai",
+  "openrouter",
   "ollama",
   "antfly",
 ];

@@ -13,11 +13,13 @@ surfaces from one package per language.
   - `specs/openapi/inference/api.yaml`
 - The public SDK contract is the root `openapi.yaml`.
 - `scripts/join_openapi.py` builds the Antfly public source contract.
-- `scripts/join_public_openapi.py` joins Antfly and inference into `openapi.yaml`.
+- `scripts/join_public_openapi.py` joins Antfly, inference, and extensions into `openapi.yaml`.
 - Public route prefixes are part of the joined contract:
   - Antfly data API: `/db/v1`
   - Auth API: `/auth/v1`
   - Inference ML API: `/ai/v1`
+  - ML prediction API: `/ml/v1`
+  - Extensions API: `/extensions/v1`
 
 Zig remains the owner of the source OpenAPI contracts and generated server/client
 code. Public SDKs must generate from root `openapi.yaml`, not from the split
@@ -32,7 +34,7 @@ Antfly or inference source specs.
 - Rust `pgaf` crate: `rs/crates/pgaf`
 
 Shared repository scripts live in top-level `scripts/`. Zig-only build code stays
-under `zig/`; there is no `zig/scripts/` directory.
+under `zig/`.
 
 ## SDK Shape
 

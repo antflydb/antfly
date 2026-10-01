@@ -243,7 +243,7 @@ test "serverless object store VOPR composes real artifact manifest WAL and progr
     try std.testing.expectEqual(@as(u64, 1), try progress.getHead("docs"));
 }
 
-test "HA seed backup restore VOPR retries ambiguous publication and canceled download" {
+test "standby seed backup restore VOPR retries ambiguous publication and canceled download" {
     const alloc = std.testing.allocator;
     const io = std.testing.io; // vopr-audit: allow(host_filesystem) seed artifact materialization is the retained native differential boundary
     var tmp = std.testing.tmpDir(.{}); // vopr-audit: allow(host_filesystem) seed artifact materialization is the retained native differential boundary
@@ -286,10 +286,10 @@ test "HA seed backup restore VOPR retries ambiguous publication and canceled dow
     var faults = objectstore.ScriptedFaultClient.init(alloc, memory.client());
     defer faults.deinit();
     var client = faults.client();
-    try client.makeBucket("ha-seeds");
+    try client.makeBucket("standby-seeds");
     const store = seed_artifact.Store{
         .client = &client,
-        .bucket = "ha-seeds",
+        .bucket = "standby-seeds",
         .prefix = "cluster-a",
     };
     const publish_request = seed_artifact.PublishRequest{

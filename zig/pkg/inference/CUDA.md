@@ -307,7 +307,7 @@ candidate is still dev-only.
 
 The complete FP16 encoder, generated tensor-core attention, Fastino comparison,
 correctness evidence, production dispatch policy, and remaining work are
-documented in [`docs/GLINER2_CUDA.md`](docs/GLINER2_CUDA.md).
+documented in [`models/gliner2/CUDA.md`](models/gliner2/CUDA.md).
 
 CUDA GLiNER2 span-head weights use resident `Q4_K` kernels by default when the
 checked-in CUDA module exposes the required GLiNER span primitives. This avoids
@@ -357,6 +357,12 @@ explicit quality/parity acceptance gate, not just the runtime gate (see
 History and Evidence for the dated measurement run). `turbo3` is functional
 and resident but remains experimental — it is slower than `polar4` on L4
 decode workloads and can change output quality more aggressively.
+
+The measured win from the CUDA block-table upload cache is memory residency
+and lower KV metadata overhead, not higher decode throughput: it cuts the
+volume of block-table uploads needed to keep the paged device KV path
+resident, which is why `polar4`/`turbo3` promote on residency and fallback
+behavior rather than on raw tok/s.
 
 User-facing E2B CUDA smoke from the repository root:
 
@@ -430,6 +436,46 @@ zig/pkg/inference/zig-out/bin/antfly-inference generate \
   --print-timing
 ```
 
+### Gemma 4 A4B defaults and rollback
+
+CUDA qualifies one fail-closed Gemma 4 26B-A4B configuration: NVIDIA SM89,
+30 MoE layers, 128 experts, top-8 routing, hidden size 2816, intermediate
+size 704, and Q4_0 expert projections, with all packed experts resident.
+Only full residency is supported: a streamed request, mismatched device,
+geometry or quantization, missing required kernel, or insufficient memory
+envelope fails model load instead of selecting host MoE execution.
+
+The default CUDA A4B load policy is full residency loaded through a bounded
+pinned-host pipeline; an explicit A4B budget flag is unnecessary for the
+qualified model, although the global backend/combined budgets must still
+admit the allocation. `--a4b-load-strategy legacy` is the rollback to the
+prior loader. `pipeline` fails closed on pinned-staging/worker/host-allocation
+problems, while `auto` falls back to `legacy` only in those same cases.
+
+`--a4b-prepared-pack` controls whether an offline-built balanced expert pack
+(`antfly-inference a4b-pack`) is used instead of the canonical GGUF. The
+default `auto` policy uses `$MODEL/a4b-cuda-pack-v2` when present; an absent
+pack uses the canonical GGUF normally, and a stale, malformed, or
+geometry-mismatched optional pack emits a warning before falling back to the
+canonical GGUF. `required` rejects any of those fallback conditions instead
+of silently using the GGUF, and `off` always forces the canonical GGUF.
+Pack manifests bind to a relocatable source fingerprint and preserve
+per-shard SHA-256 digests for offline verification.
+
+For rolling workers, clean checkpoint pages remain in the reclaimable kernel
+page cache after a successful full-residency upload. Use
+`--a4b-drop-host-cache-after-load` when host-memory pressure matters more
+than replacement-worker admission. Server `startup_strategy: "prefetch"` can
+warm the canonical GGUF or an installed prepared pack without creating a CUDA
+session; this is an operator-controlled cache-warming mechanism, not a
+promised restart-speedup, since its benefit depends on the deployment's
+host-memory and storage topology.
+
+For field isolation of the CUDA post-FFN normalization fusion, set
+`ANTFLY_INFERENCE_CUDA_DISABLE_A4B_PARALLEL_FFN_POST_RESIDUAL=1`. The request
+then uses the shared unfused graph path; model admission and every other
+qualified CUDA A4B kernel remain unchanged.
+
 ## Inference Surface
 
 The first CUDA execution surface should be:
@@ -473,11 +519,9 @@ by ClipClap, GLiNER2, and DeBERTa reranker sessions:
 - an opt-in generated GQA decode-attention candidate specialized for
   `q_seq_len=1`, `head_dim=256`, and the nullable device-scalar ABI. Enable it
   with `ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_DECODE=1`; module loading
-  fails closed if the generated symbol is missing. On an NVIDIA L4 with Gemma 4
-  E2B QAT `UD-Q4_K_XL`, three 128-token runs measured a median 64.91 tok/s
-  versus 63.18 tok/s for the hand-written route (+2.7%), with 3,556/4,480
-  attention launches generated and exact 32-token ID parity. It remains opt-in
-  pending broader model, context-length, and masking coverage.
+  fails closed if the generated symbol is missing. On an NVIDIA L4 it measured
+  modestly faster than the hand-written route with exact token parity; it
+  remains opt-in pending broader model, context-length, and masking coverage.
 - GLiNER-oriented DeBERTa attention/head helper kernels
 
 Required common kernels are loaded eagerly when the CUDA module is loaded. If a
@@ -725,7 +769,7 @@ singleton route. The row-two path has repeated paged-KV growth coverage but
 remains experimental because long generation may differ from singleton token
 output and the optimized singleton decoder is currently faster. Set
 `ANTFLY_INFERENCE_DISABLE_CONTINUOUS_BATCHING=1` for the global rollback.
-See [docs/CUDA_BATCHING.md](docs/CUDA_BATCHING.md) for the canonical rollout
+See [docs/CUDA_BATCHING.md](CUDA_BATCHING.md) for the canonical rollout
 contract and promotion gate.
 
 Run the hardware gate with:
@@ -794,35 +838,12 @@ CUDA meets its minimal-usefulness bar:
 
 ## History and Evidence
 
-Status checked on 2026-06-21 on an NVIDIA L4 (`sm_89`) with CUDA Toolkit 13.2
-and driver R580:
-
-- `zig build -Dcuda=true`, `regen-cuda-artifacts.sh --check --all`,
-  `antfly-inference cuda-info --smoke`, and `zig build test -Dcuda=true` pass.
-- `polar4` stays fully resident on CUDA with zero host attention fallback in
-  the E2B and 12B Q4 checks below.
-- `turbo3` is functional and resident, but slower than `polar4` on the L4
-  decode workloads tested.
-- Deterministic 12B Q4 f32/polar4 output matched in a 32-token raw check, but
-  E2B f32/polar4 output diverged.
-
-Measured L4 results from `/tmp/antfly-cuda-turboquant-prod`:
-
-| Workload | Cache | Tokens | Load | Warm TTFT | Cold TTFT | Decode tok/s | CUDA KV status |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| E2B Korean summary | f32 | 128 | 8.56s | 0.30s | 8.86s | 17.11 | 4480/4480 device KV successes |
-| E2B Korean summary | polar4 | 128 | 8.43s | 0.30s | 8.73s | 16.70 | 1920 compressed-V writes, 4480 reads |
-| 12B Q4 Korean summary | f32 | 40 | 17.01s | 2.01s | 19.02s | 8.67 | 1968/1968 device KV successes |
-| 12B Q4 Korean summary | polar4 | 30 | 17.10s | 1.98s | 19.08s | 8.66 | 1488 compressed-V writes, 1488 reads |
-| 12B Q4 raw repeat 1 | polar4 | 32 | 17.09s | 0.63s | 17.71s | 9.16 | zero fallback |
-| 12B Q4 raw repeat 2 | polar4 | 32 | 17.02s | 0.63s | 17.65s | 9.06 | zero fallback |
-| 12B Q4 raw repeat 3 | polar4 | 32 | 16.82s | 0.63s | 17.45s | 9.04 | zero fallback |
-
-The measured win at this stage was memory residency and lower metadata
-overhead, not higher tok/s. The block-table upload cache reduced E2B
-16-token `polar4` block-table uploads to 30, and the longer 128-token E2B
-`polar4` stress run used 135 uploads while completing 4480 device-KV reads
-with zero fallback.
+> **Relocated:** The dated L4 TurboQuant validation status and measurement
+> tables that previously lived here (32 lines, checked 2026-06-21) are
+> preserved verbatim in
+> [work-log/completed/inference/cuda-turboquant-l4-validation.md](../../../work-log/completed/inference/cuda/turboquant-l4.md).
+> Durable decisions from it are in Gemma4 And TurboQuant KV Status in this
+> document.
 
 ## Open work
 

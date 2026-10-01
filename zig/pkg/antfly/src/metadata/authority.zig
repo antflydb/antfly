@@ -78,3 +78,27 @@ test "metadata mutation non-admission classification excludes ambiguous authorit
     try std.testing.expectEqual(error.MetadataMutationOutcomeUnknown, afterPossibleAdmission(error.NotLeader));
     try std.testing.expectEqual(error.OutOfMemory, afterPossibleAdmission(error.OutOfMemory));
 }
+
+/// Leadership preparation rebuilds the durable restore queue before dispatching
+/// the public request. Its own writes may be ambiguous, but no user mutation has
+/// run, so a later request may safely retry preparation from committed state.
+/// Do not use this broader set for errors from the dispatched request itself.
+pub fn isRetryableLeadershipPreparationError(err: anyerror) bool {
+    return isRetryableError(err) or switch (err) {
+        error.MetadataProposalSuperseded,
+        error.MetadataProposalApplyTimeout,
+        error.MetadataMutationOutcomeUnknown,
+        => true,
+        else => false,
+    };
+}
+
+test "restore leadership preparation retries ambiguity without permitting mutation replay" {
+    for ([_]anyerror{ error.MetadataProposalSuperseded, error.MetadataProposalApplyTimeout, error.MetadataMutationOutcomeUnknown }) |err| {
+        try std.testing.expect(isRetryableLeadershipPreparationError(err));
+        try std.testing.expect(!isRetryableError(err));
+        try std.testing.expect(!isMutationNotAdmittedError(err));
+    }
+    try std.testing.expect(!isRetryableLeadershipPreparationError(error.CorruptRestoreJobStore));
+    try std.testing.expect(!isRetryableLeadershipPreparationError(error.RestoreJobPersistenceUnavailable));
+}

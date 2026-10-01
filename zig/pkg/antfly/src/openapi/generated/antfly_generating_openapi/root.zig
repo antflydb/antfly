@@ -21,6 +21,7 @@ pub const ImageURLContentPart = types.ImageURLContentPart;
 pub const MediaContentPart = types.MediaContentPart;
 pub const OllamaGeneratorConfig = types.OllamaGeneratorConfig;
 pub const OpenAIGeneratorConfig = types.OpenAIGeneratorConfig;
+pub const OpenAIReasoningEffort = types.OpenAIReasoningEffort;
 pub const OpenRouterGeneratorConfig = types.OpenRouterGeneratorConfig;
 pub const RateLimitConfig = types.RateLimitConfig;
 pub const RetryConfig = types.RetryConfig;

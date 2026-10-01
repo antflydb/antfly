@@ -270,15 +270,9 @@ Guardrails:
 
 Status: in progress.
 
-Current benchmark signal:
-
-- `./zig-out/bin/open_bench --docs 200 --batch-size 25 --indexes-text 2 --indexes-dense 1 --indexes-sparse 1 --stage-backlog --index-open-parallelism 1`
-  - `open_ms=9.056`
-- `./zig-out/bin/open_bench --docs 200 --batch-size 25 --indexes-text 2 --indexes-dense 1 --indexes-sparse 1 --stage-backlog`
-  - `open_ms=5.622`
-
-That is roughly a `1.6x` improvement on the replay-heavy reopen case before
-touching replay semantics.
+Current benchmark signal: `open_bench` on the replay-heavy reopen scenario
+shows parallel-safe detached index opening is measurably faster than serial
+(`--index-open-parallelism 1`) opening, before touching replay semantics.
 
 ### Provisioned Cache Warmup
 
@@ -315,26 +309,19 @@ Current progress:
   - `antfly_data_replay_debt_*`
   - `antfly_data_runtime_status_*`
 
-Current warmup-bench signal on
-`--docs 200 --batch-size 25 --body-repeat 8`:
+Current warmup-bench signal: warmed first lookup and first write batch are
+both substantially faster than cold, confirming warmup moves `DB.open()` cost
+off the first request.
 
-- first lookup: `9.750 ms` cold -> `0.134 ms` warmed
-- first write batch: `113.307 ms` cold -> `6.740 ms` warmed
+Current raft-apply-bench signal on the same workload: raft apply and
+reopen/group-state-scan latency stay small relative to the warmup savings
+above, so the adjacent raft-backed apply path is not the bottleneck this
+benchmark isolates.
 
-Current raft-apply-bench signal on the same workload:
-
-- raft apply total: `8.199 ms`
-- max raft apply batch: `1.183 ms`
-- reopen latest batch + state read: `0.066 ms` reopen,
-  `0.247 ms` group-state scan
-
-Current managed-host-wal-bench signal on the same workload:
-
-- leader election: `3.225 ms`
-- propose + commit + apply: `30.830 ms` total, `4.964 ms` max batch
-- restart: `1.506 ms`
-- WAL/apply indexes after restart: `201` persisted, `201` applied,
-  `201` latest commit index
+Current managed-host-wal-bench signal on the same workload: the full
+managed-host proposal path (leader election, propose/commit/apply, restart)
+completes with WAL and apply indexes fully consistent after restart,
+confirming durability across the same workload shape.
 
 ### Open Performance Follow-Through
 

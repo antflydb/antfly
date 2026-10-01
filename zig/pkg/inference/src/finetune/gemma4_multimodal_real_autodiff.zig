@@ -303,10 +303,11 @@ fn makeTrainerInputForExampleWeighted(
         for (0..@min(example.labels.len, rows)) |i| {
             const label = example.labels[i];
             if (label < 0) continue;
+            if (i == 0) return error.InvalidCausalLabelPosition;
             const idx: usize = @intCast(label);
             if (idx >= vocab_size) return error.LabelOutOfRange;
             const row_scale = if (token_scales) |scales| scales[supervised_idx] else default_row_scale;
-            targets[i * vocab_size + idx] = row_scale;
+            targets[(i - 1) * vocab_size + idx] = row_scale;
             supervised_idx += 1;
         }
     }
@@ -876,7 +877,7 @@ fn cachedProjectedMedia(
     errdefer allocator.free(owned_key);
     const projected = switch (kind) {
         .image => blk: {
-            var images = try gemma4_projector.encodeProjectedImages(ctx.compute_backend, allocator, ctx.gguf_projector_path, &.{bytes});
+            var images = try gemma4_projector.encodeProjectedImagesFromPath(ctx.compute_backend, allocator, ctx.gguf_projector_path, &.{bytes});
             defer images.deinit();
             if (images.tokens_per_image.len != 1) return error.InvalidPreparedPrompt;
             break :blk CachedProjectedMedia{
@@ -886,7 +887,7 @@ fn cachedProjectedMedia(
             };
         },
         .audio => blk: {
-            var audio = try gemma4_projector.encodeProjectedAudio(ctx.compute_backend, allocator, ctx.gguf_projector_path, &.{bytes});
+            var audio = try gemma4_projector.encodeProjectedAudioFromPath(ctx.compute_backend, allocator, ctx.gguf_projector_path, &.{bytes});
             defer audio.deinit();
             if (audio.tokens_per_audio.len != 1) return error.InvalidPreparedPrompt;
             break :blk CachedProjectedMedia{

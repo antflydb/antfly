@@ -40,14 +40,14 @@ test "dependency validation budgets identities overlaps and cleanup" {
         fn check(allocator: std.mem.Allocator, directory: *Directory, handles: []const Directory.Handle) !void {
             var job = Job.init(directory, .{ .input_handles = @as(?[]const Directory.Handle, handles), .source_level = @as(u32, 0), .output_level = @as(u32, 1), .tombstone_gc = false, .split_gc = false });
             defer job.deinit(allocator);
-            try std.testing.expect(!try job.step(allocator, 1, 0));
+            try std.testing.expect(!try job.step(allocator, 1, work_budget.Deadline{ .io = null, .ns = 0 }));
             try std.testing.expect(job.indices == null);
             var slices: usize = 0;
-            while (!try job.step(allocator, 1, std.math.maxInt(u64))) slices += 1;
+            while (!try job.step(allocator, 1, work_budget.Deadline{ .io = null, .ns = std.math.maxInt(u64) })) slices += 1;
             try std.testing.expect(slices > 2);
             try std.testing.expect(job.valid);
             try std.testing.expect(!job.covered);
-            try std.testing.expect(try job.step(allocator, 0, 0));
+            try std.testing.expect(try job.step(allocator, 0, work_budget.Deadline{ .io = null, .ns = 0 }));
             while (true) {
                 var credits: usize = 1;
                 if (job.deinitStep(allocator, &credits)) break;
@@ -70,7 +70,7 @@ test "dependency validation budgets identities overlaps and cleanup" {
     try changed.put(&fixture, replacement);
     var stale = Job.init(changed, .{ .input_handles = @as(?[]const Directory.Handle, &handles), .source_level = @as(u32, 0), .output_level = @as(u32, 1), .tombstone_gc = false, .split_gc = false });
     defer stale.deinit(allocator);
-    while (!try stale.step(allocator, 1, std.math.maxInt(u64))) {}
+    while (!try stale.step(allocator, 1, work_budget.Deadline{ .io = null, .ns = std.math.maxInt(u64) })) {}
     try std.testing.expect(!stale.valid);
 }
 const Members = @import("ordered_index.zig").SummarizedIndex(Member, Member.compare, void);
@@ -89,7 +89,7 @@ test "dependency certificate rebases newer writes and rejects changed inputs or 
     for (0..5) |variant| {
         var job = Job.init(base, .{ .input_handles = @as(?[]const Directory.Handle, &handles), .source_level = @as(u32, 0), .output_level = @as(u32, 1), .tombstone_gc = variant == 4, .split_gc = false });
         defer job.deinit(allocator);
-        while (!try job.step(allocator, 1, std.math.maxInt(u64))) {}
+        while (!try job.step(allocator, 1, work_budget.Deadline{ .io = null, .ns = std.math.maxInt(u64) })) {}
         try std.testing.expect(job.valid and job.covered);
         // Delta certification must still work after bounded scratch cleanup.
         job.deinit(allocator);
@@ -137,7 +137,7 @@ test "dependency certificate delta scaling benchmark" {
         var slices: usize = 0;
         while (true) {
             const before = clock.monotonicNs();
-            const done = try job.step(allocator, 2048, before +| 2 * std.time.ns_per_ms);
+            const done = try job.step(allocator, 2048, work_budget.Deadline{ .io = null, .ns = before +| 2 * std.time.ns_per_ms });
             max_slice = @max(max_slice, clock.monotonicNs() - before);
             slices += 1;
             if (done) break;

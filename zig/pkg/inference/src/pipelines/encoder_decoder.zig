@@ -44,6 +44,8 @@ pub const DecoderConfig = struct {
     forced_bos_token_id: ?i32 = null,
     no_repeat_ngram_size: usize = 0,
     max_length: usize = 512,
+    /// Mel bins the encoder expects (Whisper: 80, or 128 for large-v3).
+    n_mels: usize = 80,
 };
 
 /// Result of encoder-decoder generation.

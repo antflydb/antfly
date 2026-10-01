@@ -1,4 +1,4 @@
-"""Experimental source-store ownership through the public standalone API."""
+"""Source-store defaults and ownership through the public standalone API."""
 
 import time
 
@@ -10,11 +10,13 @@ def hit_ids(result):
     return [hit["_id"] for hit in result["responses"][0]["hits"]["hits"]]
 
 
-@pytest.mark.parametrize("mode", ["primary_lsm", "vector_store"])
+@pytest.mark.parametrize("mode", [None, "primary_lsm", "vector_store"])
 def test_vector_source_models_updates_deletes_and_restart(stateful_api, mode):
     api = stateful_api
     table = f"vector_source_{mode}_{time.time_ns()}"
-    api.create_table(table, storage={"dense_embeddings": mode})
+    options = {} if mode is None else {"storage": {"dense_embeddings": mode}}
+    api.create_table(table, **options)
+    mode = mode or "vector_store"
     assert api.get_table(table)["storage"]["dense_embeddings"] == mode
     for name, dimensions in [("model_a", 3), ("model_b", 2)]:
         assert_created_index(
@@ -110,11 +112,16 @@ def test_vector_source_models_updates_deletes_and_restart(stateful_api, mode):
                 and stats.get("retained_payloads") == 2
                 and stats.get("retained_payload_bytes") == 20
                 and stats.get("collection_pending_bytes") == 0
+                and stats.get("collections", 0) > 0
+                and stats.get("live_payloads_at_collection") == 2
+                and stats.get("live_payload_bytes_at_collection") == 20
             ):
                 return stats
             return None
 
-        # Incremental marking can remain pending after serving is ready.
+        # Reopen restores retained accounting before this owner has collected.
+        # Zero pending bytes alone also describes a collection not yet started;
+        # wait for a completed collection and its counts in the same snapshot.
         stats = wait_until(reclaimed_source_stats, timeout_s=30, interval_s=0.5)
         assert stats is not None, source_stats()
         assert stats["retained_payloads"] == 2

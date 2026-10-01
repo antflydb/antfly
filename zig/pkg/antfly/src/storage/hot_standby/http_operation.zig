@@ -40,13 +40,15 @@ pub const OwnedResponse = struct {
 pub const Executor = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
+    const BoundaryAbi = @import("../../runtime_callback_abi.zig").Boundary(VTable);
     pub const VTable = struct {
         execute: *const fn (ptr: *anyopaque, request: Request) anyerror!OwnedResponse,
     };
 
     pub fn execute(self: Executor, request: Request) !OwnedResponse {
-        return self.vtable.execute(self.ptr, request);
+        return BoundaryAbi.call("execute", self.boundary_dispatch, self.vtable.execute, .{ self.ptr, request });
     }
 };
 
@@ -57,4 +59,17 @@ test "storage.hot_standby typed HTTP operation response owns its body" {
         .body = try std.testing.allocator.dupe(u8, "ok"),
     };
     response.deinit();
+}
+
+test "storage.ha HTTP executor preserves error identity across a foreign runtime callback" {
+    const Fake = struct {
+        fn execute(_: *anyopaque, _: Request) !OwnedResponse {
+            return error.OutOfMemory;
+        }
+        fn dispatch(contract: *const @import("../../runtime_native_abi.zig").CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) @import("../../runtime_error_abi.zig").Status {
+            return Executor.BoundaryAbi.local_dispatch(contract, callback, args, output);
+        }
+    };
+    const executor: Executor = .{ .ptr = undefined, .vtable = &.{ .execute = Fake.execute }, .boundary_dispatch = Fake.dispatch };
+    try std.testing.expectError(error.OutOfMemory, executor.execute(.{ .method = .get, .target = "/admin/v1/ha/primary/status" }));
 }

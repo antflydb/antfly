@@ -735,7 +735,8 @@ def test_gemma4_public_answer(api, stream, thinking, temperature):
                     "content": "What is the capital of France? Answer with only the city name.",
                 }
             ],
-            "max_tokens": 128,
+            # Reasoning and the public answer consume the same token budget.
+            "max_tokens": 512 if thinking else 128,
             "temperature": temperature,
             "chat_template_kwargs": {"enable_thinking": thinking},
             "stream": stream,

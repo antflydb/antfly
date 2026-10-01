@@ -19,11 +19,15 @@ class ExtractionRelationSchema:
         type_ (str):
         source (str | Unset):
         target (str | Unset):
+        description (str | Unset): Version 2 model-facing relation description.
+        threshold (float | Unset):
     """
 
     type_: str
     source: str | Unset = UNSET
     target: str | Unset = UNSET
+    description: str | Unset = UNSET
+    threshold: float | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -32,6 +36,10 @@ class ExtractionRelationSchema:
         source = self.source
 
         target = self.target
+
+        description = self.description
+
+        threshold = self.threshold
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -44,6 +52,10 @@ class ExtractionRelationSchema:
             field_dict["source"] = source
         if target is not UNSET:
             field_dict["target"] = target
+        if description is not UNSET:
+            field_dict["description"] = description
+        if threshold is not UNSET:
+            field_dict["threshold"] = threshold
 
         return field_dict
 
@@ -56,10 +68,16 @@ class ExtractionRelationSchema:
 
         target = d.pop("target", UNSET)
 
+        description = d.pop("description", UNSET)
+
+        threshold = d.pop("threshold", UNSET)
+
         extraction_relation_schema = cls(
             type_=type_,
             source=source,
             target=target,
+            description=description,
+            threshold=threshold,
         )
 
         extraction_relation_schema.additional_properties = d

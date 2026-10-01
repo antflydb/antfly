@@ -14,7 +14,7 @@
 
 //! Levenshtein automaton for fuzzy matching on FST traversal.
 //!
-//! Implements the vellum.Automaton trait so it can be used with FST.search()
+//! Implements the `fst.Automaton` interface so it can be used with FST.search()
 //! to find all terms within a given edit distance of a target term.
 //!
 //! Uses on-the-fly DFA construction: each DFA state is a set of NFA states
@@ -25,7 +25,7 @@
 //! State sets are cached for deduplication (powerset construction).
 
 const std = @import("std");
-const vellum = @import("antfly_vellum");
+const fst = @import("antfly_fst");
 
 const dead_state = std.math.maxInt(usize);
 
@@ -45,8 +45,8 @@ pub const LevenshteinAutomaton = struct {
     /// We need a persistent allocator for the DFA cache
     alloc: ?std.mem.Allocator = null,
 
-    /// Get a vellum.Automaton interface for FST traversal.
-    pub fn automaton(self: *LevenshteinAutomaton) vellum.Automaton {
+    /// Get an fst.Automaton interface for FST traversal.
+    pub fn automaton(self: *LevenshteinAutomaton) fst.Automaton {
         return .{
             .ptr = @ptrCast(self),
             .vtable = &.{

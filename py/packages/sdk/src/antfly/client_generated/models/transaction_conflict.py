@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.relational_constraint_conflict_reason import RelationalConstraintConflictReason
 from ..models.transaction_conflict_kind import TransactionConflictKind
 from ..models.transaction_conflict_retry_scope import TransactionConflictRetryScope
 from ..types import UNSET, Unset
@@ -27,6 +28,8 @@ class TransactionConflict:
         message (str): Human-readable conflict description.
         kind (TransactionConflictKind): Stable machine-readable conflict classification.
         retryable (bool): Whether retrying the transaction may succeed without changing its writes.
+        reason (RelationalConstraintConflictReason | Unset): Deterministic relational integrity failure; changing the
+            mutation or data is required before retry.
         retry_after_ms (int | Unset): Minimum suggested delay before retrying a retryable conflict.
         retry_scope (TransactionConflictRetryScope | Unset): Component whose state should be refreshed before retrying.
         expected_version (int | Unset): Version required by the transaction predicate.
@@ -40,6 +43,7 @@ class TransactionConflict:
     message: str
     kind: TransactionConflictKind
     retryable: bool
+    reason: RelationalConstraintConflictReason | Unset = UNSET
     retry_after_ms: int | Unset = UNSET
     retry_scope: TransactionConflictRetryScope | Unset = UNSET
     expected_version: int | Unset = UNSET
@@ -57,6 +61,10 @@ class TransactionConflict:
         kind = self.kind.value
 
         retryable = self.retryable
+
+        reason: str | Unset = UNSET
+        if not isinstance(self.reason, Unset):
+            reason = self.reason.value
 
         retry_after_ms = self.retry_after_ms
 
@@ -83,6 +91,8 @@ class TransactionConflict:
                 "retryable": retryable,
             }
         )
+        if reason is not UNSET:
+            field_dict["reason"] = reason
         if retry_after_ms is not UNSET:
             field_dict["retry_after_ms"] = retry_after_ms
         if retry_scope is not UNSET:
@@ -111,6 +121,13 @@ class TransactionConflict:
 
         retryable = d.pop("retryable")
 
+        _reason = d.pop("reason", UNSET)
+        reason: RelationalConstraintConflictReason | Unset
+        if isinstance(_reason, Unset):
+            reason = UNSET
+        else:
+            reason = RelationalConstraintConflictReason(_reason)
+
         retry_after_ms = d.pop("retry_after_ms", UNSET)
 
         _retry_scope = d.pop("retry_scope", UNSET)
@@ -137,6 +154,7 @@ class TransactionConflict:
             message=message,
             kind=kind,
             retryable=retryable,
+            reason=reason,
             retry_after_ms=retry_after_ms,
             retry_scope=retry_scope,
             expected_version=expected_version,

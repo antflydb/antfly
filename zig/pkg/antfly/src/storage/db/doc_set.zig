@@ -73,7 +73,17 @@ pub const ResolvedDocFilter = struct {
     }
 };
 
+/// Internal representation policy. Explicit values let boundary fixtures exercise
+/// promotion without ingesting a production-sized corpus. Normal callers use {}.
+pub const BitmapPolicy = struct {
+    min_cardinality: usize = bitmap_min_cardinality,
+};
+
 pub fn fromOrdinalsAlloc(alloc: Allocator, ordinals_in: []const DocOrdinal) !ResolvedDocSet {
+    return fromOrdinalsWithPolicyAlloc(alloc, ordinals_in, .{});
+}
+
+pub fn fromOrdinalsWithPolicyAlloc(alloc: Allocator, ordinals_in: []const DocOrdinal, policy: BitmapPolicy) !ResolvedDocSet {
     if (ordinals_in.len == 0) return .none;
 
     const ordinals = try alloc.dupe(DocOrdinal, ordinals_in);
@@ -81,7 +91,7 @@ pub fn fromOrdinalsAlloc(alloc: Allocator, ordinals_in: []const DocOrdinal) !Res
     std.mem.sort(DocOrdinal, ordinals, {}, ordinalLessThan);
     const unique_len = uniqueSortedOrdinals(ordinals);
 
-    if (!shouldUseOrdinalBitmap(ordinals[0..unique_len])) {
+    if (!shouldUseBitmapStatsWithPolicy(unique_len, ordinalSpan(ordinals[0..unique_len]), policy)) {
         return .{ .ordinals = try alloc.realloc(ordinals, unique_len) };
     }
 
@@ -336,7 +346,11 @@ fn shouldUseOrdinalBitmap(ordinals: []const DocOrdinal) bool {
 }
 
 fn shouldUseBitmapStats(cardinality: usize, span: usize) bool {
-    if (cardinality < bitmap_min_cardinality) return false;
+    return shouldUseBitmapStatsWithPolicy(cardinality, span, .{});
+}
+
+fn shouldUseBitmapStatsWithPolicy(cardinality: usize, span: usize, policy: BitmapPolicy) bool {
+    if (cardinality < policy.min_cardinality) return false;
     if (span == 0) return false;
     return cardinality * bitmap_min_density_denominator >= span * bitmap_min_density_numerator;
 }

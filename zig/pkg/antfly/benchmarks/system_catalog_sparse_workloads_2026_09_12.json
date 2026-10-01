@@ -1,0 +1,701 @@
+{
+  "date": "2026-09-12",
+  "source": "1f1670980894319f0934a423acca4131b5e1cacb",
+  "production_source": "5206bfe156dcf842c3a0acab8030796ff33853f6",
+  "merged_main": "3ea6fcead3067a3f414f875ea80a944c06101609",
+  "merge_commit": "2a0e2ee85a15fb4d7d45c0436ffc2e429c364d39",
+  "environment": {
+    "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+    "zig": "0.16.0",
+    "component_optimize": "ReleaseFast",
+    "allocator": "c_allocator",
+    "application_optimize": "Debug",
+    "task_owned_work": "Final components ran after task-owned builds/tests and preflight workloads. Both component binaries compiled before timing. The recorded live workload ran afterward, separately.",
+    "host_activity": "Unrelated host activity and thermal state uncontrolled; local observations are not capacity guarantees.",
+    "binary_provenance": "The application binary was built from the production tree committed as 5206bfe15; 1f1670980 changes only benchmark payload consumption. The application JSON records its SHA-256."
+  },
+  "measurement_scope": {
+    "publisher": "Same binary: full JSON encoding/free versus production sparse prepare/encode/acknowledged commit/free. One changed group, no volatile samples; nine samples. Prior baseline is preconstructed. This fixture excludes HTTP/replication. At 10,000 groups the full JSON fixture exceeds the default 32 MiB HTTP limit; this is an encoding benchmark, not a successful 10,000-group bootstrap.",
+    "apply": "Same binary: existing full reports/reference heartbeats and cursor-fenced sparse updates. Seven samples include command decoding, component projection, checkpoint/WAL and commit. Setup, admission, proposal/replication, callback fanout and full-baseline establishment excluded.",
+    "collection": "Same captured tables/ranges: repeated linear lookups versus index construction/lookups/destruction. Nine samples, checksum verified.",
+    "snapshot": "Same source snapshot: deep clone/read/free versus immutable lease capture/read/release. Both paths consume one runtime payload per store. Nine samples; shared views batch 1,000 iterations per timer reading for clock resolution. This excludes the reconciliation plan itself.",
+    "application": "Unpaired three-metadata/three-data-node relational catalog workload: 100 one-shard tables, desired data replica count 1. Setup and readiness measured separately. Three clients sustain batches of 100 full-index upserts, qualified searches and catalog discovery for 30 seconds; every response validated."
+  },
+  "components": [
+    {
+      "workload": "COLLECTION_BENCH",
+      "groups": 100,
+      "indexed": false,
+      "p50_ms": 0.004
+    },
+    {
+      "workload": "COLLECTION_BENCH",
+      "groups": 100,
+      "indexed": true,
+      "p50_ms": 0.001
+    },
+    {
+      "workload": "COLLECTION_BENCH",
+      "groups": 1000,
+      "indexed": false,
+      "p50_ms": 0.277
+    },
+    {
+      "workload": "COLLECTION_BENCH",
+      "groups": 1000,
+      "indexed": true,
+      "p50_ms": 0.01
+    },
+    {
+      "workload": "COLLECTION_BENCH",
+      "groups": 10000,
+      "indexed": false,
+      "p50_ms": 64.185
+    },
+    {
+      "workload": "COLLECTION_BENCH",
+      "groups": 10000,
+      "indexed": true,
+      "p50_ms": 0.164
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 100,
+      "scenario": "cached_heartbeat",
+      "apply_p50_ms": 0.317,
+      "wal_bytes_per_apply": 304,
+      "full_record_bytes": 82218,
+      "command_bytes": 82224
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 100,
+      "scenario": "fresh_clocks",
+      "apply_p50_ms": 0.326,
+      "wal_bytes_per_apply": 4280,
+      "full_record_bytes": 82218,
+      "command_bytes": 82224
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 100,
+      "scenario": "one_group_change",
+      "apply_p50_ms": 0.298,
+      "wal_bytes_per_apply": 10111,
+      "full_record_bytes": 82218,
+      "command_bytes": 82224
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 100,
+      "scenario": "all_groups_change",
+      "apply_p50_ms": 0.285,
+      "wal_bytes_per_apply": 15886,
+      "full_record_bytes": 82218,
+      "command_bytes": 82224
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 100,
+      "scenario": "referenced_runtime",
+      "apply_p50_ms": 0.191,
+      "wal_bytes_per_apply": 304,
+      "full_record_bytes": 82218,
+      "command_bytes": 12424
+    },
+    {
+      "workload": "SPARSE_REPORT_BENCH",
+      "groups": 100,
+      "runtime_changed": false,
+      "apply_p50_ms": 0.199,
+      "wal_bytes_per_apply": 10232,
+      "command_bytes": 1044
+    },
+    {
+      "workload": "SPARSE_REPORT_BENCH",
+      "groups": 100,
+      "runtime_changed": true,
+      "apply_p50_ms": 0.219,
+      "wal_bytes_per_apply": 59417,
+      "command_bytes": 1044
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 100,
+      "full_store_read_p50_ms": 0.042
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 100,
+      "full_store_read_allocations": 412,
+      "full_store_read_allocated_bytes": 114887
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 100,
+      "placement_drain_read_p50_ms": 0.00776
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 1000,
+      "scenario": "cached_heartbeat",
+      "apply_p50_ms": 1.763,
+      "wal_bytes_per_apply": 304,
+      "full_record_bytes": 821118,
+      "command_bytes": 821124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 1000,
+      "scenario": "fresh_clocks",
+      "apply_p50_ms": 1.462,
+      "wal_bytes_per_apply": 35324,
+      "full_record_bytes": 821118,
+      "command_bytes": 821124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 1000,
+      "scenario": "one_group_change",
+      "apply_p50_ms": 1.477,
+      "wal_bytes_per_apply": 10111,
+      "full_record_bytes": 821118,
+      "command_bytes": 821124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 1000,
+      "scenario": "all_groups_change",
+      "apply_p50_ms": 1.427,
+      "wal_bytes_per_apply": 153766,
+      "full_record_bytes": 821118,
+      "command_bytes": 821124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 1000,
+      "scenario": "referenced_runtime",
+      "apply_p50_ms": 0.633,
+      "wal_bytes_per_apply": 304,
+      "full_record_bytes": 821118,
+      "command_bytes": 123124
+    },
+    {
+      "workload": "SPARSE_REPORT_BENCH",
+      "groups": 1000,
+      "runtime_changed": false,
+      "apply_p50_ms": 0.472,
+      "wal_bytes_per_apply": 10232,
+      "command_bytes": 1044
+    },
+    {
+      "workload": "SPARSE_REPORT_BENCH",
+      "groups": 1000,
+      "runtime_changed": true,
+      "apply_p50_ms": 0.485,
+      "wal_bytes_per_apply": 59417,
+      "command_bytes": 1044
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 1000,
+      "full_store_read_p50_ms": 0.404
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 1000,
+      "full_store_read_allocations": 4014,
+      "full_store_read_allocated_bytes": 1216197
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 1000,
+      "placement_drain_read_p50_ms": 0.00762
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 10000,
+      "scenario": "cached_heartbeat",
+      "apply_p50_ms": 18.695,
+      "wal_bytes_per_apply": 304,
+      "full_record_bytes": 8210118,
+      "command_bytes": 8210124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 10000,
+      "scenario": "fresh_clocks",
+      "apply_p50_ms": 24.864,
+      "wal_bytes_per_apply": 347228,
+      "full_record_bytes": 8210118,
+      "command_bytes": 8210124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 10000,
+      "scenario": "one_group_change",
+      "apply_p50_ms": 20.752,
+      "wal_bytes_per_apply": 10111,
+      "full_record_bytes": 8210118,
+      "command_bytes": 8210124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 10000,
+      "scenario": "all_groups_change",
+      "apply_p50_ms": 25.475,
+      "wal_bytes_per_apply": 1533295,
+      "full_record_bytes": 8210118,
+      "command_bytes": 8210124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 10000,
+      "scenario": "referenced_runtime",
+      "apply_p50_ms": 10.448,
+      "wal_bytes_per_apply": 304,
+      "full_record_bytes": 8210118,
+      "command_bytes": 1230124
+    },
+    {
+      "workload": "SPARSE_REPORT_BENCH",
+      "groups": 10000,
+      "runtime_changed": false,
+      "apply_p50_ms": 5.019,
+      "wal_bytes_per_apply": 10232,
+      "command_bytes": 1044
+    },
+    {
+      "workload": "SPARSE_REPORT_BENCH",
+      "groups": 10000,
+      "runtime_changed": true,
+      "apply_p50_ms": 5.151,
+      "wal_bytes_per_apply": 59417,
+      "command_bytes": 1044
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 10000,
+      "full_store_read_p50_ms": 4.618
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 10000,
+      "full_store_read_allocations": 40015,
+      "full_store_read_allocated_bytes": 12609697
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 10000,
+      "placement_drain_read_p50_ms": 0.00649
+    },
+    {
+      "workload": "REPAIR_ADMISSION_BENCH",
+      "groups": 1000,
+      "repair": false,
+      "p50_ms": 0.001
+    },
+    {
+      "workload": "REPAIR_ADMISSION_BENCH",
+      "groups": 1000,
+      "repair": true,
+      "p50_ms": 0.728
+    },
+    {
+      "workload": "REPAIR_ADMISSION_BENCH",
+      "groups": 10000,
+      "repair": false,
+      "p50_ms": 0.014
+    },
+    {
+      "workload": "REPAIR_ADMISSION_BENCH",
+      "groups": 10000,
+      "repair": true,
+      "p50_ms": 7.363
+    },
+    {
+      "workload": "PUBLISHER_BENCH",
+      "groups": 100,
+      "sparse": false,
+      "p50_ms": 0.274,
+      "http_bytes": 361351
+    },
+    {
+      "workload": "PUBLISHER_BENCH",
+      "groups": 100,
+      "sparse": true,
+      "p50_ms": 0.018,
+      "http_bytes": 4262
+    },
+    {
+      "workload": "PUBLISHER_BENCH",
+      "groups": 1000,
+      "sparse": false,
+      "p50_ms": 3.194,
+      "http_bytes": 3610552
+    },
+    {
+      "workload": "PUBLISHER_BENCH",
+      "groups": 1000,
+      "sparse": true,
+      "p50_ms": 0.167,
+      "http_bytes": 4262
+    },
+    {
+      "workload": "PUBLISHER_BENCH",
+      "groups": 10000,
+      "sparse": false,
+      "p50_ms": 30.068,
+      "http_bytes": 36127753
+    },
+    {
+      "workload": "PUBLISHER_BENCH",
+      "groups": 10000,
+      "sparse": true,
+      "p50_ms": 1.969,
+      "http_bytes": 4262
+    },
+    {
+      "workload": "ADMISSION_CACHE_BENCH",
+      "stores": 1,
+      "groups_per_store": 100,
+      "selected": false,
+      "p50_ms": 0.023
+    },
+    {
+      "workload": "ADMISSION_CACHE_BENCH",
+      "stores": 1,
+      "groups_per_store": 100,
+      "selected": true,
+      "p50_ms": 0.021
+    },
+    {
+      "workload": "ADMISSION_CACHE_BENCH",
+      "stores": 10,
+      "groups_per_store": 100,
+      "selected": false,
+      "p50_ms": 0.192
+    },
+    {
+      "workload": "ADMISSION_CACHE_BENCH",
+      "stores": 10,
+      "groups_per_store": 100,
+      "selected": true,
+      "p50_ms": 0.015
+    },
+    {
+      "workload": "ADMISSION_CACHE_BENCH",
+      "stores": 100,
+      "groups_per_store": 100,
+      "selected": false,
+      "p50_ms": 1.857
+    },
+    {
+      "workload": "ADMISSION_CACHE_BENCH",
+      "stores": 100,
+      "groups_per_store": 100,
+      "selected": true,
+      "p50_ms": 0.018
+    },
+    {
+      "workload": "ADMISSION_PLAN_BENCH",
+      "groups": 100,
+      "header_change": false,
+      "single_pass": false,
+      "p50_ms": 0.144,
+      "allocations": 763
+    },
+    {
+      "workload": "ADMISSION_PLAN_BENCH",
+      "groups": 100,
+      "header_change": false,
+      "single_pass": true,
+      "p50_ms": 0.057,
+      "allocations": 33
+    },
+    {
+      "workload": "ADMISSION_PLAN_BENCH",
+      "groups": 100,
+      "header_change": true,
+      "single_pass": false,
+      "p50_ms": 0.148,
+      "allocations": 1465
+    },
+    {
+      "workload": "ADMISSION_PLAN_BENCH",
+      "groups": 100,
+      "header_change": true,
+      "single_pass": true,
+      "p50_ms": 0.076,
+      "allocations": 736
+    },
+    {
+      "workload": "ADMISSION_PLAN_BENCH",
+      "groups": 1000,
+      "header_change": false,
+      "single_pass": false,
+      "p50_ms": 1.736,
+      "allocations": 7111
+    },
+    {
+      "workload": "ADMISSION_PLAN_BENCH",
+      "groups": 1000,
+      "header_change": false,
+      "single_pass": true,
+      "p50_ms": 0.746,
+      "allocations": 57
+    },
+    {
+      "workload": "ADMISSION_PLAN_BENCH",
+      "groups": 1000,
+      "header_change": true,
+      "single_pass": false,
+      "p50_ms": 1.797,
+      "allocations": 14113
+    },
+    {
+      "workload": "ADMISSION_PLAN_BENCH",
+      "groups": 1000,
+      "header_change": true,
+      "single_pass": true,
+      "p50_ms": 0.907,
+      "allocations": 7060
+    },
+    {
+      "workload": "ADMISSION_PLAN_BENCH",
+      "groups": 10000,
+      "header_change": false,
+      "single_pass": false,
+      "p50_ms": 16.987,
+      "allocations": 70147
+    },
+    {
+      "workload": "ADMISSION_PLAN_BENCH",
+      "groups": 10000,
+      "header_change": false,
+      "single_pass": true,
+      "p50_ms": 7.578,
+      "allocations": 75
+    },
+    {
+      "workload": "ADMISSION_PLAN_BENCH",
+      "groups": 10000,
+      "header_change": true,
+      "single_pass": false,
+      "p50_ms": 17.855,
+      "allocations": 140149
+    },
+    {
+      "workload": "ADMISSION_PLAN_BENCH",
+      "groups": 10000,
+      "header_change": true,
+      "single_pass": true,
+      "p50_ms": 9.242,
+      "allocations": 70078
+    },
+    {
+      "workload": "RECONCILE_VIEW_BENCH",
+      "stores": 1,
+      "groups_per_store": 100,
+      "shared": false,
+      "p50_ms": 0.017
+    },
+    {
+      "workload": "RECONCILE_VIEW_BENCH",
+      "stores": 1,
+      "groups_per_store": 100,
+      "shared": true,
+      "p50_ms": 4.8e-05
+    },
+    {
+      "workload": "RECONCILE_VIEW_BENCH",
+      "stores": 10,
+      "groups_per_store": 100,
+      "shared": false,
+      "p50_ms": 0.173
+    },
+    {
+      "workload": "RECONCILE_VIEW_BENCH",
+      "stores": 10,
+      "groups_per_store": 100,
+      "shared": true,
+      "p50_ms": 0.000147
+    },
+    {
+      "workload": "RECONCILE_VIEW_BENCH",
+      "stores": 100,
+      "groups_per_store": 100,
+      "shared": false,
+      "p50_ms": 1.83
+    },
+    {
+      "workload": "RECONCILE_VIEW_BENCH",
+      "stores": 100,
+      "groups_per_store": 100,
+      "shared": true,
+      "p50_ms": 0.001541
+    }
+  ],
+  "applications": {
+    "cluster_relational": {
+      "binary": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+      "binary_sha256": "b31c035c96cd50f591e27fc1c58f96da41dae9f5b8524fbeee34593faa274eea",
+      "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+      "settings": {
+        "binary": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+        "scenario": "catalog",
+        "deployment": "cluster",
+        "restart_after_ddl": false,
+        "listing_distinct_schemas": false,
+        "listing_page_size": 0,
+        "listing_concurrent": false,
+        "listing_reader_rate": 0,
+        "table_counts": [
+          100
+        ],
+        "mixed_seconds": 30,
+        "resolution_workload": "exact",
+        "schema_fields": 0,
+        "tenant_counts": [
+          10,
+          100
+        ],
+        "storage_mode": "relational",
+        "entity_shards": 1,
+        "entity_key_layout": "clustered",
+        "mentions": [
+          10,
+          100
+        ],
+        "documents": 5,
+        "concurrency": 8,
+        "samples": 9,
+        "warmup": 2,
+        "ndjson_lines": 20,
+        "poll_ms": 20,
+        "readiness_timeout": 115,
+        "output": "/private/tmp/catalog-sparse-live-final.json"
+      },
+      "scenarios": {
+        "catalog": {
+          "deployment": "cluster",
+          "startup_ms": 3657.6839173212647,
+          "checkpoints": [
+            {
+              "table_count": 100,
+              "table_create": {
+                "samples": 100,
+                "p50_ms": 148.21639549999998,
+                "p95_ms": 442.010333,
+                "max_ms": 772.754542
+              },
+              "shard_readiness": {
+                "samples": 100,
+                "p50_ms": 711.5453747101128,
+                "p95_ms": 1433.9622920379043,
+                "max_ms": 2049.3643330410123
+              },
+              "operations": {
+                "qualified_lookup": {
+                  "samples": 9,
+                  "p50_ms": 30.000916,
+                  "p95_ms": 288.606292,
+                  "max_ms": 288.606292
+                },
+                "qualified_query": {
+                  "samples": 9,
+                  "p50_ms": 51.881833,
+                  "p95_ms": 291.628084,
+                  "max_ms": 291.628084
+                },
+                "qualified_join": {
+                  "samples": 9,
+                  "p50_ms": 53.860833,
+                  "p95_ms": 121.8395,
+                  "max_ms": 121.8395
+                },
+                "ndjson_repeated_target": {
+                  "samples": 9,
+                  "p50_ms": 580.441291,
+                  "p95_ms": 925.99825,
+                  "max_ms": 925.99825
+                },
+                "scoped_listing": {
+                  "samples": 9,
+                  "p50_ms": 79.586292,
+                  "p95_ms": 439.0755,
+                  "max_ms": 439.0755
+                },
+                "concurrent_qualified_lookup": {
+                  "samples": 72,
+                  "p50_ms": 53.191875499999995,
+                  "p95_ms": 60.640542,
+                  "max_ms": 106.654542,
+                  "concurrency": 8,
+                  "elapsed_seconds": 0.505690041,
+                  "requests_per_second": 142.37970725628745
+                },
+                "sustained_mixed_traffic": {
+                  "requested_seconds": 30,
+                  "elapsed_ms": 30452.168625,
+                  "documents_per_batch": 100,
+                  "operations": {
+                    "ingestion": {
+                      "samples": 68,
+                      "p50_ms": 463.69712549999997,
+                      "p95_ms": 918.570292,
+                      "max_ms": 1208.5055,
+                      "completed_per_second": 2.2666666666666666
+                    },
+                    "qualified_search": {
+                      "samples": 188,
+                      "p50_ms": 53.716333000000006,
+                      "p95_ms": 721.463083,
+                      "max_ms": 1269.342792,
+                      "completed_per_second": 6.266666666666667
+                    },
+                    "scoped_discovery": {
+                      "samples": 153,
+                      "p50_ms": 78.191375,
+                      "p95_ms": 719.527417,
+                      "max_ms": 1209.069875,
+                      "completed_per_second": 5.1
+                    }
+                  }
+                },
+                "table_rename": {
+                  "samples": 9,
+                  "p50_ms": 82.14525,
+                  "p95_ms": 491.342875,
+                  "max_ms": 491.342875
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "validation": {
+    "storage": 81,
+    "catalog": 34,
+    "catalog_transport": 9,
+    "metadata_service": 126,
+    "catalog_api": 60,
+    "benchmark_tests": 20,
+    "e2e": "21 distributed status/system catalog E2Es passed, then the expanded telemetry-only distributed case passed again. Some focused Zig selections overlap; counts describe executions, not distinct tests.",
+    "checks": [
+      "Debug production server build",
+      "git diff --check",
+      "Ruff check for changed Python files",
+      "zig fmt --check on changed Zig files"
+    ],
+    "license_headers": "Repository-wide check found 984 pre-existing violations. The two touched short headers were normalized; 982 pre-existing violations remain. All follow-up files pass the canonical-header check."
+  },
+  "limitations": [
+    "Sparse apply still scans compact membership records; it does not have constant work in total group count.",
+    "Changed runtime payloads can rewrite a full 64-slot component page. The benchmark runtime-change case writes 59,417 WAL bytes.",
+    "Full refreshes and telemetry-heavy HTTP reports still pay for their payloads and remain subject to body-size limits.",
+    "The live run uses a bounded repeatedly updated working set and one data replica, not bulk growth, maximum capacity, or the earlier wide-schema/three-replica and empty-graph failure configurations."
+  ]
+}

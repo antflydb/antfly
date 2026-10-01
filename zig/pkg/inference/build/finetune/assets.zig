@@ -46,6 +46,6 @@ pub fn create(options: struct {
             module.addImport("jinja", options.jinja);
         },
     }
-    if (options.owner == .gemma4) module.addImport("antfly_platform", options.platform);
+    module.addImport("antfly_platform", options.platform);
     return module;
 }

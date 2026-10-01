@@ -863,8 +863,9 @@ zig build -Doptimize=ReleaseFast bench-tokenizer-build
 
 `test-tokenizer` runs both the Hugging Face and SentencePiece implementations;
 the tokenizer-batch target covers its inference adapter. `zig build test`
-currently selects 2,035 inference tests: 2,024 pass and 11 optional tests skip.
-`zig build root-test` passes all 222 root compile/unit tests. The focused
-`zig build resource-budget-test` gate passes both filesystem tests and all 28
-resource-manager tests without leaks. The ReleaseFast build step verifies the
-installed benchmark artifact used by the external experiments.
+selects the inference test suite, all of which pass except a small number of
+optional tests that skip. `zig build root-test` passes all root compile/unit
+tests. The focused `zig build resource-budget-test` gate passes both
+filesystem tests and all resource-manager tests without leaks. The
+ReleaseFast build step verifies the installed benchmark artifact used by the
+external experiments.

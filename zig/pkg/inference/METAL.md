@@ -128,354 +128,125 @@ Local ggml inspection on 2026-05-01 confirmed the production shape:
   but the current command/encoder explosion is already large enough to explain
   a major part of the order-of-magnitude difference.
 
+### Command Plan Abstraction
+
+`GraphCommandPlan` (with `GraphCommandPlanView` and `GraphCommandOp`) is the
+canonical graph command-plan abstraction for Metal: it owns ordered op
+records, resource ranges, encoder scopes, barrier placement, scratch
+lifetimes, and operator metadata. No parallel planner should be introduced;
+model-specific paths (Gemma gated prefill/decode today) lower into this
+generic plan through temporary lowerers such as `GatedFrameCommandLowerer`
+rather than becoming a second public planner abstraction.
+
+Op kinds in the plan are named structurally, not by decode/prefill role:
+`rms_norm`, `qkv_linear`, `head_norm_rope`, `kv_seed`, `attention`,
+`attention_output_linear`, `residual_norm_add`, `ffn_gate_up`, `ffn_down`,
+`ple_gate`, `ple_projection`, `tail_norm`, `lm_head`, `argmax`, `sample`,
+`quant_get_rows`, `quant_set_rows`, `quant_copy`, and similar. Phase, qLen, KV
+layout, quant format, and activation dtype live in per-op metadata, not in
+the op-kind enum, so the same op-kind vocabulary works across prefill,
+decode, and non-decode frame kinds.
+
+A backend-neutral `FrameDescriptor` describes command-plan lowering inputs:
+frame mode (`prefill`, `decode`, `embedding`, `classification`), batch/query
+lengths, sequence positions, requested outputs, KV mutation policy, KV
+layout, activation dtype, and backend target. It keeps model-specific layer
+specs separate from backend execution policy so the same lowering shape can
+serve Gemma today and other model families later.
+
+Planned compute barriers are range-driven: the active planned compute encoder
+tracks read/write byte ranges for encoded operations, source/source overlap is
+allowed, and any overlap involving a previous write emits a Metal buffer
+barrier (`memoryBarrierWithScope:MTLBarrierScopeBuffers`) and clears the
+tracker. This is the mechanism behind the barrier placement described above,
+not a separate scheme.
+
 ## Current Status
 
-- `--backend metal` builds with `-Dmetal=true` (there is no `-Dmlx` flag now
-  that the MLX backend has been removed).
-- The Gemma4 4-token anchor is correct on the current safe path:
-  `Hi! How can`, token ids `10979 236888 2088 740`.
-- `gelu_new` now lowers as a backend activation kind instead of decomposing
-  into frontend elementwise `x^3 -> tanh -> multiply` stages. This fixed the
-  observed qLen>1 prompt NaN where `ffn_gate=11.367456` became
-  `ffn_gate_act=NaN` and then poisoned the first prompt row.
-- The default Gemma4 path keeps the 4-token anchor correct on the Metal safe
-  path while qLen>1 prefill coverage is still mixed between planned runtime
-  pieces and staged fallbacks.
-- The qLen>1 f32-KV/Q8_0 prefill path no longer probes the old gathered-F32
-  monolithic direct block. That block was decode-shaped and produced
-  `rows=10 rc=-13 stage=4` failures before falling back. The current validator
-  anchor has `f32_q80_direct_fail=0`, token ids `10979 236888 2088 740`, and no
-  frame-blit traces. Remaining work is to broaden the planned paged-attention
-  and FFN block coverage so qLen>1 uses real planned ops rather than safe
-  staged fallback.
-- `MetalKvStorage` paged metadata is now per-layer shape aware. The hook uses
-  each layer's `num_kv_heads` and `head_dim` for raw f32, f16, int8-per-head,
-  Polar4, and Turbo3 row layout instead of rejecting mixed Gemma layer shapes
-  against one storage-wide KV shape. While an active frame is open it can also
-  reserve/expose the physical slot metadata before the slot has committed
-  tokens, which lets planned `decode_kv_seed -> attention_paged` consume the
-  same in-frame physical page table.
-- Q8_0 weights remain quantized and resident. The hot path should not
-  dequantize whole dense weights.
-- The Gemma4 prefill layer contract now owns QKV or shared-Q projection,
-  row-aware head norm/RoPE, prompt KV span seed/update, attention, FFN, PLE,
-  scalar output scale, and reusable layer scratch.
-- Gemma4 qLen>1 Q8_0 prefill setup now has a dedicated no-blit Metal setup
-  encoder for Q/QKV projection, Q/K head RMS/RoPE, and optional V norm. The
-  staged setup helpers remain as fallback, but the active prefill route no longer
-  opens helper blit encoders around that setup sequence.
-- qLen>1 Q8_0 prefill setup and block apply can consume one continuous
-  planner-produced layer contract when the full Q8_0/f32-KV + PLE shape matches:
-  setup starts at op 0, and the block helper starts at the attention op in the
-  same plan. Unsupported qLen>1 block shapes now return to the caller's safe
-  staged path instead of attempting the legacy gathered monolithic direct block.
-- qLen>1 prefill frames are enabled again for the Gemma4 Q8_0/f32-KV path. The
-  current `hi --max-tokens 4` anchor passes with one prefill frame submit
-  (`metal_decoder_frame: begins=1 submits=1`) and token ids
-  `10979 236888 2088 740`.
-- Attention planning now separates KV dtype from KV storage layout. Dense f32
-  KV still selects `attention_flash`, while paged f32 KV selects
-  `attention_paged`; Polar4/Turbo3 remain under the quantized-KV attention
-  family. This matches the ggml-shaped distinction between tensor type and
-  backend storage rather than treating raw f32 KV as inherently dense.
-- Dense f32 graph SDPA now carries an `attention_flash` `OperatorPlan` at
-  partition time, and `metal_partition_executor` consumes that plan directly
-  instead of falling through the interpreter. The validator-backed regression
-  test asserts a device-resident output, one planned operator dispatch, and zero
-  interpreter fallbacks for a fused-SDPA graph node. The same pass also fixed
-  the raw `termite_sdpa_f32` encoder's optional bias/mask bindings so Metal
-  validation does not abort when those optional inputs are disabled.
-- Shared-KV prefill frame plans now carry a `kv_layer_index` donor, so planned
-  shared-KV attention consumes the donor layer's KV resources instead of
-  reconstructing shared-Q/shared-KV setup in frontend code.
-- The active qLen=1 paged Q8_0/f32-KV decode block is enabled by default. The
-  Metal validator anchor remains correct (`token_ids: 10979 236888 2088 740`)
-  while dispatching successfully through
-  `decode_kv_seed -> attention_paged -> Q8_0 FFN/PLE` and the 4-token Gemma4
-  validator anchor is correct. The correctness bug was the active paged block
-  writing a freshly allocated output while the decode loop consumed the
-  untouched reserved hidden buffer; the paged runtime now has an `Into` form
-  that writes the caller-owned MetalTensor.
-- The graph planner now has a backend-neutral quant matmul selector
-  (`quant_matmul.zig`) with ggml-style dispatch buckets: scalar fallback, MMV,
-  small-batch, and MM. Runtime command ops can carry that planned dispatch
-  metadata, so Q8_0 is the first populated format rather than the only
-  architectural target.
-- Planned layer contracts now carry quant-matmul dispatch metadata across the
-  Zig -> Metal ABI. The planned Q8_0 setup, direct layer block, and tail helpers
-  can consume planner-selected dispatch buckets, with local shape validation
-  before falling back to the runtime selector.
-- The active direct Q8_0 block now threads those planned buckets through the
-  fused FFN gate/up activation and PLE-gate activation helpers too. These
-  helpers still have Q8_0-specific kernel bodies, but their dispatch bucket is
-  now part of the shared Graph/Metal contract.
-- The active direct Q8_0 block now builds encoder-local quant-matmul
-  descriptors for Q/QKV setup, attention output, FFN gate/up, FFN down, PLE
-  gate, PLE projection, and the tail LM head. The descriptors carry epilogue
-  kind, buffers, activation metadata, and planned dispatch while reusing the
-  already-open planned encoder.
-- Q8_0 `NONE`, `PAIR`, `QKV`, `PAIR_ACTIVATION_MUL`,
-  `ACTIVATION_RHS_MUL`, and `PAIR_ACTIVATION_RMS_SCALE_1X` encoder paths now
-  share descriptor-native implementation templates. The older Q8_0 raw-linear,
-  pair, QKV, gate/up, FFN RMS-scale gate/up, and PLE gate helper entry points
-  are compatibility callers that build descriptors, so the active linears are no
-  longer split between descriptor routing and separate dispatch-selection bodies
-  for those epilogues.
-- Unused command-buffer-only helper functions for Q4_0/Q4_K/Q5_K/Q6_K linears
-  and the Q8_0 pair/QKV/pair-activation raw wrappers have been removed; callers
-  now go through descriptor records.
-- `NONE` descriptors now also cover the broader scalar quant format set on an
-  encoder-local path: Q1_0, I2_S, I8_S, Q2_K, Q3_K, Q4_0, Q4_1, Q4_K,
-  Q5_0, Q5_1, Q5_K, Q6_K, Q8_1, Q8_K, IQ4_NL, IQ4_XS, and MXFP4. Existing
-  Q4_0/Q4_K/Q5_K/Q6_K row-1 reduce kernels are still selected through that
-  descriptor path instead of via command-buffer-only helper functions.
-- Shared-KV prefill layers now use the same structural layer contract instead
-  of doing shared-Q setup in frontend code.
-- Prompt KV/span refresh can consume device-backed Q/K/V tensors directly.
-- Dense f32 prompt attention has a tiled `qLen > 1` Metal prefill path.
-- Q8_0 prompt linears with 9 or more rows route to the simdgroup MM bucket
-  instead of the decode-style MMV path. The 10-token Gemma4 anchor now shows
-  `metal_q8_0_dispatch: mm=270` for prefill-shaped linears.
-- Runtime quant slot preparation now uses one packed-weight descriptor and
-  block-layout table across the currently wired Metal quant formats instead of
-  per-format validation copies.
-- Runtime quant slot prepared state is now one prepared-format array per slot,
-  not one boolean array per quant type.
-- The Metal runtime prepare ABI is now format-tagged
-  `prepare_quantized_linear_slot(format, ...)`; the new code does not keep
-  per-format prepare wrappers.
-- The Objective-C runtime now has a generic quant linear slot record for the
-  shared device apply path and memory accounting: format, prepared bit, in/out
-  dims, block layout, and packed weight buffer are no longer sourced from a
-  per-format switch there.
-- Q8_0/Q8_1/Q8_K runtime execution no longer keeps duplicate per-format slot
-  arrays; the active Q8 paths read packed weights through the generic slot view.
-- Dense weight handles that carry a backend-native quantized view now pass that
-  view into decoder runtime linear preparation generically, rather than only
-  for the final LM head. Unsupported quant formats still stay on the explicit
-  dense path until the Metal quant kernel exists.
-- `antfly inference smoke --inspect-only` now reports the largest non-quantized GGUF
-  tensors as well as quantized samples. Use that when checking whether a
-  "Q8_0" model file still contains dense 2D tensors that the Metal backend
-  should treat as explicit dense matmuls.
-- GGUF BF16 tensors are now preserved by `tensor_store` instead of being
-  widened to f32 during lazy loading. Metal dense linear slots can upload BF16
-  weights directly and select BF16 dense kernels. On the Gemma4 anchor, the
-  PLE model projection slot moved from one f32 dense slot
-  (`dense_f32_mb=52`) to one BF16 dense slot (`dense_bf16_mb=26`) while
-  preserving token IDs. `--print-timing` now reports dense f32/BF16 slot
-  counts and requested weight bytes separately from Metal's allocation bucket.
-- Active decoder frames now expose encoder-count and source attribution
-  telemetry. The 4-token Gemma4 anchor is down to one command buffer per decode
-  token and the latest active frame has `0` blit encoders. Planned encoder
-  scopes now cover active row-1 attention setup from pre-attention RMS through
-  Q8_0 QKV/shared-Q projection and head RMS/RoPE, row-1 attention apply +
-  Q8_0 output projection + post-attention RMS/add, row-1 FFN pre-gate RMS
-  scale + Q8_0 gate/up activation + Q8_0 down projection + post-down RMS/add,
-  and row-1 PLE gate/activation + projection + post-norm residual/output-scale.
-  Attention setup, attention apply, attention output projection, FFN, and PLE
-  now encode through a single layer-owned planned scope for the active
-  Q8_0/f32-KV block, so the old per-layer attention/FFN planned encoders are no
-  longer present in the decode frame. The layer block now consumes the
-  planner-produced barrier flags for its internal attention/FFN/PLE ops, so the
-  live barrier placement comes from the Graph/Metal dependency contract instead
-  of a second hard-coded sequence in the Objective-C helper.
-  Final Q8_0 greedy tail now also uses one planned tail encoder for final RMS,
-  LM head, and argmax. Greedy argmax now uses a parallel block reduction over
-  logits instead of scanning the whole vocabulary on one GPU thread; on the
-  4-token anchor this moved `greedy_direct` from roughly `938ms` to `134ms`
-  and total generation from roughly `18.6s` to `1.76s` while keeping token IDs
-  stable. The final greedy RMS also uses the parallel reduce RMS kernel instead
-  of the old single-thread row kernel. The latest 4-token anchor keeps token IDs
-  `10979 236888 2088 740`, reports `planned_scopes=36`,
-  `planned_barriers=422`, and brings last-frame compute encoders down to
-  `41`. The 16-token correctness anchor remains
-  token IDs `10979 236888 2088 740 564 1601 611 3124 236881 103453 106 106
-  106 106 106 106`; recent 16-token timing is noisy because prompt prefill
-  still dominates and jitters, so use the 4-token row-1 counters as the active
-  decode command-shape anchor. Current attribution has split out the main active
-  buckets:
-  `quant_linear=0`, `quant_qkv=0`, `quant_pair_act=0`, `attention=0`,
-  `rms_norm=1`, `head_rope=0`, `ffn=0`, `ple=1`, `tail=1`, `embedding=2`,
-  `dense_linear=1`, `layer=35`, and `other=0`. Compute-region attribution now
-  also shows the planned layer regions: `attention=0`, `attention_project=0`,
-  `ffn_norm=0`, `ffn=0`, `ple=4`, `tail=1`, `embedding=1`, `layer=35`, and
-  `other=0`.
-  The FFN pre-norm is now owned by the direct FFN runtime path instead of being
-  orchestrated by the outer block, and per-layer output scale is owned by the
-  active direct block instead of a post-block frontend multiply. Q8_0 embedding
-  lookup now also accepts the model embedding scale so token and PLE embedding
-  setup do not need separate scale kernels. That confirms the remaining
-  ggml-shaped planner work is mostly kernel quality and larger runtime-owned
-  graph/layer submissions rather than frontend cleanup around the active
-  single-token layer loop.
-- `TERMITE_METAL_TRACE_FRAME=1` now enables a generic debug trace for
-  substantial frames that prints the last frame's `region x source`
-  compute-encoder matrix. `TERMITE_METAL_TRACE_FRAME=all` includes small
-  prefill/setup frames too. Use it when deciding which layer contract to
-  collapse next; source-only counters cannot distinguish, for example, `other`
-  encoders in attention setup from `other` encoders in FFN or tail work.
-- Planned compute barriers are now range-driven in the same broad shape as
-  ggml. The active planned compute encoder tracks read/write byte ranges for
-  encoded operations; source/source overlap is allowed, but any overlap
-  involving a previous write emits `memoryBarrierWithScope:MTLBarrierScopeBuffers`
-  and clears the tracker. The sweep now covers the planned Q8_0 layer path,
-  paged KV seed/attention, prefill V value norm, embeddings, dense and quant
-  linear including pair/QKV dense helpers, RMS/layer norm, head/RoPE,
-  elementwise helpers, PLE/FFN fallback scoped ops, dense attention fallback,
-  ternary `where_select`, tail fallback,
-  slice helpers, and argmax partial/reduce handoff. Quant matmul descriptor
-  leaves now prepare their own ranges instead of relying on the descriptor
-  router, so future direct helper use keeps the same invariant. Remaining explicit barriers are limited to the range
-  tracker itself, the public emergency barrier hook, internal multi-dispatch
-  kernels, and standalone non-planned single-encoder tail helpers. A 2026-05-07
-  bisection found that treating planned barriers as metadata-only could let the
-  realistic Q8_0 framed gated-FFN test pass and then trigger a delayed SoC
-  watchdog reset roughly 90 seconds later. Build-only confirmations:
-  `metal-command-20260508-000751` for the initial tracker,
-  `metal-command-20260508-002316` for the full planned-helper sweep, and
-  `metal-command-20260508-074520` for the follow-up direct-dispatch helper
-  closure, `metal-command-20260508-075225` for the ternary helper closure, and
-  `metal-command-20260508-110049` for the prefill V value-norm helper closure,
-  and `metal-command-20260508-110925` for self-preparing quant descriptor
-  helpers;
-  no GPU rerun after the watchdog.
-- PLE/token setup now uses the same planned-scope encoder coalescing as the
-  layer graph. On the 2026-05-07 Gemma4 compiled smoke, the prefill PLE frame
-  dropped from 7 compute encoders to 1, and the following decode frame dropped
-  from 6 compute encoders to 1 (`metal-command-20260507-225419`). This removes
-  command submission as the dominant explanation for the remaining 130ms-class
-  prefill frame; the remaining gap is the dense BF16 PLE model projection kernel
-  and layer math.
-- `TERMITE_METAL_TRACE_GRAPH_PLAN=1` prints graph-plan commit summaries, and
-  `TERMITE_METAL_TRACE_GRAPH_PLAN=all` also prints requested slot sizes. Graph
-  plan readiness now uses allocated capacity rather than the last request set,
-  and graph-plan buffers grow geometrically. On the 4-token Gemma4 anchor this
-  collapsed scratch planning from `graph_plan_count=3`, `graph_plan_allocs=41`,
-  `graph_plan_mb=5` to `graph_plan_count=1`, `graph_plan_allocs=21`,
-  `graph_plan_mb=6`, while preserving token IDs.
-- The first trace run on the 4-token Gemma4 anchor showed too much setup work
-  in `other`: `attention=100`, `attention_project=70`, `ffn=140`, `ple=105`,
-  `tail=1`, and `other=115`. Region scopes now cover active attention setup,
-  decode-frame PLE setup, final tail, and output-scale fallback. Moving the
-  active per-layer output scale into the direct block contract, fusing Q8_0
-  embedding scale, and fusing PLE setup `add + scale` dropped the latest trace
-  to: `attention=170`, `attention_project=70`, `ffn=140`, `ple=109`,
-  `tail=3`, `embedding=1`, and `other=0`. Source-level attribution now shows
-  `dense_linear=1` inside PLE setup instead of an unnamed helper. This makes
-  the next work concrete: either make that PLE model projection arrive as a
-  quantized/backend-packed tensor like ggml would, or keep it as an explicit
-  dense backend matmul if the model contract truly requires dense; then collapse
-  FFN/PLE/attention-projection region kernels and move embedding/PLE setup into
-  the runtime-owned decode program, rather than chasing another isolated qLen=1
-  reducer.
-- The first real ggml-style RMS fusion is now in the PLE block: PLE post
-  `rms_norm + residual add + layer_output_scale` uses fused Metal kernels for
-  both `qLen == 1` and row-batched prefill. This removed two compute encoders
-  per prefill PLE layer on the 4-token Gemma4 anchor (`total_compute_encoders`
-  `2283 -> 2213`) while preserving token IDs. It does not reduce the latest
-  decode frame's `493` compute encoders yet; the next collapse needs to target
-  the active single-token decode layer regions, not the prompt prefill PLE
-  tail alone.
-- Row-batched attention/FFN residual epilogues now use the same fused
-  `rms_norm + residual add` row kernel instead of separate row RMS plus add
-  dispatches. On the same 4-token Gemma4 anchor this reduced total compute
-  encoders again (`2213 -> 2143`) with unchanged token IDs. The latest
-  single-token decode frame is still `493` compute encoders, which means the
-  next material decode improvement is not another standalone RMS/add epilogue;
-  it is `mul_mv`-owned norm handling or larger matmul+epilogue kernels with a
-  tiling scheme that can respect the full-vector reduction.
-- A Q8 gate/up kernel that recomputed FFN pre-RMS inside every output tile was
-  correct, but it was the wrong kernel shape: last-frame encoders fell
-  `531 -> 496`, while the 4-token anchor regressed badly because the full
-  hidden-vector RMS was reread for each tile. That path was removed. The
-  production direction is either materialize pre-RMS once in runtime-owned
-  scratch, as now, or build a larger layer kernel whose tiling computes the
-  reduction once and reuses it across the quantized projections.
-- The bounded ggml-shaped replacement now computes the FFN pre-RMS inverse
-  scale once per single-token row, then feeds that scalar plus the norm weights
-  into the Q8 gate/up pair kernel. This keeps correctness anchored
-  (`10979 236888 2088 740`) and avoids the per-output-tile RMS reread. Warm
-  4-token Gemma4 `hi` is about `1260ms` on the current machine, with the same
-  `531` last-frame compute encoders at the time. This was a small
-  kernel-quality win, not
-  the larger ggml-style graph/kernel fix.
-- The Q8_0 direct FFN path now also has the matching post-gate RMS fusion for
-  contracts that use it: compute the gated-vector inverse RMS once, then feed
-  that scalar and the post-gate norm weights directly into the Q8_0 down MMV
-  kernel. This avoids materializing `normed_gated_buffer` on the single-token
-  post-gate path while preserving ggml's shape: reductions are computed once,
-  quantized projections still use the shared packed matmul primitive, and the
-  intermediate gated vector is not recomputed per output tile.
-- The generic PLE fallback now uses the backend `rms_norm + residual add`
-  primitive instead of orchestrating post-PLE RMS and add as two runtime calls.
-  This gives non-Q8 PLE formats the same epilogue shape as the Q8_0 direct PLE
-  path without adding a format-specific public API. The public runtime wrapper
-  also retains the RMS-add params buffer when encoding into an active frame, so
-  row-batched frame users do not rely on Objective-C autorelease lifetime.
-- In builds that include both MLX and native Metal, the `.metal` backend now
-  uses the native Metal session/provider path instead of opening an MLX stream
-  and constructing an MLX-backed Metal provider. This keeps GGUF Metal runtime
-  availability tied to Antfly inference's native `MTLDevice` probe and prevents native
-  Metal sessions from failing with `MlxMetalUnavailable` before model load.
-- Active decode now passes per-layer output scale into the direct
-  f32-KV/Q8_0 gated block. That removes the separate post-block scale multiply
-  from the active layer loop and drops the latest single-token frame from
-  `531` to `496` compute encoders while preserving the 4-token anchor token
-  IDs.
-- Q8_0 embedding lookup now takes an embedding scale and writes scaled f32
-  output directly. This removes the separate active setup scale kernels for
-  token and PLE embeddings. PLE setup also uses a fused `add + scale` device
-  helper, so the latest single-token frame is `493` compute encoders.
-  Embedding has its own compute source/region now, and the active frame's
-  region-level `other` bucket is `0`.
-- A naive persistent compute encoder experiment reduced the last-frame compute
-  encoder count from `531` to `17`, but regressed the 4-token anchor from
-  roughly `1.3s` to `7.6s`. Do not blindly keep one encoder open across the
-  frame; the production fix needs explicit fused kernels / planned encoder
-  scopes with correct barriers, not generic encoder reuse.
-- Active-frame blit attribution showed the last-frame blits were generic
-  buffer copies, not KV span encoder copies. A capacity-backed gathered-KV
-  append path reduced the 4-token anchor's last-frame blits from `61` to `30`
-  by avoiding full prefix recopy on every decode append. Grouping the K/V
-  suffix append into one runtime blit encoder per layer reduced that to `15`.
-  The active decode layer now reserves the gathered-KV destination row before
-  K/V post-processing, so K head-norm/RoPE and V norm write directly into the
-  cache. The 4-token anchor's last-frame blits are now `0`; do not spend more
-  time on blit cleanup until compute command planning is addressed.
-- Host fallback single-linear execution now has one format-tagged quantized
-  linear ABI for Q1_0, I8_S, Q2_K, Q3_K, Q4_0, Q4_1, Q4_K, Q5_0, Q5_1, Q5_K,
-  Q6_K, Q8_0, Q8_1, Q8_K, IQ4_NL, IQ4_XS, and MXFP4. The old per-format host
-  wrapper symbols are gone. I2_S still keeps its special activation-quantized
-  host path.
-- I2_S, Q4_0, Q4_K, Q5_K, and Q6_K pair/QKV/attention/FFN execution now read
-  packed weights through the generic quant slot view too. Their duplicate
-  Objective-C per-format slot arrays have been removed.
-- `test-metal-gemma4-prefill-block-parity` validates staged-vs-block behavior
-  and the direct Q8_0 block path.
-- Active-frame batching is still gated for the conservative safe oracle. When
-  `TERMITE_METAL_DISABLE_GATED_FAMILY_RUNTIME_PREFILL_BLOCK=1` selects the safe
-  staged path, both the decoder-runtime layer frame and backend-owned active
-  decode frame are disabled. That is a correctness guard, not the final runtime
-  shape.
-- Graph-planned scratch now covers projection buffers, direct Q, direct block
-  hidden scratch, sample-tail logits, hot hidden scratch, and hot FFN/PLE
-  scratch. Hot helpers reject unplanned allocation instead of growing the graph
-  mid-frame.
-- Prefill-layer scratch planning must reserve hot hidden slots for the larger
-  of `rows * hidden_size` and `rows * attention_input_size`. Gemma4 uses
-  attention input width 2048 with hidden width 1536, and under-reserving this
-  scratch caused the fused attention-residual path to fail at stage 3 while an
-  active frame was open.
-- `--print-timing` reports Metal memory and scratch pressure, including runtime
-  prepared quant slots, lazy host mirrors, gathered spans, and pending frame
-  scratch. Quant runtime prepare also reports private-upload vs mapped-shared
-  slot counts/bytes/timing. GGUF quant weights are already mmap-backed; the
-  Metal runtime now tries `newBufferWithBytesNoCopy` for borrowed, unpacked
-  quant storage and falls back to private upload unless
-  `TERMITE_METAL_FORCE_MAPPED_QUANT_WEIGHTS=1` is set. Use
-  `TERMITE_METAL_DISABLE_MAPPED_QUANT_WEIGHTS=1` to force the old private path
-  for A/B timing.
+Metal builds with `-Dmetal=true` (the removed MLX backend no longer has a
+corresponding build flag). The Gemma4 short-prompt correctness anchor stays
+stable across the default safe path, the planned Q8_0/f32-KV decode block,
+and the default-on fused gated-FFN and attention-output-residual graph
+paths. Decode already runs through the planned Q8_0/f32-KV block by default;
+qLen>1 prefill still mixes planned runtime layer contracts with staged
+fallback coverage, and broadening planned paged-attention/FFN block coverage
+for prefill remains the main open item. The KV storage, attention-planning,
+quant-matmul dispatch, and BF16-handling rules that came out of this work are
+now documented in Production Architecture below.
+
+> **Relocated:** The accreted "X now does Y" status bullets that previously
+> lived here (346 lines) are preserved verbatim in
+> [work-log/completed/inference/metal-status-history.md](../../../work-log/completed/inference/metal/status-history.md)
+> under "Current Status bullets (relocated from METAL.md)". Durable decisions
+> from them are in Command Plan Abstraction, Production Architecture, and the
+> Debug And Rollback Env Vars subsection below.
+
+**Build/backends**
+- In builds that also include MLX, `.metal` uses the native Metal
+  session/provider path instead of an MLX stream, so GGUF Metal availability
+  tracks Antfly inference's own `MTLDevice` probe instead of
+  `MlxMetalUnavailable`.
+
+**Decode path**
+- Anchor: `Hi! How can`, token ids `10979 236888 2088 740` (16-token:
+  `... 564 1601 611 3124 236881 103453 106 106 106 106 106 106`).
+- The qLen=1 paged Q8_0/f32-KV decode block is enabled by default, dispatching
+  `decode_kv_seed -> attention_paged -> Q8_0 FFN/PLE`, and writes K/V directly
+  into the gathered-KV cache destination (no blit copies) by reserving the
+  row before K/V post-processing.
+- PLE post-block and attention/FFN residual epilogues each run as one fused
+  `rms_norm + residual-add(+ output-scale)` row kernel, single-token and
+  row-batched alike.
+- Q8_0 embedding lookup applies the model's embedding scale directly, so
+  token/PLE embedding setup needs no separate scale kernel.
+- Greedy argmax and the final RMS use parallel block-reduction kernels rather
+  than a single-thread scan/row kernel.
+
+**Prefill path**
+- `gelu_new` lowers as a backend activation kind, not a decomposed frontend
+  `x^3 -> tanh -> multiply` sequence.
+- qLen>1 Q8_0 setup runs through a dedicated no-blit encoder (Q/QKV
+  projection, Q/K head RMS/RoPE, optional V norm); when the full
+  Q8_0/f32-KV + PLE shape matches, setup and block apply share one continuous
+  planner-produced contract, otherwise it falls back to the safe staged path.
+- Dense f32 SDPA graph nodes get an `attention_flash` `OperatorPlan` at
+  partition time that `metal_partition_executor` consumes directly.
+- Shared-KV prefill frame plans carry a `kv_layer_index` donor so planned
+  shared-KV attention reuses the donor layer's KV resources instead of
+  reconstructing setup in frontend code.
+- Dense f32 prompt attention has a tiled `qLen > 1` path; Q8_0 prompt linears
+  with 9+ rows route to the simdgroup MM bucket instead of decode-style MMV.
+
+**Quant matmul**
+- Q8_0 weights stay quantized and resident; the hot path never dequantizes
+  whole dense weights.
+- Q8_0 linears (setup, layer block, tail) share one encoder-local descriptor
+  path across the `NONE`/`PAIR`/`QKV`/`PAIR_ACTIVATION_MUL`/
+  `ACTIVATION_RHS_MUL`/`PAIR_ACTIVATION_RMS_SCALE_1X` epilogues; `NONE` also
+  covers the broader scalar format set (Q1_0, I2_S, I8_S, Q2_K, Q3_K, Q4_0,
+  Q4_1, Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, Q8_1, Q8_K, IQ4_NL, IQ4_XS, MXFP4).
+- Metal prefers no-copy mapped buffers for already-mmap-backed GGUF quant
+  weights, falling back to private upload when unsupported (rollback env
+  vars below). Quant slot storage/prepare unification and the host-fallback
+  ABI are in Production Architecture > Quantized Weights.
+- `antfly inference smoke --inspect-only` reports the largest non-quantized
+  GGUF tensors alongside quantized samples, for spotting dense 2D tensors
+  inside a nominally quantized model file.
+
+**Frames/planner**
+- Graph-plan scratch readiness is capacity-based (not tied to the last
+  request set) and graph-plan buffers grow geometrically.
+- Graph-planned scratch covers projection buffers, direct-Q/direct-block
+  hidden scratch, sample-tail logits, and hot hidden/FFN/PLE scratch; hot
+  helpers reject unplanned allocation instead of growing the graph mid-frame.
+
+**Known gaps**
+- Active-frame batching still falls back to a conservative safe oracle via
+  `TERMITE_METAL_DISABLE_GATED_FAMILY_RUNTIME_PREFILL_BLOCK=1` (see Debug And
+  Rollback Env Vars) — a correctness guard, not the target shape.
+- Broadening planned paged-attention/FFN block coverage for qLen>1 prefill
+  beyond the safe staged fallback remains the main open item (see the opening
+  paragraph above).
 
 ## Benchmark Anchors
 
@@ -483,68 +254,15 @@ These are local directional anchors, not absolute device claims.
 
 The current Gemma 4 QAT baseline/no-MTP plan, canonical 2K+300 comparator, and
 promotion gates live in
-[GEMMA4_PERF_PLAN.md](./GEMMA4_PERF_PLAN.md). Older anchors
+[GEMMA4.md, Metal Performance Plan](models/gemma4/GEMMA4.md#metal-performance-plan). Older anchors
 below remain useful implementation history, but they are not the current
 llama.cpp gap unless rerun under that contract.
 
-- Current compiled partitioned graph anchor, Gemma4 Q8_0 short prompt:
-  `TERMITE_GRAPH_EXECUTOR_STATS=1` with `--backend metal --mode compiled
-  --compiled-target partitioned --max-tokens 1 --temperature 0` reports
-  `interpreter_fallbacks=0`, `host_outputs=0`, `device_outputs=819`, and
-  `planned_commands=141` on the default fused path. A current local run on
-  2026-05-05 reported `prefill=998ms`, `total=998ms`, and token id `10979`.
-  This is the right residency milestone, but it is not the same as ggml-class
-  throughput.
-- A detailed timing run with `TERMITE_DEBUG_METAL_TIMING=1` reported
-  `metal_decoder_frame: begins=1 submits=1 wait_ms=23 gpu_ms=22
-  last_compute_encoders=15 total_compute_encoders=942 total_blit_encoders=53`
-  for the same short prefill. That means the slow prefill gap is mostly not
-  raw GPU kernel time in one attention op. It is command/encoder volume,
-  many small planned graph commands, remaining device blits/copies, and
-  non-ggml-quality quant matmul kernels.
-- The latest fused gated-FFN graph path is enabled by default for the matched
-  Gemma gated FFN pattern. Use
-  `TERMITE_METAL_DISABLE_GATED_FFN_GRAPH_FUSION=1` to compare against the
-  staged path. A recent local A/B dropped graph executor commands from `1134`
-  to `924` and planned commands from `211` to `176`; elapsed time is still
-  noisy enough that command reduction is the stronger regression signal.
-- The latest fused attention-output-residual graph path is also enabled by
-  default for matched Gemma attention output strips:
-  `fused_gqa_causal_attention -> optional rms_norm -> o_proj -> optional
-  rms_norm -> residual add`. Use
-  `TERMITE_METAL_DISABLE_ATTENTION_OUTPUT_RESIDUAL_GRAPH_FUSION=1` for A/B
-  comparisons. A local validation run reduced graph executor commands from
-  `980` to `819`, planned commands from `176` to `141`, and warm prefill from
-  `1034ms` to `998ms`; correctness stayed at token id `10979` with zero
-  interpreter fallbacks and zero host outputs.
-- The recent wrong-token fast path was a runtime slot-key bug, not a math
-  difference in the fused FFN path. Native dense byte-only RMS weights had empty
-  host slices and collided when the dynamic RMS slot key used `data.ptr`; the
-  key now uses the native dense buffer identity.
-- Antfly inference Gemma4 short prompt prefill: after enabling the fused
-  f32-KV/Q8_0 attention-residual block, the Debug 10-token chat-template `hi`
-  anchor is correct and fully fused. Recent warm runs show roughly `0.49s`
-  `decoder_gated_prefill_ms.block` and roughly `1.2s` prefill-family time.
-  Cold runs after rebuild can still be much slower from Metal/runtime setup
-  noise.
-- Antfly inference Gemma4 greedy decode: roughly `15-17 tok/s` on the small anchor.
-- The 2026-05-07 RMS-add PLE fallback change passed `zig build test-bin`
-  through the Metal wrapper (`metal-command-20260507-220244`) and rebuilt
-  binary validation smokes for 1, 2, and 3 generated tokens
-  (`metal-command-20260507-220836`, `metal-command-20260507-221011`,
-  `metal-command-20260507-221023`). The repeated 4-token validation command
-  failed during session creation with `MetalDeviceUnavailable`, before kernel
-  execution, and produced no diagnostic reports
-  (`metal-command-20260507-221033`).
-- The native-provider-with-MLX boundary fix rebuilt successfully through the
-  Metal wrapper (`metal-command-20260507-222912`) and `zig build test-bin`
-  passed (`metal-command-20260507-223021`). The 4-token Gemma4 compiled
-  whole-model smoke now passes API validation (`metal-command-20260507-222950`)
-  with token IDs `10979 236888 2088 740`, `prefill=157ms`, `decode=149ms`,
-  `total=1006ms`, and no diagnostic reports.
-- Recent llama.cpp reference on the same model class:
-  - prompt processing `pp10`: about `346 tok/s`
-  - token generation `tg16`: about `101 tok/s`
+> **Relocated:** The dated per-run benchmark numbers that previously lived
+> here (59 lines, 2026-05-05 through 2026-05-07) are preserved verbatim in
+> [work-log/completed/inference/metal-status-history.md](../../../work-log/completed/inference/metal/status-history.md)
+> under "Benchmark Anchors (dated measurements)". Durable decisions from them
+> are captured in the interpretation below and in GEMMA4.md under Metal Performance Plan.
 
 Interpretation:
 
@@ -696,6 +414,12 @@ For single-stream greedy decode, a token helper can be a batch-size-1 wrapper.
 The implementation should not loop over batch items and call a token executor N
 times.
 
+The Gemma4 prefill layer contract is the concrete instance of this boundary:
+it owns QKV or shared-Q projection, row-aware head norm/RoPE, prompt KV span
+seed/update, attention, FFN, PLE, scalar output scale, and reusable layer
+scratch. The decode layer contract owns per-layer output scale the same way,
+as part of the layer rather than a frontend post-block multiply.
+
 ### Backend Primitives
 
 Metal should expose a small set of structural backend primitives:
@@ -712,6 +436,37 @@ Metal should expose a small set of structural backend primitives:
 
 Model-family code may select contracts and metadata, but the backend owns the
 packed-weight layout, command encoding, scratch plan, and device lifetimes.
+
+Prefill-layer scratch planning must size hot hidden slots to the larger of
+`rows * hidden_size` and `rows * attention_input_size`: a model's attention
+input width can exceed its hidden width (Gemma4 uses 2048 versus 1536), and
+under-reserving this scratch fails a fused attention-residual path mid-frame
+instead of at plan time.
+
+### KV Storage And Attention Planning
+
+`MetalKvStorage` paged metadata is per-layer shape aware: it uses each
+layer's `num_kv_heads` and `head_dim` to select the row layout (raw f32, f16,
+int8-per-head, Polar4, or Turbo3) instead of validating every layer against
+one storage-wide KV shape, so mixed per-layer Gemma shapes are supported.
+While an active frame is open, storage can also reserve/expose physical slot
+metadata before the slot has committed tokens, which lets a planned
+`decode_kv_seed -> attention_paged` sequence consume the same in-frame
+physical page table.
+
+Attention planning separates KV dtype from KV storage layout: dense f32 KV
+selects `attention_flash`, while paged f32 KV selects `attention_paged`, and
+Polar4/Turbo3 remain under the quantized-KV attention family. This matches
+the ggml-shaped distinction between tensor type and backend storage rather
+than treating raw f32 KV as inherently dense.
+
+Any paged decode block must write into the caller-owned output buffer
+through an explicit `Into` form rather than returning a freshly allocated
+output. The decode loop reads the caller's reserved hidden buffer directly,
+so a block that allocates its own output silently diverges from what the
+loop consumes instead of failing loudly — treat "writes to a fresh
+allocation instead of the caller's buffer" as a correctness bug class for
+any new paged/backend-owned block, not just historical instances of it.
 
 ### Quantized Weights
 
@@ -760,6 +515,104 @@ Metal, WebGPU, CUDA, and native fallback.
 
 Fused blocks must call this shared quant primitive. They should not duplicate
 quant decoding logic.
+
+This selector is implemented as `quant_matmul.zig`, the backend-neutral quant
+matmul selector with these exact dispatch buckets (scalar fallback, MMV,
+small-batch, MM). Planned layer contracts carry the selected dispatch bucket
+across the Zig/Metal ABI, with local shape validation before falling back to
+the runtime selector; Q8_0 is the first fully populated format rather than
+the only architectural target.
+
+GGUF BF16 tensors are preserved by `tensor_store` instead of being widened to
+f32 during lazy loading, so Metal dense linear slots can upload BF16 weights
+directly and select BF16 dense kernels instead of falling back to f32.
+
+Quant slot storage and prepare paths are unified rather than per-format: one
+packed-weight descriptor and block-layout table covers slot validation, one
+prepared-format array (not one boolean per quant type) tracks prepared state
+per slot, and a single format-tagged `prepare_quantized_linear_slot(format,
+...)` entrypoint replaces the old per-format prepare wrappers. The
+Objective-C runtime holds one generic quant linear slot record (format,
+prepared bit, in/out dims, block layout, packed weight buffer) for the shared
+device apply path and memory accounting instead of per-format switches.  Host
+fallback single-linear execution uses that same format-tagged quantized
+linear ABI across every wired quant format; I2_S keeps a separate
+activation-quantized host path.
+
+### Qwen3 Embedding Q8_0 Kernel Defaults
+
+The Qwen3 embedding path promotes these Q8_0 kernels as production defaults.
+Each has a startup-time rollback flag; a promoted pipeline is not constructed
+at all when its rollback flag is set, and a refuted opt-in pipeline is only
+constructed when its enable flag is set (construct-on-demand, not a runtime
+branch). The measurement protocol behind each promotion lives in
+[`scripts/qwen3_embedding/BASELINE.md`](scripts/qwen3_embedding/BASELINE.md).
+
+Default-on:
+
+- Single-linear SG-v2: vectorized Q8_0 block dequantization, direct simdgroup
+  matrix loads, barrier-free 32-row bulk store, separate ragged tail.
+  Rollback `TERMITE_METAL_DISABLE_Q8_0_SG_V2=1`.
+- Fused gate+up SG-v2: one activation tile feeds both Q8_0 projections plus the
+  SiLU/multiply epilogue (f32 and f16-output variants), removing duplicate
+  activation traffic. Rollback `TERMITE_METAL_DISABLE_Q8_PAIR_ACTIVATION_SG_V2=1`.
+- F32-input M64 single-linear schedule: 64 rows x 64 output columns, eight
+  simdgroups, K=32 panels, separate bulk/tail stores.
+  Rollback `TERMITE_METAL_DISABLE_Q8_0_SG_M64=1`.
+- Zero-bias elision: qwen3 GGUF slots carry synthesized zero biases, so skipping
+  the add is a correctness-preserving identity.
+  Rollback `TERMITE_METAL_DISABLE_ZERO_BIAS_ELISION=1`.
+- `tryDeviceQuantizedGatedFfnResidual` batched Q8_0 device-encode path replaces
+  the per-row loop and cuts dispatch count on long sequences.
+  Rollback (forces the per-row path) `TERMITE_METAL_FORCE_Q8_0_GATED_FFN_ROWWISE=1`.
+- `termite_attention_f32_dense_causal_sg[_q16]` flash attention replaces naive
+  and tiled f32 attention for full causal self-attention from position zero.
+  Eligibility: `q_len >= 8`, no bias/mask/window, `head_dim % 32 == 0`; the q16
+  variant needs `q_len >= 16` and `head_dim <= 128`.
+  Rollback `TERMITE_METAL_DISABLE_DENSE_CAUSAL_SG_ATTENTION=1`, or
+  `TERMITE_METAL_DISABLE_DENSE_CAUSAL_SG_ATTENTION_Q16=1` for the q16 variant only.
+- f16 K/V flash attention (`termite_attention_f32_dense_causal_sg_q16_f16kv`):
+  per-layer f32->f16 K/V convert into two persistent private buffers, direct
+  device simdgroup loads, staged tail chunk.
+  Rollback `TERMITE_METAL_DISABLE_DENSE_CAUSAL_SG_ATTENTION_F16KV=1`.
+
+Measured and refuted as defaults, kept opt-in for future hardware or schedule
+work (do not re-propose as defaults without new evidence):
+
+- F16-input M64 single-linear schedule was slower than the default f16-input
+  SG-v2 M32 route at long sequence lengths.
+  Opt-in `TERMITE_METAL_ENABLE_Q8_0_SG_M64_F16=1`.
+- Sharing one activation tile across the QKV K/V projections was neutral.
+  Opt-in `TERMITE_METAL_ENABLE_Q8_KV_PAIR_SG=1`.
+- GQA head-pair attention (`..._sg_q16_f16kv_gqa2`, K/V reads shared across two
+  query heads per 256-thread threadgroup) was materially slower because its
+  threadgroup footprint halves occupancy.
+  Opt-in `TERMITE_METAL_ENABLE_DENSE_CAUSAL_SG_ATTENTION_GQA_PAIR=1`.
+- Preferring the split mm_sg route over the fused scalar
+  `q8_0_pair_activation_multiply_mm` for gate+up at rows >= 129 was slower
+  end-to-end; the fused kernel's per-row-group weight re-reads stay
+  cache-resident. No flag; documented as refuted.
+
+### Gemma 4 A4B High-Memory Bundle
+
+`TERMITE_METAL_ENABLE_A4B_HIGH_MEMORY_FAST_PATH` is the opt-in, off-by-default
+umbrella for Gemma 4 26B-A4B Metal decode. It bundles: a no-copy model-wide
+Metal buffer backed by a residency set, mapped routed-expert weights, fused
+expert gate/up activation, cached adjusted norm weights, zero-bias elision,
+shared-FFN fusion, SIMD-group RMSNorm/head-RoPE kernels, triple parallel-FFN
+pre-norm, parallel-FFN post/residual fusion, RMSNorm/residual fusion, the
+qualified M4 Q4_0 schedules, the split-GQA decode kernel for A4B's exact
+local (16 query heads, 8 KV heads, head dim 256, window 1024) and global (16
+query heads, 2 KV heads, head dim 512) geometries at KV lengths of 512 or
+more, the register-based route-select kernel, the prepared A4B
+concurrent-hazard executor, and the Q6_K NR4/NSG1 LM head. Every component
+has its own `TERMITE_METAL_DISABLE_A4B_*` rollback (for example
+`TERMITE_METAL_DISABLE_A4B_DECODE_GQA_SPLIT_FRAME_SCRATCH=1` for the
+frame-owned split-GQA scratch that lets frame N+1 encode while frame N is
+still submitted, or `TERMITE_METAL_DISABLE_A4B_ROUTE_SELECT_REGISTER=1` for
+the route selector). The backend-owned prepared executor itself additionally
+requires `TERMITE_METAL_ENABLE_A4B_PREPARED_DECODE=1`. Both opt-ins default
+off.
 
 ### ggml-Shaped Metal Checklist
 
@@ -1526,6 +1379,27 @@ The 4-token Gemma4 anchor should remain:
 10979 236888 2088 740
 ```
 
+### Debug And Rollback Env Vars
+
+| Variable | Effect |
+|---|---|
+| `TERMITE_METAL_TRACE_FRAME=1` / `=all` | Dumps the last frame's `region x source` compute-encoder matrix; `all` also includes small prefill/setup frames. |
+| `TERMITE_METAL_TRACE_FRAME_BLITS=1` | Traces frame blit-encoder attribution. |
+| `TERMITE_METAL_TRACE_GRAPH_PLAN=1` / `=all` | Prints graph-plan commit summaries; `all` also prints requested slot sizes. |
+| `TERMITE_METAL_TRACE_Q80_BLOCK=1` | Traces the Q8_0 direct block path, including shared-KV setup misses. |
+| `TERMITE_GRAPH_EXECUTOR_STATS=1` | Prints graph executor stats: commands, planned commands, encoder/fallback counts. |
+| `TERMITE_DEBUG_METAL_TIMING=1` | Prints detailed per-frame Metal timing (begins/submits/wait_ms/gpu_ms/encoder counts). |
+| `TERMITE_METAL_DISABLE_MAPPED_QUANT_WEIGHTS=1` | Forces private-upload quant weight storage instead of no-copy mapped buffers, for A/B timing. |
+| `TERMITE_METAL_FORCE_MAPPED_QUANT_WEIGHTS=1` | Forces no-copy mapped quant weight storage even when the default heuristic would use private upload. |
+| `TERMITE_METAL_DISABLE_GATED_FFN_GRAPH_FUSION=1` | Rollback for the default-on fused gated-FFN graph path. |
+| `TERMITE_METAL_DISABLE_ATTENTION_OUTPUT_RESIDUAL_GRAPH_FUSION=1` | Rollback for the default-on fused attention-output-residual graph path. |
+| `TERMITE_METAL_DISABLE_GATED_FAMILY_RUNTIME_PREFILL_BLOCK=1` | Forces the safe staged prefill path, disabling both the decoder-runtime layer frame and the backend-owned active decode frame. This is a correctness guard, not the target runtime shape. |
+| `ANTFLY_INFERENCE_ALLOW_BROAD_METAL_TEST=1` | Overrides the debug wrapper's refusal to run unfiltered `zig build test` in `command` mode (which has produced SoC watchdog reboots); use `unit` mode instead by default. |
+| `ANTFLY_INFERENCE_METAL_SKIP_POSTCAPTURE=1` | Skips post-capture log/DiagnosticReports collection during `unit` isolation, for reboot bisection. |
+| `TERMITE_METAL_DISABLE_Q8_0_SG_V2=1` / `..._Q8_PAIR_ACTIVATION_SG_V2=1` / `..._Q8_0_SG_M64=1` / `..._ZERO_BIAS_ELISION=1` / `TERMITE_METAL_FORCE_Q8_0_GATED_FFN_ROWWISE=1` | Rollbacks for the default-on Qwen3 embedding Q8_0 kernels; see Qwen3 Embedding Q8_0 Kernel Defaults. |
+| `TERMITE_METAL_DISABLE_DENSE_CAUSAL_SG_ATTENTION=1` / `..._Q16=1` / `..._F16KV=1` | Rollbacks for the default-on dense causal flash-attention kernels. |
+| `TERMITE_METAL_ENABLE_Q8_0_SG_M64_F16=1` / `TERMITE_METAL_ENABLE_Q8_KV_PAIR_SG=1` / `TERMITE_METAL_ENABLE_DENSE_CAUSAL_SG_ATTENTION_GQA_PAIR=1` | Opt-in for refuted kernel candidates; constructed only when set. |
+
 ## Crash Debug Tooling
 
 Use `pkg/inference/scripts/debug_metal_command.sh` for Metal commands that may
@@ -1625,286 +1499,11 @@ Antfly inference commands or long-running Metal executions.
 - Do not treat one local fusion win as a substitute for the ggml-shaped packed
   quant matmul and graph/frame allocator work.
 
-# Generalize Existing Metal Command Planner
-
-## Summary
-
-The Metal command planner is the canonical graph command-plan abstraction; do
-not introduce a parallel planner. `GraphCommandPlan`, `GraphCommandPlanView`,
-and `GraphCommandOp` own ordered op records, resource ranges, encoder scopes,
-barrier placement, scratch lifetimes, and operator metadata. Model-specific
-paths lower into this generic command plan through temporary lowerers.
-
-Success criteria:
-- No new parallel planner is introduced.
-- `GraphCommandPlan` remains the canonical generic command plan.
-- Specialized types such as `GatedFrameCommandLowerer` remain lowering helpers
-  or disappear as the generic frame executor takes over.
-- Metal prefill consumes one generic frame command plan, not per-layer specialized slices.
-- Existing token/residency anchors remain correct.
-
-## Key Changes
-
-- Generic planner surface.
-  - Use `GraphCommandPlan`, `GraphCommandPlanView`, and `GraphCommandOp` in
-    production code.
-  - Keep `ResourceRange`, `ResourceUse`, `EncoderScope`, `ScratchSlotLifetime`, `OperatorPlan`, and `QuantMatmulPlan` as shared concepts.
-  - Do not add compatibility aliases for the old runtime-command names.
-
-- Generalize op kinds.
-  - Replace decode-specific `OpKind` names with structural names:
-    `rms_norm`, `qkv_linear`, `head_norm_rope`, `kv_seed`, `attention`, `attention_output_linear`, `residual_norm_add`, `ffn_gate_up`, `ffn_down`, `ple_gate`, `ple_projection`, `tail_norm`, `lm_head`, `argmax`, `sample`, `quant_get_rows`, `quant_set_rows`, `quant_copy`, etc.
-  - Keep phase, qLen, KV layout, quant format, and activation in metadata, not in the enum name.
-  - Update tests to assert structural op names plus operator metadata rather than decode-prefixed names.
-
-- Add a real `FrameDescriptor`.
-  - Define one backend-neutral frame descriptor for command-plan lowering.
-  - Include frame mode (`prefill`, `decode`, `embedding`, `classification`), batch/query lengths, sequence positions, requested outputs, KV mutation policy, KV layout, activation dtype, and backend target.
-  - Replace scattered prefill/decode-only fields where practical; keep model-specific layer specs separate from backend execution policy.
-
-- Convert specialized builders into generic lowerers.
-  - Keep current Gemma/Q8/f32-KV logic as a lowering path initially, but make it emit generic `GraphCommandOp`s into `GraphCommandPlan`.
-  - Keep `GatedFrameCommandLowerer`, `GatedLayerCommandLowerer`,
-    `PrefillGatedLayerCommandLowerer`, and related helpers as lowerers, not as
-    the public planner abstraction.
-  - The specialized lowering helper may still validate Q8_0/f32-KV support, but the output plan must be generic.
-
-- Make Metal consume the generic frame plan.
-  - Change Metal runtime entrypoints to accept `GraphCommandPlanView`.
-  - Execute the whole prefill frame from that view instead of slicing per-layer command views and returning to Zig orchestration.
-  - Use the existing resource ranges/scopes/barriers to group encoder work and reduce command/encoder churn.
-  - Unsupported op/operator combinations must return explicit unsupported diagnostics and counters.
-
-## Migration Order
-
-1. Mechanical rename.
-   - Use generic type names at imports/call sites.
-   - Keep old names out of production source.
-   - Run unit tests to verify no behavior change.
-
-2. Structural op-kind migration.
-   - Introduce generic op names and map old decode-prefixed values to the new names.
-   - Update planner tests and Metal cursor validation.
-   - Keep operator plans unchanged.
-
-3. Frame descriptor introduction.
-   - Add `FrameDescriptor`.
-   - Use it in the Gemma prefill/decode lowering path.
-   - Preserve existing `DecoderRuntimePrefillFramePlanRequest` as an adapter until all call sites migrate.
-
-4. Generic Gemma prefill lowering.
-   - Build a generic `GraphCommandPlan` using `FrameDescriptor` plus Gemma
-     layer specs.
-   - Keep the existing specialized lowerer only while it is the adapter from
-     Gemma metadata to graph command records.
-
-5. Whole-frame Metal execution.
-   - Make Metal execute the generic prefill plan directly.
-   - Remove per-layer command-view slicing from the active prefill path.
-   - Track `commands`, `planned_commands`, `total_compute_encoders`, and `total_blit_encoders`.
-
-6. Cleanup.
-   - Remove deprecated aliases and specialized production planner names.
-   - Update `METAL.md` and `GRAPH.md` to describe the final abstraction.
-
-## Test Plan
-
-- Mechanical tests:
-  - Run existing planner and Metal unit tests after rename.
-  - Add compile-time checks or grep-style tests only if the repo already has that pattern; otherwise keep tests behavioral.
-
-- Planner tests:
-  - Assert Gemma4 prefill and decode emit the same structural op names where appropriate.
-  - Assert qLen 2..8 selects `mul_mv_ext`, qLen >= 9 selects `mul_mm`.
-  - Assert attention operator metadata selects `attention_flash` or `attention_paged` correctly.
-
-- Metal correctness tests:
-  - Run `test-metal-gemma4-prefill-block-parity`.
-  - Run `hi --max-tokens 1 --temperature 0` and assert token `10979`.
-  - Run existing 4-token anchor and assert `10979 236888 2088 740`.
-  - Assert `interpreter_fallbacks=0` and `host_outputs=0`.
-
-- Performance checks:
-  - Run with `TERMITE_GRAPH_EXECUTOR_STATS=1 TERMITE_DEBUG_METAL_TIMING=1`.
-  - Record `commands`, `planned_commands`, `total_compute_encoders`, `total_blit_encoders`, `prefill`, and `gpu_ms`.
-  - Compare against current local baseline: `commands=924`, `planned_commands=176`, `total_compute_encoders=942`, `total_blit_encoders=53`, `prefill≈1194-1331ms`.
-
-## Assumptions
-
-- This is a refactor plus wiring change, not a new planner implementation.
-- Existing graph command-plan semantics are the source of truth.
-- Metal is the first consumer, but names and contracts should be backend-neutral enough for WebGPU/native later.
-- Specialized Q8_0/f32-KV checks can remain internally during migration, but not in the final public abstraction names.
-
-# Whole-Frame Metal Graph Execution Plan
-
-## Summary
-The current refactor made `GraphCommandPlanView` the generic command-plan shape, and the Metal backend now has frame-level Gemma4 prefill planning/execution hooks wired through `ComputeBackend`. That is real infrastructure, not just a design target. Accepted qLen>1 Q8_0 prefill layers now route setup plus attention/FFN/PLE block work through one composed runtime layer dispatch, so the fast path no longer bounces from Zig into separate setup and block runtime calls. The remaining gap is that the accepted frame still gets sliced back into per-layer `PlannedLayerContract` windows. The next larger performance step is to make Metal consume the full prefill `GraphCommandPlanView` as one backend-owned op stream, with explicit timing that separates host encode/orchestration cost from GPU work.
-
-Target outcome for the Gemma4 `hi --max-tokens 1` Metal smoke:
-- Correct token remains `10979`.
-- `interpreter_fallbacks=0`, `host_outputs=0`.
-- `commands` and `total_compute_encoders` drop materially from the current `924` / `942`.
-- Prefill improves only if command/encoder count drops; do not claim success from naming/refactor alone.
-
-## Key Changes
-- Continue the frame-level Metal execution entrypoint.
-  - `decoderRuntimePlanPrefillFrame` and `decoderRuntimeExecuteGraphCommandPlanFrame` exist and are called by Gemma4 direct prefill for qLen>1.
-  - The first supported contract remains Gemma gated RMS + PLE shared-KV prefill only; unsupported plans return `false` with diagnostics, preserving current fallback behavior.
-  - The executor now derives layer and tail windows with a structural cursor over `frame_plan.view()`, so it no longer depends on the lowerer's side-channel layer starts for accepted frames.
-  - The cursor now feeds one composed runtime dispatch for each accepted Q8_0 prefill layer, carrying the setup and block contracts together. The remaining part is direct execution of the full cursor as one op stream instead of per-layer windows plus a tail contract.
-
-- Move planning-to-execution ownership into Metal.
-  - Keep `GatedFrameCommandLowerer` as the temporary Gemma-to-`GraphCommandPlan` lowerer.
-  - Stop using per-layer `PlannedLayerContract` slices for the accepted prefill fast path.
-  - Build a Metal-side command-plan cursor over `GraphCommandOp` records and encode by structural op kind: setup/QKV, KV seed, attention, attention output, FFN, PLE, tail norm/head.
-  - Keep existing helper kernels initially, but call them from one frame executor so scope/barrier decisions are centralized.
-
-- Collapse encoder scopes before adding new kernels.
-  - Use `GraphCommandPlanView.scopes` as the source of truth for compute encoder grouping.
-  - Within a scope, encode all supported ops into the active encoder and insert planned barriers only where `barrier_before` requires it.
-  - Do not add model-named monolithic kernels in this slice; use existing quant/attention/norm primitives behind structural op dispatch.
-
-- Add missing timing and counters.
-  - Add counters for `frame_plan_ops`, `frame_plan_scopes`, `frame_plan_scope_encoders`, `frame_plan_encode_ms`, `frame_plan_submit_ms`, `frame_plan_wait_ms`, and `frame_plan_gpu_ms`.
-  - Keep existing `graph_executor_stats` fields, but distinguish node-level graph commands from frame-plan commands.
-  - Print a diagnostic reason when full-frame execution declines: unsupported op kind, unsupported operator plan, shape mismatch, missing prepared slot, scratch reservation failure.
-
-## Test Plan
-- Unit planner tests:
-  - Assert `GatedFrameCommandLowerer.view()` emits one contiguous frame plan with expected structural op kinds and scratch lifetimes.
-  - Add a test that full-frame eligibility rejects unsupported op/operator combinations without mutating frame state.
-  - Add a test that frame-scope cursor groups ops by `scope_index` and preserves planned barriers.
-  - Keep accepted-frame cursor tests that prove execution derives layer/tail windows from the full frame plan rather than lowerer side-channel views.
-
-- Metal executor tests:
-  - Add a focused mock/fake runtime test for `decoderRuntimeExecuteGraphCommandPlanFrame` that verifies op dispatch order, scope begin/end counts, and barrier count.
-  - Keep fallback tests proving unsupported frames still run through current per-layer helpers.
-
-- Runtime smoke:
-  - Build `pkg/inference` with `-Dmetal=true -Doptimize=ReleaseFast`.
-  - Run Gemma4 unsandboxed through `debug_metal_command.sh`.
-  - Acceptance for this slice: token `10979`, no fallbacks/host outputs, no diagnostic reports, and reduced command/encoder counts versus `commands=924`, `total_compute_encoders=942`.
-  - Record both cold and warm runs; use warm run for performance comparison.
-
-## Assumptions
-- Optimize command/encoder orchestration before adding new Metal kernels.
-- Preserve current correctness fallback paths until full-frame execution is proven.
-- Scope this slice to Gemma gated prefill; decode and ClipClap/ONNX graph execution use the same abstractions later but are not required for first success.
-- Existing backend hooks and active-frame plumbing are not the blocker. The blocker is replacing per-layer contract slicing inside the accepted frame with a single command-plan cursor and scope/barrier executor.
-- Performance success is measured by command/encoder reduction plus warm prefill timing, not by GPU time alone, because current `gpu_ms≈17` while prefill is about `1s`.
-
-# Metal Graph Command-Volume Reduction Plan
-
-## Summary
-Reduce real Gemma4 Metal graph command volume by moving from per-node partition execution toward ggml-style whole-graph region planning. Use `../ggml` as the reference model: optimize the graph first, fuse only when liveness/aliasing proves safety, reorder independent regions by memory ranges, then encode larger runtime regions instead of many helper calls.
-
-Current anchor: Gemma4 compiled partitioned Metal is around `commands=819`, `planned_commands=141`, `interpreter_fallbacks=0`, `host_outputs=0`, `prefill=998ms`.
-
-Target for this chunk: keep correctness and residency, reduce enabled command volume to `<=500` with a stretch target of `<=250`.
-
-## Key Changes
-- Continue the Metal graph region planner on top of the existing partition plan.
-  - Runtime region planning/execution already exists in the partition executor for Q linear, QKV, RMS/grouped QKV, attention-output residual, FFN residual, and PLE residual patterns.
-  - Existing diagnostics already track region counts and fallbacks, so new work should extend those counters instead of adding parallel statistics.
-  - The remaining region work is integration: promote compatible regions into a larger whole-frame command sequence instead of executing many small planned scopes.
-
-- Implement ggml-style fusion eligibility.
-  - Use existing use-count/last-use checks plus buffer/resource ranges as Antfly inference’s equivalent of `ggml_can_fuse`.
-  - Fuse only when intermediates have no escaping uses.
-  - Reject write/read or write/write overlap; allow source-source overlap.
-  - Preserve stateful order for KV writes, paged attention, rope position mutation, and requested graph outputs.
-
-- Extend frame/region execution for Metal.
-  - The backend frame hook exists for Gemma4 prefill; extend the implementation so it consumes the region/frame plan directly.
-  - Other backends keep the existing interpreter/partition path.
-  - If a region is not supported, it falls back to the current node executor with an explicit fallback reason.
-  - Keep this backend-neutral at the graph interface level; no Gemma-specific public API.
-
-- Fuse the highest-volume real regions first.
-  - Attention region: QKV projection, Q/K normalization or reshape/transpose layout ops, rope, fused/paged GQA attention, output projection, residual/norm where eligible.
-  - FFN region: up/gate projections, activation, elementwise multiply, down projection, residual/norm where eligible.
-  - Tail region: final norm, LM head, argmax/sampling setup where eligible.
-  - Prefer existing kernels initially; only add a small fused GLU/activation-multiply kernel if current activation+mul still creates avoidable command churn.
-
-- Add command-volume diagnostics.
-  - Track `graph_regions`, `graph_region_ops`, `graph_region_fallbacks`, per-region counts, compute encoders, command buffers, frame encode/wait/GPU time, and top fallback reasons.
-  - Keep `interpreter_fallbacks`, `host_outputs`, and `device_outputs` semantics correct after region execution.
-- Keep FFN intermediates explicitly typed in command plans.
-  - FFN scratch now carries activation dtype intent, with f16 currently enabled for the gated activation buffer and f32 retained for projected/residual-facing buffers.
-  - Planned command contracts now carry input/output activation dtype metadata through the Zig/C Metal ABI.
-  - Multi-row Q8_0 prefill uses a f16 FFN route for supported descriptors, with a dedicated fused pair-activation MM output kernel and a matching f16-input Q8_0 down-projection MM kernel. The down projection still writes f32 until residual/RMS epilogues support f16 inputs.
-  - The planner selects f16 automatically; runtime descriptor/pipeline checks fail closed when a specific shape, quant family, or kernel variant is unsupported.
-  - Track `pair_act_mm_out_f16` and `linear_mm_in_f16` counters to prove the real prefill path is using those kernels.
-  - Q8_0 pair-activation selection should prefer the fused pair-activation kernel; the split simdgroup two-matmul plus activation/multiply path is a fallback only when the fused pair kernel is unavailable.
-
-## Test Plan
-- Add planner unit tests for synthetic attention, FFN, and tail regions.
-- Add negative tests for escaped intermediates, unsafe resource overlap, requested intermediate outputs, and KV-state ordering.
-- Add real-model planner coverage for Gemma4 graph layout so synthetic coverage cannot drift away from production topology.
-- Run CPU unit suite to ensure non-Metal graph behavior is unchanged.
-- Run Metal validation through the repo’s debug wrapper only, with API validation and crash bundle capture enabled.
-- A/B runtime with region execution enabled and disabled.
-
-## Acceptance Criteria
-- Gemma4 Metal compiled partitioned generation still produces the known smoke token output, including token `10979` for the existing short prompt check.
-- `interpreter_fallbacks=0` and `host_outputs=0` remain true on the Gemma4 Metal smoke path.
-- Enabled command volume drops from `819` to `<=500`; stretch target `<=250`.
-- `planned_commands` drops from `141` to `<=100`; stretch target `<=75`.
-- No Metal diagnostic crash reports from validation runs.
-- If command/encoder volume improves but latency does not, accept this chunk as structural progress and record the remaining bottleneck as kernel quality or scheduling, not graph residency.
-
-## Assumptions
-- We use `../ggml` as a design reference, not as a linked dependency.
-- The first implementation prioritizes Gemma4 prefill/decode graph shape, but abstractions must stay graph/backend-oriented for CLIP/CLAP/ClipClap and ONNX/GGUF/Safetensors paths.
-- The current per-node executor remains the correctness fallback until each region type is proven safe.
-
-# Metal Command Reduction Implementation Plan
-
-## Summary
-Reduce Gemma4 partitioned Metal command volume by matching ggml’s execution model more closely: view-like ops become metadata-only, frame-time descriptor construction moves into planning/load paths, and attention/epilogue chains are fused into larger resident regions. Target success is fewer Metal commands with unchanged token output, `interpreter_fallbacks=0`, `host_outputs=0`, and no Metal diagnostic reports.
-
-## Key Changes
-- Treat shape/view-only graph ops as aliases in the Metal partition executor: `reshape`, simple last-dim `slice`, and quantized `concat_prim` descriptors should not increment command dispatch or encode kernels when they can be represented as retained tensor views or descriptor metadata.
-- Add a planner/cache path for grouped concat QKV weights so concat descriptor construction happens once per graph/runtime slot, not every frame.
-- Add an attention-prep graph region that matches exact Gemma layouts: grouped QKV outputs, Q/K/V head RMSNorm, Q scale, Q/K rope, GQA, output projection/norm/residual.
-- Extend existing region execution so scalar multiply/add epilogues fold into producer regions when the scalar/broadcast shape is safe and the result has a single expected use.
-- Keep all new fusions conservative: exact op sequence, exact shapes, single-use checks, same backend device, and fall back to current execution if any condition fails.
-
-## Implementation Steps
-- First implement metadata-only view handling in `metal_partition_executor`: detect no-copy reshapes/slices and publish aliases without treating them as backend commands; add ownership tests to prevent double-free and leaked aliases.
-- Move quantized concat QKV descriptors into a reusable slot/cache keyed by concat tree and quant metadata; executor should reuse the descriptor instead of rebuilding it as a command.
-- Add matcher tests for real Gemma-like attention prep graphs, then implement the region in stages: QKV outputs through head norms, then rope/scale, then GQA plus existing output residual.
-- Add epilogue folding for scalar `mul`/`add` after RMSNorm, attention, FFN, and modulation patterns only when current trace proves the exact producer/consumer shape.
-- Update stats to distinguish `metadata_aliases`, `planned_descriptors`, and real command dispatches so reductions are visible and not hidden by counter semantics.
-
-## Test Plan
-- Run `zig build test -Dmetal=false --summary failures` after each stage.
-- Run focused Metal validation smoke through `pkg/inference/scripts/debug_metal_command.sh command --api-validate -- ... --backend metal --mode compiled --compiled-target partitioned`.
-- Acceptance checks for Gemma4 smoke: token id remains `10979`, `interpreter_fallbacks=0`, `host_outputs=0`, no diagnostic reports, command count decreases from current `724`.
-- Add unit tests for alias ownership, concat descriptor reuse, attention-prep matcher rejection on extra uses, and scalar epilogue rejection on non-scalar/broadcast-unsafe inputs.
-- Keep a traced command histogram before/after each slice and document the command deltas.
-
-## Assumptions
-- Prioritize command-count and residency correctness over timing until API-validation noise is removed.
-- Do not introduce broad graph rewrites yet; implement conservative executor/planner regions first.
-- Treat ggml as the behavioral model for views and descriptors: metadata-only unless a real contiguous copy is required.
-
-## Current Status: Planned Graph Region Scopes
-- Gemma4 Metal compiled partitioned remains fully resident for the smoke path:
-  `interpreter_fallbacks=0`, `host_outputs=0`, `graph_region_fallbacks=0`.
-- PLE residual execution now supports the Q8 fused fast path and a generic device descriptor path for Q4 and other supported single-stage quant formats. Focused Metal validation covers both Q8 and Q4 PLE residual paths.
-- The partition executor now pre-materializes constants/zero tensors before opening the active Metal frame, avoiding constant uploads during the hot frame where possible.
-- Empty active frames are no longer submitted/waited: `flush_active_frame` cancels/restarts empty frames, and submit-and-wait cancels empty active frames before submit. The traced Gemma4 one-token run dropped from `456` frame traces with `350` empty frames to `106` frame traces with `0` empty-frame entries.
-- Fused graph regions now enter planned Metal compute scopes. The graph executor opens a planned region scope for attention-output residual, FFN residual, and PLE residual. If the partition-level frame has already been flushed by preparation/runtime paths, the planned scope owns a small frame and submits it safely at scope exit.
-- The traced Gemma4 one-token run now reports planned scopes in `105` of `106` frame traces, with no empty-frame entries:
-  `graph_regions=120`, `graph_region_ops=635`, `graph_region_fallbacks=0`, `interpreter_fallbacks=0`, `host_outputs=0`.
-- Current non-validation 8-token Gemma4 Metal compiled partitioned measurement:
-  `prefill=1200ms`, `decode=4574ms`, `total=5775ms`.
-- This is structural progress, not the final ggml-style execution model. The remaining bottleneck is still frame fragmentation: most graph regions submit one small planned frame each instead of one whole-frame command sequence.
-
-## Next Required Slice
-- Promote per-region planned scopes into a whole-frame `GraphCommandPlanView` executor for Gemma prefill/decode so compatible attention/FFN/PLE/tail regions share a command buffer and encoder scopes.
-- Use `GraphCommandPlanView.scopes` as the source of truth for grouping; region-local scopes are the fallback, not the destination.
-- Move per-frame quant descriptor/slot preparation out of execution hot paths; execution should reference prepared resident slots/descriptors.
-- Add frame counters for real submitted frame count, empty-frame cancels, planned-scope count, and top frame-break reasons so regressions are visible without verbose `TERMITE_METAL_TRACE_FRAME=all`.
+> **Relocated:** The four appended command-planner and frame-execution slice
+> plans that previously lived here (283 lines: "Generalize Existing Metal
+> Command Planner", "Whole-Frame Metal Graph Execution Plan", "Metal Graph
+> Command-Volume Reduction Plan", and "Metal Command Reduction Implementation
+> Plan") are preserved verbatim in
+> [work-log/completed/inference/metal-slice-plans.md](../../../work-log/completed/inference/metal/slice-plans.md).
+> Durable decisions from them are in Command Plan Abstraction near the top of
+> this document.
