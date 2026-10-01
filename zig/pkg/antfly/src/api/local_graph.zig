@@ -944,18 +944,32 @@ pub fn parseGraphMetricReads(
     for (metrics, 0..) |metric, i| {
         if (metric.damping != null or (metric.seed_nodes != null and metric.seed_nodes.?.len != 0))
             return error.GraphMetricPersonalizationUnsupported;
+        const freshness: graph_query_mod.GraphMetricFreshness = if (std.mem.eql(u8, metric.freshness, "fresh"))
+            .fresh
+        else if (std.mem.eql(u8, metric.freshness, "published"))
+            .published
+        else
+            return error.InvalidQueryRequest;
         out[i] = .{
             .name = try alloc.dupe(u8, metric.name),
-            .freshness = if (std.mem.eql(u8, metric.freshness, "fresh"))
-                .fresh
-            else if (std.mem.eql(u8, metric.freshness, "published"))
-                .published
-            else
-                return error.InvalidQueryRequest,
+            .freshness = freshness,
         };
         initialized += 1;
     }
     return out;
+}
+
+test "local graph metric reads reject invalid freshness without leaking" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidQueryRequest, parseGraphMetricReads(alloc, &.{.{ .name = "pagerank", .freshness = "invalid" }}));
+    try std.testing.expectError(error.InvalidQueryRequest, parseGraphMetricReads(alloc, &.{
+        .{ .name = "first", .freshness = "fresh" },
+        .{ .name = "second", .freshness = "invalid" },
+    }));
+    const valid = try parseGraphMetricReads(alloc, &.{.{ .name = "pagerank", .freshness = "fresh" }});
+    defer freeGraphMetricReads(alloc, valid);
+    try std.testing.expectEqualStrings("pagerank", valid[0].name);
+    try std.testing.expectEqual(graph_query_mod.GraphMetricFreshness.fresh, valid[0].freshness);
 }
 
 pub fn dupGraphMetricReads(

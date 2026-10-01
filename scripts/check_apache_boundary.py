@@ -312,6 +312,11 @@ SERVER_ENTRYPOINTS = (
     "capi/server_owner.zig",
     "capi/db_test.zig",
     "storage/server_db_adapter.zig",
+    "storage/server_transaction_dispatch.zig",
+    "storage/server_transaction_recovery.zig",
+    "storage/server_transaction_recovery_contract.zig",
+    "storage/server_db_integration_test.zig",
+    "server_db_integration_test_root.zig",
     "raft/storage/native_snapshot.zig",
     "storage/metadata_hot_standby_port.zig",
 )

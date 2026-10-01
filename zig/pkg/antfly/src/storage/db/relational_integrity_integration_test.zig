@@ -1289,7 +1289,7 @@ test "relational integrity accepted generation survives restart and bounded two-
         var staged = try transition.beginStaging();
         defer staged.deinit();
         try std.testing.expectError(error.CoordinatedConstraintRestoreRequired, db_mod.DB.restoreSnapshotToStagedGeneration(&staged, alloc, snapshot_path, staged.path(), options));
-        try db_mod.DB.restoreAuthenticatedReplicaToStagedGeneration(&staged, alloc, snapshot_path, staged.path(), options, namespace);
+        try @import("../server_db_adapter.zig").restoreAuthenticatedReplicaToStagedGeneration(&staged, alloc, snapshot_path, staged.path(), options, namespace);
         var staged_options = options;
         staged_options.staged_generation = &staged;
         var seeded = try db_mod.DB.open(alloc, staged.path(), staged_options);
@@ -2449,8 +2449,8 @@ test "relational integrity historical restore stays fenced while coherent HA see
     try std.testing.expectError(error.CoordinatedConstraintRestoreRequired, db_mod.DB.restoreSnapshotToStagedGeneration(&staged, alloc, snapshot_path, staged.path(), options));
     var wrong = namespace;
     wrong.table_id += 1;
-    try std.testing.expectError(error.IdentityNamespaceMismatch, db_mod.DB.restoreAuthenticatedReplicaToStagedGeneration(&staged, alloc, snapshot_path, staged.path(), options, wrong));
-    try db_mod.DB.restoreAuthenticatedReplicaToStagedGeneration(&staged, alloc, snapshot_path, staged.path(), options, namespace);
+    try std.testing.expectError(error.IdentityNamespaceMismatch, @import("../server_db_adapter.zig").restoreAuthenticatedReplicaToStagedGeneration(&staged, alloc, snapshot_path, staged.path(), options, wrong));
+    try @import("../server_db_adapter.zig").restoreAuthenticatedReplicaToStagedGeneration(&staged, alloc, snapshot_path, staged.path(), options, namespace);
     var staged_options = options;
     staged_options.staged_generation = &staged;
     var restored = try db_mod.DB.open(alloc, staged.path(), staged_options);

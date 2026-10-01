@@ -282,3 +282,17 @@ opaque routing-session handle: the server adapter owns and releases its actual
 catalog lease, while embedded integrity planning only uses the bound source. Portable seed validation consumes
 `system_catalog/portable_policy_contract.zig`, while server catalog projections
 and their Raft/metadata dependencies stay in `system_catalog/projection.zig`.
+
+## Server transaction ownership cleanup
+
+The structural prerequisite (#940) separates transaction participant dispatch
+and recovery fan-out into ELv2 `storage/server_transaction_*` owners. Their
+configuration and test fixtures are also server-owned. The Apache engine keeps
+local maintenance configuration, durable intent/receipt application, identity
+hooks, and an owned opaque runtime factory whose store adapter stays engine-owned.
+Local recovery needs no server participant resolver and retains failed work for
+a later bounded pass. Authenticated replica installation is a server adapter;
+identity-preserving staging, validation, and repair remain Apache local primitives.
+Raft and coordinator fixtures run in a dedicated server suite; authored engine
+sources no longer import their test adapter. See `local-db-source-separation.md`
+for lifecycle and test ownership details.

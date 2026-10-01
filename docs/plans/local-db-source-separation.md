@@ -112,6 +112,33 @@ route identity are portable contracts. Server catalog command envelopes stay
 with server coordination. Backup materialization stays with local storage;
 replica-catalog restore admission stays under server Raft storage.
 
+## Transaction and restore ownership
+
+`storage/server_transaction_dispatch.zig` owns participant identity validation,
+coordinator selection, and ordered transaction dispatch. Local schema validation
+and durable intent/receipt application remain in the storage engine.
+
+`storage/server_transaction_recovery.zig` owns participant fan-out, coordinator
+acknowledgements, and replicated metadata cleanup. Its server configuration is
+separate from the engine's local maintenance configuration. The engine accepts
+an optional factory that creates an owned opaque runtime, binds local intent
+resolution and identity hooks, forwards lifecycle operations, and releases the
+runtime before its borrowed store and contexts. The server snapshots its
+configuration during initialization; the factory context need only survive
+initialization, while callback contexts survive the DB. Local maintenance can
+run without a participant resolver, preserves distributed pending decisions,
+and retains failed local resolutions for a later bounded pass.
+
+The server restore adapter owns authenticated replica installation entry points.
+The DB exposes identity-preserving installation, namespace checks, staging,
+validation, and repair without importing the seed coordinator.
+
+Raft command and coordinator recovery fixtures live in
+`storage/server_db_integration_test.zig` and run in `antfly-server-db-test` and
+the normal unit aggregate. Their white-box hooks are available only in test
+builds. Local maintenance regressions remain owned by the storage engine shard;
+`antfly-local-transaction-recovery-test` provides a focused run.
+
 ## Remaining separation
 
 The physical DB and its complete local source closure must still move into

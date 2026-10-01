@@ -7911,6 +7911,10 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn transactionRecoveryConfig(self: *ProvisionedTableWriteSource) db_mod.transaction_runtime.Config {
+        return @import("../storage/server_transaction_recovery.zig").configFor(ProvisionedTableWriteSource, self, serverTransactionRecoveryConfig);
+    }
+
+    fn serverTransactionRecoveryConfig(self: *ProvisionedTableWriteSource) @import("../storage/server_transaction_recovery.zig").Config {
         const backend_runtime = self.backend_runtime orelse return .{};
         if (backend_runtime.io() == null or !self.isOpen()) return .{};
         const replicated = self.raft_batcher != null;
@@ -25312,6 +25316,10 @@ pub const HostedProvisionedTableWriteSource = struct {
     }
 
     fn transactionRecoveryConfig(self: *HostedProvisionedTableWriteSource) db_mod.transaction_runtime.Config {
+        return @import("../storage/server_transaction_recovery.zig").configFor(HostedProvisionedTableWriteSource, self, serverTransactionRecoveryConfig);
+    }
+
+    fn serverTransactionRecoveryConfig(self: *HostedProvisionedTableWriteSource) @import("../storage/server_transaction_recovery.zig").Config {
         const backend_runtime = self.backend_runtime orelse return .{};
         if (backend_runtime.io() == null) return .{};
         return .{
@@ -27735,13 +27743,13 @@ fn groupBatchRequest(group: GroupBatch, req: db_mod.types.BatchRequest) db_mod.t
 /// Apply one already-committed storage-owner command using only persisted local
 /// schema and the replicated envelope. Distributed routing and topology checks
 /// stay on the caller side of the compiled boundary.
-pub const applyStorageKernelReplicatedBatch = physical_local_write.applyStorageKernelReplicatedBatch;
+pub const applyStorageKernelReplicatedBatch = @import("../storage/server_transaction_dispatch.zig").applyStorageKernelReplicatedBatch;
 
 /// Apply one exact committed data-Raft entry inside the physical storage
 /// provider. The entry marker and mutation share the same backend commit.
 pub const applyStorageKernelReplicatedBatchAtRaftEntry = @import("../storage/server_db_adapter.zig").applyStorageKernelReplicatedBatchAtRaftEntry;
 
-const applyReplicatedTransactionMutation = physical_local_write.applyReplicatedTransactionMutation;
+const applyReplicatedTransactionMutation = @import("../storage/server_transaction_dispatch.zig").applyReplicatedTransactionMutation;
 
 fn applyReplicatedTransactionMutationWithCancellation(
     alloc: std.mem.Allocator,
@@ -27754,9 +27762,9 @@ fn applyReplicatedTransactionMutationWithCancellation(
     try applyReplicatedTransactionMutationInternal(alloc, db, table_name, group_id, req, visibility_cancellation, null);
 }
 
-const applyReplicatedTransactionMutationAtRaftEntry = physical_local_write.applyReplicatedTransactionMutationAtRaftEntry;
+const applyReplicatedTransactionMutationAtRaftEntry = @import("../storage/server_transaction_dispatch.zig").applyReplicatedTransactionMutationAtRaftEntry;
 
-const applyReplicatedTransactionMutationInternal = physical_local_write.applyReplicatedTransactionMutationInternal;
+const applyReplicatedTransactionMutationInternal = @import("../storage/server_transaction_dispatch.zig").applyReplicatedTransactionMutationInternal;
 
 const batchWritesAsTransactionWrites = physical_local_write.batchWritesAsTransactionWrites;
 
@@ -33608,7 +33616,7 @@ fn consumerTests() type {
             defer provisioned.deinit();
             var hosted = HostedProvisionedTableWriteSource.init("unused-recovery-clock", table_catalog.emptyCatalogSource(), undefined, undefined);
             hosted.backend_runtime = &runtime;
-            for ([_]db_mod.transaction_runtime.Config{ provisioned.transactionRecoveryConfig(), hosted.transactionRecoveryConfig() }) |config| {
+            for ([_]@import("../storage/server_transaction_recovery.zig").Config{ provisioned.serverTransactionRecoveryConfig(), hosted.serverTransactionRecoveryConfig() }) |config| {
                 vopr_io.realtime_ns = now_ns;
                 try std.testing.expect(config.enabled);
                 var backend = @import("../storage/mem_backend.zig").Backend.init(alloc, .{});
@@ -33620,12 +33628,12 @@ fn consumerTests() type {
                 const txn_id: transactions_mod.TxnId = .{7} ** 16;
                 try manager.initTransactionWithParticipantsCreatedAtAndRole(txn_id, now_ns, now_ns, &.{}, true);
 
-                const fresh = try db_mod.transaction_runtime.recoverOnce(alloc, &store, config);
+                const fresh = try @import("../storage/server_transaction_recovery.zig").recoverOnce(alloc, &store, config);
                 try std.testing.expectEqual(@as(u64, 0), fresh.auto_aborted);
                 try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try manager.getTransactionStatus(txn_id));
 
                 vopr_io.realtime_ns = now_ns + config.cutoff_ns + 1;
-                const expired = try db_mod.transaction_runtime.recoverOnce(alloc, &store, config);
+                const expired = try @import("../storage/server_transaction_recovery.zig").recoverOnce(alloc, &store, config);
                 try std.testing.expectEqual(@as(u64, 1), expired.auto_aborted);
                 try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, try manager.getTransactionStatus(txn_id));
             }
