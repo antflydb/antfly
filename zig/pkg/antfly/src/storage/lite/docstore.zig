@@ -30,6 +30,77 @@ const maintenance = @import("../maintenance.zig");
 const Allocator = std.mem.Allocator;
 const bounded_cursor_test_documents: usize = 512;
 
+test "lite reclamation vacuum preserves collector capacity with retained readers" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "vacuum-collector-capacity.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .assessment_bytes = 4096, .minimum_reclaim_bytes = 4096 } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    const large = try a.alloc(u8, 400 * 1024);
+    defer a.free(large);
+    @memset(large, 'v');
+    try store.putCatalogRecord("small", large);
+    try store.putCatalogRecord("small", "kept");
+    for (0..100) |_| {
+        if (!try store.file.retirementNeedsService()) break;
+        try store.maintainOnce(false);
+    }
+    var pinned = try store.beginRead();
+    var pin_active = true;
+    defer if (pin_active) pinned.abort();
+    const before = store.file.activeCheckpoint();
+    const before_handle = store.file.file.handle;
+    const size = (try store.file.file.stat(std.testing.io)).size;
+    const compact = (try store.file.liveStats(null)).compact_size;
+    store.maintenance_policy.options.max_storage_bytes = size + compact * 2;
+    const initial = try store.reclamationStatus();
+    try std.testing.expect(compact * 2 + initial.reusable_pages * 4096 >= try store.file.retirementReserveBytes());
+    try std.testing.expectError(error.LiteStorageBudgetExceeded, store.vacuum());
+    try std.testing.expectEqualDeep(before, store.file.activeCheckpoint());
+    try std.testing.expectEqual(before_handle, store.file.file.handle);
+    try store.putCatalogRecord("next", "value");
+    pinned.abort();
+    pin_active = false;
+    _ = try store.vacuum();
+    try store.putCatalogRecord("after", "still writable");
+    try std.testing.expect((try store.checkWithCancel(null)).valid);
+}
+
+test "lite reclamation vacuum rechecks disk headroom before adoption" {
+    const Probe = struct {
+        calls: usize = 0,
+        drop: bool = false,
+        fn available(context: *anyopaque, _: []const u8) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.calls += 1;
+            return if (self.drop and self.calls >= 2) 4095 else 1024 * 1024 * 1024;
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "vacuum-publication-disk.aflite");
+    defer a.free(path);
+    var probe = Probe{};
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .disk_headroom_bytes = 4096, .capacity_probe = .{ .context = &probe, .available = Probe.available } } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    try store.putCatalogRecord("key", "value");
+    const before = store.file.activeCheckpoint();
+    const handle = store.file.file.handle;
+    probe.calls = 0;
+    probe.drop = true;
+    try std.testing.expectError(error.LiteInsufficientDiskSpace, store.vacuum());
+    try std.testing.expectEqualDeep(before, store.file.activeCheckpoint());
+    try std.testing.expectEqual(handle, store.file.file.handle);
+    probe.drop = false;
+    _ = try store.vacuum();
+    try std.testing.expect((try store.checkWithCancel(null)).valid);
+}
+
 test "lite reclamation restore adoption rejects oversized generations" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -211,21 +282,22 @@ test "lite reclamation capacity reserve sustains bounded overwrites" {
     store.maintenance_cancel.request();
     var value: [8192]u8 = @splat('v');
     const key: [700]u8 = @splat('k');
-    var rejected: usize = 0;
     for (0..128) |version| {
         value[0] = @intCast(version);
         var accepted = false;
         for (0..256) |_| {
             var write = try store.beginWrite();
-            errdefer write.abort();
+            var write_active = true;
+            errdefer if (write_active) write.abort();
             try write.put(&key, &value);
             if (write.commit()) |_| {
+                write_active = false;
                 accepted = true;
                 break;
             } else |err| {
                 write.abort();
+                write_active = false;
                 if (err != error.LiteStorageBudgetExceeded) return err;
-                rejected += 1;
             }
             try std.testing.expect(try store.file.retirementNeedsService());
             try store.maintainOnce(false);
@@ -233,7 +305,7 @@ test "lite reclamation capacity reserve sustains bounded overwrites" {
         try std.testing.expect(accepted);
         try std.testing.expect((try store.file.file.stat(std.testing.io)).size <= limit);
     }
-    try std.testing.expect(rejected > 0);
+    try std.testing.expect((try store.file.allocatorStats()).?.reused_pages > 0);
     var read = try store.beginRead();
     defer read.abort();
     try std.testing.expectEqual(@as(u8, 127), (try read.get(&key))[0]);
@@ -969,7 +1041,7 @@ pub const Store = struct {
             self.mutex.unlock();
             if (@import("builtin").is_test) _ = self.test_maintenance_cycles.fetchAdd(1, .release);
             var failed = false;
-            self.maintainOnce(retry) catch |err| {
+            self.maintainOnceWithCancel(retry, &self.maintenance_cancel) catch |err| {
                 failed = true;
                 self.recordMaintenanceError(err);
             };
@@ -998,15 +1070,23 @@ pub const Store = struct {
     /// without a concurrency lane and deterministic qualification. Ordinary
     /// clients need no maintenance loop. `force` retries existing debt.
     pub fn maintainOnce(self: *Store, force: bool) !void {
+        return self.maintainOnceWithCancel(force, null);
+    }
+
+    fn maintainOnceWithCancel(self: *Store, force: bool, cancel: ?*const maintenance.CancelToken) !void {
         if (self.read_only) return;
         {
             lockStore(self);
             defer self.mutex.unlock();
             if (self.maintenance_running or self.generation_workspace_active or self.file.change_capture != null) return;
+            if (cancel) |token| try token.check();
+            const previous_cancel = self.file.allocator_cancel_token;
+            self.file.allocator_cancel_token = cancel;
+            defer self.file.allocator_cancel_token = previous_cancel;
             if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeUnknown;
             if (try self.file.retirementNeedsService()) {
                 try self.refreshAdmissionAssumeLocked();
-                _ = try self.file.reclaimPages(self.maintenance_policy.options.retirement_work_pages);
+                _ = try self.file.reclaimPagesWithCancel(self.maintenance_policy.options.retirement_work_pages, cancel);
                 self.maintenance_policy.status.state = if (self.maintenance_policy.options.enabled) .idle else .disabled;
                 self.maintenance_policy.status.reason = if (self.maintenance_policy.options.enabled) .none else .disabled;
                 self.maintenance_policy.status.last_error = null;
@@ -1017,7 +1097,7 @@ pub const Store = struct {
             lockStore(self);
             defer self.mutex.unlock();
             if (self.maintenance_running or self.generation_workspace_active or self.file.change_capture != null) return;
-            try self.maintenance_cancel.check();
+            if (cancel) |token| try token.check();
             const size = (try self.file.file.stat(self.file.runtime())).size;
             self.maintenance_policy.retirement_bytes = self.file.retirement_activity_bytes;
             if (!force and !self.maintenance_policy.due(size)) return;
@@ -1037,7 +1117,7 @@ pub const Store = struct {
         }
         var snapshot_open = true;
         defer if (snapshot_open) snapshot.close();
-        const stats = try snapshot.liveStats(&self.maintenance_cancel);
+        const stats = try snapshot.liveStats(cancel);
         const size = (try snapshot.file.stat(snapshot.runtime())).size;
         const rewrite = blk: {
             lockStore(self);
@@ -1057,6 +1137,11 @@ pub const Store = struct {
                 self.maintenance_policy.status.reason = .storage_budget;
                 break :blk false;
             }
+            self.admitEstimatedGenerationAssumeLocked(stats.compact_size, accounting.current_file_bytes) catch {
+                self.maintenance_policy.status.state = .deferred;
+                self.maintenance_policy.status.reason = .storage_budget;
+                break :blk false;
+            };
             if (try self.availableDiskBytes()) |available| {
                 self.maintenance_policy.status.available_disk_bytes = available;
                 if (available < workspace +| self.maintenance_policy.options.disk_headroom_bytes) {
@@ -1079,7 +1164,7 @@ pub const Store = struct {
         // lock before vacuum; the owner takes its own capture snapshot.
         snapshot.close();
         snapshot_open = false;
-        const report = try self.performVacuum(&self.maintenance_cancel, true);
+        const report = try self.performVacuum(cancel, true);
         lockStore(self);
         defer self.mutex.unlock();
         self.maintenance_policy.retirement_bytes = self.file.retirement_activity_bytes;
@@ -1222,7 +1307,8 @@ pub const Store = struct {
             self.file.change_capture = &capture;
             break :blk snapshot;
         };
-        defer source.close();
+        var source_open = true;
+        defer if (source_open) source.close();
         defer {
             lockStore(self);
             self.file.change_capture = null;
@@ -1245,6 +1331,7 @@ pub const Store = struct {
             const workspace = if (status.temporary_bytes != 0) status.temporary_bytes else @max(compact *| 2, self.maintenance_policy.options.assessment_bytes);
             const budget = self.maintenance_policy.options.max_storage_bytes;
             if (budget != 0 and status.current_file_bytes +| status.retired_file_bytes +| workspace > budget) return error.LiteStorageBudgetExceeded;
+            try self.admitEstimatedGenerationAssumeLocked(if (compact != 0) compact else self.maintenance_policy.status.compact_size_estimate orelse workspace / 2, status.current_file_bytes);
             if (try self.availableDiskBytes()) |available| {
                 self.maintenance_policy.status.available_disk_bytes = available;
                 if (available < workspace +| self.maintenance_policy.options.disk_headroom_bytes) return error.LiteInsufficientDiskSpace;
@@ -1254,6 +1341,10 @@ pub const Store = struct {
             if (budget != 0) source.vacuum_workspace_limit = workspace;
         }
         defer {
+            // The image defer closes its retired descriptor first. Release
+            // this additional old-inode descriptor before returning capacity.
+            source.close();
+            source_open = false;
             lockStore(self);
             self.maintenance_policy.status.temporary_bytes = 0;
             self.admission_refresh_size = 0;
@@ -1262,6 +1353,17 @@ pub const Store = struct {
         var image = try source.prepareVacuum(cancel);
         defer image.deinit();
         image.prepared.no_sync = true;
+        image.prepared.allocator_cancel_token = cancel;
+        const initial_sequence = blk: {
+            lockStore(self);
+            defer self.mutex.unlock();
+            break :blk self.file.activeCheckpoint().commit_sequence + 1;
+        };
+        image.prepared.private_retirement_epoch = 0;
+        try image.prepared.preparePublicationSequence(initial_sequence);
+        // Catch-up, including the final fenced residual, only journals its
+        // metadata. The adopted owner services any new checkpoint debt later.
+        image.prepared.incremental_checkpoints = true;
         // Every mutation -- transaction commits and the disk index's
         // out-of-band catalog publications alike -- is applied through the
         // group-commit queue under the store mutex, so that mutex is the one
@@ -1289,8 +1391,6 @@ pub const Store = struct {
         for (0..max_rounds) |round| {
             if (cancel) |token| try token.check();
             const final_round = round + 1 == max_rounds;
-            // Flush the large copy/catch-up outside foreground locks. Only
-            // the final header and rename remain in the publication window.
             if (!self.file.no_sync) try image.prepared.file.sync(io);
             const reserved = blk: {
                 self.reserveWriterSlot() catch |err| switch (err) {
@@ -1318,11 +1418,19 @@ pub const Store = struct {
                     image.report.before_size = (try self.file.file.stat(io)).size;
                     image.report.reclaimed_bytes = image.report.before_size -| image.report.after_size;
                     image.prepared.no_sync = self.file.no_sync;
-                    try image.prepared.preparePublicationSequence(self.file.activeCheckpoint().commit_sequence + 1);
+                    try image.prepared.finishPublicationSequence(self.file.activeCheckpoint().commit_sequence + 1, image.prepared.activeCheckpoint());
                     image.report.after_size = (try image.prepared.file.stat(io)).size;
                     image.report.reclaimed_bytes = image.report.before_size -| image.report.after_size;
+                    try self.admitPreparedGenerationAssumeLocked(&image.prepared, image.report.before_size);
                     const old_handle = self.file.file.handle;
-                    defer if (self.file.file.handle != old_handle) self.retireReadGeneration(image.report.before_size);
+                    const retained_old = if (self.read_generation) |generation| generation.references != 0 else false;
+                    defer if (self.file.file.handle != old_handle) {
+                        self.retireReadGeneration(image.report.before_size);
+                        // After rename the live file is the prepared image.
+                        // Charge the old descriptors until their cleanup runs;
+                        // retained read generations already account for them.
+                        self.maintenance_policy.status.temporary_bytes = if (retained_old) 0 else image.report.before_size;
+                    };
                     try self.file.publishVacuum(&image);
                     return image.report;
                 }
@@ -1462,18 +1570,7 @@ pub const Store = struct {
         if (self.secret_store_uncertain or self.file.checkpoint_publication_uncertain) return error.OutcomeUnknown;
         if (try self.file.hasSecretState()) return error.LiteImportTargetNotEmpty;
         const old_bytes = (try self.file.file.stat(io)).size;
-        const prepared_bytes = (try prepared.file.file.stat(prepared.file.runtime())).size;
-        const options = self.maintenance_policy.options;
-        const reserve = try prepared.file.retirementReserveBytes();
-        const reusable = if (try prepared.file.allocatorStats()) |stats| stats.reusable_pages *| prepared.file.header.page_size else 0;
-        if (options.max_storage_bytes != 0 and old_bytes +| self.retired_file_bytes +| prepared_bytes > options.max_storage_bytes) return error.LiteStorageBudgetExceeded;
-        // A generation that consumes its own collector reserve would strand
-        // its new owner at the cap immediately after adoption.
-        if (options.max_storage_bytes != 0) {
-            const remaining = options.max_storage_bytes -| old_bytes -| self.retired_file_bytes -| prepared_bytes;
-            if (remaining +| reusable < reserve) return error.LiteStorageBudgetExceeded;
-        }
-        if (try self.availableDiskBytes()) |available| if (available < options.disk_headroom_bytes +| (reserve -| reusable)) return error.LiteInsufficientDiskSpace;
+        try self.admitPreparedGenerationAssumeLocked(&prepared.file, old_bytes);
         const old_handle = self.file.file.handle;
         defer if (self.file.file.handle != old_handle) {
             self.retireReadGeneration(old_bytes);
@@ -1481,6 +1578,33 @@ pub const Store = struct {
             self.maintenance_policy.assessed_retirement_bytes = self.file.retirement_activity_bytes;
         };
         return try self.file.replaceWithPreparedGeneration(&prepared.file);
+    }
+
+    /// Refuse a predictably inadmissible rewrite before allocating/copying its
+    /// image. Final admission still checks actual catch-up bytes and queue debt.
+    fn admitEstimatedGenerationAssumeLocked(self: *Store, compact_bytes: u64, old_bytes: u64) !void {
+        const budget = self.maintenance_policy.options.max_storage_bytes;
+        if (budget == 0) return;
+        const retained_old = if (self.read_generation) |generation| (if (generation.references != 0) old_bytes else 0) else 0;
+        if (retained_old +| self.retired_file_bytes +| compact_bytes +| self.file.estimatedGenerationReserveBytes(compact_bytes) > budget) return error.LiteStorageBudgetExceeded;
+    }
+
+    /// Shared final adoption admission. Prepared bytes replace the workspace
+    /// reservation; the old inode remains charged while its readers are pinned.
+    fn admitPreparedGenerationAssumeLocked(self: *Store, prepared: *native.NativeFile, old_bytes: u64) !void {
+        const prepared_bytes = (try prepared.file.stat(prepared.runtime())).size;
+        const options = self.maintenance_policy.options;
+        const reserve = try prepared.retirementReserveBytes();
+        const reusable = if (try prepared.allocatorStats()) |stats| stats.reusable_pages *| prepared.header.page_size else 0;
+        const total = old_bytes +| self.retired_file_bytes +| prepared_bytes;
+        const retained_old = if (self.read_generation) |generation| (if (generation.references != 0) old_bytes else 0) else 0;
+        const adopted_total = retained_old +| self.retired_file_bytes +| prepared_bytes;
+        if (options.max_storage_bytes != 0) {
+            if (total > options.max_storage_bytes or options.max_storage_bytes -| adopted_total +| reusable < reserve) return error.LiteStorageBudgetExceeded;
+        }
+        if (try self.availableDiskBytes()) |available| {
+            if (available < options.disk_headroom_bytes +| (reserve -| reusable)) return error.LiteInsufficientDiskSpace;
+        }
     }
 
     /// Synchronous group commit. Callbacks run in queue order under the store

@@ -30,6 +30,131 @@ pub const allocator_v4 = @import("allocator_v4.zig");
 
 const Allocator = std.mem.Allocator;
 
+test "lite allocator v4 small checkpoints bound counter and queue boundary growth" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "small-checkpoint-boundaries.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer file.close();
+    file.reserve_retirement_capacity = true;
+    var pages = try file.pageAllocatorFromFreeMap(file.activeCheckpoint());
+    defer pages.deinit();
+    const counter_entries = (file.maxPagePayloadBytes() - 24) / 4;
+    const queue_entries = (file.maxPagePayloadBytes() - 16) / 48;
+    const first = pages.next_page_id;
+    while (pages.next_page_id < counter_entries - 2) {
+        const page = try pages.allocate();
+        try pages.writePage(page, .data, "raw block");
+    }
+    for (0..queue_entries - 1) |i| try pages.ledger.?.retire(.{ .epoch = file.publicationEpoch(), .page = first + i, .kind = .page });
+    var checkpoint = file.activeCheckpoint();
+    checkpoint.commit_sequence += 1;
+    checkpoint.free_map_root_page = try pages.allocate();
+    try file.advanceAllocatorCheckpoint(&pages, 1);
+    try std.testing.expect(pages.ledger.?.force_checkpoint);
+    try pages.flush();
+    const writes = file.test_page_writes.load(.monotonic);
+    try file.persistAllocator(&pages, &checkpoint);
+    try std.testing.expect(file.test_page_writes.load(.monotonic) - writes <= 5);
+    try std.testing.expectEqual(@as(u64, 0), pages.ledger.?.root.deltas);
+    try std.testing.expectEqual(@as(u64, 0), pages.ledger.?.root.build_limit);
+    try file.publishCheckpoint(checkpoint);
+    file.invalidateLedger();
+    try std.testing.expect((try file.check()).valid);
+}
+
+test "lite allocator v4 owner checkpoints bound metadata work across reopen and cancellation" {
+    const CancelWrite = struct {
+        var token: ?*maintenance.CancelToken = null;
+        fn write(userdata: ?*anyopaque, file: std.Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) std.Io.File.WritePositionalError!usize {
+            const written = try std.testing.io.vtable.fileWritePositional(userdata, file, header, data, splat, offset);
+            if (token) |cancel| cancel.request();
+            return written;
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "incremental-owner-checkpoint.aflite");
+    defer a.free(path);
+    {
+        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+        defer file.close();
+        file.reserve_retirement_capacity = true;
+        var pages = try file.pageAllocatorFromFreeMap(file.activeCheckpoint());
+        defer pages.deinit();
+        for (0..20_000) |_| {
+            const page = try pages.allocate();
+            try pages.writePage(page, .data, "raw block");
+        }
+        var checkpoint = file.activeCheckpoint();
+        checkpoint.commit_sequence += 1;
+        checkpoint.free_map_root_page = try pages.allocate();
+        try file.persistAllocator(&pages, &checkpoint);
+        try file.publishCheckpoint(checkpoint);
+        const writes = file.test_page_writes.load(.monotonic);
+        _ = try file.reclaimPages(1);
+        try std.testing.expect(file.ledger.?.root.build_limit != 0);
+        // One counter chunk plus bounded service/journal publication, regardless
+        // of the twenty-page counter table that remains to be snapshotted.
+        try std.testing.expect(file.test_page_writes.load(.monotonic) - writes < 16);
+    }
+    var vtable = std.testing.io.vtable.*;
+    vtable.fileWritePositional = CancelWrite.write;
+    const io = std.Io{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    var file = try NativeFile.openWithIo(a, io, path, .{ .no_sync = true });
+    defer file.close();
+    file.reserve_retirement_capacity = true;
+    const before = file.activeCheckpoint();
+    const bytes = (try file.file.stat(std.testing.io)).size;
+    var cancel = maintenance.CancelToken{};
+    cancel.request();
+    try std.testing.expectError(error.MaintenanceCanceled, file.reclaimPagesWithCancel(1, &cancel));
+    try std.testing.expectEqualDeep(before, file.activeCheckpoint());
+    try std.testing.expectEqual(bytes, (try file.file.stat(std.testing.io)).size);
+    cancel.requested.store(false, .release);
+    CancelWrite.token = &cancel;
+    defer CancelWrite.token = null;
+    try std.testing.expectError(error.MaintenanceCanceled, file.reclaimPagesWithCancel(1, &cancel));
+    CancelWrite.token = null;
+    try std.testing.expectEqualDeep(before, file.activeCheckpoint());
+    try std.testing.expectEqual(bytes, (try file.file.stat(io)).size);
+    try std.testing.expect(!file.checkpoint_publication_uncertain);
+    cancel.requested.store(false, .release);
+    file.invalidateLedger();
+    const reads = file.test_page_reads.load(.monotonic);
+    file.test_cancel_on_read = &cancel;
+    defer file.test_cancel_on_read = null;
+    try std.testing.expectError(error.MaintenanceCanceled, file.reclaimPagesWithCancel(1, &cancel));
+    file.test_cancel_on_read = null;
+    try std.testing.expect(file.test_page_reads.load(.monotonic) - reads <= 2);
+    try std.testing.expectEqualDeep(before, file.activeCheckpoint());
+    cancel.requested.store(false, .release);
+    const remaining = (try file.loadLedger(before)).root.build_end;
+    try file.putDocumentBatch(&.{.{ .key = "live", .value = "concurrent change" }});
+    try std.testing.expectEqual(@max(@as(u64, 1), remaining -| (2 * ((file.maxPagePayloadBytes() - 24) / 4))), file.ledger.?.root.build_end);
+    var batches: usize = 0;
+    while (try file.retirementNeedsService()) : (batches += 1) {
+        try std.testing.expect(batches < 500);
+        _ = try file.reclaimPagesWithCancel(1, &cancel);
+    }
+    try std.testing.expect(batches > 16);
+    try std.testing.expect((try file.check()).valid);
+    const value = (try file.getDocumentAlloc(a, "live")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("concurrent change", value);
+    // Private catch-up may have a sequence newer than the live generation.
+    // Normalization must finish an active builder and persist rebased events.
+    file.ledger.?.force_checkpoint = true;
+    _ = try file.reclaimPages(1);
+    try std.testing.expect(file.ledger.?.root.build_limit != 0);
+    try file.preparePublicationSequence(1);
+    file.invalidateLedger();
+    try std.testing.expect((try file.check()).valid);
+}
+
 /// Per-operation admission for newly written external payload pages. Catalog
 /// records and tree navigation pages remain eligible for caching. Bypassing
 /// admission still invalidates both cached bytes and links for reused page IDs.
@@ -2365,6 +2490,9 @@ pub const NativeFile = struct {
     minimum_reader_sequence: ?u64 = null,
     secondary_page_cache: ?*PageCache = null,
     retirement_work_pages: usize = 128,
+    allocator_cancel_token: ?*const maintenance.CancelToken = null,
+    private_retirement_epoch: ?u64 = null,
+    incremental_checkpoints: bool = false,
     page_cache_enabled: std.atomic.Value(bool) = .init(true),
     /// Maintenance readers and private images retain navigation pages only.
     page_cache_policy: enum { normal, metadata_only } = .normal,
@@ -2653,7 +2781,7 @@ pub const NativeFile = struct {
     }
 
     fn loadLedger(self: *NativeFile, checkpoint: CheckpointSlot) !*allocator_v4.State {
-        return self.loadLedgerWithCancel(checkpoint, null);
+        return self.loadLedgerWithCancel(checkpoint, self.allocator_cancel_token);
     }
     fn loadLedgerWithCancel(self: *NativeFile, checkpoint: CheckpointSlot, cancel: ?*const maintenance.CancelToken) !*allocator_v4.State {
         if (cancel) |token| try token.check();
@@ -2827,7 +2955,8 @@ pub const NativeFile = struct {
                         try self.indexedMark(&graph, checkpoint, page);
                         if (state.count(page) != 0 or page == state.root_page or metadata_retirements.contains(page) or current_metadata.contains(page)) return error.InvalidNativeAllocator;
                         try metadata_retirements.put(self.allocator, page, {});
-                        page = try self.retiredAllocatorNext(page, checkpoint);
+                        const next = try self.retiredAllocatorNext(page, checkpoint);
+                        page = if (next == item.length) 0 else next;
                     }
                 },
                 .metadata => {
@@ -2928,6 +3057,7 @@ pub const NativeFile = struct {
     }
 
     fn publicationEpoch(self: *NativeFile) u64 {
+        if (self.private_retirement_epoch) |epoch| return epoch;
         const header = self.transaction_header orelse self.header;
         return header.checkpoints[header.active_checkpoint].commit_sequence + 1;
     }
@@ -2965,6 +3095,7 @@ pub const NativeFile = struct {
         // physical reuse promotion with the maximum key fanout of data work.
         const promotions = @max(@as(usize, 8), budget *| (self.maxPagePayloadBytes() / 18 + 2));
         for (0..promotions) |_| {
+            if (self.allocator_cancel_token) |token| try token.check();
             const root = state.metadata_heap.peek() orelse break;
             if (root.epoch > metadata_frontier) break;
             if (root.page == 0 or root.page >= checkpoint.page_count) return error.InvalidNativeAllocator;
@@ -2975,16 +3106,19 @@ pub const NativeFile = struct {
         // creates. Scale cleanup with data work and keep an eight-page minimum
         // so even a one-object budget drains its publication overhead.
         for (0..@max(@as(usize, 8), budget)) |_| {
+            if (self.allocator_cancel_token) |token| try token.check();
             const item = state.chains_heap.peek() orelse break;
             if (item.epoch > metadata_frontier) break;
             if (state.pending.count() + 8 >= state.pending_limit + allocator_v4.collector_reserve) break;
-            const next_page = try self.retiredAllocatorNext(item.page, checkpoint);
+            const linked_page = try self.retiredAllocatorNext(item.page, checkpoint);
+            const next_page = if (linked_page == item.length) 0 else linked_page;
             try state.complete(item);
             try state.retireCollected(.{ .epoch = self.publicationEpoch(), .page = item.page, .kind = .metadata });
-            if (next_page != 0) try state.retireCollected(.{ .epoch = item.epoch, .page = next_page, .kind = .allocator_chain });
+            if (next_page != 0) try state.retireCollected(.{ .epoch = item.epoch, .page = next_page, .length = item.length, .kind = .allocator_chain });
         }
         var done: usize = 0;
         while (done < budget) : (done += 1) {
+            if (self.allocator_cancel_token) |token| try token.check();
             const item = state.heap.peek() orelse break;
             if (item.epoch > frontier) break;
             // A single node can discover value children or release many typed
@@ -3095,14 +3229,25 @@ pub const NativeFile = struct {
         var orphaned = pages.pending_values.iterator();
         while (orphaned.next()) |entry| try state.retire(.{ .epoch = self.publicationEpoch(), .page = entry.key_ptr.*, .length = entry.value_ptr.*, .kind = .value });
         pages.pending_values.clearRetainingCapacity();
+        // Writers contribute bounded metadata work too, so a busy owner does
+        // not depend on scheduling to compact journals before reaching quota.
+        // Small tables finish in one bounded publication; large builders advance
+        // at most two pages. Explicit service and private normalization supply
+        // their own checkpoint budget.
+        if (state.incremental and state.root.snapshot != 0 and self.retirement_work_pages != 0 and self.private_retirement_epoch == null) {
+            if (state.checkpointDue() or self.budgetedCheckpointDue(state)) {
+                try self.advanceAllocatorCheckpoint(pages, 2);
+            }
+        }
         try state.preparePersist(self.publicationEpoch(), self.maxPagePayloadBytes());
         // Consume free bits before emitting the journal/snapshot. Otherwise the
         // next open could allocate one of the allocator's own metadata pages.
         while (pages.metadata_reserve.items.len < state.pagesRequired(self.maxPagePayloadBytes())) {
+            if (self.allocator_cancel_token) |token| try token.check();
             try pages.metadata_reserve.append(self.allocator, try pages.allocate());
         }
         try pages.flush();
-        try state.persist(.{ .context = pages, .allocate = PageAllocator.takeMetadataPage, .read = PageAllocator.readLedgerPage, .write = PageAllocator.writeLedgerPage, .payload_bytes = self.maxPagePayloadBytes() }, checkpoint.free_map_root_page, &pages.next_page_id);
+        try state.persist(.{ .context = pages, .allocate = PageAllocator.takeMetadataPage, .read = PageAllocator.readLedgerPage, .write = PageAllocator.writeLedgerPage, .payload_bytes = self.maxPagePayloadBytes(), .cancel_requested = if (self.allocator_cancel_token) |token| &token.requested else null }, checkpoint.free_map_root_page, &pages.next_page_id);
         if (pages.metadata_cursor != pages.metadata_reserve.items.len) return error.InvalidNativeAllocator;
         checkpoint.page_count = pages.next_page_id;
         pages.ledger_persisted = true;
@@ -3119,6 +3264,12 @@ pub const NativeFile = struct {
         if (!self.header.indexed_reclamation) return 0;
         const state = try self.loadLedger(self.activeCheckpoint());
         return allocator_v4.retirementReservePages(self.maxPagePayloadBytes(), state.counts.items.len, state.pending.count()) *| self.header.page_size;
+    }
+
+    pub fn estimatedGenerationReserveBytes(self: *const NativeFile, compact_bytes: u64) u64 {
+        if (!(self.vacuum_target_indexed or self.header.indexed_reclamation)) return 0;
+        const covered = std.math.divCeil(u64, compact_bytes, self.header.page_size) catch return std.math.maxInt(u64);
+        return allocator_v4.retirementReservePages(self.maxPagePayloadBytes(), covered, 0) *| self.header.page_size;
     }
 
     /// Creation is admitted before opening/truncating/renaming any artifact.
@@ -3144,7 +3295,7 @@ pub const NativeFile = struct {
     pub fn retirementNeedsService(self: *NativeFile) !bool {
         if (!self.header.indexed_reclamation or self.read_only) return false;
         const state = try self.loadLedger(self.activeCheckpoint());
-        if (self.retirementCheckpointUnderPressure(state)) return true;
+        if (state.checkpointDue() or self.budgetedCheckpointDue(state)) return true;
         const excess_promotions = state.metadata_heap.count() > 2;
         if (state.data_pending == 0 and state.chains_heap.count() == 0 and !excess_promotions) return false;
         if (excess_promotions) {
@@ -3161,31 +3312,56 @@ pub const NativeFile = struct {
         return item.epoch <= self.reuseFrontier() or (self.minimum_reader_sequence == null and self.durable_header == null);
     }
 
-    fn retirementCheckpointUnderPressure(self: *NativeFile, state: *allocator_v4.State) bool {
+    fn budgetedCheckpointDue(self: *NativeFile, state: *allocator_v4.State) bool {
         if (!self.reserve_retirement_capacity) return false;
-        const limit = self.max_file_bytes orelse return false;
-        const available = (limit / self.header.page_size -| self.activeCheckpoint().page_count) +| state.free_pages;
-        const reserve = allocator_v4.retirementReservePages(self.maxPagePayloadBytes(), state.counts.items.len, state.pending.count());
-        // Sparse journals must also checkpoint below the byte budget, rather
-        // than requiring the ordinary 256 KiB threshold to fit in a small file.
-        // Demand a net saving so pressure cannot cause a checkpoint-per-batch
-        // loop that creates metadata faster than retirement can release it.
+        _ = self.max_file_bytes orelse return false;
+        // Budgeted owners compact profitable sparse journals proactively. A
+        // write may need substantially more than collector reserve; waiting
+        // until reserve itself is threatened can leave a rejected large write
+        // with no eligible data debt and no maintenance work to free capacity.
+        // Require twice the snapshot size to amortize construction/publication
+        // and avoid a checkpoint-per-service loop.
         const snapshot_bytes = allocator_v4.snapshotPages(self.maxPagePayloadBytes(), state.counts.items.len, state.pending.count()) *| self.maxPagePayloadBytes();
-        return available < reserve +| allocator_v4.serviceJournalPages(self.maxPagePayloadBytes(), 1) and
-            state.root.delta_bytes >= 2 *| snapshot_bytes;
+        return state.root.delta_bytes >= 2 *| snapshot_bytes;
+    }
+
+    fn advanceAllocatorCheckpoint(self: *NativeFile, pages: *PageAllocator, budget: usize) !void {
+        const state = pages.ledger.?;
+        if (state.root.build_limit == 0 and allocator_v4.snapshotPages(self.maxPagePayloadBytes(), state.counts.items.len, state.pending.count()) <= 3) {
+            // Root/old-chain retirement can add a queue page and reserving
+            // metadata can add a counter page. preparePersist caps this fast
+            // path at four snapshot pages after those events have been added.
+            state.force_checkpoint = true;
+            return;
+        }
+        for (0..budget) |_| {
+            const page = try pages.allocate();
+            try state.checkpointStep(.{ .context = pages, .allocate = PageAllocator.takeMetadataPage, .read = PageAllocator.readLedgerPage, .write = PageAllocator.writeLedgerPage, .payload_bytes = self.maxPagePayloadBytes(), .cancel_requested = if (self.allocator_cancel_token) |token| &token.requested else null }, page, self.publicationEpoch());
+            if (state.root.build_limit == 0) break;
+        }
     }
 
     /// Services idle retirement and advances recovery slots independently of
     /// file shrinking. The owner serializes this with mutations and snapshots.
     pub fn reclaimPages(self: *NativeFile, budget: usize) !usize {
+        return self.reclaimPagesWithCancel(budget, null);
+    }
+
+    pub fn reclaimPagesWithCancel(self: *NativeFile, budget: usize, cancel: ?*const maintenance.CancelToken) !usize {
         if (!self.header.indexed_reclamation or self.read_only) return 0;
+        if (cancel) |token| try token.check();
+        const previous_cancel = self.allocator_cancel_token;
+        self.allocator_cancel_token = cancel;
+        defer self.allocator_cancel_token = previous_cancel;
+        try self.beginTransaction();
+        errdefer self.abortTransaction();
         const before = self.activeCheckpoint();
         const previous_budget = self.retirement_work_pages;
         self.retirement_work_pages = 0;
         defer self.retirement_work_pages = previous_budget;
         var pages = try self.pageAllocatorFromFreeMap(before);
         defer pages.deinit();
-        if (self.retirementCheckpointUnderPressure(pages.ledger.?)) pages.ledger.?.force_checkpoint = true;
+        if (self.budgetedCheckpointDue(pages.ledger.?)) pages.ledger.?.force_checkpoint = true;
         var work = budget;
         if (self.max_file_bytes) |limit| {
             const available = (limit / self.header.page_size -| pages.next_page_id) +|
@@ -3196,6 +3372,12 @@ pub const NativeFile = struct {
             while (work > 1 and allocator_v4.serviceJournalPages(self.maxPagePayloadBytes(), work) +| advances > available) work = work / 2 + work % 2;
         }
         const count = try self.drainRetirement(pages.ledger.?, before, work);
+        const state = pages.ledger.?;
+        if (state.checkpointDue()) {
+            // Bound metadata construction independently of the physical ledger
+            // size. Each service publication makes its partial chains durable.
+            try self.advanceAllocatorCheckpoint(&pages, @max(@as(usize, 1), @min(work, 16)));
+        }
         const previous_maintenance = self.maintenance_publication;
         self.maintenance_publication = true;
         defer self.maintenance_publication = previous_maintenance;
@@ -3205,6 +3387,10 @@ pub const NativeFile = struct {
         try self.persistAllocator(&pages, &next);
         try self.syncIfRequired();
         try self.publishCheckpoint(next);
+        if (cancel) |token| try token.check();
+        // No cancellation checks after checkpoint publication begins: preserve
+        // the usual uncertain-outcome fencing across the durability boundary.
+        try self.commitTransaction();
         return count;
     }
 
@@ -5637,11 +5823,28 @@ pub const NativeFile = struct {
             defer self.retirement_work_pages = old_budget;
             var pages = try self.pageAllocatorFromFreeMap(checkpoint);
             defer pages.deinit();
-            try pages.ledger.?.rebaseEpochs(sequence);
+            // Private-image normalization may resume an interrupted owner
+            // checkpoint. Complete that builder before replacing its baseline.
+            while (pages.ledger.?.root.build_limit != 0) {
+                const page = try pages.allocate();
+                try pages.ledger.?.checkpointStep(.{ .context = &pages, .allocate = PageAllocator.takeMetadataPage, .read = PageAllocator.readLedgerPage, .write = PageAllocator.writeLedgerPage, .payload_bytes = self.maxPagePayloadBytes(), .cancel_requested = if (self.allocator_cancel_token) |token| &token.requested else null }, page, self.publicationEpoch());
+            }
+            // Epoch rebasing changes existing events rather than appending
+            // new IDs, so this private boundary must serialize the full queue.
+            pages.ledger.?.incremental = false;
+            try pages.ledger.?.rebaseEpochs(sequence, if (self.allocator_cancel_token) |token| &token.requested else null);
             self.header.checkpoints[self.header.active_checkpoint].commit_sequence = sequence -| 1;
             checkpoint.free_map_root_page = try pages.allocate();
             try self.persistAllocator(&pages, &checkpoint);
         }
+        try self.finishPublicationSequence(sequence, checkpoint);
+    }
+
+    /// Private generations normalize retirement once before catch-up. Later
+    /// changes retire at epoch zero, so final sequence publication needs only
+    /// the two header slots and never another ownership-table snapshot.
+    pub fn finishPublicationSequence(self: *NativeFile, sequence: u64, selected: CheckpointSlot) !void {
+        var checkpoint = selected;
         checkpoint.commit_sequence = sequence;
         // Catch-up can replay keys from failed/no-op foreground mutations, so
         // its private sequence may exceed the live store's publication sequence.
@@ -5828,6 +6031,7 @@ pub const NativeFile = struct {
             // One-time graph bootstrap belongs to migration/shrinking, never a
             // normal commit. Ownership follows immutable DAG edges and records.
             var writer = NativeFile{ .allocator = self.allocator, .io_impl = undefined, .borrowed_io = io, .path = @constCast(""), .file = compact_file, .header = compact_header, .page_cache_enabled = .init(false), .max_file_bytes = self.vacuum_workspace_limit };
+            writer.allocator_cancel_token = cancel;
             const state = try self.allocator.create(allocator_v4.State);
             state.* = allocator_v4.State.init(self.allocator);
             writer.ledger = state;
@@ -6546,9 +6750,10 @@ pub const NativeFile = struct {
         if (self.header.indexed_reclamation) {
             if (self.checkpoint_publication_uncertain) return error.OutcomeUnknown;
             const state = try self.loadLedger(checkpoint);
+            state.incremental = self.reserve_retirement_capacity or self.incremental_checkpoints;
             errdefer self.invalidateLedger();
             if (!self.free_pages_verified and checkpoint.free_map_root_page != 0) {
-                _ = try self.validateIndexedAllocator(checkpoint, state, null);
+                _ = try self.validateIndexedAllocator(checkpoint, state, self.allocator_cancel_token);
                 self.free_pages_verified = true;
             }
             const lock = acquireDataRewriteLock(self.runtimeIo(), self.path) catch |err| switch (err) {

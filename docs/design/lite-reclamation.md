@@ -98,9 +98,11 @@ reserve includes its own counter pages at a fixed point. It uses scalar ledger
 sizes without scanning free pages or value graphs, and scales with physical page
 count and pending queue size. Maintenance may use the reserve. Near the hard
 limit, service reduces its data batch geometrically before touching the ledger;
-normal batches remain available when capacity permits. Sparse journals checkpoint
-early under capacity pressure only when the old journal is at least twice the
-new snapshot size, ensuring a net metadata reduction. Creation checks the format
+normal batches remain available when capacity permits. Budgeted owners checkpoint
+sparse journals proactively once the old journal is at least twice the new
+snapshot size, amortizing metadata construction. Waiting until collector reserve
+is threatened can strand a larger write after data debt has already drained.
+Creation checks the format
 footprint and reserve against the budget and disk headroom before touching an
 existing artifact; an undersized limit fails with `LiteStorageBudgetExceeded`.
 Portable restore reserves an exclusive generation workspace before creating its
@@ -177,8 +179,11 @@ The owner services idle debt and advances fallback checkpoints even when
 ## Durable allocator encoding
 
 The checkpoint's allocator root is a checksummed `free_map` page containing
-`AFL4ALOC`, version 1, and snapshot, pending-queue, and delta-log roots, next event
-ID, covered physical page count, and accumulated delta bytes. Child pages have the
+`AFL4ALOC`, version 2, and snapshot, pending-queue, and delta-log roots, next event
+ID, covered physical page count, accumulated delta bytes, an exclusive journal
+stop pointer, and durable partial-checkpoint roots/cursors. Version-1 roots are
+accepted and advance to version 2 at the next publication. Older prototypes
+reject version-2 roots before modifying the file. Child pages have the
 separate `allocator` page kind. Integers are little endian.
 
 - `L4SS`: counter snapshot chunks, first physical page and packed 32-bit counts.
@@ -193,7 +198,26 @@ A counter is an ownership count, zero for reserved allocator metadata, or
 `0x80000000` for a reusable page. Counter changes and queue deltas append per
 publication. Once physical delta-page payload capacity reaches the larger of
 256 KiB or twice the counter and queue snapshot size (including unused space in
-a commit page), the next publication checkpoints only allocator metadata.
+a commit page), owner maintenance starts an incremental metadata checkpoint.
+Foreground commits continue appending journals and contribute either a complete
+small snapshot or at most two builder pages, so busy writers make progress
+independently of worker scheduling. Small counter/queue pairs finish in one
+publication, avoiding an extra recovery
+generation under a tight budget. This fast path reserves margin for retiring old
+metadata and allocating its replacement; the complete snapshot is capped at
+four pages. It never runs with an active incremental builder.
+For larger tables, a service batch constructs at
+most `min(retirement_work_pages, 16)` snapshot pages (with a one-page minimum),
+then publishes its partial roots and releases the owner mutex. Counter chunks
+sample the current table; journal entries after the builder's start override
+those samples. Pending snapshots include only pre-start IDs, with identical
+additions and already-completed IDs reconciled idempotently during version-2
+replay. Stable ID links allow queue traversal while other batches remove items.
+Reopen restores the builder and resumes it. Completion swaps the snapshot roots
+and excludes the pre-start journal using its stop pointer; no full-table copy or
+walk occurs at that boundary. The stop page remains reserved until the next
+checkpoint so recycling its ID cannot make replay terminate at a new page. Private generation construction may still write a
+full checkpoint outside the live owner mutex.
 Previous metadata snapshots retire as at most three chain-head events. Service
 reads and retires one chain page per work unit, rather than enqueueing an entire
 snapshot. Metadata roots and chains have separate queues. Their visibility fence
@@ -222,7 +246,8 @@ It is not a constant-memory allocator for arbitrarily large files. At very large
 capacities, paged counter caching or a sparse representation would require a
 separate measured implementation; no such capability is implied by this version.
 Metadata checkpoint work is amortized across accumulated changes; an individual
-checkpoint can still perform work proportional to allocator metadata size.
+checkpoint is proportional to allocator metadata size in total, but owner
+construction and publication are divided into bounded maintenance batches.
 
 ## Checkpoint, reader, and crash safety
 
@@ -318,3 +343,23 @@ long-key pages, and the fixed point of allocator root and counter snapshot pages
 Revision 4 omits the legacy namespace directory. Graph audits and vacuum ownership
 bootstrap check cancellation per value object and throughout counter/queue replay
 and validation, so a single large value cannot defer owner shutdown indefinitely.
+
+Shrinking and restore share final adoption admission. The prepared image replaces
+the workspace reservation in aggregate physical accounting; collector capacity
+is checked against the post-adoption generation plus retained old
+inodes. Both paths recheck disk headroom before rename. A scalar reserve forecast rejects
+predictably unaffordable shrinking before image allocation/copy; final admission
+checks the actual image and catch-up debt. Rejecting a rewrite preserves the live
+inode and its reusable pages. After adoption, temporary accounting switches to
+the old descriptors until cleanup closes them, unless retained read generations
+already account for that inode. Private vacuum retirement is
+normalized before catch-up, outside the owner mutex; catch-up retires at epoch
+zero and final sequence publication writes only the header slots.
+
+Worker cancellation reaches allocator reservation, counter/queue construction,
+and journal emission. Each check occurs before checkpoint publication begins.
+Canceled batches abort their private native transaction and discard its tail;
+previously published partial roots remain durable and resumable. Cancellation
+is not injected into the final durability boundary, whose existing uncertainty
+fencing remains authoritative. Cooperative maintenance calls have independent
+cancellation from the owner's worker shutdown token.
