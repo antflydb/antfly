@@ -235,7 +235,7 @@ const RequestAuthentication = struct {
     fn init(alloc: std.mem.Allocator, cfg: Config, store: ?*common_secrets.FileStore) !RequestAuthentication {
         const capabilities = providerCapabilities(cfg.provider);
         var secret = if (capabilities.credential_env) |env_name|
-            try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.api_key, env_name)
+            try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key, env_name)
         else
             try common_secrets.SecretValue.initConfig(alloc, cfg.api_key);
         errdefer if (secret) |*value| value.deinit(alloc);
@@ -869,9 +869,9 @@ test "reranking runtime remote Antfly defaults match anonymous or environment au
     const cfg = Config{ .provider = .antfly, .url = server.baseUrl(), .field = "body", .rate_limit = .{ .requests_per_minute = 1 } };
     var auth = try RequestAuthentication.init(alloc, cfg, null);
     defer auth.deinit(alloc);
-    try std.testing.expectEqualStrings("ANTFLY_INFERENCE_API_KEY", auth.secret.?.env_var);
+    try std.testing.expectEqualStrings("antfly.inference.api_key", auth.secret.?.provider_default);
     const expected_source = if (auth.token != null)
-        credential_identity.CredentialSourceIdentity.environmentVariable("ANTFLY_INFERENCE_API_KEY")
+        credential_identity.CredentialSourceIdentity.secretReference("antfly.inference.api_key")
     else
         credential_identity.CredentialSourceIdentity.none();
     try std.testing.expect(auth.identity(cfg).eql(expected_source));

@@ -1231,7 +1231,7 @@ antfly agents retrieval --table wikipedia \
   </TabsContent>
 
   <TabsContent value="openai">
-Requires an [OpenAI API key](https://platform.openai.com/api-keys). Set the `OPENAI_API_KEY` environment variable — Antfly picks it up automatically:
+Requires an [OpenAI API key](https://platform.openai.com/api-keys). The generator defaults to `https://api.openai.com/v1` and reads `openai.api_key` from the configured secret store, with `OPENAI_API_KEY` as the environment fallback. The key is read by the standalone process, so export it in the terminal that runs `antfly standalone` and restart it:
 
 ```bash
 export OPENAI_API_KEY="your-api-key-here"

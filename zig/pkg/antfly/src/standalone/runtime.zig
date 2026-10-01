@@ -2245,10 +2245,11 @@ pub fn runFromIterator(
             linkedInferenceApiInfallible().destroy(antfly_node);
     };
 
-    var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
+    var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.initWithOptions(
         alloc,
         init.io,
         if (loaded_config) |*cfg| cfg else null,
+        .{ .secret_store = &secret_store },
     );
     defer active_audio_runtime.deinit();
 
