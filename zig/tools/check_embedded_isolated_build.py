@@ -14,20 +14,22 @@
 # limitations.
 
 """Compile public C API and browser artifacts without server implementations."""
+
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from pathlib import Path
 
 from audit_embedded_source_boundary import server_source
 
 
 def stage_sources(repository: Path, destination: Path) -> int:
     listing = subprocess.check_output(
-        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"], cwd=repository
+        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        cwd=repository,
     )
     removed = 0
     for raw in listing.split(b"\0"):
@@ -42,14 +44,18 @@ def stage_sources(repository: Path, destination: Path) -> int:
         if not source.is_file():
             continue
         prefix = "zig/pkg/antfly/src/"
-        if relative.as_posix().startswith(prefix) and server_source(relative.as_posix().removeprefix(prefix)):
+        if relative.as_posix().startswith(prefix) and server_source(
+            relative.as_posix().removeprefix(prefix)
+        ):
             removed += 1
             # Zig scans relative imports in dormant test/target branches for
             # cache inputs. Retain only an unconditional compile-time trap,
             # never a server implementation: a live import must fail closed.
             target = destination / relative
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text('comptime { @compileError("server implementation unavailable in embedded build"); }\n')
+            target.write_text(
+                'comptime { @compileError("server implementation unavailable in embedded build"); }\n'
+            )
             continue
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -69,11 +75,23 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="antfly-embedded-isolated-") as directory:
         stage = Path(directory)
         removed = stage_sources(repository, stage)
-        print(f"Staged embedded build: {removed} server implementations replaced with compile-time traps", flush=True)
+        print(
+            f"Staged embedded build: {removed} server implementations replaced with compile-time traps",
+            flush=True,
+        )
         subprocess.run(
-            [args.zig, "build", "embedded-capi-check", "embedded-native-module-boundary-check",
-             "embedded-wasm-module-boundary-check", "wasm", "-Dmetal=false", *flags],
-            cwd=stage / "zig", check=True,
+            [
+                args.zig,
+                "build",
+                "embedded-capi-check",
+                "embedded-native-module-boundary-check",
+                "embedded-wasm-module-boundary-check",
+                "wasm",
+                "-Dmetal=false",
+                *flags,
+            ],
+            cwd=stage / "zig",
+            check=True,
         )
 
 

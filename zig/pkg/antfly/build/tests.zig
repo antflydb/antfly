@@ -2105,8 +2105,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // to its owners instead of collecting every transitive engine test.
         .filters = selectTestFilters(b, &.{
             "raft snapshot storage tests are reachable",
-            "file snapshot",
-            "native Raft snapshot",
+            "raft.storage.file_snapshot_store.",
+            "raft.storage.native_snapshot.",
         }),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -4509,9 +4509,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_standalone_runtime_test_step = b.step("antfly-standalone-runtime-test", "Run focused standalone runtime tests");
     const run_lib_standalone_runtime_tests = addFilteredTestRunArtifact(b, lib_standalone_runtime_tests);
     lib_standalone_runtime_test_step.dependOn(&run_lib_standalone_runtime_tests.step);
-    // Real hidden-owner publication crosses the storage-kernel C ABI. Link
-    // this one fixture separately rather than making every standalone
-    // inference/runtime unit test carry the storage owner artifact.
+    // Real hidden-owner publication crosses the storage-kernel C ABI. Give
+    // these fixtures their own control-only source profile, separate from
+    // the resident storage owners used by the runtime and restore slices.
     const standalone_initial_fk_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/standalone_runtime_test_root.zig"),
         .target = target,
@@ -6684,7 +6684,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .chaos_test_step = chaos_test_step,
         .compiled_recall_tests = compiled_recall_tests,
         .storage_test_step = lib_storage_test_step,
-        .linked_consumer_tests = std.mem.concat(b.allocator, *std.Build.Step.Compile, &.{ api_tests_addTests_result.linked_consumer_tests, data_tests_addTests_result.linked_consumer_tests, &.{ provisioned_query_visibility_tests.consumer.executable, graph_metric_remote_wire_tests.consumer.executable } }) catch @panic("OOM"),
+        // Runtime and restore slices share this root and retain storage-owner
+        // ABI callbacks, so both require the production provider libraries.
+        .linked_consumer_tests = std.mem.concat(b.allocator, *std.Build.Step.Compile, &.{ api_tests_addTests_result.linked_consumer_tests, data_tests_addTests_result.linked_consumer_tests, &.{ provisioned_query_visibility_tests.consumer.executable, graph_metric_remote_wire_tests.consumer.executable, lib_standalone_runtime_tests } }) catch @panic("OOM"),
     };
 }
 

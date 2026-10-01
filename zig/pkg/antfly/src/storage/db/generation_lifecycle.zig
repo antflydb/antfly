@@ -1972,7 +1972,7 @@ fn exchangeDirectoriesAtomicSentinel(left_z: [:0]const u8, right_z: [:0]const u8
             left_z.ptr,
             linux.AT.FDCWD,
             right_z.ptr,
-            .{ .EXCReplicationNGE = true },
+            .{ .EXCHANGE = true },
         )) == .SUCCESS;
     }
     return false;

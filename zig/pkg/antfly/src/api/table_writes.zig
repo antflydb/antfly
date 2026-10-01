@@ -7856,7 +7856,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .replicated_metadata = replicated,
             };
         }
-        const cfg = self.transactionRecoveryConfig();
+        const cfg = self.serverTransactionRecoveryConfig();
         return .{
             .enabled = cfg.enabled,
             .lease_owned = cfg.lease_owned,
@@ -12698,7 +12698,7 @@ pub const ProvisionedTableWriteSource = struct {
                 } else {
                     try opened.?.reserveRestoreStaging(cache.alloc, reservation.plan_id, reservation.plan_digest, identity_namespace orelse return error.DocIdentityNamespaceUnavailable);
                 }
-                if (opened.?.restore_staging_required.load(.acquire)) try opened.?.attachRestoreStagingReplicationMirror(self.ha_async_mirror);
+                if (opened.?.local_execution.restore_staging_required.load(.acquire)) try opened.?.attachRestoreStagingReplicationMirror(self.ha_async_mirror);
             };
 
             var cached = blk: {
@@ -20636,7 +20636,7 @@ pub const ProvisionedTableWriteSource = struct {
                 },
             );
             defer if (opened) |*db| db.close();
-            try opened.?.configureTableStorage(req.storage orelse opened.?.table_storage);
+            try opened.?.configureTableStorage(req.storage orelse opened.?.local_execution.table_storage);
             try applyLocalTableSchemaJson(alloc, &opened.?, schema_json);
             // Register entity resolvers declared in the index config. Indexes
             // and enrichments are provisioned through the managed-open path, but

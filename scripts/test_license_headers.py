@@ -15,7 +15,9 @@
 # limitations under the License.
 
 """Ensure moved ABI and inference files retain their declared license."""
+
 import unittest
+
 import license_headers
 
 
@@ -30,7 +32,11 @@ class MovedSourceLicenseTests(unittest.TestCase):
         for path in paths:
             with self.subTest(path=path):
                 header = (license_headers.ROOT / path).read_text().split("\n\n", 1)[0]
-                declared = header.split("SPDX-License-Identifier:", 1)[1].splitlines()[0].strip()
+                declared = (
+                    header.split("SPDX-License-Identifier:", 1)[1]
+                    .splitlines()[0]
+                    .strip()
+                )
                 expected = "apache" if declared == "Apache-2.0" else "elv2"
                 self.assertEqual(license_headers.group_for(path, "all"), expected)
 

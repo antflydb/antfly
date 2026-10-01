@@ -16,7 +16,6 @@
 //! test root; the API facade and its consumers remain storage-independent.
 
 test "relational backup cohort pin cancellation survives absent live catalog and late seal" {
-    const replication_ingress = @import("../storage/db/replication_ingress.zig");
     const std = @import("std");
     const db = @import("../storage/db/mod.zig");
     const seal = @import("../storage/db/native_backup_seal.zig");
@@ -60,6 +59,7 @@ test "relational backup cohort topology HA split cutover preserves binary range 
 }
 
 fn testTopologyHAControls(comptime replicated: bool, comptime split: bool) !void {
+    const replication_ingress = @import("../storage/db/replication_ingress.zig");
     const std = @import("std");
     const db = @import("../storage/db/mod.zig");
     const ha = @import("../storage/hot_standby/primary.zig");

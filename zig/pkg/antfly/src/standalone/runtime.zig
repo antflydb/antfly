@@ -12395,17 +12395,18 @@ test "standalone shared canceled owner retirement resumes from exact metadata pr
     metadata.data_server = &server;
     metadata.attachRestoreRetirementOwnership();
     const stages = @import("../metadata/restore_staging.zig");
+    // Bind native artifact identities; cancellation never imports their contents.
     const target: stages.Target = .{
         .source_table_id = 1,
         .table = .{ .table_id = 11, .name = "canceled_target", .schema_json = "{}" },
         .ranges = &.{.{ .table_id = 11, .group_id = 701, .range_id = 701, .doc_identity_shard_id = 701, .doc_identity_range_id = 701, .start_key = "" }},
-        .source_artifacts = &.{.{ .target_group_id = 701, .source_namespace = .{ .table_id = 1, .shard_id = 101, .range_id = 101 }, .format = .portable, .snapshot_path = "source.backup", .artifact_size_bytes = 1, .artifact_sha256 = @splat(3) }},
+        .source_artifacts = &.{.{ .target_group_id = 701, .source_namespace = .{ .table_id = 1, .shard_id = 101, .range_id = 101 }, .format = .native, .snapshot_path = "source.backup", .artifact_size_bytes = 1, .artifact_sha256 = @splat(3) }},
     };
     const other: stages.Target = .{
         .source_table_id = 2,
         .table = .{ .table_id = 12, .name = "canceled_other", .schema_json = "{}" },
         .ranges = &.{.{ .table_id = 12, .group_id = 702, .range_id = 702, .doc_identity_shard_id = 702, .doc_identity_range_id = 702, .start_key = "" }},
-        .source_artifacts = &.{.{ .target_group_id = 702, .source_namespace = .{ .table_id = 2, .shard_id = 102, .range_id = 102 }, .format = .portable, .snapshot_path = "other.backup", .artifact_size_bytes = 1, .artifact_sha256 = @splat(5) }},
+        .source_artifacts = &.{.{ .target_group_id = 702, .source_namespace = .{ .table_id = 2, .shard_id = 102, .range_id = 102 }, .format = .native, .snapshot_path = "other.backup", .artifact_size_bytes = 1, .artifact_sha256 = @splat(5) }},
     };
     const plan: stages.Plan = .{ .id = @splat(17), .cohort_digest = @splat(19), .targets = &.{ target, other } };
     const plan_digest = try plan.digest(alloc);
@@ -12480,7 +12481,7 @@ test "standalone catalog remote apply outage preserves committed creation and re
     var runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer runtime.deinit();
     const Failure = struct {
-        fn wait(_: *anyopaque, _: *antfly.hot_standby.primary.Primary, _: u64, _: antfly.hot_standby.primary.SyncPolicy) !void {
+        fn wait(_: *anyopaque, _: *anyopaque, _: u64, _: antfly.hot_standby.primary.SyncPolicy) !void {
             return error.HASyncCommitWouldBlock;
         }
     };
@@ -12490,7 +12491,7 @@ test "standalone catalog remote apply outage preserves committed creation and re
     var metadata_open = true;
     defer if (metadata_open) metadata.deinit();
     metadata.vector_source_storage_allowed = false;
-    try LocalStandaloneMetadata.bindHAMetadata(&metadata, .{ .primary = &primary }, mirror);
+    try LocalStandaloneMetadata.bindHAMetadata(&metadata, .{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, mirror);
     const before_revision = metadata.durable_revision;
     try std.testing.expectError(error.MetadataMutationOutcomeUnknown, LocalStandaloneMetadata.createTable(&metadata, alloc, "pending", .{}));
     try std.testing.expect(metadata.findTableByNameLocked("pending") != null);
@@ -12507,12 +12508,12 @@ test "standalone catalog remote apply outage preserves committed creation and re
     metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, runtime.ptr(), null, .local);
     metadata_open = true;
     metadata.vector_source_storage_allowed = false;
-    try LocalStandaloneMetadata.bindHAMetadata(&metadata, .{ .primary = &primary }, mirror);
+    try LocalStandaloneMetadata.bindHAMetadata(&metadata, .{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, mirror);
     try std.testing.expectError(error.MetadataMutationOutcomeUnknown, LocalStandaloneMetadata.createTable(&metadata, alloc, "pending", .{}));
     // Restart can expose the listener while remote acknowledgement is down,
     // but checkpoint preflight must still fail with the durable outbox intact.
     try std.testing.expectError(error.HASyncCommitWouldBlock, LocalStandaloneMetadata.prepareHAMetadataCheckpoint(&metadata));
-    try LocalStandaloneMetadata.bindHAMetadata(&metadata, .{ .primary = &primary }, .{ .primary = &primary });
+    try LocalStandaloneMetadata.bindHAMetadata(&metadata, .{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary) });
     try std.testing.expectError(error.TableAlreadyExists, LocalStandaloneMetadata.createTable(&metadata, alloc, "pending", .{}));
     try std.testing.expectEqual(committed_lsn, primary.lastLsn());
     const recovered_revision = metadata.durable_revision;
@@ -12564,7 +12565,7 @@ test "standalone metadata replay refreshes colliding revisions and only publishe
     var source = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", source_root, source_path, runtime.ptr(), null, .local);
     defer source.deinit();
     source.vector_source_storage_allowed = false;
-    try LocalStandaloneMetadata.bindHAMetadata(&source, .{ .primary = &primary }, .{ .primary = &primary });
+    try LocalStandaloneMetadata.bindHAMetadata(&source, .{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary) });
     try LocalStandaloneMetadata.createTable(&source, alloc, "replicated", .{});
     const first_revision = source.durable_revision;
     const first_lsn = primary.lastLsn();
@@ -12688,8 +12689,10 @@ test "standalone shared restore HA policy mirrors mixed publication and durable 
     defer metadata.deinit();
     const baseline = try metadata.lifecycle_store.?.exportHACheckpoint(std.testing.io, checkpoint);
     var barrier: antfly.db.MutationBarrier = .{};
-    const mirror: antfly.db.ReplicationAsyncEffectMirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .mutation_barrier = &barrier };
-    try LocalStandaloneMetadata.bindHAMetadata(&metadata, .{ .primary = &primary }, mirror);
+    // Metadata and all restored DB owners publish into this one WAL.
+    var transition_mutex: std.atomic.Mutex = .unlocked;
+    const mirror: antfly.db.ReplicationAsyncEffectMirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .mutation_barrier = &barrier, .transition_mutex = &transition_mutex };
+    try LocalStandaloneMetadata.bindHAMetadata(&metadata, .{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, mirror);
     try @import("../api/restore_worker_fixture.zig").runWithPolicy(antfly.public_api.http_server.RestoreWorkerTestDriver, false, metadata.statusSource(), metadata.restorePersistence(), .{
         .failover_safe = true,
         .guard = .{ .ptr = &metadata, .is_current = LocalStandaloneMetadata.restoreTermCurrent },

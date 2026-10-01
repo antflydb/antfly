@@ -24,7 +24,6 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT = SCRIPT_DIR.parent
 REPO_ROOT = ROOT
@@ -65,7 +64,6 @@ ELV2_FILES = {
     "zig/pkg/inference/src/host/worker.zig",
     "zig/pkg/inference/src/host/worker_rpc.zig",
     "zig/pkg/inference/src/host/worker_wire.zig",
-
 }
 
 APACHE_ROOTS = (
