@@ -145,7 +145,15 @@ pub const State = struct {
             self.noteAcquireFailure();
             return false;
         }
-        self.lease_expires_at_ms = std.math.add(u64, now_ms, self.lease_ttl_ms) catch std.math.maxInt(u64);
+        _ = self.noteFencedRenewal(self.lease_epoch, now_ms);
+        return true;
+    }
+
+    /// Record a renewal committed by an independent heartbeat task. The
+    /// caller serializes State access; a superseded tenure cannot update it.
+    pub fn noteFencedRenewal(self: *State, epoch: u64, now_ms: u64) bool {
+        if (!self.has_lease or epoch == 0 or self.lease_epoch != epoch) return false;
+        self.lease_expires_at_ms = @max(self.lease_expires_at_ms, std.math.add(u64, now_ms, self.lease_ttl_ms) catch std.math.maxInt(u64));
         self.renewal_count += 1;
         self.updateRenewalDeadline();
         return true;
@@ -297,6 +305,15 @@ test "ownership state renews only at the cached renewal deadline" {
     var renewed = (try owner.loadLease(alloc)) orelse return error.TestExpectedLease;
     defer lease_mod.deinitRecord(alloc, &renewed);
     try std.testing.expectEqual(first_deadline + 30_000, renewed.expires_at_ms);
+    const epoch = owner.lease_epoch;
+    try std.testing.expect(!owner.noteFencedRenewal(epoch + 1, first_deadline + 1));
+    try std.testing.expect(!owner.noteFencedRenewal(0, first_deadline + 1));
+    try std.testing.expectEqual(renewed.expires_at_ms, owner.lease_expires_at_ms);
+    try std.testing.expect(try owner.lease.renewFenced(owner.owner_id, epoch, first_deadline + 1000, owner.lease_ttl_ms));
+    try std.testing.expect(owner.noteFencedRenewal(epoch, first_deadline + 1000));
+    try std.testing.expectEqual(first_deadline + 31_000, owner.lease_expires_at_ms);
+    try std.testing.expect(owner.lease_renew_after_ms > first_deadline);
+    try std.testing.expectEqual(@as(u64, 2), owner.renewal_count);
 }
 
 test "ownership state works with memory backend store" {

@@ -831,7 +831,9 @@ class ReleasePromotionTests(unittest.TestCase):
                 self.etag = "1"
 
             def load(self):
-                return channel.StoredState(json.loads(json.dumps(self.document)), self.etag)
+                return channel.StoredState(
+                    json.loads(json.dumps(self.document)), self.etag
+                )
 
             def compare_and_swap(self, previous, document: dict) -> None:
                 if previous.etag != self.etag:
@@ -845,7 +847,12 @@ class ReleasePromotionTests(unittest.TestCase):
         )
         successor = channel.release_identity("v1.2.5", "5" * 40, "6" * 64)
         store = MemoryStore(
-            {"schema_version": 1, "channel": "stable", "current": current, "pending": pending}
+            {
+                "schema_version": 1,
+                "channel": "stable",
+                "current": current,
+                "pending": pending,
+            }
         )
         with self.assertRaisesRegex(SystemExit, "no exact pending identity"):
             channel.abort_promotion(store, {**pending, "ledger_sha256": "7" * 64}, 42)
@@ -877,23 +884,36 @@ class ReleasePromotionTests(unittest.TestCase):
             "run_attempt": 1,
         }
         jobs = [
-            {"name": name, "status": "completed", "conclusion": "cancelled", "steps": []}
+            {
+                "name": name,
+                "status": "completed",
+                "conclusion": "cancelled",
+                "steps": [],
+            }
             for name in recovery.PUBLICATION_JOBS
         ]
-        jobs.append({"name": "Reserve complete release identity", "conclusion": "success"})
+        jobs.append(
+            {"name": "Reserve complete release identity", "conclusion": "success"}
+        )
         with (
-            mock.patch.object(recovery, "github_api", side_effect=[run, {"jobs": jobs}]),
+            mock.patch.object(
+                recovery, "github_api", side_effect=[run, {"jobs": jobs}]
+            ),
         ):
             recovery.verify_cancelled_run("token")
         jobs[0]["steps"] = [{"name": "possibly published"}]
         with (
-            mock.patch.object(recovery, "github_api", side_effect=[run, {"jobs": jobs}]),
+            mock.patch.object(
+                recovery, "github_api", side_effect=[run, {"jobs": jobs}]
+            ),
             self.assertRaisesRegex(SystemExit, "may have run"),
         ):
             recovery.verify_cancelled_run("token")
 
     def test_unpublished_abort_rejects_other_active_promotions(self) -> None:
-        recovery = load_module("release_v024_abort_active_test", "abort_unpublished_v024.py")
+        recovery = load_module(
+            "release_v024_abort_active_test", "abort_unpublished_v024.py"
+        )
         with (
             mock.patch.object(
                 recovery,

@@ -31,6 +31,8 @@ pub const AddTestsOptions = struct {
 };
 pub const AddTestsResult = struct {
     linked_consumer_tests: []const *std.Build.Step.Compile,
+    hosted_recovery_tests: [3]*std.Build.Step.Compile,
+    hosted_recovery_step: *std.Build.Step,
     run_lib_api_standalone_backup_restore_tests: *std.Build.Step.Run,
     distributed_query_availability_step: *std.Build.Step,
     run_public_api_parity_aggregate_tests: *std.Build.Step.Run,
@@ -2100,6 +2102,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_source_file = b.path("pkg/antfly/src/api_hosted_initial_fk_test_root.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = false,
     });
     test_imports.configureConsumer(b, hosted_initial_fk_test_mod);
     @import("storage.zig").configureLmdb(b, hosted_initial_fk_test_mod, options.lmdb_engine, true);
@@ -2110,6 +2113,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = false,
     });
     hosted_fk_usermgr_storage.addImport("antfly_root", hosted_initial_fk_test_mod);
     hosted_fk_usermgr_storage.addImport("antfly_platform", antfly_imports.platform);
@@ -2142,20 +2146,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-api-hosted-initial-fk-offline-test", "Run canceled and published obsolete initial-child offline physical retirement")
         .dependOn(&addFilteredTestRunArtifact(b, hosted_initial_fk_offline_tests).step);
-    // CI builds each linked fixture module once, then executes the installed
-    // binaries on independent recovery runners without a compiler or cache.
-    const hosted_initial_fk_ci_tests = b.addTest(.{
+    // Recovery selections belong to the native Zig test inventory.
+    const hosted_initial_fk_recovery_tests = b.addTest(.{
         .name = "antfly-hosted-initial-fk-recovery",
         .root_module = hosted_initial_fk_test_mod,
         .filters = &.{ "mounted initial", "hosted initial FK real services and facade retain all required capabilities", "FK plan table and range descriptors survive snapshot release", "initial FK plan waits for all external parent schema migrations" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
-    const hosted_fk_recovery_install = b.step("antfly-hosted-fk-recovery-binaries", "Install prebuilt hosted FK recovery fixtures for bounded CI lanes");
-    hosted_fk_recovery_install.dependOn(&b.addInstallArtifact(hosted_initial_fk_ci_tests, .{}).step);
     const hosted_fk_drop_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_hosted_fk_drop_test_root.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = false,
     });
     test_imports.configureConsumer(b, hosted_fk_drop_test_mod);
     @import("storage.zig").configureLmdb(b, hosted_fk_drop_test_mod, options.lmdb_engine, true);
@@ -2166,6 +2168,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = false,
     });
     hosted_fk_drop_usermgr_storage.addImport("antfly_root", hosted_fk_drop_test_mod);
     hosted_fk_drop_usermgr_storage.addImport("antfly_platform", antfly_imports.platform);
@@ -2186,17 +2189,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-api-hosted-graph-truncate-test", "Run public graph TRUNCATE seal and cold-restart recovery")
         .dependOn(&addFilteredTestRunArtifact(b, hosted_graph_truncate_tests).step);
-    const hosted_truncate_fk_ci_tests = b.addTest(.{
+    const hosted_truncate_fk_recovery_tests = b.addTest(.{
         .name = "antfly-hosted-truncate-fk-recovery",
         .root_module = hosted_fk_drop_test_mod,
         .filters = &.{ "mounted hosted external-parent FK DROP publishes after parent ACK", "mounted hosted external-parent FK TRUNCATE", "mounted hosted graph TRUNCATE", "owner catalog busy without index debt keeps provisioning retry until full reconciliation", "empty activation page validates source catalog without probing external parents" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
-    hosted_fk_recovery_install.dependOn(&b.addInstallArtifact(hosted_truncate_fk_ci_tests, .{}).step);
     const hosted_self_fk_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_hosted_self_fk_test_root.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = false,
     });
     test_imports.configureConsumer(b, hosted_self_fk_test_mod);
     @import("storage.zig").configureLmdb(b, hosted_self_fk_test_mod, options.lmdb_engine, true);
@@ -2207,6 +2210,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = false,
     });
     hosted_self_fk_usermgr_storage.addImport("antfly_root", hosted_self_fk_test_mod);
     hosted_self_fk_usermgr_storage.addImport("antfly_platform", antfly_imports.platform);
@@ -2253,14 +2257,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-api-hosted-self-fk-leader-transfer-test", "Run mounted three-voter self-FK ADD/DROP owner leadership transfer")
         .dependOn(&addFilteredTestRunArtifact(b, hosted_self_fk_leader_transfer_tests).step);
-    const hosted_self_fk_ci_tests = b.addTest(.{
+    const hosted_self_fk_recovery_tests = b.addTest(.{
         .name = "antfly-hosted-self-fk-recovery",
         .root_module = hosted_self_fk_test_mod,
         // Exact positive proofs: never include the old guard-on assertions.
         .filters = &.{ "mounted hosted self-FK ADD DROP restart", "mounted hosted self-FK publication resumes after lost owner and metadata replies", "mounted hosted self-FK resumes after metadata and owner cold restart at parent ACK", "mounted hosted self-FK survives three-voter owner leadership transfer at ADD and DROP ACK" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
-    hosted_fk_recovery_install.dependOn(&b.addInstallArtifact(hosted_self_fk_ci_tests, .{}).step);
+    const hosted_recovery_tests = [_]*std.Build.Step.Compile{ hosted_initial_fk_recovery_tests, hosted_self_fk_recovery_tests, hosted_truncate_fk_recovery_tests };
+    const hosted_recovery_step = b.step("antfly-api-hosted-recovery-test", "Run native hosted owner recovery integration tests");
+    var previous_recovery: ?*std.Build.Step = null;
+    for (hosted_recovery_tests) |tests| {
+        const run = @import("test_support.zig").addRequiredTestRunArtifact(b, tests, 15 * 60 * 1000);
+        if (previous_recovery) |previous| run.step.dependOn(previous);
+        previous_recovery = &run.step;
+    }
+    hosted_recovery_step.dependOn(previous_recovery.?);
     const lib_api_standalone_backup_restore_tests = b.addTest(.{
         .root_module = api_backup_restore_test_mod,
         .filters = &.{
@@ -2296,6 +2308,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "db explicit restore runtime repair repairs managed chunked dense embeddings once for restored shard",
             "db incomplete deferred restore import recovers before runtime repair",
             "db restore state uses strict structured content identity markers",
+            "restore job list paginates after authorization filtering",
+            "restore job list bounds authorization scans with an empty continuation page",
             "restore job ownership failures remain retryable",
             "restore retry wakeup admission failure cannot escape as execution failure",
             "staged restore published metadata wins cancellation only after every owner opens",
@@ -2350,7 +2364,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-api-staged-restore-portable-terminal-test", "Prove large portable staged restore reaches durable publication").dependOn(&addFilteredTestRunArtifact(b, staged_restore_portable_terminal_tests).step);
     const rewrite_driver_tests = b.addTest(.{
         .root_module = api_backup_restore_test_mod,
-        .filters = &.{ "staged restore worker rewrites retained acknowledged writes and reopens hidden mixed owners", "staged restore native handoff", "restore immutable rewrite failures are terminal", "restore cutover readiness waits without exponential retry" },
+        .filters = &.{ "rewrite shared job", "staged restore native handoff", "staged restore worker rewrites retained acknowledged writes and reopens hidden mixed owners", "restore immutable rewrite failures are terminal", "restore cutover readiness waits without exponential retry" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-rewrite-driver-test", "Run real retained-source rewrite, hidden owner recovery and failed-tail cancellation").dependOn(&addFilteredTestRunArtifact(b, rewrite_driver_tests).step);
@@ -2381,7 +2395,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_api_transactions_docid_tests = run_api_transactions_docid_tests,
         .run_api_table_writes_docid_tests = run_api_table_writes_docid_tests,
         .run_api_table_reads_docid_tests = run_api_table_reads_docid_tests,
-        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_relational_topology_contract_tests.consumer.executable, api_table_writes_production_regression_tests.consumer.executable, hosted_batch_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable, hosted_fk_placement_tests, sql_primary_key_rewrite_tests, hosted_initial_fk_tests, hosted_initial_fk_fault_tests, hosted_initial_fk_transfer_tests, hosted_initial_fk_offline_tests, hosted_initial_fk_ci_tests, hosted_fk_drop_tests, hosted_graph_truncate_tests, hosted_truncate_fk_ci_tests, hosted_self_fk_retry_tests, hosted_self_fk_diagnostic_tests, hosted_self_fk_fault_tests, hosted_self_fk_metadata_restart_tests, hosted_self_fk_leader_transfer_tests, hosted_self_fk_ci_tests }) catch @panic("OOM"),
+        .hosted_recovery_tests = hosted_recovery_tests,
+        .hosted_recovery_step = hosted_recovery_step,
+        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_relational_topology_contract_tests.consumer.executable, api_table_writes_production_regression_tests.consumer.executable, hosted_batch_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable, hosted_fk_placement_tests, sql_primary_key_rewrite_tests, hosted_initial_fk_tests, hosted_initial_fk_fault_tests, hosted_initial_fk_transfer_tests, hosted_initial_fk_offline_tests, hosted_initial_fk_recovery_tests, hosted_fk_drop_tests, hosted_graph_truncate_tests, hosted_truncate_fk_recovery_tests, hosted_self_fk_retry_tests, hosted_self_fk_diagnostic_tests, hosted_self_fk_fault_tests, hosted_self_fk_metadata_restart_tests, hosted_self_fk_leader_transfer_tests, hosted_self_fk_recovery_tests }) catch @panic("OOM"),
         .run_api_public_table_http_docid_tests = run_api_public_table_http_docid_tests,
         .run_raft_transition_runtime_docid_tests = run_raft_transition_runtime_docid_tests,
         .run_api_table_writes_production_regression_unit_tests = run_api_table_writes_production_regression_unit_tests,

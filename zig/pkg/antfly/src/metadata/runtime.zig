@@ -119,6 +119,12 @@ fn metadataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
         .max_snapshot_submission_scans_per_round = 32,
         .max_pending_apply_tasks = 1024,
         .max_pending_apply_bytes = 16 * 1024 * 1024,
+        // Async Ready retains the unstable batch plus its storage message and
+        // responses. Preserve the same logical 64 MiB admission ceiling while
+        // explicitly accounting for these bounded ownership copies.
+        .max_pending_persistence_tasks = 1,
+        .max_pending_persistence_bytes = 16 * 1024 * 1024,
+        .max_single_persistence_bytes = 7 * metadata_raft_max_regular_ready_bytes + 1024 * 1024,
         .max_single_apply_ready_bytes = metadata_raft_max_single_ready_bytes,
         .max_pending_snapshot_bytes = metadata_raft_max_snapshot_transfer_bytes,
         .max_apply_tasks_per_round = 16,
@@ -208,6 +214,8 @@ const Factory = struct {
                     .peers = peers,
                     .election_tick = 30,
                     .heartbeat_tick = 1,
+                    .async_storage_writes = true,
+                    .max_uncommitted_entries_size = metadata_raft_max_regular_ready_bytes,
                     .pre_vote = true,
                     .check_quorum = true,
                     .step_down_on_removal = true,
@@ -269,10 +277,12 @@ pub const HealthSource = struct {
 
     fn checkReady(ptr: *anyopaque) bool {
         const self: *HealthSource = @ptrCast(@alignCast(ptr));
+        const persistence_timeout_ns = if (self.raft_progress) |progress| progress.stall_timeout_ns else 5 * std.time.ns_per_s;
         return (self.supervisor == null or self.supervisor.?.currentState() == .ready) and
             self.server.metadataHttpService().probeReady() and
             self.server.server.adminListenerHealthy() and
-            (self.raft_progress == null or self.raft_progress.?.isHealthy());
+            (self.raft_progress == null or self.raft_progress.?.isHealthy()) and
+            !self.server.metadataHttpService().raft.host.http_host.host.persistenceIsStalled(persistence_timeout_ns);
     }
 
     fn writeMetrics(ptr: *anyopaque, writer: *std.Io.Writer) anyerror!void {
@@ -347,6 +357,9 @@ pub const HealthSource = struct {
         try append(writer, "antfly_raft_runtime_pending_outbound_bytes", "gauge", "Approximate pending outbound raft bytes inside the runtime", @intCast(host_metrics.runtime_pending_outbound_bytes));
         try append(writer, "antfly_raft_runtime_pending_apply_tasks", "gauge", "Pending raft apply tasks inside the runtime", @intCast(host_metrics.runtime_pending_apply_tasks));
         try append(writer, "antfly_raft_runtime_pending_apply_bytes", "gauge", "Approximate pending raft apply bytes inside the runtime", @intCast(host_metrics.runtime_pending_apply_bytes));
+        try append(writer, "antfly_raft_runtime_pending_persistence_tasks", "gauge", "Pending asynchronous raft durability barriers", @intCast(host_metrics.runtime_pending_persistence_tasks));
+        try append(writer, "antfly_raft_runtime_pending_persistence_bytes", "gauge", "Accounted bytes owned by asynchronous raft durability barriers", @intCast(host_metrics.runtime_pending_persistence_bytes));
+        try append(writer, "antfly_raft_runtime_pending_persistence_age_ms", "gauge", "Age of the oldest pending asynchronous raft durability barrier in milliseconds", host_metrics.runtime_pending_persistence_age_ms);
         try append(writer, "antfly_raft_runtime_transport_queue_denials_total", "counter", "Total raft ready denials from outbound transport queue pressure", @intCast(host_metrics.runtime_transport_queue_denials));
         try append(writer, "antfly_raft_runtime_apply_queue_denials_total", "counter", "Total raft ready denials from apply queue pressure", @intCast(host_metrics.runtime_apply_queue_denials));
         try append(writer, "antfly_raft_runtime_oversized_outbound_ready_rejections_total", "counter", "Raft Ready batches rejected because outbound bytes exceeded the hard safety ceiling", @intCast(host_metrics.runtime_oversized_outbound_ready_rejections));
@@ -2702,6 +2715,45 @@ test "metadata runtime derives reconciler config from common shard allocation se
     try std.testing.expectEqual(@as(u64, 180000), derived.min_shard_merge_age_millis);
 }
 
+// Async persistence completes independently of control-round count. Tests that
+// inspect projected state wait for the exact accepted prefix through the same
+// receipt/application gate as production mutations.
+fn awaitMetadataTestPrefix(server: *Server) !void {
+    const svc = server.metadataHttpService();
+    const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (true) {
+        try svc.runRaftRoundOnly();
+        svc.runtime_mutex.lockUncancelable(std.Options.debug_io);
+        const pending = svc.raft.pending_updates.items.len;
+        const status_value = svc.raft.host.http_host.host.raftStatus(svc.metadata_group_id);
+        svc.runtime_mutex.unlock(std.Options.debug_io);
+        if (pending == 0) if (status_value) |value| {
+            if (value.last_index != 0) {
+                try svc.waitForTransitionApplied(.{ .term = value.last_term, .index = value.last_index });
+                return;
+            }
+        };
+        if (platform_time.monotonicNs() >= deadline) return error.MetadataTestPrefixTimeout;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
+
+fn awaitMetadataTestControlProjection(server: *Server) !void {
+    const svc = server.metadataHttpService();
+    const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (true) {
+        try server.runRound();
+        try awaitMetadataTestPrefix(server);
+        // Applying a lease/placement entry is distinct from the control
+        // owner's observing it. Assert readiness only after both milestones.
+        if (svc.reconcileLeaseStats().held_by_local and
+            svc.local_placement_epoch != null and
+            svc.local_placement_epoch.? == svc.placement_epoch.load(.monotonic)) return;
+        if (platform_time.monotonicNs() >= deadline) return error.MetadataTestControlProjectionTimeout;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
+
 test "metadata runtime preserves projected tables across restart" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2732,6 +2784,7 @@ test "metadata runtime preserves projected tables across restart" {
 
         var rounds: usize = 0;
         while (rounds < 8) : (rounds += 1) try server.runRound();
+        try awaitMetadataTestPrefix(&server);
 
         var snapshot = try server.metadataHttpService().adminSnapshot();
         defer server.metadataHttpService().freeAdminSnapshot(&snapshot);
@@ -2753,6 +2806,7 @@ test "metadata runtime preserves projected tables across restart" {
 
         var rounds: usize = 0;
         while (rounds < 8) : (rounds += 1) try server.runRound();
+        try awaitMetadataTestPrefix(&server);
 
         var snapshot = try server.metadataHttpService().adminSnapshot();
         defer server.metadataHttpService().freeAdminSnapshot(&snapshot);
@@ -2807,6 +2861,7 @@ test "metadata runtime bootstrapLocal skips local replica-root reconcile on the 
     try std.testing.expectEqual(@as(usize, 0), hook_ctx.runs);
 
     for (0..8) |_| try server.runRound();
+    try awaitMetadataTestPrefix(&server);
     try std.testing.expectEqual(@as(usize, 0), hook_ctx.runs);
 }
 
@@ -2868,6 +2923,7 @@ test "metadata ownership ignores retained foreign catalog before serving" {
     try restarted.start();
     try restarted.bootstrapLocal(cfg.metadata_group_id, cfg.local_node_id);
     for (0..8) |_| try restarted.runRound();
+    try awaitMetadataTestPrefix(&restarted);
     try std.testing.expectEqual(.absent, svc.raft.host.status(foreign.group_id));
 }
 
@@ -2903,8 +2959,10 @@ test "metadata ownership excludes colliding data placements across control round
                 .peer_node_ids = &.{},
             }, null, 0, false);
             for (0..8) |_| try svc.runRaftRoundOnly();
+            try awaitMetadataTestControlProjection(&server);
         }
         for (0..8) |_| try server.runRound();
+        try awaitMetadataTestPrefix(&server);
         std.debug.print("OWNERSHIP_RED placements boot={d} expects absent foreign group\n", .{boot});
         std.debug.print("OWNERSHIP_ASSERT placements boot={d} foreign_status\n", .{boot});
         try std.testing.expectEqual(.absent, svc.raft.host.status(1951));
@@ -2922,6 +2980,7 @@ test "metadata ownership excludes colliding data placements across control round
         try std.testing.expectEqual(svc.placement_epoch.load(.monotonic), svc.local_placement_epoch.?);
         try svc.upsertTable(.{ .table_id = 77, .name = if (boot == 0) "first" else "restarted" });
         for (0..8) |_| try server.runRound();
+        try awaitMetadataTestPrefix(&server);
         const tables = try svc.listProjectedTables(alloc);
         defer svc.freeProjectedTables(alloc, tables);
         std.debug.print("OWNERSHIP_ASSERT placements boot={d} table_count\n", .{boot});
@@ -2953,6 +3012,7 @@ test "metadata ownership never provisions data roots on repeated control rounds"
     try server.bootstrapLocal(group_ids.main_metadata_group_id, 3);
     try std.testing.expectEqual(@as(usize, 0), hook.calls);
     for (0..8) |_| try server.runRound();
+    try awaitMetadataTestControlProjection(&server);
     std.debug.print("OWNERSHIP_RED provisioning expects zero calls; actual={d}\n", .{hook.calls});
     try std.testing.expectEqual(@as(usize, 0), hook.calls);
     const svc = server.metadataHttpService();
@@ -3072,12 +3132,14 @@ fn exerciseMetadataOwnershipProjection(case: MetadataOwnershipProjectionCase) !v
             }
         }
         for (0..8) |_| try svc.runRaftRoundOnly();
+        try awaitMetadataTestPrefix(&server);
         switch (case) {
             .progress => {
                 try expectMetadataOwnershipRemoteProgress(svc, boot, "before_control");
                 svc.setLifecycleReconcileHook(null);
                 svc.observe_local_replica_root = true;
                 for (0..8) |_| try server.runRound();
+                try awaitMetadataTestPrefix(&server);
                 std.debug.print("OWNERSHIP_RED progress expects retained schema and restore reports\n", .{});
                 try expectMetadataOwnershipRemoteProgress(svc, boot, "after_control");
             },
@@ -3106,6 +3168,7 @@ fn exerciseMetadataOwnershipProjection(case: MetadataOwnershipProjectionCase) !v
                 svc.observe_local_replica_root = true;
                 svc.store_status_ticks = 39;
                 for (0..8) |_| try server.runRound();
+                try awaitMetadataTestPrefix(&server);
                 const stores = try svc.listProjectedStores(alloc);
                 defer svc.freeProjectedStores(alloc, stores);
                 std.debug.print("OWNERSHIP_RED backfill expects retained 7 and 250\n", .{});

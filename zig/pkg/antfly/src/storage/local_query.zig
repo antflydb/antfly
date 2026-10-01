@@ -220,15 +220,12 @@ pub fn executeStorageKernelGraphEdges(
     };
     try checkQueryDeadline(control_req);
     try distributed_graph.validateGraphEdgesTensorAccessPath(alloc, req);
-    _ = try currentIdentityReadGenerationForDb(req.identity_read_generation, db);
-    const graph_entry = db.core.graphIndex(req.index_name) orelse return error.IndexNotFound;
-    const edges = try graph_entry.index.getEdges(alloc, req.key, "", req.direction);
+    const result = try db.graphEdgesForInternalReadBoundedAt(alloc, req.index_name, req.key, req.edge_types, req.direction, req.identity_read_generation, req.ttl_now_ns, req.max_edges, req.max_owned_bytes, req.max_scanned_rows);
     errdefer {
-        for (edges) |edge| graph_mod.GraphIndex.freeEdge(alloc, edge);
-        if (edges.len > 0) alloc.free(edges);
+        graph_mod.GraphIndex.freeEdges(alloc, result.edges);
     }
     try checkQueryDeadline(control_req);
-    return .{ .edges = edges };
+    return .{ .edges = result.edges, .scanned_rows = @intCast(result.scanned_rows) };
 }
 
 pub fn validateGraphHydrateIncomingIndexIdentity(

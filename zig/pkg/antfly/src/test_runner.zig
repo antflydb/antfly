@@ -40,6 +40,8 @@ pub fn main(init: std.process.Init.Minimal) void {
     var exclude_filters: std.ArrayList([]const u8) = .empty;
     var allow_empty_test_filter = false;
     var list_tests = false;
+    var require_no_skips = false;
+    var timeout_ms: ?u64 = null;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -67,6 +69,13 @@ pub fn main(init: std.process.Init.Minimal) void {
             allow_empty_test_filter = true;
         } else if (std.mem.eql(u8, arg, "--list-tests")) {
             list_tests = true;
+        } else if (std.mem.eql(u8, arg, "--require-no-skips")) {
+            require_no_skips = true;
+        } else if (std.mem.startsWith(u8, arg, "--timeout-ms=")) {
+            const value = std.fmt.parseUnsigned(u64, arg["--timeout-ms=".len..], 10) catch
+                @panic("invalid --timeout-ms");
+            if (value == 0 or value > std.math.maxInt(i64)) @panic("invalid --timeout-ms");
+            timeout_ms = value;
         } else if (std.mem.startsWith(u8, arg, "--cache-dir=")) {
             // Accepted for compatibility with the default test runner.
         } else if (std.mem.eql(u8, arg, "--listen=-")) {
@@ -107,7 +116,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         std.process.exit(1);
     }
     if (total_count == 0) {
-        if (allow_empty_test_filter) {
+        if (allow_empty_test_filter and !require_no_skips) {
             return;
         }
         std.debug.print("test selection matched no runnable tests\n", .{});
@@ -128,6 +137,16 @@ pub fn main(init: std.process.Init.Minimal) void {
     var timing_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer timing_io.deinit();
     const clock_io = timing_io.io();
+    var watchdog_done: std.Io.Event = .unset;
+    var watchdog: ?std.Io.Future(void) = if (timeout_ms) |limit|
+        clock_io.concurrent(executionWatchdog, .{ clock_io, &watchdog_done, limit }) catch
+            @panic("cannot start test execution watchdog")
+    else
+        null;
+    defer if (watchdog) |*task| {
+        watchdog_done.set(clock_io);
+        task.await(clock_io);
+    };
     const progress = Progress.open(arena, clock_io, args);
     defer if (progress) |p| p.file.close(p.io);
     const trace_cleanup = getenvBool("ANTFLY_TEST_CLEANUP_TRACE");
@@ -238,11 +257,21 @@ pub fn main(init: std.process.Init.Minimal) void {
             .{ total_error_log_count, matched_error_log_count, unexpected_error_log_count },
         );
     }
-    if (fail_count != 0 or leak_count != 0 or
+    if (fail_count != 0 or leak_count != 0 or (require_no_skips and skip_count != 0) or
         (fail_on_error_logs and unexpected_error_log_count != 0))
     {
         std.process.exit(1);
     }
+}
+
+fn executionWatchdog(io: std.Io, done: *std.Io.Event, timeout_ms: u64) void {
+    done.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(@intCast(timeout_ms)), .clock = .awake } }) catch |err| switch (err) {
+        error.Timeout => {
+            std.debug.print("test execution timed out after {d} ms\n", .{timeout_ms});
+            std.process.exit(124);
+        },
+        error.Canceled => {},
+    };
 }
 
 // Checked build runs buffer stderr until exit. Keep attribution outside that

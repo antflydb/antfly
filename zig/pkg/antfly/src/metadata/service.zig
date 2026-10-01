@@ -7937,6 +7937,8 @@ pub const MetadataHttpService = struct {
     local_data_owner: bool,
     reallocation_protocol_peers: []const ReallocationProtocolPeer,
     store_status_ticks: usize,
+    restore_owner_progress_generation: std.atomic.Value(u64) = .init(1),
+    restore_owner_progress_event: std.Io.Event = .unset,
     projection_epoch: std.atomic.Value(u64) = .init(1),
     catalog_epoch: std.atomic.Value(u64) = .init(1),
     projected_core_epoch: std.atomic.Value(u64) = .init(1),
@@ -8296,6 +8298,10 @@ pub const MetadataHttpService = struct {
     fn metadataHttpServiceProjectionSignal(ptr: *anyopaque, signal: metadata_storage.raft_apply_store.ProjectionSignal) void {
         const self: *MetadataHttpService = @ptrCast(@alignCast(ptr));
         self.core_projection_changes.mark(signal);
+        if ((signal.kind == .store and signal.store_reports_changed) or signal.kind == .restore_job or signal.kind == .schema_progress or signal.kind == .restore_progress) {
+            _ = self.restore_owner_progress_generation.fetchAdd(1, .release);
+            self.restore_owner_progress_event.set(self.raft.host.http_host.host.deps.io);
+        }
         if (projectionSignalChangesCatalog(signal.kind)) {
             _ = self.catalog_epoch.fetchAdd(1, .release);
         }

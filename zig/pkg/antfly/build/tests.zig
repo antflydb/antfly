@@ -4603,7 +4603,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const raft_host_progress_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "raft integration module compiles", "host drops stale inbound", "host queues live snapshot" },
+        .filters = &.{ "raft integration module compiles", "host drops stale inbound", "host queues live snapshot", "persistence completion wake" },
     });
     b.step("antfly-raft-host-progress-test", "Run host progress notification and bounded inbound drain regressions").dependOn(&b.addRunArtifact(raft_host_progress_tests).step);
 
@@ -5399,6 +5399,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     relational_index_lifecycle_step.dependOn(&addFilteredTestRunArtifact(b, relational_index_lifecycle_tests).step);
 
     const graph_runtime_filters = [_][]const u8{
+        "db storage kernel graph edges retain typed filters and physical scan budgets",
         "graph artifact rebuild lease drains scheduler pins",
         "db direct merge import",
         "db paged merge",
@@ -6576,6 +6577,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         &run_lib_unit_tests.step,
         &run_sparse_unit_tests.step,
     });
+
+    // Recovery services contend for the same local persistence resources. Run
+    // this bounded native integration suffix after ordinary unit work, without
+    // another runner or another provider-archive build. Focused targets retain
+    // independent run nodes over the same compiler artifacts.
+    var recovery_tail: ?*std.Build.Step = null;
+    for (api_tests_addTests_result.hosted_recovery_tests) |tests| {
+        const run = @import("test_support.zig").addRequiredTestRunArtifact(b, tests, 15 * 60 * 1000);
+        if (recovery_tail) |previous| {
+            run.step.dependOn(previous);
+        } else {
+            for (unit_test_step.dependencies.items) |dependency| run.step.dependOn(dependency);
+        }
+        recovery_tail = &run.step;
+    }
+    unit_test_step.dependOn(recovery_tail.?);
+    integration_test_step.dependOn(api_tests_addTests_result.hosted_recovery_step);
 
     return .{
         .vopr_soak_test_step = vopr_soak_test_step,

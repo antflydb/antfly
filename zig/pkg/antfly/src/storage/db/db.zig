@@ -18479,24 +18479,26 @@ pub const DB = struct {
         return switch (cfg.kind) {
             .dense_vector => blk: {
                 const dense = self.core.index_manager.denseIndex(index_name) orelse break :blk .physical_index_unavailable;
-                const active_count = dense.index.stats().active_count;
+                const active_count = dense.index.servingActiveCountForCheckpoint() orelse break :blk .physical_index_unavailable;
                 if (active_count == 0) break :blk .empty_dense_publication;
-                if (checkpoint.published_count) |certified_count| {
-                    // A publication certificate proves the loaded HBC state
-                    // is exactly the snapshot committed at this checkpoint.
-                    // The live artifact target may be ahead while enrichment
-                    // is preparing the next replay window; that is completion
-                    // debt, not a reason to revoke the last safe snapshot.
-                    if (active_count != certified_count) break :blk .artifact_count_mismatch;
+                if (checkpoint.published_count != null) {
+                    // Only an open or publication boundary may certify this
+                    // checkpoint. A recovered older native WAL prefix remains
+                    // serviceable when its sidecar names an unfinished window.
+                    if (!dense.hasValidatedServingCertificate(checkpoint) and
+                        !dense.hasRecoveredNativeServingCertificate(checkpoint))
+                        break :blk .artifact_count_mismatch;
                 } else {
                     // v0.2/legacy checkpoints carry no physical certificate.
-                    // Preserve their conservative equality proof instead of
-                    // inferring safety from an unversioned cardinality.
-                    const expected_active_count = if (densePublicationTargetUsesArtifactCounter(dense))
-                        (try loadDenseArtifactTargetCounter(alloc, self.core.store, index_name)) orelse break :blk .artifact_counter_unavailable
-                    else
-                        produced;
-                    if (!denseCoverageMatchesTarget(active_count, expected_active_count)) break :blk .artifact_count_mismatch;
+                    // An opened native WAL can prove its durable prefix;
+                    // otherwise preserve the conservative equality proof.
+                    if (!dense.hasRecoveredNativeServingCertificate(checkpoint)) {
+                        const expected_active_count = if (densePublicationTargetUsesArtifactCounter(dense))
+                            (try loadDenseArtifactTargetCounter(alloc, self.core.store, index_name)) orelse break :blk .artifact_counter_unavailable
+                        else
+                            produced;
+                        if (!denseCoverageMatchesTarget(active_count, expected_active_count)) break :blk .artifact_count_mismatch;
+                    }
                 }
                 // Dirty posting centroids/payloads are bounded optimization
                 // debt. HBC searches them exactly until the maintenance lane
@@ -24451,21 +24453,27 @@ pub const DB = struct {
         return .{ .json = try std.json.Stringify.valueAlloc(alloc, Response{ .address = address, .page = &page }, .{}) };
     }
 
-    fn lookupRelationalIntegrityJobs(self: *DB, alloc: Allocator, request_json: []const u8) !?types.LookupResult {
+    fn lookupRelationalIntegrityJobs(self: *DB, alloc: Allocator, request_json: []const u8, options: types.LookupOptions) !?types.LookupResult {
         const integrity = @import("relational_integrity.zig");
         if (request_json.len > 4096) return error.InvalidIntegrityBudget;
         var kind = try std.json.parseFromSlice(struct { kind: []const u8 = "discover" }, alloc, request_json, .{ .ignore_unknown_fields = true });
         defer kind.deinit();
         if (std.mem.eql(u8, kind.value.kind, "retirement")) return self.lookupRelationalRetirement(alloc, request_json);
         var request = try std.json.parseFromSlice(struct {
-            kind: enum { discover, references } = .discover,
+            kind: enum { discover, references, claims, observations } = .discover,
+            addresses: []const integrity.Address = &.{},
+            keys: []const []const u8 = &.{},
+            schema_version: ?u32 = null,
+            generation_set: ?integrity.Digest = null,
             address: ?integrity.Address = null,
             after: ?[]const u8 = null,
             limit: u32 = 16,
         }, alloc, request_json, .{ .allocate = .alloc_always });
         defer request.deinit();
         if (request.value.limit == 0 or request.value.limit > 128) return error.InvalidIntegrityBudget;
-        if (request.value.kind == .references) return self.lookupRelationalIntegrityReferences(alloc, request.value.address orelse return error.InvalidIntegrityAddress, request.value.after, request.value.limit);
+        if (request.value.kind == .observations) return self.lookupPreparationObservations(alloc, request.value.keys, options, request.value.schema_version, request.value.generation_set);
+        if (request.value.kind == .claims) return self.lookupRelationalIntegrityClaims(alloc, request.value.addresses, request.value.schema_version, request.value.generation_set);
+        if (request.value.kind == .references) return self.lookupRelationalIntegrityReferences(alloc, request.value.address orelse return error.InvalidIntegrityAddress, request.value.after, request.value.limit, request.value.schema_version, request.value.generation_set);
         if (request.value.address != null) return error.InvalidIntegrityAddress;
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
@@ -24529,7 +24537,124 @@ pub const DB = struct {
         return .{ .json = try std.json.Stringify.valueAlloc(alloc, Response{ .jobs = jobs.items, .next = next }, .{}) };
     }
 
-    fn lookupRelationalIntegrityReferences(self: *DB, alloc: Allocator, address: @import("relational_integrity.zig").Address, after: ?[]const u8, limit: u32) !?types.LookupResult {
+    /// A single routed ReadIndex gate covers this bounded owner-local read.
+    /// All addresses must belong to this physical range; topology changes fail
+    /// closed rather than silently routing part of the batch elsewhere.
+    fn validateIntegrityReadGeneration(alloc: Allocator, read: *@import("relational_integrity.zig").CurrentView, expected_schema: ?u32, expected_set: ?@import("relational_integrity.zig").Digest) !void {
+        if (expected_schema == null and expected_set == null) return;
+        const schema_version = expected_schema orelse return error.InvalidIntegrityAddress;
+        const generation_set = expected_set orelse return error.InvalidIntegrityAddress;
+        const catalog = @import("relational_integrity_catalog.zig");
+        const encoded = read.get(catalog.key) catch |err| switch (err) {
+            error.NotFound => return error.PreparedGenerationChanged,
+            else => return err,
+        };
+        var bindings = try catalog.decode(alloc, encoded);
+        defer bindings.deinit();
+        if (bindings.schema_version != schema_version or !std.mem.eql(u8, &generation_set, &@import("relational_integrity_activation_contract.zig").generationSet(bindings))) return error.PreparedGenerationChanged;
+    }
+
+    fn lookupPreparationObservations(self: *DB, alloc: Allocator, keys: []const []const u8, outer: types.LookupOptions, expected_schema: ?u32, expected_set: ?@import("relational_integrity.zig").Digest) !?types.LookupResult {
+        if (expected_schema == null or expected_set == null) return error.InvalidIntegrityAddress;
+        if (keys.len == 0 or keys.len > 8) return error.InvalidIntegrityBudget;
+        const Item = struct { key: []const u8, row: ?types.LookupResult };
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const items = try scratch.alloc(Item, keys.len);
+        try self.lockApplySharedForPortableRuntime();
+        defer self.core.unlockApplyShared();
+        var probe = try self.core.store.beginReadTxn();
+        defer probe.abort();
+        var serving = try @import("relational_integrity.zig").CurrentView.init(self.core.store);
+        defer serving.deinit();
+        try validateIntegrityReadGeneration(scratch, &serving, expected_schema, expected_set);
+        var retained: usize = 0;
+        for (keys, items) |key, *item| {
+            try checkLookupOptionsActive(outer);
+            if (key.len == 0 or key.len > 512 or internal_keys.isInternalUserKey(key)) return error.InvalidIntegrityAddress;
+            if (!self.core.byteRange().contains(key)) return error.PreparedGenerationChanged;
+            try @import("online_integrity_shadow.zig").requireServing(&serving, self.core.byteRange(), key);
+            var options = outer;
+            options.relational_integrity_jobs_json = "";
+            options.include_primary_digest = true;
+            const row = try self.lookupPrimarySnapshot(scratch, key, options, &probe);
+            if (row) |value| {
+                retained = std.math.add(usize, retained, value.json.len) catch return error.TransactionTooLarge;
+                if (retained > 16 * 1024 * 1024) return error.TransactionTooLarge;
+            }
+            item.* = .{ .key = key, .row = row };
+        }
+        const Response = struct {
+            observations: []const Item,
+            pub fn jsonStringify(value: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+                try stream.beginObject();
+                try stream.objectField("observations");
+                try stream.beginArray();
+                for (value.observations) |item| {
+                    try stream.beginObject();
+                    try stream.objectField("key");
+                    try @import("relational_integrity_json.zig").write(item.key, stream);
+                    try stream.objectField("row");
+                    // Primary JSON remains an encoded document string. Binary
+                    // digests are fixed arrays and cannot lose byte identity.
+                    try stream.write(item.row);
+                    try stream.endObject();
+                }
+                try stream.endArray();
+                try stream.endObject();
+            }
+        };
+        const json = try std.json.Stringify.valueAlloc(alloc, Response{ .observations = items }, .{});
+        errdefer alloc.free(json);
+        if (json.len > 16 * 1024 * 1024) return error.TransactionTooLarge;
+        try checkLookupOptionsActive(outer);
+        return .{ .json = json };
+    }
+
+    fn lookupRelationalIntegrityClaims(self: *DB, alloc: Allocator, addresses: []const @import("relational_integrity.zig").Address, expected_schema: ?u32, expected_set: ?@import("relational_integrity.zig").Digest) !?types.LookupResult {
+        const integrity = @import("relational_integrity.zig");
+        if (expected_schema == null or expected_set == null) return error.InvalidIntegrityAddress;
+        if (addresses.len == 0 or addresses.len > 8) return error.InvalidIntegrityBudget;
+        const Item = struct { address: integrity.Address, claim: ?integrity.Claim };
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const owned = scratch.allocator();
+        const items = try owned.alloc(Item, addresses.len);
+        try self.lockApplySharedForPortableRuntime();
+        defer self.core.unlockApplyShared();
+        var read = try integrity.CurrentView.init(self.core.store);
+        defer read.deinit();
+        try validateIntegrityReadGeneration(owned, &read, expected_schema, expected_set);
+        for (addresses, items) |address, *item| {
+            if (self.backend_runtime.io()) |io| try io.checkCancel();
+            _ = try integrity.parseKey(&address.claimKey());
+            if (!self.core.byteRange().contains(&address.routing)) return error.PreparedGenerationChanged;
+            try @import("online_integrity_shadow.zig").requireServing(&read, self.core.byteRange(), &address.routing);
+            const raw = read.get(&address.claimKey()) catch |err| switch (err) {
+                error.NotFound => {
+                    item.* = .{ .address = address, .claim = null };
+                    continue;
+                },
+                else => return err,
+            };
+            const claim = try integrity.Claim.decode(&address.claimKey(), raw);
+            if (claim.state != .live) return error.ForeignKeyActionInProgress;
+            item.* = .{ .address = address, .claim = claim };
+        }
+        const Response = struct {
+            claims: []const Item,
+            pub fn jsonStringify(value: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+                try stream.beginObject();
+                try stream.objectField("claims");
+                try @import("relational_integrity_json.zig").write(value.claims, stream);
+                try stream.endObject();
+            }
+        };
+        return .{ .json = try std.json.Stringify.valueAlloc(alloc, Response{ .claims = items }, .{}) };
+    }
+
+    fn lookupRelationalIntegrityReferences(self: *DB, alloc: Allocator, address: @import("relational_integrity.zig").Address, after: ?[]const u8, limit: u32, expected_schema: ?u32, expected_set: ?@import("relational_integrity.zig").Digest) !?types.LookupResult {
         const integrity = @import("relational_integrity.zig");
         const prefix = address.referencePrefix();
         _ = try integrity.parseKey(&address.claimKey());
@@ -24546,6 +24671,7 @@ pub const DB = struct {
         defer self.core.unlockApplyShared();
         var read = try integrity.CurrentView.init(self.core.store);
         defer read.deinit();
+        try validateIntegrityReadGeneration(owned, &read, expected_schema, expected_set);
         try @import("online_integrity_shadow.zig").requireServing(&read, self.core.byteRange(), &address.routing);
         const raw_claim = read.get(&address.claimKey()) catch |err| switch (err) {
             error.NotFound => return null,
@@ -24762,7 +24888,16 @@ pub const DB = struct {
         if (opts.relational_activation_json.len != 0) return self.lookupRelationalActivation(alloc, opts.relational_activation_json);
         if (opts.relational_integrity_catalog) return self.lookupRelationalIntegrityCatalog(alloc);
         if (opts.relational_integrity_action) return self.lookupRelationalIntegrityAction(alloc, key);
-        if (opts.relational_integrity_jobs_json.len != 0) return self.lookupRelationalIntegrityJobs(alloc, opts.relational_integrity_jobs_json);
+        if (opts.relational_integrity_jobs_json.len != 0) return self.lookupRelationalIntegrityJobs(alloc, opts.relational_integrity_jobs_json, opts);
+        var probe = if (opts.include_primary_digest)
+            try self.core.store.beginReadTxn()
+        else
+            try self.core.store.beginProbeTxn();
+        defer probe.abort();
+        return self.lookupPrimarySnapshot(alloc, key, opts, &probe);
+    }
+
+    fn lookupPrimarySnapshot(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions, probe: *@import("../docstore.zig").DocStore.Txn) !?types.LookupResult {
         var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
         defer if (verified_principal) |*principal| principal.deinit();
         var row_policy_lease = if (opts.row_policy_principal_proof.len != 0) bound: {
@@ -24770,21 +24905,12 @@ pub const DB = struct {
             break :bound try self.row_policy_gate.enterVerifiedPrincipal(&verified_principal.?.value, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         } else try self.row_policy_gate.enterRawRead();
         defer row_policy_lease.release();
-        // Pin the schema once and keep the physical row intact through TTL and
-        // projection. Relational rows carry their timestamp in the authenticated
-        // AROW header, so a point read does not need a second store lookup.
+        // Each row uses its authenticated schema epoch. A batch shares the
+        // same immutable storage snapshot through projection and predicates.
         var schema_view = self.core.acquireSchemaView();
         defer if (schema_view) |*view| view.release();
         const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view);
         defer alloc.free(store_key);
-        // Keep the probe's borrowed value pinned through projection. A full
-        // runtime snapshot would clone mutable state for a one-key lookup;
-        // an owned get would copy every unselected byte of a wide row.
-        var probe = if (opts.include_primary_digest)
-            try self.core.store.beginReadTxn()
-        else
-            try self.core.store.beginProbeTxn();
-        defer probe.abort();
         const raw = probe.getLeased(store_key) catch |err| switch (err) {
             error.NotFound => return null,
             else => return err,
@@ -24834,7 +24960,7 @@ pub const DB = struct {
                 const timestamp_ns = if (ordinal_row) |row|
                     row.writeTimestampNs()
                 else
-                    try self.getTimestamp(alloc, key);
+                    try lookupSnapshotTimestamp(alloc, key, probe);
                 if (timestamp_ns != 0 and ttl_mod.isExpired(timestamp_ns, ttl_duration_ns, currentTimeNs())) return null;
             }
         }
@@ -24871,20 +24997,23 @@ pub const DB = struct {
             std.crypto.hash.sha2.Sha256.hash(raw, &primary_digest, .{});
             digest = primary_digest;
             if (version == null) {
-                const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, key);
-                defer alloc.free(timestamp_key);
-                const timestamp = probe.get(timestamp_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
-                version = if (timestamp) |bytes| blk: {
-                    if (bytes.len != 8) return error.InvalidTimestamp;
-                    break :blk std.mem.readInt(u64, bytes[0..8], .little);
-                } else 0;
+                version = try lookupSnapshotTimestamp(alloc, key, probe);
             }
         }
         try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         return .{ .json = stored, .version = version, .expected_content_digest = digest };
+    }
+
+    fn lookupSnapshotTimestamp(alloc: Allocator, key: []const u8, probe: *docstore_mod.DocStore.Txn) !u64 {
+        const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, key);
+        defer alloc.free(timestamp_key);
+        const timestamp = probe.get(timestamp_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        const bytes = timestamp orelse return 0;
+        if (bytes.len != 8) return error.InvalidTimestamp;
+        return std.mem.readInt(u64, bytes[0..8], .little);
     }
 
     fn lookupRelationalRetirement(self: *DB, alloc: Allocator, request_json: []const u8) !?types.LookupResult {
@@ -27025,7 +27154,8 @@ pub const DB = struct {
         try derived_writes.append(self.alloc, .{ .key = graph_merge_import_recovery_key, .value = recovery_record });
         try derived_writes.append(self.alloc, .{ .key = graph_edge_ttl_due_rebuild_marker, .value = "1" });
         {
-            const raw_writes: []const docstore_mod.KVPair = @ptrCast(derived_writes.items);
+            const raw_writes = try rawStoreWritesAlloc(self.alloc, derived_writes.items);
+            defer self.alloc.free(raw_writes);
             try self.core.store.putBatch(raw_writes, stale_artifact_keys.items);
             primary_published = true;
             self.graph_merge_import_recovery_pending.store(true, .release);
@@ -30683,7 +30813,7 @@ pub const DB = struct {
                     var bootstrap = try contract.OwnerBootstrap.decode(alloc, raw);
                     defer bootstrap.deinit();
                     try bootstrap.value.validate();
-                    if (!bootstrap.value.scope.empty_generation or bootstrap.value.empty_generation_handoff == null or
+                    if (bootstrap.value.empty_generation_handoff == null or
                         !bootstrap.value.scope.target_namespace.eql(self.core.identity_namespace) or
                         !std.mem.eql(u8, &scope, &bootstrap.value.scope.digest()) or
                         !std.mem.eql(u8, &plan_id, &bootstrap.value.scope.plan_id)) return error.RestoreStagingScopeChanged;
@@ -32563,8 +32693,7 @@ pub const DB = struct {
                 const raw_progress = txn.get(contract.key) catch return error.RestoreStagingScopeChanged;
                 var progress = try contract.Progress.decode(self.alloc, raw_progress);
                 defer progress.deinit();
-                if (!bootstrap.value.scope.empty_generation or
-                    !bootstrap.value.scope.target_namespace.eql(command.fence.namespace) or
+                if (!bootstrap.value.scope.target_namespace.eql(command.fence.namespace) or
                     !std.mem.eql(u8, &bootstrap.value.scope.plan_id, &expected_plan_id) or
                     !std.mem.eql(u8, &bootstrap.value.scope.digest(), &install.scope) or
                     !std.mem.eql(u8, &progress.value.scope.digest(), &install.scope) or
@@ -32908,6 +33037,34 @@ pub const DB = struct {
             resolved_finalized += 1;
         }
         return resolved_finalized;
+    }
+
+    /// Physical graph reads retain the same admission, identity fence, and
+    /// scan budget through selection and the owned result.
+    pub fn graphEdgesForInternalReadBoundedAt(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: graph_mod.EdgeDirection,
+        identity_read_generation: ?u64,
+        ttl_now_ns: u64,
+        max_edges: usize,
+        max_owned_bytes: usize,
+        max_scanned_rows: usize,
+    ) !graph_mod.GraphIndex.BoundedEdgeResult {
+        var row_policy_lease = try self.row_policy_gate.enterRawRead();
+        defer row_policy_lease.release();
+        try self.lockApplySharedForPortableRuntime();
+        defer self.core.unlockApplyShared();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
+        _ = try self.currentIdentityReadGenerationForRequest(identity_read_generation);
+        const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
+        const result = try entry.index.getEdgesByTypesBoundedWithStatsAt(alloc, key, edge_types, direction, max_edges, max_owned_bytes, max_scanned_rows, if (ttl_now_ns == 0) entry.index.clock.nowRealtimeNs() else ttl_now_ns);
+        errdefer graph_mod.GraphIndex.freeEdges(alloc, result.edges);
+        try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+        return result;
     }
 
     pub fn getEdges(
@@ -40661,7 +40818,14 @@ pub const DB = struct {
     fn validateOpenedDenseServingCertificates(self: *DB) void {
         for (self.core.index_manager.dense_indexes.items) |*entry| {
             const checkpoint = self.core.loadProjectionCheckpoint(self.alloc, entry.config.name) catch continue;
-            _ = entry.validateServingCertificate(checkpoint);
+            if (!entry.validateServingCertificate(checkpoint)) {
+                // An absent or newer sidecar may not describe the native
+                // WAL's immutable generation after an in-flight source
+                // window. On reopen it still proves a durable prefix. Record
+                // this only at the open boundary. Status must never certify
+                // a later coincidental live count.
+                _ = entry.validateRecoveredNativeServingCertificate(checkpoint);
+            }
         }
     }
 
@@ -40682,15 +40846,23 @@ pub const DB = struct {
         };
         if (!installed or self.observeResidentIndexAdmission(alloc, item.name, preloaded_repair_state) != .admitted) return false;
         if (item.kind == .dense_vector) {
+            const entry = self.core.denseIndex(item.name) orelse return false;
             if (item.projection_checkpoint_published_count) |certified| {
-                const entry = self.core.denseIndex(item.name) orelse return false;
-                if (!entry.hasValidatedServingCertificate(.{
+                const checkpoint: apply_state.ProjectionCheckpoint = .{
                     .applied_sequence = item.projection_checkpoint_applied_sequence,
                     .generation = item.projection_checkpoint_generation,
                     .config_hash = item.projection_checkpoint_config_hash,
                     .published_count = certified,
-                })) return false;
+                };
+                if (!entry.hasValidatedServingCertificate(checkpoint) and
+                    !entry.hasRecoveredNativeServingCertificate(checkpoint)) return false;
             } else if (item.coverage_produced_count != 0) {
+                const checkpoint: apply_state.ProjectionCheckpoint = .{
+                    .applied_sequence = item.projection_checkpoint_applied_sequence,
+                    .generation = item.projection_checkpoint_generation,
+                    .config_hash = item.projection_checkpoint_config_hash,
+                };
+                if (entry.hasRecoveredNativeServingCertificate(checkpoint)) return true;
                 if (self.core.index_manager.get(item.name)) |cfg| {
                     // Older checkpoints have no count certificate. For managed
                     // progressive indexes use the existing durable coverage
@@ -41139,6 +41311,30 @@ pub const DB = struct {
         };
     }
 
+    const DenseServingCounts = struct { doc_count: u64, node_count: u64, root_node: u64, revision: u64 };
+
+    fn denseServingCounts(index: *hbc_mod.HBCIndex) DenseServingCounts {
+        if (index.nativeServingSnapshot()) |serving_snapshot| return .{
+            .doc_count = serving_snapshot.active_count,
+            .node_count = serving_snapshot.node_count,
+            .root_node = serving_snapshot.root_node,
+            .revision = serving_snapshot.publish_generation,
+        };
+        if (index.experimentalPostingWalAuthoritative()) return .{
+            .doc_count = 0,
+            .node_count = 0,
+            .root_node = 0,
+            .revision = 0,
+        };
+        const published = index.publishedStats();
+        return .{
+            .doc_count = published.stats.active_count,
+            .node_count = published.stats.node_count,
+            .root_node = published.stats.root_node,
+            .revision = published.generation,
+        };
+    }
+
     fn collectLiveIndexStatusSnapshot(index_manager: *index_manager_mod.IndexManager, index_name: []const u8) ?IndexStatusSnapshot {
         // These bytes enter compressed durable tables, so even a diagnostic
         // timestamp can change disk usage and subsequent placement decisions.
@@ -41155,10 +41351,10 @@ pub const DB = struct {
             };
         }
         if (index_manager.denseIndex(index_name)) |entry| {
-            const dense_stats = entry.index.stats();
+            const dense_stats = denseServingCounts(entry.index);
             return .{
                 .kind = .dense_vector,
-                .doc_count = dense_stats.active_count,
+                .doc_count = dense_stats.doc_count,
                 .node_count = dense_stats.node_count,
                 .root_node = dense_stats.root_node,
                 .updated_at_ns = now,
@@ -41796,10 +41992,10 @@ pub const DB = struct {
                 },
                 .dense_vector => {
                     if (self.core.denseIndex(item.name)) |entry| {
-                        const hbc_stats = entry.index.stats();
-                        item.doc_count = hbc_stats.active_count;
-                        item.node_count = hbc_stats.node_count;
-                        item.root_node = hbc_stats.root_node;
+                        const serving = denseServingCounts(entry.index);
+                        item.doc_count = serving.doc_count;
+                        item.node_count = serving.node_count;
+                        item.root_node = serving.root_node;
                         item.hbc_cache = dbHbcCacheStats(entry.index.hbcCacheStats());
                         item.hbc_posting.refresh_pending = entry.index.postingRefreshPending();
                     }
@@ -43840,12 +44036,11 @@ pub const DB = struct {
                 },
                 .dense_vector => {
                     if (self.core.denseIndex(cfg.name)) |entry| {
-                        const published = entry.index.publishedStats();
-                        const hbc_stats = published.stats;
-                        item.doc_count = hbc_stats.active_count;
-                        item.node_count = hbc_stats.node_count;
-                        item.root_node = hbc_stats.root_node;
-                        item.serving_snapshot_revision = published.generation;
+                        const serving = denseServingCounts(entry.index);
+                        item.doc_count = serving.doc_count;
+                        item.node_count = serving.node_count;
+                        item.root_node = serving.root_node;
+                        item.serving_snapshot_revision = serving.revision;
                         item.serving_snapshot_owner_id = self.backend_owner_id;
                         serving_observed = true;
                         item.hbc_cache = dbHbcCacheStats(entry.index.hbcCacheStats());
@@ -44100,10 +44295,10 @@ pub const DB = struct {
                 },
                 .dense_vector => {
                     if (self.core.denseIndex(cfg.name)) |entry| {
-                        const hbc_stats = entry.index.stats();
-                        item.doc_count = hbc_stats.active_count;
-                        item.node_count = hbc_stats.node_count;
-                        item.root_node = hbc_stats.root_node;
+                        const serving = denseServingCounts(entry.index);
+                        item.doc_count = serving.doc_count;
+                        item.node_count = serving.node_count;
+                        item.root_node = serving.root_node;
                         item.hbc_cache = dbHbcCacheStats(entry.index.hbcCacheStats());
                         item.hbc_posting = dbHbcPostingStats(try entry.index.postingBacklogStats(), entry.index.getWriteProfile());
                         item.hbc_posting.refresh_pending = entry.index.postingRefreshPending();
@@ -67104,9 +67299,14 @@ fn appliedSequenceUpdatesWithConfigHashes(
                 enriched[i].config_hash = types.indexConfigHash(cfg.*);
             }
         }
-        if (enriched[i].published_count == null) {
+        // Native batches publish their WAL watermark directly; their generic
+        // update never writes a count sidecar. Avoid pinning a read generation
+        // on every ingest batch just to discard that count below.
+        if (enriched[i].published_count == null and
+            !index_manager.densePostingWalAuthoritativeByName(update.index_name))
+        {
             if (index_manager.denseIndex(update.index_name)) |entry| {
-                enriched[i].published_count = entry.index.stats().active_count;
+                enriched[i].published_count = entry.index.servingActiveCountForCheckpoint();
             }
         }
     }
@@ -75779,6 +75979,14 @@ fn copyGraphEdgeRangeIntoSplitDestination(
     if (writes.items.len > 0) try dest_store.putBatch(writes.items, &.{});
 }
 
+// Mutation planning fields are not part of physical key/value storage. An
+// explicit borrowed projection keeps these layers independent of Zig layout.
+fn rawStoreWritesAlloc(alloc: Allocator, writes: []const types.BatchWrite) ![]docstore_mod.KVPair {
+    const raw = try alloc.alloc(docstore_mod.KVPair, writes.len);
+    for (writes, raw) |write, *item| item.* = .{ .key = write.key, .value = write.value };
+    return raw;
+}
+
 fn putIndexedSplitBatchDirect(
     dest_store: *docstore_mod.DocStore,
     dest_indexes: *index_manager_mod.IndexManager,
@@ -75789,7 +75997,8 @@ fn putIndexedSplitBatchDirect(
 ) !void {
     if (writes.len == 0) return;
 
-    const raw_writes: []const docstore_mod.KVPair = @ptrCast(writes);
+    const raw_writes = try rawStoreWritesAlloc(dest_indexes.alloc, writes);
+    defer dest_indexes.alloc.free(raw_writes);
     try dest_store.putBatch(raw_writes, &.{});
 
     try applySplitEmbeddingArtifactsFromBatch(dest_store, dest_indexes, writes, dense_handoffs, sparse_handoffs);
@@ -78680,8 +78889,9 @@ fn finalizeCoveredDenseProjectionCheckpointClaimed(
         current_checkpoint.config_hash != checkpoint.config_hash)
         return false;
     const current_expected_count = (try denseTargetCountForIndexContext(ctx, index_name)) orelse return false;
+    const serving_count = entry.index.servingActiveCountForCheckpoint() orelse return false;
     if (current_expected_count != expected_count or
-        entry.index.stats().active_count != current_expected_count or
+        serving_count != current_expected_count or
         entry.index.experimentalPostingDurableAppliedSequence() != applied_sequence or
         !ctx.index_manager.vectorBlockReadyForDenseIndexAtSequence(index_name, applied_sequence, current_expected_count))
         return false;
@@ -78691,7 +78901,7 @@ fn finalizeCoveredDenseProjectionCheckpointClaimed(
         .status = .clean,
         .generation = checkpoint.generation +| 1,
         .config_hash = checkpoint.config_hash,
-        .published_count = entry.index.stats().active_count,
+        .published_count = serving_count,
     };
     try ctx.index_manager.saveDenseProjectionCheckpointMetadata(index_name, clean_checkpoint);
     try apply_state.saveProjectionCheckpointWithSidecar(
@@ -105527,6 +105737,47 @@ test "db leased enrichment worker generates dense embeddings" {
     try expectDenseEmbeddingArtifactValue(alloc, artifacts[0].value, enrichment_artifact_codec.hashSource("generated vector text"), 3);
 }
 
+test "db leased enrichment worker renews text replay tenure across provider waits" {
+    const alloc = std.testing.allocator;
+    const Slow = struct {
+        calls: usize = 0,
+        fn embed(ptr: *anyopaque, a: Allocator, name: []const u8, text: []const u8, dims: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            // Plain text uses no document-transform heartbeat guard. The
+            // replay tenure must survive several renewal intervals itself.
+            sleepNs(2500 * std.time.ns_per_ms);
+            var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+            return deterministic.interface().embedDense(a, name, text, dims);
+        }
+    };
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var slow = Slow{};
+    var db = try DB.open(alloc, path_tmp.path(), .{
+        .start_optional_runtime_workers = false,
+        .enrichment = .{
+            .owner_id = "text-replay-owner",
+            .lease_ttl_ms = 1000,
+            .dense_embedder = .{ .ptr = &slow, .dense_embed_fn = Slow.embed },
+        },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense\"}}",
+    });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"slow text provider\"}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    const stats = db.enrichment_runtime.?.stats();
+    try std.testing.expectEqual(@as(usize, 1), slow.calls);
+    try std.testing.expectEqual(@as(u64, 0), stats.lost_leases);
+    try std.testing.expectEqual(db.core.nextEnrichmentSequence(), stats.applied_sequence);
+    try std.testing.expect(stats.has_lease);
+    try std.testing.expect(db.enrichment_runtime.?.ownership.renewal_count > 0);
+}
+
 test "db leased enrichment worker backs off while a stale owner holds the lease" {
     const alloc = std.testing.allocator;
 
@@ -125383,11 +125634,21 @@ test "db progressive managed admission serves a checkpointed partial generation"
         entry.index.published_active_count.store(target_before + 1, .release);
         defer entry.index.published_active_count.store(target_before, .release);
         try std.testing.expectEqual(target_before + 1, entry.index.stats().active_count);
+        try std.testing.expectEqual(target_before, entry.index.servingActiveCountForCheckpoint().?);
+        var ahead_checkpoint = certified_checkpoint;
+        ahead_checkpoint.published_count = target_before + 1;
+        try std.testing.expect(!entry.validateServingCertificate(ahead_checkpoint));
+        var unspecified_checkpoint = certified_checkpoint;
+        unspecified_checkpoint.published_count = null;
+        try db.core.saveProjectionCheckpoint(cfg.name, unspecified_checkpoint);
+        const written_checkpoint = try db.core.loadProjectionCheckpoint(alloc, cfg.name);
+        try std.testing.expectEqual(@as(?u64, target_before), written_checkpoint.published_count);
         const ahead_stats = try db.stats(alloc);
         defer types.freeDBStats(alloc, ahead_stats);
         for (ahead_stats.indexes) |index_stats| {
             if (!std.mem.eql(u8, index_stats.name, cfg.name)) continue;
             try std.testing.expect(index_stats.serving_snapshot_ready);
+            try std.testing.expectEqual(target_before, index_stats.doc_count);
         }
     }
 
@@ -125407,6 +125668,57 @@ test "db progressive managed admission serves a checkpointed partial generation"
     for (mismatched_stats.indexes) |index_stats| {
         if (!std.mem.eql(u8, index_stats.name, cfg.name)) continue;
         try std.testing.expect(!index_stats.serving_snapshot_ready);
+    }
+    // Reopen may recover an older immutable native WAL prefix while a
+    // sidecar names a later unfinished source window. Only that explicit
+    // open-boundary proof may keep the older prefix queryable; the live
+    // mismatched certificate above remains closed.
+    {
+        const entry = db.core.denseIndex(cfg.name) orelse return error.IndexNotFound;
+        var advanced_checkpoint = certified_checkpoint;
+        advanced_checkpoint.published_count = target_before + 1;
+        try std.testing.expect(entry.validateRecoveredNativeServingCertificate(advanced_checkpoint));
+        const recovered_stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, recovered_stats);
+        for (recovered_stats.indexes) |index_stats| {
+            if (!std.mem.eql(u8, index_stats.name, cfg.name)) continue;
+            try std.testing.expect(index_stats.serving_snapshot_ready);
+            try std.testing.expectEqual(target_before, index_stats.doc_count);
+        }
+        entry.recovered_native_serving_certificate = null;
+        var older_checkpoint = certified_checkpoint;
+        older_checkpoint.published_count = target_before - 1;
+        try std.testing.expect(!entry.validateRecoveredNativeServingCertificate(older_checkpoint));
+
+        // Native posting authority also outlives an optional sidecar whose
+        // count was never written for the newest source boundary.
+        var missing_checkpoint = advanced_checkpoint;
+        missing_checkpoint.published_count = null;
+        try apply_state.saveProjectionCheckpointWithSidecar(
+            alloc,
+            db.core.index_manager.checkpointIo(),
+            db.core.store,
+            db.core.applied_sequence_checkpoint_path,
+            cfg.name,
+            missing_checkpoint,
+        );
+        try std.testing.expect(entry.validateRecoveredNativeServingCertificate(missing_checkpoint));
+        const missing_stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, missing_stats);
+        for (missing_stats.indexes) |index_stats| {
+            if (!std.mem.eql(u8, index_stats.name, cfg.name)) continue;
+            try std.testing.expect(index_stats.serving_snapshot_ready);
+            try std.testing.expectEqual(target_before, index_stats.doc_count);
+        }
+        entry.recovered_native_serving_certificate = null;
+        try apply_state.saveProjectionCheckpointWithSidecar(
+            alloc,
+            db.core.index_manager.checkpointIo(),
+            db.core.store,
+            db.core.applied_sequence_checkpoint_path,
+            cfg.name,
+            advanced_checkpoint,
+        );
     }
     // A later live write can happen to reach the invalid certificate's
     // cardinality. Status may observe it, but only a publication boundary may
@@ -125793,8 +126105,20 @@ test "db progressive managed admission serves a checkpointed partial generation"
         try std.testing.expect(partial_record.next_retry_at_ms > currentTimeNs() / std.time.ns_per_ms);
     }
 
-    // The durable checkpoint and repair ownership are sufficient to restore
-    // the same partial generation as queryable after a process restart.
+    // Force a sidecar from the unfinished window across the real reopen.
+    // The immutable WAL prefix must remain queryable until the next complete
+    // publication supplies a matching count.
+    const restart_checkpoint = try db.core.loadProjectionCheckpoint(alloc, cfg.name);
+    var mismatched_restart_checkpoint = restart_checkpoint;
+    mismatched_restart_checkpoint.published_count = target_before + 1;
+    try apply_state.saveProjectionCheckpointWithSidecar(
+        alloc,
+        db.core.index_manager.checkpointIo(),
+        db.core.store,
+        db.core.applied_sequence_checkpoint_path,
+        cfg.name,
+        mismatched_restart_checkpoint,
+    );
     db.close();
     db = try DB.open(alloc, std.mem.span(path), .{
         .start_optional_runtime_workers = false,
@@ -125803,6 +126127,14 @@ test "db progressive managed admission serves a checkpointed partial generation"
     });
     try std.testing.expect(try db.managedAdmissionGenerationIsQueryable(alloc, repair.intent));
     try std.testing.expect(!try db.managedAdmissionGenerationIsServiceable(alloc, repair.intent));
+    const reopened_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, reopened_stats);
+    for (reopened_stats.indexes) |index_stats| {
+        if (!std.mem.eql(u8, index_stats.name, cfg.name)) continue;
+        try std.testing.expect(index_stats.serving_snapshot_ready);
+        try std.testing.expectEqual(target_before, index_stats.doc_count);
+    }
+    try db.core.saveProjectionCheckpoint(cfg.name, restart_checkpoint);
     {
         const entry = db.core.denseIndex(cfg.name) orelse return error.IndexNotFound;
         try std.testing.expect((try entry.index.postingBacklogStats()).hasMaintenanceDebt());
@@ -134590,6 +134922,70 @@ test "db enrichment graph ttl replay honors source tombstone" {
     defer graph_mod.GraphIndex.freeEdges(alloc, visible);
     try std.testing.expectEqual(@as(usize, 1), visible.len);
     try std.testing.expectEqual(@as(f64, 3), visible[0].weight);
+}
+
+test "db storage kernel graph edges retain typed filters and physical scan budgets" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("db-kernel-graph-edge-budgets");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "relations", .kind = .asset, .field = "relations", .content_type = "application/json" });
+    try db.addIndex(.{ .name = "relations_graph", .kind = .graph, .config_json =
+        \\{"sources":[{"artifact":"relations"}]}
+    });
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value =
+        \\{"relations":[{"type":"links","target":{"document_id":"doc:b"},"weight":2},{"type":"mentions","target":{"document_id":"doc:c"},"weight":3}]}
+    }}, .sync_level = .enrichments });
+    try db.runUntilIdle();
+    const graph = @import("../../api/distributed_graph.zig");
+    const access = algebraic_mod.ir.graphEdgeAccessPath("relations_graph");
+    var request = graph.GraphEdgesRequest{
+        .index_name = try alloc.dupe(u8, "relations_graph"),
+        .key = try alloc.dupe(u8, "doc:a"),
+        .direction = .out,
+        .tensor_access_path = .{
+            .owner = try alloc.dupe(u8, access.owner),
+            .layout = access.layout,
+            .fragments = try alloc.dupe(algebraic_mod.ir.TensorFragment, access.fragments),
+            .output_dims = try alloc.dupe(algebraic_mod.ir.Dimension, access.output_dims),
+            .law_ids = try alloc.dupe(@typeInfo(@TypeOf(access.law_ids)).pointer.child, access.law_ids),
+        },
+        .tensor_program = try graph.graphEdgesTensorProgramEnvelopeAlloc(alloc, "relations_graph"),
+        .max_edges = 2,
+        .max_owned_bytes = 4096,
+        .max_scanned_rows = 4,
+    };
+    defer request.deinit(alloc);
+    const local = @import("../local_query.zig");
+    {
+        var result = try local.executeStorageKernelGraphEdges(alloc, &db, request);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 2), result.edges.len);
+        try std.testing.expectEqual(@as(u32, 4), result.scanned_rows);
+        const wire = try graph.encodeGraphEdgesResponse(alloc, result);
+        defer alloc.free(wire);
+        var decoded = try graph.parseGraphEdgesResponse(alloc, wire);
+        defer decoded.deinit(alloc);
+        try std.testing.expectEqual(@as(u32, 4), decoded.scanned_rows);
+    }
+    request.max_scanned_rows = 1;
+    try std.testing.expectError(error.GraphExploredEdgesBudgetExceeded, local.executeStorageKernelGraphEdges(alloc, &db, request));
+    request.max_scanned_rows = 4;
+    request.max_edges = 1;
+    try std.testing.expectError(error.GraphExploredEdgesBudgetExceeded, local.executeStorageKernelGraphEdges(alloc, &db, request));
+    request.max_edges = 2;
+    request.max_owned_bytes = 1;
+    try std.testing.expectError(error.GraphExploredEdgeBytesBudgetExceeded, local.executeStorageKernelGraphEdges(alloc, &db, request));
+    request.max_owned_bytes = 4096;
+    request.edge_types = try alloc.alloc([]const u8, 1);
+    request.edge_types[0] = try alloc.dupe(u8, "mentions");
+    request.max_edges = 1;
+    var filtered = try local.executeStorageKernelGraphEdges(alloc, &db, request);
+    defer filtered.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), filtered.edges.len);
+    try std.testing.expectEqualStrings("mentions", filtered.edges[0].edge_type);
+    try std.testing.expectEqual(@as(u32, 2), filtered.scanned_rows);
 }
 
 test "db document deletion retires graph source contender and due entry" {

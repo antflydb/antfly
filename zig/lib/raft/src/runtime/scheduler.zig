@@ -28,6 +28,7 @@ pub const VirtualTime = struct {
 pub const QuarantineReason = enum {
     outbound_ready_too_large,
     apply_ready_too_large,
+    persistence_ready_too_large,
 };
 
 /// Operator-visible state for a group stopped by a non-retryable host safety
