@@ -89,7 +89,11 @@ checked before local planning, including before the first applied-entry marker
 exists. Pending jobs survive restart and leader changes. Standalone HA mirrors the exact
 selected relationship identities and job removals, encoded under the apply fence
 and reused by its durable outbox and stream; standbys never replan cleanup from
-their own directory rebuild progress.
+their own directory rebuild progress. Startup and local maintenance check the
+live HA write gate as well as Raft ownership. Standby, transitioning, fenced,
+and stale-generation owners retain queued jobs without planning local effects
+or advancing directory rebuilds; exact replicated pages remain applicable. A
+newly authorized primary resumes local cleanup through the same authority check.
 
 A transactionally maintained admission count fences graph reads only for jobs
 with incident inline edges. Empty jobs do not interrupt unrelated traversals.

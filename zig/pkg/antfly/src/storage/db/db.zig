@@ -9686,9 +9686,10 @@ pub const DB = struct {
         // Most batches create no endpoint jobs. Avoid authority probes and
         // maintenance admission altogether on their completion path.
         if (!try self.core.store.hasGraphEndpointCleanup()) return false;
-        if (try self.graphCleanupRequiresRaft()) return false;
+        if (!try self.canRunLocalGraphEndpointCleanup()) return false;
         var pages: usize = 0;
         while (pages < max_pages and try self.core.store.hasGraphEndpointCleanup()) {
+            if (!try self.canRunLocalGraphEndpointCleanup()) break;
             // The primary mutation is already durable. Cancellation can leave
             // queued maintenance for the resident owner, but must never interrupt
             // a page halfway through its atomic commit. Explicit drains use .none.
@@ -9722,6 +9723,23 @@ pub const DB = struct {
             try self.waitForCurrentSyncLevelWithCancellation(.full_index, opts.visibility_cancellation);
     }
 
+    /// Local maintenance follows the same live HA authority as user writes.
+    /// A retained standby/fenced generation may open and replay exact commands,
+    /// but cannot choose cleanup effects or mutate its local directory on its own.
+    fn graphEndpointCleanupWriteAuthority(self: *DB) !bool {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
+        if (self.ha_write_gate) |gate| gate.check() catch |err| switch (err) {
+            error.HAReadOnlyStandby, error.HAPromotedStandbyRequiresPrimaryOpen, error.HAFencedPrimary => return false,
+            else => return err,
+        };
+        return true;
+    }
+
+    fn canRunLocalGraphEndpointCleanup(self: *DB) !bool {
+        if (!try self.graphEndpointCleanupWriteAuthority()) return false;
+        return !try self.graphCleanupRequiresRaft();
+    }
+
     fn graphCleanupRequiresRaft(self: *DB) !bool {
         return blk: {
             var read = try self.core.store.beginReadTxn();
@@ -9734,7 +9752,7 @@ pub const DB = struct {
     fn startGraphEndpointCleanupWorker(self: *DB) void {
         if (comptime builtin.os.tag == .freestanding) return;
         if (!self.stable_address or !self.optional_runtime_workers_enabled or self.open_mode != .writer or self.graph_cleanup_worker != null) return;
-        if (self.graphCleanupRequiresRaft() catch true) return;
+        if (!(self.canRunLocalGraphEndpointCleanup() catch false)) return;
         const scheduler = self.backend_runtime.maintenanceScheduler() catch |err| {
             std.log.warn("graph cleanup scheduler unavailable: {}", .{err});
             return;
@@ -9766,14 +9784,14 @@ pub const DB = struct {
     /// Every enqueue path is serviced independently of subsequent foreground
     /// writes. Each scheduler turn commits at most one bounded page.
     fn runStandaloneGraphEndpointCleanupStep(self: *DB) !bool {
-        if (try self.graphCleanupRequiresRaft()) return false;
+        if (!try self.canRunLocalGraphEndpointCleanup()) return false;
         if (!try self.core.store.hasGraphEndpointCleanup()) {
             // A ready directory needs no work. Idle owners must not contend
             // with user mutations for the apply lock every scheduler turn.
             if (try self.core.store.graphIncomingDirectoryReady()) return false;
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
-            if (try self.graphCleanupRequiresRaft()) return false;
+            if (!try self.canRunLocalGraphEndpointCleanup()) return false;
             if (self.core.index_manager.hasGraphIndexes() and !try self.core.store.graphIncomingDirectoryReady())
                 return !try self.core.store.backfillGraphIncomingDirectoryPage();
             return false;
@@ -9798,9 +9816,11 @@ pub const DB = struct {
     /// The leader selects exact identities before proposal. Followers apply
     /// these afterimages rather than consulting their local directory progress.
     pub fn prepareGraphEndpointCleanupBatch(self: *DB, alloc: Allocator) !?GraphEndpointCleanupBatch {
+        if (!try self.graphEndpointCleanupWriteAuthority()) return null;
         if (!try self.core.store.hasGraphEndpointCleanup() and try self.core.store.graphIncomingDirectoryReady()) return null;
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
+        if (!try self.graphEndpointCleanupWriteAuthority()) return null;
         if (!try self.core.store.hasGraphEndpointCleanup()) {
             // Build local directory coverage ahead of future endpoint deletes,
             // without proposing empty Raft maintenance entries.
@@ -159017,4 +159037,90 @@ test "db graph endpoint cleanup pages HA mirrors exact effects across directory 
         try replica.applyHAReplicationRecord(entry.record);
         try std.testing.expectEqual(entry.record.lsn, try replica.haAppliedReplicationLsn());
     }
+}
+
+test "db graph endpoint cleanup pages HA denied owners reopen and replay without local planning" {
+    const alloc = std.testing.allocator;
+    for ([_]ha_public_gate_state_mod.Role{ .standby, .transitioning, .fenced_primary }) |role| {
+        var directory = try TestDirectory.init("ha-cleanup-authority");
+        defer directory.cleanup();
+        const job = try internal_keys.graphEndpointCleanupKeyAlloc(alloc, "hub");
+        defer alloc.free(job);
+        {
+            var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+            defer db.close();
+            try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+            try db.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "hub", .edge_type = "R" }}, .sync_level = .full_index });
+            // An HA endpoint deletion may be durable at shutdown while its
+            // exact cleanup page is still in flight from the primary.
+            try db.core.store.put(job, "hub");
+            try db.core.store.invalidateGraphDirectories();
+        }
+        var gate: ha_public_gate_state_mod.State = .{};
+        gate.role.store(@intFromEnum(role), .release);
+        var reopened = try DB.open(alloc, directory.path(), .{ .ha_write_gate = .{ .shared = .{ .state = &gate } }, .start_optional_runtimes = false, .start_index_workers = false });
+        defer reopened.close();
+        try std.testing.expect(try reopened.core.store.hasGraphEndpointCleanup());
+        try std.testing.expect(!try reopened.drainStandaloneGraphEndpointCleanup());
+        try std.testing.expect(!try reopened.runStandaloneGraphEndpointCleanupStep());
+        try std.testing.expect((try reopened.prepareGraphEndpointCleanupBatch(alloc)) == null);
+        const reset = try reopened.core.store.get(alloc, internal_keys.graph_directory_reset_key);
+        defer alloc.free(reset);
+        try std.testing.expectEqualSlices(u8, &.{0}, reset);
+        const payload = try ha_effects_mod.encodeBatchMutationRequestAlloc(alloc, .{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true, .graph_deletes = &.{.{ .index_name = "g", .source = "a", .target = "hub", .edge_type = "R" }}, .deletes = &.{job}, .sync_level = .write });
+        defer alloc.free(payload);
+        const record: ha_replication_record_mod.RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = payload };
+        try reopened.applyHAReplicationRecord(record);
+        try std.testing.expect(!try reopened.core.store.hasGraphEndpointCleanup());
+        try std.testing.expectEqual(@as(u64, 1), try reopened.haAppliedReplicationLsn());
+        const artifact = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, "a", "g", "R", "hub", "a", "");
+        defer alloc.free(artifact);
+        try std.testing.expect(try reopened.core.store.graphRelationshipRetired(artifact));
+        // Idle directory backfill is subject to the same authority gate.
+        try std.testing.expect(!try reopened.runStandaloneGraphEndpointCleanupStep());
+        try std.testing.expect((try reopened.prepareGraphEndpointCleanupBatch(alloc)) == null);
+        try std.testing.expect(!try reopened.core.store.graphIncomingDirectoryReady());
+    }
+}
+
+test "db graph endpoint cleanup pages HA promotion requires fresh owner generation" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("ha-cleanup-promotion");
+    defer directory.cleanup();
+    var log_dir = try TestDirectory.init("ha-cleanup-promotion-log");
+    defer log_dir.cleanup();
+    var slots_dir = try TestDirectory.init("ha-cleanup-promotion-slots");
+    defer slots_dir.cleanup();
+    var stream = try ha_primary_mod.Primary.open(alloc, log_dir.path().ptr, slots_dir.path().ptr, .{ .cluster_id = 200, .shard_id = 3, .table_id = 9, .timeline_id = 1, .epoch = 1 }, .{});
+    defer stream.close();
+    {
+        var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        const job = try internal_keys.graphEndpointCleanupKeyAlloc(alloc, "hub");
+        defer alloc.free(job);
+        try db.core.store.put(job, "hub");
+    }
+    var gate: ha_public_gate_state_mod.State = .{};
+    gate.role.store(@intFromEnum(ha_public_gate_state_mod.Role.standby), .release);
+    const opts: OpenOptions = .{ .ha_write_gate = .{ .shared = .{ .state = &gate } }, .start_optional_runtimes = false, .start_index_workers = false };
+    {
+        var old_owner = try DB.open(alloc, directory.path(), opts);
+        defer old_owner.close();
+        gate.publishPrimary(&stream, false);
+        try std.testing.expect(!try old_owner.drainStandaloneGraphEndpointCleanup());
+        try std.testing.expect(!try old_owner.runStandaloneGraphEndpointCleanupStep());
+        try std.testing.expect((try old_owner.prepareGraphEndpointCleanupBatch(alloc)) == null);
+        try std.testing.expect(try old_owner.core.store.hasGraphEndpointCleanup());
+    }
+    var primary_opts = opts;
+    primary_opts.ha_async_batch_mirror = .{ .primary = &stream };
+    var primary = try DB.open(alloc, directory.path(), primary_opts);
+    defer primary.close();
+    try std.testing.expect(!try primary.core.store.hasGraphEndpointCleanup());
+    var entry = (try stream.log.entryAt(alloc, stream.lastLsn())).?;
+    defer entry.deinit(alloc);
+    var decoded = try ha_effects_mod.decodeBatchMutationRequest(alloc, entry.record);
+    defer decoded.deinit();
+    try std.testing.expect(decoded.value.request.graph_endpoint_cleanup_planned);
+    try std.testing.expectEqual(@as(usize, 1), decoded.value.request.deletes.len);
 }
