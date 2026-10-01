@@ -10412,7 +10412,7 @@ test "httpx multi batch route uses the batch commit hook and public response con
     const alloc = std.testing.allocator;
     var status = AuthStatusSource{};
     var writes = FakeWrites{};
-    var api_server = ApiHttpServer.init(alloc, .{}, status.iface(), null, writes.source());
+    var api_server = ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone }, status.iface(), null, writes.source());
     var e2e_server: HttpxE2eServer = undefined;
     e2e_server.init(alloc, &api_server) catch |err| switch (err) {
         // Restricted test environments may forbid even loopback listeners.
@@ -10658,7 +10658,7 @@ test "httpx stable transaction commit durably hands off recovery before acknowle
     const alloc = std.testing.allocator;
     var status = AuthStatusSource{};
     var writes = FakeWrites{};
-    var api_server = ApiHttpServer.init(alloc, .{}, status.iface(), null, writes.source());
+    var api_server = ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone }, status.iface(), null, writes.source());
     defer api_server.deinit();
     var e2e_server: HttpxE2eServer = undefined;
     e2e_server.init(alloc, &api_server) catch |err| switch (err) {
