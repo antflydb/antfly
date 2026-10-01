@@ -55,7 +55,7 @@ pub fn executeJson(db: *DB, alloc: Allocator, request: wire.Request, cancellatio
     try request.validate();
     if (!db.core.identity_namespace.eql(request.scope.receiver_namespace)) return error.MergeCopyFenced;
     const io = db.backend_runtime.io() orelse return error.BackendRuntimeIoUnavailable;
-    const owner_cache = &db.online_merge_reader;
+    const owner_cache = &db.local_execution.online_merge_reader;
     try owner_cache.mutex.lock(io);
     defer owner_cache.mutex.unlock(io);
     const cache = &owner_cache.receiver;

@@ -16,15 +16,15 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
-const CancellationToken = @import("../../../common/cancellation.zig").CancellationToken;
-const inference_request_context = @import("../../../inference/execution_context.zig");
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
+const inference_request_context = @import("antfly_inference_execution_context");
 const RequestContext = inference_request_context.RequestContext;
 const utf8_text = @import("utf8_text.zig");
 const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
     @import("../template_stub.zig")
 else
     @import("../../../template.zig");
-const inference_work = @import("../../../inference/work.zig");
+const inference_work = @import("antfly_inference_work");
 const antfly_image = @import("antfly_image");
 
 pub const DenseEmbedFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, text: []const u8, dims: u32) anyerror![]f32;
@@ -82,16 +82,7 @@ pub const SparseEmbedWithContextFn = *const fn (ptr: *anyopaque, alloc: Allocato
 pub const SparseEmbedBatchWithContextFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, texts: []const []const u8, context: RequestContext) anyerror![]SparseEmbedding;
 pub const SparseEmbedDeinitFn = *const fn (ptr: *anyopaque, alloc: Allocator) void;
 
-pub const SparseEmbedding = struct {
-    indices: []u32,
-    values: []f32,
-
-    pub fn deinit(self: *SparseEmbedding, alloc: Allocator) void {
-        alloc.free(self.indices);
-        alloc.free(self.values);
-        self.* = undefined;
-    }
-};
+pub const SparseEmbedding = @import("antfly_sparse_embedding").SparseEmbedding;
 
 pub const DenseEmbedder = struct {
     ptr: *anyopaque,

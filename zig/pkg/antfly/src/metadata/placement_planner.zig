@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const raft_catalog = @import("../raft/catalog.zig");
+const raft_catalog = @import("../raft/storage/catalog.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const store_observer = @import("store_observer.zig");
 const table_manager = @import("table_manager.zig");

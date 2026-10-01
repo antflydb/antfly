@@ -50,8 +50,8 @@ The server topology remains Antfly Standalone.
 The implementation now consists of:
 
 - `pkg/antfly-embedded` exposes a standalone embedded package.
-- `pkg/antfly/src/embedded/db.zig` wraps the high-level DB surface.
-- `pkg/antfly/src/embedded/api.zig` exposes JSON-oriented helpers for batch,
+- `pkg/antfly-embedded/src/engine/db.zig` wraps the high-level DB surface.
+- `pkg/antfly-embedded/src/engine/api.zig` exposes JSON-oriented helpers for batch,
   lookup, scan, search, stats, indexes, enrichments, capabilities, and
   `runUntilIdle`.
 - `storage/db/db.zig` already supports open modes such as writer,

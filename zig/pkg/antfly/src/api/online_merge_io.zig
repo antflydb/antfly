@@ -36,7 +36,7 @@ pub const Port = struct {
     /// observation so a promotion cannot return another authority's result.
     /// Actual mutations still enter ordinary native batch admission, whose
     /// shared mutation lease and durable mirror own the commit boundary.
-    pub fn executeStandaloneRewrite(self: Port, alloc: std.mem.Allocator, group: u64, table: []const u8, request: contract.Request, context: operation.RequestContext, gate: ?@import("../storage/db/ha_contract.zig").WriteGate) ![]u8 {
+    pub fn executeStandaloneRewrite(self: Port, alloc: std.mem.Allocator, group: u64, table: []const u8, request: contract.Request, context: operation.RequestContext, gate: ?@import("../storage/db/replication_contract.zig").WriteGate) ![]u8 {
         try context.ensureActive();
         if (request.scope.fence.role != .rewrite_source) return error.UnsupportedRestoreSource;
         const pinned = if (gate) |value| value.pinned() else null;
@@ -70,7 +70,7 @@ test "online merge private standalone rewrite port pins authority and never fabr
     var state: gate_mod.State = .{};
     var probe: Probe = .{ .state = &state };
     const port: Port = .{ .ptr = &probe, .execute_fn = Probe.execute };
-    const gate: @import("../storage/db/ha_contract.zig").WriteGate = .{ .shared = .{ .state = &state } };
+    const gate: @import("../storage/db/replication_contract.zig").WriteGate = .{ .shared = .{ .state = state.storageWriteState() } };
     var request: contract.Request = .{
         .scope = .{
             .fence = .{ .transition_id = 1, .attempt = 0, .admission_epoch = 0, .owner_group_id = 2, .peer_group_id = 3, .role = .rewrite_source, .namespace = .{ .table_id = 1, .shard_id = 12, .range_id = 22 }, .catalog_digest = @splat(0) },
@@ -150,7 +150,7 @@ test "online merge private port preserves source recovery errors through foreign
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.failure;
         }
-        fn foreignDispatch(call: *const @import("../runtime_native_abi.zig").CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) @import("../runtime_error_abi.zig").Status {
+        fn foreignDispatch(call: *const @import("antfly_runtime_abi").native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
             return Port.BoundaryAbi.local_dispatch(call, callback, args, output);
         }
     };

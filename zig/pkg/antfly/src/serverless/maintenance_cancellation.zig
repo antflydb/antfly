@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 /// Borrowed cooperative cancellation for one synchronous maintenance pass.
 /// The atomic flag covers graceful shutdown before Future cancellation is

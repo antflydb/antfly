@@ -27,7 +27,7 @@ const settings = @import("settings.zig");
 
 pub const Request = domain.Request;
 
-pub fn storeRootMutation(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: domain.Call) ![]u8 {
+pub fn storeRootMutation(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: @import("server_call.zig").Call) ![]u8 {
     const enroll = input == .store_root_enroll;
     if (enroll and !context.setting_admin) return error.Forbidden;
     if (!enroll and input != .fk_initial_retirement_ack) return error.InvalidArgument;
@@ -460,7 +460,7 @@ fn listTablesJson(svc: anytype, alloc: std.mem.Allocator, context: operation.Req
     return result;
 }
 
-pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: domain.Call) ![]u8 {
+pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: @import("server_call.zig").Call) ![]u8 {
     return switch (input) {
         .setting_snapshot => |scope| settingSnapshotJson(svc, alloc, context, scope),
         .policy_snapshot => |request| policySnapshotJson(svc, alloc, context, request),

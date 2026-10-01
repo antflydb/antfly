@@ -15,8 +15,8 @@
 //! Complete local-metadata hot-standby capability. Distributed metadata is replicated
 //! by its own Raft group and deliberately does not expose this port.
 const std = @import("std");
-const db = @import("../storage/db/ha_contract.zig");
-const record = @import("../storage/hot_standby/replication_record.zig");
+const db = @import("../storage/db/replication_contract.zig");
+const record = @import("../storage/db/replication_record.zig");
 const staging = @import("../metadata/restore_provisioning_contract.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 

@@ -15,7 +15,7 @@
 const std = @import("std");
 const join_planning = @import("join_planning.zig");
 const RouteBudget = @import("table_router.zig").RouteBudget;
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const platform_sync = @import("antfly_platform").sync;
 const table_reads = @import("table_read_source.zig");
 const query_api = @import("query.zig");
@@ -26,6 +26,7 @@ const docstore_mod = @import("../storage/docstore.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
+const metadata_server_openapi = @import("antfly_metadata_server_openapi");
 const metadata_reconciler = @import("../metadata/reconciler.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const tables_api = @import("tables.zig");
@@ -132,7 +133,7 @@ pub const JoinContext = struct {
     planning_scope: ?*PlanningScope = null,
     routing_session: ?*table_catalog.RoutingSession = null,
     require_authoritative_routing: bool = true,
-    fanout_io: ?@import("../runtime_io_abi.zig").Borrow = null,
+    fanout_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
 
     response_label: ?[]const u8 = null,
 
@@ -541,7 +542,7 @@ pub fn parseBoundJoinRequestWithSecrets(alloc: std.mem.Allocator, body: []const 
     const wire = parsed.value.join orelse return null;
     var bound = try supportedBoundJoinFromWire(alloc, wire);
     errdefer bound.deinit(alloc);
-    var envelope = try metadata_openapi.server.parseQueryTableBody(alloc, body);
+    var envelope = try metadata_server_openapi.server.parseQueryTableBody(alloc, body);
     defer envelope.deinit();
     return .{ .join = bound, .foreign_sources = try foreign_sources_api.postgresSourceMapFromMetadataOpenApiResolvedWithSecrets(alloc, envelope.value.foreign_sources, secrets) };
 }
@@ -1742,7 +1743,7 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
     job_store.setContext(ctx);
     try ctx.ensureExecutionDeadline();
     const uses_foreign = joinUsesForeignSource(join, foreign_sources);
-    var contract_request = metadata_openapi.server.parseQueryTableBody(alloc, body) catch return error.InvalidQueryRequest;
+    var contract_request = metadata_server_openapi.server.parseQueryTableBody(alloc, body) catch return error.InvalidQueryRequest;
     defer contract_request.deinit();
     try ctx.ensureExecutionDeadline();
     const requested_left_field_strings = contract_request.value.fields orelse &.{};
@@ -2217,10 +2218,11 @@ const JoinReadBinding = struct {
         if (ctx.routing_session != null) return result;
         if (try source.acquireJoinView(alloc, .{ .clock = .{ .deadline_ns = result.ctx.nativeExecutionDeadline() }, .cancellation = result.ctx.cancellation })) |view| {
             errdefer view.deinit();
+            const routing_session: *table_catalog.RoutingSession = @ptrCast(@alignCast(view.routing_session orelse return error.TopologyChanged));
             // A finalizer may fan out further, but cannot upgrade the topology
             // admitted by its coordinator to a newer split/rename generation.
             if (source.route_fence) |expected| {
-                const catalog = view.session.catalog();
+                const catalog = routing_session.catalog();
                 const actual = (try catalog.vtable.route_fence.?(catalog.ptr, expected.route.group_id)) orelse return error.TopologyChanged;
                 if (actual.metadata_group_id != expected.metadata_group_id or
                     !std.meta.eql(actual.metadata_incarnation, expected.metadata_incarnation) or
@@ -2228,7 +2230,7 @@ const JoinReadBinding = struct {
                     !std.meta.eql(actual.route, expected.route)) return error.TopologyChanged;
             }
             result.view = view;
-            result.ctx.routing_session = &view.session;
+            result.ctx.routing_session = routing_session;
             result.source = view.source;
         }
         return result;
@@ -4645,7 +4647,7 @@ pub fn parseSupportedJoinRequestWithSecrets(
     body: []const u8,
     secret_store: ?*@import("../common/secrets.zig").FileStore,
 ) !?ParsedSupportedJoinRequest {
-    var parsed_request = metadata_openapi.server.parseQueryTableBody(alloc, body) catch return error.InvalidQueryRequest;
+    var parsed_request = metadata_server_openapi.server.parseQueryTableBody(alloc, body) catch return error.InvalidQueryRequest;
     defer parsed_request.deinit();
     const join = parsed_request.value.join orelse return null;
     var owned_join = try supportedJoinRequestFromOpenApi(alloc, join);
@@ -9530,7 +9532,7 @@ test "distributed join fanout bounds concurrency drains errors and preserves gro
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .limited(8) });
     defer threaded.deinit();
     const io = threaded.io();
-    var ctx = JoinContext{ .ptr = &fixture, .fanout_io = @import("../runtime_io_abi.zig").Borrow.init(&io), .vtable = undefined };
+    var ctx = JoinContext{ .ptr = &fixture, .fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io), .vtable = undefined };
     const source = table_reads.TableReadSource{ .ptr = &fixture, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .query_group_local = Fixture.query } };
     const alloc = std.testing.allocator;
     var hits = std.json.Array.init(alloc);
@@ -9582,6 +9584,7 @@ test "distributed join finalizer refuses to replace an admitted split topology" 
         released: usize = 0,
         const Holder = struct {
             view: table_reads.JoinReadView,
+            session: table_catalog.RoutingSession,
             owner: *ThisFixture,
             allocator: std.mem.Allocator,
         };
@@ -9591,12 +9594,13 @@ test "distributed join finalizer refuses to replace an admitted split topology" 
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const holder = try a.create(Holder);
             self.generation.retain();
-            holder.* = .{ .owner = self, .allocator = a, .view = .{ .session = self.generation.session(a, undefined, true), .source = undefined, .destroy = destroy } };
+            holder.* = .{ .owner = self, .allocator = a, .session = self.generation.session(a, undefined, true), .view = .{ .source = undefined, .destroy = destroy } };
+            holder.view.routing_session = @ptrCast(&holder.session);
             return &holder.view;
         }
         fn destroy(view: *table_reads.JoinReadView) void {
             const holder: *Holder = @fieldParentPtr("view", view);
-            view.session.deinit();
+            holder.session.deinit();
             holder.owner.released += 1;
             holder.allocator.destroy(holder);
         }

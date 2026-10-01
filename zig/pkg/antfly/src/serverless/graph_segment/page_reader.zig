@@ -25,7 +25,7 @@ const artifacts = @import("../artifacts/store.zig");
 const refs = @import("../manifest/artifact_ref.zig");
 const wire = @import("packed.zig");
 const types = @import("types.zig");
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const Dictionary = std.StringArrayHashMapUnmanaged(void);
 
 fn clear(alloc: Allocator, dict: *Dictionary) void {

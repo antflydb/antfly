@@ -5,7 +5,7 @@
 //! error numbering or std.Io implementation.
 const std = @import("std");
 const secrets = @import("common/secrets.zig");
-const error_abi = @import("runtime_error_abi.zig");
+const error_abi = @import("antfly_runtime_abi").error_abi;
 
 // Tests execute serially. Inject inside the owning archive so the consumer
 // must receive cancellation through stable callback status transport.

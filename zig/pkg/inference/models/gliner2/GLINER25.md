@@ -262,7 +262,7 @@ production row's `LengthContract`.
 The fix in section 6 lived in `extractJSON` (the HTTP handler) only. The
 in-process worker's provider "extract" operation
 (`host.linkedInferenceInvokeProvider` in
-`antfly/src/standalone/inference_host.zig`) never calls `extractJSON`; it
+`zig/pkg/inference/src/host/host.zig`) never calls `extractJSON`; it
 calls `Node.extractDirectWithControl` directly, which calls the shared
 `extractWithAdmission`. Running `examples/dogfood` in-process (real
 enrichment drain, `-extract-model fastino/gliner2.5-base-v1`) still hit
@@ -775,7 +775,7 @@ ingest process stalled at 100% CPU with no further log output
 `GlinerBoundary*LimitExceeded` error (like the pre-existing
 `UnsupportedGlinerBoundaryRuntime`) collapses to the stable
 `error.InferenceProviderFailure` at the provider ABI boundary
-(`zig/pkg/antfly/src/standalone/provider_failure.zig`), which
+(`zig/pkg/inference/src/host/provider_failure.zig`), which
 `enrichment_runtime.zig`'s `enrichmentErrorDisposition` already classifies
 `.terminal_request` (not retried) -- confirmed by code reading and by
 reproducing the exact 2-item-batch rejection against a live `antfly
@@ -1068,7 +1068,7 @@ findings, outside this file's ownership to fix):**
   concurrency `zig/pkg/antfly`'s enrichment runtime allows, not something
   `zig/pkg/inference`'s Node/executor controls.
 - **The embedded worker's out-of-process hop, on Metal.** Reading (not
-  editing) `zig/pkg/antfly/src/standalone/inference_host.zig`:
+  editing) `zig/pkg/inference/src/host/host.zig`:
   `linkedInferenceCreateLocal` sets `use_worker = ... and
   inference.backends.BackendRuntime.availableRequiresProcessIsolation()`,
   and when true, `linkedInferenceInvokeProvider` routes every provider call

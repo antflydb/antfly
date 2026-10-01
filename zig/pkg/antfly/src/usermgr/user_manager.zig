@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const catalog_names = @import("../system_catalog/domain.zig");
-const io_abi = @import("../runtime_io_abi.zig");
+const io_abi = @import("antfly_runtime_abi").io_abi;
 const casbin = @import("antfly_casbin");
 
 const Allocator = std.mem.Allocator;

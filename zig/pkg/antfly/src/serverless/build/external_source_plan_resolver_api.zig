@@ -28,7 +28,7 @@ pub const ResolveRequest = struct {
     /// a shared mutable artifact-store pointer or upload before fencing.
     artifacts: *@import("../artifacts/store.zig").ArtifactStore,
     previous_artifacts: []const @import("../manifest/artifact_ref.zig").ArtifactRef = &.{},
-    cancellation: @import("../../common/cancellation.zig").CancellationToken = .none,
+    cancellation: @import("antfly_cancellation").CancellationToken = .none,
 };
 
 pub const Resolver = struct {

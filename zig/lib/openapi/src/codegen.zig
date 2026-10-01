@@ -35,6 +35,9 @@ pub const GenerateOptions = struct {
     /// Generate only framework-agnostic extractors (param structs, body parsers, route table).
     /// Like server but without the httpx-specific ServerRouter layer.
     generate_extractors: bool = false,
+    /// For a server-only output, use an existing generated types module instead
+    /// of emitting a second types.zig. Its root must re-export schema types.
+    external_types_module: ?[]const u8 = null,
     /// Maps external $ref file paths to Zig import module names.
     /// e.g., "../../lib/schema/openapi.yaml" → "schema"
     /// When a $ref points to a mapped file, the generated code will emit
@@ -54,6 +57,11 @@ pub const GeneratedFiles = struct {
 
 /// Generate all code from a parsed OpenAPI document.
 pub fn generate(arena: Allocator, doc: *const types.OpenApiDoc, opts: GenerateOptions) !GeneratedFiles {
+    if (opts.external_types_module != null and opts.generate_types)
+        return error.ExternalTypesWithGeneratedTypes;
+    if (opts.external_types_module == null and !opts.generate_types and
+        (opts.generate_client or opts.generate_server or opts.generate_extractors))
+        return error.MissingTypesModule;
     var result = GeneratedFiles{ .root = undefined };
 
     var resolver = Resolver.init(arena, doc);
@@ -78,7 +86,8 @@ pub fn generate(arena: Allocator, doc: *const types.OpenApiDoc, opts: GenerateOp
         type_gen.zig_type_mapping = opts.zig_type_mapping;
         var client_gen = ClientGenerator.init(arena, &body_w, &resolver, &type_gen);
         try client_gen.generate(doc);
-        result.client = try buildModule(arena, opts.package_name, &.{ .{ "httpx", "httpx" }, .{ "types", "types.zig" } }, type_gen.used_imports, body_w.toSlice());
+        const types_import = opts.external_types_module orelse "types.zig";
+        result.client = try buildModule(arena, opts.package_name, &.{ .{ "httpx", "httpx" }, .{ "types", types_import } }, type_gen.used_imports, body_w.toSlice());
     }
 
     // Generate server (full with httpx router) or extractors only (framework-agnostic)
@@ -88,12 +97,13 @@ pub fn generate(arena: Allocator, doc: *const types.OpenApiDoc, opts: GenerateOp
         type_gen.import_mapping = opts.import_mapping;
         type_gen.zig_type_mapping = opts.zig_type_mapping;
         var server_gen = ServerGenerator.init(arena, &body_w, &resolver, &type_gen);
+        const types_import = opts.external_types_module orelse "types.zig";
         if (opts.generate_server) {
             try server_gen.generate(doc);
-            result.server = try buildModule(arena, opts.package_name, &.{ .{ "httpx", "httpx" }, .{ "types", "types.zig" } }, type_gen.used_imports, body_w.toSlice());
+            result.server = try buildModule(arena, opts.package_name, &.{ .{ "httpx", "httpx" }, .{ "types", types_import } }, type_gen.used_imports, body_w.toSlice());
         } else {
             try server_gen.generateExtractorsOnly(doc);
-            result.server = try buildModule(arena, opts.package_name, &.{.{ "types", "types.zig" }}, type_gen.used_imports, body_w.toSlice());
+            result.server = try buildModule(arena, opts.package_name, &.{.{ "types", types_import }}, type_gen.used_imports, body_w.toSlice());
         }
     }
 
@@ -506,4 +516,35 @@ test "generate extractors only" {
 
     // Client should not be generated
     try std.testing.expect(result.client == null);
+}
+
+test "server-only output imports one existing types module" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const doc = types.OpenApiDoc{
+        .openapi = "3.0.3",
+        .info = .{ .title = "Shared types", .version = "1.0" },
+    };
+    const generated = try generate(arena, &doc, .{
+        .package_name = "server_api",
+        .generate_types = false,
+        .generate_client = false,
+        .generate_server = true,
+        .external_types_module = "shared_api",
+    });
+    try std.testing.expect(generated.types == null);
+    try std.testing.expect(std.mem.indexOf(u8, generated.root, "types.zig") == null);
+    try std.testing.expect(std.mem.indexOf(u8, generated.server.?, "const types = @import(\"shared_api\");") != null);
+    try std.testing.expectError(error.MissingTypesModule, generate(arena, &doc, .{
+        .generate_types = false,
+        .generate_client = false,
+        .generate_server = true,
+    }));
+    try std.testing.expectError(error.ExternalTypesWithGeneratedTypes, generate(arena, &doc, .{
+        .generate_types = true,
+        .generate_client = false,
+        .generate_server = true,
+        .external_types_module = "shared_api",
+    }));
 }

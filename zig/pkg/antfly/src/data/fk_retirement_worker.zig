@@ -4,7 +4,7 @@
 //! The prepared ticket survives process death before/after rename. A receipt
 //! is created only after both rename parents and the unlinked intent are synced.
 const std = @import("std");
-const fs = @import("../common/fs_paths.zig");
+const fs = @import("antfly_runtime_fs").fs_paths;
 const contract = @import("../metadata/fk_initial_retirement_contract.zig");
 const auth = @import("../metadata/fk_initial_retirement_auth.zig");
 const signing = @import("../storage/db/root_signing_identity.zig");

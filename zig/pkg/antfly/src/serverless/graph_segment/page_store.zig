@@ -17,7 +17,7 @@
 const std = @import("std");
 const tree = @import("page_tree.zig");
 const artifacts = @import("../artifacts/store.zig");
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const graph = @import("page_graph.zig");
 const refs = @import("../manifest/artifact_ref.zig");
 

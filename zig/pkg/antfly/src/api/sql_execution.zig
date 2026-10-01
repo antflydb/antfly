@@ -1156,7 +1156,7 @@ test "SQL point bound is half-open and excludes all byte-key descendants" {
 
 test "SQL require-index equality uses exact native bounds only inside a guarded statement" {
     const Fake = struct {
-        fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, call: system_catalog.Call) ![]u8 {
+        fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             if (call == .policy_publication_status) {
                 try std.testing.expect(context.row_policy_install_authority);
                 const mode: *u8 = @ptrCast(@alignCast(ptr));
@@ -1235,7 +1235,7 @@ test "SQL API document preparation uses native normalization and retains mutatio
     const Fake = struct {
         normalized: bool = false,
         closed: bool = false,
-        fn resolve(_: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: system_catalog.Call) ![]u8 {
+        fn resolve(_: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             if (call == .policy_publication_status) return error.RowPolicyCatalogChanged;
             return alloc.dupe(u8, "{\"revision\":3,\"tables\":[{\"table_id\":7,\"name\":\"physical\"}]}");
         }
@@ -1310,7 +1310,7 @@ test "SQL API guarded sessions retain reads and atomic MERGE writes across trans
         fn status(_: *anyopaque) !metadata.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
-        fn resolve(_: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: system_catalog.Call) ![]u8 {
+        fn resolve(_: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             if (call == .write_validation) return std.json.Stringify.valueAlloc(alloc, .{ .schema_json = schema }, .{});
             if (call == .policy_publication_status) return error.RowPolicyCatalogChanged;
             return std.json.Stringify.valueAlloc(alloc, .{ .revision = 2, .tables = .{.{ .table_id = 3, .name = "physical", .query_definition = .{ .table_id = 3, .schema_json = schema, .read_schema_json = "", .indexes_json = "{}" } }}, .logical_names = .{"docs"} }, .{});
@@ -1642,7 +1642,7 @@ test "SQL API cross-table MERGE retains both source and target range proofs" {
         fn status(_: *anyopaque) !metadata.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
-        fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: system_catalog.Call) ![]u8 {
+        fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *Self = @ptrCast(@alignCast(ptr));
             if (call == .write_validation) return std.json.Stringify.valueAlloc(alloc, .{ .schema_json = schema }, .{});
             if (call == .policy_publication_status) return error.RowPolicyCatalogChanged;
@@ -2545,7 +2545,7 @@ test "SQL direct conflict scalar uses one guarded native cut through owner and c
         fn status(_: *anyopaque) !metadata.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
-        fn resolve(ptr: *anyopaque, allocator: std.mem.Allocator, context: operation.RequestContext, call: system_catalog.Call) ![]u8 {
+        fn resolve(ptr: *anyopaque, allocator: std.mem.Allocator, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             if (call == .write_validation) return std.json.Stringify.valueAlloc(allocator, .{ .schema_json = schema }, .{});
             if (call == .policy_publication_status) {
                 try std.testing.expect(context.row_policy_install_authority);
@@ -2605,7 +2605,7 @@ test "SQL direct conflict scalar uses one guarded native cut through owner and c
             }
             return .{ .ptr = self, .views = self.views[0..scans.len], .vtable = &.{ .close = close, .range_proofs = proofs } };
         }
-        fn openSnapshot(ptr: *anyopaque, _: std.mem.Allocator, table: []const u8, _: u32, _: @import("../raft/read_gate.zig").ReadConsistency, _: ?@import("../common/cancellation.zig").CancellationToken, _: ?u64) !reads.RelationalStatementSnapshot {
+        fn openSnapshot(ptr: *anyopaque, _: std.mem.Allocator, table: []const u8, _: u32, _: @import("../raft/read_gate.zig").ReadConsistency, _: ?@import("antfly_cancellation").CancellationToken, _: ?u64) !reads.RelationalStatementSnapshot {
             const self: *Self = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("physical_usage", table);
             self.captures += 1;

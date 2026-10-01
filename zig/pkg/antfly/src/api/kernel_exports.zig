@@ -26,11 +26,13 @@ const backend_erased = @import("../storage/backend_erased.zig");
 const ha_http_operation = @import("../storage/hot_standby/http_operation.zig");
 const httpx = @import("httpx");
 const platform_sync = @import("antfly_platform").sync;
-const runtime_http_bridge = @import("../runtime_http_bridge.zig");
+const runtime_http_bridge = @import("antfly_runtime_abi").http_bridge;
 const metadata_api = @import("../metadata/api.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
-const runtime_io_abi = @import("../runtime_io_abi.zig");
+const metadata_server_openapi = @import("antfly_metadata_server_openapi");
+const usermgr_server_openapi = @import("antfly_usermgr_server_openapi");
+const runtime_io_abi = @import("antfly_runtime_abi").io_abi;
 
 pub const CreateContext = abi.CreateContext;
 pub const CallContext = abi.CallContext;
@@ -188,7 +190,7 @@ pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
         state.server.deinit();
         return fail(err);
     };
-    if (reads.*) |read_source| read_source.bindIncomingGraphRoutes(&state.server.incoming_graph_routes);
+    if (reads.*) |read_source| read_source.bindIncomingGraphRoutes(@ptrCast(&state.server.incoming_graph_routes));
     state.request_alloc_abi = .fromStd(&state.server.alloc);
     context.out_handle.* = state;
     context.out_request_alloc.* = &state.request_alloc_abi;
@@ -654,7 +656,7 @@ fn routeMetadata(method: abi.HttpMethod, path: []const u8) RouteMetadata {
         .delete => "DELETE",
         .patch => "PATCH",
     };
-    inline for (.{ metadata_openapi.server.routes, usermgr_openapi.server.routes }) |routes| {
+    inline for (.{ metadata_server_openapi.server.routes, usermgr_server_openapi.server.routes }) |routes| {
         for (routes) |route| {
             if (std.mem.eql(u8, route.method, method_name) and metadataPathMatches(route.path, path)) {
                 return .{

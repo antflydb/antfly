@@ -47,5 +47,5 @@ pub fn install(alloc: std.mem.Allocator, db: *db_mod.DB, before_json: []const u8
         .before_catalog_digest = before_catalog_digest,
         .after_catalog_digest = after_catalog_digest,
     } };
-    try db.batchRaftReplicatedApply(.{ .relational_topology = command }, .{ .term = 1, .index = raft_index });
+    try @import("../storage/server_db_adapter.zig").applyOrdered(&db, .{ .relational_topology = command }, .{ .term = 1, .index = raft_index });
 }
