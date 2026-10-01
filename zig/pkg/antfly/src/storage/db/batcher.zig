@@ -1156,50 +1156,19 @@ test "sparse replay preserves multiple artifact members for one source key" {
 }
 
 fn cloneGraphWrite(alloc: Allocator, write: types.GraphEdgeWrite) !types.GraphEdgeWrite {
-    return .{
-        .index_name = try alloc.dupe(u8, write.index_name),
-        .source = try alloc.dupe(u8, write.source),
-        .target = try alloc.dupe(u8, write.target),
-        .edge_type = try alloc.dupe(u8, write.edge_type),
-        .edge_id = try alloc.dupe(u8, write.edge_id),
-        .owner_document = try alloc.dupe(u8, write.owner_document),
-        .weight = write.weight,
-        .created_at = write.created_at,
-        .updated_at = write.updated_at,
-        .metadata_json = if (write.metadata_json.len > 0) try alloc.dupe(u8, write.metadata_json) else "",
-    };
+    return write.cloneAlloc(alloc);
 }
 
 fn deinitGraphWrite(alloc: Allocator, write: *types.GraphEdgeWrite) void {
-    alloc.free(@constCast(write.index_name));
-    alloc.free(@constCast(write.source));
-    alloc.free(@constCast(write.target));
-    alloc.free(@constCast(write.edge_type));
-    if (write.edge_id.len > 0) alloc.free(@constCast(write.edge_id));
-    if (write.owner_document.len > 0) alloc.free(@constCast(write.owner_document));
-    if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
-    write.* = undefined;
+    write.deinit(alloc);
 }
 
 fn cloneGraphDelete(alloc: Allocator, delete: types.GraphEdgeDelete) !types.GraphEdgeDelete {
-    return .{
-        .index_name = try alloc.dupe(u8, delete.index_name),
-        .source = try alloc.dupe(u8, delete.source),
-        .target = try alloc.dupe(u8, delete.target),
-        .edge_type = try alloc.dupe(u8, delete.edge_type),
-        .edge_id = try alloc.dupe(u8, delete.edge_id),
-        .owner_document = try alloc.dupe(u8, delete.owner_document),
-    };
+    return delete.cloneAlloc(alloc);
 }
 
 fn deinitGraphDelete(alloc: Allocator, delete: *types.GraphEdgeDelete) void {
-    alloc.free(@constCast(delete.index_name));
-    alloc.free(@constCast(delete.source));
-    alloc.free(@constCast(delete.target));
-    alloc.free(@constCast(delete.edge_type));
-    if (delete.edge_id.len > 0) alloc.free(@constCast(delete.edge_id));
-    if (delete.owner_document.len > 0) alloc.free(@constCast(delete.owner_document));
-    delete.* = undefined;
+    delete.deinit(alloc);
 }
 
 test "graph replay node clears do not subsume independently owned fact deletions" {

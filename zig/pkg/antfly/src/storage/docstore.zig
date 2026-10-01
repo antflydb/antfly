@@ -356,6 +356,85 @@ pub const DocStoreOptions = struct {
     read_only: bool = false,
 };
 
+fn applyGraphRetirement(txn: anytype, alloc: Allocator, key: []const u8, value: []const u8, maybe: *?bool) anyerror!void {
+    if (!std.mem.eql(u8, value, "1")) return error.InvalidGraphRetirement;
+    const artifact = try internal_keys.graphRetirementArtifactKeyAlloc(alloc, key);
+    defer alloc.free(artifact);
+    txn.delete(artifact) catch |err| switch (err) {
+        error.NotFound => {},
+        else => return err,
+    };
+    const ref = try internal_keys.graphRetirementRefKeyAlloc(alloc, key);
+    defer alloc.free(ref);
+    if (txn.get(ref)) |_| {} else |err| {
+        if (err != error.NotFound) return err;
+        const count = try graphRetirementCount(txn);
+        const next = try std.math.add(u64, count, 1);
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, next, .little);
+        try txn.put(ref, "1");
+        try txn.put(internal_keys.graph_retirement_count_key, &bytes);
+    }
+    // Old stores remain conservative until the bounded v2 migration completes.
+    try txn.put(internal_keys.graph_retirement_present_key, "1");
+    maybe.* = true;
+}
+
+fn graphRetirementCount(txn: anytype) !u64 {
+    const bytes = txn.get(internal_keys.graph_retirement_count_key) catch |err| switch (err) {
+        error.NotFound => return 0,
+        else => return err,
+    };
+    if (bytes.len != 8) return error.InvalidGraphRetirement;
+    return std.mem.readInt(u64, bytes[0..8], .little);
+}
+
+fn removeGraphRetirementReference(txn: anytype, alloc: Allocator, key: []const u8, maybe: *?bool) anyerror!void {
+    if (!internal_keys.isGraphRetirementKey(key)) return;
+    const ref = try internal_keys.graphRetirementRefKeyAlloc(alloc, key);
+    defer alloc.free(ref);
+    _ = txn.get(ref) catch |err| switch (err) {
+        error.NotFound => return,
+        else => return err,
+    };
+    const next = try std.math.sub(u64, try graphRetirementCount(txn), 1);
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, next, .little);
+    try txn.delete(ref);
+    try txn.put(internal_keys.graph_retirement_count_key, &bytes);
+    maybe.* = null;
+}
+
+fn graphRetirementsPresentCached(txn: anytype, maybe: *?bool) !bool {
+    if (maybe.* == null) {
+        if (txn.get(internal_keys.graph_incoming_ready_key)) |_| {
+            maybe.* = try graphRetirementCount(txn) != 0;
+            return maybe.*.?;
+        } else |err| if (err != error.NotFound) return err;
+        // Without a complete local directory, absence of metadata proves
+        // nothing about primary markers (physical range copies omit metadata).
+        maybe.* = true;
+    }
+    return maybe.*.?;
+}
+
+fn graphRelationshipRetiredCached(txn: anytype, alloc: Allocator, key: []const u8, maybe: *?bool) !bool {
+    if (!internal_keys.isGraphEdgeArtifactKey(key)) return false;
+    if (!try graphRetirementsPresentCached(txn, maybe)) return false;
+    return graphRelationshipRetiredInTxn(txn, alloc, key);
+}
+
+fn graphRelationshipRetiredInTxn(txn: anytype, alloc: Allocator, key: []const u8) !bool {
+    if (!internal_keys.isGraphEdgeArtifactKey(key)) return false;
+    const retirement = try internal_keys.graphRetirementKeyAlloc(alloc, key);
+    defer alloc.free(retirement);
+    _ = txn.get(retirement) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
 fn columnarMutationToken(txn: anytype, cached: *?internal_keys.ColumnarMutationToken) !internal_keys.ColumnarMutationToken {
     if (cached.*) |token| return token;
     const old = txn.get(internal_keys.relational_columnar_mutation_key) catch |err| switch (err) {
@@ -437,6 +516,8 @@ pub const DocStore = struct {
         portable_import_reader_owner: ?*DocStore = null,
         columns_invalidated: bool = false,
         columnar_mutation: ?internal_keys.ColumnarMutationToken = null,
+        graph_directory_checked: bool = false,
+        graph_retirements_maybe: ?bool = null,
         columnar_owner: ?*DocStore = null,
 
         pub const CursorAdapter = backend_erased.Cursor;
@@ -618,7 +699,20 @@ pub const DocStore = struct {
             return try self.getManySorted(keys, values);
         }
 
-        pub fn put(self: *Txn, key: []const u8, value: []const u8) !void {
+        pub fn put(self: *Txn, key: []const u8, value: []const u8) anyerror!void {
+            if (internal_keys.isInternalUserKey(key) and !self.graph_directory_checked) {
+                self.graph_directory_checked = true;
+                try initializeEmptyGraphIncomingDirectory(self);
+            }
+            if (internal_keys.isGraphRetirementKey(key)) {
+                try applyGraphRetirement(self, self.alloc, key, value, &self.graph_retirements_maybe);
+            }
+            if (try graphRelationshipRetiredCached(self, self.alloc, key, &self.graph_retirements_maybe)) return;
+
+            if (try internal_keys.graphIncomingKeyAlloc(self.alloc, key)) |incoming| {
+                defer self.alloc.free(incoming);
+                try self.put(incoming, key);
+            }
             try self.markColumnarDirty(key, value);
             try self.invalidateColumns(key);
             if (supports_lmdb) {
@@ -632,7 +726,15 @@ pub const DocStore = struct {
             if (self.payload_session) |session| try session.recordOwnership(&self.write.?, key, stored);
         }
 
-        pub fn delete(self: *Txn, key: []const u8) !void {
+        pub fn delete(self: *Txn, key: []const u8) anyerror!void {
+            try removeGraphRetirementReference(self, self.alloc, key, &self.graph_retirements_maybe);
+            if (try internal_keys.graphIncomingKeyAlloc(self.alloc, key)) |incoming| {
+                defer self.alloc.free(incoming);
+                self.delete(incoming) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+            }
             try self.markColumnarDirty(key, null);
             try self.invalidateColumns(key);
             if (supports_lmdb) {
@@ -712,6 +814,8 @@ pub const DocStore = struct {
         alloc: Allocator,
         columns_invalidated: bool = false,
         columnar_mutation: ?internal_keys.ColumnarMutationToken = null,
+        graph_directory_checked: bool = false,
+        graph_retirements_maybe: ?bool = null,
         unordered_bulk_append_puts: bool = false,
         raw: ?LmdbBatch = null,
         dbi: LmdbDbi = undefined,
@@ -722,6 +826,8 @@ pub const DocStore = struct {
             alloc: Allocator,
             columns_invalidated: *bool,
             columnar_mutation: *?internal_keys.ColumnarMutationToken,
+            graph_directory_checked: *bool,
+            graph_retirements_maybe: *?bool,
             unordered_bulk_append_puts: bool = false,
             raw: ?*LmdbTransaction = null,
             dbi: LmdbDbi = undefined,
@@ -757,7 +863,20 @@ pub const DocStore = struct {
                 }
             }
 
-            pub fn put(self: @This(), key: []const u8, value: []const u8) !void {
+            pub fn put(self: @This(), key: []const u8, value: []const u8) anyerror!void {
+                if (internal_keys.isInternalUserKey(key) and !self.graph_directory_checked.*) {
+                    self.graph_directory_checked.* = true;
+                    try initializeEmptyGraphIncomingDirectory(self);
+                }
+                if (internal_keys.isGraphRetirementKey(key)) {
+                    try applyGraphRetirement(self, self.alloc, key, value, self.graph_retirements_maybe);
+                }
+                if (try graphRelationshipRetiredCached(self, self.alloc, key, self.graph_retirements_maybe)) return;
+
+                if (try internal_keys.graphIncomingKeyAlloc(self.alloc, key)) |incoming| {
+                    defer self.alloc.free(incoming);
+                    try self.put(incoming, key);
+                }
                 try self.markColumnarDirty(key, value);
                 try self.invalidateColumns(key);
                 if (supports_lmdb) {
@@ -771,7 +890,29 @@ pub const DocStore = struct {
                 if (self.payload_session) |session| try session.recordOwnership(self.runtime.?, key, stored);
             }
 
-            pub fn appendPut(self: @This(), key: []const u8, value: []const u8) !void {
+            pub fn appendPut(self: @This(), key: []const u8, value: []const u8) anyerror!void {
+                return self.appendPutChecked(key, value, false);
+            }
+
+            fn appendPutChecked(self: @This(), key: []const u8, value: []const u8, retirement_checked: bool) anyerror!void {
+                if (internal_keys.isInternalUserKey(key) and !self.graph_directory_checked.*) {
+                    self.graph_directory_checked.* = true;
+                    try initializeEmptyGraphIncomingDirectory(self);
+                }
+                if (internal_keys.isGraphRetirementKey(key)) {
+                    if (self.unordered_bulk_append_puts) return error.Unsupported;
+                    try applyGraphRetirement(self, self.alloc, key, value, self.graph_retirements_maybe);
+                }
+                // Read-dependent filtering cannot stay in the unordered append
+                // arena: fall back once instead of draining it for every edge.
+                if (!retirement_checked and self.unordered_bulk_append_puts and internal_keys.isGraphEdgeArtifactKey(key) and
+                    try graphRetirementsPresentCached(self, self.graph_retirements_maybe)) return error.Unsupported;
+                if (!retirement_checked and try graphRelationshipRetiredCached(self, self.alloc, key, self.graph_retirements_maybe)) return;
+
+                if (try internal_keys.graphIncomingKeyAlloc(self.alloc, key)) |incoming| {
+                    defer self.alloc.free(incoming);
+                    try self.appendPut(incoming, key);
+                }
                 if (self.unordered_bulk_append_puts and internal_keys.isRelationalRowKey(key)) {
                     // Keep auxiliary records in the bulk arena too. A regular
                     // put drains that arena into a sorted mutable map, causing
@@ -792,7 +933,15 @@ pub const DocStore = struct {
                 if (self.payload_session) |session| try session.recordOwnership(self.runtime.?, key, stored);
             }
 
-            pub fn delete(self: @This(), key: []const u8) !void {
+            pub fn delete(self: @This(), key: []const u8) anyerror!void {
+                try removeGraphRetirementReference(self, self.alloc, key, self.graph_retirements_maybe);
+                if (try internal_keys.graphIncomingKeyAlloc(self.alloc, key)) |incoming| {
+                    defer self.alloc.free(incoming);
+                    self.delete(incoming) catch |err| switch (err) {
+                        error.NotFound => {},
+                        else => return err,
+                    };
+                }
                 try self.markColumnarDirty(key, null);
                 try self.invalidateColumns(key);
                 if (supports_lmdb) {
@@ -897,6 +1046,8 @@ pub const DocStore = struct {
                 .raw = if (supports_lmdb) if (self.raw) |*raw| raw.asTransaction() else null else null,
                 .columns_invalidated = &self.columns_invalidated,
                 .columnar_mutation = &self.columnar_mutation,
+                .graph_directory_checked = &self.graph_directory_checked,
+                .graph_retirements_maybe = &self.graph_retirements_maybe,
                 .unordered_bulk_append_puts = self.unordered_bulk_append_puts,
                 .dbi = self.dbi,
                 .runtime = if (self.runtime) |*runtime| runtime else null,
@@ -1319,6 +1470,178 @@ pub const DocStore = struct {
         return txn;
     }
 
+    pub fn hasGraphRetirements(self: *DocStore) !bool {
+        try self.ensureGraphIncomingDirectory();
+        var txn = try self.beginReadTxn();
+        defer txn.abort();
+        var maybe: ?bool = null;
+        return graphRetirementsPresentCached(&txn, &maybe);
+    }
+
+    pub fn graphRelationshipRetired(self: *DocStore, key: []const u8) !bool {
+        var txn = try self.beginReadTxn();
+        defer txn.abort();
+        return graphRelationshipRetiredInTxn(&txn, self.alloc, key);
+    }
+
+    /// Physical range rewrites bypass per-key directory maintenance. Reset
+    /// local derived state in bounded, restartable pages before rebuilding it.
+    pub fn invalidateGraphDirectories(self: *DocStore) !void {
+        var txn = try self.beginWriteTxn();
+        errdefer txn.abort();
+        // A new physical rewrite restarts clearing even if a previous rebuild
+        // was interrupted: its checkpoint described a different primary range.
+        try txn.put(internal_keys.graph_directory_reset_key, &.{0});
+        for ([_][]const u8{ internal_keys.graph_incoming_ready_key, internal_keys.graph_incoming_cursor_key }) |key| {
+            txn.delete(key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        }
+        try txn.commit();
+    }
+
+    pub fn rebuildGraphDirectories(self: *DocStore) !void {
+        try self.invalidateGraphDirectories();
+        try self.ensureGraphIncomingDirectory();
+    }
+
+    /// A durable page checkpoint limits temporary memory and writer occupancy.
+    /// Ordinary writes maintain the directory throughout migration, including
+    /// artifacts inserted behind the checkpoint. Read and publication share
+    /// each page's writer transaction, so deletes cannot race the backfill.
+    pub fn backfillGraphIncomingDirectoryPage(self: *DocStore) !bool {
+        var txn = try self.beginWriteTxn();
+        errdefer txn.abort();
+        const reset = txn.get(internal_keys.graph_directory_reset_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (reset) |phase| {
+            if (phase.len != 1 or phase[0] > 2) return error.InvalidGraphRetirement;
+            if (phase[0] < 2) {
+                const current = phase[0];
+                const prefix = if (current == 0) internal_keys.graph_incoming_prefix else internal_keys.graph_retirement_ref_prefix;
+                var arena = std.heap.ArenaAllocator.init(self.alloc);
+                defer arena.deinit();
+                const alloc = arena.allocator();
+                var keys = std.ArrayListUnmanaged([]const u8).empty;
+                var bytes: usize = 0;
+                var done = false;
+                {
+                    var cursor = try txn.openPhysicalCursorAdapter();
+                    defer cursor.close();
+                    var entry = try cursor.seekAtOrAfter(prefix);
+                    while (entry) |row| {
+                        if (!std.mem.startsWith(u8, row.key, prefix)) break;
+                        try keys.append(alloc, try alloc.dupe(u8, row.key));
+                        bytes +|= row.key.len;
+                        entry = try cursor.next();
+                        if (keys.items.len >= 256 or bytes >= 256 * 1024) break;
+                    }
+                    done = if (entry) |row| !std.mem.startsWith(u8, row.key, prefix) else true;
+                }
+                for (keys.items) |key| try txn.delete(key);
+                if (done) {
+                    try txn.put(internal_keys.graph_directory_reset_key, &.{current + 1});
+                    if (current == 1) try txn.put(internal_keys.graph_retirement_count_key, &([_]u8{0} ** 8));
+                }
+                try txn.commit();
+                return false;
+            }
+        }
+        if (txn.get(internal_keys.graph_incoming_ready_key)) |_| {
+            txn.abort();
+            return true;
+        } else |err| if (err != error.NotFound) return err;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const checkpoint = txn.get(internal_keys.graph_incoming_cursor_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        const start = if (checkpoint) |key| try std.mem.concat(alloc, u8, &.{ key, &.{0} }) else &.{internal_keys.user_namespace};
+        var entries = std.ArrayListUnmanaged(KVPair).empty;
+        var last: ?[]const u8 = null;
+        var done = false;
+        var copied_bytes: usize = 0;
+        {
+            var cursor = try txn.openPhysicalCursorAdapter();
+            defer cursor.close();
+            cursor.setUpperBound(&.{internal_keys.user_namespace + 1});
+            var entry = try cursor.seekAtOrAfter(start);
+            var scanned: usize = 0;
+            while (entry) |item| {
+                last = try alloc.dupe(u8, item.key);
+                copied_bytes +|= item.key.len;
+                if (try internal_keys.graphIncomingKeyAlloc(alloc, item.key)) |key| {
+                    const value = try alloc.dupe(u8, item.key);
+                    try entries.append(alloc, .{ .key = key, .value = value });
+                    copied_bytes +|= key.len +| value.len;
+                }
+                if (internal_keys.isGraphRetirementKey(item.key)) {
+                    if (!std.mem.eql(u8, item.value, "1")) return error.InvalidGraphRetirement;
+                    // Reusing marker puts makes restart and concurrent insert
+                    // accounting idempotent through the reference directory.
+                    try entries.append(alloc, .{ .key = last.?, .value = "1" });
+                }
+                scanned += 1;
+                entry = try cursor.next();
+                // At most one oversized key is admitted in a page.
+                if (scanned >= 256 or copied_bytes >= 256 * 1024) break;
+            }
+            done = entry == null;
+        }
+        for (entries.items) |item| try txn.put(item.key, item.value);
+        if (done) {
+            // Publish an explicit zero too: no marker has ever written a count.
+            const count = try graphRetirementCount(&txn);
+            var bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &bytes, count, .little);
+            try txn.put(internal_keys.graph_retirement_count_key, &bytes);
+            try txn.put(internal_keys.graph_incoming_ready_key, "1");
+            txn.delete(internal_keys.graph_directory_reset_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            txn.delete(internal_keys.graph_incoming_cursor_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        } else try txn.put(internal_keys.graph_incoming_cursor_key, last.?);
+        try txn.commit();
+        return done;
+    }
+
+    pub fn ensureGraphIncomingDirectory(self: *DocStore) !void {
+        const ready = self.get(self.alloc, internal_keys.graph_incoming_ready_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (ready) |value| {
+            self.alloc.free(value);
+            return;
+        }
+        while (!try self.backfillGraphIncomingDirectoryPage()) {}
+    }
+
+    fn initializeEmptyGraphIncomingDirectory(txn: anytype) anyerror!void {
+        if (txn.get(internal_keys.graph_directory_reset_key)) |_| return else |err| if (err != error.NotFound) return err;
+        if (txn.get(internal_keys.graph_incoming_ready_key)) |_| return else |err| if (err != error.NotFound) return err;
+        if (txn.get(internal_keys.graph_incoming_cursor_key)) |_| return else |err| if (err != error.NotFound) return err;
+        const empty = blk: {
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            cursor.setUpperBound(&.{internal_keys.user_namespace + 1});
+            break :blk try cursor.seekAtOrAfter(&.{internal_keys.user_namespace}) == null;
+        };
+        if (empty) {
+            try txn.put(internal_keys.graph_retirement_count_key, &([_]u8{0} ** 8));
+            try txn.put(internal_keys.graph_incoming_ready_key, "1");
+        }
+    }
+
     pub fn beginWriteTxn(self: *DocStore) !Txn {
         try self.ensurePortableImportOperational();
         const payload_session = if (if (self.kind == .runtime) self.payload_store else null) |store| try artifact_payload.Session.create(self.alloc, store) else null;
@@ -1557,6 +1880,37 @@ pub const DocStore = struct {
         validate: *const fn (ptr: *anyopaque, alloc: Allocator, txn: *Batch.BatchTxn) anyerror!void,
     };
 
+    /// Resolve retirements before admitting any append entries. The writer
+    /// transaction pins both the checks and sorted ingestion atomically.
+    fn graphBulkRetirementMask(alloc: Allocator, txn: Batch.BatchTxn, writes: []const KVPair) !?[]bool {
+        if (!try graphRetirementsPresentCached(txn, txn.graph_retirements_maybe)) return null;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const Candidate = struct {
+            key: []const u8,
+            index: usize,
+            fn less(_: void, left: @This(), right: @This()) bool {
+                return std.mem.order(u8, left.key, right.key) == .lt;
+            }
+        };
+        var candidates = std.ArrayListUnmanaged(Candidate).empty;
+        for (writes, 0..) |write, index| {
+            if (!internal_keys.isGraphEdgeArtifactKey(write.key)) continue;
+            try candidates.append(scratch, .{ .key = try internal_keys.graphRetirementKeyAlloc(scratch, write.key), .index = index });
+        }
+        if (candidates.items.len == 0) return null;
+        std.sort.pdq(Candidate, candidates.items, {}, Candidate.less);
+        const keys = try scratch.alloc([]const u8, candidates.items.len);
+        const values = try scratch.alloc(?[]const u8, candidates.items.len);
+        for (candidates.items, keys) |candidate, *key| key.* = candidate.key;
+        try txn.getManySorted(keys, values);
+        const mask = try alloc.alloc(bool, writes.len);
+        @memset(mask, false);
+        for (candidates.items, values) |candidate, value| mask[candidate.index] = value != null;
+        return mask;
+    }
+
     fn putBatchWithReplayOnceWithOptions(
         self: *DocStore,
         writes: []const KVPair,
@@ -1564,9 +1918,18 @@ pub const DocStore = struct {
         replay: ?ReplayAppend,
         options: backend_types.BatchOptions,
     ) !void {
+        const graph_bulk = deletes.len == 0 and options.mode == .bulk_ingest;
+        if (graph_bulk) {
+            for (writes) |write| if (internal_keys.isGraphEdgeArtifactKey(write.key)) {
+                try self.ensureGraphIncomingDirectory();
+                break;
+            };
+        }
         var batch = try self.beginWriteBatchWithOptions(options);
         errdefer batch.abort();
         var txn = batch.asTxn();
+        const retirement_mask = if (graph_bulk) try graphBulkRetirementMask(self.alloc, txn, writes) else null;
+        defer if (retirement_mask) |mask| self.alloc.free(mask);
         for (deletes) |key| {
             txn.delete(key) catch |err| switch (err) {
                 error.NotFound => {}, // ignore missing keys
@@ -1576,8 +1939,9 @@ pub const DocStore = struct {
         var used_bulk_append = false;
         if (deletes.len == 0 and options.mode == .bulk_ingest) {
             used_bulk_append = true;
-            for (writes) |kv| {
-                txn.appendPut(kv.key, kv.value) catch |err| switch (err) {
+            for (writes, 0..) |kv, index| {
+                if (retirement_mask) |mask| if (mask[index]) continue;
+                txn.appendPutChecked(kv.key, kv.value, true) catch |err| switch (err) {
                     error.Unsupported => {
                         used_bulk_append = false;
                         break;
@@ -3959,4 +4323,294 @@ test "docstore runtime lsm persists replay rows across namespace reopen" {
     }
     try std.testing.expectEqual(@as(usize, 1), entries.len);
     try std.testing.expectEqualStrings("replay:1", entries[0].payload);
+}
+
+test "graph incoming directory follows primary transaction commit and rollback" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf);
+    defer cleanupTmp(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    const target = "target\x00binary";
+    const legacy = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "source", "facts", "R", target);
+    defer alloc.free(legacy);
+    const explicit = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, "source", "facts", "R", target, "source", "id");
+    defer alloc.free(explicit);
+    const fact = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, "fact", "facts", "R", target, "source", "fact");
+    defer alloc.free(fact);
+    const prefix = try internal_keys.graphIncomingPrefixAlloc(alloc, target);
+    defer alloc.free(prefix);
+    const explicit_ref = (try internal_keys.graphIncomingKeyAlloc(alloc, explicit)).?;
+    defer alloc.free(explicit_ref);
+    try std.testing.expect((try internal_keys.graphIncomingKeyAlloc(alloc, fact)) == null);
+    try store.putBatch(&.{ .{ .key = legacy, .value = "legacy" }, .{ .key = explicit, .value = "explicit" }, .{ .key = fact, .value = "fact" } }, &.{});
+    {
+        const refs = try store.scanPrefix(alloc, prefix);
+        defer DocStore.freeResults(alloc, refs);
+        try std.testing.expectEqual(@as(usize, 2), refs.len);
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try txn.delete(explicit);
+        try std.testing.expectError(error.NotFound, txn.get(explicit_ref));
+    }
+    {
+        var batch = try store.beginWriteBatch();
+        defer batch.abort();
+        try batch.delete(legacy);
+    }
+    const refs = try store.scanPrefix(alloc, prefix);
+    defer DocStore.freeResults(alloc, refs);
+    try std.testing.expectEqual(@as(usize, 2), refs.len);
+    // Backfill an old store, then exercise maintenance after the ready marker.
+    for (refs) |ref| try store.delete(ref.key);
+    try store.delete(internal_keys.graph_incoming_ready_key);
+    try store.ensureGraphIncomingDirectory();
+    try store.ensureGraphIncomingDirectory();
+    const recovered = try store.get(alloc, explicit_ref);
+    defer alloc.free(recovered);
+    try std.testing.expectEqualStrings(explicit, recovered);
+    try store.delete(explicit);
+    try std.testing.expectError(error.NotFound, store.get(alloc, explicit_ref));
+    try store.put(explicit, "new");
+    const renewed = try store.get(alloc, explicit_ref);
+    defer alloc.free(renewed);
+    try std.testing.expectEqualStrings(explicit, renewed);
+}
+
+test "graph incoming directory backfill resumes bounded pages" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf);
+    defer cleanupTmp(path);
+    {
+        var store = try DocStore.open(alloc, path, .{});
+        defer store.close();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const temporary = arena.allocator();
+        var writes = std.ArrayListUnmanaged(KVPair).empty;
+        for (0..800) |i| {
+            const owner = try std.fmt.allocPrint(temporary, "{d:0>8}", .{i});
+            const key = try internal_keys.graphEdgeArtifactKeyAlloc(temporary, owner, "g", "R", "target");
+            try writes.append(temporary, .{ .key = key, .value = "payload" });
+        }
+        try store.putBatch(writes.items, &.{});
+        const ready = try store.get(alloc, internal_keys.graph_incoming_ready_key);
+        defer alloc.free(ready);
+        try std.testing.expectEqualStrings("1", ready);
+        // New stores are ready before deletion. Remove derived metadata to
+        // simulate an old store and verify one work quantum is bounded.
+        const refs = try store.scanPrefix(alloc, internal_keys.graph_incoming_prefix);
+        defer DocStore.freeResults(alloc, refs);
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        for (refs) |ref| try deletes.append(temporary, ref.key);
+        try deletes.append(temporary, internal_keys.graph_incoming_ready_key);
+        try store.putBatch(&.{}, deletes.items);
+        try std.testing.expect(!try store.backfillGraphIncomingDirectoryPage());
+        const first_page = try store.scanPrefix(alloc, internal_keys.graph_incoming_prefix);
+        defer DocStore.freeResults(alloc, first_page);
+        try std.testing.expectEqual(@as(usize, 256), first_page.len);
+        // Writers between pages must maintain entries behind the checkpoint,
+        // and deletion ahead of it must not resurrect a stale directory entry.
+        const late = try internal_keys.graphRelationshipArtifactKeyAlloc(temporary, "00000000", "g", "R", "target", "00000000", "late");
+        try store.put(late, "late");
+        try store.delete(writes.items[799].key);
+    }
+    {
+        var store = try DocStore.open(alloc, path, .{});
+        defer store.close();
+        const checkpoint = try store.get(alloc, internal_keys.graph_incoming_cursor_key);
+        defer alloc.free(checkpoint);
+        var pages: usize = 0;
+        while (true) {
+            pages += 1;
+            const complete = try store.backfillGraphIncomingDirectoryPage();
+            try std.testing.expect(pages <= 3);
+            if (complete) break;
+        }
+        try std.testing.expectError(error.NotFound, store.get(alloc, internal_keys.graph_incoming_cursor_key));
+        const refs = try store.scanPrefix(alloc, internal_keys.graph_incoming_prefix);
+        defer DocStore.freeResults(alloc, refs);
+        try std.testing.expectEqual(@as(usize, 800), refs.len);
+        const gone = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "00000799", "g", "R", "target");
+        defer alloc.free(gone);
+        const gone_ref = (try internal_keys.graphIncomingKeyAlloc(alloc, gone)).?;
+        defer alloc.free(gone_ref);
+        try std.testing.expectError(error.NotFound, store.get(alloc, gone_ref));
+    }
+}
+
+test "graph relationship bulk ingestion preserves direct append and retirement" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 1, .bulk_ingest_flush_threshold_multiplier = 2 });
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const temporary = arena.allocator();
+    var writes = std.ArrayListUnmanaged(KVPair).empty;
+    for (0..512) |i| {
+        const owner = try std.fmt.allocPrint(temporary, "{d:0>8}", .{i});
+        const key = try internal_keys.graphRelationshipArtifactKeyAlloc(temporary, owner, "g", "R", "target", owner, "id");
+        try writes.append(temporary, .{ .key = key, .value = "payload" });
+    }
+    {
+        var batch = try store.beginWriteBatchWithOptions(.{ .mode = .bulk_ingest });
+        errdefer batch.abort();
+        var txn = batch.asTxn();
+        for (writes.items) |write| try txn.appendPut(write.key, write.value);
+        try batch.commit();
+    }
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.sorted_ingest_runs);
+    const refs = try store.scanPrefix(alloc, internal_keys.graph_incoming_prefix);
+    defer DocStore.freeResults(alloc, refs);
+    try std.testing.expectEqual(@as(usize, 512), refs.len);
+    const retired = try internal_keys.graphRetirementKeyAlloc(temporary, writes.items[0].key);
+    {
+        var batch = try store.beginWriteBatch();
+        defer batch.abort();
+        try batch.put(retired, "1");
+    }
+    const before = try store.get(alloc, writes.items[0].key);
+    defer alloc.free(before);
+    try std.testing.expectEqualStrings("payload", before);
+    try store.put(retired, "1");
+    try std.testing.expectError(error.NotFound, store.get(alloc, writes.items[0].key));
+    {
+        var batch = try store.beginWriteBatchWithOptions(.{ .mode = .bulk_ingest });
+        errdefer batch.abort();
+        var txn = batch.asTxn();
+        try std.testing.expectError(error.Unsupported, txn.appendPut(writes.items[0].key, "revived"));
+        try txn.put(writes.items[0].key, "revived");
+        try txn.put(writes.items[1].key, "updated");
+        try batch.commit();
+    }
+    try std.testing.expectError(error.NotFound, store.get(alloc, writes.items[0].key));
+    const after = try store.get(alloc, writes.items[1].key);
+    defer alloc.free(after);
+    try std.testing.expectEqualStrings("updated", after);
+    const runs_before = backend.snapshotWriteStats().sorted_ingest_runs;
+    try store.putBatchWithReplayWithOptions(null, writes.items, &.{}, null, .{ .mode = .bulk_ingest });
+    try std.testing.expectEqual(runs_before + 1, backend.snapshotWriteStats().sorted_ingest_runs);
+    try std.testing.expectError(error.NotFound, store.get(alloc, writes.items[0].key));
+    try std.testing.expect(try store.hasGraphRetirements());
+    try store.delete(retired);
+    try std.testing.expect(!try store.hasGraphRetirements());
+    const runs_after = backend.snapshotWriteStats().sorted_ingest_runs;
+    try store.putBatchWithReplayWithOptions(null, writes.items, &.{}, null, .{ .mode = .bulk_ingest });
+    try std.testing.expectEqual(runs_after + 1, backend.snapshotWriteStats().sorted_ingest_runs);
+    const revived = try store.get(alloc, writes.items[0].key);
+    defer alloc.free(revived);
+    try std.testing.expectEqualStrings("payload", revived);
+}
+
+test "graph incoming directory backfill resumes bounded pages with retirement accounting" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var markers = std.ArrayListUnmanaged(KVPair).empty;
+    for (0..600) |i| {
+        const owner = try std.fmt.allocPrint(scratch, "{d:0>8}", .{i});
+        const artifact = try internal_keys.graphEdgeArtifactKeyAlloc(scratch, owner, "g", "R", "target");
+        try markers.append(scratch, .{ .key = try internal_keys.graphRetirementKeyAlloc(scratch, artifact), .value = "1" });
+    }
+    try store.putBatch(markers.items, &.{});
+    // Simulate a v1 store: primary markers and its conservative presence flag
+    // survive, but v2 count/reference metadata does not exist yet.
+    const refs = try store.scanPrefix(alloc, internal_keys.graph_retirement_ref_prefix);
+    defer DocStore.freeResults(alloc, refs);
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    for (refs) |ref| try deletes.append(scratch, ref.key);
+    try deletes.appendSlice(scratch, &.{ internal_keys.graph_incoming_ready_key, internal_keys.graph_retirement_count_key });
+    try store.putBatch(&.{}, deletes.items);
+    try std.testing.expect(!try store.backfillGraphIncomingDirectoryPage());
+    const checkpoint = try store.get(alloc, internal_keys.graph_incoming_cursor_key);
+    defer alloc.free(checkpoint);
+    // Existing refs are idempotent; writes behind and deletes ahead of the
+    // checkpoint compose with migration without double counting.
+    try store.put(markers.items[0].key, "1");
+    try store.delete(markers.items[599].key);
+    const late_artifact = try internal_keys.graphRelationshipArtifactKeyAlloc(scratch, "00000000", "g", "R", "target", "00000000", "late");
+    const late_marker = try internal_keys.graphRetirementKeyAlloc(scratch, late_artifact);
+    try store.put(late_marker, "1");
+    try store.ensureGraphIncomingDirectory();
+    {
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        try std.testing.expectEqual(@as(u64, 600), try graphRetirementCount(&txn));
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try txn.delete(markers.items[0].key);
+        try std.testing.expectEqual(@as(u64, 599), try graphRetirementCount(&txn));
+    }
+    try std.testing.expect(try store.hasGraphRetirements());
+    {
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        try std.testing.expectEqual(@as(u64, 600), try graphRetirementCount(&txn));
+    }
+    var final_deletes = std.ArrayListUnmanaged([]const u8).empty;
+    for (markers.items) |marker| try final_deletes.append(scratch, marker.key);
+    try final_deletes.append(scratch, late_marker);
+    try store.putBatch(&.{}, final_deletes.items);
+    try std.testing.expect(!try store.hasGraphRetirements());
+}
+
+test "graph incoming directory backfill resumes bounded pages after physical reset" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var markers = std.ArrayListUnmanaged(KVPair).empty;
+    for (0..600) |i| {
+        const owner = try std.fmt.allocPrint(scratch, "{d:0>8}", .{i});
+        const artifact = try internal_keys.graphEdgeArtifactKeyAlloc(scratch, owner, "g", "R", "target");
+        try markers.append(scratch, .{ .key = try internal_keys.graphRetirementKeyAlloc(scratch, artifact), .value = "1" });
+    }
+    try store.putBatch(markers.items, &.{});
+    // Seed stale directories as a physical parent rewrite would retain them.
+    const stale = try internal_keys.graphEdgeArtifactKeyAlloc(scratch, "gone", "g", "R", "target");
+    const incoming = (try internal_keys.graphIncomingKeyAlloc(scratch, stale)).?;
+    try store.put(incoming, stale);
+    try store.invalidateGraphDirectories();
+    // Model the crash window after physical pruning, which bypasses DocStore
+    // delete hooks and leaves references to records that no longer exist.
+    {
+        var raw = try store.runtime_store.beginWrite();
+        errdefer raw.abort();
+        try raw.delete(markers.items[599].key);
+        try raw.commit();
+    }
+    try store.delete(internal_keys.graph_retirement_present_key);
+    // Missing presence metadata must never bypass a primary retirement.
+    const artifact = try internal_keys.graphRetirementArtifactKeyAlloc(scratch, markers.items[0].key);
+    try store.put(artifact, "revived");
+    try std.testing.expectError(error.NotFound, store.get(alloc, artifact));
+    try std.testing.expect(!try store.backfillGraphIncomingDirectoryPage());
+    try std.testing.expect(!try store.backfillGraphIncomingDirectoryPage());
+    // Resume with a new store handle after interrupting reference cleanup.
+    var resumed = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer resumed.close();
+    try resumed.ensureGraphIncomingDirectory();
+    try std.testing.expectError(error.NotFound, resumed.get(alloc, incoming));
+    try std.testing.expectError(error.NotFound, resumed.get(alloc, internal_keys.graph_directory_reset_key));
+    var txn = try resumed.beginReadTxn();
+    defer txn.abort();
+    try std.testing.expectEqual(@as(u64, 599), try graphRetirementCount(&txn));
 }

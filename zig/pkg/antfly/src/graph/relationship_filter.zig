@@ -232,7 +232,7 @@ fn intervalContains(metadata: std.json.Value, lower: []const u8, upper: []const 
 pub fn parsePublicAlloc(alloc: Allocator, value: anytype) !Filter {
     const raw = try std.json.Stringify.valueAlloc(alloc, value, .{ .emit_null_optional_fields = false });
     defer alloc.free(raw);
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{ .parse_numbers = false });
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidRelationshipFilter;
     const root = parsed.value.object;
@@ -323,5 +323,23 @@ test "relationship predicate roots reject every nonobject JSON type" {
         var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
         defer parsed.deinit();
         try std.testing.expectError(error.InvalidRelationshipFilter, parsePublicAlloc(std.testing.allocator, parsed.value));
+    }
+}
+
+test "relationship predicates preserve exact decimal literals" {
+    const alloc = std.testing.allocator;
+    const Edge = struct { source: []const u8 = "a", target: []const u8 = "b", edge_type: []const u8 = "R", edge_id: []const u8 = "fact", owner_document: []const u8 = "fact", weight: f64 = 1, created_at: u64 = 0, updated_at: u64 = 0, metadata: []const u8 };
+    for ([_][]const u8{ "eq", "ne", "gt", "gte", "lt", "lte" }) |op| {
+        const raw = try std.fmt.allocPrint(alloc, "{{\"properties\":[{{\"field\":\"/metadata/value\",\"op\":\"{s}\",\"value\":1.0000000000000001}}]}}", .{op});
+        defer alloc.free(raw);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{ .parse_numbers = false });
+        defer parsed.deinit();
+        const filter = try parsePublicAlloc(alloc, parsed.value);
+        defer filter.deinit(alloc);
+        try std.testing.expectEqualStrings("1.0000000000000001", filter.properties[0].value_json);
+        const equal_passes = std.mem.eql(u8, op, "eq") or std.mem.eql(u8, op, "gte") or std.mem.eql(u8, op, "lte");
+        try std.testing.expectEqual(equal_passes, try filter.matches(alloc, Edge{ .metadata = "{\"value\":1.0000000000000001}" }));
+        const lower_passes = std.mem.eql(u8, op, "ne") or std.mem.eql(u8, op, "lt") or std.mem.eql(u8, op, "lte");
+        try std.testing.expectEqual(lower_passes, try filter.matches(alloc, Edge{ .metadata = "{\"value\":1}" }));
     }
 }

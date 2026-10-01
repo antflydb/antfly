@@ -2650,7 +2650,7 @@ pub fn parseQueryRequestWithDeadline(
         metadata_openapi.StatefulQueryRequest,
         alloc,
         body_for_contract,
-        .{},
+        .{ .parse_numbers = false },
     ) catch return classifyPublicFilterContractErrorAlloc(alloc, effective_body);
     defer parsed.deinit();
     try ensureQueryDeadline(execution_deadline_ns);
@@ -10900,7 +10900,7 @@ fn maybeExpandPublicDocFilterBindingsWithLimitAlloc(
     deadline_ns: ?u64,
 ) !?[]u8 {
     if (max_expanded_bytes == 0) return error.InvalidQueryRequest;
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false }) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
     try ensureQueryDeadline(deadline_ns);
     if (parsed.value != .object) return error.InvalidQueryRequest;
@@ -11079,7 +11079,7 @@ fn queryBodyForGeneratedContractAlloc(
 ) !?[]u8 {
     if (!options.strip_internal_shard_fields and !options.strip_public_doc_filter_bindings and !options.strip_public_hierarchy_controls and !options.strip_query_timeout and !options.strip_graph_metric) return null;
 
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false }) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
 
@@ -16406,6 +16406,18 @@ fn consumerTests() type {
                 var owned = try parsePublicQueryRequest(alloc, null, "docs", body);
                 defer owned.deinit(alloc);
                 try std.testing.expect(owned.req.graph_queries[0].query.params.edge_filter.active());
+            }
+            for ([_][]const u8{
+                \\{"timeout_ms":10000,"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["Alice"]},"edge_filter":{"properties":[{"field":"/metadata/value","op":"eq","value":1.0000000000000001}]}}}}}
+                ,
+                \\{"graph_queries":{"path":{"index":"g","shortest_path":{"from":{"key":"Alice"},"to":{"key":"Acme"},"edge_filter":{"properties":[{"field":"/metadata/value","op":"eq","value":1.0000000000000001}]}}}}}
+                ,
+                \\{"graph_queries":{"paths":{"index":"g","k_shortest_paths":{"from":{"key":"Alice"},"to":{"key":"Acme"},"k":2,"edge_filter":{"properties":[{"field":"/metadata/value","op":"eq","value":1.0000000000000001}]}}}}}
+                ,
+            }) |body| {
+                var owned = try parsePublicQueryRequest(alloc, null, "docs", body);
+                defer owned.deinit(alloc);
+                try std.testing.expectEqualStrings("1.0000000000000001", owned.req.graph_queries[0].query.params.edge_filter.properties[0].value_json);
             }
             var matched = try parsePublicQueryRequest(alloc, null, "docs",
                 \\{"graph_queries":{"facts":{"index":"g","match":{"anchor":"a","nodes":{"a":{},"b":{}},"edges":[{"from":"a","to":"b","edge_filter":{"valid_at":"2022-01-01T00:00:00Z"}}]},"return":{"aggregates":{"facts":{"count":"*"}}}}}}

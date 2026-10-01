@@ -26,6 +26,85 @@ recovery: primary-store durability, replay journal, enrichment state hashes,
 managed-index applied sequence, and reverse-index rebuild from owned outgoing
 edges.
 
+## Relationship deletion durability
+
+Primary graph relationship artifacts are the durable authority for graph replay,
+reconstruction, and portable snapshots. Deleting a document retires its owned
+artifacts and source-owned inline relationships that target it. This includes
+legacy relationships, parallel explicit IDs, and self loops. Fact relationships
+owned by an independent document retain that document's lifecycle and may refer
+to absent endpoints; deleting their owner retires them.
+
+A local target directory maps inline relationships to their complete primary
+artifact keys. Every primary transaction and batch maintains it atomically with
+artifact writes and deletes. New stores mark the directory ready on their first
+user-record write. Older stores backfill at most 256 keys or 256 KiB of temporary
+key data per transaction (one oversized key may form its own page). A durable
+cursor resumes migration after interruption; readers use the directory only
+when the final ready marker commits. The first deletion on an old store waits
+for this one-time migration. Subsequent deletion work follows affected targets.
+
+Deleting an endpoint also records retirement of each affected relationship whose
+owner survives. Retirement records belong to that owner and retain the complete
+relationship identity. Primary projection writes honor them even when retained
+source artifacts are replayed, so rebuilding source precedence during restore
+cannot recreate a retired relationship. Explicit relationship writes clear that
+identity's retirement. A meaningful owner-document update clears its retirements
+and replays its durable graph inputs; semantic no-ops preserve retirement.
+Explicit relationship deletion records the same durable retirement, including
+independently owned identities. Index deletion removes its retirement records
+through the existing bounded cleanup fence before same-name recreation.
+
+Retirements transfer with their owning document range and are included in
+portable relationship blocks, including imports that omit derived indexes.
+Ordinary batch deletion and TTL expiry share the same retirement planner. Bundles containing them require AFB reader version
+4; ordinary relationship bundles remain compatible with version 3. The target
+directory and its migration checkpoint are local derived metadata and are
+rebuilt through primary writes on import. Directory keys are fixed-size hashes,
+while values retain complete artifact keys. A local reference directory maintains
+an exact retirement count, including repeated writes, deletion, and rollback.
+The bounded, resumable v2 migration indexes existing retirements before publishing
+the count as authoritative. It runs before the first graph bulk batch or an owner
+update with legacy retirement state, as well as endpoint deletion.
+Stores with no retirements cache that state per transaction. Bulk ingestion checks
+all candidate identities with sorted reads before adding append entries, then
+ingests surviving edges directly even while other retirements remain. Batches
+that write retirement records themselves use ordinary transactional writes.
+
+Merge artifact pages include primary retirement records. Receiver replay applies
+exact relationship deletions to existing projections as well as suppressing
+future materialization; retirement-bearing batches require data-Raft protocol
+version 7. Ordinary artifact batches retain their existing protocol requirements.
+Physical splits rebuild the incoming directory and retirement accounting on both
+the child and retained parent before graph work resumes. Clearing and rebuilding
+use bounded, durable pages; incomplete directories conservatively check primary
+retirement records rather than inferring their absence from missing metadata.
+
+Explicit mutation range validation uses the producing document (or the logical
+source for an implicitly owned edge). Endpoints may belong to other ranges.
+Graph document cleanup scans adjacency and fact-owner keys in pages of at most
+256 records or 256 KiB of identity keys, admitting one oversized identity when
+necessary. It does not hydrate relationship metadata. Independent incident facts
+survive endpoint cleanup; their owner directory drives fact-document deletion.
+Each page uses the normal graph mutation path, and interrupted replay resumes by
+scanning remaining records before advancing its durable coverage checkpoint.
+
+This preserves the local-store ownership scope of primary artifacts; it does not
+introduce a global cross-shard endpoint-deletion protocol.
+
+## Projection values and page budgets
+
+JSON number literals remain intact in source artifacts, document context, and
+metadata templates through live materialization, repair, and restore. Only
+numeric fields used by the graph engine, such as edge weights and entity array
+indices, are converted to their declared numeric types.
+
+Artifact materialization and restore pages retain at most 2048 relation items
+or 4 MiB of materialized writes. Byte accounting includes the mutation struct,
+index name, both endpoints, type, relationship ID, owner, and metadata. One
+oversized relationship may occupy a page by itself to guarantee cursor progress;
+subsequent relationships resume from the durable item ordinal.
+
 ## Goals
 
 - Let a graph index declare an enrichment dependency for the artifact it needs.

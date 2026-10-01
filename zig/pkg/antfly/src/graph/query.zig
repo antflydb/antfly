@@ -2181,16 +2181,7 @@ fn clonePatternPathEdgesFromInfoAlloc(alloc: Allocator, edges: []const PathEdgeI
         if (out.len > 0) alloc.free(out);
     }
     for (edges, 0..) |edge, i| {
-        out[i] = .{
-            .source = try alloc.dupe(u8, edge.source),
-            .target = try alloc.dupe(u8, edge.target),
-            .edge_type = try alloc.dupe(u8, edge.edge_type),
-            .edge_id = try alloc.dupe(u8, edge.edge_id),
-            .owner_document = try alloc.dupe(u8, edge.owner_document),
-            .weight = edge.weight,
-            .metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "",
-            .traversal_direction = edge.traversal_direction,
-        };
+        out[i] = try paths_mod.clonePathEdge(alloc, edge);
         initialized += 1;
     }
     return out;
@@ -4656,4 +4647,29 @@ test "graph algebraic provenance preserves binary relationship identity" {
     try std.testing.expectEqualStrings("fact\x00:1", parsed.edge_id);
     try std.testing.expectEqualStrings("a\x1f", parsed.source);
     try std.testing.expectEqualStrings("fact:1", parsed.owner_document);
+}
+
+test "graph pattern path conversion releases partial relationship allocations" {
+    const Case = struct {
+        fn run(alloc: Allocator) !void {
+            const edges = [_]PathEdgeInfo{.{
+                .source = "a",
+                .target = "b",
+                .edge_type = "RELATES_TO",
+                .edge_id = "fact:1",
+                .owner_document = "fact:1",
+                .weight = 2,
+                .metadata = "{\"group_id\":\"g\"}",
+                .traversal_direction = .in,
+            }};
+            const copy = try clonePatternPathEdgesFromInfoAlloc(alloc, &edges);
+            defer {
+                freeGraphPatternPathEdgeItems(alloc, copy);
+                alloc.free(copy);
+            }
+            try std.testing.expectEqualStrings("fact:1", copy[0].edge_id);
+            try std.testing.expectEqual(@as(?graph_mod.EdgeDirection, .in), copy[0].traversal_direction);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

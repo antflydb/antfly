@@ -64,6 +64,8 @@ pub const artifact_kind: u8 = 0x20;
 pub const chunk_record_kind: u8 = 0x30;
 pub const derived_embedding_kind: u8 = 0x31;
 pub const graph_edge_record_kind: u8 = 0x32;
+/// Durable document-owned retirement of an exact primary graph relationship.
+pub const graph_retirement_kind: u8 = 0x50;
 pub const asset_state_kind: u8 = 0x33;
 pub const graph_asset_state_kind: u8 = 0x34;
 pub const document_unit_record_kind: u8 = 0x35;
@@ -1747,10 +1749,18 @@ fn skipDerivedEmbeddingBaseRecordSuffix(key: []const u8, pos: usize) ?usize {
 }
 
 pub fn isGraphEdgeArtifactKey(key: []const u8) bool {
+    return isGraphRelationshipRecordKey(key, artifact_kind);
+}
+
+pub fn isGraphRetirementKey(key: []const u8) bool {
+    return isGraphRelationshipRecordKey(key, graph_retirement_kind);
+}
+
+fn isGraphRelationshipRecordKey(key: []const u8, owner_kind: u8) bool {
     if (!isInternalUserKey(key)) return false;
     const doc_term = findComponentTerminator(key, 1) orelse return false;
     var pos = doc_term + 2;
-    if (pos >= key.len or key[pos] != artifact_kind) return false;
+    if (pos >= key.len or key[pos] != owner_kind) return false;
     pos += 1;
 
     if (!componentEquals(key, pos, "graph")) return false;
@@ -1770,7 +1780,15 @@ pub fn isGraphEdgeArtifactKey(key: []const u8) bool {
 }
 
 pub fn matchesGraphEdgeIndexName(key: []const u8, index_name: []const u8) bool {
-    if (!isGraphEdgeArtifactKey(key)) return false;
+    return matchesGraphRelationshipIndexName(key, index_name, false);
+}
+
+pub fn matchesGraphRetirementIndexName(key: []const u8, index_name: []const u8) bool {
+    return matchesGraphRelationshipIndexName(key, index_name, true);
+}
+
+fn matchesGraphRelationshipIndexName(key: []const u8, index_name: []const u8, retired: bool) bool {
+    if (if (retired) !isGraphRetirementKey(key) else !isGraphEdgeArtifactKey(key)) return false;
     const doc_term = findComponentTerminator(key, 1) orelse return false;
     var pos = doc_term + 2 + 1;
     const type_term = findComponentTerminator(key, pos) orelse return false;
@@ -2155,6 +2173,79 @@ pub fn parseGraphEdgeArtifactKeyAlloc(
         .edge_id = edge_id,
         .logical_source = logical_source,
     };
+}
+
+// Local, derived directory. Portable imports rebuild it from primary artifacts.
+pub fn graphRetirementKeyAlloc(alloc: Allocator, artifact: []const u8) ![]u8 {
+    if (!isGraphEdgeArtifactKey(artifact)) return error.InvalidInternalUserKey;
+    const key = try alloc.dupe(u8, artifact);
+    key[findComponentTerminator(key, 1).? + 2] = graph_retirement_kind;
+    return key;
+}
+
+pub fn graphRetirementArtifactKeyAlloc(alloc: Allocator, retired: []const u8) ![]u8 {
+    if (!isGraphRetirementKey(retired)) return error.InvalidInternalUserKey;
+    const key = try alloc.dupe(u8, retired);
+    key[findComponentTerminator(key, 1).? + 2] = artifact_kind;
+    return key;
+}
+
+pub fn graphRetirementPrefixAlloc(alloc: Allocator, owner: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try appendDocumentPrefix(&out, alloc, owner);
+    try out.append(alloc, graph_retirement_kind);
+    return out.toOwnedSlice(alloc);
+}
+
+pub const graph_retirement_present_key = "\x00\x00__graph_retirement__:present:v1";
+
+pub const graph_incoming_cursor_key = "\x00\x00__graph_incoming__:cursor:v2";
+
+pub const graph_incoming_prefix = "\x00\x00__graph_incoming__:v1:";
+pub const graph_directory_reset_key = "\x00\x00__graph_incoming__:reset:v1";
+pub const graph_incoming_ready_key = "\x00\x00__graph_incoming__:ready:v2";
+pub const graph_retirement_count_key = "\x00\x00__graph_retirement__:count:v2";
+pub const graph_retirement_ref_prefix = "\x00\x00__graph_retirement__:refs:v2:";
+
+pub fn graphRetirementRefKeyAlloc(alloc: Allocator, key: []const u8) ![]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(key, &digest, .{});
+    return std.mem.concat(alloc, u8, &.{ graph_retirement_ref_prefix, &digest });
+}
+
+pub fn graphIncomingPrefixAlloc(alloc: Allocator, target: []const u8) ![]u8 {
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+    try appendEncodedComponent(&encoded, alloc, target);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(encoded.items, &digest, .{});
+    return try std.mem.concat(alloc, u8, &.{ graph_incoming_prefix, &digest });
+}
+
+/// Only source-owned relationships follow endpoint deletion. Fact-owned
+/// relationships retain their own document lifecycle, including absent endpoints.
+/// Fixed-size hashes keep directory keys within backend key-size limits; values
+/// carry the authoritative full artifact identity.
+pub fn graphInlineTargetComponent(artifact: []const u8) ?[]const u8 {
+    if (!isGraphEdgeArtifactKey(artifact)) return null;
+    var pos = findComponentTerminator(artifact, 1).? + 3;
+    pos = findComponentTerminator(artifact, pos).? + 2; // artifact type
+    pos = findComponentTerminator(artifact, pos).? + 3; // index and record kind
+    pos = findComponentTerminator(artifact, pos).? + 2; // edge type
+    const target_end = findComponentTerminator(artifact, pos).? + 2;
+    const suffix = parseGraphRelationshipSuffix(artifact, target_end).?;
+    if (suffix.logical_source.len != 0) return null;
+    return artifact[pos..target_end];
+}
+
+pub fn graphIncomingKeyAlloc(alloc: Allocator, artifact: []const u8) !?[]u8 {
+    const target = graphInlineTargetComponent(artifact) orelse return null;
+    var target_digest: [32]u8 = undefined;
+    var artifact_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(target, &target_digest, .{});
+    std.crypto.hash.Blake3.hash(artifact, &artifact_digest, .{});
+    return try std.mem.concat(alloc, u8, &.{ graph_incoming_prefix, &target_digest, &artifact_digest });
 }
 
 pub fn nextPrefixAlloc(alloc: Allocator, prefix: []const u8) !?[]u8 {

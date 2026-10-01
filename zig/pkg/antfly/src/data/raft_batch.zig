@@ -25,6 +25,7 @@ pub const merge_transition_protocol_version = internal_batch_forwarding.raft_bat
 pub const split_delta_predecessor_protocol_version = internal_batch_forwarding.raft_batch_split_delta_predecessor_protocol_version;
 pub const merge_artifacts_protocol_version = internal_batch_forwarding.raft_batch_merge_artifacts_protocol_version;
 pub const merge_copy_attempt_protocol_version = internal_batch_forwarding.raft_batch_merge_copy_attempt_protocol_version;
+pub const merge_retirements_protocol_version = internal_batch_forwarding.raft_batch_merge_retirements_protocol_version;
 
 pub const OwnedStorageOwnerDescriptor = struct {
     descriptor: descriptor_contract.Descriptor,
@@ -183,7 +184,8 @@ fn consumerTests() type {
             try std.testing.expect(split_delta_predecessor_protocol_version > merge_transition_protocol_version);
             try std.testing.expect(merge_artifacts_protocol_version > split_delta_predecessor_protocol_version);
             try std.testing.expect(merge_copy_attempt_protocol_version > merge_artifacts_protocol_version);
-            try std.testing.expectEqual(protocol_version, merge_copy_attempt_protocol_version);
+            try std.testing.expect(merge_retirements_protocol_version > merge_copy_attempt_protocol_version);
+            try std.testing.expectEqual(protocol_version, merge_retirements_protocol_version);
             const encoded = try encodeProtocolBarrier(std.testing.allocator, "docs", timestamp_protocol_version);
             defer std.testing.allocator.free(encoded);
 

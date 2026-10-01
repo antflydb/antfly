@@ -8941,6 +8941,10 @@ pub const DataServer = struct {
     }
 
     fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        for (req.merge_artifacts) |row| {
+            if (antfly.internal_keys.isGraphRetirementKey(row.key))
+                return data_raft_batch.merge_retirements_protocol_version;
+        }
         if (req.merge_replication != null or req.merge_checkpoint != null)
             return data_raft_batch.merge_copy_attempt_protocol_version;
         if (req.merge_artifacts.len > 0) return data_raft_batch.merge_artifacts_protocol_version;
@@ -28871,6 +28875,15 @@ fn consumerTests() type {
         }
 
         test "data raft source finalization and receiver checkpoints apply document range metadata" {
+            const alloc = std.testing.allocator;
+            const artifact = try antfly.internal_keys.graphEdgeArtifactKeyAlloc(alloc, "a", "g", "R", "b");
+            defer alloc.free(artifact);
+            const retirement = try antfly.internal_keys.graphRetirementKeyAlloc(alloc, artifact);
+            defer alloc.free(retirement);
+            try std.testing.expectEqual(
+                data_raft_batch.merge_retirements_protocol_version,
+                DataServer.requiredRaftBatchProtocolVersion(.{ .merge_artifacts = &.{.{ .key = retirement, .value = "1" }} }),
+            );
             try std.testing.expectEqual(
                 data_raft_batch.merge_artifacts_protocol_version,
                 DataServer.requiredRaftBatchProtocolVersion(.{ .merge_artifacts = &.{.{ .key = "artifact", .value = "payload" }} }),

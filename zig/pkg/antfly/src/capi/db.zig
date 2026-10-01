@@ -10146,7 +10146,7 @@ pub export fn antfly_db_execute_graph_queries_json(
         identity_read_generation: ?u64 = null,
     };
 
-    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{}) catch return .invalid_argument;
+    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{ .parse_numbers = false }) catch return .invalid_argument;
     defer parsed.deinit();
 
     if (parsed.value.identity_read_generation == null) {
@@ -11445,7 +11445,7 @@ pub export fn antfly_db_traverse_edges_json(
         deduplicate_nodes: bool = true,
         include_paths: bool = false,
     };
-    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{}) catch return .invalid_argument;
+    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{ .parse_numbers = false }) catch return .invalid_argument;
     defer parsed.deinit();
     const edge_filter = parseEmbeddedRelationshipFilter(handle.alloc, parsed.value.edge_filter) catch return .invalid_argument;
     defer edge_filter.deinit(handle.alloc);
@@ -11532,7 +11532,7 @@ pub export fn antfly_db_find_shortest_path_json(
         min_weight: f64 = 0.0,
         max_weight: f64 = 0.0,
     };
-    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{}) catch return .invalid_argument;
+    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{ .parse_numbers = false }) catch return .invalid_argument;
     defer parsed.deinit();
     const edge_filter = parseEmbeddedRelationshipFilter(handle.alloc, parsed.value.edge_filter) catch return .invalid_argument;
     defer edge_filter.deinit(handle.alloc);
@@ -11588,7 +11588,7 @@ pub export fn antfly_db_find_k_shortest_paths_json(
         max_weight: f64 = 0.0,
         k: u32 = 1,
     };
-    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{}) catch return .invalid_argument;
+    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{ .parse_numbers = false }) catch return .invalid_argument;
     defer parsed.deinit();
     const edge_filter = parseEmbeddedRelationshipFilter(handle.alloc, parsed.value.edge_filter) catch return .invalid_argument;
     defer edge_filter.deinit(handle.alloc);
@@ -13731,7 +13731,7 @@ test "capi fact relationships preserve identities and filter before ranking" {
             .{ .key = "fact:expired", .value = "{}" },
         },
         .graph_writes = &.{
-            .{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R", .edge_id = "one", .owner_document = "fact:one", .weight = 1, .metadata_json = "{}" },
+            .{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R", .edge_id = "one", .owner_document = "fact:one", .weight = 1, .metadata_json = "{\"value\":1.0000000000000001}" },
             .{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R", .edge_id = "two", .owner_document = "fact:two", .weight = 2, .metadata_json = "{}" },
             .{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R", .edge_id = "expired", .owner_document = "fact:expired", .weight = 0.1, .metadata_json = "{\"invalid_at\":\"2020-01-01T00:00:00Z\"}" },
         },
@@ -13769,6 +13769,31 @@ test "capi fact relationships preserve identities and filter before ranking" {
         try std.testing.expect(std.mem.indexOf(u8, bytes, "\"owner_document_b64\":\"ZmFjdDpvbmU=\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, bytes, "ZXhwaXJlZA==") == null);
         if (i != 1) try std.testing.expect(std.mem.indexOf(u8, bytes, "\"edge_id_b64\":\"dHdv\"") != null);
+    }
+    const decimal_requests = [_][]const u8{
+        \\{"index_name":"facts","start_key_b64":"YQ==","max_depth":1,"include_paths":true,"edge_filter":{"properties":[{"field":"/metadata/value","op":"eq","value":1.0000000000000001}]}}
+        ,
+        \\{"index_name":"facts","source_b64":"YQ==","target_b64":"Yg==","edge_filter":{"properties":[{"field":"/metadata/value","op":"eq","value":1.0000000000000001}]}}
+        ,
+        \\{"index_name":"facts","source_b64":"YQ==","target_b64":"Yg==","k":2,"edge_filter":{"properties":[{"field":"/metadata/value","op":"eq","value":1.0000000000000001}]}}
+        ,
+        \\{"graph_queries":[{"name":"walk","type":"traverse","index_name":"facts","start_nodes":{"keys":["YQ=="]},"include_paths":true,"max_depth":1,"edge_filter":{"properties":[{"field":"/metadata/value","op":"eq","value":1.0000000000000001}]}}],"named_sets":[]}
+        ,
+    };
+    for (decimal_requests, 0..) |request, i| {
+        var output: capi.Buffer = .{};
+        defer antfly_db_buffer_free(output.ptr, output.len);
+        const slice = capi.Slice{ .ptr = request.ptr, .len = request.len };
+        const status = switch (i) {
+            0 => antfly_db_traverse_edges_json(handle_ptr, slice, &output),
+            1 => antfly_db_find_shortest_path_json(handle_ptr, slice, &output),
+            2 => antfly_db_find_k_shortest_paths_json(handle_ptr, slice, &output),
+            else => antfly_db_execute_graph_queries_json(handle_ptr, slice, &output),
+        };
+        try std.testing.expectEqual(capi.ErrorCode.ok, status);
+        const bytes = output.ptr.?[0..output.len];
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "\"edge_id_b64\":\"b25l\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "\"edge_id_b64\":\"dHdv\"") == null);
     }
     for ([_][]const u8{
         "{\"index_name\":\"facts\",\"start_key_b64\":\"YQ==\",\"edge_filter\":true}",

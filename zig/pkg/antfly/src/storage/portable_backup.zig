@@ -98,6 +98,7 @@ const PortableOutput = struct {
     writer: ?*std.Io.Writer = null,
     mode: PortableOutputMode,
     bytes_written: u64 = 0,
+    min_reader_version: u32 = 2,
     bundle_offset: u64 = 0,
     stats: ?*ExportStats = null,
 
@@ -333,9 +334,9 @@ pub fn exportPortableToWriterWithOptions(
         .created_at_unix_ns = options.created_at_unix_ns,
         .compatibility = .{
             .storage_engine = "logical",
-            .min_afb_reader = for (objects.items) |object| {
+            .min_afb_reader = @max(inventory_out.min_reader_version, for (objects.items) |object| {
                 if (object.block_type == .graph_relationship_batch) break backup_bundle.relationship_reader_version;
-            } else 2,
+            } else 2),
         },
         .objects = descriptors,
         .blobs = blob_descriptors,
@@ -675,6 +676,15 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
             } else if (internal_keys.isEmbeddingArtifactKey(kv.key)) {
                 try collectEmbedding(alloc, &emb_batches, &sparse_batches, kv.key, kv.value);
                 derived_batch_bytes += kv.key.len + kv.value.len;
+            } else if (internal_keys.isGraphRetirementKey(kv.key)) {
+                if (!std.mem.eql(u8, kv.value, "1")) return error.InvalidBackupRequest;
+                const key = try alloc.dupe(u8, kv.key);
+                errdefer alloc.free(key);
+                const value = try alloc.dupe(u8, kv.value);
+                errdefer alloc.free(value);
+                try relationship_batch.append(alloc, .{ .key = key, .value = value });
+                relationship_batch_bytes += key.len + value.len;
+                out.min_reader_version = backup_bundle.retirement_reader_version;
             } else if (internal_keys.isGraphEdgeArtifactKey(kv.key)) {
                 if (try appendRelationshipArtifactEntry(alloc, &relationship_batch, kv.key, kv.value)) {
                     relationship_batch_bytes += kv.key.len + kv.value.len;
@@ -1953,7 +1963,7 @@ fn validateAndImportPortableStagingReader(
             .embedding_batch => if (opts.import_derived_indexes) try importEmbeddingBatch(alloc, store, block.payload, opts.embedding_source_fields),
             .sparse_batch => if (opts.import_derived_indexes) try importSparseBatch(alloc, store, block.payload, opts.embedding_source_fields),
             .edge_batch => if (opts.import_derived_indexes) try importEdgeBatch(alloc, store, block.payload),
-            .graph_relationship_batch => if (opts.import_derived_indexes) try importRelationshipBatch(alloc, store, block.payload),
+            .graph_relationship_batch => try importRelationshipBatch(alloc, store, block.payload, opts.import_derived_indexes),
             .shard_header, .shard_footer, .file_footer => try validatePortableImportBlockPayload(alloc, block.block_type, block.payload, opts, &archive),
             .bundle_manifest, .cluster_manifest, .table_manifest, .summary_batch, .transaction_batch => {},
             else => {},
@@ -1997,6 +2007,7 @@ fn importPortablePrimaryBlocks(alloc: Allocator, store: *DocStore, reader: anyty
                 imported_identity = true;
             },
             .metadata_batch => try importMetadataBatch(alloc, store, block.payload),
+            .graph_relationship_batch => try importRelationshipBatch(alloc, store, block.payload, false),
             // Skip: derived indexes in the first pass; they are restored after documents.
             .cluster_manifest, .table_manifest, .shard_header, .shard_footer, .file_footer => {},
             else => {},
@@ -2025,7 +2036,7 @@ fn importPortableDerivedBlocks(alloc: Allocator, store: *DocStore, reader: anyty
             .embedding_batch => try importEmbeddingBatch(alloc, store, block.payload, opts.embedding_source_fields),
             .sparse_batch => try importSparseBatch(alloc, store, block.payload, opts.embedding_source_fields),
             .edge_batch => try importEdgeBatch(alloc, store, block.payload),
-            .graph_relationship_batch => try importRelationshipBatch(alloc, store, block.payload),
+            .graph_relationship_batch => try importRelationshipBatch(alloc, store, block.payload, true),
             else => {},
         }
     }
@@ -2405,7 +2416,7 @@ fn validatePortableImportBlockPayload(
         .embedding_batch => if (opts.import_derived_indexes) try validateEmbeddingBatchPayload(alloc, payload),
         .sparse_batch => if (opts.import_derived_indexes) try validateSparseBatchPayload(alloc, payload),
         .edge_batch => if (opts.import_derived_indexes) try validateEdgeBatchPayload(alloc, payload),
-        .graph_relationship_batch => if (opts.import_derived_indexes) try validateRelationshipBatchPayload(alloc, payload),
+        .graph_relationship_batch => try validateRelationshipBatchPayload(alloc, payload, opts.import_derived_indexes),
         .shard_header => {
             const header = try backup_codec.decodeShardHeader(alloc, payload);
             alloc.free(header.table_name);
@@ -3108,10 +3119,15 @@ fn embeddingSourceHashForDocument(
     return enrichment_artifact_codec.hashSource(source_text);
 }
 
-fn validateRelationshipBatchPayload(alloc: Allocator, payload: []const u8) !void {
+fn validateRelationshipBatchPayload(alloc: Allocator, payload: []const u8, include_relationships: bool) !void {
     const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
     defer freeKeyValueEntries(alloc, entries);
     for (entries) |entry| {
+        if (internal_keys.isGraphRetirementKey(entry.key)) {
+            if (!std.mem.eql(u8, entry.value, "1")) return error.InvalidBackupRequest;
+            continue;
+        }
+        if (!include_relationships) continue;
         const parsed = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(alloc, entry.key)) orelse return error.InvalidBackupRequest;
         defer {
             alloc.free(parsed.doc_key);
@@ -3127,15 +3143,20 @@ fn validateRelationshipBatchPayload(alloc: Allocator, payload: []const u8) !void
     }
 }
 
-fn importRelationshipBatch(alloc: Allocator, store: *DocStore, payload: []const u8) !void {
+fn importRelationshipBatch(alloc: Allocator, store: *DocStore, payload: []const u8, include_relationships: bool) !void {
     // Staging imports also validate records before publishing any identity.
-    try validateRelationshipBatchPayload(alloc, payload);
+    try validateRelationshipBatchPayload(alloc, payload, include_relationships);
     const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
     defer freeKeyValueEntries(alloc, entries);
     const writes = try alloc.alloc(KVPair, entries.len);
     defer alloc.free(writes);
-    for (entries, 0..) |entry, i| writes[i] = .{ .key = entry.key, .value = entry.value };
-    if (writes.len > 0) try store.putBatch(writes, &.{});
+    var count: usize = 0;
+    for (entries) |entry| {
+        if (!include_relationships and !internal_keys.isGraphRetirementKey(entry.key)) continue;
+        writes[count] = .{ .key = entry.key, .value = entry.value };
+        count += 1;
+    }
+    if (count > 0) try store.putBatch(writes[0..count], &.{});
 }
 
 fn importEdgeBatch(alloc: Allocator, store: *DocStore, payload: []const u8) !void {
@@ -4883,6 +4904,56 @@ test "portable relationships preserve parallel identities and arbitrary endpoint
             defer decoded.deinit(alloc);
             try std.testing.expectEqual(@as(f64, 2.5), decoded.weight);
             try std.testing.expectEqualStrings("{\"fact\":true}", decoded.metadata_json);
+        }
+    }
+}
+
+test "portable graph retirements are primary and require reader version four" {
+    const alloc = std.testing.allocator;
+    var tmp_src = std.testing.tmpDir(.{});
+    defer tmp_src.cleanup();
+    var src = try openTestStore(alloc, &tmp_src);
+    defer src.close();
+    const edge = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "source", "facts", "R", "target");
+    defer alloc.free(edge);
+    const retired = try internal_keys.graphRetirementKeyAlloc(alloc, edge);
+    defer alloc.free(retired);
+    const fact = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, "fact", "facts", "R", "target", "source", "fact");
+    defer alloc.free(fact);
+    const value = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 7, 2.5, 0, 0, "{}");
+    defer alloc.free(value);
+    try src.put(edge, value);
+    try src.put(retired, "1");
+    try src.put(fact, value);
+    var out: ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try exportPortable(alloc, &src, &out);
+    {
+        var reader = backup_codec.SliceReader.init(out.items);
+        _ = try reader.readHeader();
+        const block = try reader.readBlock(alloc);
+        defer alloc.free(block.payload);
+        var manifest = try backup_bundle.parseManifest(alloc, block.payload);
+        defer manifest.deinit();
+        try std.testing.expectEqual(@as(u32, 4), manifest.value.compatibility.min_afb_reader);
+    }
+    for ([_]bool{ false, true }) |staged| {
+        for ([_]bool{ false, true }) |derived| {
+            var tmp_dst = std.testing.tmpDir(.{});
+            defer tmp_dst.cleanup();
+            var dst = try openTestStore(alloc, &tmp_dst);
+            defer dst.close();
+            try importPortableWithOptions(alloc, &dst, out.items, .{ .unpublished_staging = staged, .import_derived_indexes = derived });
+            const marker = try dst.get(alloc, retired);
+            defer alloc.free(marker);
+            try std.testing.expectEqualStrings("1", marker);
+            try std.testing.expect(try dst.hasGraphRetirements());
+            try dst.put(edge, value);
+            try std.testing.expectError(error.NotFound, dst.get(alloc, edge));
+            if (derived) {
+                const restored_fact = try dst.get(alloc, fact);
+                defer alloc.free(restored_fact);
+            } else try std.testing.expectError(error.NotFound, dst.get(alloc, fact));
         }
     }
 }

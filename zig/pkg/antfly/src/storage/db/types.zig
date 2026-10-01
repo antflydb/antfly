@@ -355,7 +355,8 @@ pub fn validateMergeArtifacts(req: BatchRequest) !void {
     const keys = @import("../internal_keys.zig");
     for (req.merge_artifacts) |row| {
         if (!keys.isGraphEdgeArtifactKey(row.key) and !keys.isEmbeddingArtifactKey(row.key) and
-            !keys.isDerivedEmbeddingArtifactKey(row.key)) return error.InvalidBatchRequest;
+            !keys.isDerivedEmbeddingArtifactKey(row.key) and !keys.isGraphRetirementKey(row.key)) return error.InvalidBatchRequest;
+        if (keys.isGraphRetirementKey(row.key) and !std.mem.eql(u8, row.value, "1")) return error.InvalidBatchRequest;
     }
 }
 

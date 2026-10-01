@@ -11663,6 +11663,7 @@ pub const IndexManager = struct {
                 if (!should_delete) should_delete = cleanupRecordMatchesEmbedding(state.record, candidate);
                 if (!should_delete) if (state.graph_index_name) |index_name| {
                     should_delete = internal_keys.matchesGraphEdgeIndexName(candidate, index_name) or
+                        internal_keys.matchesGraphRetirementIndexName(candidate, index_name) or
                         internal_keys.matchesGraphAssetStateIndexName(candidate, index_name) or
                         internal_keys.matchesGraphEdgeContenderIndexName(candidate, index_name) or
                         internal_keys.matchesGraphGlobalEdgeContenderIndexName(candidate, index_name);
@@ -23934,33 +23935,10 @@ pub const IndexManager = struct {
         return try doc_ids.toOwnedSlice(alloc);
     }
 
-    fn deleteGraphDocsEntry(self: *IndexManager, entry: *GraphIndex, keys: []const []const u8) !void {
-        var deletes = std.ArrayListUnmanaged(graph_mod.BatchDelete).empty;
-        defer {
-            for (deletes.items) |delete| {
-                self.alloc.free(@constCast(delete.source));
-                self.alloc.free(@constCast(delete.target));
-                self.alloc.free(@constCast(delete.edge_type));
-                if (delete.edge_id.len > 0) self.alloc.free(@constCast(delete.edge_id));
-                if (delete.owner_document.len > 0) self.alloc.free(@constCast(delete.owner_document));
-            }
-            deletes.deinit(self.alloc);
-        }
-
-        for (keys) |key| {
-            const edges = try entry.index.getEdges(self.alloc, key, "", .both);
-            defer graph_mod.GraphIndex.freeEdges(self.alloc, edges);
-
-            for (edges) |edge| {
-                try deletes.append(self.alloc, .{
-                    .source = try self.alloc.dupe(u8, edge.source),
-                    .target = try self.alloc.dupe(u8, edge.target),
-                    .edge_type = try self.alloc.dupe(u8, edge.edge_type),
-                });
-            }
-        }
-
-        try entry.index.batchApply(&.{}, deletes.items);
+    fn deleteGraphDocsEntry(_: *IndexManager, entry: *GraphIndex, keys: []const []const u8) !void {
+        // The graph index owns the relationship identity and ownership rules.
+        // Reuse its cleanup path for both endpoint and fact-document deletion.
+        try entry.index.deleteEdgesForDocs(keys);
     }
 
     fn applyGraphWritesEntry(self: *IndexManager, entry: *GraphIndex, writes: []const types.GraphEdgeWrite) !void {
@@ -28806,29 +28784,19 @@ pub const GraphArtifactMapping = struct {
     context_doc_fields: []const []u8 = &.{},
 
     pub fn clone(alloc: Allocator, mapping: GraphArtifactMapping) !GraphArtifactMapping {
-        const context_doc_fields: [][]u8 = if (mapping.context_doc_fields.len > 0)
-            try alloc.alloc([]u8, mapping.context_doc_fields.len)
-        else
-            @constCast(&.{});
-        var initialized: usize = 0;
-        errdefer {
-            for (context_doc_fields[0..initialized]) |field| alloc.free(field);
-            if (context_doc_fields.len > 0) alloc.free(context_doc_fields);
+        var result = GraphArtifactMapping{ .node_model = mapping.node_model };
+        errdefer result.deinit(alloc);
+        inline for ([_][]const u8{ "source_template", "edge_id_template", "target_template", "edge_type_template", "weight_template", "metadata_template_json" }) |field| {
+            const value = @field(mapping, field);
+            if (value.len > 0) @field(result, field) = try alloc.dupe(u8, value);
         }
-        for (mapping.context_doc_fields, 0..) |field, i| {
-            context_doc_fields[i] = try alloc.dupe(u8, field);
-            initialized += 1;
+        if (mapping.context_doc_fields.len > 0) {
+            const fields = try alloc.alloc([]u8, mapping.context_doc_fields.len);
+            @memset(fields, @constCast(""));
+            result.context_doc_fields = fields;
+            for (mapping.context_doc_fields, fields) |field, *owned| owned.* = try alloc.dupe(u8, field);
         }
-        return .{
-            .node_model = mapping.node_model,
-            .source_template = if (mapping.source_template.len > 0) try alloc.dupe(u8, mapping.source_template) else "",
-            .edge_id_template = if (mapping.edge_id_template.len > 0) try alloc.dupe(u8, mapping.edge_id_template) else "",
-            .target_template = if (mapping.target_template.len > 0) try alloc.dupe(u8, mapping.target_template) else "",
-            .edge_type_template = if (mapping.edge_type_template.len > 0) try alloc.dupe(u8, mapping.edge_type_template) else "",
-            .weight_template = if (mapping.weight_template.len > 0) try alloc.dupe(u8, mapping.weight_template) else "",
-            .metadata_template_json = if (mapping.metadata_template_json.len > 0) try alloc.dupe(u8, mapping.metadata_template_json) else "",
-            .context_doc_fields = context_doc_fields,
-        };
+        return result;
     }
 
     pub fn deinit(self: *GraphArtifactMapping, alloc: Allocator) void {
@@ -28856,13 +28824,13 @@ pub const GraphArtifactSource = struct {
     mention_edge_type: []u8 = "",
 
     pub fn clone(alloc: Allocator, source: GraphArtifactSource) !GraphArtifactSource {
-        return .{
-            .artifact_name = try alloc.dupe(u8, source.artifact_name),
-            .path = if (source.path.len > 0) try alloc.dupe(u8, source.path) else "",
-            .format = source.format,
-            .mapping = try GraphArtifactMapping.clone(alloc, source.mapping),
-            .mention_edge_type = if (source.mention_edge_type.len > 0) try alloc.dupe(u8, source.mention_edge_type) else "",
-        };
+        var result = GraphArtifactSource{ .artifact_name = @constCast(""), .format = source.format };
+        errdefer result.deinit(alloc);
+        result.artifact_name = try alloc.dupe(u8, source.artifact_name);
+        if (source.path.len > 0) result.path = try alloc.dupe(u8, source.path);
+        result.mapping = try GraphArtifactMapping.clone(alloc, source.mapping);
+        if (source.mention_edge_type.len > 0) result.mention_edge_type = try alloc.dupe(u8, source.mention_edge_type);
+        return result;
     }
 
     pub fn deinit(self: *GraphArtifactSource, alloc: Allocator) void {
@@ -30042,7 +30010,7 @@ pub fn validateGraphConfig(alloc: Allocator, raw: []const u8) !void {
 }
 
 fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
-    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{ .parse_numbers = false });
     defer parsed.deinit();
     const root = parsed.value;
     if (root != .object) return error.InvalidIndexConfig;
@@ -30052,10 +30020,13 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
     if (root.object.get("sources") != null and root.object.get("source") != null) return error.InvalidIndexConfig;
     const algebraic_semiring_traversal = try parseGraphAlgebraicSemiringTraversal(root);
     const max_edges_per_document: u32 = if (root.object.get("max_edges_per_document")) |value| blk: {
-        if (value != .integer or value.integer < 0 or value.integer > @as(i64, graph_asset_state.hard_max_edges_per_document)) {
-            return error.InvalidIndexConfig;
-        }
-        break :blk @intCast(value.integer);
+        const count = switch (value) {
+            .integer => |v| v,
+            .number_string => |text| std.fmt.parseInt(i64, text, 10) catch return error.InvalidIndexConfig,
+            else => return error.InvalidIndexConfig,
+        };
+        if (count < 0 or count > @as(i64, graph_asset_state.hard_max_edges_per_document)) return error.InvalidIndexConfig;
+        break :blk @intCast(count);
     } else 0;
     const artifact_sources: []GraphArtifactSource = if (root.object.get("sources") != null)
         try parseGraphArtifactSources(alloc, root)
@@ -30265,6 +30236,7 @@ fn jsonNumberAsF64(value: std.json.Value) !f64 {
     return switch (value) {
         .integer => |v| @floatFromInt(v),
         .float => |v| v,
+        .number_string => |text| std.fmt.parseFloat(f64, text) catch error.InvalidIndexConfig,
         else => error.InvalidIndexConfig,
     };
 }
@@ -30273,6 +30245,10 @@ fn jsonNumberAsU32(value: std.json.Value) !u32 {
     return switch (value) {
         .integer => |v| if (v > 0 and v <= std.math.maxInt(u32)) @intCast(v) else error.InvalidIndexConfig,
         .float => |v| if (v > 0 and v <= std.math.maxInt(u32) and @floor(v) == v) @intFromFloat(v) else error.InvalidIndexConfig,
+        .number_string => |text| blk: {
+            const v = std.fmt.parseFloat(f64, text) catch return error.InvalidIndexConfig;
+            break :blk if (v > 0 and v <= std.math.maxInt(u32) and @floor(v) == v) @as(u32, @intFromFloat(v)) else error.InvalidIndexConfig;
+        },
         else => error.InvalidIndexConfig,
     };
 }
@@ -43191,3 +43167,48 @@ test "exact sparse vector generation remains eligible for mutation capture befor
     try std.testing.expect(!IndexManager.vectorBlockGenerationReadyAtSequence(generation, 0));
 }
 const StoreBatchOptions = backend_types.BatchOptions;
+
+test "graph artifact mapping and source clones release partial allocations" {
+    const Case = struct {
+        fn run(alloc: Allocator) !void {
+            const mapping = GraphArtifactMapping{
+                .source_template = @constCast("{{ _item.source }}"),
+                .edge_id_template = @constCast("{{ _doc.key }}"),
+                .target_template = @constCast("{{ _item.target }}"),
+                .edge_type_template = @constCast("RELATES_TO"),
+                .weight_template = @constCast("{{ _item.weight }}"),
+                .metadata_template_json = @constCast("{\"group_id\":\"g\"}"),
+                .context_doc_fields = &.{ @constCast("group_id"), @constCast("valid_at"), @constCast("") },
+            };
+            var copy = try GraphArtifactMapping.clone(alloc, mapping);
+            defer copy.deinit(alloc);
+            try std.testing.expectEqualStrings(mapping.edge_id_template, copy.edge_id_template);
+            var source = try GraphArtifactSource.clone(alloc, .{
+                .artifact_name = @constCast("facts"),
+                .path = @constCast("$.relations"),
+                .mapping = mapping,
+                .mention_edge_type = @constCast("MENTIONS"),
+            });
+            defer source.deinit(alloc);
+            try std.testing.expectEqualStrings(mapping.source_template, source.mapping.source_template);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "graph projection preserves numeric literals in configured templates" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseGraphConfig(alloc,
+        \\{"max_edges_per_document":10,"metrics":{"pagerank":{"damping":0.8,"tolerance":0.00001,"max_iterations":20}},"source":{"artifact":"facts","nodes":{"source":"{{ _item.source }}"},"edge":{"edge_id":18446744073709551615,"metadata":{"score":1.0000000000000001,"large":18446744073709551615}}}}
+    );
+    defer cfg.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 10), cfg.max_edges_per_document);
+    try std.testing.expectEqual(@as(u32, 20), cfg.metric_configs[0].max_iterations);
+    try std.testing.expectEqual(@as(f64, 0.8), cfg.metric_configs[0].damping);
+    try std.testing.expectEqual(@as(f64, 0.00001), cfg.metric_configs[0].tolerance);
+    try std.testing.expectEqualStrings("18446744073709551615", cfg.artifact_sources[0].mapping.edge_id_template);
+    try std.testing.expectEqualStrings("{\"score\":1.0000000000000001,\"large\":18446744073709551615}", cfg.artifact_sources[0].mapping.metadata_template_json);
+    for ([_][]const u8{ "{\"max_edges_per_document\":-1}", "{\"max_edges_per_document\":1.5}", "{\"max_edges_per_document\":1000001}", "{\"metrics\":{\"pagerank\":{\"max_iterations\":1.5}}}" }) |raw| {
+        try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc, raw));
+    }
+}

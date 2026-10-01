@@ -22,6 +22,7 @@ pub const raft_batch_merge_transition_protocol_version = data_raft_protocol.batc
 pub const raft_batch_split_delta_predecessor_protocol_version = data_raft_protocol.batch_split_delta_predecessor_protocol_version;
 pub const raft_batch_merge_artifacts_protocol_version = data_raft_protocol.batch_merge_artifacts_protocol_version;
 pub const raft_batch_merge_copy_attempt_protocol_version = data_raft_protocol.batch_merge_copy_attempt_protocol_version;
+pub const raft_batch_merge_retirements_protocol_version = data_raft_protocol.batch_merge_retirements_protocol_version;
 const http_common = @import("../raft/transport/http_common.zig");
 
 pub const remaining_ms_header = "X-Antfly-Raft-Batch-Remaining-Ms";

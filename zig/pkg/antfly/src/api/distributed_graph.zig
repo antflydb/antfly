@@ -7828,17 +7828,17 @@ fn validateGraphEdgesReadLimits(max_edges: u32, max_owned_bytes: u32) !void {
 }
 
 fn cloneGraphEdge(alloc: std.mem.Allocator, edge: GraphEdgeJson) !graph_mod.Edge {
-    return .{
-        .source = try alloc.dupe(u8, edge.source),
-        .target = try alloc.dupe(u8, edge.target),
-        .edge_type = try alloc.dupe(u8, edge.edge_type),
-        .edge_id = try alloc.dupe(u8, edge.edge_id),
-        .owner_document = try alloc.dupe(u8, edge.owner_document),
+    return cloneOwnedGraphEdge(alloc, .{
+        .source = edge.source,
+        .target = edge.target,
+        .edge_type = edge.edge_type,
+        .edge_id = edge.edge_id,
+        .owner_document = edge.owner_document,
         .weight = edge.weight,
         .created_at = edge.created_at,
         .updated_at = edge.updated_at,
-        .metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "",
-    };
+        .metadata = edge.metadata,
+    });
 }
 
 pub fn encodeGraphEdgesResponse(alloc: std.mem.Allocator, res: GraphEdgesResponse) ![]u8 {
@@ -13825,6 +13825,16 @@ test "distributed graph edges response round trips owned edges" {
     }};
     const encoded = try encodeGraphEdgesResponse(alloc, .{ .edges = edges[0..] });
     defer alloc.free(encoded);
+
+    const FailureCase = struct {
+        fn run(allocator: std.mem.Allocator, body: []const u8) !void {
+            var response = try parseGraphEdgesResponse(allocator, body);
+            defer response.deinit(allocator);
+            try std.testing.expectEqualStrings("fact:1", response.edges[0].edge_id);
+            try std.testing.expectEqualStrings("fact:1", response.edges[0].owner_document);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, FailureCase.run, .{encoded});
 
     var parsed = try parseGraphEdgesResponse(alloc, encoded);
     defer parsed.deinit(alloc);

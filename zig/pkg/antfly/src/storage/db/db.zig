@@ -9954,7 +9954,11 @@ pub const DB = struct {
         try store_writes.appendSlice(self.alloc, timestamp_writes.items);
         for (req.merge_artifacts) |row| {
             try store_writes.append(self.alloc, .{ .key = row.key, .value = row.value });
-            try appendUniqueOwnedKeyIndexed(self.alloc, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, row.key);
+            if (internal_keys.isGraphRetirementKey(row.key)) {
+                const artifact = try internal_keys.graphRetirementArtifactKeyAlloc(self.alloc, row.key);
+                defer self.alloc.free(artifact);
+                try appendUniqueOwnedKeyIndexed(self.alloc, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, artifact);
+            } else try appendUniqueOwnedKeyIndexed(self.alloc, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, row.key);
         }
         for (explicit_embedding_artifact_writes.items) |write| {
             try store_writes.append(self.alloc, .{
@@ -9963,16 +9967,36 @@ pub const DB = struct {
             });
         }
         for (explicit_graph_artifact_writes.items) |write| {
+            const retired = try internal_keys.graphRetirementKeyAlloc(self.alloc, write.key);
+            owned_delete_keys.append(self.alloc, retired) catch |err| {
+                self.alloc.free(retired);
+                return err;
+            };
+            try delete_keys.append(self.alloc, retired);
             try store_writes.append(self.alloc, .{
                 .key = write.key,
                 .value = write.value,
             });
             try appendUniqueOwnedKeyIndexed(self.alloc, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, write.key);
         }
+        var deleted_graph_owners = std.StringHashMapUnmanaged(void).empty;
+        defer deleted_graph_owners.deinit(self.alloc);
+        for (effective_req.deletes) |owner| try deleted_graph_owners.put(self.alloc, owner, {});
         for (effective_req.graph_deletes) |delete| {
             const artifact_key = try internal_keys.graphRelationshipArtifactKeyAlloc(self.alloc, if (delete.owner_document.len > 0) delete.owner_document else delete.source, delete.index_name, delete.edge_type, delete.target, delete.source, delete.edge_id);
             defer self.alloc.free(artifact_key);
             if (explicit_graph_write_key_set.contains(artifact_key)) continue;
+            // Explicit removal overrides retained projection inputs until a
+            // new owner lifecycle or exact relationship write revives it.
+            const owner = if (delete.owner_document.len > 0) delete.owner_document else delete.source;
+            if (!deleted_graph_owners.contains(owner)) {
+                const retired = try internal_keys.graphRetirementKeyAlloc(self.alloc, artifact_key);
+                owned_store_keys.append(self.alloc, retired) catch |err| {
+                    self.alloc.free(retired);
+                    return err;
+                };
+                try store_writes.append(self.alloc, .{ .key = retired, .value = "1" });
+            }
             if (graph_delete_key_set.contains(artifact_key)) continue;
             const owned_key = try self.alloc.dupe(u8, artifact_key);
             try owned_delete_keys.append(self.alloc, owned_key);
@@ -9992,6 +10016,27 @@ pub const DB = struct {
         }
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_writes_ns, extract_writes_start_ns);
 
+        if (effective_req.writes.len != 0 and try self.core.store.hasGraphRetirements()) {
+            for (effective_req.writes, 0..) |write, write_index| {
+                // Semantic no-ops retain retirement; a real owner update starts
+                // a new projection lifecycle and replays its durable inputs.
+                if (!derived_changed_flags[write_index]) continue;
+                const retired_prefix = try internal_keys.graphRetirementPrefixAlloc(self.alloc, write.key);
+                defer self.alloc.free(retired_prefix);
+                const before = delete_keys.items.len;
+                try collectDeleteKeysForPrefix(self.alloc, self.core.store, retired_prefix, &delete_keys, &owned_delete_keys, null);
+                if (delete_keys.items.len == before) continue;
+                const artifact_prefix = try internal_keys.artifactRootPrefixAlloc(self.alloc, write.key);
+                defer self.alloc.free(artifact_prefix);
+                const inputs = try self.core.store.scanPrefixKeysPage(self.alloc, artifact_prefix, null, std.math.maxInt(usize));
+                defer freeOwnedKeySlice(self.alloc, inputs);
+                for (inputs) |input| {
+                    if (!internal_keys.isAssetArtifactKey(input) and !internal_keys.isChunkArtifactRecordKey(input) and !internal_keys.isResolutionArtifactKey(input)) continue;
+                    try appendUniqueOwnedKeyIndexed(self.alloc, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, input);
+                }
+            }
+        }
+
         const delete_artifacts_start_ns = monotonicTimeNs();
         const deleted_artifact_keys = try collectEnrichmentArtifactDeletesForBatch(
             self,
@@ -10001,6 +10046,7 @@ pub const DB = struct {
             &owned_delete_keys,
         );
         defer self.alloc.free(deleted_artifact_keys);
+        try appendGraphEndpointRetirements(self.alloc, effective_req.deletes, deleted_artifact_keys, &store_writes, &owned_store_keys);
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.delete_artifacts_ns, delete_artifacts_start_ns);
 
         const use_thin_replay_fast_path =
@@ -22172,6 +22218,7 @@ pub const DB = struct {
             if (upper) |bound| if (std.mem.order(u8, row.key, bound) != .lt) break;
             if (after_key) |key| if (std.mem.order(u8, row.key, key) != .gt) continue;
             if (!isMergeArtifactKey(row.key)) continue;
+            if (internal_keys.isGraphRetirementKey(row.key) and !std.mem.eql(u8, row.value, "1")) return error.InvalidGraphRetirement;
             const value = if (internal_keys.isGraphEdgeArtifactKey(row.key)) graph: {
                 const edge = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(alloc, row.key)) orelse return error.InvalidBatchRequest;
                 defer {
@@ -22262,8 +22309,18 @@ pub const DB = struct {
 
         var derived_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
         defer derived_writes.deinit(self.alloc);
+        var retired_artifacts = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (retired_artifacts.items) |key| self.alloc.free(key);
+            retired_artifacts.deinit(self.alloc);
+        }
         for (donor_rows) |row| {
-            if (!internal_keys.isGraphEdgeArtifactKey(row.key) and
+            if (internal_keys.isGraphRetirementKey(row.key)) {
+                const artifact = try internal_keys.graphRetirementArtifactKeyAlloc(self.alloc, row.key);
+                errdefer self.alloc.free(artifact);
+                try retired_artifacts.append(self.alloc, artifact);
+            }
+            if (!internal_keys.isGraphRetirementKey(row.key) and !internal_keys.isGraphEdgeArtifactKey(row.key) and
                 !internal_keys.isEmbeddingArtifactKey(row.key) and
                 !internal_keys.isDerivedEmbeddingArtifactKey(row.key)) continue;
             try derived_writes.append(self.alloc, .{ .key = row.key, .value = row.value });
@@ -22291,6 +22348,9 @@ pub const DB = struct {
             self.core.store,
             self.core.index_manager,
         );
+        for (self.core.index_manager.graphIndexes()) |index| {
+            try applyGraphArtifactMutationPages(self.async_context, index.config.name, retired_artifacts.items, &.{}, 0);
+        }
         try self.core.index_manager.syncAll(true);
         try self.core.syncStore(true);
     }
@@ -26945,18 +27005,9 @@ pub const DB = struct {
                 });
             }
             for (extracted.graph_writes) |graph_write| {
-                try graph_writes.append(alloc, .{
-                    .index_name = try alloc.dupe(u8, graph_write.index_name),
-                    .source = try alloc.dupe(u8, graph_write.source),
-                    .target = try alloc.dupe(u8, graph_write.target),
-                    .edge_type = try alloc.dupe(u8, graph_write.edge_type),
-                    .edge_id = if (graph_write.edge_id.len > 0) try alloc.dupe(u8, graph_write.edge_id) else "",
-                    .owner_document = if (graph_write.owner_document.len > 0) try alloc.dupe(u8, graph_write.owner_document) else "",
-                    .weight = graph_write.weight,
-                    .created_at = graph_write.created_at,
-                    .updated_at = graph_write.updated_at,
-                    .metadata_json = if (graph_write.metadata_json.len > 0) try alloc.dupe(u8, graph_write.metadata_json) else "",
-                });
+                var owned = try graph_write.cloneAlloc(alloc);
+                errdefer owned.deinit(alloc);
+                try graph_writes.append(alloc, owned);
             }
         }
 
@@ -39957,6 +40008,7 @@ fn isMetadataKey(key: []const u8) bool {
 
 fn isMergeArtifactKey(key: []const u8) bool {
     return internal_keys.isGraphEdgeArtifactKey(key) or
+        internal_keys.isGraphRetirementKey(key) or
         internal_keys.isEmbeddingArtifactKey(key) or
         internal_keys.isDerivedEmbeddingArtifactKey(key);
 }
@@ -44223,7 +44275,7 @@ fn extractAssetSourceValue(
         return @constCast(rendered);
     }
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, doc_value, .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, doc_value, .{ .parse_numbers = false });
     defer parsed.deinit();
     if (parsed.value != .object) return null;
     const source = parsed.value.object.get(request.source_field) orelse return null;
@@ -49019,10 +49071,13 @@ fn collectEnrichmentArtifactDeletesForBatch(
     _ = extracted;
     if (!self.core.hasArtifactCleanupMaybe()) return try self.alloc.alloc([]u8, 0);
 
+    if (req.deletes.len != 0) try self.core.store.ensureGraphIncomingDirectory();
     var deleted = std.ArrayListUnmanaged([]u8).empty;
     errdefer deleted.deinit(self.alloc);
     var seen_docs = std.StringHashMapUnmanaged(void).empty;
     defer seen_docs.deinit(self.alloc);
+    var selected_artifacts = std.StringHashMapUnmanaged(void).empty;
+    defer selected_artifacts.deinit(self.alloc);
 
     for (req.deletes) |key| {
         const gop = try seen_docs.getOrPut(self.alloc, key);
@@ -49034,6 +49089,7 @@ fn collectEnrichmentArtifactDeletesForBatch(
             delete_keys,
             owned_delete_keys,
             &deleted,
+            &selected_artifacts,
         );
     }
     return try deleted.toOwnedSlice(self.alloc);
@@ -49046,6 +49102,7 @@ fn collectEnrichmentArtifactDeleteKeysForDocContext(
     delete_keys: *std.ArrayListUnmanaged([]const u8),
     owned_delete_keys: *std.ArrayListUnmanaged([]u8),
     deleted_artifact_keys: *std.ArrayListUnmanaged([]u8),
+    selected_artifacts: *std.StringHashMapUnmanaged(void),
 ) !void {
     const document_prefix = try internal_keys.documentExactPrefixAlloc(alloc, doc_key);
     defer alloc.free(document_prefix);
@@ -49072,6 +49129,7 @@ fn collectEnrichmentArtifactDeleteKeysForDocContext(
         delete_keys: *std.ArrayListUnmanaged([]const u8),
         owned_delete_keys: *std.ArrayListUnmanaged([]u8),
         deleted_artifact_keys: *std.ArrayListUnmanaged([]u8),
+        selected_artifacts: *std.StringHashMapUnmanaged(void),
 
         fn visit(raw: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
             _ = value;
@@ -49081,13 +49139,17 @@ fn collectEnrichmentArtifactDeleteKeysForDocContext(
                 !std.mem.startsWith(u8, key, ctx.asset_state_prefix) and
                 !std.mem.startsWith(u8, key, ctx.graph_asset_state_prefix) and
                 !std.mem.startsWith(u8, key, ctx.graph_edge_contender_prefix)) return .@"continue";
+            if (is_artifact and ctx.selected_artifacts.contains(key)) return .@"continue";
             const owned = try ctx.alloc.dupe(u8, key);
             errdefer ctx.alloc.free(owned);
             try ctx.owned_delete_keys.append(ctx.alloc, owned);
             errdefer _ = ctx.owned_delete_keys.pop();
             try ctx.delete_keys.append(ctx.alloc, owned);
             errdefer _ = ctx.delete_keys.pop();
-            if (is_artifact) try ctx.deleted_artifact_keys.append(ctx.alloc, owned);
+            if (is_artifact) {
+                try ctx.deleted_artifact_keys.append(ctx.alloc, owned);
+                try ctx.selected_artifacts.put(ctx.alloc, owned, {});
+            }
             return .@"continue";
         }
     };
@@ -49100,8 +49162,31 @@ fn collectEnrichmentArtifactDeleteKeysForDocContext(
         .delete_keys = delete_keys,
         .owned_delete_keys = owned_delete_keys,
         .deleted_artifact_keys = deleted_artifact_keys,
+        .selected_artifacts = selected_artifacts,
     };
     try store.scanWithContext(document_prefix, upper orelse "", .{}, &scan_context, ScanContext.visit);
+    const retired_prefix = try internal_keys.graphRetirementPrefixAlloc(alloc, doc_key);
+    defer alloc.free(retired_prefix);
+    try collectDeleteKeysForPrefix(alloc, store, retired_prefix, delete_keys, owned_delete_keys, null);
+
+    // Retire authoritative inline relationship artifacts, not just adjacency.
+    // Exact primary tombstones flow through the ordinary graph replay journal.
+    const incoming_prefix = try internal_keys.graphIncomingPrefixAlloc(alloc, doc_key);
+    defer alloc.free(incoming_prefix);
+    const incoming = try store.scanPrefix(alloc, incoming_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, incoming);
+    for (incoming) |entry| {
+        // Self loops and jointly deleted endpoints may already be selected.
+        if (selected_artifacts.contains(entry.value)) continue;
+        const owned = try alloc.dupe(u8, entry.value);
+        errdefer alloc.free(owned);
+        try owned_delete_keys.append(alloc, owned);
+        errdefer _ = owned_delete_keys.pop();
+        try delete_keys.append(alloc, owned);
+        errdefer _ = delete_keys.pop();
+        try deleted_artifact_keys.append(alloc, owned);
+        try selected_artifacts.put(alloc, owned, {});
+    }
 }
 
 fn collectDeleteKeysForPrefix(
@@ -49137,6 +49222,31 @@ fn collectGraphArtifactsForDocIndex(
     const prefix = try internal_keys.graphArtifactIndexPrefixAlloc(alloc, doc_key, index_name);
     defer alloc.free(prefix);
     return try store.scanPrefix(alloc, prefix);
+}
+
+fn appendGraphEndpointRetirements(
+    alloc: Allocator,
+    deleted_docs: []const []const u8,
+    deleted_artifacts: []const []const u8,
+    writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    owned_keys: *std.ArrayListUnmanaged([]u8),
+) !void {
+    var deleted_owners = std.StringHashMapUnmanaged(void).empty;
+    defer deleted_owners.deinit(alloc);
+    for (deleted_docs) |doc| try deleted_owners.put(alloc, doc, {});
+    for (deleted_artifacts) |artifact| {
+        if (internal_keys.graphInlineTargetComponent(artifact) == null) continue;
+        const owner_end = internal_keys.findComponentTerminator(artifact, 1).?;
+        const owner = try internal_keys.decodeBodyAlloc(alloc, artifact[1..owner_end]);
+        defer alloc.free(owner);
+        if (deleted_owners.contains(owner)) continue;
+        const retired = try internal_keys.graphRetirementKeyAlloc(alloc, artifact);
+        owned_keys.append(alloc, retired) catch |err| {
+            alloc.free(retired);
+            return err;
+        };
+        try writes.append(alloc, .{ .key = retired, .value = "1" });
+    }
 }
 
 fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []const u8, sync_level: types.SyncLevel) !void {
@@ -49208,6 +49318,9 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     else
         true;
     if (should_scan_artifacts) {
+        try ctx.store.ensureGraphIncomingDirectory();
+        var selected_artifacts = std.StringHashMapUnmanaged(void).empty;
+        defer selected_artifacts.deinit(ctx.alloc);
         var seen_docs = std.StringHashMapUnmanaged(void).empty;
         defer seen_docs.deinit(ctx.alloc);
         for (keys) |key| {
@@ -49220,9 +49333,11 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
                 &delete_keys,
                 &owned_delete_keys,
                 &deleted_artifact_keys,
+                &selected_artifacts,
             );
         }
     }
+    try appendGraphEndpointRetirements(ctx.alloc, keys, deleted_artifact_keys.items, &store_writes, &owned_store_keys);
     const req = types.BatchRequest{
         .deletes = keys,
         .sync_level = sync_level,
@@ -57247,7 +57362,7 @@ fn materializeGraphArtifactValuePaged(
     const generation = (index_manager.graphIndex(index_name) orelse return error.IndexNotFound).config.coverage_generation;
     const configured_edge_limit = graph_asset_state.effectiveEdgeLimit((index_manager.graphIndex(index_name) orelse return error.IndexNotFound).max_edges_per_document);
 
-    var parsed_artifact = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    var parsed_artifact = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{ .parse_numbers = false });
     defer parsed_artifact.deinit();
     const raw_doc = try storeDocumentValueForGraphSource(
         alloc,
@@ -57257,7 +57372,7 @@ fn materializeGraphArtifactValuePaged(
         if (options.repair_ctx) |ctx| ctx.relational_base_rows else false,
     );
     defer if (raw_doc) |value| alloc.free(value);
-    var parsed_document = if (raw_doc) |value| try std.json.parseFromSlice(std.json.Value, alloc, value, .{}) else null;
+    var parsed_document = if (raw_doc) |value| try std.json.parseFromSlice(std.json.Value, alloc, value, .{ .parse_numbers = false }) else null;
     defer if (parsed_document) |*document| document.deinit();
 
     var item_offset: usize = 0;
@@ -57737,11 +57852,11 @@ fn materializeGraphSourceArtifactRestorePage(
         defer if (raw_doc) |value| alloc.free(value);
         if (self.graph_restore_parse_cache) |*cache| cache.deinit(self.alloc);
         self.graph_restore_parse_cache = null;
-        var parsed_artifact = try std.json.parseFromSlice(std.json.Value, self.alloc, raw, .{});
+        var parsed_artifact = try std.json.parseFromSlice(std.json.Value, self.alloc, raw, .{ .parse_numbers = false });
         var artifact_owned = true;
         errdefer if (artifact_owned) parsed_artifact.deinit();
         var parsed_document = if (raw_doc) |value|
-            try std.json.parseFromSlice(std.json.Value, self.alloc, value, .{})
+            try std.json.parseFromSlice(std.json.Value, self.alloc, value, .{ .parse_numbers = false })
         else
             null;
         var document_owned = parsed_document != null;
@@ -58476,9 +58591,9 @@ fn graphWritesFromArtifactValueAlloc(
     raw_doc: ?[]const u8,
     edge_limit: usize,
 ) ![]types.GraphEdgeWrite {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{ .parse_numbers = false });
     defer parsed.deinit();
-    var parsed_doc = if (raw_doc) |doc| try std.json.parseFromSlice(std.json.Value, alloc, doc, .{}) else null;
+    var parsed_doc = if (raw_doc) |doc| try std.json.parseFromSlice(std.json.Value, alloc, doc, .{ .parse_numbers = false }) else null;
     defer if (parsed_doc) |*doc| doc.deinit();
     const doc_value: ?std.json.Value = if (parsed_doc) |doc| doc.value else null;
 
@@ -58601,8 +58716,7 @@ fn graphWritesFromArtifactParsedPageAlloc(
             );
             if (writes.items.len > before) {
                 const write = writes.items[writes.items.len - 1];
-                const write_bytes = write.index_name.len +| write.source.len +| write.target.len +|
-                    write.edge_type.len +| write.metadata_json.len +| 128;
+                const write_bytes = write.retainedBytes();
                 if (writes.items.len > 1 and output_bytes +| write_bytes > output_byte_limit) {
                     const removed = writes.pop().?;
                     freeGraphWriteFields(alloc, removed);
@@ -58917,7 +59031,7 @@ fn renderGraphArtifactMetadataTemplateAlloc(
     artifact_content_type: []const u8,
     artifact_value: std.json.Value,
 ) ![]u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, metadata_template_json, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, metadata_template_json, .{ .parse_numbers = false });
     defer parsed.deinit();
     var rendered = try renderGraphArtifactMetadataValueAlloc(alloc, parsed.value, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
     defer freeGraphRenderedJsonValue(alloc, &rendered);
@@ -59031,6 +59145,7 @@ fn jsonIntegerField(value: std.json.Value, field: []const u8) ?i64 {
     const found = value.object.get(field) orelse return null;
     return switch (found) {
         .integer => found.integer,
+        .number_string => |text| std.fmt.parseInt(i64, text, 10) catch null,
         else => null,
     };
 }
@@ -59041,6 +59156,7 @@ fn jsonFloatField(value: std.json.Value, field: []const u8) ?f64 {
     return switch (found) {
         .float => found.float,
         .integer => @floatFromInt(found.integer),
+        .number_string => |text| std.fmt.parseFloat(f64, text) catch null,
         else => null,
     };
 }
@@ -59175,24 +59291,25 @@ fn collectGraphMutationsForArtifacts(
                     return err;
                 },
             };
+            defer decoded.deinit(alloc);
             // Raw v0.2 edge keys carry no incarnation proof. Only explicitly
             // portable records may be rebound without a current-generation
             // state manifest authenticating the edge.
             if (enrichment_artifact_codec.isLegacyUnboundGraphEdge(value)) {
-                decoded.deinit(alloc);
                 continue;
             }
             const generation_unbound = enrichment_artifact_codec.isPortableUnboundGraphEdge(value);
             if (decoded.generation != options.expected_generation and !generation_unbound) {
-                decoded.deinit(alloc);
-                try deletes.append(alloc, .{
-                    .index_name = try alloc.dupe(u8, parsed.index_name),
-                    .source = try alloc.dupe(u8, if (parsed.logical_source.len > 0) parsed.logical_source else parsed.doc_key),
-                    .edge_id = try alloc.dupe(u8, parsed.edge_id),
-                    .owner_document = if (parsed.logical_source.len > 0) try alloc.dupe(u8, parsed.doc_key) else "",
-                    .target = try alloc.dupe(u8, parsed.target_doc_key),
-                    .edge_type = try alloc.dupe(u8, parsed.edge_type),
-                });
+                var owned = try (types.GraphEdgeDelete{
+                    .index_name = parsed.index_name,
+                    .source = if (parsed.logical_source.len > 0) parsed.logical_source else parsed.doc_key,
+                    .edge_id = parsed.edge_id,
+                    .owner_document = if (parsed.logical_source.len > 0) parsed.doc_key else "",
+                    .target = parsed.target_doc_key,
+                    .edge_type = parsed.edge_type,
+                }).cloneAlloc(alloc);
+                errdefer owned.deinit(alloc);
+                try deletes.append(alloc, owned);
                 continue;
             }
             if (generation_unbound) {
@@ -59206,39 +59323,42 @@ fn collectGraphMutationsForArtifacts(
                 errdefer alloc.free(bound_key);
                 try generation_bindings.append(alloc, .{ .key = bound_key, .value = bound_value });
             }
-            errdefer decoded.deinit(alloc);
-            try writes.append(alloc, .{
-                .index_name = try alloc.dupe(u8, parsed.index_name),
-                .source = try alloc.dupe(u8, if (parsed.logical_source.len > 0) parsed.logical_source else parsed.doc_key),
-                .edge_id = try alloc.dupe(u8, parsed.edge_id),
-                .owner_document = if (parsed.logical_source.len > 0) try alloc.dupe(u8, parsed.doc_key) else "",
-                .target = try alloc.dupe(u8, parsed.target_doc_key),
-                .edge_type = try alloc.dupe(u8, parsed.edge_type),
+            var owned = try (types.GraphEdgeWrite{
+                .index_name = parsed.index_name,
+                .source = if (parsed.logical_source.len > 0) parsed.logical_source else parsed.doc_key,
+                .edge_id = parsed.edge_id,
+                .owner_document = if (parsed.logical_source.len > 0) parsed.doc_key else "",
+                .target = parsed.target_doc_key,
+                .edge_type = parsed.edge_type,
                 .weight = decoded.weight,
                 .created_at = decoded.created_at,
                 .updated_at = decoded.updated_at,
-                .metadata_json = decoded.metadata_json,
-            });
+                .metadata_json = "",
+            }).cloneAlloc(alloc);
+            errdefer owned.deinit(alloc);
+            try writes.append(alloc, owned);
+            writes.items[writes.items.len - 1].metadata_json = decoded.metadata_json;
             decoded.metadata_json = &.{};
-            decoded.deinit(alloc);
         } else {
-            try deletes.append(alloc, .{
-                .index_name = try alloc.dupe(u8, parsed.index_name),
-                .source = try alloc.dupe(u8, if (parsed.logical_source.len > 0) parsed.logical_source else parsed.doc_key),
-                .edge_id = try alloc.dupe(u8, parsed.edge_id),
-                .owner_document = if (parsed.logical_source.len > 0) try alloc.dupe(u8, parsed.doc_key) else "",
-                .target = try alloc.dupe(u8, parsed.target_doc_key),
-                .edge_type = try alloc.dupe(u8, parsed.edge_type),
-            });
+            var owned = try (types.GraphEdgeDelete{
+                .index_name = parsed.index_name,
+                .source = if (parsed.logical_source.len > 0) parsed.logical_source else parsed.doc_key,
+                .edge_id = parsed.edge_id,
+                .owner_document = if (parsed.logical_source.len > 0) parsed.doc_key else "",
+                .target = parsed.target_doc_key,
+                .edge_type = parsed.edge_type,
+            }).cloneAlloc(alloc);
+            errdefer owned.deinit(alloc);
+            try deletes.append(alloc, owned);
         }
     }
 
-    return .{
-        .alloc = alloc,
-        .writes = try writes.toOwnedSlice(alloc),
-        .deletes = try deletes.toOwnedSlice(alloc),
-        .generation_bindings = try generation_bindings.toOwnedSlice(alloc),
-    };
+    var result = OwnedGraphMutations{ .alloc = alloc };
+    errdefer result.deinit();
+    result.writes = try writes.toOwnedSlice(alloc);
+    result.deletes = try deletes.toOwnedSlice(alloc);
+    result.generation_bindings = try generation_bindings.toOwnedSlice(alloc);
+    return result;
 }
 
 const GeneratedEnrichmentNameLookup = struct {
@@ -60405,7 +60525,11 @@ fn finalizePrimarySplitPreservingMetadata(
     defer docstore_mod.DocStore.freeResults(self.alloc, identity_rows);
 
     try merge_state_mod.protectForSplit(self.alloc, self.core.store);
+    // Persist invalidation before the physical rewrite. A crash after pruning
+    // must leave a resumable rebuild, never a ready directory for the old range.
+    try self.core.store.invalidateGraphDirectories();
     _ = try tryFinalizePrimarySplitFast(self, split_lower);
+    try self.core.store.ensureGraphIncomingDirectory();
     try putIdentityMetadataRows(self.alloc, self.core.store, identity_rows);
     try rebaseRangeCoverageMetadata(
         self.alloc,
@@ -60427,6 +60551,7 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
     var opened_dest_store = try openSplitDestinationStore(self, dest_dir);
     defer opened_dest_store.close(self.alloc);
     const dest_store = &opened_dest_store.store;
+    if (page_split_built) try dest_store.rebuildGraphDirectories();
     var dest_indexes = try index_manager_mod.IndexManager.initWithOptions(
         self.alloc,
         dest_dir,
@@ -128541,6 +128666,17 @@ test "db graph stale generation cleanup retires the exact fact identity" {
     const key = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, "fact:one", "facts", "R", "b", "a", "one");
     defer alloc.free(key);
     const generation = db.core.index_manager.graphIndex("facts").?.config.coverage_generation;
+    const FailureCase = struct {
+        fn run(allocator: Allocator, store: *docstore_mod.DocStore, artifact_key: []const u8, expected: u64) !void {
+            var current = try collectGraphMutationsForArtifacts(allocator, store, &.{artifact_key}, "facts", .{ .expected_generation = expected });
+            defer current.deinit();
+            var stale_copy = try collectGraphMutationsForArtifacts(allocator, store, &.{artifact_key}, "facts", .{ .expected_generation = expected + 1 });
+            defer stale_copy.deinit();
+            try std.testing.expectEqual(@as(usize, 1), current.writes.len);
+            try std.testing.expectEqual(@as(usize, 1), stale_copy.deletes.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, FailureCase.run, .{ db.core.store, key, generation });
     var stale = try collectGraphMutationsForArtifacts(alloc, db.core.store, &.{key}, "facts", .{ .expected_generation = generation + 1 });
     defer stale.deinit();
     try std.testing.expectEqual(@as(usize, 1), stale.deletes.len);
@@ -128576,4 +128712,526 @@ test "db algebraic path conversion preserves provenance under allocation failure
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.convert, .{edge});
+}
+
+test "db graph endpoint deletion retires inline identities and preserves independent facts" {
+    const alloc = std.testing.allocator;
+    for ([_][]const []const u8{ &.{"a"}, &.{"b"}, &.{ "a", "b" } }) |deleted_endpoints| {
+        const endpoint = deleted_endpoints[0];
+        var directory = try TestDirectory.init("endpoint-identity-cleanup");
+        defer directory.cleanup();
+        var db = try DB.open(alloc, std.mem.span(directory.path().ptr), .{});
+        defer db.close();
+        try db.addIndex(.{ .name = "facts", .kind = .graph, .config_json = "{}" });
+        try db.batch(.{
+            .writes = &.{ .{ .key = "a", .value = "{}" }, .{ .key = "b", .value = "{}" }, .{ .key = "fact:1", .value = "{}" } },
+            .graph_writes = &.{
+                .{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "LEGACY" },
+                .{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R", .edge_id = "inline:1" },
+                .{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R", .edge_id = "inline:2" },
+                .{ .index_name = "facts", .source = endpoint, .target = endpoint, .edge_type = "R", .edge_id = "self" },
+                .{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R", .edge_id = "fact:1", .owner_document = "fact:1" },
+            },
+            .sync_level = .write,
+        });
+        if (std.mem.eql(u8, endpoint, "b")) {
+            // Simulate a pre-directory store and leave graph projection pending:
+            // cleanup must derive identities from primary data, never adjacency.
+            const refs = try db.core.store.scanPrefix(alloc, internal_keys.graph_incoming_prefix);
+            defer docstore_mod.DocStore.freeResults(alloc, refs);
+            for (refs) |ref| try db.core.store.delete(ref.key);
+            try db.core.store.delete(internal_keys.graph_incoming_ready_key);
+        } else try db.runUntilIdle();
+        if (std.mem.eql(u8, endpoint, "b")) {
+            var ctx = db.batchContext();
+            try executeDeleteBatchContext(&ctx, deleted_endpoints, .full_index);
+        } else try db.batch(.{ .deletes = deleted_endpoints, .sync_level = .full_index });
+        try db.runUntilIdle();
+        _ = try db.rebuildGraphDerivedState();
+        const graph = &(db.core.index_manager.graphIndex("facts") orelse return error.IndexNotFound).index;
+        for ([_]graph_mod.EdgeDirection{ .out, .in }) |direction| {
+            const edges = try graph.getEdges(alloc, if (direction == .out) "a" else "b", "", direction);
+            defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+            try std.testing.expectEqual(@as(usize, 1), edges.len);
+            try std.testing.expectEqualStrings("fact:1", edges[0].edge_id);
+            try std.testing.expectEqualStrings("fact:1", edges[0].owner_document);
+        }
+        var restored_directory = try TestDirectory.init("endpoint-identity-restore");
+        defer restored_directory.cleanup();
+        const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/facts", .{directory.path()});
+        defer alloc.free(snapshot_root);
+        defer {
+            var io_impl = threadedIo();
+            defer io_impl.deinit();
+            std.Io.Dir.cwd().deleteTree(io_impl.io(), snapshot_root) catch {};
+        }
+        _ = try db.snapshot("facts");
+        try DB.restoreSnapshotTo(alloc, snapshot_root, std.mem.span(restored_directory.path().ptr), .{});
+        for (0..2) |iteration| {
+            var restored = try DB.open(alloc, std.mem.span(restored_directory.path().ptr), .{});
+            defer restored.close();
+            const restored_edges = try restored.getEdges(alloc, "facts", "a", "", .out);
+            defer graph_mod.GraphIndex.freeEdges(alloc, restored_edges);
+            try std.testing.expectEqual(@as(usize, if (iteration == 0) 1 else 0), restored_edges.len);
+            if (iteration == 0) {
+                try std.testing.expectEqualStrings("fact:1", restored_edges[0].edge_id);
+                try std.testing.expectEqualStrings("fact:1", restored_edges[0].owner_document);
+                try restored.batch(.{ .deletes = &.{"fact:1"}, .sync_level = .full_index });
+                try restored.runUntilIdle();
+            }
+        }
+        try db.batch(.{ .deletes = &.{"fact:1"}, .sync_level = .full_index });
+        try db.runUntilIdle();
+        const edges = try graph.getEdges(alloc, "a", "", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 0), edges.len);
+    }
+}
+
+test "db graph projected endpoint retirement survives restore" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("projected-retirement");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, std.mem.span(directory.path().ptr), .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "facts", .kind = .graph, .config_json =
+        \\{"source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}}
+    });
+    try db.batch(.{ .writes = &.{
+        .{ .key = "a", .value = "{\"relations\":{\"relations\":[{\"type\":\"R\",\"target\":{\"document_id\":\"b\"}}]}}" },
+        .{ .key = "b", .value = "{}" },
+    }, .sync_level = .full_index });
+    try db.runUntilIdle();
+    {
+        const edges = try db.getEdges(alloc, "facts", "a", "", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+    }
+    try db.batch(.{ .deletes = &.{"b"}, .sync_level = .full_index });
+    try db.runUntilIdle();
+    {
+        const edges = try db.getEdges(alloc, "facts", "a", "", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 0), edges.len);
+    }
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"relations\":{\"relations\":[{\"type\":\"R\",\"target\":{\"document_id\":\"b\"}}]}}" }}, .sync_level = .full_index });
+    try db.runUntilIdle();
+    var restored_directory = try TestDirectory.init("projected-retirement-restore");
+    defer restored_directory.cleanup();
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/facts", .{directory.path()});
+    defer alloc.free(snapshot_root);
+    defer {
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), snapshot_root) catch {};
+    }
+    _ = try db.snapshot("facts");
+    try DB.restoreSnapshotTo(alloc, snapshot_root, std.mem.span(restored_directory.path().ptr), .{});
+    for (0..3) |iteration| {
+        var restored = try DB.open(alloc, std.mem.span(restored_directory.path().ptr), .{});
+        defer restored.close();
+        const edges = try restored.getEdges(alloc, "facts", "a", "", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, if (iteration == 1) 1 else 0), edges.len);
+        if (iteration == 0) {
+            // An intentional new relationship write revives exactly this identity.
+            try restored.batch(.{ .graph_writes = &.{.{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R" }}, .sync_level = .full_index });
+            try restored.runUntilIdle();
+        } else if (iteration == 1) {
+            var ctx = restored.batchContext();
+            try executeDeleteBatchContext(&ctx, &.{"b"}, .full_index);
+            try restored.runUntilIdle();
+        }
+    }
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"relations\":{\"relations\":[{\"type\":\"R\",\"target\":{\"document_id\":\"b\"},\"weight\":2}]}}" }}, .sync_level = .full_index });
+    try db.runUntilIdle();
+    const renewed = try db.getEdges(alloc, "facts", "a", "", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, renewed);
+    try std.testing.expectEqual(@as(usize, 1), renewed.len);
+    try std.testing.expectEqual(@as(f64, 2), renewed[0].weight);
+}
+
+test "db graph projected endpoint retirement survives restore index recreation" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("review-retirement-index");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, std.mem.span(directory.path().ptr), .{});
+    defer db.close();
+    const cfg = types.IndexConfig{ .name = "facts", .kind = .graph, .config_json =
+        \\{"source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}}
+    };
+    try db.addIndex(cfg);
+    try db.batch(.{ .writes = &.{
+        .{ .key = "a", .value = "{\"relations\":{\"relations\":[{\"type\":\"R\",\"target\":{\"document_id\":\"b\"}}]}}" },
+        .{ .key = "b", .value = "{}" },
+    }, .sync_level = .full_index });
+    try db.runUntilIdle();
+    try db.batch(.{ .deletes = &.{"b"}, .sync_level = .full_index });
+    try db.runUntilIdle();
+    const input_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "a", "asset", "relations_v1");
+    defer alloc.free(input_key);
+    const input_value = try db.core.store.get(alloc, input_key);
+    defer alloc.free(input_value);
+    try std.testing.expect(try db.deleteIndex("facts"));
+    try db.runUntilIdle();
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+    try db.batch(.{ .writes = &.{.{ .key = "b", .value = "{}" }}, .sync_level = .full_index });
+    try db.addIndex(cfg);
+    try db.core.store.put(input_key, input_value);
+    const changed = try materializeGraphSourceArtifactsForIndex(alloc, db.core.store, db.core.index_manager, &.{input_key}, "facts", .{});
+    defer freeOwnedKeySlice(alloc, changed);
+    try applyGraphArtifactMutationPages(db.async_context, "facts", &.{}, changed, 0);
+    try db.runUntilIdle();
+    const edges = try db.getEdges(alloc, "facts", "a", "", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+}
+
+test "db graph projected endpoint retirement survives restore explicit deletion" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("review-retirement-explicit");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, std.mem.span(directory.path().ptr), .{});
+    defer db.close();
+    const cfg = types.IndexConfig{ .name = "facts", .kind = .graph, .config_json =
+        \\{"source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}}
+    };
+    try db.addIndex(cfg);
+    try db.batch(.{ .writes = &.{
+        .{ .key = "a", .value = "{\"relations\":{\"relations\":[{\"type\":\"R\",\"target\":{\"document_id\":\"b\"}}]}}" },
+        .{ .key = "b", .value = "{}" },
+    }, .sync_level = .full_index });
+    try db.runUntilIdle();
+    try db.batch(.{ .graph_deletes = &.{.{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R" }}, .sync_level = .full_index });
+    try db.runUntilIdle();
+    {
+        const deleted = try db.getEdges(alloc, "facts", "a", "", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, deleted);
+        try std.testing.expectEqual(@as(usize, 0), deleted.len);
+    }
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/facts", .{directory.path()});
+    defer alloc.free(snapshot_root);
+    defer {
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), snapshot_root) catch {};
+    }
+    _ = try db.snapshot("facts");
+    var restored_directory = try TestDirectory.init("review-explicit-restore");
+    defer restored_directory.cleanup();
+    try DB.restoreSnapshotTo(alloc, snapshot_root, std.mem.span(restored_directory.path().ptr), .{});
+    var restored = try DB.open(alloc, std.mem.span(restored_directory.path().ptr), .{});
+    defer restored.close();
+    const edges = try restored.getEdges(alloc, "facts", "a", "", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 0), edges.len);
+}
+
+test "db graph projected endpoint retirement survives restore independent fact deletion" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("fact-explicit-retirement");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, std.mem.span(directory.path().ptr), .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "facts", .kind = .graph, .config_json =
+        \\{"source":{"artifact":"relations_v1","path":"$","nodes":{"source":"{{ _item.source }}","target":"{{ _item.target }}"},"edge":{"edge_id":"{{ _doc.key }}","type":"RELATES_TO"}},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}}
+    });
+    try db.batch(.{ .writes = &.{
+        .{ .key = "fact:one", .value = "{\"relations\":[{\"source\":\"alice\",\"target\":\"acme\"}]}" },
+        .{ .key = "fact:two", .value = "{\"relations\":[{\"source\":\"alice\",\"target\":\"acme\"}]}" },
+    }, .sync_level = .full_index });
+    try db.runUntilIdle();
+    try db.batch(.{ .graph_deletes = &.{.{ .index_name = "facts", .source = "alice", .target = "acme", .edge_type = "RELATES_TO", .edge_id = "fact:one", .owner_document = "fact:one" }}, .sync_level = .full_index });
+    try db.runUntilIdle();
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/facts", .{directory.path()});
+    defer alloc.free(snapshot_root);
+    defer {
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), snapshot_root) catch {};
+    }
+    _ = try db.snapshot("facts");
+    var restored_directory = try TestDirectory.init("fact-explicit-retirement-restored");
+    defer restored_directory.cleanup();
+    try DB.restoreSnapshotTo(alloc, snapshot_root, std.mem.span(restored_directory.path().ptr), .{});
+    var restored = try DB.open(alloc, std.mem.span(restored_directory.path().ptr), .{});
+    defer restored.close();
+    {
+        const edges = try restored.getEdges(alloc, "facts", "alice", "", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+        try std.testing.expectEqualStrings("fact:two", edges[0].edge_id);
+    }
+    try std.testing.expect(try restored.core.store.hasGraphRetirements());
+    try restored.batch(.{ .graph_writes = &.{.{ .index_name = "facts", .source = "alice", .target = "acme", .edge_type = "RELATES_TO", .edge_id = "fact:one", .owner_document = "fact:one" }}, .sync_level = .full_index });
+    try restored.runUntilIdle();
+    try std.testing.expect(!try restored.core.store.hasGraphRetirements());
+    const revived = try restored.getEdges(alloc, "facts", "alice", "", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, revived);
+    try std.testing.expectEqual(@as(usize, 2), revived.len);
+}
+
+test "db graph projected endpoint retirement survives restore review merge export" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("retirement-merge-review");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, std.mem.span(directory.path().ptr), .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "facts", .kind = .graph, .config_json = "{}" });
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{}" }}, .graph_writes = &.{.{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R" }}, .sync_level = .full_index });
+    try db.batch(.{ .graph_deletes = &.{.{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R" }}, .sync_level = .full_index });
+    const rows = try db.mergeArtifactsPage(alloc, .{ .start = "a", .end = "b" }, null);
+    defer {
+        for (rows) |row| {
+            alloc.free(row.key);
+            alloc.free(row.value);
+        }
+        alloc.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expect(internal_keys.isGraphRetirementKey(rows[0].key));
+}
+
+test "db graph projected endpoint retirement survives restore review merge validation" {
+    const alloc = std.testing.allocator;
+    const artifact = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "a", "facts", "R", "b");
+    defer alloc.free(artifact);
+    const retired = try internal_keys.graphRetirementKeyAlloc(alloc, artifact);
+    defer alloc.free(retired);
+    try types.validateMergeArtifacts(.{ .merge_replication = .{ .transition_id = 1, .donor_group_id = 2, .receiver_group_id = 3, .identity_namespace = .{} }, .merge_artifacts = &.{.{ .key = retired, .value = "1" }} });
+}
+
+test "db graph projected endpoint retirement survives restore review physical split" {
+    try expectPhysicalSplitRetirements(.{ .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } } });
+    expectPhysicalSplitRetirements(.{ .primary_backend = .lmdb }) catch |err| switch (err) {
+        error.UnsupportedPlatform => {},
+        else => return err,
+    };
+}
+
+fn expectPhysicalSplitRetirements(options: OpenOptions) !void {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("retirement-split-review");
+    defer directory.cleanup();
+    var destination = try TestDirectory.init("retirement-split-review-child");
+    defer destination.cleanup();
+    var db = try DB.open(alloc, std.mem.span(directory.path().ptr), options);
+    defer db.close();
+    try db.addIndex(.{ .name = "facts", .kind = .graph, .config_json = "{}" });
+    try db.batch(.{ .writes = &.{.{ .key = "z", .value = "{}" }}, .graph_writes = &.{.{ .index_name = "facts", .source = "z", .target = "a", .edge_type = "R" }}, .sync_level = .full_index });
+    try db.batch(.{ .graph_deletes = &.{.{ .index_name = "facts", .source = "z", .target = "a", .edge_type = "R" }}, .sync_level = .full_index });
+    try db.runUntilIdle();
+    try std.testing.expect(try db.core.store.hasGraphRetirements());
+    try prepareSplitDestination(&db, .{ .start = "m", .end = "" }, std.mem.span(destination.path().ptr));
+    var child = try DB.open(alloc, std.mem.span(destination.path().ptr), options);
+    defer child.close();
+    const artifact = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "z", "facts", "R", "a");
+    defer alloc.free(artifact);
+    try std.testing.expect(try child.core.store.graphRelationshipRetired(artifact));
+    // Replay/materialization writes must honor the primary marker even when
+    // physical shard copying bypassed transactional directory maintenance.
+    try child.core.store.put(artifact, "reconstructed");
+    const revived = child.core.store.get(alloc, artifact) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    defer if (revived) |value| alloc.free(value);
+    try std.testing.expect(revived == null);
+    const split_lower = try documentRangeLowerAlloc(alloc, "m");
+    defer alloc.free(split_lower);
+    try finalizePrimarySplitPreservingMetadata(&db, split_lower, .{ .start = "", .end = "m" });
+    try std.testing.expect(!try db.core.store.hasGraphRetirements());
+    const parent_refs = try db.core.store.scanPrefix(alloc, internal_keys.graph_retirement_ref_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, parent_refs);
+    try std.testing.expectEqual(@as(usize, 0), parent_refs.len);
+}
+
+test "db graph projected endpoint retirement survives restore merge receiver replay" {
+    const alloc = std.testing.allocator;
+    var donor_dir = try TestDirectory.init("retirement-donor");
+    defer donor_dir.cleanup();
+    var donor = try DB.open(alloc, std.mem.span(donor_dir.path().ptr), .{});
+    defer donor.close();
+    const config: types.IndexConfig = .{ .name = "facts", .kind = .graph, .config_json = "{}" };
+    try donor.addIndex(config);
+    const write: types.GraphEdgeWrite = .{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R" };
+    try donor.batch(.{ .writes = &.{.{ .key = "a", .value = "{}" }}, .graph_writes = &.{write}, .sync_level = .full_index });
+    try donor.batch(.{ .graph_deletes = &.{.{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R" }}, .sync_level = .full_index });
+    const rows = try donor.mergeArtifactsPage(alloc, .{ .start = "", .end = "" }, null);
+    defer {
+        for (rows) |row| {
+            alloc.free(row.key);
+            alloc.free(row.value);
+        }
+        alloc.free(rows);
+    }
+    for ([_]bool{ false, true }) |direct| {
+        var receiver_dir = try TestDirectory.init("retirement-receiver");
+        defer receiver_dir.cleanup();
+        {
+            var receiver = try DB.open(alloc, std.mem.span(receiver_dir.path().ptr), .{});
+            defer receiver.close();
+            try receiver.addIndex(config);
+            try receiver.batch(.{ .writes = &.{.{ .key = "a", .value = "{}" }}, .graph_writes = &.{write}, .sync_level = .full_index });
+            if (direct) {
+                try receiver.importMergeRangeFromTransitionDonor(&donor, .{ .start = "", .end = "" });
+            } else {
+                try receiver.updateRange(.{ .start = "m", .end = "" });
+                try receiver.batch(.{ .merge_checkpoint = .{ .kind = .accept, .transition_id = 1, .donor_group_id = 2, .receiver_group_id = 3, .receiver_base_start = "m", .receiver_base_end = "", .merged_start = "", .merged_end = "" } });
+                const req: types.BatchRequest = .{ .merge_replication = .{ .transition_id = 1, .donor_group_id = 2, .receiver_group_id = 3, .identity_namespace = receiver.core.identity_namespace }, .merge_artifacts = rows };
+                try receiver.batchRaftReplicatedApply(req, .{ .term = 1, .index = 10 });
+                try receiver.batchRaftReplicatedApply(req, .{ .term = 1, .index = 10 });
+            }
+            try receiver.runUntilIdle();
+            const edges = try receiver.getEdges(alloc, "facts", "a", "", .out);
+            defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+            try std.testing.expectEqual(@as(usize, 0), edges.len);
+        }
+        var reopened = try DB.open(alloc, std.mem.span(receiver_dir.path().ptr), .{});
+        defer reopened.close();
+        try reopened.runUntilIdle();
+        const edges = try reopened.getEdges(alloc, "facts", "a", "", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 0), edges.len);
+        try std.testing.expect(try reopened.core.store.hasGraphRetirements());
+    }
+}
+
+test "db graph projected endpoint retirement survives restore local owner remote endpoints" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("fact-range-review");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, std.mem.span(directory.path().ptr), .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "facts", .kind = .graph, .config_json = "{}" });
+    try db.updateRange(.{ .start = "m", .end = "" });
+    try db.batch(.{ .writes = &.{.{ .key = "z", .value = "{}" }}, .graph_writes = &.{.{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R", .owner_document = "z", .edge_id = "fact" }}, .sync_level = .full_index });
+    const edges = try db.getEdges(alloc, "facts", "a", "", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("z", edges[0].owner_document);
+    try db.batch(.{ .graph_deletes = &.{.{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R", .owner_document = "z", .edge_id = "fact" }}, .sync_level = .full_index });
+    const deleted = try db.getEdges(alloc, "facts", "a", "", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, deleted);
+    try std.testing.expectEqual(@as(usize, 0), deleted.len);
+}
+
+test "db graph projected endpoint retirement survives restore remote owner local endpoints" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("fact-range-review");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, std.mem.span(directory.path().ptr), .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "facts", .kind = .graph, .config_json = "{}" });
+    try db.updateRange(.{ .start = "m", .end = "" });
+    try std.testing.expectError(error.KeyOutOfRange, db.batch(.{ .graph_writes = &.{.{ .index_name = "facts", .source = "y", .target = "z", .edge_type = "R", .owner_document = "a", .edge_id = "fact" }}, .sync_level = .full_index }));
+}
+
+test "db graph projected endpoint retirement survives restore rejects remote delete owner" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("fact-delete-range");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, std.mem.span(directory.path().ptr), .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "facts", .kind = .graph, .config_json = "{}" });
+    try db.updateRange(.{ .start = "m", .end = "" });
+    try std.testing.expectError(error.KeyOutOfRange, db.batch(.{ .graph_deletes = &.{.{ .index_name = "facts", .source = "y", .target = "z", .edge_type = "R", .owner_document = "a", .edge_id = "fact" }} }));
+}
+
+test "graph projection preserves numeric literals in direct materialization" {
+    const alloc = std.testing.allocator;
+    const writes = try graphWritesFromArtifactValueAlloc(alloc, "g", "fact", "{\"source\":\"a\",\"target\":\"b\",\"type\":\"R\",\"uuid\":\"id\",\"score\":1.0000000000000001}", .{
+        .artifact_name = @constCast("facts"),
+        .mapping = .{ .source_template = @constCast("{{ _item.source }}"), .edge_id_template = @constCast("{{ _item.uuid }}") },
+    }, "application/json", null, 10);
+    defer freeGraphWrites(alloc, writes);
+    try std.testing.expectEqual(@as(usize, 1), writes.len);
+    const filter = @import("../../graph/relationship_filter.zig").Filter{ .properties = &.{.{ .field = "/metadata/score", .op = .eq, .value_json = "1.0000000000000001" }} };
+    const edge = graph_mod.Edge{ .source = writes[0].source, .target = writes[0].target, .edge_type = writes[0].edge_type, .weight = writes[0].weight, .metadata = writes[0].metadata_json, .created_at = 0, .updated_at = 0 };
+    try std.testing.expect(try filter.matches(alloc, edge));
+}
+
+test "graph projection pages account for complete relationship identities" {
+    const alloc = std.testing.allocator;
+    const id = try alloc.alloc(u8, 10000);
+    defer alloc.free(id);
+    @memset(id, 'x');
+    const raw = try std.fmt.allocPrint(alloc, "[{{\"source\":\"a\",\"target\":\"b\",\"type\":\"R\",\"uuid\":\"{s}1\"}},{{\"source\":\"a\",\"target\":\"b\",\"type\":\"R\",\"uuid\":\"{s}2\"}}]", .{ id, id });
+    defer alloc.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const page = try graphWritesFromArtifactParsedPageAlloc(alloc, "g", "fact", parsed.value, .{
+        .artifact_name = @constCast("facts"),
+        .mapping = .{ .source_template = @constCast("{{ _item.source }}"), .edge_id_template = @constCast("{{ _item.uuid }}"), .metadata_template_json = @constCast("{}") },
+    }, "application/json", null, 0, 2048, 4096, 100);
+    defer freeGraphWrites(alloc, page.writes);
+    try std.testing.expectEqual(@as(usize, 1), page.writes.len);
+    try std.testing.expectEqual(@as(?usize, 1), page.next_item_offset);
+    const next = try graphWritesFromArtifactParsedPageAlloc(alloc, "g", "fact", parsed.value, .{
+        .artifact_name = @constCast("facts"),
+        .mapping = .{ .source_template = @constCast("{{ _item.source }}"), .edge_id_template = @constCast("{{ _item.uuid }}"), .metadata_template_json = @constCast("{}") },
+    }, "application/json", null, page.next_item_offset.?, 2048, 4096, 100);
+    defer freeGraphWrites(alloc, next.writes);
+    try std.testing.expectEqual(@as(usize, 1), next.writes.len);
+    try std.testing.expectEqual(@as(?usize, null), next.next_item_offset);
+    try std.testing.expect(!std.mem.eql(u8, page.writes[0].edge_id, next.writes[0].edge_id));
+    // Owner bytes alone must also force the page boundary.
+    const owned = try graphWritesFromArtifactParsedPageAlloc(alloc, "g", id, parsed.value, .{
+        .artifact_name = @constCast("facts"),
+        .mapping = .{ .source_template = @constCast("{{ _item.source }}"), .edge_id_template = @constCast("{{ _item_index }}"), .metadata_template_json = @constCast("{}") },
+    }, "application/json", null, 0, 2048, 4096, 100);
+    defer freeGraphWrites(alloc, owned.writes);
+    try std.testing.expectEqual(@as(usize, 1), owned.writes.len);
+    try std.testing.expectEqualStrings(id, owned.writes[0].owner_document);
+    try std.testing.expectEqual(@as(?usize, 1), owned.next_item_offset);
+}
+
+test "graph projection preserves numeric literals through field artifacts repair snapshot and reopen" {
+    const alloc = std.testing.allocator;
+    var source_dir = try TestDirectory.init("numeric-projection-source");
+    defer source_dir.cleanup();
+    var dest_dir = try TestDirectory.init("numeric-projection-restore");
+    defer dest_dir.cleanup();
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/facts", .{source_dir.path()});
+    defer alloc.free(snapshot_root);
+    defer {
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), snapshot_root) catch {};
+    }
+    const Check = struct {
+        fn edges(db: *DB, allocator: Allocator) !void {
+            const found = try db.getEdges(allocator, "facts", "alice", "R", .out);
+            defer graph_mod.GraphIndex.freeEdges(allocator, found);
+            try std.testing.expectEqual(@as(usize, 1), found.len);
+            try std.testing.expectEqualStrings("18446744073709551615", found[0].edge_id);
+            try std.testing.expectEqual(@as(f64, 0.75), found[0].weight);
+            const filter = @import("../../graph/relationship_filter.zig").Filter{ .properties = &.{
+                .{ .field = "/metadata/score", .op = .eq, .value_json = "1.0000000000000001" },
+                .{ .field = "/metadata/large", .op = .eq, .value_json = "18446744073709551615" },
+            } };
+            try std.testing.expect(try filter.matches(allocator, found[0]));
+        }
+    };
+    {
+        var db = try DB.open(alloc, std.mem.span(source_dir.path().ptr), .{});
+        defer db.close();
+        try db.addIndex(.{ .name = "facts", .kind = .graph, .config_json =
+            \\{"source":{"artifact":"relations_v1","path":"$","nodes":{"source":"{{ _item.source }}","target":"{{ _item.target }}"},"edge":{"edge_id":"{{ _doc.value.uuid }}","type":"R"},"context":{"doc_fields":["uuid"]}},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}}
+        });
+        try db.batch(.{ .writes = &.{.{ .key = "fact", .value =
+            \\{"uuid":18446744073709551615,"relations":[{"source":"alice","target":"acme","weight":0.75,"score":1.0000000000000001,"large":18446744073709551615}]}
+        }}, .sync_level = .enrichments });
+        try db.runUntilIdle();
+        try Check.edges(&db, alloc);
+        _ = try db.rebuildGraphDerivedState();
+        try Check.edges(&db, alloc);
+        _ = try db.snapshot("facts");
+    }
+    try DB.restoreSnapshotTo(alloc, snapshot_root, std.mem.span(dest_dir.path().ptr), .{});
+    for (0..2) |_| {
+        var restored = try DB.open(alloc, std.mem.span(dest_dir.path().ptr), .{});
+        defer restored.close();
+        try Check.edges(&restored, alloc);
+    }
 }

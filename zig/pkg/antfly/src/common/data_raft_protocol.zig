@@ -21,10 +21,13 @@
 /// watermarks cannot be mistaken for omitted replication work.
 /// Version 5 transfers authoritative merge artifacts through durable replay.
 /// Version 6 fences merge copy attempts across donor leadership changes.
-pub const batch_protocol_version: u16 = 6;
+pub const batch_protocol_version: u16 = 7;
 pub const batch_timestamp_protocol_version: u16 = 1;
 pub const batch_activation_barrier_protocol_version: u16 = 2;
 pub const batch_merge_transition_protocol_version: u16 = 3;
 pub const batch_split_delta_predecessor_protocol_version: u16 = 4;
 pub const batch_merge_artifacts_protocol_version: u16 = 5;
 pub const batch_merge_copy_attempt_protocol_version: u16 = 6;
+
+/// Version 7 transfers durable relationship retirements during merges.
+pub const batch_merge_retirements_protocol_version: u16 = 7;

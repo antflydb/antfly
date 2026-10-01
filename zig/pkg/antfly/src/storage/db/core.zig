@@ -1819,12 +1819,12 @@ pub const DBCore = struct {
             try self.validateKeyOwnership(key);
         }
         for (req.graph_writes) |write| {
-            try self.validateKeyOwnership(write.source);
-            try self.validateKeyOwnership(write.target);
+            // A relationship is stored with its producing document. Logical
+            // endpoints may belong to any range in the graph index's table.
+            try self.validateKeyOwnership(if (write.owner_document.len > 0) write.owner_document else write.source);
         }
         for (req.graph_deletes) |delete| {
-            try self.validateKeyOwnership(delete.source);
-            try self.validateKeyOwnership(delete.target);
+            try self.validateKeyOwnership(if (delete.owner_document.len > 0) delete.owner_document else delete.source);
         }
         for (req.predicates) |predicate| {
             try self.validateKeyOwnership(predicate.key);

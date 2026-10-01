@@ -7854,52 +7854,92 @@ pub const GraphIndex = struct {
 
     /// Delete relationships incident to a node and relationships owned by a fact document.
     pub fn deleteEdgesForDoc(self: *GraphIndex, doc_key: []const u8) !void {
-        const incident = try self.getEdges(self.alloc, doc_key, "", .both);
-        defer freeEdges(self.alloc, incident);
-        var owned = std.ArrayListUnmanaged(Edge).empty;
-        defer {
-            for (owned.items) |edge| freeEdge(self.alloc, edge);
-            owned.deinit(self.alloc);
+        try self.deleteEdgesForDocs(&.{doc_key});
+    }
+
+    /// Cleanup reads keys only and releases every cursor before mutation.
+    /// Successful pages remove their own input, so durable document replay can
+    /// retry from the prefix after interruption without a separate checkpoint.
+    pub fn deleteEdgesForDocs(self: *GraphIndex, doc_keys: []const []const u8) !void {
+        for (doc_keys) |doc_key| {
+            const incident_prefix = try graphIndexEdgePrefixAlloc(self.alloc, doc_key, self.index_name, "");
+            defer self.alloc.free(incident_prefix);
+            try self.deleteGraphDocPrefix(incident_prefix, .out, false);
+            try self.deleteGraphDocPrefix(incident_prefix, .in, false);
+            var owner_prefix = std.ArrayListUnmanaged(u8).empty;
+            defer owner_prefix.deinit(self.alloc);
+            try internal_keys.appendDocumentPrefix(&owner_prefix, self.alloc, doc_key);
+            try owner_prefix.append(self.alloc, internal_keys.artifact_kind);
+            try internal_keys.appendEncodedComponent(&owner_prefix, self.alloc, "graph_index_owner");
+            try internal_keys.appendEncodedComponent(&owner_prefix, self.alloc, self.index_name);
+            try owner_prefix.append(self.alloc, internal_keys.graph_edge_record_kind);
+            try self.deleteGraphDocPrefix(owner_prefix.items, .out, true);
         }
+    }
+
+    const GraphDocCleanupPage = struct {
+        next_cursor: ?[]u8,
+        scanned: usize,
+        selected: usize,
+    };
+
+    fn deleteGraphDocPrefix(self: *GraphIndex, prefix: []const u8, direction: EdgeDirection, owner_records: bool) !void {
+        var after: ?[]u8 = null;
+        defer if (after) |key| self.alloc.free(key);
+        while (true) {
+            const page = try self.deleteGraphDocPrefixPage(self.alloc, prefix, direction, owner_records, after);
+            if (after) |key| self.alloc.free(key);
+            after = page.next_cursor;
+            if (after == null) return;
+        }
+    }
+
+    fn deleteGraphDocPrefixPage(self: *GraphIndex, alloc: Allocator, prefix: []const u8, direction: EdgeDirection, owner_records: bool, after: ?[]const u8) !GraphDocCleanupPage {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const upper = try graphIndexEdgeUpperAlloc(scratch, prefix);
+        const start = if (after) |key| try std.mem.concat(scratch, u8, &.{ key, &.{0} }) else prefix;
+        var deletes = std.ArrayListUnmanaged(BatchDelete).empty;
+        var scanned: usize = 0;
+        var bytes: usize = 0;
+        var last: ?[]const u8 = null;
+        var done = false;
         {
-            var prefix = std.ArrayListUnmanaged(u8).empty;
-            defer prefix.deinit(self.alloc);
-            try internal_keys.appendDocumentPrefix(&prefix, self.alloc, doc_key);
-            try prefix.append(self.alloc, internal_keys.artifact_kind);
-            try internal_keys.appendEncodedComponent(&prefix, self.alloc, "graph_index_owner");
-            try internal_keys.appendEncodedComponent(&prefix, self.alloc, self.index_name);
-            var txn = try self.outgoing_store.beginRead();
+            var txn = if (direction == .in) try self.beginReadReverseTxn() else try self.beginReadOutgoingTxn();
             defer txn.abort();
             var cursor = try txn.openCursor();
             defer cursor.close();
-            var entry = try cursor.seekAtOrAfter(prefix.items);
-            while (entry) |kv| : (entry = try cursor.next()) {
-                if (!std.mem.startsWith(u8, kv.key, prefix.items)) break;
-                var parsed = (try parseOutgoingEdgeKeyAlloc(self.alloc, kv.key)) orelse return error.InvalidGraphSegment;
-                defer parsed.deinit(self.alloc);
-                try appendParsedEdge(self.alloc, &owned, parsed, kv.value);
+            cursor.setUpperBound(upper);
+            var entry = try cursor.seekAtOrAfter(start);
+            while (entry) |row| {
+                if (!std.mem.startsWith(u8, row.key, prefix)) break;
+                const identity = BorrowedEdgeKey.parse(row.key, direction) orelse return error.InvalidGraphSegment;
+                if (identity.owner_record != owner_records) return error.InvalidGraphSegment;
+                last = try scratch.dupe(u8, row.key);
+                bytes +|= row.key.len;
+                scanned += 1;
+                // Independent facts have their own lifecycle. Select their
+                // owner directory only; never hydrate an incident payload.
+                if (owner_records or identity.owner_document.len == 0) {
+                    try deletes.append(scratch, .{
+                        .source = try BorrowedEdgeKey.decode(scratch, identity.source),
+                        .target = try BorrowedEdgeKey.decode(scratch, identity.target),
+                        .edge_type = try BorrowedEdgeKey.decode(scratch, identity.edge_type),
+                        .edge_id = try BorrowedEdgeKey.decode(scratch, identity.edge_id),
+                        .owner_document = try BorrowedEdgeKey.decode(scratch, identity.owner_document),
+                    });
+                }
+                entry = try cursor.next();
+                // One oversized identity is allowed; no whole adjacency is retained.
+                if (scanned >= 256 or bytes >= 256 * 1024) break;
             }
+            done = if (entry) |row| !std.mem.startsWith(u8, row.key, prefix) else true;
         }
-        var deletes = std.ArrayListUnmanaged(BatchDelete).empty;
-        defer deletes.deinit(self.alloc);
-        for (incident) |edge| {
-            if (edge.owner_document.len > 0 and !std.mem.eql(u8, edge.owner_document, doc_key)) continue;
-            try deletes.append(self.alloc, .{
-                .source = edge.source,
-                .target = edge.target,
-                .edge_type = edge.edge_type,
-                .edge_id = edge.edge_id,
-                .owner_document = edge.owner_document,
-            });
-        }
-        for (owned.items) |edge| try deletes.append(self.alloc, .{
-            .source = edge.source,
-            .target = edge.target,
-            .edge_type = edge.edge_type,
-            .edge_id = edge.edge_id,
-            .owner_document = edge.owner_document,
-        });
+        const next = if (!done) try alloc.dupe(u8, last.?) else null;
+        errdefer if (next) |key| alloc.free(key);
         try self.batchApply(&.{}, deletes.items);
+        return .{ .next_cursor = next, .scanned = scanned, .selected = deletes.items.len };
     }
 
     /// Read-only benchmark oracle for distinct-source tree ingestion. The
@@ -36198,4 +36238,76 @@ test "graph redundant source ownership is canonical across writes probes and del
     const remaining = try graph.getEdges(alloc, "b", "R", .in);
     defer GraphIndex.freeEdges(alloc, remaining);
     try std.testing.expectEqual(@as(usize, 0), remaining.len);
+}
+
+test "graph document cleanup pages bound keys and skip preserved fact payloads" {
+    const alloc = std.testing.allocator;
+    var graph = try GraphIndex.openWithPrivateStores(alloc, "unused-out", "unused-in", "facts", .{ .reverse_backend = .mem });
+    defer graph.close();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const payload = try scratch.alloc(u8, 8192);
+    @memset(payload, 'x');
+    const metadata = try std.fmt.allocPrint(scratch, "{{\"payload\":\"{s}\"}}", .{payload});
+    var writes = std.ArrayListUnmanaged(BatchWrite).empty;
+    for (0..600) |i| {
+        try writes.append(scratch, .{ .source = "a", .target = "b", .edge_type = "R", .owner_document = "fact", .edge_id = try std.fmt.allocPrint(scratch, "fact-{d:0>4}", .{i}), .metadata_json = metadata });
+    }
+    try graph.batchApply(writes.items, &.{});
+    const work = @import("work_budget.zig");
+    var budget = work.WorkBudget.initWithLimits(.{ .max_retained_state_bytes = 1024 * 1024 });
+    var capped = work.RetainedAllocator{ .backing = alloc, .budget = &budget };
+    const limited = capped.allocator();
+    const prefix = try graphIndexEdgePrefixAlloc(alloc, "a", "facts", "");
+    defer alloc.free(prefix);
+    // The incident metadata alone exceeds the scratch ceiling. Selection must
+    // inspect keys without decoding or retaining any of those fact payloads.
+    const preserved = try graph.deleteGraphDocPrefixPage(limited, prefix, .out, false, null);
+    try std.testing.expectEqual(@as(usize, 256), preserved.scanned);
+    try std.testing.expectEqual(@as(usize, 0), preserved.selected);
+    try std.testing.expect(preserved.next_cursor != null);
+    limited.free(preserved.next_cursor.?);
+    try std.testing.expectEqual(@as(usize, 0), capped.live_bytes);
+    try std.testing.expect(!capped.denied);
+    writes.clearRetainingCapacity();
+    for (0..600) |i| {
+        try writes.append(scratch, .{ .source = "a", .target = "b", .edge_type = "R", .edge_id = try std.fmt.allocPrint(scratch, "inline-{d:0>4}", .{i}), .metadata_json = metadata });
+    }
+    try writes.appendSlice(scratch, &.{
+        .{ .source = "a", .target = "a", .edge_type = "loop", .edge_id = "self" },
+        .{ .source = "c", .target = "a", .edge_type = "R" },
+    });
+    try graph.batchApply(writes.items, &.{});
+    try graph.deleteEdgesForDocs(&.{ "a", "c" });
+    {
+        const surviving = try graph.getEdges(alloc, "a", "", .both);
+        defer GraphIndex.freeEdges(alloc, surviving);
+        try std.testing.expectEqual(@as(usize, 600), surviving.len);
+        for (surviving) |edge| {
+            try std.testing.expectEqualStrings("fact", edge.owner_document);
+            try std.testing.expectEqualStrings(metadata, edge.metadata);
+        }
+    }
+    var owner_prefix = std.ArrayListUnmanaged(u8).empty;
+    defer owner_prefix.deinit(alloc);
+    try internal_keys.appendDocumentPrefix(&owner_prefix, alloc, "fact");
+    try owner_prefix.append(alloc, internal_keys.artifact_kind);
+    try internal_keys.appendEncodedComponent(&owner_prefix, alloc, "graph_index_owner");
+    try internal_keys.appendEncodedComponent(&owner_prefix, alloc, "facts");
+    try owner_prefix.append(alloc, internal_keys.graph_edge_record_kind);
+    const removed = try graph.deleteGraphDocPrefixPage(limited, owner_prefix.items, .out, true, null);
+    try std.testing.expectEqual(@as(usize, 256), removed.selected);
+    try std.testing.expect(removed.next_cursor != null);
+    limited.free(removed.next_cursor.?);
+    try std.testing.expectEqual(@as(usize, 0), capped.live_bytes);
+    // Restart from the document, as replay does after an interrupted page.
+    try graph.deleteEdgesForDoc("fact");
+    try graph.deleteEdgesForDocs(&.{ "a", "fact", "c" });
+    const outgoing = try graph.getEdges(alloc, "a", "", .out);
+    defer GraphIndex.freeEdges(alloc, outgoing);
+    const incoming = try graph.getEdges(alloc, "b", "", .in);
+    defer GraphIndex.freeEdges(alloc, incoming);
+    try std.testing.expectEqual(@as(usize, 0), outgoing.len);
+    try std.testing.expectEqual(@as(usize, 0), incoming.len);
 }

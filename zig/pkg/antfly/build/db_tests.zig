@@ -30,6 +30,21 @@ pub const AddTestsResult = struct {
 pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
     const relationship_identity_filters = [_][]const u8{
+        "portable graph retirements are primary and require reader version four",
+        "graph relationship bulk ingestion preserves direct append and retirement",
+        "docstore relational bulk appends retain direct ingest and atomic dirty tokens",
+        "docstore backend adapters expose txn cursor and batch operations",
+        "graph incoming directory backfill resumes bounded pages",
+        "AFB2 relationship inventory requires reader version three",
+        "db graph projected endpoint retirement survives restore",
+        "graph incoming directory follows primary transaction commit and rollback",
+        "graph mutation clones release partial relationship allocations",
+        "db graph endpoint deletion retires inline identities and preserves independent facts",
+        "relationship predicates preserve exact decimal literals",
+        "graph projection preserves numeric literals",
+        "graph projection pages account for complete relationship identities",
+        "graph artifact mapping and source clones release partial allocations",
+        "graph pattern path conversion releases partial relationship allocations",
         "graph replay truncated relationship fields release all allocations",
         "db algebraic path conversion preserves provenance under allocation failures",
         "portable relationships preserve parallel identities and arbitrary endpoints",
@@ -39,6 +54,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db graph fact projections survive logical snapshot restore and reopen",
         "graph replay node clears do not subsume independently owned fact deletions",
         "graph redundant source ownership is canonical across writes probes and deletes",
+        "graph document cleanup pages",
     };
     const relationship_identity_tests = b.addTest(.{
         .root_module = antfly_test_mod,

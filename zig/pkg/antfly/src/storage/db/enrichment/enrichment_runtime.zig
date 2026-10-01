@@ -19697,9 +19697,9 @@ fn runtimeGraphWritesFromArtifactValueAlloc(
     raw_doc: ?[]const u8,
     edge_limit: usize,
 ) ![]types.GraphEdgeWrite {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{ .parse_numbers = false });
     defer parsed.deinit();
-    var parsed_doc = if (raw_doc) |doc| try std.json.parseFromSlice(std.json.Value, alloc, doc, .{}) else null;
+    var parsed_doc = if (raw_doc) |doc| try std.json.parseFromSlice(std.json.Value, alloc, doc, .{ .parse_numbers = false }) else null;
     defer if (parsed_doc) |*doc| doc.deinit();
     const doc_value: ?std.json.Value = if (parsed_doc) |doc| doc.value else null;
 
@@ -20053,7 +20053,7 @@ fn runtimeRenderGraphArtifactMetadataTemplateAlloc(
     artifact_content_type: []const u8,
     artifact_value: std.json.Value,
 ) ![]u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, metadata_template_json, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, metadata_template_json, .{ .parse_numbers = false });
     defer parsed.deinit();
     var rendered = try runtimeRenderGraphArtifactMetadataValueAlloc(alloc, parsed.value, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
     defer runtimeFreeGraphRenderedJsonValue(alloc, &rendered);
@@ -20167,6 +20167,7 @@ fn runtimeJsonIntegerField(value: std.json.Value, field: []const u8) ?i64 {
     const found = value.object.get(field) orelse return null;
     return switch (found) {
         .integer => found.integer,
+        .number_string => |text| std.fmt.parseInt(i64, text, 10) catch null,
         else => null,
     };
 }
@@ -20177,6 +20178,7 @@ fn runtimeJsonFloatField(value: std.json.Value, field: []const u8) ?f64 {
     return switch (found) {
         .float => found.float,
         .integer => @floatFromInt(found.integer),
+        .number_string => |text| std.fmt.parseFloat(f64, text) catch null,
         else => null,
     };
 }
@@ -27534,7 +27536,7 @@ fn extractAssetSourceValue(
         return rendered;
     }
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw_doc, .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw_doc, .{ .parse_numbers = false });
     defer parsed.deinit();
     if (parsed.value != .object) return null;
     const source = parsed.value.object.get(request.source_field) orelse return null;
@@ -29275,4 +29277,28 @@ test "extractSourceText with template and scrubHtml helper" {
     const result = try extractSourceText(alloc, .{}, doc, request) orelse return error.TestUnexpectedResult;
     defer alloc.free(result);
     try std.testing.expectEqualStrings("HelloWorld", result);
+}
+
+test "graph projection preserves numeric literals in enrichment metadata and templates" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "", "{\"score\":1.0000000000000001,\"large\":18446744073709551615,\"uuid\":\"{{ _doc.value.uuid }}\"}" }) |metadata_template| {
+        const writes = try runtimeGraphWritesFromArtifactValueAlloc(alloc, "facts", "fact",
+            \\{"entities":[{"id":"b","document_id":"b"}],"relations":[{"source":"a","target":{"entity_index":0},"type":"R","weight":0.75,"score":1.0000000000000001,"large":18446744073709551615}]}
+        , .{ .artifact_name = @constCast("relations"), .path = @constCast("relations"), .mapping = .{
+            .source_template = @constCast("{{ _item.source }}"),
+            .edge_id_template = @constCast("{{ _doc.value.uuid }}"),
+            .metadata_template_json = @constCast(metadata_template),
+        } }, "application/json", "{\"uuid\":18446744073709551615}", 10);
+        defer runtimeFreeGraphWrites(alloc, writes);
+        try std.testing.expectEqual(@as(usize, 1), writes.len);
+        try std.testing.expectEqualStrings("18446744073709551615", writes[0].edge_id);
+        try std.testing.expectEqualStrings("b", writes[0].target);
+        try std.testing.expectEqual(@as(f64, 0.75), writes[0].weight);
+        const filter = @import("../../../graph/relationship_filter.zig").Filter{ .properties = &.{
+            .{ .field = "/metadata/score", .op = .eq, .value_json = "1.0000000000000001" },
+            .{ .field = "/metadata/large", .op = .eq, .value_json = "18446744073709551615" },
+        } };
+        const edge = @import("../../../graph/graph.zig").Edge{ .source = writes[0].source, .target = writes[0].target, .edge_type = writes[0].edge_type, .weight = writes[0].weight, .metadata = writes[0].metadata_json, .created_at = 0, .updated_at = 0 };
+        try std.testing.expect(try filter.matches(alloc, edge));
+    }
 }
