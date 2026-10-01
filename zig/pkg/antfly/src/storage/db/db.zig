@@ -2261,18 +2261,9 @@ const LocalMutationExecution = struct {
     root_incarnation: u128 = 0,
     async_context: *AsyncContext,
     backend_runtime: *background_runtime_mod.BackendRuntime,
-    index_repair_clock: ?platform_clock.Clock = null,
     backend_owner_id: u64,
     repair_cleanup_owner_id: u64,
-    replication_recovery_owner_id: u64 = 0,
-    capacity_source: ?types.RepairCapacitySource,
     executor: *derived_executor_mod.Executor,
-    start_index_workers: bool,
-    graph_metric_idle_maintenance: OpenOptions.GraphMetricIdleMaintenanceMode,
-    graph_metric_idle_planned_options: index_manager_mod.IndexManager.GraphMetricPlannedMaintenanceOptions,
-    graph_metric_idle_auto_options: index_manager_mod.IndexManager.GraphMetricPlannedAutoIdleOptions,
-    graph_metric_idle_degree_canary_options: index_manager_mod.IndexManager.GraphMetricDegreeCanaryOptions,
-    resolver_workers_enabled: bool,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
     enrichment_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime,
@@ -2417,20 +2408,11 @@ const LocalExecutionContext = struct {
     backend_runtime: *background_runtime_mod.BackendRuntime,
     backend_owner_id: u64,
     repair_cleanup_owner_id: u64,
-    capacity_source: ?types.RepairCapacitySource,
     executor: *derived_executor_mod.Executor,
     ttl_cleanup_context: ?*TtlCleanupContext,
     transaction_recovery_identity_context: ?*db_core.TransactionRecoveryIdentityContext,
-    start_index_workers: bool,
-    graph_metric_idle_maintenance: OpenOptions.GraphMetricIdleMaintenanceMode,
-    graph_metric_idle_planned_options: index_manager_mod.IndexManager.GraphMetricPlannedMaintenanceOptions,
-    graph_metric_idle_auto_options: index_manager_mod.IndexManager.GraphMetricPlannedAutoIdleOptions,
-    graph_metric_idle_degree_canary_options: index_manager_mod.IndexManager.GraphMetricDegreeCanaryOptions,
-    resolver_workers_enabled: bool,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
-    index_repair_clock: ?platform_clock.Clock,
-    replication_recovery_owner_id: u64,
 
     fn borrow(db: *DB) @This() {
         return .{
@@ -2448,20 +2430,11 @@ const LocalExecutionContext = struct {
             .backend_runtime = db.backend_runtime,
             .backend_owner_id = db.backend_owner_id,
             .repair_cleanup_owner_id = db.repair_cleanup_owner_id,
-            .capacity_source = db.capacity_source,
             .executor = db.executor,
             .ttl_cleanup_context = db.ttl_cleanup_context,
             .transaction_recovery_identity_context = db.transaction_recovery_identity_context,
-            .start_index_workers = db.start_index_workers,
-            .graph_metric_idle_maintenance = db.graph_metric_idle_maintenance,
-            .graph_metric_idle_planned_options = db.graph_metric_idle_planned_options,
-            .graph_metric_idle_auto_options = db.graph_metric_idle_auto_options,
-            .graph_metric_idle_degree_canary_options = db.graph_metric_idle_degree_canary_options,
-            .resolver_workers_enabled = db.resolver_workers_enabled,
             .secret_store = db.secret_store,
             .remote_content = db.remote_content,
-            .index_repair_clock = db.index_repair_clock,
-            .replication_recovery_owner_id = db.replication_recovery_owner_id,
         };
     }
 
@@ -2484,18 +2457,9 @@ const LocalExecutionContext = struct {
             .backend_runtime = self.backend_runtime,
             .backend_owner_id = self.backend_owner_id,
             .repair_cleanup_owner_id = self.repair_cleanup_owner_id,
-            .capacity_source = self.capacity_source,
             .executor = self.executor,
-            .start_index_workers = self.start_index_workers,
-            .graph_metric_idle_maintenance = self.graph_metric_idle_maintenance,
-            .graph_metric_idle_planned_options = self.graph_metric_idle_planned_options,
-            .graph_metric_idle_auto_options = self.graph_metric_idle_auto_options,
-            .graph_metric_idle_degree_canary_options = self.graph_metric_idle_degree_canary_options,
-            .resolver_workers_enabled = self.resolver_workers_enabled,
             .secret_store = self.secret_store,
             .remote_content = self.remote_content,
-            .index_repair_clock = self.index_repair_clock,
-            .replication_recovery_owner_id = self.replication_recovery_owner_id,
             .enrichment_runtime = self.async_context.enrichment_runtime,
             .resolution_runtime = self.async_context.resolution_runtime,
             .promotion_runtime = self.async_context.promotion_runtime,
@@ -78920,11 +78884,11 @@ const default_test_wait_attempts: usize = 100;
 const slow_test_wait_attempts: usize = 500;
 const graph_replay_test_wait_attempts: usize = 2000;
 
-fn waitForSearchResult(alloc: Allocator, db: anytype, req: types.SearchRequest, min_hits: u32) !types.SearchResult {
+fn waitForSearchResult(alloc: Allocator, db: *DB, req: types.SearchRequest, min_hits: u32) !types.SearchResult {
     return waitForSearchResultWithAttempts(alloc, db, req, min_hits, default_test_wait_attempts);
 }
 
-fn waitForSearchResultWithAttempts(alloc: Allocator, db: anytype, req: types.SearchRequest, min_hits: u32, max_attempts: usize) !types.SearchResult {
+fn waitForSearchResultWithAttempts(alloc: Allocator, db: *DB, req: types.SearchRequest, min_hits: u32, max_attempts: usize) !types.SearchResult {
     var last = try db.search(alloc, req);
     var attempts: usize = 0;
     while (last.total_hits < min_hits and attempts < max_attempts) : (attempts += 1) {
@@ -78941,7 +78905,7 @@ fn waitForSearchResultWithAttempts(alloc: Allocator, db: anytype, req: types.Sea
 
 fn waitForGraphEdges(
     alloc: Allocator,
-    db: anytype,
+    db: *DB,
     index_name: []const u8,
     key: []const u8,
     edge_type: []const u8,
@@ -78956,7 +78920,7 @@ fn replayStageHasPendingWork(stats: types.ReplayStageStats) bool {
     return stats.catch_up_required or stats.applied_sequence < stats.target_sequence;
 }
 
-fn graphEdgeProducerHasPendingWork(alloc: Allocator, db: anytype, index_name: []const u8) !bool {
+fn graphEdgeProducerHasPendingWork(alloc: Allocator, db: *DB, index_name: []const u8) !bool {
     const graph_applied = try db.core.loadAppliedSequence(alloc, index_name);
     if (graph_applied < db.core.nextDerivedSequence()) return true;
     const pending = db.pendingWorkStats();
@@ -78966,7 +78930,7 @@ fn graphEdgeProducerHasPendingWork(alloc: Allocator, db: anytype, index_name: []
 
 fn waitForGraphEdgesWithAttempts(
     alloc: Allocator,
-    db: anytype,
+    db: *DB,
     index_name: []const u8,
     key: []const u8,
     edge_type: []const u8,
@@ -78997,11 +78961,11 @@ fn waitForGraphEdgesWithAttempts(
     return edges;
 }
 
-fn waitForDenseSearchResult(alloc: Allocator, db: anytype, req: types.SearchRequest, min_hits: u32) !types.SearchResult {
+fn waitForDenseSearchResult(alloc: Allocator, db: *DB, req: types.SearchRequest, min_hits: u32) !types.SearchResult {
     return waitForDenseSearchResultWithAttempts(alloc, db, req, min_hits, default_test_wait_attempts);
 }
 
-fn waitForDenseSearchResultWithAttempts(alloc: Allocator, db: anytype, req: types.SearchRequest, min_hits: u32, max_attempts: usize) !types.SearchResult {
+fn waitForDenseSearchResultWithAttempts(alloc: Allocator, db: *DB, req: types.SearchRequest, min_hits: u32, max_attempts: usize) !types.SearchResult {
     const dense = req.dense orelse return error.InvalidArgument;
     var last = try db.searchDense(alloc, req, dense);
     var attempts: usize = 0;
@@ -79044,7 +79008,7 @@ fn waitForDenseIndexResultsWithAttempts(index: *hbc_mod.HBCIndex, query: []const
 
 fn waitForAppliedSequenceAdvance(
     alloc: Allocator,
-    db: anytype,
+    db: *DB,
     index_name: []const u8,
     previous: u64,
 ) !u64 {
@@ -79096,7 +79060,7 @@ test "applied sequence coalescer takePending removes only requested index" {
     try std.testing.expect(coalescer.pending.get("dv_v1") == null);
 }
 
-fn waitForRawDelete(alloc: Allocator, db: anytype, key: []const u8, max_attempts: usize) !void {
+fn waitForRawDelete(alloc: Allocator, db: *DB, key: []const u8, max_attempts: usize) !void {
     var attempts: usize = 0;
     while (attempts < max_attempts) : (attempts += 1) {
         const raw = try db.get(alloc, key);
@@ -79107,7 +79071,7 @@ fn waitForRawDelete(alloc: Allocator, db: anytype, key: []const u8, max_attempts
     return error.Timeout;
 }
 
-fn initStoppedTtlRuntimeForTest(db: anytype, cfg: ttl_runtime_mod.Config) !void {
+fn initStoppedTtlRuntimeForTest(db: *DB, cfg: ttl_runtime_mod.Config) !void {
     try std.testing.expect(db.ttl_runtime == null);
     try db.initOptionalTtlRuntime(cfg);
 }
@@ -79134,14 +79098,14 @@ fn expectedDocumentEmbeddingArtifactKeyAlloc(alloc: Allocator, doc_key: []const 
     return try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_key, embedding_name);
 }
 
-fn putDenseEmbeddingArtifactForTest(db: anytype, alloc: Allocator, artifact_key: []const u8, source_hash: ?u64, vector: []const f32) !void {
+fn putDenseEmbeddingArtifactForTest(db: *DB, alloc: Allocator, artifact_key: []const u8, source_hash: ?u64, vector: []const f32) !void {
     const payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, source_hash, vector);
     defer alloc.free(payload);
     try db.core.store.put(artifact_key, payload);
     try markArtifactPresenceForTest(db);
 }
 
-fn putDenseEmbeddingArtifactWithCounterForTest(db: anytype, alloc: Allocator, artifact_key: []const u8, source_hash: ?u64, vector: []const f32) !void {
+fn putDenseEmbeddingArtifactWithCounterForTest(db: *DB, alloc: Allocator, artifact_key: []const u8, source_hash: ?u64, vector: []const f32) !void {
     const payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, source_hash, vector);
     defer alloc.free(payload);
 
@@ -79190,13 +79154,13 @@ fn writeRawProjectionCheckpointSidecarForTest(path: []const u8, raw: []const u8)
     try writer.end();
 }
 
-fn markArtifactPresenceForTest(db: anytype) !void {
+fn markArtifactPresenceForTest(db: *DB) !void {
     db.core.artifact_cleanup_maybe.store(true, .release);
     try db.core.store.put(internal_keys.artifact_presence_key[0..], "1");
 }
 
 fn putSparseEmbeddingArtifactForTest(
-    db: anytype,
+    db: *DB,
     alloc: Allocator,
     artifact_key: []const u8,
     source_hash: ?u64,
@@ -80250,7 +80214,7 @@ fn summarizeDbSplitDatabases(alloc: Allocator, source_db: *DB, dest_db: ?*DB) !D
     };
 }
 
-fn applyDbSplitWritesToDb(alloc: Allocator, db: anytype, writes: []const DbSplitOwnedWrite) !void {
+fn applyDbSplitWritesToDb(alloc: Allocator, db: *DB, writes: []const DbSplitOwnedWrite) !void {
     var batch_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
     defer batch_writes.deinit(alloc);
     for (writes) |write| {
@@ -82445,7 +82409,7 @@ test "relational runtime-only and mixed schema epochs survive portable restore" 
     }
 }
 
-fn expectTestRelationalIndexRow(db: anytype, document: []const u8, json: []const u8, present: bool) !void {
+fn expectTestRelationalIndexRow(db: *DB, document: []const u8, json: []const u8, present: bool) !void {
     const alloc = std.testing.allocator;
     var index_snapshot = db.core.relational_indexes.acquire().?;
     defer index_snapshot.deinit();
@@ -83852,7 +83816,7 @@ test "relational columnar existence and null projection do not fetch payload rec
     try std.testing.expect(db.relational_columns_rebuild_requested.load(.acquire));
 }
 
-fn drainTestRelationalMaintenance(db: anytype) !void {
+fn drainTestRelationalMaintenance(db: *DB) !void {
     var passes: usize = 0;
     while (try db.rebuildRelationalColumns()) {
         passes += 1;
@@ -84961,11 +84925,11 @@ test "relational columnar decoded cache preserves snapshots and releases visitor
     }
 }
 
-fn seedColumnScanPlanTest(db: anytype, alloc: Allocator) !void {
+fn seedColumnScanPlanTest(db: *DB, alloc: Allocator) !void {
     return seedColumnScanPlanRows(db, alloc, 768);
 }
 
-fn seedColumnScanPlanRows(db: anytype, alloc: Allocator, row_count: usize) !void {
+fn seedColumnScanPlanRows(db: *DB, alloc: Allocator, row_count: usize) !void {
     std.debug.assert(row_count >= 8 and row_count <= 768);
     try db.setSchemaJson(alloc,
         \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"},"user-name":{"type":"string"},"payload":{"type":"json"},"embedding":{"type":"embedding"},"wide":{"type":"string"}},"additionalProperties":false}}}}
@@ -92952,7 +92916,7 @@ test "db batch uses change journal as the replay authority" {
     try std.testing.expectEqual(@as(usize, 1), entries.len);
 }
 
-fn waitForDerivedReplayTarget(db: anytype) !void {
+fn waitForDerivedReplayTarget(db: *DB) !void {
     const sequence = db.core.nextDerivedSequence();
     if (sequence == 0) return;
     try db.executor.waitForAll(sequence);
@@ -104798,7 +104762,7 @@ test "db managed dense enrichment remains searchable after transient rate limits
     try db.runUntilIdle();
 }
 
-fn independentDensePublicationVisibleForTest(db: anytype, alloc: Allocator) !bool {
+fn independentDensePublicationVisibleForTest(db: *DB, alloc: Allocator) !bool {
     // Materialization counters and a replay cursor can advance before the
     // asynchronous query publication is visible. The isolation witness is a
     // successful query while the unrelated producer remains gated; waiting
@@ -107005,7 +106969,7 @@ fn testDenseChunkArtifactLifecycle(settings: table_storage_mod.Settings, migrate
     try std.testing.expectEqual(@as(u64, 1), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
 }
 
-fn resetDenseIndexForArtifactRebuildForTest(db: anytype, index_name: []const u8) !void {
+fn resetDenseIndexForArtifactRebuildForTest(db: *DB, index_name: []const u8) !void {
     // The native publisher holds catalog pins without the apply lock. Retire
     // those borrowers before taking apply exclusive and closing the old HBC.
     var structural = db.beginIndexStructuralMutation("test artifact dense reset", index_name);
@@ -117906,7 +117870,7 @@ test "db paged merge contributor accounting survives page order retry and source
     }
 }
 
-fn expectMergeArtifactSearches(alloc: Allocator, db: anytype) !void {
+fn expectMergeArtifactSearches(alloc: Allocator, db: *DB) !void {
     var dense = try db.search(alloc, .{ .index_name = "dv_v1", .query = .{ .dense_knn = .{ .vector = &.{ 1, 0, 0 }, .k = 1 } }, .limit = 1 });
     defer dense.deinit();
     try std.testing.expectEqual(@as(usize, 1), dense.hits.len);
@@ -120605,7 +120569,7 @@ test "db managed vector admission durably seeds missing enrichment artifacts" {
 /// then let the ordinary enrichment runtime publish those durable requests.
 /// Tests use this boundary instead of `runUntilIdle()` alone: admission is
 /// intentionally O(1), so maintenance—not DDL—owns the existing-corpus scan.
-fn drainManagedAdmissionSourceReplayForTest(db: anytype, alloc: Allocator, repair_id: u128) !void {
+fn drainManagedAdmissionSourceReplayForTest(db: *DB, alloc: Allocator, repair_id: u128) !void {
     for (0..1024) |_| {
         var entry = try db.loadIndexRepairEntryById(alloc, repair_id);
         const state = entry.intent.source_replay_state;
@@ -120631,7 +120595,7 @@ fn drainManagedAdmissionSourceReplayForTest(db: anytype, alloc: Allocator, repai
 /// Source replay completion can start a background full checkpoint. Tests
 /// which freeze or inspect its publication certificate must await that
 /// distinct boundary before changing the corpus or removing the worker.
-fn awaitManagedAdmissionPublicationForTest(db: anytype, alloc: Allocator, repair_id: u128) !void {
+fn awaitManagedAdmissionPublicationForTest(db: *DB, alloc: Allocator, repair_id: u128) !void {
     var entry = try db.loadIndexRepairEntryById(alloc, repair_id);
     defer entry.deinit(alloc);
     const deadline = monotonicTimeNs() +| 10 * std.time.ns_per_s;
@@ -125119,7 +125083,7 @@ const InterruptedActivatedDenseRepair = struct {
 
 fn interruptDenseRepairAfterActivation(
     alloc: Allocator,
-    db: anytype,
+    db: *DB,
 ) !InterruptedActivatedDenseRepair {
     const CrashHook = struct {
         fn afterSnapshot(_: *anyopaque, _: *DB, _: []const u8, _: u64) !void {}
@@ -126615,7 +126579,7 @@ test "db runtime status overlay refreshes identity totals with coverage counters
     try std.testing.expect(stale_stats.indexes[0].repair_degraded);
 }
 
-fn waitForNativeDenseReadyForTest(db: anytype, index_name: []const u8) !void {
+fn waitForNativeDenseReadyForTest(db: *DB, index_name: []const u8) !void {
     const deadline = monotonicTimeNs() +| 10 * std.time.ns_per_s;
     while (true) {
         const stats = try db.stats(std.testing.allocator);
@@ -134300,7 +134264,7 @@ test "db search_as_you_type schema emits Elasticsearch-style field variants" {
 }
 
 fn expectFilteredFullTextDeleteCliffProbe(
-    db: anytype,
+    db: *DB,
     alloc: Allocator,
     expected_total: u32,
     forbidden_id: ?[]const u8,
@@ -134465,7 +134429,7 @@ test "db one real delete keeps filtered full text on complement path across rest
     }
 }
 
-fn expectHighFrequencyKeywordRecall(db: anytype, alloc: Allocator) !void {
+fn expectHighFrequencyKeywordRecall(db: *DB, alloc: Allocator) !void {
     var published = try db.search(alloc, .{
         .index_name = "full_text_index_v0",
         .query = .{ .match = .{ .field = "title", .text = "catalog" } },
@@ -138249,7 +138213,7 @@ test "db fallback resource manager does not bind caller owned lsm cache" {
     try std.testing.expect(cache.resource_manager == null);
 }
 
-fn printDenseStreamingQualificationDiagnostics(db: anytype, docs_written: usize, memory: process_memory_mod.Stats) void {
+fn printDenseStreamingQualificationDiagnostics(db: *DB, docs_written: usize, memory: process_memory_mod.Stats) void {
     const print_lsm = struct {
         fn run(label: []const u8, stats: lsm_backend_mod.Backend.MaintenanceStats) void {
             std.debug.print(
@@ -146461,7 +146425,7 @@ fn loadStoredSearchDocumentManyCallback(
     return try loadStoredSearchDocumentsMany(self, alloc, keys, null);
 }
 
-fn completeVectorMigrationForTest(db: anytype, job_id: []const u8) !void {
+fn completeVectorMigrationForTest(db: *DB, job_id: []const u8) !void {
     const deadline = platform_time.monotonicNs() + 30 * std.time.ns_per_s;
     while (true) {
         var state = (try vector_migration.load(std.testing.allocator, db.core.store)).?;
