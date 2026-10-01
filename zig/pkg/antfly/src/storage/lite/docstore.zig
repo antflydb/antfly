@@ -423,6 +423,8 @@ pub const Store = struct {
     maintenance_wake: std.Io.Event = .unset,
     maintenance_cancel: maintenance.CancelToken = .{},
     maintenance_running: bool = false,
+    maintenance_start_suppressed: bool = false,
+    test_maintenance_cycles: if (@import("builtin").is_test) std.atomic.Value(u64) else void = if (@import("builtin").is_test) .init(0) else {},
     admission_refresh_size: u64 = 0,
     disk_admission_limit: ?u64 = null,
     read_only: bool = false,
@@ -451,6 +453,7 @@ pub const Store = struct {
         const policy = try reclamation.Policy.init(opts.reclamation);
         const native_opts = native.OpenOptions{
             .read_only = opts.read_only,
+            .wait_for_reader_lock = opts.read_only,
             .no_sync = opts.no_sync,
             .resource_manager = opts.resource_manager,
         };
@@ -464,6 +467,7 @@ pub const Store = struct {
             .read_only = opts.read_only,
             .resource_manager = opts.resource_manager,
             .maintenance_policy = policy,
+            .maintenance_start_suppressed = true,
         };
         errdefer result.close();
         // An owner may live for only one CLI invocation. Reopen services debt
@@ -474,6 +478,7 @@ pub const Store = struct {
             _ = try result.vacuumWithCancel(null);
         }
         if (!opts.read_only) result.maintainOnce(false) catch |err| result.recordMaintenanceError(err);
+        result.maintenance_start_suppressed = false;
         return result;
     }
 
@@ -621,7 +626,7 @@ pub const Store = struct {
         if (self.maintenance_started.load(.acquire)) return;
         lockStore(self);
         defer self.mutex.unlock();
-        if (self.read_only or self.maintenance_cancel.requested.load(.acquire) or
+        if (self.read_only or self.maintenance_start_suppressed or self.maintenance_cancel.requested.load(.acquire) or
             self.maintenance_future != null) return;
         const retirement = self.file.retirementNeedsService() catch false;
         if (!retirement and (!self.maintenance_policy.options.enabled or self.file.activeCheckpoint().page_count *| self.file.header.page_size < self.maintenance_policy.options.minimum_reclaim_bytes)) return;
@@ -650,12 +655,18 @@ pub const Store = struct {
                 continue;
             }
             lockStore(self);
-            const retry = self.maintenance_policy.status.state == .deferred;
+            const retry = self.maintenance_policy.status.state == .deferred or self.maintenance_policy.status.state == .failed;
             self.mutex.unlock();
-            self.maintainOnce(retry) catch |err| self.recordMaintenanceError(err);
+            if (@import("builtin").is_test) _ = self.test_maintenance_cycles.fetchAdd(1, .release);
+            var failed = false;
+            self.maintainOnce(retry) catch |err| {
+                failed = true;
+                self.recordMaintenanceError(err);
+            };
             if (self.maintenance_cancel.requested.load(.acquire)) break;
             lockStore(self);
-            const deferred = self.maintenance_policy.status.state == .deferred;
+            const deferred = failed or self.maintenance_policy.status.state == .deferred;
+            const blocked = self.maintenance_running or self.file.change_capture != null;
             self.mutex.unlock();
             if (deferred) {
                 retry_at = std.Io.Clock.awake.now(io).addDuration(std.Io.Duration.fromMilliseconds(self.maintenance_policy.options.retry_ms));
@@ -666,7 +677,7 @@ pub const Store = struct {
             } else {
                 retry_at = .zero;
                 lockStore(self);
-                const more = self.file.retirementNeedsService() catch false;
+                const more = !blocked and (self.file.retirementNeedsService() catch false);
                 self.mutex.unlock();
                 if (!more) self.maintenance_wake.waitUncancelable(io);
             }
@@ -682,6 +693,7 @@ pub const Store = struct {
             lockStore(self);
             defer self.mutex.unlock();
             if (self.maintenance_running or self.file.change_capture != null) return;
+            if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeUnknown;
             if (try self.file.retirementNeedsService()) {
                 try self.refreshAdmissionAssumeLocked();
                 _ = try self.file.reclaimPages(self.maintenance_policy.options.retirement_work_pages);
@@ -706,6 +718,7 @@ pub const Store = struct {
         defer {
             lockStore(self);
             self.maintenance_running = false;
+            self.maintenance_wake.set(self.file.runtime());
             self.mutex.unlock();
         }
         var snapshot_open = true;
@@ -896,6 +909,7 @@ pub const Store = struct {
         defer {
             lockStore(self);
             self.file.change_capture = null;
+            self.maintenance_wake.set(io);
             self.mutex.unlock();
         }
         // Manual and automatic rewrites share resource admission. Reserve the
@@ -3985,4 +3999,69 @@ test "lite pending replacement allocation failures preserve borrowed values" {
         if (exhausted) break;
     }
     try std.testing.expect(exhausted);
+}
+
+test "lite reclamation worker waits while online capture owns publication" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "worker-capture-wait.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.file.retirement_work_pages = 0;
+    try store.file.putDocument("key", "old");
+    try store.file.putDocument("key", "new");
+    try store.file.putDocument("advance", "frontier");
+    try std.testing.expect(try store.file.retirementNeedsService());
+    var capture = native.ChangeCapture{};
+    defer capture.deinit(a);
+    store.file.change_capture = &capture;
+    defer {
+        lockStore(&store);
+        store.file.change_capture = null;
+        store.maintenance_wake.set(store.file.runtime());
+        store.mutex.unlock();
+    }
+    store.startMaintenance();
+    if (store.maintenance_future == null) return error.SkipZigTest;
+    const started_deadline = std.Io.Clock.awake.now(store.file.runtime()).addDuration(std.Io.Duration.fromSeconds(3));
+    while (store.test_maintenance_cycles.load(.acquire) == 0) {
+        if (std.Io.Clock.awake.now(store.file.runtime()).nanoseconds >= started_deadline.nanoseconds) return error.TestUnexpectedResult;
+        try std.Io.sleep(store.file.runtime(), .fromMilliseconds(1), .awake);
+    }
+    const before = store.test_maintenance_cycles.load(.acquire);
+    try std.Io.sleep(store.file.runtime(), .fromMilliseconds(50), .awake);
+    try std.testing.expect(before <= 1);
+    try std.testing.expectEqual(before, store.test_maintenance_cycles.load(.acquire));
+}
+
+test "lite reclamation worker backs off failed publication fences" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "worker-error-backoff.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .retry_ms = 500 } });
+    defer store.close();
+    store.file.retirement_work_pages = 0;
+    try store.file.putDocument("key", "old");
+    try store.file.putDocument("key", "new");
+    try store.file.putDocument("advance", "frontier");
+    store.file.checkpoint_publication_uncertain = true;
+    store.startMaintenance();
+    if (store.maintenance_future == null) return error.SkipZigTest;
+    const started_deadline = std.Io.Clock.awake.now(store.file.runtime()).addDuration(std.Io.Duration.fromSeconds(3));
+    while (store.test_maintenance_cycles.load(.acquire) == 0) {
+        if (std.Io.Clock.awake.now(store.file.runtime()).nanoseconds >= started_deadline.nanoseconds) return error.TestUnexpectedResult;
+        try std.Io.sleep(store.file.runtime(), .fromMilliseconds(1), .awake);
+    }
+    const before = store.test_maintenance_cycles.load(.acquire);
+    try std.Io.sleep(store.file.runtime(), .fromMilliseconds(50), .awake);
+    try std.testing.expect(before <= 1);
+    try std.testing.expectEqual(before, store.test_maintenance_cycles.load(.acquire));
+    lockStore(&store);
+    defer store.mutex.unlock();
+    try std.testing.expectEqual(reclamation.State.failed, store.maintenance_policy.status.state);
+    try std.testing.expectEqualStrings("OutcomeUnknown", store.maintenance_policy.status.last_error.?);
 }

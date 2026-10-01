@@ -86,10 +86,10 @@ fn lockStore(store: *docstore.Store) void {
     platform_sync.lockYielding(&store.mutex);
 }
 
-fn pinCheckpoint(store: *docstore.Store) native.CheckpointSlot {
-    lockStore(store);
-    defer store.mutex.unlock();
-    return store.file.activeCheckpoint();
+fn pinSnapshot(store: *docstore.Store) !docstore.Txn {
+    // The generation lock fences replacement; this pin additionally fences
+    // in-place reuse for the entire metadata/value read or cursor traversal.
+    return store.beginRead();
 }
 
 fn pathContains(prefix: []const u8, path: []const u8) bool {
@@ -119,7 +119,9 @@ fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_by
     const io = self.docs.file.runtime();
     self.docs.generation_lock.lockSharedUncancelable(io);
     defer self.docs.generation_lock.unlockShared(io);
-    const checkpoint = pinCheckpoint(self.docs);
+    var snapshot = try pinSnapshot(self.docs);
+    defer snapshot.abort();
+    const checkpoint = snapshot.checkpoint;
 
     return (try self.docs.file.getIndexCatalogRecordLimitedAtCheckpointAlloc(allocator, path, max_bytes, checkpoint)) orelse error.FileNotFound;
 }
@@ -130,7 +132,9 @@ fn readFileRangeAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, o
     const io = self.docs.file.runtime();
     self.docs.generation_lock.lockSharedUncancelable(io);
     defer self.docs.generation_lock.unlockShared(io);
-    const checkpoint = pinCheckpoint(self.docs);
+    var snapshot = try pinSnapshot(self.docs);
+    defer snapshot.abort();
+    const checkpoint = snapshot.checkpoint;
 
     return (try self.docs.file.getIndexCatalogRecordRangeAtCheckpointAlloc(allocator, path, offset, len, checkpoint)) orelse return error.FileNotFound;
 }
@@ -141,7 +145,9 @@ fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
     const io = self.docs.file.runtime();
     self.docs.generation_lock.lockSharedUncancelable(io);
     defer self.docs.generation_lock.unlockShared(io);
-    const checkpoint = pinCheckpoint(self.docs);
+    var snapshot = try pinSnapshot(self.docs);
+    defer snapshot.abort();
+    const checkpoint = snapshot.checkpoint;
 
     const size = (try self.docs.file.getIndexCatalogRecordSizeAtCheckpoint(path, checkpoint)) orelse return error.FileNotFound;
     return @intCast(size);
@@ -153,7 +159,9 @@ fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8,
     const io = self.docs.file.runtime();
     self.docs.generation_lock.lockSharedUncancelable(io);
     defer self.docs.generation_lock.unlockShared(io);
-    const checkpoint = pinCheckpoint(self.docs);
+    var snapshot = try pinSnapshot(self.docs);
+    defer snapshot.abort();
+    const checkpoint = snapshot.checkpoint;
 
     const size = (try self.docs.file.getIndexCatalogRecordSizeAtCheckpoint(path, checkpoint)) orelse return error.FileNotFound;
     if (size < len) return error.EndOfStream;
@@ -305,7 +313,9 @@ fn listFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) !
     const io = self.docs.file.runtime();
     self.docs.generation_lock.lockSharedUncancelable(io);
     defer self.docs.generation_lock.unlockShared(io);
-    const checkpoint = pinCheckpoint(self.docs);
+    var snapshot = try pinSnapshot(self.docs);
+    defer snapshot.abort();
+    const checkpoint = snapshot.checkpoint;
     const prefix = if (std.mem.eql(u8, directory, "/"))
         try allocator.dupe(u8, "/")
     else
@@ -554,6 +564,8 @@ test "lite native repeated WAL reset does not publish unchanged control records"
     defer allocator.free(path);
     var docs = try docstore.Store.create(allocator, path, true);
     defer docs.close();
+    // Isolate WAL publication from independent allocator service checkpoints.
+    docs.maintenance_cancel.request();
     var indexes = Store.init(allocator, &docs);
     const storage = indexes.storage();
     const root = "/indexes/test";
@@ -1272,7 +1284,9 @@ test "lite native directory cursor skips large subtrees and preserves boundary f
         for ([_][]const u8{ "/a", "/a/sub", "/a/sub.", "/a/sub0", "/a/submarine", "/a/other0", "/a/z", "/top" }) |key|
             try mutations.append(scratch, .{ .key = key, .value = "direct" });
         try docs.file.putIndexCatalogBatch(mutations.items);
-        const pinned = docs.file.activeCheckpoint();
+        var snapshot = try docs.beginRead();
+        defer snapshot.abort();
+        const pinned = snapshot.checkpoint;
         const reads = docs.file.test_page_reads.load(.monotonic);
         const names = try storage.listFileNamesAlloc(alloc, "/a/");
         defer StorageIo.freeFileNames(alloc, names);

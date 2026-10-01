@@ -10,7 +10,8 @@ const Allocator = std.mem.Allocator;
 pub const free: u32 = 0x80000000;
 pub const max_references: u32 = free - 1;
 pub const max_pending_objects = 1024 * 1024;
-pub const Kind = enum(u8) { record, index, value, metadata, page };
+pub const collector_reserve = 4096; // 64 levels × 63 siblings, plus publication metadata.
+pub const Kind = enum(u8) { record, index, value, metadata, page, allocator_chain };
 pub const Retirement = struct {
     id: u64 = 0,
     epoch: u64,
@@ -32,12 +33,16 @@ pub const IO = struct {
     read: *const fn (*anyopaque, Allocator, u64) anyerror![]u8,
     write: *const fn (*anyopaque, u64, []const u8) anyerror!void,
     payload_bytes: usize,
+    cancel_requested: ?*const std.atomic.Value(bool) = null,
+    fn checkCancel(self: IO) !void {
+        if (self.cancel_requested) |flag| if (flag.load(.acquire)) return error.MaintenanceCanceled;
+    }
 };
 
 const Heap = std.PriorityQueue(Retirement, void, order);
 fn order(_: void, a: Retirement, b: Retirement) std.math.Order {
     const epoch = std.math.order(a.epoch, b.epoch);
-    return if (epoch == .eq) std.math.order(a.id, b.id) else epoch;
+    return if (epoch == .eq) std.math.order(b.id, a.id) else epoch;
 }
 
 pub const State = struct {
@@ -49,6 +54,9 @@ pub const State = struct {
     data_pending: u64 = 0,
     pending: std.AutoHashMapUnmanaged(u64, Retirement) = .empty,
     heap: Heap,
+    metadata_heap: Heap,
+    chains_heap: Heap,
+    pending_limit: usize = max_pending_objects,
     changes: std.AutoHashMapUnmanaged(u64, u32) = .empty,
     added: std.ArrayList(Retirement) = .empty,
     completed: std.ArrayList(u64) = .empty,
@@ -61,13 +69,15 @@ pub const State = struct {
     force_checkpoint: bool = false,
 
     pub fn init(a: Allocator) State {
-        return .{ .allocator = a, .heap = Heap.initContext({}) };
+        return .{ .allocator = a, .heap = Heap.initContext({}), .metadata_heap = Heap.initContext({}), .chains_heap = Heap.initContext({}) };
     }
     pub fn deinit(self: *State) void {
         self.counts.deinit(self.allocator);
         for (&self.bitmap) |*level| level.deinit(self.allocator);
         self.pending.deinit(self.allocator);
         self.heap.deinit(self.allocator);
+        self.metadata_heap.deinit(self.allocator);
+        self.chains_heap.deinit(self.allocator);
         self.changes.deinit(self.allocator);
         self.added.deinit(self.allocator);
         self.completed.deinit(self.allocator);
@@ -152,37 +162,60 @@ pub const State = struct {
         self.allocations +|= 1;
         return index;
     }
+    fn queue(self: *State, kind: Kind) *Heap {
+        return switch (kind) {
+            .metadata => &self.metadata_heap,
+            .allocator_chain => &self.chains_heap,
+            else => &self.heap,
+        };
+    }
     pub fn retire(self: *State, item: Retirement) !void {
+        if (self.pending.count() >= self.pending_limit) return error.LiteRetirementBacklogExceeded;
+        return self.retireCollected(item);
+    }
+    pub fn retireCollected(self: *State, item: Retirement) !void {
         // Bound owner metadata debt independently of reader lifetime. The caller
         // can keep reads available and report pressure when this limit is hit.
-        if (self.pending.count() >= max_pending_objects) return error.LiteRetirementBacklogExceeded;
+        if (self.pending.count() >= self.pending_limit + collector_reserve) return error.LiteRetirementBacklogExceeded;
         var owned = item;
         owned.id = self.root.next_id;
         self.root.next_id = try std.math.add(u64, owned.id, 1);
         try self.added.append(self.allocator, owned);
         try self.pending.put(self.allocator, owned.id, owned);
-        try self.heap.push(self.allocator, owned);
-        if (owned.kind != .metadata) self.data_pending += 1;
+        try self.queue(owned.kind).push(self.allocator, owned);
+        if (owned.kind != .metadata and owned.kind != .allocator_chain) self.data_pending += 1;
     }
     pub fn oldest(self: *State, frontier: u64) ?Retirement {
-        const item = self.heap.peek() orelse return null;
-        return if (item.epoch <= frontier) item else null;
+        return self.eligible(frontier, frontier);
+    }
+    pub fn eligible(self: *State, data_frontier: u64, metadata_frontier: u64) ?Retirement {
+        for ([_]*Heap{ &self.metadata_heap, &self.chains_heap, &self.heap }, [_]u64{ metadata_frontier, metadata_frontier, data_frontier }) |q, frontier| {
+            if (q.peek()) |item| if (item.epoch <= frontier) return item;
+        }
+        return null;
+    }
+    pub fn eligibleWork(self: *State, data_frontier: u64, metadata_frontier: u64) ?Retirement {
+        if (self.chains_heap.peek()) |item| if (item.epoch <= metadata_frontier) return item;
+        if (self.heap.peek()) |item| if (item.epoch <= data_frontier) return item;
+        return null;
     }
     pub fn complete(self: *State, item: Retirement) !void {
         try self.completed.append(self.allocator, item.id);
-        const first = self.heap.pop() orelse return error.InvalidNativeAllocator;
+        const first = self.queue(item.kind).pop() orelse return error.InvalidNativeAllocator;
         if (first.id != item.id or !self.pending.remove(item.id)) return error.InvalidNativeAllocator;
         self.collected +|= 1;
-        if (item.kind != .metadata) self.data_pending -= 1;
+        if (item.kind != .metadata and item.kind != .allocator_chain) self.data_pending -= 1;
     }
     /// Private-image publication discards all earlier private recovery roots.
     /// Rebase pending epochs and checkpoint the queue at that final boundary.
     pub fn rebaseEpochs(self: *State, epoch: u64) !void {
         self.heap.clearRetainingCapacity();
+        self.metadata_heap.clearRetainingCapacity();
+        self.chains_heap.clearRetainingCapacity();
         var items = self.pending.valueIterator();
         while (items.next()) |item| {
             item.epoch = @min(item.epoch, epoch);
-            try self.heap.push(self.allocator, item.*);
+            try self.queue(item.kind).push(self.allocator, item.*);
         }
         self.force_checkpoint = true;
     }
@@ -212,6 +245,7 @@ pub const State = struct {
     }
 
     pub fn load(a: Allocator, io: IO, root_page: u64) !State {
+        try io.checkCancel();
         var self = State.init(a);
         errdefer self.deinit();
         const raw = try io.read(io.context, a, root_page);
@@ -224,6 +258,7 @@ pub const State = struct {
         var snapshot_first: u64 = 1;
         var page = self.root.snapshot;
         while (page != 0) {
+            try io.checkCancel();
             try self.visit(page, &visited);
             const payload = try io.read(io.context, a, page);
             defer a.free(payload);
@@ -232,6 +267,7 @@ pub const State = struct {
             const n = (payload.len - 24) / 4;
             if ((payload.len - 24) % 4 != 0 or first != snapshot_first or first > self.root.covered_pages or n > self.root.covered_pages - first) return error.InvalidNativeAllocator;
             for (0..n) |i| {
+                try io.checkCancel();
                 const value = std.mem.readInt(u32, payload[24 + i * 4 ..][0..4], .little);
                 try self.set(first + i, value, false);
             }
@@ -240,14 +276,16 @@ pub const State = struct {
         }
         page = self.root.pending;
         while (page != 0) {
+            try io.checkCancel();
             try self.visit(page, &visited);
             const payload = try io.read(io.context, a, page);
             defer a.free(payload);
             if (payload.len < 16 or !std.mem.eql(u8, payload[0..4], "L4RQ") or (payload.len - 16) % 48 != 0) return error.InvalidNativeAllocator;
             var offset: usize = 16;
             while (offset < payload.len) : (offset += 48) {
+                try io.checkCancel();
                 const item = try decodeRetirement(payload[offset..][0..48]);
-                if (self.pending.contains(item.id) or self.pending.count() >= max_pending_objects) return error.InvalidNativeAllocator;
+                if (self.pending.contains(item.id) or self.pending.count() >= max_pending_objects + collector_reserve) return error.InvalidNativeAllocator;
                 try self.pending.put(a, item.id, item);
             }
             page = get64(payload, 8);
@@ -256,6 +294,7 @@ pub const State = struct {
         defer deltas.deinit(a);
         page = self.root.deltas;
         while (page != 0) {
+            try io.checkCancel();
             try self.visit(page, &visited);
             try deltas.append(a, page);
             const payload = try io.read(io.context, a, page);
@@ -265,11 +304,13 @@ pub const State = struct {
         }
         var i = deltas.items.len;
         while (i > 0) {
+            try io.checkCancel();
             i -= 1;
             const payload = try io.read(io.context, a, deltas.items[i]);
             defer a.free(payload);
             var offset: usize = 16;
             while (offset < payload.len) : (offset += 56) {
+                try io.checkCancel();
                 const entry = payload[offset..][0..56];
                 switch (entry[0]) {
                     1 => {
@@ -279,7 +320,7 @@ pub const State = struct {
                     },
                     2 => {
                         const item = try decodeRetirement(entry[8..][0..48]);
-                        if (self.pending.contains(item.id) or self.pending.count() >= max_pending_objects) return error.InvalidNativeAllocator;
+                        if (self.pending.contains(item.id)) return error.InvalidNativeAllocator;
                         try self.pending.put(a, item.id, item);
                     },
                     3 => if (!self.pending.remove(get64(entry, 8))) return error.InvalidNativeAllocator,
@@ -287,11 +328,13 @@ pub const State = struct {
                 }
             }
         }
+        if (self.pending.count() > max_pending_objects + collector_reserve) return error.InvalidNativeAllocator;
         var items = self.pending.valueIterator();
         while (items.next()) |item| {
+            try io.checkCancel();
             if (item.id >= self.root.next_id or item.page == 0) return error.InvalidNativeAllocator;
-            try self.heap.push(a, item.*);
-            if (item.kind != .metadata) self.data_pending += 1;
+            try self.queue(item.kind).push(a, item.*);
+            if (item.kind != .metadata and item.kind != .allocator_chain) self.data_pending += 1;
         }
         for (self.metadata.items) |metadata_page| if (self.count(metadata_page) == free) return error.InvalidNativeAllocator;
         if (self.count(root_page) == free) return error.InvalidNativeAllocator;
@@ -306,26 +349,33 @@ pub const State = struct {
 
     /// Metadata snapshots amortize O(page count) work over at least twice their
     /// encoded size in counter changes. Snapshotting never touches value bytes.
-    pub fn preparePersist(self: *State, epoch: u64) !void {
-        if (self.root_page != 0) try self.retire(.{ .epoch = epoch, .page = self.root_page, .kind = .metadata });
-        const delta_size = (self.changes.count() + self.added.items.len + self.completed.items.len) * 56;
+    pub fn preparePersist(self: *State, epoch: u64, payload_bytes: usize) !void {
+        if (self.root_page != 0) try self.retireCollected(.{ .epoch = epoch, .page = self.root_page, .kind = .metadata });
+        const delta_size = self.deltaFootprint(payload_bytes);
         const threshold = @max(@as(u64, 256 * 1024), @as(u64, self.counts.items.len) * 8 + self.pending.count() * 96);
         self.checkpointing = self.force_checkpoint or self.root.snapshot == 0 or self.root.delta_bytes +| delta_size >= threshold;
         if (self.checkpointing) {
             // These pages remain reachable from the fallback allocator root.
-            for (self.metadata.items) |old| try self.retire(.{ .epoch = epoch, .page = old, .kind = .metadata });
+            for ([_]u64{ self.root.snapshot, self.root.pending, self.root.deltas }) |old| {
+                if (old != 0) try self.retireCollected(.{ .epoch = epoch, .page = old, .kind = .allocator_chain });
+            }
         }
     }
     /// Reserve this many metadata pages BEFORE encoding counters. Allocation
     /// consumes free bits; serializing first would advertise its own pages free.
     /// Re-evaluate after reserving until the small fixed point is reached.
+    fn deltaFootprint(self: *State, payload_bytes: usize) u64 {
+        const entries = self.changes.count() + self.added.items.len + self.completed.items.len;
+        const pages = std.math.divCeil(usize, entries, (payload_bytes - 16) / 56) catch unreachable;
+        return @as(u64, pages) * payload_bytes;
+    }
     pub fn pagesRequired(self: *State, payload_bytes: usize) usize {
         if (self.checkpointing) return @max(@as(usize, 1), std.math.divCeil(usize, self.counts.items.len -| 1, (payload_bytes - 24) / 4) catch unreachable) +
             (std.math.divCeil(usize, self.pending.count(), (payload_bytes - 16) / 48) catch unreachable);
         return std.math.divCeil(usize, self.changes.count() + self.added.items.len + self.completed.items.len, (payload_bytes - 16) / 56) catch unreachable;
     }
     pub fn persist(self: *State, io: IO, root_page: u64, covered: *u64) !void {
-        const delta_size = (self.changes.count() + self.added.items.len + self.completed.items.len) * 56;
+        const delta_size = self.deltaFootprint(io.payload_bytes);
         if (self.checkpointing) {
             self.metadata.clearRetainingCapacity();
             self.root.snapshot = try self.writeCounts(io);
@@ -493,4 +543,63 @@ test "lite allocator v4 retirement preserves shared ownership and oldest epoch" 
     try state.complete(oldest);
     try std.testing.expect(state.oldest(9) == null);
     try std.testing.expectEqual(@as(u64, 1), state.oldest(10).?.page);
+}
+
+test "lite allocator v4 saturated admission preserves depth first collector space" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    state.pending_limit = 8;
+    for (1..9) |page| try state.retire(.{ .epoch = 1, .page = page, .kind = .value });
+    try std.testing.expectError(error.LiteRetirementBacklogExceeded, state.retire(.{ .epoch = 1, .page = 9, .kind = .value }));
+    const parent = state.oldest(1).?;
+    try state.complete(parent);
+    // Expand one full extent at a time. Newly discovered children must be
+    // serviced before older siblings, including at the admission limit.
+    for (0..63) |depth| {
+        for (0..64) |child| try state.retireCollected(.{ .epoch = 1, .page = 1000 + depth * 64 + child, .kind = .value });
+        const next = state.oldest(1).?;
+        try std.testing.expectEqual(@as(u64, 1000 + depth * 64 + 63), next.page);
+        try state.complete(next);
+    }
+    try std.testing.expect(state.pending.count() < state.pending_limit + collector_reserve);
+    while (state.oldest(1)) |item| try state.complete(item);
+    try std.testing.expectEqual(@as(u64, 0), state.data_pending);
+    try state.retire(.{ .epoch = 2, .page = 1, .kind = .value });
+}
+
+test "lite allocator v4 checkpoints retire chains without queue bursts" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    state.root_page = 1;
+    state.root.snapshot = 2;
+    state.root.pending = 3;
+    state.root.deltas = 4;
+    state.force_checkpoint = true;
+    for (2..10000) |page| try state.metadata.append(std.testing.allocator, page);
+    try state.preparePersist(5, 4080);
+    try std.testing.expectEqual(@as(usize, 4), state.pending.count());
+    try std.testing.expectEqual(@as(u64, 0), state.data_pending);
+    try state.retire(.{ .epoch = 3, .page = 10000, .kind = .value });
+    // A data reader at epoch 2 does not inspect allocator metadata. Recovery
+    // slots at epoch 5 still protect every page that can be reused.
+    const root = state.eligible(2, 5).?;
+    try std.testing.expectEqual(Kind.metadata, root.kind);
+    try state.complete(root);
+    for (0..3) |_| {
+        const chain = state.eligible(2, 5).?;
+        try std.testing.expectEqual(Kind.allocator_chain, chain.kind);
+        try state.complete(chain);
+    }
+    try std.testing.expect(state.eligible(2, 5) == null);
+    try std.testing.expectEqual(Kind.value, state.eligible(3, 5).?.kind);
+}
+
+test "lite allocator v4 sparse journal pages count toward checkpoint threshold" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    state.root.snapshot = 1;
+    state.root.delta_bytes = 64 * 4080;
+    try state.retain(2);
+    try state.preparePersist(1, 4080);
+    try std.testing.expect(state.checkpointing);
 }

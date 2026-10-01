@@ -56,10 +56,13 @@ exceeds twice estimated compact size and estimated savings reach 256 MiB. These
 are provisional, configurable defaults; sustained benchmark qualification must
 precede a release-level numerical performance promise.
 
-The task is lazy: files without retirement debt or eligible shrinking do not consume a concurrency lane. Mutations signal
-one owner task and requests coalesce. Busy publication and resource deferral retry
-after the configured interval. Read-only handles perform no maintenance. Writable
-reopen assesses outstanding debt synchronously, preventing repeated short CLI
+The task is lazy: files without retirement debt or eligible shrinking do not
+consume a concurrency lane. Mutations signal one owner task and requests coalesce.
+Busy publication, resource deferral, and failed service retry
+after the configured interval. An active online capture or assessment parks the
+worker until completion signals it; eligible debt never causes a no-progress spin.
+Construction suppresses worker startup until the returned owner has a stable
+address. Read-only handles perform no maintenance. Writable reopen assesses outstanding debt synchronously, preventing repeated short CLI
 sessions from discarding a newly launched background task forever. Close requests
 cancellation, wakes and joins the task, then closes the storage runtime. The
 publication boundary retains the existing atomic adoption and directory-sync
@@ -124,13 +127,16 @@ builder-root accounting into the unpublished image.
 COW index edits queue only replaced/pruned physical nodes and changed records.
 Unchanged index subtrees remain owned. A delete queues its old record in constant
 payload work; retirement subsequently discovers value children in bounded batches.
-The default budget is 128 graph objects per mutation/service iteration, configured
-by `retirement_work_pages`. One extent node can queue at most 64 children. The
+The default data budget is 128 graph objects per mutation/service iteration,
+configured by `retirement_work_pages`. One extent node can queue at most 64 children. The
 budget counts graph objects, including logical slots; it is not a hard time limit.
 
-The durable queue is ordered by retirement epoch and event ID. Children inherit
-the parent's epoch, so newly eligible work cannot starve behind newer unsafe
-retirements. Pending events are capped at 1,048,576; admissions fail with
+The durable data queue is ordered by ascending retirement epoch and descending
+event ID. Children inherit their parent's epoch and run before its older siblings,
+bounding depth-first expansion to 63 siblings per extent level (at most 63 levels).
+Foreground pending events are capped at 1,048,576; a separate 4,096-event reserve
+allows collector expansion and publication at that limit. A collector completes
+the parent before queuing children. Admissions fail with
 `LiteRetirementBacklogExceeded` when readers or insufficient service prevent
 progress. The file-byte budget independently bounds retained data and workspace.
 The owner services idle debt and advances fallback checkpoints even when
@@ -145,15 +151,31 @@ separate `allocator` page kind. Integers are little endian.
 
 - `L4SS`: counter snapshot chunks, first physical page and packed 32-bit counts.
 - `L4RQ`: retirement snapshot chunks, 48-byte events (ID, epoch, reference,
-  value length, and kind).
+  value length, and kind). Kind 5 is an allocator-chain head; kinds 0–4 retain
+  their existing meanings. New readers also accept earlier single-page metadata
+  retirements. Earlier revision-4 prototypes reject unknown kinds rather than
+  modifying a ledger they cannot interpret.
 - `L4DL`: 56-byte tagged counter updates, new retirement events, and completed IDs.
 
 A counter is an ownership count, zero for reserved allocator metadata, or
 `0x80000000` for a reusable page. Counter changes and queue deltas append per
-publication. Once encoded deltas reach the larger of 256 KiB or twice the counter
-and queue snapshot size, the next publication checkpoints only allocator metadata.
-Previous metadata itself retires behind the same visibility frontier. It does not
-rewrite live document/value bytes. Metadata reservations consume free bits before
+publication. Once physical delta-page payload capacity reaches the larger of
+256 KiB or twice the counter and queue snapshot size (including unused space in
+a commit page), the next publication checkpoints only allocator metadata.
+Previous metadata snapshots retire as at most three chain-head events. Service
+reads and retires one chain page per work unit, rather than enqueueing an entire
+snapshot. Metadata roots and chains have separate queues. Their visibility fence
+is the recovery/durability slots: internal data transactions never read allocator
+metadata. External snapshot and audit handles still prevent physical overwrite
+through the inode lock. Each service batch additionally cleans at most two eligible
+old allocator roots and at most `max(8, retirement_work_pages)` allocator-chain
+pages. Scaling cleanup with data work avoids accumulating snapshot overhead under
+sustained service; the eight-page minimum lets a one-object data budget drain its
+publication overhead. Data never waits behind an entire metadata chain. Root-only
+debt beyond two retained roots also drains at a net reduction per publication; the
+last two roots never start an idle service loop. Existing single-page metadata
+retirements remain readable. Metadata checkpoints preserve live document/value
+pages. Metadata reservations consume free bits before
 serialization, preventing the allocator from advertising its own pages as free.
 
 Memory is approximately four bytes per physical page plus bitmap summaries (about
@@ -174,6 +196,12 @@ materializations. Data and allocator roots use the same sync and checksummed slo
 publication barriers. Failed transactions reload the previous ledger; partial
 private tail pages never enter the committed free bitmap. An uncertain publication
 fences mutations until recovery.
+
+Index artifact reads and directory cursors retain an owner read pin for their
+entire traversal in addition to fencing generation replacement. Owner read-only
+opens wait for a current in-place write to release its inode lock; writer and
+maintenance admission remain nonblocking. Raw native opens keep fail-fast
+admission unless `wait_for_reader_lock` is requested.
 
 In-process readers use a generation-local intrusive epoch list. Pinning and
 removing an arbitrary reader, and finding the oldest epoch, take constant time.
@@ -223,7 +251,18 @@ Qualification covers overwrite/reopen plateaus with full vacuum disabled, large
 free sets, long keys and splits, packed-slot deletion, shared append/rename graphs,
 bounded retirement batches, concurrent readers, external-lock fallback, unsynced
 commits, fallback recovery, transaction abort, legacy migration, online copy and
-catch-up, allocator corruption, and allocation failures. Full storage suites
+catch-up, allocator corruption, allocation failures, saturated queue progress
+with a one-object budget, worker parking/backoff, and cancellation inside values. Full storage suites
 exercise existing backup/import/encryption/replay/resource contracts. Numerical
 throughput, latency-percentile, and I/O promises require workload benchmarks;
 correctness tests and structural page-growth bounds do not establish those claims.
+
+## Failure and estimation guarantees
+
+Replacement creation initializes and syncs the complete selected format on the
+staged inode before rename; initialization failure preserves the original artifact.
+Compact-size estimation models the destination format, including migration, typed
+long-key pages, and the fixed point of allocator root and counter snapshot pages.
+Revision 4 omits the legacy namespace directory. Graph audits and vacuum ownership
+bootstrap check cancellation per value object and throughout counter/queue replay
+and validation, so a single large value cannot defer owner shutdown indefinitely.

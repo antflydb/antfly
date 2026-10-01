@@ -789,8 +789,9 @@ pub const RecordPageReader = struct {
 };
 
 /// Ordered live catalog keys at a pinned checkpoint. The prefix is borrowed
-/// for the cursor lifetime. Callers fence generation replacement (vacuum) while
-/// using this cursor; ordinary copy-on-write commits may continue concurrently.
+/// for the cursor lifetime. Callers keep the checkpoint pinned and fence
+/// generation replacement (vacuum) while using this cursor; ordinary copy-on-write
+/// commits may continue concurrently.
 pub const CatalogCursor = struct {
     records: RecordPageReader = .{},
     index: DocumentIndexCursor,
@@ -1689,6 +1690,8 @@ pub const LockMode = enum {
 };
 
 pub const OpenOptions = struct {
+    /// Owner read-only opens wait for in-place service; primitives default to fail-fast.
+    wait_for_reader_lock: bool = false,
     internal_reader: bool = false,
     read_only: bool = false,
     no_sync: bool = false,
@@ -2384,6 +2387,7 @@ pub const NativeFile = struct {
     // filesystem speed and cache warmth. No counters exist in production.
     test_value_read_bytes: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_value_read_calls: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+    test_cancel_on_read: if (builtin.is_test) ?*maintenance.CancelToken else void = if (builtin.is_test) null else {},
     test_page_reads: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_index_view_hits: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_index_comparisons: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
@@ -2429,7 +2433,7 @@ pub const NativeFile = struct {
         }
         errdefer if (writer_lock_file) |lock_file| lock_file.close(io);
 
-        const opened_file = try openDataFile(io, path, if (opts.read_only) (if (opts.internal_reader) .internal_reader else .reader) else .writer);
+        const opened_file = try openDataFile(io, path, if (opts.read_only) (if (opts.internal_reader) .internal_reader else .reader) else .writer, opts.wait_for_reader_lock);
         const file = opened_file.file;
         errdefer file.close(io);
 
@@ -2456,27 +2460,21 @@ pub const NativeFile = struct {
     }
 
     pub fn create(allocator: Allocator, path: []const u8) !NativeFile {
-        return try createWithMode(allocator, path, false, false, null, "");
+        return try createWithMode(allocator, path, false, false, null, "", false);
     }
 
     pub fn createNew(allocator: Allocator, path: []const u8) !NativeFile {
-        return try createWithMode(allocator, path, true, false, null, "");
+        return try createWithMode(allocator, path, true, false, null, "", false);
     }
 
     pub fn createWithOptions(allocator: Allocator, path: []const u8, opts: CreateOptions) !NativeFile {
-        var result = try createWithMode(allocator, path, opts.exclusive, opts.no_sync, opts.resource_manager, opts.writer_lock_marker);
-        errdefer result.close();
-        if (opts.indexed_reclamation) try result.initializeIndexedAllocator();
-        return result;
+        return try createWithMode(allocator, path, opts.exclusive, opts.no_sync, opts.resource_manager, opts.writer_lock_marker, opts.indexed_reclamation);
     }
 
     /// Creates a Lite file using a caller-owned std.Io runtime. The runtime
     /// must outlive the returned file.
     pub fn createWithIo(allocator: Allocator, io: std.Io, path: []const u8, opts: CreateOptions) !NativeFile {
-        var result = try createWithRuntime(allocator, path, opts.exclusive, opts.no_sync, opts.resource_manager, opts.writer_lock_marker, undefined, io);
-        errdefer result.close();
-        if (opts.indexed_reclamation) try result.initializeIndexedAllocator();
-        return result;
+        return try createWithRuntime(allocator, path, opts.exclusive, opts.no_sync, opts.resource_manager, opts.writer_lock_marker, undefined, io, opts.indexed_reclamation);
     }
 
     fn createWithMode(
@@ -2486,10 +2484,11 @@ pub const NativeFile = struct {
         no_sync: bool,
         resource_manager: ?*resource_manager_mod.ResourceManager,
         writer_lock_marker: []const u8,
+        indexed: bool,
     ) !NativeFile {
         var io_impl = threaded_io_limits.initService(allocator);
         errdefer io_impl.deinit();
-        return try createWithRuntime(allocator, path, exclusive, no_sync, resource_manager, writer_lock_marker, io_impl, null);
+        return try createWithRuntime(allocator, path, exclusive, no_sync, resource_manager, writer_lock_marker, io_impl, null, indexed);
     }
 
     fn createWithRuntime(
@@ -2501,6 +2500,7 @@ pub const NativeFile = struct {
         writer_lock_marker: []const u8,
         io_impl: std.Io.Threaded,
         borrowed_io: ?std.Io,
+        indexed: bool,
     ) !NativeFile {
         var owned_io_impl = io_impl;
         const io = borrowed_io orelse owned_io_impl.io();
@@ -2547,6 +2547,15 @@ pub const NativeFile = struct {
         errdefer if (file_open) file.close(io);
 
         try file.writePositionalAll(io, &encoded, 0);
+        var initialized_header: Header = .{};
+        if (indexed) {
+            // Finish every fallible initialization step on the private inode.
+            var staged = NativeFile{ .allocator = allocator, .io_impl = undefined, .borrowed_io = io, .path = owned_path, .file = file, .header = .{}, .read_only = false, .no_sync = no_sync, .page_cache_enabled = .init(false) };
+            defer staged.invalidateLedger();
+            defer staged.page_cache.deinit(allocator);
+            try staged.initializeIndexedAllocator();
+            initialized_header = staged.header;
+        }
         if (!no_sync) {
             try file.sync(io);
         }
@@ -2558,7 +2567,7 @@ pub const NativeFile = struct {
                 return err;
             };
             if (!no_sync) try fs_paths.syncDirPortable(io, std.fs.path.dirname(create_target) orelse ".");
-            file = (try openDataFile(io, path, .writer)).file;
+            file = (try openDataFile(io, path, .writer, false)).file;
             file_open = true;
         } else if (!no_sync) {
             try fs_paths.syncDirPortable(io, std.fs.path.dirname(create_target) orelse ".");
@@ -2571,7 +2580,7 @@ pub const NativeFile = struct {
             .path = owned_path,
             .file = file,
             .writer_lock_file = writer_lock_file,
-            .header = .{},
+            .header = initialized_header,
             .read_only = false,
             .no_sync = no_sync,
             .page_cache_enabled = .init(true),
@@ -2638,6 +2647,10 @@ pub const NativeFile = struct {
     }
 
     fn loadLedger(self: *NativeFile, checkpoint: CheckpointSlot) !*allocator_v4.State {
+        return self.loadLedgerWithCancel(checkpoint, null);
+    }
+    fn loadLedgerWithCancel(self: *NativeFile, checkpoint: CheckpointSlot, cancel: ?*const maintenance.CancelToken) !*allocator_v4.State {
+        if (cancel) |token| try token.check();
         if (self.ledger) |state| if (state.root_page == checkpoint.free_map_root_page) return state;
         self.invalidateLedger();
         if (checkpoint.free_map_root_page != 0) {
@@ -2653,6 +2666,7 @@ pub const NativeFile = struct {
             .read = ledgerRead,
             .write = ledgerReadOnlyWrite,
             .payload_bytes = self.maxPagePayloadBytes(),
+            .cancel_requested = if (cancel) |token| &token.requested else null,
         }, checkpoint.free_map_root_page);
         self.ledger = state;
         return state;
@@ -2679,12 +2693,13 @@ pub const NativeFile = struct {
         try graph.pages.put(self.allocator, page, {});
     }
 
-    fn indexedValue(self: *NativeFile, graph: *IndexedGraph, checkpoint: CheckpointSlot, root: u64, length: u64) !void {
+    fn indexedValue(self: *NativeFile, graph: *IndexedGraph, checkpoint: CheckpointSlot, root: u64, length: u64, cancel: ?*const maintenance.CancelToken) !void {
         const Value = struct { page: u64, length: u64, height: ?u8 = null };
         var work: std.ArrayList(Value) = .empty;
         defer work.deinit(self.allocator);
         try work.append(self.allocator, .{ .page = root, .length = length });
         while (work.pop()) |value| {
+            if (cancel) |token| try token.check();
             if (value.length == 0 or physicalPage(value.page) != value.page) return error.InvalidNativeValueChain;
             try self.indexedMark(graph, checkpoint, value.page);
             if (graph.owners) |owners| try owners.retain(value.page);
@@ -2757,7 +2772,7 @@ pub const NativeFile = struct {
                 };
                 if (record.previous_page != 0 or record.is_delete or !std.mem.eql(u8, key, record.key)) return error.InvalidDocumentIndex;
                 if (graph.owners) |owners| try owners.retain(physicalPage(reference));
-                if (record.external_value_root_page != 0) try self.indexedValue(graph, checkpoint, record.external_value_root_page, record.external_value_len);
+                if (record.external_value_root_page != 0) try self.indexedValue(graph, checkpoint, record.external_value_root_page, record.external_value_len, cancel);
                 graph.record_count += 1;
             },
         }
@@ -2784,6 +2799,12 @@ pub const NativeFile = struct {
         defer expected.deinit();
         var graph = try self.indexedGraph(checkpoint, &expected, cancel);
         defer graph.deinit(self.allocator);
+        var current_metadata: ReachablePageSet = .empty;
+        defer current_metadata.deinit(self.allocator);
+        for (state.metadata.items) |page| {
+            if (cancel) |token| try token.check();
+            try current_metadata.put(self.allocator, page, {});
+        }
         var metadata_retirements: ReachablePageSet = .empty;
         defer metadata_retirements.deinit(self.allocator);
         var pending = state.pending.valueIterator();
@@ -2793,12 +2814,22 @@ pub const NativeFile = struct {
             if (item.epoch > checkpoint.commit_sequence) return error.InvalidNativeAllocator;
             try self.indexedMark(&graph, checkpoint, item.page);
             switch (item.kind) {
+                .allocator_chain => {
+                    var page = item.page;
+                    while (page != 0) {
+                        if (cancel) |token| try token.check();
+                        try self.indexedMark(&graph, checkpoint, page);
+                        if (state.count(page) != 0 or page == state.root_page or metadata_retirements.contains(page) or current_metadata.contains(page)) return error.InvalidNativeAllocator;
+                        try metadata_retirements.put(self.allocator, page, {});
+                        page = try self.retiredAllocatorNext(page, checkpoint);
+                    }
+                },
                 .metadata => {
-                    if (state.count(item.page) != 0 or item.page == state.root_page or metadata_retirements.contains(item.page) or std.mem.indexOfScalar(u64, state.metadata.items, item.page) != null) return error.InvalidNativeAllocator;
+                    if (state.count(item.page) != 0 or item.page == state.root_page or metadata_retirements.contains(item.page) or current_metadata.contains(item.page)) return error.InvalidNativeAllocator;
                     try metadata_retirements.put(self.allocator, item.page, {});
                 },
                 .page => try expected.retain(item.page),
-                .value => try self.indexedValue(&graph, checkpoint, item.page, item.length),
+                .value => try self.indexedValue(&graph, checkpoint, item.page, item.length, cancel),
                 .index => {
                     if (graph.nodes.contains(item.page)) return error.InvalidNativeAllocator;
                     try graph.nodes.put(self.allocator, item.page, {});
@@ -2829,11 +2860,12 @@ pub const NativeFile = struct {
                         },
                         else => return error.InvalidNativeAllocator,
                     };
-                    if (root != 0) try self.indexedValue(&graph, checkpoint, root, length);
+                    if (root != 0) try self.indexedValue(&graph, checkpoint, root, length, cancel);
                 },
             }
         }
         for (state.counts.items, 0..) |references, page| {
+            if (cancel) |token| try token.check();
             const wanted = expected.count(page);
             if (references == allocator_v4.free) {
                 if (wanted != 0) return error.InvalidNativeAllocator;
@@ -2855,16 +2887,22 @@ pub const NativeFile = struct {
             defer graph.deinit(self.allocator);
             if (index == self.header.active_checkpoint) active_records = graph.record_count;
             var pages = graph.pages.keyIterator();
-            while (pages.next()) |page| if (state.count(page.*) == allocator_v4.free or state.count(page.*) == 0) return error.InvalidNativeAllocator;
+            while (pages.next()) |page| {
+                if (cancel) |token| try token.check();
+                if (state.count(page.*) == allocator_v4.free or state.count(page.*) == 0) return error.InvalidNativeAllocator;
+            }
             const old_payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, slot.free_map_root_page, .free_map, slot);
             defer self.allocator.free(old_payload);
             const old_root = try allocator_v4.State.decodeRoot(old_payload);
             if (old_root.covered_pages != slot.page_count or state.count(slot.free_map_root_page) == allocator_v4.free) return error.InvalidNativeAllocator;
             // The fallback may name an older ledger. Read it independently;
             // loading it into the owner's cache would discard current state.
-            var old_state = try allocator_v4.State.load(self.allocator, .{ .context = self, .allocate = ledgerReadOnlyAllocate, .read = ledgerReadAny, .write = ledgerReadOnlyWrite, .payload_bytes = self.maxPagePayloadBytes() }, slot.free_map_root_page);
+            var old_state = try allocator_v4.State.load(self.allocator, .{ .context = self, .allocate = ledgerReadOnlyAllocate, .read = ledgerReadAny, .write = ledgerReadOnlyWrite, .payload_bytes = self.maxPagePayloadBytes(), .cancel_requested = if (cancel) |token| &token.requested else null }, slot.free_map_root_page);
             defer old_state.deinit();
-            for (old_state.metadata.items) |page| if (state.count(page) == allocator_v4.free) return error.InvalidNativeAllocator;
+            for (old_state.metadata.items) |page| {
+                if (cancel) |token| try token.check();
+                if (state.count(page) == allocator_v4.free) return error.InvalidNativeAllocator;
+            }
         }
         if (state.root.covered_pages != checkpoint.page_count) return error.InvalidNativeAllocator;
         try self.validateIndexedOwnership(checkpoint, state, cancel);
@@ -2887,7 +2925,7 @@ pub const NativeFile = struct {
         const header = self.transaction_header orelse self.header;
         return header.checkpoints[header.active_checkpoint].commit_sequence + 1;
     }
-    fn reuseFrontier(self: *NativeFile) u64 {
+    fn metadataReuseFrontier(self: *NativeFile) u64 {
         var frontier: u64 = std.math.maxInt(u64);
         const header = self.transaction_header orelse self.header;
         for (header.checkpoints) |slot| if (validCheckpointSlot(slot)) {
@@ -2896,19 +2934,55 @@ pub const NativeFile = struct {
         if (self.durable_header) |durable| for (durable.checkpoints) |slot| {
             if (validCheckpointSlot(slot)) frontier = @min(frontier, slot.commit_sequence);
         };
+        return frontier;
+    }
+    fn reuseFrontier(self: *NativeFile) u64 {
+        const frontier = self.metadataReuseFrontier();
         return @min(frontier, self.minimum_reader_sequence orelse frontier);
     }
 
     /// Work is bounded by retired graph objects, including value subtrees. A
     /// delete only enqueues its record; value-page traversal happens here.
+    fn retiredAllocatorNext(self: *NativeFile, page: u64, checkpoint: CheckpointSlot) !u64 {
+        const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, page, .allocator, checkpoint);
+        defer self.allocator.free(payload);
+        if (payload.len < 16 or (!std.mem.eql(u8, payload[0..4], "L4SS") and !std.mem.eql(u8, payload[0..4], "L4RQ") and !std.mem.eql(u8, payload[0..4], "L4DL"))) return error.InvalidNativeAllocator;
+        return std.mem.readInt(u64, payload[8..16], .little);
+    }
+
     fn drainRetirement(self: *NativeFile, state: *allocator_v4.State, checkpoint: CheckpointSlot, budget: usize) !usize {
+        if (budget == 0) return 0;
         const frontier = self.reuseFrontier();
+        const metadata_frontier = self.metadataReuseFrontier();
+        // Each publication creates one root retirement. Two housekeeping
+        // slots drain that debt without starving data when the work budget is 1.
+        for (0..2) |_| {
+            const root = state.metadata_heap.peek() orelse break;
+            if (root.epoch > metadata_frontier) break;
+            if (root.page == 0 or root.page >= checkpoint.page_count) return error.InvalidNativeAllocator;
+            try state.complete(root);
+            try state.releaseMetadata(root.page);
+        }
+        // Metadata service must retire more pages than its own publication
+        // creates. Scale cleanup with data work and keep an eight-page minimum
+        // so even a one-object budget drains its publication overhead.
+        for (0..@max(@as(usize, 8), budget)) |_| {
+            const item = state.chains_heap.peek() orelse break;
+            if (item.epoch > metadata_frontier) break;
+            const next_page = try self.retiredAllocatorNext(item.page, checkpoint);
+            try state.complete(item);
+            try state.releaseMetadata(item.page);
+            if (next_page != 0) try state.retireCollected(.{ .epoch = item.epoch, .page = next_page, .kind = .allocator_chain });
+        }
         var done: usize = 0;
         while (done < budget) : (done += 1) {
-            const item = state.oldest(frontier) orelse break;
+            const item = state.heap.peek() orelse break;
+            if (item.epoch > frontier) break;
             if (physicalPage(item.page) == 0 or physicalPage(item.page) >= checkpoint.page_count) return error.InvalidNativeAllocator;
+            try state.complete(item);
             switch (item.kind) {
                 .metadata => try state.releaseMetadata(item.page),
+                .allocator_chain => return error.InvalidNativeAllocator,
                 .page => {
                     _ = try state.release(item.page);
                 },
@@ -2926,7 +3000,7 @@ pub const NativeFile = struct {
                         },
                         else => return error.InvalidNativeAllocator,
                     };
-                    if (root != 0) try state.retire(.{ .epoch = item.epoch, .page = root, .length = length, .kind = .value });
+                    if (root != 0) try state.retireCollected(.{ .epoch = item.epoch, .page = root, .length = length, .kind = .value });
                     _ = try state.release(physicalPage(item.page));
                 },
                 .index => {
@@ -2952,18 +3026,17 @@ pub const NativeFile = struct {
                             @intFromEnum(PageKind.value) => {
                                 const value = try decodeValuePage(try decodePagePayload(raw, .value));
                                 if (value.chunk.len == 0 or value.chunk.len > item.length) return error.InvalidNativeValueChain;
-                                if (value.next_page != 0) try state.retire(.{ .epoch = item.epoch, .page = value.next_page, .length = item.length - value.chunk.len, .kind = .value });
+                                if (value.next_page != 0) try state.retireCollected(.{ .epoch = item.epoch, .page = value.next_page, .length = item.length - value.chunk.len, .kind = .value });
                             },
                             @intFromEnum(PageKind.value_extent) => {
                                 const node = try decodeExtentNode(try decodePagePayload(raw, .value_extent), item.length);
-                                for (node.children[0..node.count]) |child| try state.retire(.{ .epoch = item.epoch, .page = child.page, .length = child.len, .kind = .value });
+                                for (node.children[0..node.count]) |child| try state.retireCollected(.{ .epoch = item.epoch, .page = child.page, .length = child.len, .kind = .value });
                             },
                             else => return error.InvalidNativeValueChain,
                         }
                     }
                 },
             }
-            try state.complete(item);
         }
         return done;
     }
@@ -2993,7 +3066,7 @@ pub const NativeFile = struct {
         var orphaned = pages.pending_values.iterator();
         while (orphaned.next()) |entry| try state.retire(.{ .epoch = self.publicationEpoch(), .page = entry.key_ptr.*, .length = entry.value_ptr.*, .kind = .value });
         pages.pending_values.clearRetainingCapacity();
-        try state.preparePersist(self.publicationEpoch());
+        try state.preparePersist(self.publicationEpoch(), self.maxPagePayloadBytes());
         // Consume free bits before emitting the journal/snapshot. Otherwise the
         // next open could allocate one of the allocator's own metadata pages.
         while (pages.metadata_reserve.items.len < state.pagesRequired(self.maxPagePayloadBytes())) {
@@ -3023,7 +3096,16 @@ pub const NativeFile = struct {
     pub fn retirementNeedsService(self: *NativeFile) !bool {
         if (!self.header.indexed_reclamation or self.read_only) return false;
         const state = try self.loadLedger(self.activeCheckpoint());
-        if (state.data_pending == 0) return false;
+        const excess_roots = state.metadata_heap.count() > 2;
+        if (state.data_pending == 0 and state.chains_heap.count() == 0 and !excess_roots) return false;
+        if (excess_roots) {
+            const root = state.metadata_heap.peek().?;
+            if (root.epoch <= self.metadataReuseFrontier() or self.durable_header == null) return true;
+        }
+        if (state.eligibleWork(self.reuseFrontier(), self.metadataReuseFrontier()) != null) return true;
+        // Metadata readers are fenced by recovery/durability slots, so a
+        // pinned data transaction cannot prevent advancing an idle chain.
+        if (state.chains_heap.count() != 0 and self.durable_header == null) return true;
         const item = state.heap.peek() orelse return false;
         // Advancing a fallback slot makes progress only if a reader or a
         // deferred durability barrier is not the remaining visibility fence.
@@ -3086,7 +3168,10 @@ pub const NativeFile = struct {
         if (file_size < expected_size) return invalidCheck(report, "truncated_file");
 
         if (self.header.indexed_reclamation) {
-            const state = self.loadLedger(checkpoint) catch |err| return invalidCheck(report, issueForPageCheckError(err));
+            const state = self.loadLedgerWithCancel(checkpoint, cancel) catch |err| {
+                if (err == error.MaintenanceCanceled) return err;
+                return invalidCheck(report, issueForPageCheckError(err));
+            };
             const records = self.validateIndexedAllocator(checkpoint, state, cancel) catch |err| {
                 if (err == error.MaintenanceCanceled) return err;
                 return invalidCheck(report, issueForPageCheckError(err));
@@ -3196,6 +3281,7 @@ pub const NativeFile = struct {
     }
 
     fn readPhysicalPageAlloc(self: *NativeFile, allocator: Allocator, page_id: u64, checkpoint: CheckpointSlot) ![]u8 {
+        if (builtin.is_test) if (self.test_cancel_on_read) |token| token.request();
         if (builtin.is_test) _ = self.test_page_reads.fetchAdd(1, .monotonic);
         if (page_id == 0 or page_id >= checkpoint.page_count) return error.InvalidPageId;
 
@@ -5670,7 +5756,10 @@ pub const NativeFile = struct {
             state.* = allocator_v4.State.init(self.allocator);
             writer.ledger = state;
             defer writer.invalidateLedger();
-            for (1..@intCast(next_page_id)) |page| try state.reserveTail(page);
+            for (1..@intCast(next_page_id)) |page| {
+                if (cancel) |token| try token.check();
+                try state.reserveTail(page);
+            }
             var graph = try writer.indexedGraph(checkpoint, state, cancel);
             defer graph.deinit(self.allocator);
             var pages = PageAllocator{ .file = &writer, .free_pages = &.{}, .next_page_id = next_page_id, .ledger = state, .can_reuse = false };
@@ -6765,7 +6854,8 @@ pub const NativeFile = struct {
     /// Integrity checking separately visits and validates all reachable payloads.
     pub fn liveStats(self: *NativeFile, cancel: ?*const maintenance.CancelToken) !LiveStats {
         var live_bytes: u64 = 0;
-        var compact_pages: u64 = 2; // header and the vacuum's empty free map
+        const indexed = self.header.indexed_reclamation or self.vacuum_target_indexed;
+        var compact_pages: u64 = if (indexed) 1 else 2; // header; allocator added below
         var record_count: u64 = 0;
         var namespace_directory = NamespaceDirectory.empty;
         defer deinitNamespaceDirectory(self.allocator, &namespace_directory);
@@ -6794,9 +6884,10 @@ pub const NativeFile = struct {
                     }
                     packed_used += 4 + record_size;
                 }
+                if (indexed and record.key.len > index_inline_key_limit) compact_pages += 1;
                 try counter.add(record.key, 1);
                 count += 1;
-                if (!is_catalog) {
+                if (!is_catalog and !indexed) {
                     const namespace = documentNamespace(record.key);
                     if (!namespace_directory.contains(namespace)) {
                         const owned = try self.allocator.dupe(u8, namespace);
@@ -6845,6 +6936,15 @@ pub const NativeFile = struct {
             }
             _ = try counter.finish();
             compact_pages += 1; // directory catalog descriptor
+        }
+        if (indexed) {
+            const data_pages = compact_pages;
+            const per_page = (self.maxPagePayloadBytes() - 24) / 4;
+            while (true) {
+                const total = data_pages + 1 + (try std.math.divCeil(u64, compact_pages - 1, per_page));
+                if (total == compact_pages) break;
+                compact_pages = total;
+            }
         }
         return .{ .record_count = record_count, .bytes = live_bytes, .compact_size = compact_pages * @as(u64, self.header.page_size) };
     }
@@ -7532,11 +7632,13 @@ pub fn lockWriterPathWithIo(allocator: Allocator, io: std.Io, path: []const u8) 
     };
 }
 
-fn openDataFile(io: std.Io, path: []const u8, lock_mode: LockMode) !LockFile {
+fn openDataFile(io: std.Io, path: []const u8, lock_mode: LockMode, wait_for_reader_lock: bool) !LockFile {
     const file = std.Io.Dir.cwd().openFile(io, path, .{
         .mode = if (lock_mode != .writer) .read_only else .read_write,
         .lock = if (lock_mode == .reader) .shared else .none,
-        .lock_nonblocking = true,
+        // Readers wait for a bounded in-place allocator write to finish.
+        // Writers and maintenance retain nonblocking admission.
+        .lock_nonblocking = lock_mode != .reader or !wait_for_reader_lock,
     }) catch |err| switch (err) {
         // Snapshot safety and maintenance fencing depend on the kernel lock.
         // Silently reopening without it turns an unsupported filesystem into
@@ -7666,7 +7768,7 @@ fn deleteFilePath(io: std.Io, path: []const u8) !void {
 }
 
 pub fn inspect(_: Allocator, io: std.Io, path: []const u8) !InspectReport {
-    var file = (try openDataFile(io, path, .reader)).file;
+    var file = (try openDataFile(io, path, .reader, false)).file;
     defer file.close(io);
 
     var header_bytes: [header_size]u8 = undefined;
@@ -7679,7 +7781,7 @@ pub fn checkFile(allocator: Allocator, path: []const u8) !CheckReport {
     defer io_impl.deinit();
     const io = io_impl.io();
 
-    var file = (try openDataFile(io, path, .reader)).file;
+    var file = (try openDataFile(io, path, .reader, false)).file;
     defer file.close(io);
 
     const file_size = (try file.stat(io)).size;
@@ -14593,4 +14695,230 @@ test "lite validated index views release residency under shared hard pressure" {
     try std.testing.expectEqual(view.size() + external, manager.sliceStats(.lite_native_page_cache).used_bytes);
     file.page_cache.releaseIndex(a, view);
     try std.testing.expectEqual(external, manager.sliceStats(.lite_native_page_cache).used_bytes);
+}
+
+test "lite allocator v4 compact estimates match long keys values and migration" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "long-key-estimate.aflite");
+    defer a.free(path);
+    for ([_]bool{ false, true }) |source_indexed| {
+        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = source_indexed, .no_sync = true });
+        defer file.close();
+        file.vacuum_target_indexed = true;
+        var key: [1024]u8 = @splat('k');
+        for (0..16) |i| {
+            std.mem.writeInt(u64, key[0..8], i, .big);
+            try file.putDocument(&key, "value");
+            try file.putCatalogRecord(&key, "catalog value");
+        }
+        const value: [32768]u8 = @splat('v');
+        try file.putDocument("chain", &value);
+        try file.putCatalogRecord("extent", &value);
+        const stats = try file.liveStats(null);
+        var image = try file.prepareVacuum(null);
+        defer image.deinit();
+        try std.testing.expectEqual(image.report.after_size, stats.compact_size);
+    }
+}
+
+test "lite allocator v4 failed replacement create preserves original" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "review-create-replacement.aflite");
+    defer a.free(path);
+    for (0..96) |fail_index| {
+        {
+            var original = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+            defer original.close();
+            try original.putDocument("original", "must survive failed create");
+        }
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+        if (NativeFile.createWithIo(failing.allocator(), std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true })) |result| {
+            var created = result;
+            created.close();
+        } else |err| {
+            if (err != error.OutOfMemory) return err;
+            var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true });
+            defer reopened.close();
+            const value = try reopened.getDocumentAlloc(a, "original");
+            defer if (value) |bytes| a.free(bytes);
+            try std.testing.expect(value != null);
+        }
+    }
+}
+
+test "lite allocator v4 ownership graph cancels within an external value" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "cancel-value-graph.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer file.close();
+    const payload = try a.alloc(u8, 256 * 1024);
+    defer a.free(payload);
+    @memset(payload, 'v');
+    try file.putDocument("key", payload);
+    const checkpoint = file.activeCheckpoint();
+    var node = try file.readDocumentIndexNode(checkpoint.document_index_root_page, checkpoint);
+    defer node.deinit(a);
+    const record_payload = try file.readPagePayloadByKindAllocForCheckpoint(a, node.pointers[0], .document, checkpoint);
+    defer a.free(record_payload);
+    const record = try decodeDocumentEntry(record_payload);
+    var cancel = maintenance.CancelToken{};
+    var graph: NativeFile.IndexedGraph = .{};
+    defer graph.deinit(a);
+    file.test_page_reads.store(0, .monotonic);
+    file.test_cancel_on_read = &cancel;
+    defer file.test_cancel_on_read = null;
+    try std.testing.expectError(error.MaintenanceCanceled, file.indexedValue(&graph, checkpoint, record.external_value_root_page, record.external_value_len, &cancel));
+    try std.testing.expectEqual(@as(u64, 1), file.test_page_reads.load(.monotonic));
+}
+
+test "lite allocator v4 metadata chain retirement progresses behind data reader" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "metadata-chain-reader.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer file.close();
+    file.retirement_work_pages = 0;
+    try file.putDocument("key", "pinned");
+    const pinned = file.activeCheckpoint();
+    file.minimum_reader_sequence = pinned.commit_sequence;
+    for (0..24) |_| try file.putDocument("key", "replacement");
+    (try file.loadLedger(file.activeCheckpoint())).force_checkpoint = true;
+    try file.putDocument("key", "checkpoint");
+    try file.putDocument("advance", "frontier");
+    const before = (try file.allocatorStats()).?;
+    try std.testing.expect(try file.retirementNeedsService());
+    _ = try file.reclaimPages(1024);
+    const after = (try file.allocatorStats()).?;
+    try std.testing.expect(after.reusable_pages > before.reusable_pages);
+    try std.testing.expectEqual(before.pending_data_objects, after.pending_data_objects);
+    const value = (try file.getDocumentAtCheckpointAlloc(a, pinned, "key")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("pinned", value);
+    try std.testing.expect((try file.check()).valid);
+    file.minimum_reader_sequence = null;
+    for (0..8) |_| _ = try file.reclaimPages(1024);
+    try std.testing.expectEqual(@as(u64, 0), (try file.allocatorStats()).?.pending_data_objects);
+    try std.testing.expect((try file.check()).valid);
+    // Force a replay from disk, rather than only validating cached state.
+    file.invalidateLedger();
+    try std.testing.expect((try file.check()).valid);
+}
+
+test "lite allocator v4 saturated queue drains with a single object budget" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "saturated-single-budget.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer file.close();
+    file.retirement_work_pages = 0;
+    const value = try a.alloc(u8, 512 * 1024);
+    defer a.free(value);
+    @memset(value, 'v');
+    try file.putCatalogRecord("key", value);
+    try file.putCatalogRecord("key", "replacement");
+    try file.putDocument("advance", "frontier");
+    const state = try file.loadLedger(file.activeCheckpoint());
+    state.pending_limit = state.pending.count();
+    try std.testing.expectError(error.LiteRetirementBacklogExceeded, state.retire(.{ .epoch = file.activeCheckpoint().commit_sequence, .page = 1, .kind = .page }));
+    for (0..512) |_| {
+        if (!try file.retirementNeedsService()) break;
+        try std.testing.expect(try file.reclaimPages(1) <= 1);
+    }
+    try std.testing.expectEqual(@as(u64, 0), (try file.allocatorStats()).?.pending_data_objects);
+    try std.testing.expect(!try file.retirementNeedsService());
+    file.invalidateLedger();
+    try std.testing.expect((try file.check()).valid);
+    const surviving = (try file.getCatalogRecordAlloc(a, "key")).?;
+    defer a.free(surviving);
+    try std.testing.expectEqualStrings("replacement", surviving);
+}
+
+test "lite allocator v4 idle metadata advances recovery behind a pinned reader" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "idle-metadata-reader.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer file.close();
+    file.retirement_work_pages = 0;
+    const pinned = file.activeCheckpoint();
+    file.minimum_reader_sequence = pinned.commit_sequence;
+    (try file.loadLedger(pinned)).force_checkpoint = true;
+    try file.putDocument("live", "value");
+    try std.testing.expectEqual(@as(u64, 0), (try file.allocatorStats()).?.pending_data_objects);
+    try std.testing.expect(try file.retirementNeedsService());
+    _ = try file.reclaimPages(1);
+    _ = try file.reclaimPages(1);
+    try std.testing.expect(!try file.retirementNeedsService());
+    try std.testing.expectEqual(@as(?[]u8, null), try file.getDocumentAtCheckpointAlloc(a, pinned, "live"));
+    try std.testing.expect((try file.check()).valid);
+}
+
+test "lite allocator v4 external reader waits for in place reclamation lock" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "reader-reclamation-lock.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer file.close();
+    try file.putDocument("key", "value");
+    const held = try acquireDataRewriteLock(io, path);
+    var lock_open = true;
+    defer if (lock_open) held.file.close(io);
+    const Reader = struct {
+        started: std.atomic.Value(bool) = .init(false),
+        opened: std.atomic.Value(bool) = .init(false),
+        result: anyerror!void = {},
+        fn run(self: *@This(), allocator: Allocator, runtime_io: std.Io, source: []const u8) void {
+            self.started.store(true, .release);
+            self.read(allocator, runtime_io, source) catch |err| {
+                self.result = err;
+            };
+        }
+        fn read(self: *@This(), allocator: Allocator, runtime_io: std.Io, source: []const u8) !void {
+            var reader = try NativeFile.openWithIo(allocator, runtime_io, source, .{ .read_only = true, .wait_for_reader_lock = true });
+            defer reader.close();
+            const value = (try reader.getDocumentAlloc(allocator, "key")).?;
+            defer allocator.free(value);
+            try std.testing.expectEqualStrings("value", value);
+            self.opened.store(true, .release);
+        }
+    };
+    var context = Reader{};
+    var future = try io.concurrent(Reader.run, .{ &context, a, io, path });
+    var joined = false;
+    defer if (!joined) {
+        if (lock_open) {
+            held.file.close(io);
+            lock_open = false;
+        }
+        future.await(io);
+    };
+    const deadline = std.Io.Clock.awake.now(io).addDuration(std.Io.Duration.fromSeconds(3));
+    while (!context.started.load(.acquire)) {
+        if (std.Io.Clock.awake.now(io).nanoseconds >= deadline.nanoseconds) return error.TestUnexpectedResult;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+    try std.testing.expect(!context.opened.load(.acquire));
+    held.file.close(io);
+    lock_open = false;
+    future.await(io);
+    joined = true;
+    try context.result;
+    try std.testing.expect(context.opened.load(.acquire));
 }
