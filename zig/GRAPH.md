@@ -95,8 +95,9 @@ and stale-generation owners retain queued jobs without planning local effects
 or advancing directory rebuilds; exact replicated pages remain applicable. A
 newly authorized primary resumes local cleanup through the same authority check.
 
-A transactionally maintained admission count fences graph reads only for jobs
-with incident inline edges. Empty jobs do not interrupt unrelated traversals.
+A transactionally maintained admission count fences graph reads for endpoint
+jobs with incident inline edges. Empty endpoint jobs do not interrupt unrelated
+traversals. Owner revival jobs fence reads until their input replay is complete.
 Older queues or invalidated directories without a complete admission summary
 remain conservatively fenced until their jobs drain. Graph reads return
 `StorageBusy` while an incident-edge job remains pending. New inline
@@ -121,32 +122,41 @@ through the existing bounded cleanup fence before same-name recreation.
 Retirements transfer with their owning document range and are included in
 portable relationship blocks, including imports that omit derived indexes.
 Ordinary batch deletion and TTL expiry share the same retirement planner. Bundles containing them require AFB reader version
-7; ordinary relationship bundles require version 6. The target
+8; ordinary relationship bundles require version 6. The target
 directory and its migration checkpoint are local derived metadata and are
 rebuilt through primary writes on import. Directory keys are fixed-size hashes,
 while values retain complete artifact keys. A local reference directory maintains
 an exact retirement count, including repeated writes, deletion, and rollback.
-The bounded, resumable v2 migration indexes existing retirements before publishing
-the count as authoritative. It runs before the first graph bulk batch or an owner
-update with legacy retirement state, as well as endpoint deletion.
+The bounded, resumable v3 migration indexes existing retirements and only locally
+owned incident relationships before publishing the count as authoritative. A
+managed table persists its namespace binding with graph artifact writes. Explicit
+source or target tags in another namespace cannot enter the local endpoint
+cleanup directory, even when document keys coincide. Anonymous native stores
+consider explicit table tags foreign. Upgrading a v2 directory clears and rebuilds
+its local entries in bounded pages; changing the namespace binding does the same.
+Primary document replay deletes producing-document ownership only; incoming
+relationship removal uses exact identities selected from this authoritative directory.
 Stores with no retirements cache that state per transaction. Bulk ingestion checks
 all candidate identities with sorted reads before adding append entries, then
 ingests surviving edges directly even while other retirements remain. Batches
-that write retirement records themselves use ordinary transactional writes.
+that write retirement records themselves use ordinary transactional writes. A
+sorted bulk preflight also detects foreign rewrites with old local incoming
+membership; those rewrites remove it transactionally, while fresh foreign rows
+retain the append path without per-edge buffer drains.
 
 Merge artifact pages include primary retirement records. Receiver replay applies
 exact relationship deletions to existing projections as well as suppressing
 future materialization. Commands that can generate retirements during apply
-require data-Raft protocol version 21, including ordinary document writes and deletion,
+require data-Raft protocol version 22, including ordinary document writes and deletion,
 legacy relationship deletion, cleanup, transforms, document transaction
 prepares, committed transaction decisions, and merge pages. Classification occurs before proposal even when retirement records
 are absent from the input. Ordinary artifact-only batches retain their existing
 protocol requirements.
 
-HA batch mutation envelope V20 independently protects that complete graph apply
+HA batch mutation envelope V21 independently protects that complete graph apply
 contract, including document-derived effects, on both unordered and ordinary-Raft
 replay. Its `apply_schema_version` retains the original control schema and exact
-receipts; older standbys reject V20 before applying rows. New decoders can still
+receipts; older standbys reject V21 before applying rows. New decoders can still
 read historical envelopes. Duplicate ordinary replay projects only the completion
 proof and envelope versions, without copying document or artifact payloads.
 
@@ -155,10 +165,39 @@ strings. Nested evidence fields cannot redirect traversal. Whitespace and JSON
 escapes are supported in names and keys; malformed or ambiguous tags have no
 routing authority. Plain names borrow metadata, while decoded names use scoped,
 budgeted scratch shared by traversal, paths, patterns, and distributed expansion.
-Traversal selects direction before reading the adjacent endpoint's tag. Equal
+Traversal verifies the departing qualified endpoint and requested direction
+before admitting its adjacent endpoint. Equal
 document keys in different tables are distinct nodes: reverse traversal reads
 the source tag, and bidirectional traversal compares qualified endpoint
 identities. A genuine self-loop remains unoriented for bidirectional traversal.
+
+Native shortest-path and Yen searches preserve qualified node identity in every
+returned node, spur seed, root exclusion, and joined candidate. Native callers can specify
+`source_table` and `target_table` to distinguish equal document keys; an omitted
+target table retains the legacy key-only target selection. Returned-path memory
+leases include the table array and every owned table string, as well as node and
+relationship data.
+
+Meaningful producing-document updates revive older relationship deletions through
+a durable owner job. Foreground admission performs a job lookup and at most one
+retirement-prefix seek, then atomically publishes a new lifecycle generation.
+Older retirement stamps immediately cease suppressing the new document
+projection. Maintenance clears older stamps and replays retained assets, chunks,
+and resolutions through separate type prefixes, skipping projected edges and embeddings,
+in pages of at most 255 inspected records plus one checkpoint,
+or 256 KiB, admitting one oversized record. Owner jobs can progress independently
+of incoming-directory migration. A checkpoint digest fences stale or
+repeated pages. Replay checks the current input bytes under the apply lock;
+newer input updates and newer deletion stamps survive older prepared pages.
+Endpoint pages likewise recheck current table routing before deleting a selected
+relationship. Semantic no-op owner writes preserve retirements and pending jobs.
+
+Graph reads and portable exports wait while owner jobs are pending. `full_index`
+completion drains the jobs and waits for their derived replay cut. Weak sync
+returns after the bounded foreground write; durable maintenance resumes after
+restart and follows the existing Raft and HA write-authority rules. Portable
+retirement stamps require AFB reader version 8; historical unstamped markers
+remain readable, and imported stamps advance the local lifecycle counter.
 
 Artifact metadata writers use the same structural root-field rules in primary
 and background indexing. Custom templates can override a resolved table with

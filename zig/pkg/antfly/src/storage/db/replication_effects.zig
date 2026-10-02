@@ -69,13 +69,13 @@ pub const BatchMutationPayload = struct {
     online_source_applied_index: ?u64 = null,
     restore_staging_bootstrap: ?@import("restore_staging_contract.zig").OwnerBootstrap = null,
     schema_version: u32 = 1,
-    /// V20 protects the complete relationship apply contract while retaining
+    /// V21 protects the complete relationship apply contract while retaining
     /// the independently versioned control/receipt schema inside the envelope.
     apply_schema_version: ?u32 = null,
     request: db_types.BatchRequest,
 };
 
-const graph_apply_envelope_version: u32 = 20;
+const graph_apply_envelope_version: u32 = 21;
 
 fn encodeBatchPayloadAlloc(alloc: Allocator, input: BatchMutationPayload) ![]u8 {
     var payload = input;
@@ -89,16 +89,16 @@ fn encodeBatchPayloadAlloc(alloc: Allocator, input: BatchMutationPayload) ![]u8 
 /// Unwrap only after checking both the outer capability and inner schema.
 /// Existing receipt validators continue to own each control's apply contract.
 fn unwrapSchemaVersion(version: *u32, inner: *?u32) !void {
-    if (version.* == graph_apply_envelope_version) {
+    if (version.* == graph_apply_envelope_version or version.* == 20) {
         const apply = inner.* orelse return error.UnsupportedBatchMutationPayloadVersion;
-        if (apply == 0 or apply >= graph_apply_envelope_version) return error.UnsupportedBatchMutationPayloadVersion;
+        if (apply == 0 or apply >= 20) return error.UnsupportedBatchMutationPayloadVersion;
         version.* = apply;
         inner.* = null;
     } else if (inner.* != null) return error.UnsupportedBatchMutationPayloadVersion;
 }
 
 fn unwrapGraphApplyEnvelope(payload: *BatchMutationPayload) !void {
-    if (payload.schema_version == graph_apply_envelope_version and !db_types.requiresGraphRelationshipProtocol(payload.request))
+    if ((payload.schema_version == graph_apply_envelope_version or payload.schema_version == 20) and !db_types.requiresGraphRelationshipProtocol(payload.request))
         return error.UnsupportedBatchMutationPayloadVersion;
     try unwrapSchemaVersion(&payload.schema_version, &payload.apply_schema_version);
 }
@@ -1373,5 +1373,34 @@ test "storage.hot_standby graph apply duplicate replay skips large row payloads"
         var buffer: [16 * 1024]u8 = undefined;
         var fixed = std.heap.FixedBufferAllocator.init(&buffer);
         try std.testing.expect((try decodeRestoreFinishForReplay(fixed.allocator(), record)) == null);
+    }
+}
+
+test "db graph owner revival HA transports checkpoint guards and exact replay inputs" {
+    const alloc = std.testing.allocator;
+    const contract = @import("../graph_cleanup_contract.zig");
+    const job_key = try contract.ownerJobKeyAlloc(alloc, "owner");
+    defer alloc.free(job_key);
+    const old = try contract.encodeOwnerJobAlloc(alloc, .{ .owner = "owner", .generation = 7 });
+    defer alloc.free(old);
+    const next = try contract.encodeOwnerJobAlloc(alloc, .{ .owner = "owner", .generation = 7, .phase = .inputs });
+    defer alloc.free(next);
+    const input = try @import("../internal_keys.zig").artifactNamedPrefixAlloc(alloc, "owner", "asset", "relations");
+    defer alloc.free(input);
+    const guard: contract.Guard = .{ .endpoint = "owner", .generation = 7, .kind = .owner_replay, .checkpoint_digest = contract.checkpointDigest(old) };
+    const request: db_types.BatchRequest = .{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true, .graph_endpoint_cleanup_guards = &.{guard}, .merge_artifacts = &.{ .{ .key = input, .value = "retained-input" }, .{ .key = job_key, .value = next } } };
+    try db_types.validateGraphEndpointCleanupCommand(request);
+    for ([_]bool{ false, true }) |ordered| {
+        const encoded = if (ordered) try encodeRaftBatchMutationRequestAlloc(alloc, request, .{ .term = 2, .index = 8 }) else try encodeBatchMutationRequestAlloc(alloc, request);
+        defer alloc.free(encoded);
+        var parsed = try decodeBatchMutationRequest(alloc, .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = encoded });
+        defer parsed.deinit();
+        const restored = parsed.value.request;
+        try std.testing.expectEqual(guard.kind, restored.graph_endpoint_cleanup_guards[0].kind);
+        try std.testing.expectEqualSlices(u8, &guard.checkpoint_digest, &restored.graph_endpoint_cleanup_guards[0].checkpoint_digest);
+        try std.testing.expectEqualSlices(u8, next, restored.merge_artifacts[1].value);
+        try std.testing.expect(try contract.guardMatches(restored.graph_endpoint_cleanup_guards[0], job_key, old));
+        try std.testing.expect(!try contract.guardMatches(restored.graph_endpoint_cleanup_guards[0], job_key, next));
+        if (ordered) try std.testing.expectEqual(@as(u64, 8), parsed.value.ordinary_raft_entry.?.index);
     }
 }

@@ -9050,11 +9050,19 @@ pub const GraphIndex = struct {
     /// Successful pages remove their own input, so durable document replay can
     /// retry from the prefix after interruption without a separate checkpoint.
     pub fn deleteEdgesForDocs(self: *GraphIndex, doc_keys: []const []const u8) !void {
+        return self.deleteGraphDocuments(doc_keys, true);
+    }
+
+    pub fn deleteOwnedEdgesForDocs(self: *GraphIndex, doc_keys: []const []const u8) !void {
+        return self.deleteGraphDocuments(doc_keys, false);
+    }
+
+    fn deleteGraphDocuments(self: *GraphIndex, doc_keys: []const []const u8, include_incoming: bool) !void {
         for (doc_keys) |doc_key| {
             const incident_prefix = try graphIndexEdgePrefixAlloc(self.alloc, doc_key, self.index_name, "");
             defer self.alloc.free(incident_prefix);
             try self.deleteGraphDocPrefix(incident_prefix, .out, false);
-            try self.deleteGraphDocPrefix(incident_prefix, .in, false);
+            if (include_incoming) try self.deleteGraphDocPrefix(incident_prefix, .in, false);
             var owner_prefix = std.ArrayListUnmanaged(u8).empty;
             defer owner_prefix.deinit(self.alloc);
             try internal_keys.appendDocumentPrefix(&owner_prefix, self.alloc, doc_key);
@@ -9127,6 +9135,18 @@ pub const GraphIndex = struct {
                 // Independent facts have their own lifecycle. Select their
                 // owner directory only; never hydrate an incident payload.
                 if (owner_records or identity.owner_document.len == 0) {
+                    if (!owner_records and direction == .in) {
+                        const edge_value = try decodeEdgeValue(row.value);
+                        var metadata_scratch = @import("metadata_tables.zig").Scratch.init(scratch, null);
+                        defer metadata_scratch.deinit();
+                        // This key-only API addresses the anonymous local
+                        // namespace. Qualified targets have their own lifecycle.
+                        if (try metadata_scratch.table(edge_value.metadata, "target_table") != null or try metadata_scratch.table(edge_value.metadata, "source_table") != null) {
+                            entry = try cursor.next();
+                            if (scanned >= 256 or bytes >= 256 * 1024) break;
+                            continue;
+                        }
+                    }
                     try deletes.append(scratch, .{
                         .source = try BorrowedEdgeKey.decode(scratch, identity.source),
                         .target = try BorrowedEdgeKey.decode(scratch, identity.target),

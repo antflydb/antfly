@@ -170,3 +170,67 @@ test "db graph endpoint cleanup pages HA promotion requires fresh owner generati
     try std.testing.expect(decoded.value.request.graph_endpoint_cleanup_planned);
     try std.testing.expectEqual(@as(usize, 1), decoded.value.request.deletes.len);
 }
+
+test "db graph owner revival HA mirrors bounded checkpoints across restart and directory progress" {
+    const alloc = std.testing.allocator;
+    var primary_dir = try TestDirectory.init("ha-owner-primary");
+    defer primary_dir.cleanup();
+    var replica_dir = try TestDirectory.init("ha-owner-replica");
+    defer replica_dir.cleanup();
+    var log_dir = try TestDirectory.init("ha-owner-log");
+    defer log_dir.cleanup();
+    var slots_dir = try TestDirectory.init("ha-owner-slots");
+    defer slots_dir.cleanup();
+    var stream = try ha_primary_mod.Primary.open(alloc, log_dir.path().ptr, slots_dir.path().ptr, .{ .cluster_id = 200, .shard_id = 3, .table_id = 9, .timeline_id = 1, .epoch = 1 }, .{});
+    defer stream.close();
+    const options: OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false };
+    var primary = try DB.open(alloc, primary_dir.path(), options);
+    defer primary.close();
+    var replica = try DB.open(alloc, replica_dir.path(), options);
+    defer replica.close();
+    const contract = @import("../graph_cleanup_contract.zig");
+    const artifact = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, "owner", "g", "R", "b", "owner", "id");
+    defer alloc.free(artifact);
+    const marker = try internal_keys.graphRetirementKeyAlloc(alloc, artifact);
+    defer alloc.free(marker);
+    const job = try contract.ownerJobKeyAlloc(alloc, "owner");
+    defer alloc.free(job);
+    const value = try contract.encodeOwnerJobAlloc(alloc, .{ .owner = "owner", .generation = 7 });
+    defer alloc.free(value);
+    for ([_]*DB{ &primary, &replica }) |db| {
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+        try db.core.store.put(marker, "1");
+        try db.core.store.put(job, value);
+        try db.core.store.ensureGraphIncomingDirectory();
+    }
+    try replica.core.store.invalidateGraphDirectories();
+    var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
+    primary.local_execution.replication_async_batch_mirror = .{ .publisher = publisher_adapter.bind(&stream), .last_lsn = &last_lsn };
+    var gate: ha_public_gate_state_mod.State = .{};
+    gate.role.store(@intFromEnum(ha_public_gate_state_mod.Role.standby), .release);
+    const replica_options: OpenOptions = .{ .replication_write_gate = .{ .shared = .{ .state = gate.storageWriteState() } }, .start_optional_runtimes = false, .start_index_workers = false };
+    replica.local_execution.replication_write_gate = replica_options.replication_write_gate;
+    var pages: usize = 0;
+    while (try primary.core.store.hasGraphEndpointCleanup()) {
+        try std.testing.expect(pages < 4);
+        try std.testing.expect(try engine.test_support.runStandaloneGraphEndpointCleanupStep(&primary));
+        var entry = (try stream.log.entryAt(alloc, last_lsn.load(.acquire))).?;
+        defer entry.deinit(alloc);
+        var decoded = try ha_effects_mod.decodeBatchMutationRequest(alloc, entry.record);
+        defer decoded.deinit();
+        try std.testing.expect(decoded.value.request.graph_endpoint_cleanup_guards[0].kind == .owner_replay);
+        try replication_ingress.applyRecord(&replica, entry.record);
+        try replication_ingress.applyRecord(&replica, entry.record);
+        pages += 1;
+        if (pages == 1) {
+            replica.close();
+            replica = try DB.open(alloc, replica_dir.path(), replica_options);
+            try std.testing.expect(try replica.core.store.hasGraphEndpointCleanup());
+            try std.testing.expect(!try engine.test_support.runStandaloneGraphEndpointCleanupStep(&replica));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), pages);
+    try std.testing.expect(!try replica.core.store.hasGraphEndpointCleanup());
+    try std.testing.expectError(error.NotFound, primary.core.store.get(alloc, marker));
+    try std.testing.expectError(error.NotFound, replica.core.store.get(alloc, marker));
+}

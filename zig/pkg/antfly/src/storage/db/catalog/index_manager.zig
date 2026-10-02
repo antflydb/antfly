@@ -25152,7 +25152,7 @@ pub const IndexManager = struct {
     fn deleteGraphDocsEntry(_: *IndexManager, entry: *GraphIndex, keys: []const []const u8) !void {
         // The graph index owns the relationship identity and ownership rules.
         // Reuse its cleanup path for both endpoint and fact-document deletion.
-        try entry.index.deleteEdgesForDocs(keys);
+        try entry.index.deleteOwnedEdgesForDocs(keys);
     }
 
     fn applyGraphWritesEntry(self: *IndexManager, entry: *GraphIndex, writes: []const types.GraphEdgeWrite) !void {

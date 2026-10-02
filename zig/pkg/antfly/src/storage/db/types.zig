@@ -467,6 +467,7 @@ pub const BatchRequest = struct {
 
 pub fn validateMergeArtifacts(req: BatchRequest) !void {
     if (req.merge_artifacts.len == 0) return;
+    if (req.graph_endpoint_cleanup) return validateGraphEndpointCleanupCommand(req);
     if (req.merge_replication == null or req.merge_checkpoint != null or
         req.split_checkpoint != null or req.split_replication != null or
         req.split_transition != null or req.merge_source_transition != null or
@@ -481,7 +482,7 @@ pub fn validateMergeArtifacts(req: BatchRequest) !void {
             !keys.isGraphRetirementKey(row.key) and !keys.isGraphGlobalEdgeContenderKey(row.key) and
             !keys.isGraphEdgeTtlLifetimeKey(row.key) and !keys.isGraphEdgeTtlTombstoneKey(row.key))
             return error.InvalidBatchRequest;
-        if (keys.isGraphRetirementKey(row.key) and !std.mem.eql(u8, row.value, "1")) return error.InvalidBatchRequest;
+        if (keys.isGraphRetirementKey(row.key)) _ = @import("../graph_cleanup_contract.zig").retirementGeneration(row.value) catch return error.InvalidBatchRequest;
     }
 }
 
@@ -5072,7 +5073,7 @@ pub fn validateGraphEndpointCleanupCommand(req: BatchRequest) !void {
     const defaults = BatchRequest{};
     inline for (std.meta.fields(BatchRequest)) |field| {
         if (comptime !std.mem.eql(u8, field.name, "graph_endpoint_cleanup") and !std.mem.eql(u8, field.name, "graph_endpoint_cleanup_planned") and !std.mem.eql(u8, field.name, "timestamp_ns") and !std.mem.eql(u8, field.name, "sync_level")) {
-            if (comptime std.mem.eql(u8, field.name, "deletes") or std.mem.eql(u8, field.name, "graph_deletes") or std.mem.eql(u8, field.name, "graph_endpoint_cleanup_guards")) {
+            if (comptime std.mem.eql(u8, field.name, "deletes") or std.mem.eql(u8, field.name, "graph_deletes") or std.mem.eql(u8, field.name, "graph_endpoint_cleanup_guards") or std.mem.eql(u8, field.name, "merge_artifacts")) {
                 if (!req.graph_endpoint_cleanup_planned and @field(req, field.name).len != 0) return error.InvalidBatchRequest;
             } else {
                 const value = @field(req, field.name);
@@ -5088,28 +5089,44 @@ pub fn validateGraphEndpointCleanupCommand(req: BatchRequest) !void {
 /// In particular, the constraint exemption never admits a document deletion.
 fn validatePlannedGraphEndpointCleanup(req: BatchRequest) !void {
     const keys = @import("../internal_keys.zig");
-    if (req.graph_deletes.len + req.deletes.len > 256 or req.graph_endpoint_cleanup_guards.len > 256) return error.InvalidBatchRequest;
     const contract = @import("../graph_cleanup_contract.zig");
+    if (req.graph_deletes.len + req.deletes.len + req.merge_artifacts.len > 256 or req.graph_endpoint_cleanup_guards.len > 256) return error.InvalidBatchRequest;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
     for (req.graph_endpoint_cleanup_guards, 0..) |guard, i| {
-        for (req.graph_endpoint_cleanup_guards[0..i]) |prior| if (std.mem.eql(u8, guard.endpoint, prior.endpoint)) return error.InvalidBatchRequest;
+        if (guard.kind == .owner_replay and guard.generation == 0) return error.InvalidBatchRequest;
+        for (req.graph_endpoint_cleanup_guards[0..i]) |prior| if (guard.kind == prior.kind and std.mem.eql(u8, guard.endpoint, prior.endpoint)) return error.InvalidBatchRequest;
     }
     for (req.deletes) |key| {
-        if (!std.mem.startsWith(u8, key, keys.graph_endpoint_cleanup_prefix) or key.len != keys.graph_endpoint_cleanup_prefix.len + 64) return error.InvalidBatchRequest;
-        for (key[keys.graph_endpoint_cleanup_prefix.len..]) |byte| if (!std.ascii.isHex(byte)) return error.InvalidBatchRequest;
         var covered = false;
-        for (req.graph_endpoint_cleanup_guards) |guard| if (contract.matchesKey(key, guard.endpoint)) {
-            covered = true;
-            break;
-        };
+        for (req.graph_endpoint_cleanup_guards) |guard| {
+            covered = if (guard.kind == .endpoint) contract.matchesKey(key, guard.endpoint) else contract.matchesOwnerJobKey(key, guard.endpoint) or (keys.isGraphRetirementKey(key) and try contract.ownedBy(alloc, key, guard.endpoint));
+            if (covered) break;
+        }
         if (!covered) return error.InvalidBatchRequest;
     }
     for (req.graph_deletes) |edge| {
         if (edge.owner_document.len != 0 or edge.index_name.len == 0 or edge.source.len == 0 or edge.target.len == 0) return error.InvalidBatchRequest;
         var covered = false;
-        for (req.graph_endpoint_cleanup_guards) |guard| if (std.mem.eql(u8, guard.endpoint, edge.target)) {
+        for (req.graph_endpoint_cleanup_guards) |guard| if (guard.kind == .endpoint and std.mem.eql(u8, guard.endpoint, edge.target)) {
             covered = true;
             break;
         };
+        if (!covered) return error.InvalidBatchRequest;
+    }
+    for (req.merge_artifacts) |row| {
+        if (row.json_null_fields.len != 0) return error.InvalidBatchRequest;
+        var covered = false;
+        for (req.graph_endpoint_cleanup_guards) |guard| {
+            if (guard.kind != .owner_replay) continue;
+            if (contract.matchesOwnerJobKey(row.key, guard.endpoint)) {
+                const next = try contract.decodeOwnerJob(row.key, row.value);
+                if (next.generation != guard.generation) return error.InvalidBatchRequest;
+                covered = true;
+            } else covered = contract.isReplayInput(row.key) and try contract.ownedBy(alloc, row.key, guard.endpoint);
+            if (covered) break;
+        }
         if (!covered) return error.InvalidBatchRequest;
     }
 }

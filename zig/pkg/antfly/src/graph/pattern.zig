@@ -1430,6 +1430,7 @@ fn streamReachableNodes(
                         if (!try edgeMatchesBudgeted(alloc, graph_edge, edge, work_budget)) continue;
                         if (edgeTarget(graph_edge, frontier.key, edge.direction) == null) continue;
                         const endpoint = try resolvedEdgeEndpoint(&table_scratch, edge_reader, frontier.table, frontier.key, graph_edge, traversal);
+                        if (!endpoint.connected) continue;
                         const target_key = endpoint.key;
                         const target_table = endpoint.table;
                         if (shouldRejectPathRevisit(
@@ -1469,6 +1470,7 @@ fn streamReachableNodes(
                         } else if (!try edgeMatchesBudgeted(alloc, graph_edge, edge, work_budget)) continue;
                         if (edgeTarget(graph_edge, frontier.key, edge.direction) == null) continue;
                         const endpoint = try resolvedEdgeEndpoint(&table_scratch, edge_reader, frontier.table, frontier.key, graph_edge, traversal);
+                        if (!endpoint.connected) continue;
                         const target_key = endpoint.key;
                         const target_table = endpoint.table;
                         if (shouldRejectPathRevisit(
@@ -1494,6 +1496,7 @@ fn streamReachableNodes(
                 for (edges, 0..) |graph_edge, edge_index| {
                     if (edgeTarget(graph_edge, frontier.key, edge.direction) == null) continue;
                     const endpoint = try resolvedEdgeEndpoint(&table_scratch, edge_reader, frontier.table, frontier.key, graph_edge, traversal);
+                    if (!endpoint.connected) continue;
                     const target_key = endpoint.key;
                     const target_table = endpoint.table;
                     const revisits_path = frontierContainsNode(
@@ -5450,7 +5453,7 @@ test "local pattern reader serves cross-table nodes only under a complete snapsh
     // The autoschema shape: a mention edge into a resolved cross-table
     // entity node whose entity-sourced relation row lives in THIS index.
     try graph_index.addEdge("doc:a", "entity/ada", "mentions", 1.0, 0, 0, "{\"target_table\":\"entities\"}");
-    try graph_index.addEdge("entity/ada", "event/xyz", "participates_in", 1.0, 0, 0, "{\"target_table\":\"events\"}");
+    try graph_index.addEdge("entity/ada", "event/xyz", "participates_in", 1.0, 0, 0, "{\"source_table\":\"entities\",\"target_table\":\"events\"}");
 
     const start_keys = [_][]const u8{"doc:a"};
     const pattern = [_]PatternStep{
@@ -5625,5 +5628,18 @@ test "pattern equal-key cross-table reverse endpoint and orientation" {
         try std.testing.expectEqual(@as(usize, 1), matches.len);
         try std.testing.expectEqualStrings("people", matches[0].bindings[1].table.?);
         try std.testing.expectEqual(graph_mod.EdgeDirection.in, matches[0].path[0].traversal_direction.?);
+    }
+}
+
+test "qualified MATCH rejects wrong departing table in every direction" {
+    const alloc = std.testing.allocator;
+    for ([_]graph_mod.EdgeDirection{ .out, .in, .both }) |direction| {
+        var graph = try graph_mod.GraphIndex.openWithPrivateStores(alloc, "unused-out", "unused-in", "facts", .{ .reverse_backend = .mem });
+        defer graph.close();
+        try graph.batchApply(&.{.{ .source = if (direction == .in) "end" else "shared", .target = if (direction == .in) "shared" else "end", .edge_type = "R", .edge_id = "fact", .owner_document = "fact", .weight = 1, .metadata_json = if (direction == .in) "{\"source_table\":\"events\",\"target_table\":\"people\"}" else "{\"source_table\":\"people\",\"target_table\":\"events\"}" }}, &.{});
+        const opts: MatchOptions = .{ .owning_table = "facts", .expand_cross_table_local = true };
+        const matches = try matchPatternFromRefsWithEdgeReader(alloc, LocalGraphIndexEdgeReader.init(&graph, opts), &.{.{ .table = "companies", .key = "shared" }}, &.{ .{ .alias = "a" }, .{ .alias = "b", .edge = .{ .direction = direction } } }, opts);
+        defer freeMatches(alloc, matches);
+        try std.testing.expectEqual(@as(usize, 0), matches.len);
     }
 }

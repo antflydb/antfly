@@ -3290,6 +3290,7 @@ fn canonicalGraphStepAlloc(
             return work_budget.exhaust(.explored_edges, work_budget.max_edges);
         }
         const endpoint = try graph_traversal_mod.resolveAdjacent(&table_scratch, edge, key, current_table, expansion_table, params.direction);
+        if (!endpoint.connected) continue;
         const adjacent = endpoint.key;
         const declared_table = endpoint.table;
         path_edges[node_count] = .{

@@ -2851,6 +2851,7 @@ fn collectAlgebraicReachabilityEdges(
                 break :scan;
             }
             const endpoint = try traversal_mod.resolveAdjacent(&table_scratch, edge, current.key, null, null, params.direction);
+            if (!endpoint.connected) continue;
             const next_key = endpoint.key;
             if (std.mem.eql(u8, next_key, start_key)) continue;
             const already_visited = visited.contains(next_key);
@@ -3231,7 +3232,7 @@ test "engine execution scope expands through cross-table nodes and canonicalizes
     // entity, an entity-sourced relation row in THIS index, plus a
     // self-table tag that must canonicalize instead of splitting identity.
     try ctx.graph.addEdge("doc:a", "entity/ada", "mentions", 1.0, 0, 0, "{\"target_table\":\"entities\"}");
-    try ctx.graph.addEdge("entity/ada", "event/xyz", "participates_in", 1.0, 0, 0, "{\"target_table\":\"events\"}");
+    try ctx.graph.addEdge("entity/ada", "event/xyz", "participates_in", 1.0, 0, 0, "{\"source_table\":\"entities\",\"target_table\":\"events\"}");
     try ctx.graph.addEdge("doc:a", "doc:b", "cites", 1.0, 0, 0, "{\"target_table\":\"documents\"}");
 
     const start_keys: []const []const u8 = &.{"doc:a"};

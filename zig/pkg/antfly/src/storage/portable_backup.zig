@@ -842,8 +842,8 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
     {
         var cursor = try scan.openPhysicalCursorAdapter();
         defer cursor.close();
-        if (try cursor.seekAtOrAfter(internal_keys.graph_endpoint_cleanup_prefix)) |row| {
-            if (std.mem.startsWith(u8, row.key, internal_keys.graph_endpoint_cleanup_prefix)) return error.StorageBusy;
+        for ([_][]const u8{ internal_keys.graph_endpoint_cleanup_prefix, internal_keys.graph_owner_replay_prefix }) |prefix| {
+            if (try cursor.seekAtOrAfter(prefix)) |row| if (std.mem.startsWith(u8, row.key, prefix)) return error.StorageBusy;
         }
     }
 
@@ -1310,7 +1310,7 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
                     }
                 } else derived_batch_bytes += kv.key.len + kv.value.len;
             } else if (internal_keys.isGraphRetirementKey(kv.key)) {
-                if (!std.mem.eql(u8, kv.value, "1")) return error.InvalidBackupRequest;
+                _ = @import("graph_cleanup_contract.zig").retirementGeneration(kv.value) catch return error.InvalidBackupRequest;
                 const key = try alloc.dupe(u8, kv.key);
                 errdefer alloc.free(key);
                 const value = try alloc.dupe(u8, kv.value);
@@ -5011,7 +5011,7 @@ fn validateRelationshipBatchPayload(alloc: Allocator, payload: []const u8, inclu
     defer freeKeyValueEntries(alloc, entries);
     for (entries) |entry| {
         if (internal_keys.isGraphRetirementKey(entry.key)) {
-            if (!std.mem.eql(u8, entry.value, "1")) return error.InvalidBackupRequest;
+            _ = @import("graph_cleanup_contract.zig").retirementGeneration(entry.value) catch return error.InvalidBackupRequest;
             continue;
         }
         if (!include_relationships) continue;
@@ -7096,50 +7096,58 @@ test "portable relationships preserve parallel identities and arbitrary endpoint
 
 test "portable graph retirements are primary and require reader version four" {
     const alloc = std.testing.allocator;
-    var tmp_src = std.testing.tmpDir(.{});
-    defer tmp_src.cleanup();
-    var src = try openTestStore(alloc, &tmp_src);
-    defer src.close();
-    const edge = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "source", "facts", "R", "target");
-    defer alloc.free(edge);
-    const retired = try internal_keys.graphRetirementKeyAlloc(alloc, edge);
-    defer alloc.free(retired);
-    const fact = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, "fact", "facts", "R", "target", "source", "fact");
-    defer alloc.free(fact);
-    const value = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 7, 2.5, 0, 0, "{}");
-    defer alloc.free(value);
-    try src.put(edge, value);
-    try src.put(retired, "1");
-    try src.put(fact, value);
-    var out: ArrayList(u8) = .empty;
-    defer out.deinit(alloc);
-    try exportPortable(alloc, &src, &out);
-    {
-        var reader = backup_codec.SliceReader.init(out.items);
-        _ = try reader.readHeader();
-        const block = try reader.readBlock(alloc);
-        defer alloc.free(block.payload);
-        var manifest = try backup_bundle.parseManifest(alloc, block.payload);
-        defer manifest.deinit();
-        try std.testing.expectEqual(backup_bundle.retirement_reader_version, manifest.value.compatibility.min_afb_reader);
-    }
-    for ([_]bool{ false, true }) |staged| {
-        for ([_]bool{ false, true }) |derived| {
-            var tmp_dst = std.testing.tmpDir(.{});
-            defer tmp_dst.cleanup();
-            var dst = try openTestStore(alloc, &tmp_dst);
-            defer dst.close();
-            try importPortableWithOptions(alloc, &dst, out.items, .{ .unpublished_staging = staged, .import_derived_indexes = derived });
-            const marker = try dst.get(alloc, retired);
-            defer alloc.free(marker);
-            try std.testing.expectEqualStrings("1", marker);
-            try std.testing.expect(try dst.hasGraphRetirements());
-            try dst.put(edge, value);
-            try std.testing.expectError(error.NotFound, dst.get(alloc, edge));
-            if (derived) {
-                const restored_fact = try dst.get(alloc, fact);
-                defer alloc.free(restored_fact);
-            } else try std.testing.expectError(error.NotFound, dst.get(alloc, fact));
+    const stamped = @import("graph_cleanup_contract.zig").retirementValue(42);
+    for ([_][]const u8{ "1", &stamped }) |retirement| {
+        var tmp_src = std.testing.tmpDir(.{});
+        defer tmp_src.cleanup();
+        var src = try openTestStore(alloc, &tmp_src);
+        defer src.close();
+        const edge = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "source", "facts", "R", "target");
+        defer alloc.free(edge);
+        const retired = try internal_keys.graphRetirementKeyAlloc(alloc, edge);
+        defer alloc.free(retired);
+        const fact = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, "fact", "facts", "R", "target", "source", "fact");
+        defer alloc.free(fact);
+        const value = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 7, 2.5, 0, 0, "{}");
+        defer alloc.free(value);
+        try src.put(edge, value);
+        try src.put(retired, retirement);
+        try src.put(fact, value);
+        var out: ArrayList(u8) = .empty;
+        defer out.deinit(alloc);
+        try exportPortable(alloc, &src, &out);
+        {
+            var reader = backup_codec.SliceReader.init(out.items);
+            _ = try reader.readHeader();
+            const block = try reader.readBlock(alloc);
+            defer alloc.free(block.payload);
+            var manifest = try backup_bundle.parseManifest(alloc, block.payload);
+            defer manifest.deinit();
+            try std.testing.expectEqual(backup_bundle.retirement_reader_version, manifest.value.compatibility.min_afb_reader);
+        }
+        for ([_]bool{ false, true }) |staged| {
+            for ([_]bool{ false, true }) |derived| {
+                var tmp_dst = std.testing.tmpDir(.{});
+                defer tmp_dst.cleanup();
+                var dst = try openTestStore(alloc, &tmp_dst);
+                defer dst.close();
+                try importPortableWithOptions(alloc, &dst, out.items, .{ .unpublished_staging = staged, .import_derived_indexes = derived });
+                const marker = try dst.get(alloc, retired);
+                defer alloc.free(marker);
+                try std.testing.expectEqualStrings(retirement, marker);
+                if (retirement.len != 1) {
+                    const generation = try dst.get(alloc, internal_keys.graph_endpoint_cleanup_generation_key);
+                    defer alloc.free(generation);
+                    try std.testing.expect(std.mem.readInt(u64, generation[0..8], .little) >= 42);
+                }
+                try std.testing.expect(try dst.hasGraphRetirements());
+                try dst.put(edge, value);
+                try std.testing.expectError(error.NotFound, dst.get(alloc, edge));
+                if (derived) {
+                    const restored_fact = try dst.get(alloc, fact);
+                    defer alloc.free(restored_fact);
+                } else try std.testing.expectError(error.NotFound, dst.get(alloc, fact));
+            }
         }
     }
 }

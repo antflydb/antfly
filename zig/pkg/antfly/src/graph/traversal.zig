@@ -350,6 +350,7 @@ pub fn traverseWithEdgeReader(
                 for (edges, 0..) |edge, edge_index| {
                     if (!try shouldTraverseEdge(alloc, &effective_rules, &edge)) continue;
                     const endpoint = try resolveAdjacent(&table_scratch, edge, current.ancestry.key, current.ancestry.target_table, if (effective_rules.owning_table.len > 0) effective_rules.owning_table else null, effective_rules.direction);
+                    if (!endpoint.connected) continue;
                     const next_key = endpoint.key;
                     const target_table = if (endpoint.table) |table| if (std.mem.eql(u8, table, effective_rules.owning_table)) null else table else null;
                     if (effective_rules.deduplicate and visited.contains(.{
@@ -374,6 +375,7 @@ pub fn traverseWithEdgeReader(
 
             for (edges, 0..) |edge, edge_index| {
                 const endpoint = try resolveAdjacent(&table_scratch, edge, current.ancestry.key, current.ancestry.target_table, if (effective_rules.owning_table.len > 0) effective_rules.owning_table else null, effective_rules.direction);
+                if (!endpoint.connected) continue;
                 const next_key = endpoint.key;
 
                 if (admitted_edges) |mask| {
@@ -896,7 +898,7 @@ test "local traversal expands through a cross-table node when opted in" {
         1.0,
         0,
         0,
-        "{\"target_table\":\"events\"}",
+        "{\"source_table\":\"entities\",\"target_table\":\"events\"}",
     );
 
     const results = try traverse(alloc, &graph, "doc:a", .{
@@ -1141,12 +1143,13 @@ test "graph endpoint routing ignores nested tags and decodes forward and reverse
             const start = if (reverse) "b" else "a";
             const end = if (reverse) "a" else "b";
             const table = if (reverse) case.source_table else case.target_table;
-            const results = try traverse(alloc, &graph, start, .{ .direction = if (reverse) .in else .out, .max_depth = 1, .owning_table = "facts", .include_paths = true });
+            const start_table = if (reverse) case.target_table else case.source_table;
+            const results = try traverse(alloc, &graph, start, .{ .direction = if (reverse) .in else .out, .max_depth = 1, .owning_table = start_table orelse "facts", .include_paths = true });
             defer freeOwnedResults(alloc, results);
             try std.testing.expectEqual(@as(usize, 1), results.len);
             try std.testing.expectEqualStrings(end, results[0].key);
             if (table) |name| try std.testing.expectEqualStrings(name, results[0].target_table.?) else try std.testing.expect(results[0].target_table == null);
-            const path = (try paths_mod.findShortestPath(alloc, &graph, start, end, .{ .direction = if (reverse) .in else .out, .owning_table = "facts" })).?;
+            const path = (try paths_mod.findShortestPath(alloc, &graph, start, end, .{ .direction = if (reverse) .in else .out, .owning_table = "facts", .source_table = start_table, .expand_cross_table_local = true })).?;
             defer paths_mod.freePath(alloc, path);
             if (table) |name| {
                 try std.testing.expectEqual(@as(usize, 2), path.node_tables.len);

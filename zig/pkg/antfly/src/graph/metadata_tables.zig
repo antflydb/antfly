@@ -127,6 +127,7 @@ test "graph metadata table routing frees partial allocations" {
 const graph = @import("graph.zig");
 
 pub const Endpoint = struct {
+    connected: bool = true,
     key: []const u8,
     table: ?[]const u8,
     direction: ?graph.EdgeDirection,
@@ -136,27 +137,28 @@ pub const Endpoint = struct {
 /// self-loops when their table namespaces differ. Missing tags refer to the
 /// physical index table; callers canonicalize the result in their namespace.
 pub fn adjacent(scratch: *Scratch, edge: anytype, current_key: []const u8, current_table: ?[]const u8, index_table: ?[]const u8, requested: graph.EdgeDirection) !Endpoint {
-    var forward = requested != .in;
-    var direction: ?graph.EdgeDirection = requested;
-    if (requested == .both) {
-        forward = std.mem.eql(u8, current_key, edge.source);
-        if (std.mem.eql(u8, edge.source, edge.target)) {
-            const source_table = (try scratch.table(edge.metadata, "source_table")) orelse index_table;
-            const target_table = (try scratch.table(edge.metadata, "target_table")) orelse index_table;
-            const here = current_table orelse index_table;
-            const at_source = optionalTableEql(here, source_table);
-            const at_target = optionalTableEql(here, target_table);
-            if (at_source != at_target) {
-                forward = at_source;
-                direction = if (forward) .out else .in;
-            } else direction = null;
-            return .{ .key = if (forward) edge.target else edge.source, .table = if (forward) target_table else source_table, .direction = direction };
-        }
-        direction = if (forward) .out else .in;
-    }
+    const source_table = (try scratch.table(edge.metadata, "source_table")) orelse index_table;
+    const target_table = (try scratch.table(edge.metadata, "target_table")) orelse index_table;
+    const here = current_table orelse index_table;
+    // Legacy callers without a table context retain their key-only contract.
+    // Qualified callers must match the departing endpoint, not just its key.
+    const at_source = std.mem.eql(u8, current_key, edge.source) and (here == null or optionalTableEql(here, source_table));
+    const at_target = std.mem.eql(u8, current_key, edge.target) and (here == null or optionalTableEql(here, target_table));
+    const connected = switch (requested) {
+        .out => at_source,
+        .in => at_target,
+        .both => at_source or at_target,
+    };
+    const forward = switch (requested) {
+        .out => true,
+        .in => false,
+        .both => at_source,
+    };
+    const direction: ?graph.EdgeDirection = if (requested == .both and at_source and at_target) null else if (forward) .out else .in;
     return .{
+        .connected = connected,
         .key = if (forward) edge.target else edge.source,
-        .table = (try scratch.table(edge.metadata, if (forward) "target_table" else "source_table")) orelse index_table,
+        .table = if (forward) target_table else source_table,
         .direction = direction,
     };
 }
@@ -273,4 +275,19 @@ test "graph qualified endpoint orientation distinguishes equal keys from self lo
     const self = try adjacent(&scratch, .{ .source = "same", .target = "same", .metadata = "{}" }, "same", null, "people", .both);
     try std.testing.expect(self.direction == null);
     try std.testing.expectEqualStrings("people", self.table.?);
+}
+
+test "qualified endpoint eligibility checks both keys and departing tables" {
+    var scratch = Scratch.init(std.testing.allocator, null);
+    defer scratch.deinit();
+    const edge = .{ .source = "a", .target = "b", .metadata = "{\"source_table\":\"people\",\"target_table\":\"events\"}" };
+    for ([_]graph.EdgeDirection{ .out, .both }) |direction| {
+        try std.testing.expect(!(try adjacent(&scratch, edge, "a", "companies", "facts", direction)).connected);
+        try std.testing.expect((try adjacent(&scratch, edge, "a", "people", "facts", direction)).connected);
+    }
+    for ([_]graph.EdgeDirection{ .in, .both }) |direction| {
+        try std.testing.expect(!(try adjacent(&scratch, edge, "b", "companies", "facts", direction)).connected);
+        try std.testing.expect((try adjacent(&scratch, edge, "b", "events", "facts", direction)).connected);
+    }
+    try std.testing.expect(!(try adjacent(&scratch, .{ .source = "same", .target = "same", .metadata = edge.metadata }, "same", "companies", "facts", .both)).connected);
 }

@@ -2541,11 +2541,13 @@ pub fn graphRetirementPrefixAlloc(alloc: Allocator, owner: []const u8) ![]u8 {
 
 pub const graph_retirement_present_key = "\x00\x00__graph_retirement__:present:v1";
 
-pub const graph_incoming_cursor_key = "\x00\x00__graph_incoming__:cursor:v2";
+pub const graph_incoming_cursor_key = "\x00\x00__graph_incoming__:cursor:v3";
 
 pub const graph_incoming_prefix = "\x00\x00__graph_incoming__:v1:";
 pub const graph_directory_reset_key = "\x00\x00__graph_incoming__:reset:v1";
-pub const graph_incoming_ready_key = "\x00\x00__graph_incoming__:ready:v2";
+pub const graph_incoming_legacy_ready_key = "\x00\x00__graph_incoming__:ready:v2";
+pub const graph_incoming_ready_key = "\x00\x00__graph_incoming__:ready:v3";
+pub const graph_owning_table_key = "\x00\x00__metadata__:graph_owning_table:v1";
 pub const graph_retirement_count_key = "\x00\x00__graph_retirement__:count:v2";
 pub const graph_retirement_ref_prefix = "\x00\x00__graph_retirement__:refs:v2:";
 
@@ -3490,6 +3492,13 @@ pub const graph_endpoint_cleanup_generation_key = "\x00\x00__metadata__:graph_en
 pub const graph_endpoint_cleanup_count_key = "\x00\x00__metadata__:graph_endpoint_cleanup_active_count:v1";
 pub const graph_endpoint_cleanup_ref_prefix = "\x00\x00__metadata__:graph_endpoint_cleanup_active:v1:";
 pub fn isGraphEndpointCleanupControlKey(key: []const u8) bool {
-    return std.mem.startsWith(u8, key, graph_endpoint_cleanup_prefix) or
+    return std.mem.startsWith(u8, key, graph_owner_replay_prefix) or std.mem.startsWith(u8, key, graph_endpoint_cleanup_prefix) or
         std.mem.startsWith(u8, key, graph_endpoint_cleanup_ref_prefix) or std.mem.eql(u8, key, graph_endpoint_cleanup_count_key) or std.mem.eql(u8, key, graph_endpoint_cleanup_generation_key);
+}
+
+pub const graph_owner_replay_prefix = "\x00\x00__metadata__:graph_owner_replay:v1:";
+pub fn isGraphOwnerReplayJobKey(key: []const u8) bool {
+    if (!std.mem.startsWith(u8, key, graph_owner_replay_prefix) or key.len != graph_owner_replay_prefix.len + 64) return false;
+    for (key[graph_owner_replay_prefix.len..]) |byte| if (!std.ascii.isHex(byte)) return false;
+    return true;
 }

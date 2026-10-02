@@ -276,13 +276,28 @@ pub const DocStoreOptions = struct {
 };
 
 fn applyGraphRetirement(txn: anytype, alloc: Allocator, key: []const u8, value: []const u8, maybe: *?bool) anyerror!void {
-    if (!std.mem.eql(u8, value, "1")) return error.InvalidGraphRetirement;
+    const generation = try @import("graph_cleanup_contract.zig").retirementGeneration(value);
+    if (generation != 0) {
+        const previous = txn.get(internal_keys.graph_endpoint_cleanup_generation_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (previous != null and previous.?.len != 8) return error.InvalidGraphRetirement;
+        const prior = if (previous) |bytes| std.mem.readInt(u64, bytes[0..8], .little) else 0;
+        if (generation > prior) {
+            var bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &bytes, generation, .little);
+            try txn.put(internal_keys.graph_endpoint_cleanup_generation_key, &bytes);
+        }
+    }
     const artifact = try internal_keys.graphRetirementArtifactKeyAlloc(alloc, key);
     defer alloc.free(artifact);
-    txn.delete(artifact) catch |err| switch (err) {
-        error.NotFound => {},
-        else => return err,
-    };
+    if (try retirementSuppressesRelationship(txn, alloc, artifact, value)) {
+        txn.delete(artifact) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
     const ref = try internal_keys.graphRetirementRefKeyAlloc(alloc, key);
     defer alloc.free(ref);
     if (txn.get(ref)) |_| {} else |err| {
@@ -294,7 +309,7 @@ fn applyGraphRetirement(txn: anytype, alloc: Allocator, key: []const u8, value: 
         try txn.put(ref, "1");
         try txn.put(internal_keys.graph_retirement_count_key, &bytes);
     }
-    // Old stores remain conservative until the bounded v2 migration completes.
+    // Old stores remain conservative until the bounded v3 migration completes.
     try txn.put(internal_keys.graph_retirement_present_key, "1");
     maybe.* = true;
 }
@@ -347,11 +362,28 @@ fn graphRelationshipRetiredInTxn(txn: anytype, alloc: Allocator, key: []const u8
     if (!internal_keys.isGraphEdgeArtifactKey(key)) return false;
     const retirement = try internal_keys.graphRetirementKeyAlloc(alloc, key);
     defer alloc.free(retirement);
-    _ = txn.get(retirement) catch |err| switch (err) {
+    const stamp = txn.get(retirement) catch |err| switch (err) {
         error.NotFound => return false,
         else => return err,
     };
-    return true;
+    return retirementSuppressesRelationship(txn, alloc, key, stamp);
+}
+
+fn retirementSuppressesRelationship(txn: anytype, alloc: Allocator, key: []const u8, stamp: []const u8) !bool {
+    const contract = @import("graph_cleanup_contract.zig");
+    const generation = try contract.retirementGeneration(stamp);
+    const end = internal_keys.findComponentTerminator(key, 1) orelse return error.InvalidGraphSegment;
+    const owner = try internal_keys.decodeBodyAlloc(alloc, key[1..end]);
+    defer alloc.free(owner);
+    const job_key = try contract.ownerJobKeyAlloc(alloc, owner);
+    defer alloc.free(job_key);
+    const job_value = txn.get(job_key) catch |err| switch (err) {
+        error.NotFound => return true,
+        else => return err,
+    };
+    // A changed owner starts a new lifecycle atomically. Its fresh document
+    // projection may publish before bounded history collection has finished.
+    return generation >= (try contract.decodeOwnerJob(job_key, job_value)).generation;
 }
 
 fn columnarMutationToken(txn: anytype, cached: *?internal_keys.ColumnarMutationToken) !internal_keys.ColumnarMutationToken {
@@ -709,6 +741,7 @@ pub const DocStore = struct {
         }
 
         pub fn put(self: *Txn, key: []const u8, value: []const u8) anyerror!void {
+            try updateGraphOwningTable(self, key, value);
             try updateGraphEndpointCleanupAdmission(self, self.alloc, key, value);
             if (internal_keys.isInternalUserKey(key) and !self.graph_directory_checked) {
                 self.graph_directory_checked = true;
@@ -717,13 +750,10 @@ pub const DocStore = struct {
             if (internal_keys.isGraphRetirementKey(key)) {
                 try applyGraphRetirement(self, self.alloc, key, value, &self.graph_retirements_maybe);
             }
-            try requireGraphEndpointWritable(self, self.alloc, key);
+            try requireGraphEndpointWritable(self, self.alloc, key, value);
             if (try graphRelationshipRetiredCached(self, self.alloc, key, &self.graph_retirements_maybe)) return;
 
-            if (try internal_keys.graphIncomingKeyAlloc(self.alloc, key)) |incoming| {
-                defer self.alloc.free(incoming);
-                try self.put(incoming, key);
-            }
+            try maintainGraphIncoming(self, self.alloc, key, value, false, false);
             try self.artifact_footprint.touch(key, value);
             try self.range_mutation.touch(self, key);
             try self.artifact_inputs.touch(self.alloc, self, key, value);
@@ -883,6 +913,7 @@ pub const DocStore = struct {
             }
 
             pub fn put(self: @This(), key: []const u8, value: []const u8) anyerror!void {
+                try updateGraphOwningTable(self, key, value);
                 try updateGraphEndpointCleanupAdmission(self, self.alloc, key, value);
                 if (internal_keys.isInternalUserKey(key) and !self.graph_directory_checked.*) {
                     self.graph_directory_checked.* = true;
@@ -891,13 +922,10 @@ pub const DocStore = struct {
                 if (internal_keys.isGraphRetirementKey(key)) {
                     try applyGraphRetirement(self, self.alloc, key, value, self.graph_retirements_maybe);
                 }
-                try requireGraphEndpointWritable(self, self.alloc, key);
+                try requireGraphEndpointWritable(self, self.alloc, key, value);
                 if (try graphRelationshipRetiredCached(self, self.alloc, key, self.graph_retirements_maybe)) return;
 
-                if (try internal_keys.graphIncomingKeyAlloc(self.alloc, key)) |incoming| {
-                    defer self.alloc.free(incoming);
-                    try self.put(incoming, key);
-                }
+                try maintainGraphIncoming(self, self.alloc, key, value, false, false);
                 try self.artifact_footprint.touch(key, value);
                 try self.range_mutation.touch(self, key);
                 try self.artifact_inputs.touch(self.alloc, self, key, value);
@@ -916,6 +944,7 @@ pub const DocStore = struct {
 
             fn appendPutChecked(self: @This(), key: []const u8, value: []const u8, retirement_checked: bool) anyerror!void {
                 if (std.mem.startsWith(u8, key, internal_keys.graph_endpoint_cleanup_prefix) and self.unordered_bulk_append_puts) return error.Unsupported;
+                try updateGraphOwningTable(self, key, value);
                 try updateGraphEndpointCleanupAdmission(self, self.alloc, key, value);
                 if (internal_keys.isInternalUserKey(key) and !self.graph_directory_checked.*) {
                     self.graph_directory_checked.* = true;
@@ -929,13 +958,10 @@ pub const DocStore = struct {
                 // arena: fall back once instead of draining it for every edge.
                 if (!retirement_checked and self.unordered_bulk_append_puts and internal_keys.isGraphEdgeArtifactKey(key) and
                     try graphRetirementsPresentCached(self, self.graph_retirements_maybe)) return error.Unsupported;
-                try requireGraphEndpointWritable(self, self.alloc, key);
+                try requireGraphEndpointWritable(self, self.alloc, key, value);
                 if (!retirement_checked and try graphRelationshipRetiredCached(self, self.alloc, key, self.graph_retirements_maybe)) return;
 
-                if (try internal_keys.graphIncomingKeyAlloc(self.alloc, key)) |incoming| {
-                    defer self.alloc.free(incoming);
-                    try self.appendPut(incoming, key);
-                }
+                try maintainGraphIncoming(self, self.alloc, key, value, true, retirement_checked);
                 try self.artifact_footprint.touch(key, value);
                 // Active tracking requires point updates for bucket counters.
                 // Restore bulk writers publish into a fresh identity; they may
@@ -1402,6 +1428,7 @@ pub const DocStore = struct {
         guards: []const @import("graph_cleanup_contract.zig").Guard = &.{},
         alloc: Allocator,
         writes: []KVPair,
+        replay_writes: []KVPair = &.{},
         deletes: []const []const u8,
         inspected: usize,
         bytes: usize,
@@ -1412,6 +1439,11 @@ pub const DocStore = struct {
                 self.alloc.free(row.key);
                 self.alloc.free(row.value);
             }
+            for (self.replay_writes) |row| {
+                self.alloc.free(row.key);
+                self.alloc.free(row.value);
+            }
+            if (self.replay_writes.len != 0) self.alloc.free(self.replay_writes);
             for (self.deletes) |key| self.alloc.free(key);
             self.alloc.free(self.writes);
             self.alloc.free(self.deletes);
@@ -1429,13 +1461,17 @@ pub const DocStore = struct {
         return true;
     }
 
+    fn hasPrefixTxn(txn: *Txn, prefix: []const u8) !bool {
+        var cursor = try txn.openPhysicalCursorAdapter();
+        defer cursor.close();
+        const row = (try cursor.seekAtOrAfter(prefix)) orelse return false;
+        return std.mem.startsWith(u8, row.key, prefix);
+    }
+
     pub fn hasGraphEndpointCleanup(self: *DocStore) !bool {
         var read = try self.beginReadTxn();
         defer read.abort();
-        var cursor = try read.openPhysicalCursorAdapter();
-        defer cursor.close();
-        const row = (try cursor.seekAtOrAfter(internal_keys.graph_endpoint_cleanup_prefix)) orelse return false;
-        return std.mem.startsWith(u8, row.key, internal_keys.graph_endpoint_cleanup_prefix);
+        return try hasPrefixTxn(&read, internal_keys.graph_endpoint_cleanup_prefix) or try hasPrefixTxn(&read, internal_keys.graph_owner_replay_prefix);
     }
 
     /// Empty endpoint jobs do not change the graph and need not fence reads.
@@ -1444,6 +1480,7 @@ pub const DocStore = struct {
     pub fn graphEndpointCleanupBlocksReads(self: *DocStore) !bool {
         var read = try self.beginReadTxn();
         defer read.abort();
+        if (try hasPrefixTxn(&read, internal_keys.graph_owner_replay_prefix)) return true;
         const count = read.get(internal_keys.graph_endpoint_cleanup_count_key) catch |err| switch (err) {
             error.NotFound => {
                 var cursor = try read.openPhysicalCursorAdapter();
@@ -1460,8 +1497,89 @@ pub const DocStore = struct {
     /// Borrowed transaction check keeps every insertion path, including bulk
     /// append, behind the same durable target fence. Facts have no directory
     /// entry and deliberately retain their independent document lifecycle.
-    fn requireGraphEndpointWritable(txn: anytype, alloc: Allocator, artifact: []const u8) !void {
-        const target = internal_keys.graphInlineTargetComponent(artifact) orelse return;
+    /// The local lifecycle directory contains only targets in this physical
+    /// namespace. Explicit foreign tags never participate in local deletion.
+    fn localGraphInlineTarget(txn: anytype, alloc: Allocator, artifact: []const u8, value: []const u8) !?[]const u8 {
+        const target = internal_keys.graphInlineTargetComponent(artifact) orelse return null;
+        const codec = @import("db/enrichment/artifact_codec.zig");
+        if (std.mem.startsWith(u8, value, &codec.magic)) {
+            const edge = try codec.decodeGraphEdgeBorrowed(value);
+            var scratch = @import("../graph/metadata_tables.zig").Scratch.init(alloc, null);
+            defer scratch.deinit();
+            const source_table = try scratch.table(edge.metadata_json, "source_table");
+            const target_table = try scratch.table(edge.metadata_json, "target_table");
+            if (source_table != null or target_table != null) {
+                const here = txn.get(internal_keys.graph_owning_table_key) catch |err| switch (err) {
+                    error.NotFound => return null,
+                    else => return err,
+                };
+                // Equal document keys in a foreign source table do not make
+                // an independently owned fact into a source-owned inline edge.
+                if (source_table) |declared| if (!std.mem.eql(u8, declared, here)) return null;
+                if (target_table) |declared| if (!std.mem.eql(u8, declared, here)) return null;
+            }
+        }
+        return target;
+    }
+
+    /// Recheck a planned endpoint deletion against the current routing value.
+    /// A same-identity write may have moved the relationship to a foreign table.
+    pub fn graphRelationshipLocallyOwned(txn: anytype, alloc: Allocator, artifact: []const u8) !bool {
+        const value = txn.get(artifact) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        return try localGraphInlineTarget(txn, alloc, artifact, value) != null;
+    }
+
+    fn maintainGraphIncoming(txn: anytype, alloc: Allocator, artifact: []const u8, value: []const u8, append: bool, incoming_checked: bool) !void {
+        const physical_key = (try internal_keys.graphIncomingKeyAlloc(alloc, artifact)) orelse return;
+        defer alloc.free(physical_key);
+        const local_target = try localGraphInlineTarget(txn, alloc, artifact, value);
+        if (local_target != null) {
+            if (comptime @hasDecl(switch (@typeInfo(@TypeOf(txn))) {
+                .pointer => |pointer| pointer.child,
+                else => @TypeOf(txn),
+            }, "appendPut")) {
+                if (append) try txn.appendPut(physical_key, artifact) else try txn.put(physical_key, artifact);
+            } else try txn.put(physical_key, artifact);
+        } else {
+            if (comptime @hasField(switch (@typeInfo(@TypeOf(txn))) {
+                .pointer => |pointer| pointer.child,
+                else => @TypeOf(txn),
+            }, "unordered_bulk_append_puts")) {
+                if (append and txn.unordered_bulk_append_puts) {
+                    // The sorted bulk preflight proved that no prior local
+                    // membership needs deleting before these fresh appends.
+                    if (incoming_checked) return;
+                    return error.Unsupported;
+                }
+            }
+            txn.delete(physical_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        }
+    }
+
+    fn updateGraphOwningTable(txn: anytype, key: []const u8, value: []const u8) !void {
+        if (!std.mem.eql(u8, key, internal_keys.graph_owning_table_key)) return;
+        const previous = txn.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (previous) |name| if (std.mem.eql(u8, name, value)) return;
+        try txn.put(internal_keys.graph_directory_reset_key, &.{0});
+        for ([_][]const u8{ internal_keys.graph_incoming_ready_key, internal_keys.graph_incoming_cursor_key, internal_keys.graph_endpoint_cleanup_count_key }) |metadata_key| {
+            txn.delete(metadata_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        }
+    }
+
+    fn requireGraphEndpointWritable(txn: anytype, alloc: Allocator, artifact: []const u8, value: []const u8) !void {
+        const target = (try localGraphInlineTarget(txn, alloc, artifact, value)) orelse return;
         const endpoint = try internal_keys.decodeBodyAlloc(alloc, target[0 .. target.len - 2]);
         defer alloc.free(endpoint);
         const key = try internal_keys.graphEndpointCleanupKeyAlloc(alloc, endpoint);
@@ -1478,6 +1596,14 @@ pub const DocStore = struct {
     /// retirements remove their own directory inputs atomically, so restarting
     /// at the prefix is both a durable cursor and an idempotent retry.
     pub fn prepareGraphEndpointCleanupPage(self: *DocStore, alloc: Allocator) !?GraphEndpointCleanupPage {
+        const owner_only = blk: {
+            var read = try self.beginReadTxn();
+            defer read.abort();
+            break :blk !try hasPrefixTxn(&read, internal_keys.graph_endpoint_cleanup_prefix) and try hasPrefixTxn(&read, internal_keys.graph_owner_replay_prefix);
+        };
+        // Owner revival needs only its own primary prefixes. An unrelated
+        // incoming-directory upgrade must not delay its bounded input replay.
+        if (owner_only) return self.prepareGraphOwnerReplayPage(alloc);
         if (!try self.backfillGraphIncomingDirectoryPage()) return .{ .alloc = alloc, .writes = try alloc.alloc(KVPair, 0), .deletes = try alloc.alloc([]const u8, 0), .inspected = 0, .bytes = 0 };
         var guards = std.ArrayListUnmanaged(@import("graph_cleanup_contract.zig").Guard).empty;
         errdefer {
@@ -1505,7 +1631,7 @@ pub const DocStore = struct {
             var incoming = try read.openPhysicalCursorAdapter();
             defer incoming.close();
             var job_row = try jobs.seekAtOrAfter(internal_keys.graph_endpoint_cleanup_prefix);
-            if (job_row == null or !std.mem.startsWith(u8, job_row.?.key, internal_keys.graph_endpoint_cleanup_prefix)) return null;
+            if (job_row == null or !std.mem.startsWith(u8, job_row.?.key, internal_keys.graph_endpoint_cleanup_prefix)) return self.prepareGraphOwnerReplayPage(alloc);
             while (job_row) |job| {
                 if (!std.mem.startsWith(u8, job.key, internal_keys.graph_endpoint_cleanup_prefix)) break;
                 if (inspected + deletes.items.len >= 256) break;
@@ -1533,7 +1659,8 @@ pub const DocStore = struct {
                     defer alloc.free(expected_entry);
                     if (!std.mem.eql(u8, expected_entry, entry.key)) return error.InvalidGraphSegment;
                     const retired = try internal_keys.graphRetirementKeyAlloc(alloc, entry.value);
-                    const value = alloc.dupe(u8, "1") catch |err| {
+                    const encoded = if (incarnation.generation != 0) @import("graph_cleanup_contract.zig").retirementValue(incarnation.generation) else undefined;
+                    const value = alloc.dupe(u8, if (incarnation.generation != 0) &encoded else "1") catch |err| {
                         alloc.free(retired);
                         return err;
                     };
@@ -1575,6 +1702,103 @@ pub const DocStore = struct {
 
     /// Exact maintenance query: explicitly completes directory migration.
     /// Write admission must use mayHaveGraphRetirements instead.
+    /// Owner revival uses the same replicated maintenance lane as endpoint
+    /// cleanup. Each page owns at most 255 records plus its checkpoint and
+    /// releases its source snapshot before publication.
+    fn prepareGraphOwnerReplayPage(self: *DocStore, alloc: Allocator) !?GraphEndpointCleanupPage {
+        const contract = @import("graph_cleanup_contract.zig");
+        var read = try self.beginReadTxn();
+        defer read.abort();
+        var jobs = try read.openPhysicalCursorAdapter();
+        defer jobs.close();
+        const row = (try jobs.seekAtOrAfter(internal_keys.graph_owner_replay_prefix)) orelse return null;
+        if (!internal_keys.isGraphOwnerReplayJobKey(row.key)) return null;
+        const job = try contract.decodeOwnerJob(row.key, row.value);
+        var page: GraphEndpointCleanupPage = .{ .alloc = alloc, .writes = try alloc.alloc(KVPair, 0), .deletes = try alloc.alloc([]const u8, 0), .inspected = 0, .bytes = row.key.len + @sizeOf(contract.Guard) + job.owner.len };
+        errdefer page.deinit();
+        page.guards = blk: {
+            const owner = try alloc.dupe(u8, job.owner);
+            errdefer alloc.free(owner);
+            const guards = try alloc.alloc(contract.Guard, 1);
+            guards[0] = .{ .endpoint = owner, .generation = job.generation, .kind = .owner_replay, .checkpoint_digest = contract.checkpointDigest(row.value) };
+            break :blk guards;
+        };
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer deletes.deinit(alloc);
+        errdefer for (deletes.items) |key| alloc.free(key);
+        var replay = std.ArrayListUnmanaged(KVPair).empty;
+        defer replay.deinit(alloc);
+        errdefer for (replay.items) |entry| {
+            alloc.free(entry.key);
+            alloc.free(entry.value);
+        };
+        const prefix = switch (job.phase) {
+            .retirements => try internal_keys.graphRetirementPrefixAlloc(alloc, job.owner),
+            .inputs => try internal_keys.artifactTypePrefixAlloc(alloc, job.owner, "asset"),
+            .chunks => try internal_keys.artifactTypePrefixAlloc(alloc, job.owner, "chunk"),
+            .resolutions => try internal_keys.artifactTypePrefixAlloc(alloc, job.owner, "resolution"),
+        };
+        defer alloc.free(prefix);
+        if (job.cursor.len != 0 and !std.mem.startsWith(u8, job.cursor, prefix)) return error.InvalidGraphSegment;
+        const start = if (job.cursor.len == 0) try alloc.dupe(u8, prefix) else try std.mem.concat(alloc, u8, &.{ job.cursor, &.{0} });
+        defer alloc.free(start);
+        var inputs = try read.openPhysicalCursorAdapter();
+        defer inputs.close();
+        var input = try inputs.seekAtOrAfter(start);
+        var last: ?[]u8 = null;
+        defer if (last) |key| alloc.free(key);
+        while (input) |entry| {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            const value = if (job.phase != .retirements and contract.isReplayInput(entry.key)) try read.get(entry.key) else entry.value;
+            const cost = entry.key.len +| (if (job.phase != .retirements and contract.isReplayInput(entry.key)) value.len else 0);
+            if (page.inspected != 0 and (page.inspected >= 255 or page.bytes +| cost +| 21 +| job.owner.len +| entry.key.len > 256 * 1024)) break;
+            if (job.phase == .retirements) {
+                if (try contract.retirementGeneration(value) < job.generation) {
+                    const key = try alloc.dupe(u8, entry.key);
+                    deletes.append(alloc, key) catch |err| {
+                        alloc.free(key);
+                        return err;
+                    };
+                }
+            } else if (contract.isReplayInput(entry.key)) {
+                try replay.ensureUnusedCapacity(alloc, 1);
+                const key = try alloc.dupe(u8, entry.key);
+                errdefer alloc.free(key);
+                replay.appendAssumeCapacity(.{ .key = key, .value = try alloc.dupe(u8, value) });
+            }
+            const next_cursor = try alloc.dupe(u8, entry.key);
+            if (last) |key| alloc.free(key);
+            last = next_cursor;
+            page.inspected += 1;
+            page.bytes +|= cost;
+            input = try inputs.next();
+        }
+        const complete = input == null or !std.mem.startsWith(u8, input.?.key, prefix);
+        if (complete and job.phase == .resolutions) {
+            const key = try alloc.dupe(u8, row.key);
+            deletes.append(alloc, key) catch |err| {
+                alloc.free(key);
+                return err;
+            };
+        } else {
+            try replay.ensureUnusedCapacity(alloc, 1);
+            const key = try alloc.dupe(u8, row.key);
+            errdefer alloc.free(key);
+            const value = try contract.encodeOwnerJobAlloc(alloc, .{ .owner = job.owner, .generation = job.generation, .phase = if (complete) switch (job.phase) {
+                .retirements => .inputs,
+                .inputs => .chunks,
+                .chunks => .resolutions,
+                .resolutions => unreachable,
+            } else job.phase, .cursor = if (complete) "" else last.? });
+            replay.appendAssumeCapacity(.{ .key = key, .value = value });
+            page.bytes +|= value.len;
+        }
+        alloc.free(page.deletes);
+        page.deletes = try deletes.toOwnedSlice(alloc);
+        page.replay_writes = try replay.toOwnedSlice(alloc);
+        return page;
+    }
+
     pub fn hasGraphRetirements(self: *DocStore) !bool {
         try self.ensureGraphIncomingDirectory();
         return self.mayHaveGraphRetirements();
@@ -1626,6 +1850,11 @@ pub const DocStore = struct {
     pub fn backfillGraphIncomingDirectoryPage(self: *DocStore) !bool {
         var txn = try self.beginWriteTxn();
         errdefer txn.abort();
+        // Upgrade key-only directories before granting v3 cleanup admission.
+        if (txn.get(internal_keys.graph_incoming_legacy_ready_key)) |_| {
+            try txn.put(internal_keys.graph_directory_reset_key, &.{0});
+            try txn.delete(internal_keys.graph_incoming_legacy_ready_key);
+        } else |err| if (err != error.NotFound) return err;
         const reset = txn.get(internal_keys.graph_directory_reset_key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
@@ -1688,16 +1917,21 @@ pub const DocStore = struct {
             while (entry) |item| {
                 last = try alloc.dupe(u8, item.key);
                 copied_bytes +|= item.key.len;
-                if (try internal_keys.graphIncomingKeyAlloc(alloc, item.key)) |key| {
+                // Resolve external payloads through the transaction; routing
+                // metadata is borrowed and never copied just to classify it.
+                const graph_value = if (internal_keys.graphInlineTargetComponent(item.key) != null) try txn.get(item.key) else "";
+                copied_bytes +|= graph_value.len;
+                if (try localGraphInlineTarget(&txn, alloc, item.key, graph_value) != null) {
+                    const key = (try internal_keys.graphIncomingKeyAlloc(alloc, item.key)).?;
                     const value = try alloc.dupe(u8, item.key);
                     try entries.append(alloc, .{ .key = key, .value = value });
                     copied_bytes +|= key.len +| value.len;
                 }
                 if (internal_keys.isGraphRetirementKey(item.key)) {
-                    if (!std.mem.eql(u8, item.value, "1")) return error.InvalidGraphRetirement;
+                    _ = try @import("graph_cleanup_contract.zig").retirementGeneration(item.value);
                     // Reusing marker puts makes restart and concurrent insert
                     // accounting idempotent through the reference directory.
-                    try entries.append(alloc, .{ .key = last.?, .value = "1" });
+                    try entries.append(alloc, .{ .key = last.?, .value = try alloc.dupe(u8, item.value) });
                 }
                 scanned += 1;
                 entry = try cursor.next();
@@ -1951,10 +2185,35 @@ pub const DocStore = struct {
         validate_at_commit: ?*const fn (ptr: *anyopaque, alloc: Allocator, txn: *Batch.BatchTxn) anyerror!void = null,
     };
 
+    /// A foreign rewrite may replace a previously local relationship. Detect
+    /// those memberships with one sorted read before entering the append arena;
+    /// fresh foreign bulk rows then avoid per-edge drains or a whole-batch fallback.
+    fn graphBulkIncomingNeedsDelete(alloc: Allocator, txn: Batch.BatchTxn, writes: []const KVPair) !bool {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var keys = std.ArrayListUnmanaged([]const u8).empty;
+        for (writes) |write| {
+            if (!internal_keys.isGraphEdgeArtifactKey(write.key) or try localGraphInlineTarget(txn, scratch, write.key, write.value) != null) continue;
+            if (try internal_keys.graphIncomingKeyAlloc(scratch, write.key)) |key| try keys.append(scratch, key);
+        }
+        if (keys.items.len == 0) return false;
+        const Order = struct {
+            fn less(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        };
+        std.sort.pdq([]const u8, keys.items, {}, Order.less);
+        const values = try scratch.alloc(?[]const u8, keys.items.len);
+        try txn.getManySorted(keys.items, values);
+        for (values) |value| if (value != null) return true;
+        return false;
+    }
+
     /// Resolve retirements before admitting any append entries. The writer
     /// transaction pins both the checks and sorted ingestion atomically.
     fn graphBulkRetirementMask(alloc: Allocator, txn: Batch.BatchTxn, writes: []const KVPair) !?[]bool {
-        for (writes) |write| try requireGraphEndpointWritable(txn, alloc, write.key);
+        for (writes) |write| try requireGraphEndpointWritable(txn, alloc, write.key, write.value);
         if (!try graphRetirementsPresentCached(txn, txn.graph_retirements_maybe)) return null;
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
@@ -1979,7 +2238,9 @@ pub const DocStore = struct {
         try txn.getManySorted(keys, values);
         const mask = try alloc.alloc(bool, writes.len);
         @memset(mask, false);
-        for (candidates.items, values) |candidate, value| mask[candidate.index] = value != null;
+        for (candidates.items, values) |candidate, value| if (value) |stamp| {
+            mask[candidate.index] = try retirementSuppressesRelationship(txn, scratch, writes[candidate.index].key, stamp);
+        };
         return mask;
     }
 
@@ -2001,7 +2262,11 @@ pub const DocStore = struct {
         options: backend_types.BatchOptions,
         participant: ?@import("commit_participant.zig").Participant,
     ) !void {
-        const graph_bulk = deletes.len == 0 and options.mode == .bulk_ingest;
+        const has_owner_job = blk: {
+            for (writes) |write| if (internal_keys.isGraphOwnerReplayJobKey(write.key)) break :blk true;
+            break :blk false;
+        };
+        const bulk_candidate = deletes.len == 0 and options.mode == .bulk_ingest and !has_owner_job;
         // The retirement mask reads candidate markers from this same writer
         // transaction. It remains authoritative during directory migration,
         // so bulk ingestion never needs a foreground whole-store backfill.
@@ -2009,6 +2274,7 @@ pub const DocStore = struct {
         errdefer batch.abort();
         if (participant) |observer| try batch.setCommitParticipant(observer);
         var txn = batch.asTxn();
+        const graph_bulk = bulk_candidate and !try graphBulkIncomingNeedsDelete(self.alloc, txn, writes);
         const retirement_mask = if (graph_bulk) try graphBulkRetirementMask(self.alloc, txn, writes) else null;
         defer if (retirement_mask) |mask| self.alloc.free(mask);
         for (deletes) |key| {
@@ -2018,7 +2284,7 @@ pub const DocStore = struct {
             };
         }
         var used_bulk_append = false;
-        if (deletes.len == 0 and options.mode == .bulk_ingest) {
+        if (graph_bulk) {
             used_bulk_append = true;
             for (writes, 0..) |kv, index| {
                 if (retirement_mask) |mask| if (mask[index]) continue;
@@ -5709,4 +5975,232 @@ test "graph endpoint cleanup byte admission observes pending incoming additions 
         try txn.commit();
     }
     try std.testing.expect(try store.graphEndpointCleanupBlocksReads());
+}
+
+test "graph qualified cleanup isolates foreign targets and foreign-source facts" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf);
+    defer cleanupTmp(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    try store.put(internal_keys.graph_owning_table_key, "facts");
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const codec = @import("db/enrichment/artifact_codec.zig");
+    const metadata = [_][]const u8{ "{}", "{\"target_table\":\"facts\"}", "{\"target_table\":\"people\"}", "{\"source_table\":\"people\",\"target_table\":\"facts\"}" };
+    var edges: [4][]const u8 = undefined;
+    var values: [4][]const u8 = undefined;
+    for (metadata, 0..) |raw, i| {
+        edges[i] = try internal_keys.graphRelationshipArtifactKeyAlloc(a, "source", "g", "R", "shared", "source", try std.fmt.allocPrint(a, "{d}", .{i}));
+        values[i] = try codec.encodeGraphEdgeAlloc(a, null, 1, 1, 0, 0, raw);
+        try store.put(edges[i], values[i]);
+    }
+    try store.ensureGraphIncomingDirectory();
+    const prefix = try internal_keys.graphIncomingPrefixAlloc(a, "shared");
+    const refs = try store.scanPrefix(alloc, prefix);
+    defer DocStore.freeResults(alloc, refs);
+    try std.testing.expectEqual(@as(usize, 2), refs.len);
+    const job = try internal_keys.graphEndpointCleanupKeyAlloc(a, "shared");
+    try store.put(job, "shared");
+    try std.testing.expectError(error.IntegrityTopologyBusy, store.put(edges[0], values[0]));
+    try std.testing.expectError(error.IntegrityTopologyBusy, store.put(edges[1], values[1]));
+    try store.put(edges[2], values[2]);
+    try store.put(edges[3], values[3]);
+    while (try store.prepareGraphEndpointCleanupPage(alloc)) |owned| {
+        var page = owned;
+        defer page.deinit();
+        try store.putBatch(page.writes, page.deletes);
+    }
+    for (edges, 0..) |edge, i| try std.testing.expectEqual(i < 2, try store.graphRelationshipRetired(edge));
+    for (edges[2..]) |edge| {
+        const value = try store.get(alloc, edge);
+        defer alloc.free(value);
+    }
+}
+
+test "graph owner revival pages bound history and inputs and retain newer deletions" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf);
+    defer cleanupTmp(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const contract = @import("graph_cleanup_contract.zig");
+    var rows = std.ArrayListUnmanaged(KVPair).empty;
+    const input_value = try a.alloc(u8, 2048);
+    @memset(input_value, 'x');
+    for (0..600) |i| {
+        const id = try std.fmt.allocPrint(a, "{d:0>4}", .{i});
+        const edge = try internal_keys.graphRelationshipArtifactKeyAlloc(a, "owner", "g", "R", "target", "owner", id);
+        try rows.append(a, .{ .key = try internal_keys.graphRetirementKeyAlloc(a, edge), .value = "1" });
+        try rows.append(a, .{ .key = try internal_keys.artifactNamedPrefixAlloc(a, "owner", "asset", id), .value = input_value });
+    }
+    try store.putBatch(rows.items, &.{});
+    const new_edge = try internal_keys.graphRelationshipArtifactKeyAlloc(a, "owner", "g", "R", "target", "owner", "new");
+    const new_marker = try internal_keys.graphRetirementKeyAlloc(a, new_edge);
+    const stamp = contract.retirementValue(51);
+    try store.put(new_marker, &stamp);
+    const job_key = try contract.ownerJobKeyAlloc(a, "owner");
+    try store.put(job_key, try contract.encodeOwnerJobAlloc(a, .{ .owner = "owner", .generation = 50 }));
+    try std.testing.expect(try store.graphEndpointCleanupBlocksReads());
+    var pages: usize = 0;
+    var inputs: usize = 0;
+    while (try store.prepareGraphEndpointCleanupPage(alloc)) |owned| {
+        var page = owned;
+        defer page.deinit();
+        try std.testing.expect(page.inspected <= 255);
+        try std.testing.expect(page.bytes <= 256 * 1024);
+        try std.testing.expect(page.deletes.len + page.replay_writes.len <= 256);
+        for (page.replay_writes) |row| if (contract.isReplayInput(row.key)) {
+            inputs += 1;
+        };
+        try store.putBatch(page.replay_writes, page.deletes);
+        pages += 1;
+    }
+    try std.testing.expect(pages > 5);
+    try std.testing.expectEqual(@as(usize, 600), inputs);
+    const prefix = try internal_keys.graphRetirementPrefixAlloc(a, "owner");
+    const remaining = try store.scanPrefixKeysPage(alloc, prefix, null, 10);
+    defer {
+        for (remaining) |key| alloc.free(key);
+        alloc.free(remaining);
+    }
+    try std.testing.expectEqual(@as(usize, 1), remaining.len);
+    try std.testing.expectEqualStrings(new_marker, remaining[0]);
+    try std.testing.expect(!try store.graphEndpointCleanupBlocksReads());
+}
+
+test "graph owner revival planning releases every partial allocation" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf);
+    defer cleanupTmp(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    try store.ensureGraphIncomingDirectory();
+    const contract = @import("graph_cleanup_contract.zig");
+    const key = try contract.ownerJobKeyAlloc(alloc, "owner");
+    defer alloc.free(key);
+    const value = try contract.encodeOwnerJobAlloc(alloc, .{ .owner = "owner", .generation = 1, .phase = .inputs });
+    defer alloc.free(value);
+    try store.put(key, value);
+    const input_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "owner", "asset", "a");
+    defer alloc.free(input_key);
+    try store.put(input_key, "input");
+    const Case = struct {
+        fn plan(a: Allocator, owner: *DocStore) !void {
+            var page = (try owner.prepareGraphEndpointCleanupPage(a)).?;
+            defer page.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Case.plan, .{&store});
+}
+
+test "graph qualified directory upgrade removes stale foreign membership and preserves revived artifacts" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf);
+    defer cleanupTmp(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    const codec = @import("db/enrichment/artifact_codec.zig");
+    const contract = @import("graph_cleanup_contract.zig");
+    const foreign = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, "a", "g", "R", "b", "a", "foreign");
+    defer alloc.free(foreign);
+    const local = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, "a", "g", "R", "b", "a", "local");
+    defer alloc.free(local);
+    const foreign_value = try codec.encodeGraphEdgeAlloc(alloc, null, 1, 1, 0, 0, "{\"target_table\":\"people\"}");
+    defer alloc.free(foreign_value);
+    const local_value = try codec.encodeGraphEdgeAlloc(alloc, null, 1, 1, 0, 0, "{}");
+    defer alloc.free(local_value);
+    const retired = try internal_keys.graphRetirementKeyAlloc(alloc, local);
+    defer alloc.free(retired);
+    try store.put(retired, "1");
+    const job_key = try contract.ownerJobKeyAlloc(alloc, "a");
+    defer alloc.free(job_key);
+    const job_value = try contract.encodeOwnerJobAlloc(alloc, .{ .owner = "a", .generation = 2 });
+    defer alloc.free(job_value);
+    try store.put(job_key, job_value);
+    try store.put(local, local_value);
+    try store.put(foreign, foreign_value);
+    const stale = (try internal_keys.graphIncomingKeyAlloc(alloc, foreign)).?;
+    defer alloc.free(stale);
+    try store.put(stale, foreign);
+    try store.put(internal_keys.graph_incoming_legacy_ready_key, "1");
+    try store.delete(internal_keys.graph_incoming_ready_key);
+    try store.ensureGraphIncomingDirectory();
+    const refs = try store.scanPrefix(alloc, internal_keys.graph_incoming_prefix);
+    defer DocStore.freeResults(alloc, refs);
+    try std.testing.expectEqual(@as(usize, 1), refs.len);
+    try std.testing.expectEqualSlices(u8, local, refs[0].value);
+    const revived = try store.get(alloc, local);
+    defer alloc.free(revived);
+    try std.testing.expectEqualSlices(u8, local_value, revived);
+    try std.testing.expect(!try store.graphRelationshipRetired(local));
+}
+
+test "graph owner revival skips projected outputs and unrelated directory migration" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf);
+    defer cleanupTmp(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const rows = try a.alloc(KVPair, 600);
+    for (rows, 0..) |*row, i| row.* = .{ .key = try internal_keys.graphRelationshipArtifactKeyAlloc(a, "owner", "g", "R", "b", "owner", try std.fmt.allocPrint(a, "{d}", .{i})), .value = "payload" };
+    try store.putBatch(rows, &.{});
+    try store.delete(internal_keys.graph_incoming_ready_key);
+    const contract = @import("graph_cleanup_contract.zig");
+    const job = try contract.ownerJobKeyAlloc(a, "owner");
+    try store.put(job, try contract.encodeOwnerJobAlloc(a, .{ .owner = "owner", .generation = 2, .phase = .inputs }));
+    var page = (try store.prepareGraphEndpointCleanupPage(alloc)).?;
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 0), page.inspected);
+    try std.testing.expectEqual(@as(usize, 1), page.replay_writes.len);
+    try std.testing.expectEqual(contract.OwnerPhase.chunks, (try contract.decodeOwnerJob(page.replay_writes[0].key, page.replay_writes[0].value)).phase);
+    try std.testing.expect(!try store.graphIncomingDirectoryReady());
+    try std.testing.expectError(error.NotFound, store.get(alloc, internal_keys.graph_incoming_cursor_key));
+}
+
+test "graph qualified bulk rewrites remove old local membership and admit fresh foreign rows" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf);
+    defer cleanupTmp(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    const codec = @import("db/enrichment/artifact_codec.zig");
+    const edge = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, "a", "g", "R", "b", "a", "id");
+    defer alloc.free(edge);
+    const local = try codec.encodeGraphEdgeAlloc(alloc, null, 1, 1, 0, 0, "{}");
+    defer alloc.free(local);
+    const foreign = try codec.encodeGraphEdgeAlloc(alloc, null, 1, 1, 0, 0, "{\"target_table\":\"people\"}");
+    defer alloc.free(foreign);
+    try store.put(edge, local);
+    try store.putBatchWithReplayWithOptions(null, &.{.{ .key = edge, .value = foreign }}, &.{}, null, .{ .mode = .bulk_ingest });
+    const refs = try store.scanPrefix(alloc, internal_keys.graph_incoming_prefix);
+    defer DocStore.freeResults(alloc, refs);
+    try std.testing.expectEqual(@as(usize, 0), refs.len);
+    const fresh = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, "a", "g", "R", "b", "a", "fresh");
+    defer alloc.free(fresh);
+    try store.putBatchWithReplayWithOptions(null, &.{.{ .key = fresh, .value = foreign }}, &.{}, null, .{ .mode = .bulk_ingest });
+    for ([_][]const u8{ edge, fresh }) |key| {
+        const actual = try store.get(alloc, key);
+        defer alloc.free(actual);
+        try std.testing.expectEqualSlices(u8, foreign, actual);
+    }
+    const job = try internal_keys.graphEndpointCleanupKeyAlloc(alloc, "b");
+    defer alloc.free(job);
+    try store.put(job, "b");
+    var page = (try store.prepareGraphEndpointCleanupPage(alloc)).?;
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 0), page.writes.len);
 }
