@@ -260,19 +260,20 @@ fn createPathNode(
 }
 
 /// Table identity of the node an edge leads to, canonicalized against the
-/// index-owning table. Only a forward arrival (next_key == edge.target)
-/// carries the tag, mirroring the BFS traversal engine.
-fn canonicalNextNodeTable(opts: *const PathFindOptions, next_key: []const u8, edge: *const Edge) ?[]const u8 {
+/// index-owning table. Forward arrivals read the target tag; reverse arrivals
+/// read the source tag, matching the BFS traversal engine.
+fn canonicalNextNodeTable(scratch: *traversal_mod.MetadataScratch, opts: *const PathFindOptions, next_key: []const u8, edge: *const Edge) !?[]const u8 {
     const table = if (std.mem.eql(u8, next_key, edge.target))
-        traversal_mod.metadataTargetTable(edge.metadata) orelse return null
+        (try traversal_mod.metadataTargetTable(scratch, edge.metadata)) orelse return null
     else
-        traversal_mod.metadataSourceTable(edge.metadata) orelse return null;
+        (try traversal_mod.metadataSourceTable(scratch, edge.metadata)) orelse return null;
     if (opts.owning_table.len > 0 and std.mem.eql(u8, table, opts.owning_table)) return null;
     return table;
 }
 
 fn retainPathNodeState(
     key: []const u8,
+    table: ?[]const u8,
     edge: ?Edge,
     budget: *work_budget_mod.WorkBudget,
     retained_bytes: *usize,
@@ -282,6 +283,14 @@ fn retainPathNodeState(
         return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
     var added = std.math.add(usize, @sizeOf(PathNode) + 3 * @sizeOf(*PathNode), duplicated_key_bytes) catch
         return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+    if (table) |name| {
+        // BFS owns both a node table and a visited identity table. This is
+        // also a conservative bound for Dijkstra, whose map borrows the node.
+        const table_bytes = std.math.mul(usize, 2, name.len) catch
+            return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+        added = std.math.add(usize, added, table_bytes) catch
+            return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+    }
     if (edge) |value| {
         for ([_][]const u8{ value.source, value.target, value.edge_type, value.edge_id, value.owner_document, value.metadata }) |part| {
             added = std.math.add(usize, added, part.len) catch
@@ -568,7 +577,7 @@ fn bfsShortestPath(
     // Seed
     try work_budget.checkIntermediateStates(1, opts.max_intermediate_states);
     try work_budget.consumeNode();
-    try retainPathNodeState(source, null, work_budget, &retained_node_bytes);
+    try retainPathNodeState(source, null, null, work_budget, &retained_node_bytes);
     const start = try createPathNode(alloc, source, null, 0, 0, null, null);
     var start_owned = true;
     errdefer if (start_owned) destroyPathNode(alloc, start);
@@ -592,6 +601,8 @@ fn bfsShortestPath(
         defer stream.deinit();
         while (try stream.nextBudget(work_budget, edge_stream.batch_records)) |edges| {
             defer edge_reader.freeEdges(alloc, edges);
+            var table_scratch = traversal_mod.MetadataScratch.init(alloc, work_budget);
+            defer table_scratch.deinit();
             try work_budget.consumeMaterializedEdges(edges);
 
             const admitted_edges = if (opts.node_admission) |admission| blk: {
@@ -617,7 +628,7 @@ fn bfsShortestPath(
                             .owner_document = edge.owner_document,
                         })) continue;
                     }
-                    const target_table = canonicalNextNodeTable(&opts, next_key, &edge);
+                    const target_table = try canonicalNextNodeTable(&table_scratch, &opts, next_key, &edge);
                     if (visited.contains(.{ .table = target_table, .key = next_key })) continue;
                     candidate_indexes.appendAssumeCapacity(edge_index);
                     candidate_nodes.appendAssumeCapacity(.{
@@ -654,7 +665,7 @@ fn bfsShortestPath(
                         })) continue;
                     }
                 }
-                const next_table = canonicalNextNodeTable(&opts, next_key, &edge);
+                const next_table = try canonicalNextNodeTable(&table_scratch, &opts, next_key, &edge);
                 if (visited.contains(.{ .table = next_table, .key = next_key })) continue;
                 const is_target = std.mem.eql(u8, next_key, target);
                 if (!is_target) {
@@ -662,7 +673,7 @@ fn bfsShortestPath(
                     try work_budget.checkIntermediateStates(pending_states + 1, opts.max_intermediate_states);
                 }
                 try work_budget.consumeNode();
-                try retainPathNodeState(next_key, edge, work_budget, &retained_node_bytes);
+                try retainPathNodeState(next_key, next_table, edge, work_budget, &retained_node_bytes);
                 _ = try visited.putIfAbsent(alloc, .{ .table = next_table, .key = next_key }, {});
 
                 const node = try createPathNode(
@@ -727,7 +738,7 @@ fn dijkstraPath(
 
     try work_budget.checkIntermediateStates(1, opts.max_intermediate_states);
     try work_budget.consumeNode();
-    try retainPathNodeState(source, null, work_budget, &retained_node_bytes);
+    try retainPathNodeState(source, null, null, work_budget, &retained_node_bytes);
     const start = try createPathNode(alloc, source, null, 0.0, 0, null, null);
     var start_owned = true;
     errdefer if (start_owned) destroyPathNode(alloc, start);
@@ -753,6 +764,8 @@ fn dijkstraPath(
         defer stream.deinit();
         while (try stream.nextBudget(work_budget, edge_stream.batch_records)) |edges| {
             defer edge_reader.freeEdges(alloc, edges);
+            var table_scratch = traversal_mod.MetadataScratch.init(alloc, work_budget);
+            defer table_scratch.deinit();
             try work_budget.consumeMaterializedEdges(edges);
 
             const admitted_edges = if (opts.node_admission) |admission| blk: {
@@ -778,7 +791,7 @@ fn dijkstraPath(
                             .owner_document = edge.owner_document,
                         })) continue;
                     }
-                    const target_table = canonicalNextNodeTable(&opts, next_key, &edge);
+                    const target_table = try canonicalNextNodeTable(&table_scratch, &opts, next_key, &edge);
                     candidate_indexes.appendAssumeCapacity(edge_index);
                     candidate_nodes.appendAssumeCapacity(.{
                         .key = next_key,
@@ -815,13 +828,13 @@ fn dijkstraPath(
                     }
                 }
 
-                const next_table = canonicalNextNodeTable(&opts, next_key, &edge);
+                const next_table = try canonicalNextNodeTable(&table_scratch, &opts, next_key, &edge);
                 const new_dist = current.distance + try pathEdgeCost(opts.weight_mode, edge.weight);
                 const next_hops = current.hops + 1;
                 if (!pathStateDominated(&best_dist, next_key, next_table, next_hops, new_dist, false)) {
                     try work_budget.checkIntermediateStates(heap.items.len + 1, opts.max_intermediate_states);
                     try work_budget.consumeNode();
-                    try retainPathNodeState(next_key, edge, work_budget, &retained_node_bytes);
+                    try retainPathNodeState(next_key, next_table, edge, work_budget, &retained_node_bytes);
                     const node = try createPathNode(alloc, next_key, next_table, new_dist, next_hops, current, edge);
                     var node_owned = true;
                     errdefer if (node_owned) destroyPathNode(alloc, node);

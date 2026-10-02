@@ -1421,6 +1421,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "traversal preflights live frontier admission before ownership transfer",
         "traversal ancestry and returned paths share retained state budget",
         "traversal selected fact relationships are allocation failure safe",
+        "graph metadata table routing",
+        "graph endpoint routing ignores nested tags",
         "projected MATCH rows reserve and release retained output bytes",
         "shortest path preflights live frontier admission",
         "shortest path retained payloads use the shared request budget",

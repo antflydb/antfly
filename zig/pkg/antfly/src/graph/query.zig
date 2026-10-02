@@ -2204,15 +2204,18 @@ fn algebraicPatternMatchFromNodeAlloc(
         if (all_bindings.len > 0) alloc.free(all_bindings);
     }
 
+    var table_scratch = traversal_mod.MetadataScratch.init(alloc, null);
+    defer table_scratch.deinit();
     for (pattern, 0..) |step, i| {
         if (!graphQueryPassesPrefixFilter(node_path[i], step.node_filter)) return null;
         var alias_buf: [32]u8 = undefined;
         const alias = graphQueryEffectiveAlias(step.alias, i, &alias_buf);
-        const table = if (i > 0 and
-            std.mem.eql(u8, edge_path[i - 1].target, node_path[i]))
-            traversal_mod.metadataTargetTable(edge_path[i - 1].metadata)
+        const table = if (i == 0)
+            null
+        else if (std.mem.eql(u8, edge_path[i - 1].target, node_path[i]))
+            try traversal_mod.metadataTargetTable(&table_scratch, edge_path[i - 1].metadata)
         else
-            null;
+            try traversal_mod.metadataSourceTable(&table_scratch, edge_path[i - 1].metadata);
         all_bindings[i] = try clonePatternBindingAlloc(
             alloc,
             alias,
@@ -2833,15 +2836,17 @@ fn collectAlgebraicReachabilityEdges(
         else
             try graph_index.getEdges(alloc, current.key, "", params.direction);
         defer graph_mod.GraphIndex.freeEdges(alloc, graph_edges);
+        var table_scratch = traversal_mod.MetadataScratch.init(alloc, work_budget);
+        defer table_scratch.deinit();
         if (work_budget) |budget| try budget.consumeMaterializedEdges(graph_edges);
         for (graph_edges) |edge| {
             if (!graphEdgeTypeAllowed(params.edge_types, edge.edge_type)) continue;
             if (!graphEdgeWeightAllowed(params, edge.weight)) continue;
             const next_key = if (std.mem.eql(u8, current.key, edge.source)) edge.target else edge.source;
             const target_table = if (std.mem.eql(u8, next_key, edge.target))
-                traversal_mod.metadataTargetTable(edge.metadata)
+                try traversal_mod.metadataTargetTable(&table_scratch, edge.metadata)
             else
-                null;
+                try traversal_mod.metadataSourceTable(&table_scratch, edge.metadata);
             // Stop the algebraic probe immediately. Its tensor vertices are
             // key-only, while this edge names a table-qualified identity.
             if (target_table != null) {

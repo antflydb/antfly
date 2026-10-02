@@ -1112,6 +1112,8 @@ fn matchExactTwoEdgePattern(
         false,
     );
     defer edge_reader.freeEdges(alloc, forward_edges);
+    var table_scratch = traversal_mod.MetadataScratch.init(alloc, work_budget);
+    defer table_scratch.deinit();
 
     const Candidate = struct {
         middle_key: []const u8,
@@ -1128,9 +1130,9 @@ fn matchExactTwoEdgePattern(
     defer candidates.deinit(alloc);
     for (forward_edges, 0..) |graph_edge, edge_index| {
         if (!try edgeMatchesBudgeted(alloc, graph_edge, prepared_steps[1].edge, work_budget)) continue;
-        if (traversal_mod.metadataTargetTable(graph_edge.metadata) != null) return null;
+        if ((try traversal_mod.metadataTargetTable(&table_scratch, graph_edge.metadata)) != null) return null;
         const middle_key = edgeTarget(graph_edge, start_key, pattern[1].edge.direction) orelse continue;
-        if (edgeTargetTable(null, graph_edge, middle_key) != null) return null;
+        if (try edgeTargetTable(&table_scratch, null, graph_edge, middle_key) != null) return null;
         if (!(try passesNodeFilter(.{ .table = null, .key = middle_key }, pattern[1].node_filter, opts.evaluator))) continue;
         try candidates.append(alloc, .{
             .middle_key = middle_key,
@@ -1201,7 +1203,9 @@ fn matchExactTwoEdgePattern(
             // A physical edge whose metadata changes node-table identity cannot
             // use this table-local plan. Release already-built results before
             // the successful null return hands control to generic expansion.
-            if (traversal_mod.metadataTargetTable(backward_edge.metadata) != null) {
+            if ((try traversal_mod.metadataTargetTable(&table_scratch, backward_edge.metadata)) != null or
+                (try edgeTargetTable(&table_scratch, null, backward_edge, target_key)) != null)
+            {
                 for (matches.items) |*match| match.deinit(alloc);
                 matches.deinit(alloc);
                 matches = .empty;
@@ -1399,6 +1403,8 @@ fn streamReachableNodes(
             defer edge_pages.deinit();
             while (!observer.full()) {
                 const edges = try edge_pages.nextBudget(work_budget, edge_stream.batch_records) orelse break;
+                var table_scratch = traversal_mod.MetadataScratch.init(alloc, work_budget);
+                defer table_scratch.deinit();
                 defer edge_reader.freeEdges(alloc, edges);
                 if (stats) |active| {
                     active.adjacency_reads += 1;
@@ -1419,7 +1425,8 @@ fn streamReachableNodes(
                     for (edges, 0..) |graph_edge, edge_index| {
                         if (!try edgeMatchesBudgeted(alloc, graph_edge, edge, work_budget)) continue;
                         const target_key = edgeTarget(graph_edge, frontier.key, edge.direction) orelse continue;
-                        const target_table = resolvedEdgeTargetTable(
+                        const target_table = try resolvedEdgeTargetTable(
+                            &table_scratch,
                             edge_reader,
                             frontier.table,
                             graph_edge,
@@ -1464,7 +1471,8 @@ fn streamReachableNodes(
                             if (!mask[edge_index]) continue;
                         } else if (!try edgeMatchesBudgeted(alloc, graph_edge, edge, work_budget)) continue;
                         const target_key = edgeTarget(graph_edge, frontier.key, edge.direction) orelse continue;
-                        const target_table = resolvedEdgeTargetTable(
+                        const target_table = try resolvedEdgeTargetTable(
+                            &table_scratch,
                             edge_reader,
                             frontier.table,
                             graph_edge,
@@ -1493,7 +1501,8 @@ fn streamReachableNodes(
 
                 for (edges, 0..) |graph_edge, edge_index| {
                     const target_key = edgeTarget(graph_edge, frontier.key, edge.direction) orelse continue;
-                    const target_table = resolvedEdgeTargetTable(
+                    const target_table = try resolvedEdgeTargetTable(
+                        &table_scratch,
                         edge_reader,
                         frontier.table,
                         graph_edge,
@@ -1588,10 +1597,12 @@ fn startNodeAdmitted(
     const incoming = try getEdgesForBudget(alloc, edge_reader, null, start_key, &.{}, .in, work_budget, false);
     defer edge_reader.freeEdges(alloc, incoming);
     try consumeMaterializedEdges(work_budget, incoming);
+    var table_scratch = traversal_mod.MetadataScratch.init(alloc, work_budget);
+    defer table_scratch.deinit();
     for (incoming) |graph_edge| {
         if (std.mem.eql(u8, graph_edge.target, start_key) and
             (admission.external_targets or
-                traversal_mod.metadataTargetTable(graph_edge.metadata) != null))
+                (try traversal_mod.metadataTargetTable(&table_scratch, graph_edge.metadata)) != null))
         {
             return true;
         }
@@ -1651,14 +1662,15 @@ fn edgeTarget(edge: graph_mod.Edge, current_key: []const u8, direction: graph_mo
 }
 
 fn edgeTargetTable(
+    scratch: *traversal_mod.MetadataScratch,
     current_table: ?[]const u8,
     edge: graph_mod.Edge,
     target_key: []const u8,
-) ?[]const u8 {
+) !?[]const u8 {
     if (std.mem.eql(u8, target_key, edge.target)) {
-        return traversal_mod.metadataTargetTable(edge.metadata) orelse current_table;
+        return (try traversal_mod.metadataTargetTable(scratch, edge.metadata)) orelse current_table;
     }
-    return current_table;
+    return (try traversal_mod.metadataSourceTable(scratch, edge.metadata)) orelse current_table;
 }
 
 /// Edge metadata names tables in the storage namespace, while match bindings
@@ -1668,12 +1680,13 @@ fn edgeTargetTable(
 /// distinct-identity sets. The compile-time capability check keeps local and
 /// serverless readers allocation- and dispatch-free.
 fn canonicalEdgeTargetTable(
+    scratch: *traversal_mod.MetadataScratch,
     edge_reader: anytype,
     current_table: ?[]const u8,
     edge: graph_mod.Edge,
     target_key: []const u8,
-) ?[]const u8 {
-    const table = edgeTargetTable(current_table, edge, target_key);
+) !?[]const u8 {
+    const table = try edgeTargetTable(scratch, current_table, edge, target_key);
     if (comptime @hasDecl(@TypeOf(edge_reader), "canonicalizeTable")) {
         return edge_reader.canonicalizeTable(table);
     }
@@ -1688,19 +1701,20 @@ fn canonicalizeNodeTable(edge_reader: anytype, table: ?[]const u8) ?[]const u8 {
 }
 
 fn resolvedEdgeTargetTable(
+    scratch: *traversal_mod.MetadataScratch,
     edge_reader: anytype,
     current_table: ?[]const u8,
     graph_edge: graph_mod.Edge,
     target_key: []const u8,
     traversal: PhysicalEdgeTraversal,
-) ?[]const u8 {
+) !?[]const u8 {
     if (traversal.incoming_source != null and
         traversal.step.direction == .in and
         std.mem.eql(u8, target_key, graph_edge.source))
     {
         return canonicalizeNodeTable(edge_reader, traversal.incoming_source.?.table);
     }
-    return canonicalEdgeTargetTable(edge_reader, current_table, graph_edge, target_key);
+    return canonicalEdgeTargetTable(scratch, edge_reader, current_table, graph_edge, target_key);
 }
 
 fn declaredNodeTableMatches(edge_reader: anytype, actual: ?[]const u8, declared: ?[]const u8) bool {

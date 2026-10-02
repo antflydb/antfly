@@ -3211,6 +3211,7 @@ const CanonicalGraphStep = struct {
     group_ids: []u64,
     node_count: usize,
     array_lease: graph_work_budget.RetainedLease,
+    table_scratch: graph_traversal_mod.MetadataScratch,
     metrics_lease: graph_work_budget.RetainedLease = .{},
 
     fn visibleNodes(self: @This()) []const graph_query_mod.GraphResultNode {
@@ -3227,6 +3228,7 @@ const CanonicalGraphStep = struct {
         alloc.free(self.group_ids);
         graph_mod.GraphIndex.freeEdges(alloc, self.edges);
         self.metrics_lease.deinit();
+        self.table_scratch.deinit();
         self.array_lease.deinit();
         self.* = undefined;
     }
@@ -3270,6 +3272,8 @@ fn canonicalGraphStepAlloc(
     const group_ids = try alloc.alloc(u64, capacity);
     errdefer alloc.free(group_ids);
     var node_count: usize = 0;
+    var table_scratch = graph_traversal_mod.MetadataScratch.init(alloc, work_budget);
+    errdefer table_scratch.deinit();
     var edge_bytes: usize = 0;
     for (edges) |edge| {
         edge_bytes = std.math.add(usize, edge_bytes, graphEdgeOwnedBytes(edge)) catch
@@ -3286,9 +3290,9 @@ fn canonicalGraphStepAlloc(
         const forward = std.mem.eql(u8, key, edge.source);
         const adjacent = if (forward) edge.target else edge.source;
         const declared_table = if (forward)
-            graph_traversal_mod.metadataTargetTable(edge.metadata)
+            try graph_traversal_mod.metadataTargetTable(&table_scratch, edge.metadata)
         else
-            graph_traversal_mod.metadataSourceTable(edge.metadata);
+            try graph_traversal_mod.metadataSourceTable(&table_scratch, edge.metadata);
         path_edges[node_count] = .{
             .source = edge.source,
             .target = edge.target,
@@ -3312,7 +3316,7 @@ fn canonicalGraphStepAlloc(
     try work_budget.consumeEdgeBytes(edge_bytes);
     try work_budget.consumeNodes(node_count);
     try work_budget.consumeEdges(node_count);
-    return .{ .edges = edges, .nodes = nodes, .path_edges = path_edges, .group_ids = group_ids, .node_count = node_count, .array_lease = array_lease };
+    return .{ .edges = edges, .nodes = nodes, .path_edges = path_edges, .group_ids = group_ids, .node_count = node_count, .array_lease = array_lease, .table_scratch = table_scratch };
 }
 
 fn attachCanonicalGraphStepMetrics(
@@ -4817,8 +4821,10 @@ fn executeDistributedShortestPath(
 
     var output_retained_bytes: usize = 0;
     if (path_result) |result| {
-        output_retained_bytes = graphResultNodeFromPathRetainedBytes(result.path) catch
-            return request_work_budget.exhaust(.retained_state_bytes, request_work_budget.max_retained_state_bytes);
+        output_retained_bytes = graphResultNodeFromPathRetainedBytes(alloc, result.path, request_work_budget) catch |err| switch (err) {
+            error.Overflow => return request_work_budget.exhaust(.retained_state_bytes, request_work_budget.max_retained_state_bytes),
+            else => return err,
+        };
         output_retained_bytes = std.math.add(
             usize,
             output_retained_bytes,
@@ -4830,7 +4836,7 @@ fn executeDistributedShortestPath(
     errdefer output_lease.deinit();
 
     const nodes = if (path_result) |result| blk: {
-        var node = try graphPathToResultNode(alloc, result.path);
+        var node = try graphPathToResultNode(alloc, result.path, request_work_budget);
         errdefer node.deinit(alloc);
         const out = try alloc.alloc(graph_query_mod.GraphResultNode, 1);
         out[0] = node;
@@ -5119,8 +5125,10 @@ fn executeDistributedKShortestPaths(
         out_nodes_retained_bytes = std.math.add(
             usize,
             out_nodes_retained_bytes,
-            graphResultNodeFromPathRetainedBytes(result.path) catch
-                return request_work_budget.exhaust(.retained_state_bytes, request_work_budget.max_retained_state_bytes),
+            graphResultNodeFromPathRetainedBytes(alloc, result.path, request_work_budget) catch |err| switch (err) {
+                error.Overflow => return request_work_budget.exhaust(.retained_state_bytes, request_work_budget.max_retained_state_bytes),
+                else => return err,
+            },
         ) catch return request_work_budget.exhaust(.retained_state_bytes, request_work_budget.max_retained_state_bytes);
     }
     var out_nodes_lease = try graph_work_budget.RetainedLease.init(request_work_budget, out_nodes_retained_bytes);
@@ -5132,7 +5140,7 @@ fn executeDistributedKShortestPaths(
         alloc.free(out_nodes);
     }
     for (results.items, 0..) |path, i| {
-        out_nodes[i] = try graphPathToResultNode(alloc, path.path);
+        out_nodes[i] = try graphPathToResultNode(alloc, path.path, request_work_budget);
         out_nodes_initialized += 1;
     }
 
@@ -8274,13 +8282,16 @@ fn edgeWeightFromNode(node: graph_query_mod.GraphResultNode) f64 {
 fn graphPathToResultNode(
     alloc: std.mem.Allocator,
     path: db_mod.types.GraphPath,
+    work_budget: ?*graph_work_budget.WorkBudget,
 ) !graph_query_mod.GraphResultNode {
+    var table_scratch = graph_traversal_mod.MetadataScratch.init(alloc, work_budget);
+    defer table_scratch.deinit();
     const target_key = if (path.nodes.len > 0) path.nodes[path.nodes.len - 1] else "";
     const target_table = if (path.nodes.len > 0 and path.node_tables.len == path.nodes.len)
         path.node_tables[path.node_tables.len - 1]
     else if (path.edges.len > 0 and
         std.mem.eql(u8, path.edges[path.edges.len - 1].target, target_key))
-        graph_traversal_mod.metadataTargetTable(path.edges[path.edges.len - 1].metadata)
+        try graph_traversal_mod.metadataTargetTable(&table_scratch, path.edges[path.edges.len - 1].metadata)
     else
         null;
     const nodes = try dupPath(alloc, path.nodes);
@@ -8308,7 +8319,9 @@ fn graphPathToResultNode(
     );
 }
 
-fn graphResultNodeFromPathRetainedBytes(path: db_mod.types.GraphPath) !usize {
+fn graphResultNodeFromPathRetainedBytes(alloc: std.mem.Allocator, path: db_mod.types.GraphPath, work_budget: ?*graph_work_budget.WorkBudget) !usize {
+    var table_scratch = graph_traversal_mod.MetadataScratch.init(alloc, work_budget);
+    defer table_scratch.deinit();
     var total: usize = @sizeOf(graph_query_mod.GraphResultNode);
     if (path.nodes.len > 0) {
         const target_key = path.nodes[path.nodes.len - 1];
@@ -8316,7 +8329,7 @@ fn graphResultNodeFromPathRetainedBytes(path: db_mod.types.GraphPath) !usize {
         const target_table: ?[]const u8 = if (graphPathNodeTable(path, path.nodes.len - 1)) |table|
             table
         else if (path.edges.len > 0 and std.mem.eql(u8, path.edges[path.edges.len - 1].target, target_key))
-            graph_traversal_mod.metadataTargetTable(path.edges[path.edges.len - 1].metadata)
+            try graph_traversal_mod.metadataTargetTable(&table_scratch, path.edges[path.edges.len - 1].metadata)
         else
             null;
         if (target_table) |table|
@@ -9042,7 +9055,7 @@ test "distributed shortest path identity and endpoint retain table provenance" {
     defer alloc.free(entity_key);
     try std.testing.expect(!std.mem.eql(u8, source_key, entity_key));
 
-    var result_node = try graphPathToResultNode(alloc, entity_path);
+    var result_node = try graphPathToResultNode(alloc, entity_path, null);
     defer result_node.deinit(alloc);
     try std.testing.expectEqualStrings("same", result_node.key);
     try std.testing.expectEqualStrings("entities", result_node.table.?);

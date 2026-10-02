@@ -5567,7 +5567,7 @@ fn toOpenApiGraphPathEdges(
         } else if (connects_in_order != connects_in_reverse)
             (if (connects_in_order) .out else .in)
         else
-            try graphPathEdgeDirectionForEqualKeys(node_tables, i, edge.metadata);
+            try graphPathEdgeDirectionForEqualKeys(alloc, node_tables, i, edge.metadata);
         out[i] = .{
             .from = .{
                 .key = left_key,
@@ -5589,6 +5589,7 @@ fn toOpenApiGraphPathEdges(
 }
 
 fn graphPathEdgeDirectionForEqualKeys(
+    alloc: std.mem.Allocator,
     node_tables: []const ?[]const u8,
     edge_index: usize,
     metadata: []const u8,
@@ -5600,7 +5601,9 @@ fn graphPathEdgeDirectionForEqualKeys(
         const left_table = node_tables[edge_index];
         const right_table = node_tables[edge_index + 1];
         if (!optionalStringEqual(left_table, right_table)) {
-            const target_table = graph_traversal_mod.metadataTargetTable(metadata) orelse
+            var table_scratch = graph_traversal_mod.MetadataScratch.init(alloc, null);
+            defer table_scratch.deinit();
+            const target_table = (try graph_traversal_mod.metadataTargetTable(&table_scratch, metadata)) orelse
                 return error.InvalidRemoteResponse;
             var left_is_target = optionalStringEqualsValue(left_table, target_table);
             var right_is_target = optionalStringEqualsValue(right_table, target_table);

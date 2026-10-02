@@ -142,6 +142,20 @@ legacy relationship deletion, cleanup, transforms, document transaction
 prepares, committed transaction decisions, and merge pages. Classification occurs before proposal even when retirement records
 are absent from the input. Ordinary artifact-only batches retain their existing
 protocol requirements.
+
+HA batch mutation envelope V20 independently protects that complete graph apply
+contract, including document-derived effects, on both unordered and ordinary-Raft
+replay. Its `apply_schema_version` retains the original control schema and exact
+receipts; older standbys reject V20 before applying rows. New decoders can still
+read historical envelopes. Duplicate ordinary replay projects only the completion
+proof and envelope versions, without copying document or artifact payloads.
+
+Endpoint routing reads only unique root `source_table` and `target_table` JSON
+strings. Nested evidence fields cannot redirect traversal. Whitespace and JSON
+escapes are supported in names and keys; malformed or ambiguous tags have no
+routing authority. Plain names borrow metadata, while decoded names use scoped,
+budgeted scratch shared by traversal, paths, patterns, and distributed expansion.
+
 Physical splits rebuild the incoming directory and retirement accounting on both
 the child and retained parent before graph work resumes. Clearing and rebuilding
 use bounded, durable pages; incomplete directories conservatively check primary
