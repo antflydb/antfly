@@ -233,3 +233,55 @@ test "query wake barrier bounds redirected queries with one total budget" {
     try std.testing.expect(std.Io.Clock.awake.now(io).nanoseconds - start < 330 * std.time.ns_per_ms);
     try std.testing.expectEqualSlices(usize, &.{ 1, 1 }, server.route_hits);
 }
+
+test "query wake barrier retries incomplete bodies without accepting incomplete chunk framing" {
+    const httpx = client_mod.httpx;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const json = "{\"responses\":[{\"status\":200,\"took\":0}]}";
+    const chunks = try std.fmt.allocPrint(alloc, "{x}\r\n{s}\r\n0\r\n\r\n", .{ json.len, json });
+    defer alloc.free(chunks);
+    for ([_]bool{ false, true }) |chunked| {
+        var server = try httpx.TestServer.start(alloc, io, &.{
+            .{ .method = .POST, .path = "/db/v1/tables/docs/query", .max_uses = 1, .respond = .{ .body = if (chunked) chunks else json, .chunked = chunked, .truncate_body_at = if (chunked) chunks.len - 5 else 8 } },
+            .{ .method = .POST, .path = "/db/v1/tables/docs/query", .respond = .{ .body = json } },
+        });
+        defer server.deinit();
+        const Task = struct {
+            fn serve(ts: *httpx.TestServer) std.Io.Cancelable!void {
+                for (0..2) |_| ts.handleOne() catch return;
+            }
+        };
+        var group: std.Io.Group = .init;
+        try group.concurrent(io, Task.serve, .{&server});
+        defer group.cancel(io);
+        var http = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+        defer http.deinit();
+        var client = try client_mod.AntflyClient.init(alloc, &http, server.baseUrl());
+        defer client.deinit();
+        var response = try wait(io, &client, "docs", .{}, 2000);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status_code);
+        try std.testing.expectEqualSlices(usize, &.{ 1, 1 }, server.route_hits);
+    }
+}
+
+test "query wake barrier does not retry malformed framing or complete invalid JSON" {
+    const httpx = client_mod.httpx;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |chunked| {
+        var server = try httpx.TestServer.start(alloc, io, &.{
+            .{ .method = .POST, .path = "/db/v1/tables/docs/query", .respond = .{ .body = if (chunked) "z\r\n" else "{broken", .chunked = chunked } },
+        });
+        defer server.deinit();
+        var serving = try io.concurrent(httpx.TestServer.handleOne, .{&server});
+        defer serving.cancel(io) catch {};
+        var http = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+        defer http.deinit();
+        var client = try client_mod.AntflyClient.init(alloc, &http, server.baseUrl());
+        defer client.deinit();
+        try std.testing.expectError(if (chunked) error.InvalidResponse else error.InvalidApiResponse, wait(io, &client, "docs", .{}, 2000));
+        try std.testing.expectEqualSlices(usize, &.{1}, server.route_hits);
+    }
+}

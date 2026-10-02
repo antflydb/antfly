@@ -35,6 +35,8 @@ pub const ResponseSpec = struct {
     status: u16 = 200,
     headers: []const HeaderPair = &.{},
     body: ?[]const u8 = null,
+    /// Body contains transfer-encoded wire bytes; do not emit Content-Length.
+    chunked: bool = false,
     content_type: ?[]const u8 = null,
     /// Delay the response on the borrowed `std.Io` clock. This is logical time
     /// under VoprIo and wall time under Threaded.
@@ -262,7 +264,13 @@ pub const TestServer = struct {
 
         var header_buffer = Io.Writer.Allocating.init(alloc);
         defer header_buffer.deinit();
-        try header_buffer.writer.print("HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n", .{ spec.status, reason, ct, body.len });
+        try header_buffer.writer.print("HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\n", .{ spec.status, reason, ct });
+        if (spec.chunked) {
+            try header_buffer.writer.writeAll("Transfer-Encoding: chunked\r\n");
+        } else {
+            try header_buffer.writer.print("Content-Length: {d}\r\n", .{body.len});
+        }
+        try header_buffer.writer.writeAll("Connection: close\r\n");
         for (spec.headers) |entry| try header_buffer.writer.print("{s}: {s}\r\n", .{ entry.name, entry.value });
         try header_buffer.writer.writeAll("\r\n");
         const header = header_buffer.written();

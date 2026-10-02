@@ -3233,6 +3233,17 @@ pub const Client = struct {
         return res;
     }
 
+    /// Recover errors hidden by Io.Reader's narrow error set. In particular,
+    /// incomplete framing is retryable transport truncation; invalid chunk
+    /// syntax is a terminal protocol error. TLS errors are checked first.
+    fn checkBodyFramingError(parser: *const Parser, content_length: *const ContentLengthReader, chunked: *const ChunkedBodyReader) !void {
+        if (parser.chunked) {
+            try chunked.checkReadError();
+        } else if (parser.content_length != null) {
+            try content_length.checkReadError();
+        }
+    }
+
     /// Builds a Response by streaming the body through an Io.Reader chain.
     /// After headers are parsed, the chain is: leftover bytes → network → framing → decompress → output.
     fn buildStreamingResponse(
@@ -3319,6 +3330,7 @@ pub const Client = struct {
             while (true) {
                 const n = readSomeOnce(framed_reader, &read_buf) catch |err| {
                     if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                    try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                     if (err == error.EndOfStream) break;
                     if (err == error.ReadFailed and close_delimited_body) break;
                     return error.InvalidResponse;
@@ -3347,6 +3359,7 @@ pub const Client = struct {
             while (true) {
                 const n = readSomeOnce(framed_reader, &read_buf) catch |err| {
                     if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                    try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                     if (err == error.EndOfStream) break;
                     if (err == error.ReadFailed and close_delimited_body) break;
                     return error.InvalidResponse;
@@ -3438,6 +3451,7 @@ pub const Client = struct {
             while (true) {
                 const n = readSomeOnce(framed_reader, &read_buf) catch |err| {
                     if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                    try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                     if (err == error.EndOfStream) break;
                     if (err == error.ReadFailed and close_delimited_body) break;
                     return error.InvalidResponse;
@@ -3455,6 +3469,7 @@ pub const Client = struct {
             while (encoded_prefix_len < encoded_prefix.len) {
                 const n = readSomeOnce(framed_reader, encoded_prefix[encoded_prefix_len..]) catch |err| {
                     if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                    try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                     if (err == error.EndOfStream) break;
                     if (err == error.ReadFailed and close_delimited_body) break;
                     return error.InvalidResponse;
@@ -3476,6 +3491,7 @@ pub const Client = struct {
                 while (true) {
                     const n = readSomeOnce(&encoded_reader.reader_iface, &read_buf) catch |err| {
                         if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                        try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                         if (err == error.EndOfStream) break;
                         if (err == error.ReadFailed and close_delimited_body) break;
                         return error.InvalidResponse;
@@ -3514,6 +3530,7 @@ pub const Client = struct {
                 while (true) {
                     const n = decompressor.reader.readSliceShort(&read_buf) catch |err| {
                         if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                        try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                         if (err == error.EndOfStream) break;
                         if (err == error.ReadFailed and close_delimited_body) break;
                         return error.DecompressionFailed;
@@ -3536,6 +3553,7 @@ pub const Client = struct {
             while (true) {
                 const n = readSomeOnce(framed_reader, &read_buf) catch |err| {
                     if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                    try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                     if (err == error.EndOfStream) break;
                     if (err == error.ReadFailed and close_delimited_body) break;
                     return error.InvalidResponse;
@@ -3560,6 +3578,21 @@ pub const Client = struct {
             _ = res.headers.remove(HeaderName.CONTENT_LENGTH);
         }
 
+        // A decoder can finish before the HTTP terminal chunk/trailers.
+        // Validate that framing without buffering or publishing extra bytes.
+        if (content_coding != null and (parser.chunked or parser.content_length != null)) {
+            var discarded: usize = 0;
+            while (true) {
+                const n = readSomeOnce(framed_reader, &read_buf) catch |err| {
+                    if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                    try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
+                    if (err == error.EndOfStream) break;
+                    return err;
+                };
+                if (n == 0) break;
+                discarded = try checkedResponseSize(discarded, n, max_response_size);
+            }
+        }
         return res;
     }
 
@@ -6262,5 +6295,109 @@ test "request redirects preserve unlimited budgets and successful response owner
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 200), response.status.code);
         try std.testing.expectEqualStrings("ready", if (to_writer) output.items else response.body.?);
+    }
+}
+
+test "client body framing preserves truncation and syntax errors without replaying streamed output" {
+    const TestServer = @import("../testing.zig").TestServer;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const Case = struct { body: []const u8, chunked: bool = false, truncate: ?usize = null, expected: anyerror };
+    for ([_]bool{ false, true }) |to_writer| {
+        for ([_]Case{
+            .{ .body = "ready", .truncate = 2, .expected = error.UnexpectedEof },
+            .{ .body = "5\r\nready\r\n", .chunked = true, .expected = error.UnexpectedEof },
+            .{ .body = "5\r\nre", .chunked = true, .expected = error.UnexpectedEof },
+            .{ .body = "0\r\n", .chunked = true, .expected = error.UnexpectedEof },
+            .{ .body = "z\r\n", .chunked = true, .expected = error.InvalidResponse },
+            .{ .body = "1\r\nx!", .chunked = true, .expected = error.InvalidResponse },
+        }) |case| {
+            var server = try TestServer.start(alloc, io, &.{
+                .{ .path = "/", .respond = .{ .body = case.body, .chunked = case.chunked, .truncate_body_at = case.truncate } },
+            });
+            defer server.deinit();
+            var serving = try io.concurrent(TestServer.handleOne, .{&server});
+            defer serving.cancel(io) catch {};
+            var client = Client.initWithConfig(alloc, io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = if (to_writer) 3 else 0 } });
+            defer client.deinit();
+            var output = std.ArrayListUnmanaged(u8).empty;
+            defer output.deinit(alloc);
+            if (to_writer) {
+                try std.testing.expectError(case.expected, client.getToWriter(server.baseUrl(), .{}, arrayListWriter(&output, alloc), null, null));
+            } else {
+                try std.testing.expectError(case.expected, client.get(server.baseUrl(), .{}));
+            }
+            try std.testing.expectEqualSlices(usize, &.{1}, server.route_hits);
+        }
+    }
+}
+
+test "client compressed bodies validate complete HTTP framing before success" {
+    const TestServer = @import("../testing.zig").TestServer;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    // gzip.compress(b"ready", mtime=0), including its checksum/footer.
+    const encoded = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x2b\x4a\x4d\x4c\xa9\x04\x00\xaf\x85\x95\x28\x05\x00\x00\x00";
+    const complete = try std.fmt.allocPrint(alloc, "{x}\r\n{s}\r\n0\r\n\r\n", .{ encoded.len, encoded });
+    defer alloc.free(complete);
+    for ([_]bool{ false, true }) |to_writer| {
+        for ([_]bool{ false, true }) |chunked| {
+            for ([_]bool{ false, true }) |truncated| {
+                const wire = if (chunked) complete else encoded;
+                var server = try TestServer.start(alloc, io, &.{
+                    .{ .path = "/", .respond = .{ .body = wire, .chunked = chunked, .truncate_body_at = if (truncated) wire.len - (if (chunked) @as(usize, 5) else 2) else null, .headers = &.{.{ .name = "Content-Encoding", .value = "gzip" }} } },
+                });
+                defer server.deinit();
+                var serving = try io.concurrent(TestServer.handleOne, .{&server});
+                defer serving.cancel(io) catch {};
+                var client = Client.initWithConfig(alloc, io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+                defer client.deinit();
+                var output = std.ArrayListUnmanaged(u8).empty;
+                defer output.deinit(alloc);
+                const result = if (to_writer)
+                    client.getToWriter(server.baseUrl(), .{}, arrayListWriter(&output, alloc), null, null)
+                else
+                    client.get(server.baseUrl(), .{});
+                if (truncated) {
+                    try std.testing.expectError(error.UnexpectedEof, result);
+                } else {
+                    var response = try result;
+                    defer response.deinit();
+                    try std.testing.expectEqualStrings("ready", if (to_writer) output.items else response.body.?);
+                }
+            }
+        }
+    }
+}
+
+test "client body replay preserves method safety after truncation" {
+    const TestServer = @import("../testing.zig").TestServer;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]types.Method{ .GET, .POST }) |method| {
+        var server = try TestServer.start(alloc, io, &.{
+            .{ .method = method, .path = "/", .max_uses = 1, .respond = .{ .body = "ready", .truncate_body_at = 2 } },
+            .{ .method = method, .path = "/", .respond = .{ .body = "ready" } },
+        });
+        defer server.deinit();
+        const Task = struct {
+            fn serve(ts: *TestServer) Io.Cancelable!void {
+                for (0..2) |_| ts.handleOne() catch return;
+            }
+        };
+        var group: Io.Group = .init;
+        try group.concurrent(io, Task.serve, .{&server});
+        defer group.cancel(io);
+        var client = Client.initWithConfig(alloc, io, .{ .keep_alive = false, .retry_policy = .{ .initial_delay_ms = 1 } });
+        defer client.deinit();
+        if (method == .GET) {
+            var response = try client.request(method, server.baseUrl(), .{});
+            defer response.deinit();
+            try std.testing.expectEqualStrings("ready", response.body.?);
+            try std.testing.expectEqualSlices(usize, &.{ 1, 1 }, server.route_hits);
+        } else {
+            try std.testing.expectError(error.UnexpectedEof, client.request(method, server.baseUrl(), .{}));
+            try std.testing.expectEqualSlices(usize, &.{ 1, 0 }, server.route_hits);
+        }
     }
 }
