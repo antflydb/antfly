@@ -44,6 +44,9 @@ Both graph callback regressions and the native clock/replay regression passed
 Aggregate test ownership is audited against the original selected union. The
 shared module gates own their contract tests; implementation gates receive
 explicit runtime dependencies and exclude only tests executed by another gate.
+Six ordered merge/split regressions belong to the server storage integration
+gate; the data-runtime selector no longer demands those absent declarations.
+The final audit retains all 19,046 named tests with zero repeated executions.
 Focused targets keep their original selections. Public API fixtures with local
 database mocks now declare standalone deployment explicitly, while the restore
 binding fixture authoritatively answers the no-policy publication probe.
