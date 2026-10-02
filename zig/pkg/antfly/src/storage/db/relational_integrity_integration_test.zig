@@ -1170,7 +1170,10 @@ test "relational integrity accepted generation survives restart and bounded two-
         split.role = .split_source;
         split.transition_id += 1;
         split.admission_epoch += 1;
-        try std.testing.expectError(error.IntegrityTopologyBusy, db.applyRelationalTopologyControl(.{ .fence = split, .action = .begin }, null));
+        // The owner's retirement activation is already durable but not yet
+        // metadata-acknowledged: that specific, actionable reason takes
+        // precedence over the generic busy fence mismatch.
+        try std.testing.expectError(error.GenerationRetirementAcknowledgementPending, db.applyRelationalTopologyControl(.{ .fence = split, .action = .begin }, null));
         try std.testing.expectError(error.GenerationAdmissionActivationRequired, db.applyRelationalTopologyControl(.{ .fence = fence, .action = .release }, null));
         try std.testing.expectError(error.GenerationAdmissionActivationRequired, db.applyRelationalTopologyControl(.{ .fence = fence, .action = .cancel }, null));
         const gc_before_ack = try db.core.store.get(alloc, retirement.gc_progress_key);
