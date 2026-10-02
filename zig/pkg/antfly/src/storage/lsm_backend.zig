@@ -42,8 +42,8 @@ const wal_mod = @import("lsm_backend/wal.zig");
 const internal_keys = @import("internal_keys.zig");
 const resource_manager_mod = @import("resource_manager.zig");
 const platform_time = @import("antfly_platform").time;
-const fs_paths = @import("../common/fs_paths.zig");
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const native_artifact_sink = @import("native_artifact_sink.zig");
 
 comptime {

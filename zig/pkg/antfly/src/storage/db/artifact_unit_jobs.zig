@@ -767,7 +767,7 @@ test "ordered artifact inventory document worker fairly resumes nonempty childre
     var ordered = try db.artifactInventoryCommand(alloc);
     defer ordered.catalogs.deinit(alloc);
     ordered.binding.effect_protocol = 15;
-    try db.batchRaftReplicatedApply(.{ .artifact_catalog = ordered }, .{ .term = 1, .index = 1 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .artifact_catalog = ordered }, .{ .term = 1, .index = 1 });
     var writer = try db.core.store.beginWriteTxn();
     var writer_open = true;
     defer if (writer_open) writer.abort();

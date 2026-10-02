@@ -30,7 +30,7 @@ pub const ApiError = error{
 /// Borrowed cancellation source. The owner must keep `ptr` alive for the
 /// complete operation call. A callback keeps the kernel independent of the
 /// transport's concrete cancellation representation.
-pub const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+pub const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 /// Authenticated identity projected into an operation. Permissions stay in
 /// the authorization policy layer; operations receive only the identity they
@@ -124,10 +124,10 @@ pub const RequestContext = struct {
     /// Absolute monotonic deadline. This deliberately does not use a wall
     /// clock or a transport timeout duration.
     deadline_ns: ?u64 = null,
-    deadline_io: ?@import("../runtime_io_abi.zig").Borrow = null,
+    deadline_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
     /// Execution capability for bounded request fanout. Independent of the
     /// deadline clock: native-monotonic HTTP budgets can still schedule Io.
-    fanout_io: ?@import("../runtime_io_abi.zig").Borrow = null,
+    fanout_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
     /// Borrowed request identity used for correlation. An empty value means
     /// the caller did not supply one; adapters may generate one in middleware.
     request_id: []const u8 = "",

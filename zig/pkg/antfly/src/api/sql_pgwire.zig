@@ -28,7 +28,7 @@ const catalog = @import("../sql/catalog.zig");
 const ast = @import("../sql/ast.zig");
 const operation = @import("operation.zig");
 const usermgr = @import("../usermgr/mod.zig");
-const io_abi = @import("../runtime_io_abi.zig");
+const io_abi = @import("antfly_runtime_abi").io_abi;
 const Mac = std.crypto.auth.hmac.sha2.HmacSha256;
 const credential_domain = "antfly.pgwire.password-session.v1";
 
@@ -799,7 +799,7 @@ const Job = struct {
             return;
         }
         const parameters = try normalizeParameters(self.alloc, self.request.parameters, self.request.parameter_types);
-        var result = native_adapter.execute(self.alloc, compiled, parameters, .{ .result_rows = self.request.limit, .page_rows = 4096 }, guarded.backend()) catch |err| {
+        var result = native_adapter.execute(self.alloc, compiled, parameters, .{ .result_rows = self.request.limit }, guarded.backend()) catch |err| {
             if (self.request.diagnostics) |diagnostic| diagnostic.transaction_status = @enumFromInt(@intFromEnum(native_adapter.transaction_status));
             if (err == error.SqlMutationOutcomeUnknown or err == error.SqlTransactionOutcomeUnknown or err == error.SessionLeaseLost) if (self.request.diagnostics) |diagnostic|
                 diagnostic.set("40003", "transaction outcome is unknown; do not replay this statement", native_adapter.outcome_transaction_id, false);

@@ -19,7 +19,7 @@ const std = @import("std");
 const ledger = @import("online_source.zig");
 const seal = @import("native_backup_seal.zig");
 const backup = @import("native_backup.zig");
-const fs = @import("../../common/fs_paths.zig");
+const fs = @import("antfly_runtime_fs").fs_paths;
 const state = @import("../source_pin_state.zig");
 const snapshot = @import("../source_snapshot.zig");
 const portable = @import("../portable_backup.zig");
@@ -568,12 +568,12 @@ test "relational index system source pin cancellation releases a prepared cut be
     const scope: ledger.Scope = .{ .fence = .{ .role = .merge_source, .transition_id = 78, .attempt = 1, .admission_epoch = owner.next_epoch, .peer_group_id = 3, .owner_group_id = 2, .namespace = owner.namespace, .catalog_digest = owner.catalog_digest }, .receiver_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .consumer_epoch = 1, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } };
     test_failure = .after_prepare;
     defer test_failure = .none;
-    try std.testing.expectError(error.InjectedSourcePinFailure, db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 }));
+    try std.testing.expectError(error.InjectedSourcePinFailure, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 }));
     test_failure = .none;
-    try db.batchRaftReplicatedApply(.{ .online_source = .{ .release = scope } }, .{ .term = 1, .index = 2 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .release = scope } }, .{ .term = 1, .index = 2 });
     try std.testing.expectEqual(.released, (try db.onlineSourceStatus(scope)).phase);
-    try db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 });
-    try db.batchRaftReplicatedApply(.{ .timestamp_ns = 1, .writes = &.{.{ .key = "a", .value = "{\"ok\":true}" }} }, .{ .term = 1, .index = 3 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .timestamp_ns = 1, .writes = &.{.{ .key = "a", .value = "{\"ok\":true}" }} }, .{ .term = 1, .index = 3 });
     db.close();
     db = try DB.open(alloc, path, options);
     try std.testing.expectEqual(.released, (try db.onlineSourceStatus(scope)).phase);
@@ -591,7 +591,7 @@ test "relational index system source pin interrupted cleanup reserves slot acros
     try db.setSchemaJson(alloc, "{}");
     const owner = try db.relationalTopologyIdentity();
     const scope: ledger.Scope = .{ .fence = .{ .role = .merge_source, .transition_id = 79, .attempt = 1, .admission_epoch = owner.next_epoch, .peer_group_id = 3, .owner_group_id = 2, .namespace = owner.namespace, .catalog_digest = owner.catalog_digest }, .receiver_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .consumer_epoch = 1, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } };
-    try db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 });
     const old_location = try locate(&db, scope);
     const old_slot = old_location.slot;
     const old_root = try pathAlloc(alloc, path, scope);
@@ -608,7 +608,7 @@ test "relational index system source pin interrupted cleanup reserves slot acros
     garbage_dir.close(std.testing.io);
     test_failure = .before_cleanup;
     defer test_failure = .none;
-    try std.testing.expectError(error.InjectedSourcePinFailure, db.batchRaftReplicatedApply(.{ .online_source = .{ .release = scope } }, .{ .term = 1, .index = 2 }));
+    try std.testing.expectError(error.InjectedSourcePinFailure, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .release = scope } }, .{ .term = 1, .index = 2 }));
     try std.testing.expect(try exists(std.testing.io, old_root));
     var next = scope;
     next.consumer_epoch = 2;
@@ -621,18 +621,18 @@ test "relational index system source pin interrupted cleanup reserves slot acros
         defer exporting.deinit();
         // Admission's fair cleanup pass skips an exporting slot without
         // blocking the apply fence, and cannot erase its cleanup ownership.
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = next } } }, .{ .term = 1, .index = 3 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = next } } }, .{ .term = 1, .index = 3 });
         try std.testing.expect(old_slot != (try locate(&db, next)).slot);
         try std.testing.expect(try exists(std.testing.io, old_root));
         const next_slot = (try locate(&db, next)).slot;
         test_failure = .before_cleanup;
-        try std.testing.expectError(error.InjectedSourcePinFailure, db.batchRaftReplicatedApply(.{ .online_source = .{ .release = next } }, .{ .term = 1, .index = 4 }));
+        try std.testing.expectError(error.InjectedSourcePinFailure, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .release = next } }, .{ .term = 1, .index = 4 }));
         test_failure = .none;
         try drainCleanupForTest(&db, next);
         var third = scope;
         third.consumer_epoch = 3;
         third.copy_attempt.sequence = 3;
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = third } } }, .{ .term = 1, .index = 5 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = third } } }, .{ .term = 1, .index = 5 });
         // Busy first slot cannot starve a later ready cleanup.
         try std.testing.expectEqual(next_slot, (try locate(&db, third)).slot);
     }
@@ -662,7 +662,7 @@ test "relational index system source pin interrupted cleanup reserves slot acros
     }
     healthy_dir.close(std.testing.io);
     test_failure = .before_cleanup;
-    try std.testing.expectError(error.InjectedSourcePinFailure, db.batchRaftReplicatedApply(.{ .online_source = .{ .release = healthy } }, .{ .term = 1, .index = 6 }));
+    try std.testing.expectError(error.InjectedSourcePinFailure, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .release = healthy } }, .{ .term = 1, .index = 6 }));
     test_failure = .none;
     db.close();
     db = try DB.open(alloc, path, options);
@@ -680,7 +680,7 @@ test "relational index system source pin interrupted cleanup reserves slot acros
     // Useful later-slot work keeps the next pass prompt despite the earlier
     // damaged cursor, while zero-progress errors retain exponential backoff.
     try std.testing.expect(db.sourcePinCleanupStatus().next_attempt_ns <= @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_ms);
-    try db.batchRaftReplicatedApply(.{ .timestamp_ns = 7, .writes = &.{.{ .key = "healthy", .value = "{\"ok\":true}" }} }, .{ .term = 1, .index = 7 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .timestamp_ns = 7, .writes = &.{.{ .key = "healthy", .value = "{\"ok\":true}" }} }, .{ .term = 1, .index = 7 });
     for (0..100) |_| {
         attempt: {
             _ = reconcileReleasedWithBudget(&db, .{ .max_entries = 128, .max_metadata_bytes = 128 * 1024, .max_duration_ns = std.time.ns_per_s }) catch |err| {
@@ -700,10 +700,10 @@ test "relational index system source pin interrupted cleanup reserves slot acros
     var last = scope;
     last.consumer_epoch = 4;
     last.copy_attempt.sequence = 4;
-    try db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = last } } }, .{ .term = 1, .index = 8 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = last } } }, .{ .term = 1, .index = 8 });
     try std.testing.expectEqual(old_slot, (try locate(&db, last)).slot);
     try cleanupLocated(&db, old_location);
-    try db.batchRaftReplicatedApply(.{ .online_source = .{ .release = scope } }, .{ .term = 1, .index = 2 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .release = scope } }, .{ .term = 1, .index = 2 });
     try std.testing.expectEqual(.pinned, (try db.onlineSourceStatus(last)).snapshot_phase);
 }
 
@@ -752,7 +752,7 @@ test "relational index system source pin prepared reopen pages abandoned staging
         scope = .{ .fence = .{ .role = .merge_source, .transition_id = 89, .attempt = 1, .admission_epoch = owner.next_epoch, .peer_group_id = 3, .owner_group_id = 2, .namespace = owner.namespace, .catalog_digest = owner.catalog_digest }, .receiver_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .consumer_epoch = 1, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } };
         test_failure = .after_prepare;
         defer test_failure = .none;
-        try std.testing.expectError(error.InjectedSourcePinFailure, db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 }));
+        try std.testing.expectError(error.InjectedSourcePinFailure, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 }));
         const root = try pathAlloc(alloc, path, scope);
         defer alloc.free(root);
         const abandoned = try std.fmt.allocPrint(alloc, "{s}.staging/abandoned", .{root});
@@ -782,7 +782,7 @@ test "relational index system source pin prepared reopen pages abandoned staging
     const progress = try db.onlineSourceStatus(scope);
     try std.testing.expectEqual(.pinned, progress.snapshot_phase);
     try std.testing.expectEqual(@as(u64, 1), progress.admitted_applied_index);
-    try db.batchRaftReplicatedApply(.{ .timestamp_ns = 2, .writes = &.{.{ .key = "after", .value = "{\"ok\":true}" }} }, .{ .term = 1, .index = 2 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .timestamp_ns = 2, .writes = &.{.{ .key = "after", .value = "{\"ok\":true}" }} }, .{ .term = 1, .index = 2 });
 }
 
 test "relational index system source pin prepared crash blocks markers then reopens exact immutable artifact" {
@@ -805,7 +805,7 @@ test "relational index system source pin prepared crash blocks markers then reop
             var db = try db_mod.DB.open(alloc, path, options);
             defer db.close();
             try db.setSchemaJson(alloc, schema);
-            try db.batchRaftReplicatedApply(.{ .timestamp_ns = 111, .writes = &.{.{ .key = "a", .value = "{\"id\":1}" }} }, .{ .term = 1, .index = 1 });
+            try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .timestamp_ns = 111, .writes = &.{.{ .key = "a", .value = "{\"id\":1}" }} }, .{ .term = 1, .index = 1 });
             // A parent may already accept a child generation. Private source
             // decoding must still export its exact pinned row cut, without
             // making that accepted scope portable as a database backup.
@@ -852,10 +852,10 @@ test "relational index system source pin prepared crash blocks markers then reop
             scope = .{ .fence = .{ .role = .merge_source, .transition_id = 77, .attempt = 1, .admission_epoch = owner.next_epoch, .peer_group_id = 3, .owner_group_id = 2, .namespace = owner.namespace, .catalog_digest = owner.catalog_digest }, .receiver_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .consumer_epoch = 1, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } };
             test_failure = point;
             defer test_failure = .none;
-            try std.testing.expectError(error.InjectedSourcePinFailure, db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 2 }));
+            try std.testing.expectError(error.InjectedSourcePinFailure, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 2 }));
             try std.testing.expectEqual(.prepared, (try db.onlineSourceStatus(scope)).snapshot_phase);
-            try std.testing.expectError(error.OnlineSourcePinPending, db.batchRaftReplicatedApply(.{ .transaction = .{ .prepare = .{ .txn_id = @splat(4), .topology_epoch = 1 } } }, .{ .term = 1, .index = 3 }));
-            try std.testing.expectError(error.OnlineSourcePinPending, db.batchRaftReplicatedApply(.{}, .{ .term = 1, .index = 3 }));
+            try std.testing.expectError(error.OnlineSourcePinPending, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .transaction = .{ .prepare = .{ .txn_id = @splat(4), .topology_epoch = 1 } } }, .{ .term = 1, .index = 3 }));
+            try std.testing.expectError(error.OnlineSourcePinPending, @import("../server_db_adapter.zig").applyOrdered(&db, .{}, .{ .term = 1, .index = 3 }));
             // Even direct transaction metadata cannot bypass the prepared gate.
             {
                 var txn = try db.core.store.beginWriteTxn();
@@ -868,10 +868,10 @@ test "relational index system source pin prepared crash blocks markers then reop
         var db = try db_mod.DB.open(alloc, path, options);
         defer db.close();
         try std.testing.expectEqual(.pinned, (try db.onlineSourceStatus(scope)).snapshot_phase);
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 2 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 2 });
         try db.setSchemaJson(alloc, schema);
         try std.testing.expectError(error.IntegrityTopologyBusy, db.setSchemaJson(alloc, changed));
-        try db.batchRaftReplicatedApply(.{ .timestamp_ns = 222, .writes = &.{.{ .key = "a", .value = "{\"id\":2}" }} }, .{ .term = 1, .index = 3 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .timestamp_ns = 222, .writes = &.{.{ .key = "a", .value = "{\"id\":2}" }} }, .{ .term = 1, .index = 3 });
         var canceled = std.atomic.Value(bool).init(true);
         try std.testing.expectError(error.Canceled, db.prepareOnlineSourcePublication(scope, Cancellation.fromAtomic(&canceled)));
         const root = try pathAlloc(alloc, path, scope);
@@ -963,7 +963,7 @@ test "relational index system source pin prepared crash blocks markers then reop
         try std.testing.expect(!std.mem.eql(u8, pinned_primary, live_primary));
         // Distinct later live writes cannot alter the certified artifact.
         try std.testing.expect(certificate.eql(try db.prepareOnlineSourcePublication(scope, .none)));
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = certificate } } }, .{ .term = 1, .index = 4 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = certificate } } }, .{ .term = 1, .index = 4 });
         try std.testing.expectEqual(.published, (try db.onlineSourceStatus(scope)).snapshot_phase);
         _ = try backup.writeFileDurable(std.testing.io, artifact, "corrupt");
         try std.testing.expectError(error.BackupSealSourceChanged, publicationCertificateIfPresent(&db, scope, .none));
@@ -972,9 +972,9 @@ test "relational index system source pin prepared crash blocks markers then reop
         try std.testing.expectError(error.FileNotFound, db.prepareOnlineSourcePublication(scope, .none));
         // A missing published artifact is not recaptured from the later row.
         try std.testing.expect(!try exists(std.testing.io, artifact));
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .release = scope } }, .{ .term = 1, .index = 5 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .release = scope } }, .{ .term = 1, .index = 5 });
         // An old applied admission never resurrects a released pin.
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 2 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 2 });
         try db.setSchemaJson(alloc, changed);
         try std.testing.expectError(error.OnlineSourceScopeChanged, db.prepareOnlineSourcePublication(scope, .none));
     }

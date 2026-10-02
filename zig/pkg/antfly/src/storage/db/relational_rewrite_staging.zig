@@ -154,12 +154,13 @@ fn prepareTailInternal(target: *DB, alloc: Allocator, scope: staging.Scope, sour
         const output_key = try owned.dupe(u8, key);
         if (transformed) |value| {
             if (effect.timestamp == 0 or value.timestamp != effect.timestamp) return error.RetainedEffectsCorrupt;
-            try writes.append(owned, .{ .key = output_key, .value = try owned.dupe(u8, value.json) });
+            try writes.append(owned, .{ .key = output_key, .value = try owned.dupe(u8, value.json), .json_null_fields = try @import("types.zig").cloneJsonNullFields(owned, value.json_null_fields) });
             try timestamps.append(owned, .{ .key = output_key, .timestamp = value.timestamp });
         } else try deletes.append(owned, output_key);
         var hash = std.crypto.hash.Blake3.init(.{});
         hash.update(&next.logical_digest);
         hash.update(&reader.frame_digest);
+        if (transformed) |value| @import("relational_rewrite_program.zig").hashJsonNullFields(&hash, value.json_null_fields);
         var offset: [8]u8 = undefined;
         std.mem.writeInt(u64, &offset, reader.pos, .little);
         hash.update(&offset);

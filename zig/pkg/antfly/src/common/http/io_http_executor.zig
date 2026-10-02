@@ -90,7 +90,7 @@ pub const IoHttpExecutor = struct {
             .ptr = self,
             .vtable = &.{ .execute = execute, .execute_stream = executeStream },
             .realtime_ns_fn = realtimeNs,
-            .clock_io = @import("../../runtime_io_abi.zig").Borrow.init(&self.io),
+            .clock_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&self.io),
         };
     }
 

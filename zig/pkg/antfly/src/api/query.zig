@@ -27,7 +27,7 @@ const graph_node_identity = @import("../graph/node_identity.zig");
 const graph_work_budget = @import("../graph/work_budget.zig");
 const graph_work_budget_diagnostic = @import("../graph/work_budget_diagnostic.zig");
 const graph_distinct_budget_diagnostic = @import("../graph/distinct_budget_diagnostic.zig");
-const public_limits = @import("public_limits.zig");
+const public_limits = @import("antfly_public_limits");
 const query_contract = @import("query_contract.zig");
 
 pub const QueryResponse = query_contract.QueryResponse;

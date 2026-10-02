@@ -7,7 +7,7 @@ const backend_erased = @import("../storage/backend_erased.zig");
 const mem_backend = @import("../storage/mem_backend.zig");
 const platform_sync = @import("antfly_platform").sync;
 const platform_time = @import("antfly_platform").time;
-const runtime_error_abi = @import("../runtime_error_abi.zig");
+const runtime_error_abi = @import("antfly_runtime_abi").error_abi;
 const runtime_memory_abi = @import("runtime_memory_abi");
 
 const key_prefix = "\x00\x00__api_restore_jobs__:";

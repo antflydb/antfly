@@ -565,6 +565,7 @@ pub const Adapter = struct {
                 .fields = request.fields,
                 .limit = request.limit,
                 .relational_query = .{
+                    .page_bytes = 256 * 1024,
                     .fields = request.fields,
                     .conditions = conditions,
                     .index = if (request.index_equality) |probe| probe.name else null,
@@ -957,7 +958,7 @@ pub const Adapter = struct {
             var deletes: std.ArrayList([]const u8) = .empty;
             const predicates = try alloc.alloc(db_types.TransactionVersionPredicate, input.len);
             for (input, predicates) |mutation, *predicate| {
-                predicate.* = .{ .key = mutation.key, .expected_version = mutation.expected_version, .expected_content_digest = mutation.expected_content_digest };
+                predicate.* = .{ .key = mutation.key, .expected_version = mutation.expected_version, .expected_content_digest = mutation.expected_content_digest, .unique_absence = mutation.unique_absence };
                 if (mutation.predicate_only) continue;
                 if (self.inserting and mutation.expected_version == 0) if (self.staged) |staged| for (staged.tables) |existing| {
                     if (!std.mem.eql(u8, staged.physicalName(existing.table_name), table.physical_name)) continue;
@@ -965,6 +966,9 @@ pub const Adapter = struct {
                     for (existing.batch.deletes) |deleted| if (std.mem.eql(u8, deleted, mutation.key)) {
                         for (existing.predicates.items) |observed| if (std.mem.eql(u8, observed.key, mutation.key)) {
                             predicate.expected_version = observed.expected_version;
+                            // Reinsert after a staged DELETE checks the original
+                            // row version, rather than absence in durable storage.
+                            if (observed.expected_version != 0) predicate.unique_absence = false;
                             break;
                         };
                         break;
@@ -1014,7 +1018,7 @@ pub const Adapter = struct {
         var deletes: std.ArrayList([]const u8) = .empty;
         const predicates = try alloc.alloc(db_types.TransactionVersionPredicate, input.len);
         for (input, predicates) |mutation, *predicate| {
-            predicate.* = .{ .key = mutation.key, .expected_version = mutation.expected_version, .expected_content_digest = mutation.expected_content_digest };
+            predicate.* = .{ .key = mutation.key, .expected_version = mutation.expected_version, .expected_content_digest = mutation.expected_content_digest, .unique_absence = mutation.unique_absence };
             if (mutation.predicate_only) continue;
             if (mutation.row) |row| {
                 try writes.append(alloc, .{ .key = mutation.key, .value = try std.json.Stringify.valueAlloc(alloc, row, .{}), .json_null_fields = if (table.storage_mode == .document) &.{} else mutation.json_null_fields });
@@ -1113,6 +1117,9 @@ fn classifyMutationFailure(status: u16, body: []const u8) MutationFailure {
     // A commit/unknown receipt contradicts any definite-abort error field.
     if (parsed.value.status) |state| if (std.mem.startsWith(u8, state, "committed") or std.mem.eql(u8, state, "unknown"))
         return .{ .err = error.SqlMutationOutcomeUnknown, .transaction_id = id };
+    if (status == 503) if (parsed.value.code) |code| {
+        if (std.mem.eql(u8, code, "constraint_activation_pending")) return .{ .err = error.SqlWriteCapacityUnavailable, .transaction_id = id };
+    };
     return .{ .err = definiteMutationFailure(status, parsed.value.@"error" orelse "") orelse error.SqlMutationOutcomeUnknown, .transaction_id = id };
 }
 
@@ -1182,7 +1189,7 @@ test "SQL point bound is half-open and excludes all byte-key descendants" {
 
 test "SQL require-index equality uses exact native bounds only inside a guarded statement" {
     const Fake = struct {
-        fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, call: system_catalog.Call) ![]u8 {
+        fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             if (call == .policy_publication_status) {
                 try std.testing.expect(context.row_policy_install_authority);
                 const mode: *u8 = @ptrCast(@alignCast(ptr));
@@ -1261,7 +1268,7 @@ test "SQL API document preparation uses native normalization and retains mutatio
     const Fake = struct {
         normalized: bool = false,
         closed: bool = false,
-        fn resolve(_: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: system_catalog.Call) ![]u8 {
+        fn resolve(_: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             if (call == .policy_publication_status) return error.RowPolicyCatalogChanged;
             return alloc.dupe(u8, "{\"revision\":3,\"tables\":[{\"table_id\":7,\"name\":\"physical\"}]}");
         }
@@ -1336,7 +1343,7 @@ test "SQL API guarded sessions retain reads and atomic MERGE writes across trans
         fn status(_: *anyopaque) !metadata.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
-        fn resolve(_: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: system_catalog.Call) ![]u8 {
+        fn resolve(_: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             if (call == .write_validation) return std.json.Stringify.valueAlloc(alloc, .{ .schema_json = schema }, .{});
             if (call == .policy_publication_status) return error.RowPolicyCatalogChanged;
             return std.json.Stringify.valueAlloc(alloc, .{ .revision = 2, .tables = .{.{ .table_id = 3, .name = "physical", .query_definition = .{ .table_id = 3, .schema_json = schema, .read_schema_json = "", .indexes_json = "{}" } }}, .logical_names = .{"docs"} }, .{});
@@ -1668,7 +1675,7 @@ test "SQL API cross-table MERGE retains both source and target range proofs" {
         fn status(_: *anyopaque) !metadata.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
-        fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: system_catalog.Call) ![]u8 {
+        fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *Self = @ptrCast(@alignCast(ptr));
             if (call == .write_validation) return std.json.Stringify.valueAlloc(alloc, .{ .schema_json = schema }, .{});
             if (call == .policy_publication_status) return error.RowPolicyCatalogChanged;
@@ -2528,6 +2535,9 @@ test "SQL unknown mutation keeps native reconciliation receipt without allocatio
     try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, receipt.err);
     try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", &receipt.transaction_id.?);
     try std.testing.expectEqual(error.DuplicateSqlRow, classifyMutationFailure(409, "{\"error\":\"UniqueConstraintViolation\"}").err);
+    try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, classifyMutationFailure(503, "write unavailable").err);
+    try std.testing.expectEqual(error.SqlWriteCapacityUnavailable, classifyMutationFailure(503, "{\"code\":\"constraint_activation_pending\"}").err);
+    try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, classifyMutationFailure(503, "{\"code\":\"constraint_activation_pending\",\"status\":\"committed_pending\"}").err);
     try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, classifyMutationFailure(503, "write committed locally; standby durability acknowledgment pending").err);
     try std.testing.expectEqual(catalog.MutationOutcome.committed_pending, try committedMutationOutcome("{\"status\":\"committed_pending\"}"));
     try std.testing.expectEqual(catalog.MutationOutcome.committed_repair_required, try committedMutationOutcome("{\"status\":\"committed_repair_required\"}"));
@@ -2571,7 +2581,7 @@ test "SQL direct conflict scalar uses one guarded native cut through owner and c
         fn status(_: *anyopaque) !metadata.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
-        fn resolve(ptr: *anyopaque, allocator: std.mem.Allocator, context: operation.RequestContext, call: system_catalog.Call) ![]u8 {
+        fn resolve(ptr: *anyopaque, allocator: std.mem.Allocator, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             if (call == .write_validation) return std.json.Stringify.valueAlloc(allocator, .{ .schema_json = schema }, .{});
             if (call == .policy_publication_status) {
                 try std.testing.expect(context.row_policy_install_authority);
@@ -2631,7 +2641,7 @@ test "SQL direct conflict scalar uses one guarded native cut through owner and c
             }
             return .{ .ptr = self, .views = self.views[0..scans.len], .vtable = &.{ .close = close, .range_proofs = proofs } };
         }
-        fn openSnapshot(ptr: *anyopaque, _: std.mem.Allocator, table: []const u8, _: u32, _: @import("../raft/read_gate.zig").ReadConsistency, _: ?@import("../common/cancellation.zig").CancellationToken, _: ?u64) !reads.RelationalStatementSnapshot {
+        fn openSnapshot(ptr: *anyopaque, _: std.mem.Allocator, table: []const u8, _: u32, _: @import("../raft/read_gate.zig").ReadConsistency, _: ?@import("antfly_cancellation").CancellationToken, _: ?u64) !reads.RelationalStatementSnapshot {
             const self: *Self = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("physical_usage", table);
             self.captures += 1;

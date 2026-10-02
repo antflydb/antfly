@@ -16,28 +16,26 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
-const scraping = @import("antfly_scraping");
+const scraping = if (builtin.os.tag == .freestanding) @import("db/scraping_stub.zig") else @import("antfly_scraping");
 const common_secrets = @import("../common/secrets.zig");
-const fs_paths = @import("../common/fs_paths.zig");
-const backups_api = @import("../api/backups.zig");
-const metadata_table_provisioner = @import("../metadata/table_provisioner.zig");
-const backup_restore = @import("../raft/storage/backup_restore.zig");
-const transactions_mod = @import("transactions.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
+const backups_api = @import("../api/local_backups.zig");
+const metadata_table_provisioner = @import("../metadata/local_index_reconcile.zig");
+const backup_restore = @import("backup_restore.zig");
 const doc_identity = @import("db/doc_identity.zig");
 const hbc_mod = @import("hbc_adapter.zig");
 const lsm_backend = @import("lsm_backend/mod.zig");
 const portable_backup = @import("portable_backup.zig");
 const resource_manager_mod = @import("resource_manager.zig");
 const storage_schema = @import("schema.zig");
-const tables_api = @import("../api/tables.zig");
+const tables_api = @import("../api/local_tables.zig");
 const stored_destination_authorization = @import("../api/stored_destination_authorization.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
-const remote_capabilities = @import("../inference/remote_capabilities.zig");
+const remote_capabilities = @import("antfly_inference_remote_capabilities");
 const db_embedder = @import("db/enrichment/embedder.zig");
 const asset_producer_runtime = @import("../asset_producer_runtime.zig");
 const asset_producer_mod = @import("db/enrichment/asset_producer.zig");
 const document_extraction_mod = @import("db/enrichment/document_extraction.zig");
-const distributed_txn = @import("../api/distributed_txn.zig");
 const platform_time = @import("antfly_platform").time;
 const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
 const control_only_storage_sources = false;
@@ -308,217 +306,6 @@ fn persistOwnerCatalogContract(alloc: std.mem.Allocator, db: *db_mod.DB, indexes
     try db.core.store.put(owner_catalog_initialized_key, indexes_json);
 }
 
-pub fn applyStorageKernelReplicatedBatch(
-    alloc: std.mem.Allocator,
-    db: *db_mod.DB,
-    table_name: []const u8,
-    group_id: u64,
-    req: db_mod.types.BatchRequest,
-) !void {
-    try validateTableBatchAgainstLocalSchema(alloc, db, req.writes, req.deletes, req.transforms);
-    runTestBeforeBatchExecutionHook();
-    if (req.transaction != null)
-        try applyReplicatedTransactionMutation(alloc, db, table_name, group_id, req)
-    else
-        try db.batchReplicatedApply(req);
-}
-
-pub fn applyStorageKernelReplicatedBatchAtRaftEntry(
-    alloc: std.mem.Allocator,
-    db: *db_mod.DB,
-    table_name: []const u8,
-    group_id: u64,
-    req: db_mod.types.BatchRequest,
-    raft_entry: db_mod.RaftAppliedEntryIdentity,
-) !void {
-    // The leader admitted this immutable command under the descriptor pinned
-    // in its Raft entry. A follower may already have a newer durable schema
-    // when it catches up; validating against that schema would make apply
-    // order depend on metadata delivery and can even reject an already
-    // applied entry before the native marker gets a chance to short-circuit.
-    runTestBeforeBatchExecutionHook();
-    if (req.transaction != null)
-        try applyReplicatedTransactionMutationAtRaftEntry(alloc, db, table_name, group_id, req, raft_entry)
-    else
-        try db.batchRaftReplicatedApply(req, raft_entry);
-}
-
-pub fn applyReplicatedTransactionMutation(
-    alloc: std.mem.Allocator,
-    db: *db_mod.DB,
-    table_name: []const u8,
-    group_id: u64,
-    req: db_mod.types.BatchRequest,
-) !void {
-    try applyReplicatedTransactionMutationInternal(alloc, db, table_name, group_id, req, .none, null);
-}
-
-pub fn applyReplicatedTransactionMutationAtRaftEntry(
-    alloc: std.mem.Allocator,
-    db: *db_mod.DB,
-    table_name: []const u8,
-    group_id: u64,
-    req: db_mod.types.BatchRequest,
-    raft_entry: db_mod.RaftAppliedEntryIdentity,
-) !void {
-    try applyReplicatedTransactionMutationInternal(alloc, db, table_name, group_id, req, .none, raft_entry);
-}
-
-pub fn applyReplicatedTransactionMutationInternal(
-    alloc: std.mem.Allocator,
-    db: *db_mod.DB,
-    table_name: []const u8,
-    group_id: u64,
-    req: db_mod.types.BatchRequest,
-    visibility_cancellation: db_mod.types.CancellationToken,
-    raft_entry: ?db_mod.RaftAppliedEntryIdentity,
-) !void {
-    const mutation = req.transaction orelse return error.InvalidBatchRequest;
-    try @import("range_protection.zig").validateRequest(req);
-    if (req.relational_index_maintenance) |command| if (command.owner_group_id != group_id) return error.PreparedGenerationChanged;
-    switch (mutation) {
-        .begin => |begin| {
-            const local_participant = try distributed_txn.participantIdForGroupScoped(alloc, table_name, group_id, req.restore_staging_scope, req.restore_staging_plan_id);
-            defer alloc.free(local_participant);
-            if (begin.participants.len == 0) return error.InvalidBatchRequest;
-            var seen = std.StringHashMapUnmanaged(void).empty;
-            defer seen.deinit(alloc);
-            var local_present = false;
-            for (begin.participants) |participant| {
-                if (distributed_txn.parseParticipantRef(participant) == null) return error.InvalidBatchRequest;
-                const entry = try seen.getOrPut(alloc, participant);
-                if (entry.found_existing) return error.InvalidBatchRequest;
-                if (std.mem.eql(u8, participant, local_participant)) local_present = true;
-            }
-            if (!local_present) return error.InvalidBatchRequest;
-            const coordinator = std.mem.eql(u8, begin.participants[0], local_participant);
-            const local_only = [_][]const u8{local_participant};
-            // Only the coordinator owns the full participant fan-out. A
-            // follower tracks itself, making successful cleanup O(N) rather
-            // than every participant retrying every other participant.
-            const durable_participants: []const []const u8 = if (coordinator) begin.participants else &local_only;
-            if (raft_entry) |entry|
-                _ = try db.beginReplicatedTransactionScoped(
-                    begin.txn_id,
-                    begin.begin_timestamp,
-                    begin.created_at_ns,
-                    durable_participants,
-                    coordinator,
-                    begin.retain_terminal,
-                    entry,
-                    req.restore_staging_scope,
-                )
-            else
-                _ = try db.beginTransactionScoped(
-                    begin.txn_id,
-                    begin.begin_timestamp,
-                    begin.created_at_ns,
-                    durable_participants,
-                    coordinator,
-                    begin.retain_terminal,
-                    req.restore_staging_scope,
-                );
-        },
-        .prepare => |prepare| {
-            const intents: db_mod.types.TransactionIntentRequest = .{
-                .writes = batchWritesAsTransactionWrites(req.writes),
-                .deletes = req.deletes,
-                .transforms = req.transforms,
-                .predicates = req.predicates,
-                .integrity = req.integrity,
-                .integrity_commands = req.integrity_commands,
-                .range_guards = req.range_guards,
-                .relational_activation = req.relational_activation,
-                .relational_retirement = req.relational_retirement,
-                .relational_index_maintenance = req.relational_index_maintenance,
-                .schema_version = req.schema_version,
-                .relational_schema_version = req.relational_schema_version,
-                .relational_integrity_generation_set = req.relational_integrity_generation_set,
-                .restore_staging_scope = req.restore_staging_scope,
-                .restore_staging_plan_id = req.restore_staging_plan_id,
-                .relational_repair = req.relational_repair,
-            };
-            if (raft_entry) |entry|
-                try db.writeReplicatedTransactionAtRaftEntry(prepare.txn_id, intents, entry)
-            else
-                try db.writeTransaction(prepare.txn_id, intents);
-        },
-        .resolve => |resolve| {
-            const local_participant = try distributed_txn.participantIdForGroupScoped(alloc, table_name, group_id, req.restore_staging_scope, req.restore_staging_plan_id);
-            defer alloc.free(local_participant);
-            if (raft_entry) |entry| {
-                // Retained coordinators keep their own acknowledgement pending
-                // until the API session registry durably records the response.
-                // Everyone else records resolution, acknowledgement, and the
-                // Raft receipt in one backend batch.
-                const defer_coordinator_ack = db.transactionRetainsCoordinatorAcknowledgement(resolve.txn_id) catch |err| switch (err) {
-                    transactions_mod.TxnError.TxnNotFound => if (resolve.status == .aborted) false else return err,
-                    else => return err,
-                };
-                try db.resolveReplicatedTransactionAtRaftEntry(
-                    resolve.txn_id,
-                    resolve.status,
-                    resolve.commit_version,
-                    req.sync_level,
-                    visibility_cancellation,
-                    entry,
-                    if (defer_coordinator_ack) null else local_participant,
-                );
-            } else {
-                try db.resolveTransactionIntentsWithSyncLevelAndCancellation(
-                    resolve.txn_id,
-                    resolve.status,
-                    resolve.commit_version,
-                    req.sync_level,
-                    visibility_cancellation,
-                );
-                const defer_coordinator_ack = db.transactionDefersCoordinatorAcknowledgement(resolve.txn_id) catch |err| switch (err) {
-                    transactions_mod.TxnError.TxnNotFound => if (resolve.status == .aborted) false else return err,
-                    else => return err,
-                };
-                if (!defer_coordinator_ack) {
-                    db.markTransactionParticipantResolved(resolve.txn_id, local_participant) catch |err| switch (err) {
-                        transactions_mod.TxnError.TxnNotFound => if (resolve.status != .aborted) return err,
-                        else => return err,
-                    };
-                }
-            }
-        },
-        .acknowledge => |ack| (if (raft_entry) |entry|
-            db.markReplicatedTransactionParticipantResolvedAtRaftEntry(ack.txn_id, ack.participant, entry)
-        else
-            db.markTransactionParticipantResolved(ack.txn_id, ack.participant)) catch |err| switch (err) {
-            // Cleanup and acknowledgements are independently retryable Raft
-            // commands. Once cleanup wins, a late acknowledgement is a safe
-            // no-op and must not recreate coordinator sidecar metadata.
-            transactions_mod.TxnError.TxnNotFound => {},
-            else => return err,
-        },
-        .acknowledge_many => |ack| (if (raft_entry) |entry|
-            db.markReplicatedTransactionParticipantsResolvedAtRaftEntry(ack.txn_id, ack.participants, entry)
-        else
-            db.markTransactionParticipantsResolved(ack.txn_id, ack.participants)) catch |err| switch (err) {
-            transactions_mod.TxnError.TxnNotFound => {},
-            else => return err,
-        },
-        .cleanup => |cleanup| {
-            if (raft_entry) |entry|
-                _ = try db.cleanupReplicatedTransactionAtRaftEntry(
-                    cleanup.txn_id,
-                    cleanup.cutoff_timestamp,
-                    cleanup.retained_cutoff_timestamp,
-                    entry,
-                )
-            else
-                _ = try db.cleanupTransactionMetadataIfEligible(
-                    cleanup.txn_id,
-                    cleanup.cutoff_timestamp,
-                    cleanup.retained_cutoff_timestamp,
-                );
-        },
-    }
-}
-
 pub fn batchWritesAsTransactionWrites(writes: []const db_mod.types.BatchWrite) []const db_mod.types.TransactionWrite {
     comptime std.debug.assert(@sizeOf(db_mod.types.BatchWrite) == @sizeOf(db_mod.types.TransactionWrite));
     comptime std.debug.assert(@alignOf(db_mod.types.BatchWrite) == @alignOf(db_mod.types.TransactionWrite));
@@ -601,10 +388,10 @@ pub const ManagedDbOpenOptions = struct {
     reconcile_for_replicated_apply: bool = false,
     inference_api_url: ?[]const u8 = null,
     remote_capability_cache: ?*remote_capabilities.Cache = null,
-    ha_write_gate: ?db_mod.HAWriteGate = null,
-    ha_async_effect_mirror: ?db_mod.HAAsyncEffectMirror = null,
-    ha_async_batch_mirror: ?db_mod.HAAsyncBatchMirror = null,
-    ha_async_metadata_mirror: ?db_mod.HAAsyncMetadataMirror = null,
+    replication_write_gate: ?db_mod.ReplicationWriteGate = null,
+    replication_async_effect_mirror: ?db_mod.ReplicationAsyncEffectMirror = null,
+    replication_async_batch_mirror: ?db_mod.ReplicationAsyncBatchMirror = null,
+    replication_async_metadata_mirror: ?db_mod.ReplicationAsyncMetadataMirror = null,
     staged_generation: ?*const (if (control_only_storage_sources) anyopaque else db_mod.generation_lifecycle.StagedGeneration) = null,
     /// Immutable native backend decision retained by PreparedRestore. Only
     /// repair execution policy and owned enrichment providers may be layered
@@ -653,7 +440,7 @@ pub fn configureRestoreOwnerDb(alloc: std.mem.Allocator, db: *db_mod.DB, bootstr
         if (bootstrap.schema_json.len != 0) try db.setSchemaJson(alloc, bootstrap.schema_json);
     }
     try db.installRestoreStagingReadSchema(alloc, bootstrap.scope, bootstrap.read_schema_json);
-    _ = try @import("../metadata/table_provisioner.zig").reconcileDbIndexesWithOptions(alloc, db, bootstrap.indexes_json, .{ .restore_build_only = true });
+    _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, db, bootstrap.indexes_json, .{ .restore_build_only = true });
     try db.updateRange(bootstrap.byte_range);
     try db.reserveRestoreStagingScoped(alloc, bootstrap.scope);
     try db.installRestoreStagingBootstrap(alloc, bootstrap);
@@ -873,10 +660,10 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
     const reconcile_mode: ManagedDbOpenMode = if (options.reconcile_for_replicated_apply) .restore_repair else mode;
     var reconcile_options = options;
     if (options.reconcile_for_replicated_apply) {
-        reconcile_options.ha_write_gate = null;
-        reconcile_options.ha_async_effect_mirror = null;
-        reconcile_options.ha_async_batch_mirror = null;
-        reconcile_options.ha_async_metadata_mirror = null;
+        reconcile_options.replication_write_gate = null;
+        reconcile_options.replication_async_effect_mirror = null;
+        reconcile_options.replication_async_batch_mirror = null;
+        reconcile_options.replication_async_metadata_mirror = null;
     }
     var enrichments = try createManagedDbEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, options.remote_capability_cache, options.inference_api_url, options.source_table, secret_store, remote_content);
     // takeConfig() clears every transferred owner. An unconditional defer is
@@ -903,128 +690,40 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
             const schema_before_index_load = try prepareManagedSchemaBeforeIndexLoad(allocator, open_mode, open_options.schema_json_before_index_load);
             defer if (schema_before_index_load) |schema| storage_schema.freeSchema(allocator, schema.runtime_schema);
 
-            if (open_options.native_restore_open_plan) |native_plan| {
-                if (open_mode != .restore_repair) return error.InvalidNativeRestoreOpenMode;
-                const staged_generation = open_options.staged_generation orelse
-                    return error.InvalidGenerationTransition;
-                var resolved = try native_plan.optionsForStagedGeneration(staged_generation);
-                // The plan owns every storage/root decision. These overlays
-                // are request-scoped runtime policy or move-only providers and
-                // cannot redirect candidate I/O outside the staged generation.
-                resolved.secret_store = store;
-                resolved.remote_content = remote;
-                resolved.identity_namespace = namespace;
-                resolved.prefer_existing_identity_namespace = namespace != null;
-                resolved.enrichment = enrichment_cfg;
-                resolved.ha_write_gate = open_options.ha_write_gate;
-                resolved.ha_async_effect_mirror = null;
-                resolved.ha_async_batch_mirror = null;
-                resolved.ha_async_metadata_mirror = null;
-                resolved.schema_before_index_load = schema_before_index_load;
-                resolved.open_mode = .writer_no_replay;
-                resolved.start_index_workers = false;
-                resolved.start_optional_runtimes = enrichment_cfg != null;
-                resolved.start_optional_runtime_workers = false;
-                resolved.ttl_cleanup = .{ .enabled = false };
-                resolved.transaction_recovery = .{ .enabled = false };
-                resolved.text_merge = .{ .enabled = false };
-                resolved.index_backends.dense_native_migration_policy_source = open_options.dense_native_migration_policy_source;
-                return try db_mod.DB.open(allocator, db_path, resolved);
-            }
+            // Resolve policy first, then open once. Separate DB-valued switch
+            // branches reserve a large return slot per branch in Debug, which
+            // can overflow the bounded transition task stack.
+            const resolved_options: db_mod.OpenOptions = resolve_options: {
+                if (open_options.native_restore_open_plan) |native_plan| {
+                    if (open_mode != .restore_repair) return error.InvalidNativeRestoreOpenMode;
+                    const staged_generation = open_options.staged_generation orelse
+                        return error.InvalidGenerationTransition;
+                    var resolved = try native_plan.optionsForStagedGeneration(staged_generation);
+                    // The plan owns every storage/root decision. These overlays
+                    // are request-scoped runtime policy or move-only providers and
+                    // cannot redirect candidate I/O outside the staged generation.
+                    resolved.secret_store = store;
+                    resolved.remote_content = remote;
+                    resolved.identity_namespace = namespace;
+                    resolved.prefer_existing_identity_namespace = namespace != null;
+                    resolved.enrichment = enrichment_cfg;
+                    resolved.replication_write_gate = open_options.replication_write_gate;
+                    resolved.replication_async_effect_mirror = null;
+                    resolved.replication_async_batch_mirror = null;
+                    resolved.replication_async_metadata_mirror = null;
+                    resolved.schema_before_index_load = schema_before_index_load;
+                    resolved.open_mode = .writer_no_replay;
+                    resolved.start_index_workers = false;
+                    resolved.start_optional_runtimes = enrichment_cfg != null;
+                    resolved.start_optional_runtime_workers = false;
+                    resolved.ttl_cleanup = .{ .enabled = false };
+                    resolved.transaction_recovery = .{ .enabled = false };
+                    resolved.text_merge = .{ .enabled = false };
+                    resolved.index_backends.dense_native_migration_policy_source = open_options.dense_native_migration_policy_source;
+                    break :resolve_options resolved;
+                }
 
-            const base: db_mod.OpenOptions = .{
-                .lsm_cache = cache,
-                .hbc_cache = vector_cache,
-                .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
-                .lsm_root_generation = root_generation,
-                .resource_manager = manager,
-                .backend_runtime = runtime,
-                .secret_store = store,
-                .remote_content = remote,
-                .identity_namespace = namespace,
-                .prefer_existing_identity_namespace = namespace != null,
-                .enrichment = enrichment_cfg,
-                .ha_write_gate = open_options.ha_write_gate,
-                .ha_async_effect_mirror = open_options.ha_async_effect_mirror,
-                .ha_async_batch_mirror = open_options.ha_async_batch_mirror,
-                .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
-                .transaction_recovery = open_options.transaction_recovery,
-                .schema_before_index_load = schema_before_index_load,
-                .start_resolver_workers = !open_options.defer_resolver_workers,
-            };
-            return switch (open_mode) {
-                .default => if (enrichment_cfg != null)
-                    try db_mod.DB.open(allocator, db_path, base)
-                else
-                    try db_mod.DB.open(allocator, db_path, .{
-                        .lsm_cache = cache,
-                        .hbc_cache = vector_cache,
-                        .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
-                        .lsm_root_generation = root_generation,
-                        .resource_manager = manager,
-                        .backend_runtime = runtime,
-                        .secret_store = store,
-                        .remote_content = remote,
-                        .identity_namespace = namespace,
-                        .prefer_existing_identity_namespace = namespace != null,
-                        .ha_write_gate = open_options.ha_write_gate,
-                        .ha_async_effect_mirror = open_options.ha_async_effect_mirror,
-                        .ha_async_batch_mirror = open_options.ha_async_batch_mirror,
-                        .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
-                        .transaction_recovery = open_options.transaction_recovery,
-                        .schema_before_index_load = schema_before_index_load,
-                        .start_resolver_workers = !open_options.defer_resolver_workers,
-                    }),
-                .default_async, .writer_no_replay => if (enrichment_cfg != null)
-                    try db_mod.DB.open(allocator, db_path, .{
-                        .lsm_cache = cache,
-                        .hbc_cache = vector_cache,
-                        .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
-                        .lsm_root_generation = root_generation,
-                        .resource_manager = manager,
-                        .backend_runtime = runtime,
-                        .secret_store = store,
-                        .remote_content = remote,
-                        .identity_namespace = namespace,
-                        .prefer_existing_identity_namespace = namespace != null,
-                        .enrichment = enrichment_cfg,
-                        .ha_write_gate = open_options.ha_write_gate,
-                        .ha_async_effect_mirror = open_options.ha_async_effect_mirror,
-                        .ha_async_batch_mirror = open_options.ha_async_batch_mirror,
-                        .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
-                        .transaction_recovery = open_options.transaction_recovery,
-                        .schema_before_index_load = schema_before_index_load,
-                        .start_resolver_workers = !open_options.defer_resolver_workers,
-                        .open_mode = .writer_no_replay,
-                        // The managed write cache opens DBs synchronously while
-                        // table/index metadata can still be settling. Keep
-                        // index catalog opens serial on this no-replay path
-                        // until the parallel index opener is allocator-safe.
-                        .index_open_parallelism = 1,
-                    })
-                else
-                    try db_mod.DB.open(allocator, db_path, .{
-                        .lsm_cache = cache,
-                        .hbc_cache = vector_cache,
-                        .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
-                        .lsm_root_generation = root_generation,
-                        .resource_manager = manager,
-                        .backend_runtime = runtime,
-                        .secret_store = store,
-                        .remote_content = remote,
-                        .identity_namespace = namespace,
-                        .prefer_existing_identity_namespace = namespace != null,
-                        .ha_write_gate = open_options.ha_write_gate,
-                        .ha_async_effect_mirror = open_options.ha_async_effect_mirror,
-                        .ha_async_batch_mirror = open_options.ha_async_batch_mirror,
-                        .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
-                        .transaction_recovery = open_options.transaction_recovery,
-                        .schema_before_index_load = schema_before_index_load,
-                        .start_resolver_workers = !open_options.defer_resolver_workers,
-                        .open_mode = .writer_no_replay,
-                        .index_open_parallelism = 1,
-                    }),
-                .startup_catch_up => try db_mod.DB.open(allocator, db_path, .{
+                const base: db_mod.OpenOptions = .{
                     .lsm_cache = cache,
                     .hbc_cache = vector_cache,
                     .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
@@ -1035,39 +734,88 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                     .remote_content = remote,
                     .identity_namespace = namespace,
                     .prefer_existing_identity_namespace = namespace != null,
-                    .ha_write_gate = open_options.ha_write_gate,
+                    .enrichment = enrichment_cfg,
+                    .replication_write_gate = open_options.replication_write_gate,
+                    .replication_async_effect_mirror = open_options.replication_async_effect_mirror,
+                    .replication_async_batch_mirror = open_options.replication_async_batch_mirror,
+                    .replication_async_metadata_mirror = open_options.replication_async_metadata_mirror,
+                    .transaction_recovery = open_options.transaction_recovery,
                     .schema_before_index_load = schema_before_index_load,
                     .start_resolver_workers = !open_options.defer_resolver_workers,
-                    .open_mode = .writer_no_replay,
-                    .start_index_workers = false,
-                    .enrichment = if (enrichment_cfg) |configured| blk: {
-                        var bounded = configured;
-                        // Loaded-state startup must not wait through the
-                        // normal external-provider inline retry budget. One
-                        // attempt records durable retry state; the startup
-                        // scheduler owns later attempts.
-                        bounded.inline_retry_max_attempts = 1;
-                        // Startup is a short-lived foreground owner. If a
-                        // retry budget was nearly exhausted before shutdown,
-                        // do not convert one startup probe into terminal
-                        // coverage before the long-lived worker can resume it.
-                        // The persisted attempt count is retained, so the
-                        // normal worker still enforces its bounded budget.
-                        bounded.worker_retry_max_attempts = std.math.maxInt(u32);
-                        break :blk bounded;
-                    } else null,
-                    // Startup catch-up drives enrichment synchronously below.
-                    // Construct the runtime with metadata-owned providers, but
-                    // do not leave workers attached to this short-lived owner.
-                    .start_optional_runtimes = enrichment_cfg != null,
-                    .start_optional_runtime_workers = false,
-                    .ttl_cleanup = .{ .enabled = false },
-                    .transaction_recovery = .{ .enabled = false },
-                    .text_merge = .{ .enabled = false },
-                    .staged_generation = open_options.staged_generation,
-                }),
-                .restore_repair => if (enrichment_cfg != null)
-                    try db_mod.DB.open(allocator, db_path, .{
+                };
+                break :resolve_options switch (open_mode) {
+                    .default => if (enrichment_cfg != null)
+                        base
+                    else
+                        .{
+                            .lsm_cache = cache,
+                            .hbc_cache = vector_cache,
+                            .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
+                            .lsm_root_generation = root_generation,
+                            .resource_manager = manager,
+                            .backend_runtime = runtime,
+                            .secret_store = store,
+                            .remote_content = remote,
+                            .identity_namespace = namespace,
+                            .prefer_existing_identity_namespace = namespace != null,
+                            .replication_write_gate = open_options.replication_write_gate,
+                            .replication_async_effect_mirror = open_options.replication_async_effect_mirror,
+                            .replication_async_batch_mirror = open_options.replication_async_batch_mirror,
+                            .replication_async_metadata_mirror = open_options.replication_async_metadata_mirror,
+                            .transaction_recovery = open_options.transaction_recovery,
+                            .schema_before_index_load = schema_before_index_load,
+                            .start_resolver_workers = !open_options.defer_resolver_workers,
+                        },
+                    .default_async, .writer_no_replay => if (enrichment_cfg != null)
+                        .{
+                            .lsm_cache = cache,
+                            .hbc_cache = vector_cache,
+                            .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
+                            .lsm_root_generation = root_generation,
+                            .resource_manager = manager,
+                            .backend_runtime = runtime,
+                            .secret_store = store,
+                            .remote_content = remote,
+                            .identity_namespace = namespace,
+                            .prefer_existing_identity_namespace = namespace != null,
+                            .enrichment = enrichment_cfg,
+                            .replication_write_gate = open_options.replication_write_gate,
+                            .replication_async_effect_mirror = open_options.replication_async_effect_mirror,
+                            .replication_async_batch_mirror = open_options.replication_async_batch_mirror,
+                            .replication_async_metadata_mirror = open_options.replication_async_metadata_mirror,
+                            .transaction_recovery = open_options.transaction_recovery,
+                            .schema_before_index_load = schema_before_index_load,
+                            .start_resolver_workers = !open_options.defer_resolver_workers,
+                            .open_mode = .writer_no_replay,
+                            // The managed write cache opens DBs synchronously while
+                            // table/index metadata can still be settling. Keep
+                            // index catalog opens serial on this no-replay path
+                            // until the parallel index opener is allocator-safe.
+                            .index_open_parallelism = 1,
+                        }
+                    else
+                        .{
+                            .lsm_cache = cache,
+                            .hbc_cache = vector_cache,
+                            .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
+                            .lsm_root_generation = root_generation,
+                            .resource_manager = manager,
+                            .backend_runtime = runtime,
+                            .secret_store = store,
+                            .remote_content = remote,
+                            .identity_namespace = namespace,
+                            .prefer_existing_identity_namespace = namespace != null,
+                            .replication_write_gate = open_options.replication_write_gate,
+                            .replication_async_effect_mirror = open_options.replication_async_effect_mirror,
+                            .replication_async_batch_mirror = open_options.replication_async_batch_mirror,
+                            .replication_async_metadata_mirror = open_options.replication_async_metadata_mirror,
+                            .transaction_recovery = open_options.transaction_recovery,
+                            .schema_before_index_load = schema_before_index_load,
+                            .start_resolver_workers = !open_options.defer_resolver_workers,
+                            .open_mode = .writer_no_replay,
+                            .index_open_parallelism = 1,
+                        },
+                    .startup_catch_up => .{
                         .lsm_cache = cache,
                         .hbc_cache = vector_cache,
                         .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
@@ -1078,120 +826,165 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .remote_content = remote,
                         .identity_namespace = namespace,
                         .prefer_existing_identity_namespace = namespace != null,
-                        .enrichment = enrichment_cfg,
-                        .ha_write_gate = open_options.ha_write_gate,
+                        .replication_write_gate = open_options.replication_write_gate,
                         .schema_before_index_load = schema_before_index_load,
                         .start_resolver_workers = !open_options.defer_resolver_workers,
                         .open_mode = .writer_no_replay,
                         .start_index_workers = false,
+                        .enrichment = if (enrichment_cfg) |configured| blk: {
+                            var bounded = configured;
+                            // Loaded-state startup must not wait through the
+                            // normal external-provider inline retry budget. One
+                            // attempt records durable retry state; the startup
+                            // scheduler owns later attempts.
+                            bounded.inline_retry_max_attempts = 1;
+                            // Startup is a short-lived foreground owner. If a
+                            // retry budget was nearly exhausted before shutdown,
+                            // do not convert one startup probe into terminal
+                            // coverage before the long-lived worker can resume it.
+                            // The persisted attempt count is retained, so the
+                            // normal worker still enforces its bounded budget.
+                            bounded.worker_retry_max_attempts = std.math.maxInt(u32);
+                            break :blk bounded;
+                        } else null,
+                        // Startup catch-up drives enrichment synchronously below.
+                        // Construct the runtime with metadata-owned providers, but
+                        // do not leave workers attached to this short-lived owner.
+                        .start_optional_runtimes = enrichment_cfg != null,
                         .start_optional_runtime_workers = false,
                         .ttl_cleanup = .{ .enabled = false },
                         .transaction_recovery = .{ .enabled = false },
                         .text_merge = .{ .enabled = false },
                         .staged_generation = open_options.staged_generation,
-                    })
-                else
-                    try db_mod.DB.open(allocator, db_path, .{
-                        .lsm_cache = cache,
-                        .hbc_cache = vector_cache,
-                        .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
-                        .lsm_root_generation = root_generation,
-                        .resource_manager = manager,
-                        .backend_runtime = runtime,
-                        .secret_store = store,
-                        .remote_content = remote,
-                        .identity_namespace = namespace,
-                        .prefer_existing_identity_namespace = namespace != null,
-                        .ha_write_gate = open_options.ha_write_gate,
-                        .schema_before_index_load = schema_before_index_load,
-                        .start_resolver_workers = !open_options.defer_resolver_workers,
-                        .open_mode = .writer_no_replay,
-                        .start_index_workers = false,
-                        .start_optional_runtimes = false,
-                        .ttl_cleanup = .{ .enabled = false },
-                        .transaction_recovery = .{ .enabled = false },
-                        .text_merge = .{ .enabled = false },
-                        .staged_generation = open_options.staged_generation,
-                    }),
-                .query_readonly => if (enrichment_cfg != null)
-                    try db_mod.DB.open(allocator, db_path, .{
-                        .lsm_cache = cache,
-                        .hbc_cache = vector_cache,
-                        .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
-                        .lsm_root_generation = root_generation,
-                        .resource_manager = manager,
-                        .backend_runtime = runtime,
-                        .secret_store = store,
-                        .remote_content = remote,
-                        .identity_namespace = namespace,
-                        .prefer_existing_identity_namespace = namespace != null,
-                        .enrichment = enrichment_cfg,
-                        .ha_write_gate = open_options.ha_write_gate,
-                        .open_mode = .query_readonly,
-                        .start_index_workers = false,
-                        .ttl_cleanup = .{ .enabled = false },
-                        .transaction_recovery = .{ .enabled = false },
-                        .text_merge = .{ .enabled = false },
-                    })
-                else
-                    try db_mod.DB.open(allocator, db_path, .{
-                        .lsm_cache = cache,
-                        .hbc_cache = vector_cache,
-                        .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
-                        .lsm_root_generation = root_generation,
-                        .resource_manager = manager,
-                        .backend_runtime = runtime,
-                        .secret_store = store,
-                        .remote_content = remote,
-                        .identity_namespace = namespace,
-                        .prefer_existing_identity_namespace = namespace != null,
-                        .ha_write_gate = open_options.ha_write_gate,
-                        .open_mode = .query_readonly,
-                        .start_index_workers = false,
-                        .ttl_cleanup = .{ .enabled = false },
-                        .transaction_recovery = .{ .enabled = false },
-                        .text_merge = .{ .enabled = false },
-                    }),
-                .status_only => if (enrichment_cfg != null)
-                    try db_mod.DB.open(allocator, db_path, .{
-                        .lsm_cache = cache,
-                        .hbc_cache = vector_cache,
-                        .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
-                        .lsm_root_generation = root_generation,
-                        .resource_manager = manager,
-                        .backend_runtime = runtime,
-                        .secret_store = store,
-                        .remote_content = remote,
-                        .identity_namespace = namespace,
-                        .prefer_existing_identity_namespace = namespace != null,
-                        .enrichment = enrichment_cfg,
-                        .ha_write_gate = open_options.ha_write_gate,
-                        .open_mode = .status_only,
-                        .start_index_workers = false,
-                        .ttl_cleanup = .{ .enabled = false },
-                        .transaction_recovery = .{ .enabled = false },
-                        .text_merge = .{ .enabled = false },
-                    })
-                else
-                    try db_mod.DB.open(allocator, db_path, .{
-                        .lsm_cache = cache,
-                        .hbc_cache = vector_cache,
-                        .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
-                        .lsm_root_generation = root_generation,
-                        .resource_manager = manager,
-                        .backend_runtime = runtime,
-                        .secret_store = store,
-                        .remote_content = remote,
-                        .identity_namespace = namespace,
-                        .prefer_existing_identity_namespace = namespace != null,
-                        .ha_write_gate = open_options.ha_write_gate,
-                        .open_mode = .status_only,
-                        .start_index_workers = false,
-                        .ttl_cleanup = .{ .enabled = false },
-                        .transaction_recovery = .{ .enabled = false },
-                        .text_merge = .{ .enabled = false },
-                    }),
+                    },
+                    .restore_repair => if (enrichment_cfg != null)
+                        .{
+                            .lsm_cache = cache,
+                            .hbc_cache = vector_cache,
+                            .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
+                            .lsm_root_generation = root_generation,
+                            .resource_manager = manager,
+                            .backend_runtime = runtime,
+                            .secret_store = store,
+                            .remote_content = remote,
+                            .identity_namespace = namespace,
+                            .prefer_existing_identity_namespace = namespace != null,
+                            .enrichment = enrichment_cfg,
+                            .replication_write_gate = open_options.replication_write_gate,
+                            .schema_before_index_load = schema_before_index_load,
+                            .start_resolver_workers = !open_options.defer_resolver_workers,
+                            .open_mode = .writer_no_replay,
+                            .start_index_workers = false,
+                            .start_optional_runtime_workers = false,
+                            .ttl_cleanup = .{ .enabled = false },
+                            .transaction_recovery = .{ .enabled = false },
+                            .text_merge = .{ .enabled = false },
+                            .staged_generation = open_options.staged_generation,
+                        }
+                    else
+                        .{
+                            .lsm_cache = cache,
+                            .hbc_cache = vector_cache,
+                            .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
+                            .lsm_root_generation = root_generation,
+                            .resource_manager = manager,
+                            .backend_runtime = runtime,
+                            .secret_store = store,
+                            .remote_content = remote,
+                            .identity_namespace = namespace,
+                            .prefer_existing_identity_namespace = namespace != null,
+                            .replication_write_gate = open_options.replication_write_gate,
+                            .schema_before_index_load = schema_before_index_load,
+                            .start_resolver_workers = !open_options.defer_resolver_workers,
+                            .open_mode = .writer_no_replay,
+                            .start_index_workers = false,
+                            .start_optional_runtimes = false,
+                            .ttl_cleanup = .{ .enabled = false },
+                            .transaction_recovery = .{ .enabled = false },
+                            .text_merge = .{ .enabled = false },
+                            .staged_generation = open_options.staged_generation,
+                        },
+                    .query_readonly => if (enrichment_cfg != null)
+                        .{
+                            .lsm_cache = cache,
+                            .hbc_cache = vector_cache,
+                            .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
+                            .lsm_root_generation = root_generation,
+                            .resource_manager = manager,
+                            .backend_runtime = runtime,
+                            .secret_store = store,
+                            .remote_content = remote,
+                            .identity_namespace = namespace,
+                            .prefer_existing_identity_namespace = namespace != null,
+                            .enrichment = enrichment_cfg,
+                            .replication_write_gate = open_options.replication_write_gate,
+                            .open_mode = .query_readonly,
+                            .start_index_workers = false,
+                            .ttl_cleanup = .{ .enabled = false },
+                            .transaction_recovery = .{ .enabled = false },
+                            .text_merge = .{ .enabled = false },
+                        }
+                    else
+                        .{
+                            .lsm_cache = cache,
+                            .hbc_cache = vector_cache,
+                            .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
+                            .lsm_root_generation = root_generation,
+                            .resource_manager = manager,
+                            .backend_runtime = runtime,
+                            .secret_store = store,
+                            .remote_content = remote,
+                            .identity_namespace = namespace,
+                            .prefer_existing_identity_namespace = namespace != null,
+                            .replication_write_gate = open_options.replication_write_gate,
+                            .open_mode = .query_readonly,
+                            .start_index_workers = false,
+                            .ttl_cleanup = .{ .enabled = false },
+                            .transaction_recovery = .{ .enabled = false },
+                            .text_merge = .{ .enabled = false },
+                        },
+                    .status_only => if (enrichment_cfg != null)
+                        .{
+                            .lsm_cache = cache,
+                            .hbc_cache = vector_cache,
+                            .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
+                            .lsm_root_generation = root_generation,
+                            .resource_manager = manager,
+                            .backend_runtime = runtime,
+                            .secret_store = store,
+                            .remote_content = remote,
+                            .identity_namespace = namespace,
+                            .prefer_existing_identity_namespace = namespace != null,
+                            .enrichment = enrichment_cfg,
+                            .replication_write_gate = open_options.replication_write_gate,
+                            .open_mode = .status_only,
+                            .start_index_workers = false,
+                            .ttl_cleanup = .{ .enabled = false },
+                            .transaction_recovery = .{ .enabled = false },
+                            .text_merge = .{ .enabled = false },
+                        }
+                    else
+                        .{
+                            .lsm_cache = cache,
+                            .hbc_cache = vector_cache,
+                            .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
+                            .lsm_root_generation = root_generation,
+                            .resource_manager = manager,
+                            .backend_runtime = runtime,
+                            .secret_store = store,
+                            .remote_content = remote,
+                            .identity_namespace = namespace,
+                            .prefer_existing_identity_namespace = namespace != null,
+                            .replication_write_gate = open_options.replication_write_gate,
+                            .open_mode = .status_only,
+                            .start_index_workers = false,
+                            .ttl_cleanup = .{ .enabled = false },
+                            .transaction_recovery = .{ .enabled = false },
+                            .text_merge = .{ .enabled = false },
+                        },
+                };
             };
+            return try db_mod.DB.open(allocator, db_path, resolved_options);
         }
     }.run;
 
@@ -1810,9 +1603,9 @@ pub fn configureStorageKernelOwnerDbAtOpen(
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
     installed: ?*OwnerManagedConfig,
-    historical_raft_apply: bool,
+    historical_ordered_apply: bool,
 ) !bool {
-    if (historical_raft_apply) {
+    if (historical_ordered_apply) {
         const stored = try loadOwnerCatalogContract(alloc, db);
         defer if (stored) |value| alloc.free(value);
         if (stored) |value| {
@@ -1827,7 +1620,7 @@ pub fn configureStorageKernelOwnerDbAtOpen(
             }
             return false;
         }
-        if (try db.raftAppliedEntry() != null) return false;
+        if (try db.orderedApplyReceipt() != null) return false;
         // Older physical roots predate the marker. Existing index definitions
         // still prove that replay must not replace their current catalog.
         const indexes = try db.listIndexes(alloc);
@@ -2057,7 +1850,7 @@ pub fn reconcileStorageKernelOwnerDb(
             try metadata_table_provisioner.reconcileDbIndexTargetWithOptions(alloc, db, indexes_json, target, options)
         else
             try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, db, indexes_json, options);
-    } else metadata_table_provisioner.ProvisionSummary{};
+    } else metadata_table_provisioner.IndexReconcileSummary{};
     if (replace) try db.resumeEnrichmentRuntimeAfterReconfigure("owner reconciliation", target_index_name orelse "*");
     if (indexes_json.len > 0 and !installed_matches) try persistOwnerCatalogContract(alloc, db, indexes_json);
     if (indexes_json.len > 0) if (installed) |state| state.publish(indexes_json);

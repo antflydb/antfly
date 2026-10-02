@@ -1,5 +1,7 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+const server_test_adapter = if (builtin.is_test) @import("../server_db_adapter.zig") else struct {};
+const builtin = @import("builtin");
 const std = @import("std");
 const rewrite = @import("relational_rewrite_staging.zig");
 const contract = @import("relational_rewrite_contract.zig");
@@ -21,7 +23,7 @@ fn apply(target: *db_mod.DB, value: *const staging.PreparedPage, index: u64) !vo
     var decoded = try effects.decodeBatchMutationRequest(alloc, .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = index, .previous_lsn = index - 1, .payload = encoded });
     defer decoded.deinit();
     try std.testing.expectEqualDeep(value.batch.?.restore_staging, decoded.value.request.restore_staging);
-    try target.batchRaftReplicatedApply(decoded.value.request, .{ .term = 1, .index = index });
+    try server_test_adapter.applyOrdered(&target, decoded.value.request, .{ .term = 1, .index = index });
 }
 
 test "relational index system rewrite shared staging preserves post-cut updates deletes partial frames and replay across reopen" {
@@ -53,7 +55,7 @@ fn runRewrite(preserve_document: bool) !void {
     var source_open = true;
     defer if (source_open) source.close();
     try source.setSchemaJson(alloc, from_schema);
-    try source.batchRaftReplicatedApply(.{ .timestamp_ns = 101, .writes = &.{ .{ .key = "a", .value = "{\"x\":2}" }, .{ .key = "b", .value = "{\"x\":4}" } } }, .{ .term = 1, .index = 1 });
+    try server_test_adapter.applyOrdered(&source, .{ .timestamp_ns = 101, .writes = &.{ .{ .key = "a", .value = "{\"x\":2}" }, .{ .key = "b", .value = "{\"x\":4}" } } }, .{ .term = 1, .index = 1 });
     const owner = try source.relationalTopologyIdentity();
     const source_scope: @import("online_source_contract.zig").Scope = .{
         .fence = .{ .role = .rewrite_source, .transition_id = 1, .attempt = 1, .admission_epoch = owner.next_epoch, .owner_group_id = 12, .peer_group_id = 22, .namespace = owner.namespace, .catalog_digest = owner.catalog_digest },
@@ -68,10 +70,10 @@ fn runRewrite(preserve_document: bool) !void {
     merge_alias.receiver_namespace.table_id = source_scope.fence.namespace.table_id;
     try std.testing.expectError(error.InvalidOnlineSourceCommand, merge_alias.validate());
     try std.testing.expectError(error.InvalidOnlineSourceCommand, (@import("online_merge_io_contract.zig").Request{ .scope = source_scope, .operation = .{ .status = .receiver } }).validate());
-    try source.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = source_scope, .limit = retained.default_limit } } }, .{ .term = 1, .index = 2 });
+    try server_test_adapter.applyOrdered(&source, .{ .online_source = .{ .admit = .{ .scope = source_scope, .limit = retained.default_limit } } }, .{ .term = 1, .index = 2 });
     const start = (try source.onlineSourceStatus(source_scope)).start;
     const certificate = try source.prepareOnlineSourcePublication(source_scope, .none);
-    try source.batchRaftReplicatedApply(.{ .online_source = .{ .publish_certificate = .{ .scope = source_scope, .certificate = certificate } } }, .{ .term = 1, .index = 3 });
+    try server_test_adapter.applyOrdered(&source, .{ .online_source = .{ .publish_certificate = .{ .scope = source_scope, .certificate = certificate } } }, .{ .term = 1, .index = 3 });
     // Restart after durable admission/publication; never recapture the source.
     source.close();
     source_open = false;
@@ -104,7 +106,7 @@ fn runRewrite(preserve_document: bool) !void {
     try target.setSchemaJson(alloc, to_schema);
     const scope: staging.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = source_options.identity_namespace.?, .target_namespace = target_options.identity_namespace.?, .target_schema_digest = programs.target_runtime_digest, .rewrite = .{ .program_digest = programs.identity, .retained_pin = source_scope.pin(), .snapshot_certificate = try certificate.digest(), .retained_epoch = 1, .retained_start = start, .source_applied_index = certificate.cut.applied_index, .source_scope = source_scope } };
     try target.reserveRestoreStagingScoped(alloc, scope);
-    try target.batchRaftReplicatedApply(.{ .restore_staging = .{ .begin = scope } }, .{ .term = 1, .index = 1 });
+    try server_test_adapter.applyOrdered(&target, .{ .restore_staging = .{ .begin = scope } }, .{ .term = 1, .index = 1 });
     try std.testing.expectError(error.InvalidRestoreStagingCommand, target.prepareRestoreStagingPage(alloc, scope, &decoder, 1, .none));
     var first = try target.prepareRewriteStagingPage(alloc, scope, &decoder, 1, .none, &programs);
     defer first.deinit();
@@ -113,12 +115,12 @@ fn runRewrite(preserve_document: bool) !void {
     defer last.deinit();
     // An acknowledged source transaction occurs after the immutable snapshot
     // page was prepared, but before the receiver has applied that last page.
-    try source.batchRaftReplicatedApply(.{ .timestamp_ns = 202, .writes = &.{ .{ .key = "a", .value = "{\"x\":9}" }, .{ .key = "c", .value = "{\"x\":5}" } }, .deletes = &.{"b"} }, .{ .term = 1, .index = 4 });
+    try server_test_adapter.applyOrdered(&source, .{ .timestamp_ns = 202, .writes = &.{ .{ .key = "a", .value = "{\"x\":9}" }, .{ .key = "c", .value = "{\"x\":5}" } }, .deletes = &.{"b"} }, .{ .term = 1, .index = 4 });
     try apply(&target, &last, 3);
     try apply(&target, &last, 3); // Lost response, identical committed command.
     try std.testing.expectError(error.RestoreStagingProgressChanged, apply(&target, &first, 4));
-    try source.batchRaftReplicatedApply(.{ .relational_topology = .{ .fence = source_scope.fence, .action = .begin } }, .{ .term = 1, .index = 5 });
-    try source.batchRaftReplicatedApply(.{ .online_source = .{ .final_fence = .{ .scope = source_scope, .expected_sequence = start + 1 } } }, .{ .term = 1, .index = 6 });
+    try server_test_adapter.applyOrdered(&source, .{ .relational_topology = .{ .fence = source_scope.fence, .action = .begin } }, .{ .term = 1, .index = 5 });
+    try server_test_adapter.applyOrdered(&source, .{ .online_source = .{ .final_fence = .{ .scope = source_scope, .expected_sequence = start + 1 } } }, .{ .term = 1, .index = 6 });
     const final_status = try source.onlineSourceStatus(source_scope);
     const cut: contract.FinalCut = .{ .sequence = final_status.through_sequence, .applied_index = final_status.applied_index, .digest = final_status.cut_digest };
     const final_receipt = try contract.FinalReceipt.fromProgress(scope.rewrite.?, final_status);
@@ -236,7 +238,7 @@ fn runRewrite(preserve_document: bool) !void {
     defer status.deinit();
     try std.testing.expectEqual(.published, status.value.phase);
     try std.testing.expectEqual(cut, status.value.rewrite.?.final_cut.?);
-    try source.batchRaftReplicatedApply(.{ .online_source = .{ .release = source_scope } }, .{ .term = 1, .index = 7 });
+    try server_test_adapter.applyOrdered(&source, .{ .online_source = .{ .release = source_scope } }, .{ .term = 1, .index = 7 });
     try std.testing.expectEqual(.released, (try source.onlineSourceStatus(source_scope)).phase);
 }
 
@@ -247,7 +249,7 @@ test "relational index system rewrite immutable program set binds policy and all
     var reopened = try rewrite.ProgramSet.initIntent(alloc, intent);
     defer reopened.deinit();
     try std.testing.expectEqualSlices(u8, &programs.identity, &reopened.identity);
-    intent.apply_defaults_to_absent = true;
+    intent.allow_column_drops = true;
     try std.testing.expectError(error.RestoreStagingScopeChanged, rewrite.ProgramSet.initIntent(alloc, intent));
     try std.testing.expectError(error.InvalidRestoreStagingCommand, rewrite.ProgramSet.init(alloc, &.{ source_schema, source_schema }, target_schema, .{}));
     const historical = try std.mem.replaceOwned(u8, alloc, source_schema, "\"version\":1", "\"version\":3");

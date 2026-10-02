@@ -18,7 +18,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
-const runtime_http_bridge = @import("../runtime_http_bridge.zig");
+const runtime_http_bridge = @import("antfly_runtime_abi").http_bridge;
 const abi = @import("kernel_abi.zig");
 const server_mod = @import("http_server.zig");
 const handler_mod = @import("httpx_handler.zig");

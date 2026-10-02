@@ -16,7 +16,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const catalog_types = @import("types.zig");
 const head_coordination = @import("../head_coordination.zig");
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const work_lease = @import("../build/work_lease.zig");
 
 pub const PublicationFence = head_coordination.Fence;

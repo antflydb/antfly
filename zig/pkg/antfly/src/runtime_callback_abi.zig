@@ -10,8 +10,8 @@
 //! ABI, and allocator ownership uses runtime_memory_abi at explicit owner ABIs.
 
 const std = @import("std");
-const error_abi = @import("runtime_error_abi.zig");
-const native_abi = @import("runtime_native_abi.zig");
+const error_abi = @import("antfly_runtime_abi").error_abi;
+const native_abi = @import("antfly_runtime_abi").native_abi;
 
 pub const CallbackDispatch = *const fn (
     contract: *const native_abi.CallContract,

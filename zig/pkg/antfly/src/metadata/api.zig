@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const platform_time = @import("antfly_platform").time;
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const metadata_state = @import("state.zig");
 const metadata_reconciler = @import("reconciler.zig");
 const extension_domain = @import("../extensions/mod.zig");
@@ -26,25 +26,15 @@ const transition_state = @import("transition_state.zig");
 const metadata_incarnation = @import("incarnation.zig");
 const reallocation_request = @import("reallocation_request.zig");
 
-pub const MetadataClusterIncarnation = metadata_incarnation.MetadataClusterIncarnation;
+pub const MetadataClusterIncarnation = @import("catalog_mutation_stamp.zig").MetadataClusterIncarnation;
+
 pub const MetadataRaftVoterSetFingerprint = [table_manager.voter_set_fingerprint_len * 2]u8;
 
 /// Authoritative ordering stamp for one consensus-committed catalog mutation.
 /// The Raft log index is comparable only inside the same metadata namespace;
 /// carrying that namespace with the receipt prevents delayed callbacks from a
 /// replaced metadata group from superseding current control-plane work.
-pub const CatalogMutationStamp = struct {
-    metadata_group_id: u64,
-    metadata_incarnation: MetadataClusterIncarnation,
-    term: u64,
-    index: u64,
-
-    pub fn eql(lhs: CatalogMutationStamp, rhs: CatalogMutationStamp) bool {
-        return lhs.metadata_group_id == rhs.metadata_group_id and
-            std.mem.eql(u8, &lhs.metadata_incarnation, &rhs.metadata_incarnation) and
-            lhs.term == rhs.term and lhs.index == rhs.index;
-    }
-};
+pub const CatalogMutationStamp = @import("catalog_mutation_stamp.zig").CatalogMutationStamp;
 
 /// Allocation-free subset of `/status` used by rolling-upgrade admission
 /// probes. Keeping this separate from MetadataStatus avoids parsing and
@@ -392,113 +382,18 @@ pub const CatalogRouteQuery = struct {
     group_id: u64 = 0,
 };
 
-pub const CatalogIdentityNamespace = struct {
-    table_id: u64,
-    shard_id: u64,
-    range_id: u64,
-};
-
-pub const CatalogGroupRoute = struct {
-    group_id: u64,
-    range_id: u64,
-    identity_namespace: CatalogIdentityNamespace,
-};
-
-pub const catalog_route_fence_protocol_current: u16 = 1;
-pub const catalog_route_fence_header = "X-Antfly-Catalog-Route-Fence";
-pub const catalog_route_fence_ack_header = "X-Antfly-Catalog-Route-Fence-Ack";
-pub const catalog_route_fence_ack_value = "1";
-/// Separate from routing acknowledgement: emitted only after a successful
-/// fenced read-index lookup proves the logical key absent.
-pub const read_index_absence_header = "X-Antfly-Read-Index-Absence";
-pub const read_index_absence_value = "1";
-pub const catalog_route_deadline_ms_header = "X-Antfly-Catalog-Route-Deadline-Ms";
-pub const catalog_route_default_deadline_ms: u32 = 5_000;
-pub const catalog_route_max_deadline_ms: u32 = 30_000;
-
-/// Immutable authority and identity carried with every first-party
-/// group-local read. The receiver validates this against its compact routing
-/// projection before opening storage, so an independently cached admin
-/// snapshot can never select a different table generation.
-pub const CatalogRouteFence = struct {
-    protocol: u16 = catalog_route_fence_protocol_current,
-    metadata_group_id: u64,
-    metadata_incarnation: ?MetadataClusterIncarnation = null,
-    catalog_revision: u64,
-    table_id: u64,
-    topology_epoch: u64,
-    route: CatalogGroupRoute,
-    /// Receiver-local admission context. These fields are intentionally
-    /// excluded from the wire representation: monotonic clocks and borrowed
-    /// cancellation callbacks are process-local capabilities.
-    admission_deadline_ns: ?u64 = null,
-    admission_deadline_io: ?@import("../runtime_io_abi.zig").Borrow = null,
-    admission_cancellation: CancellationToken = .none,
-
-    const Wire = struct {
-        protocol: u16 = catalog_route_fence_protocol_current,
-        metadata_group_id: u64,
-        metadata_incarnation: ?MetadataClusterIncarnation = null,
-        catalog_revision: u64,
-        table_id: u64,
-        topology_epoch: u64,
-        route: CatalogGroupRoute,
-    };
-
-    fn wire(self: @This()) Wire {
-        return .{
-            .protocol = self.protocol,
-            .metadata_group_id = self.metadata_group_id,
-            .metadata_incarnation = self.metadata_incarnation,
-            .catalog_revision = self.catalog_revision,
-            .table_id = self.table_id,
-            .topology_epoch = self.topology_epoch,
-            .route = self.route,
-        };
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.write(self.wire());
-    }
-
-    /// The binary-safe durable transaction encoder also uses the wire-only
-    /// projection; borrowed process-local admission callbacks are never data.
-    pub fn nativeJsonProjection(self: @This()) Wire {
-        return self.wire();
-    }
-
-    pub fn jsonParse(alloc: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        const value = try std.json.innerParse(Wire, alloc, source, options);
-        return .{
-            .protocol = value.protocol,
-            .metadata_group_id = value.metadata_group_id,
-            .metadata_incarnation = value.metadata_incarnation,
-            .catalog_revision = value.catalog_revision,
-            .table_id = value.table_id,
-            .topology_epoch = value.topology_epoch,
-            .route = value.route,
-        };
-    }
-
-    pub fn validate(self: @This()) !void {
-        if (self.protocol != catalog_route_fence_protocol_current) return error.UnsupportedCatalogRouteFence;
-        if (self.metadata_group_id == 0 or self.table_id == 0 or self.route.group_id == 0) return error.InvalidCatalogRouteFence;
-        if (self.route.identity_namespace.table_id != self.table_id) return error.InvalidCatalogRouteFence;
-    }
-
-    pub fn jsonParseFromValue(alloc: std.mem.Allocator, value: std.json.Value, options: std.json.ParseOptions) !@This() {
-        const parsed = try std.json.innerParseFromValue(Wire, alloc, value, options);
-        return .{
-            .protocol = parsed.protocol,
-            .metadata_group_id = parsed.metadata_group_id,
-            .metadata_incarnation = parsed.metadata_incarnation,
-            .catalog_revision = parsed.catalog_revision,
-            .table_id = parsed.table_id,
-            .topology_epoch = parsed.topology_epoch,
-            .route = parsed.route,
-        };
-    }
-};
+pub const CatalogIdentityNamespace = @import("catalog_route_contract.zig").CatalogIdentityNamespace;
+pub const CatalogGroupRoute = @import("catalog_route_contract.zig").CatalogGroupRoute;
+pub const catalog_route_fence_protocol_current = @import("catalog_route_contract.zig").catalog_route_fence_protocol_current;
+pub const catalog_route_fence_header = @import("catalog_route_contract.zig").catalog_route_fence_header;
+pub const catalog_route_fence_ack_header = @import("catalog_route_contract.zig").catalog_route_fence_ack_header;
+pub const catalog_route_fence_ack_value = @import("catalog_route_contract.zig").catalog_route_fence_ack_value;
+pub const read_index_absence_header = @import("catalog_route_contract.zig").read_index_absence_header;
+pub const read_index_absence_value = @import("catalog_route_contract.zig").read_index_absence_value;
+pub const catalog_route_deadline_ms_header = @import("catalog_route_contract.zig").catalog_route_deadline_ms_header;
+pub const catalog_route_default_deadline_ms = @import("catalog_route_contract.zig").catalog_route_default_deadline_ms;
+pub const catalog_route_max_deadline_ms = @import("catalog_route_contract.zig").catalog_route_max_deadline_ms;
+pub const CatalogRouteFence = @import("catalog_route_contract.zig").CatalogRouteFence;
 
 pub const CatalogRoutePlan = struct {
     metadata_group_id: u64,

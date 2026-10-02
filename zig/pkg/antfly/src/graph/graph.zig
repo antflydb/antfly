@@ -36,7 +36,7 @@ const adjacency_blocks = @import("adjacency.zig");
 const topology_owner = @import("topology_owner.zig");
 const typed_edges = @import("typed_edges.zig");
 const maintenance = @import("maintenance.zig");
-const cancellation_mod = @import("../common/cancellation.zig");
+const cancellation_mod = @import("antfly_cancellation");
 const backend_erased = @import("../storage/backend_erased.zig");
 const backend_scan = @import("../storage/backend_scan.zig");
 const docstore = @import("../storage/docstore.zig");
@@ -1296,6 +1296,33 @@ pub const GraphIndex = struct {
             if (ownsGraphOwner(scope, owner)) return true;
         }
         return false;
+    }
+
+    /// Document owners of a materialized edge, using its adjacency-local
+    /// membership range rather than scanning the graph's primary catalog.
+    pub fn edgeOwnersAlloc(self: *GraphIndex, alloc: Allocator, source: []const u8, edge_type: []const u8, target: []const u8) ![][]u8 {
+        const prefix = try ownerMemberEdgePrefixAlloc(alloc, source, edge_type, target);
+        defer alloc.free(prefix);
+        var owners: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (owners.items) |owner| alloc.free(owner);
+            owners.deinit(alloc);
+        }
+        var read = try self.beginReadReverseTxn();
+        defer read.abort();
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        var row = try cursor.seekAtOrAfter(prefix);
+        while (row) |entry| : (row = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            const suffix = entry.key[prefix.len..];
+            const end = internal_keys.findComponentTerminator(suffix, 0) orelse return error.InvalidGraphOwnerMember;
+            if (end + 2 != suffix.len) return error.InvalidGraphOwnerMember;
+            const owner = try internal_keys.decodeBodyAlloc(alloc, suffix[0..end]);
+            errdefer alloc.free(owner);
+            try owners.append(alloc, owner);
+        }
+        return owners.toOwnedSlice(alloc);
     }
 
     fn hasOwnerMember(self: *GraphIndex, alloc: Allocator, source: []const u8, edge_type: []const u8, target: []const u8) !bool {

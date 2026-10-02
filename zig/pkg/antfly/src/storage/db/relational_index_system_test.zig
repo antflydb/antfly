@@ -13,6 +13,10 @@
 // limitations.
 
 //! End-to-end LSM lifecycle and standby contracts, plus reproducible work counts.
+const server_test_adapter = if (builtin.is_test) @import("../server_db_adapter.zig") else struct {};
+const builtin = @import("builtin");
+const hot_standby_publisher_adapter = @import("../hot_standby/db_commit.zig");
+const replication_ingress = @import("replication_ingress.zig");
 const std = @import("std");
 const db_mod = @import("mod.zig");
 const rows = @import("relational_rows.zig");
@@ -883,7 +887,7 @@ test "relational index system restore replay projection bounds allocation for wi
     defer alloc.free(payload);
     var scratch: [16 * 1024]u8 = undefined;
     var bounded = std.heap.FixedBufferAllocator.init(&scratch);
-    const record: @import("../hot_standby/replication_record.zig").RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = payload };
+    const record: @import("replication_record.zig").RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = payload };
     try std.testing.expectEqual(null, try effects.decodeRestoreFinishForReplay(bounded.allocator(), record));
 }
 
@@ -924,7 +928,7 @@ test "relational index system restore receipts require local coverage through fa
     var decoded_page = try batch_api.parseInternalBatchRequest(alloc, encoded_page);
     defer decoded_page.deinit(alloc);
     try std.testing.expectEqual(.write, decoded_page.req.sync_level);
-    try target.batchRaftReplicatedApply(decoded_page.req, .{ .index = 1, .term = 1 });
+    try server_test_adapter.applyOrdered(&target, decoded_page.req, .{ .index = 1, .term = 1 });
     try std.testing.expectError(error.RestoreStagingInProgress, target.lookup(alloc, "a", .{}));
     {
         var imported = (try target.restoreStagingStatus(alloc)).?;
@@ -951,14 +955,14 @@ test "relational index system restore receipts require local coverage through fa
             try std.testing.expectEqual(.building, (try target.relationalIndexBuildStatus("tenant_id")).state);
             try std.testing.expectError(error.IndexRebuilding, target.finishRestoreStaging(alloc, scope.digest(), phase));
             if (trial == 1) {
-                target.ha_write_gate = .{ .shared = .{ .state = &standby_gate } };
+                target.local_execution.replication_write_gate = .{ .shared = .{ .state = standby_gate.storageWriteState() } };
                 try std.testing.expectError(error.HAReadOnlyStandby, target.prepareRestoreStagingIndexesStep(alloc, scope.digest()));
             }
             const request: db_mod.types.BatchRequest = .{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = phase } } };
             const entry_index = if (trial == 0) raft_index else raft_index - 1;
             var pending: usize = 0;
             for (0..32) |_| {
-                target.batchRaftReplicatedApply(request, .{ .index = entry_index, .term = 1 }) catch |err| switch (err) {
+                server_test_adapter.applyOrdered(&target, request, .{ .index = entry_index, .term = 1 }) catch |err| switch (err) {
                     error.RestoreProjectionCatchUpPending => {
                         pending += 1;
                         continue;
@@ -977,25 +981,25 @@ test "relational index system restore receipts require local coverage through fa
     }
     // The hot-standby LSN fast path has the same obligation as Raft: a replay
     // receipt cannot skip reconstructing this replica's missing local proof.
-    const ha_payload = try @import("../hot_standby/effects.zig").encodeBatchMutationRequestAlloc(alloc, .{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .published } } });
-    defer alloc.free(ha_payload);
-    const record: @import("../hot_standby/replication_record.zig").RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = ha_payload };
-    try target.applyHAReplicationRecord(record);
+    const replication_payload = try @import("../hot_standby/effects.zig").encodeBatchMutationRequestAlloc(alloc, .{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .published } } });
+    defer alloc.free(replication_payload);
+    const record: @import("replication_record.zig").RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = replication_payload };
+    try replication_ingress.applyRecord(&target, record);
     try resetRestoreIndexCoverage(&target, false);
     target.close();
     target = try db_mod.DB.open(alloc, target_directory.path(), target_options);
-    target.ha_write_gate = .{ .shared = .{ .state = &standby_gate } };
+    target.local_execution.replication_write_gate = .{ .shared = .{ .state = standby_gate.storageWriteState() } };
     // Superseded entries and an unrelated scope must not perform maintenance
     // against the current generation, even when its local coverage is missing.
-    try target.batchRaftReplicatedApply(.{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .validated } } }, .{ .index = 2, .term = 1 });
+    try server_test_adapter.applyOrdered(&target, .{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .validated } } }, .{ .index = 2, .term = 1 });
     try std.testing.expectEqual(.building, (try target.relationalIndexBuildStatus("tenant_id")).state);
-    try target.batchRaftReplicatedApply(.{ .restore_staging = .{ .finish = .{ .scope = @splat(99), .phase = .published } } }, .{ .index = 3, .term = 1 });
+    try server_test_adapter.applyOrdered(&target, .{ .restore_staging = .{ .finish = .{ .scope = @splat(99), .phase = .published } } }, .{ .index = 3, .term = 1 });
     try std.testing.expectEqual(.building, (try target.relationalIndexBuildStatus("tenant_id")).state);
-    var ha_pending: usize = 0;
+    var replication_pending: usize = 0;
     for (0..32) |_| {
-        target.applyHAReplicationRecord(record) catch |err| switch (err) {
+        replication_ingress.applyRecord(&target, record) catch |err| switch (err) {
             error.RestoreProjectionCatchUpPending => {
-                ha_pending += 1;
+                replication_pending += 1;
                 continue;
             },
             else => return err,
@@ -1003,7 +1007,7 @@ test "relational index system restore receipts require local coverage through fa
         break;
     } else return error.IndexBuildDidNotConverge;
     try std.testing.expectEqual(.ready, (try target.relationalIndexBuildStatus("tenant_id")).state);
-    try std.testing.expect(ha_pending != 0);
+    try std.testing.expect(replication_pending != 0);
     target.close();
     target = try db_mod.DB.open(alloc, target_directory.path(), target_options);
     try std.testing.expectEqual(@as(usize, 1), try expressionIndexCount(&target, 20));
@@ -1754,7 +1758,7 @@ test "relational index system replicated merge fences stale attempts and rebuild
     try applyTopology(&db, &index, winning_request);
     // Exact Raft replay, then a stale owner's request at a NEW applied index:
     // neither may leave old secondary tuples or change the winning row.
-    try db.batchRaftReplicatedApply(winning_request, .{ .term = 7, .index = index });
+    try server_test_adapter.applyOrdered(&db, winning_request, .{ .term = 7, .index = index });
     try applyTopology(&db, &index, old_request);
     try applyTopology(&db, &index, .{ .merge_replication = old_copy, .deletes = &.{"b\x00"} });
     db.close();
@@ -1777,7 +1781,7 @@ test "relational index system replicated merge fences stale attempts and rebuild
 
 fn applyTopology(db: *db_mod.DB, index: *u64, request: db_mod.types.BatchRequest) !void {
     index.* += 1;
-    try db.batchRaftReplicatedApply(request, .{ .term = 7, .index = index.* });
+    try server_test_adapter.applyOrdered(&db, request, .{ .term = 7, .index = index.* });
 }
 
 test "relational index system replicated split checkpoints and sparse deltas preserve native companions across reopen" {
@@ -1815,7 +1819,7 @@ test "relational index system replicated split checkpoints and sparse deltas pre
     try std.testing.expectError(error.RelationalIndexNotReady, db.beginRelationalRows(alloc, .{ .index = "tenant_id" }));
     const request: db_mod.types.BatchRequest = .{ .split_replication = copy, .writes = &.{ .{ .key = "x\x00", .value = "{\"tenant\":1,\"id\":9}" }, .{ .key = "y", .value = "{\"tenant\":1,\"id\":8}" } } };
     try applyTopology(&db, &index, request);
-    try db.batchRaftReplicatedApply(request, .{ .term = 7, .index = index });
+    try server_test_adapter.applyOrdered(&db, request, .{ .term = 7, .index = index });
     db.close();
     db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
     try applyTopology(&db, &index, .{ .split_replication = control, .split_checkpoint = checkpoint });
@@ -1828,7 +1832,7 @@ test "relational index system replicated split checkpoints and sparse deltas pre
     delta.previous_sequence = 9;
     const update: db_mod.types.BatchRequest = .{ .split_replication = delta, .writes = &.{.{ .key = "x\x00", .value = "{\"tenant\":1,\"id\":7}" }}, .deletes = &.{"y"} };
     try applyTopology(&db, &index, update);
-    try db.batchRaftReplicatedApply(update, .{ .term = 7, .index = index });
+    try server_test_adapter.applyOrdered(&db, update, .{ .term = 7, .index = index });
     try applyTopology(&db, &index, update);
     _ = try ready(&db);
     try expectIndexRows(&db, &.{"x\x00"});
@@ -2413,8 +2417,8 @@ fn replay(primary: *primary_mod.Primary, replica: *db_mod.DB, next: *u64) !void 
     while (next.* <= primary.lastLsn()) : (next.* += 1) {
         var entry = (try primary.log.entryAt(alloc, next.*)) orelse return error.MissingReplicationRecord;
         defer entry.deinit(alloc);
-        try replica.applyHAReplicationRecord(entry.record);
-        try replica.applyHAReplicationRecord(entry.record);
+        try replication_ingress.applyRecord(replica, entry.record);
+        try replication_ingress.applyRecord(replica, entry.record);
     }
 }
 
@@ -2433,8 +2437,8 @@ test "relational index system standby replays schema churn and rebuilds ready ge
     var last_lsn = std.atomic.Value(u64).init(0);
     var failures = std.atomic.Value(u64).init(0);
     var mirrored = options;
-    mirrored.ha_async_metadata_mirror = .{ .primary = &primary, .last_lsn = &last_lsn, .failure_count = &failures };
-    mirrored.ha_async_batch_mirror = .{ .primary = &primary, .sync_policy = .{ .mode = .async } };
+    mirrored.replication_async_metadata_mirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .last_lsn = &last_lsn, .failure_count = &failures };
+    mirrored.replication_async_batch_mirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .async } };
     var source = try db_mod.DB.open(alloc, source_path, mirrored);
     defer source.close();
     var replica = try db_mod.DB.open(alloc, replica_path, options);
@@ -2489,7 +2493,7 @@ test "relational index system standby replays schema churn and rebuilds ready ge
     const current = try replica.relationalIndexBuildStatus("tenant_id");
     try std.testing.expect(current.generation > first.generation);
     try std.testing.expectEqual(@as(usize, 2), (try scan(&replica, true)).count);
-    try std.testing.expectEqual(next - 1, try replica.haAppliedReplicationLsn());
+    try std.testing.expectEqual(next - 1, try replica.replicationAppliedSequence());
     try std.testing.expectEqual(@as(u64, 0), failures.load(.acquire));
     // The recovered replica's active plan must also serve fresh primary writes;
     // replay completion alone is insufficient evidence of a usable write plan.
@@ -2633,7 +2637,7 @@ test "relational index system LSM build work is linear in rows times indexes" {
         try std.testing.expectEqual(count, check_records);
         for (0..256) |_| {
             _ = try db.runRelationalIndexMaintenancePass();
-            if (!db.relational_index_maintenance_sweep.isPending()) break;
+            if (!db.local_execution.relational_index_maintenance_sweep.isPending()) break;
         } else return error.MaintenanceDidNotBecomeIdle;
         try std.testing.expect(!try db.runRelationalIndexMaintenancePass() or index_count > 16);
         std.debug.print("LSM primary/CHECK scans indexes={d} rows={d} primary_records={d} check_records={d}\n", .{ index_count, count, primary_records, check_records });

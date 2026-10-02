@@ -15,7 +15,7 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const table_catalog = @import("../api/table_catalog.zig");
 const db_types = @import("../storage/db/types.zig");
 const graph_query = @import("../graph/query.zig");
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 

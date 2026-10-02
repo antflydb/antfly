@@ -3927,6 +3927,7 @@ fn encodeCommitRequestMode(alloc: std.mem.Allocator, req: OwnedTransactionCommit
                     .key = predicate.key,
                     .version = try std.fmt.bufPrint(&version_buf, "{d}", .{predicate.expected_version}),
                     .digest = predicate.expected_content_digest,
+                    .unique_absence = predicate.unique_absence,
                 }, .{});
                 defer alloc.free(encoded);
                 try out.appendSlice(alloc, encoded);
@@ -4197,7 +4198,7 @@ fn parseStoredCommitValue(alloc: std.mem.Allocator, value: std.json.Value) !Owne
             const table = for (request.tables) |*table| {
                 if (std.mem.eql(u8, table.table_name, entry.key_ptr.*)) break table;
             } else return error.InvalidTransactionSessionRecord;
-            const Stored = struct { key: []const u8, version: []const u8, digest: ?[32]u8 };
+            const Stored = struct { key: []const u8, version: []const u8, digest: ?[32]u8, unique_absence: bool = false };
             var parsed = try std.json.parseFromValue([]const Stored, alloc, entry.value_ptr.*, .{});
             defer parsed.deinit();
             const predicates = try alloc.alloc(db_mod.types.TransactionVersionPredicate, parsed.value.len);
@@ -4206,6 +4207,7 @@ fn parseStoredCommitValue(alloc: std.mem.Allocator, value: std.json.Value) !Owne
                 .key = stored.key,
                 .expected_version = try parseVersionString(stored.version),
                 .expected_content_digest = stored.digest,
+                .unique_absence = stored.unique_absence,
             };
             try appendPredicates(alloc, &table.predicates, predicates);
         }
@@ -4454,6 +4456,7 @@ fn clonePredicatesInto(
             .key = try alloc.dupe(u8, predicate.key),
             .expected_version = predicate.expected_version,
             .expected_content_digest = predicate.expected_content_digest,
+            .unique_absence = predicate.unique_absence,
         });
     }
 }
@@ -4842,12 +4845,14 @@ fn appendPredicates(
             if (previous.expected_content_digest) |digest| {
                 if (predicate.expected_content_digest) |next| if (!std.mem.eql(u8, &digest, &next)) return error.VersionConflict;
             } else previous.expected_content_digest = predicate.expected_content_digest;
+            previous.unique_absence = previous.unique_absence or predicate.unique_absence;
             continue;
         }
         predicates.appendAssumeCapacity(.{
             .key = try alloc.dupe(u8, predicate.key),
             .expected_version = predicate.expected_version,
             .expected_content_digest = predicate.expected_content_digest,
+            .unique_absence = predicate.unique_absence,
         });
         by_key.putAssumeCapacity(predicates.items[predicates.items.len - 1].key, predicates.items.len - 1);
     }

@@ -149,10 +149,10 @@ const Fixture = struct {
             try std.testing.expectError(error.RestoreStagingScopeChanged, self.destinationIndex(name, null, request.restore_staging_plan_id, command.fence.owner_group_id));
             try std.testing.expectError(error.RestoreStagingScopeChanged, self.destinationIndex(name, request.restore_staging_scope, @as([16]u8, @splat(0)), command.fence.owner_group_id));
             try std.testing.expectError(error.RestoreStagingScopeChanged, self.destinationIndex(name, request.restore_staging_scope, request.restore_staging_plan_id, 20 + i));
-            const donor_marker = try self.donors[i].raftAppliedEntry();
+            const donor_marker = try self.donors[i].orderedApplyReceipt();
             var apply: Apply = .{ .fixture = self, .index = i };
             try Apply.propose(&apply, request, .{});
-            try std.testing.expect(std.meta.eql(donor_marker, try self.donors[i].raftAppliedEntry()));
+            try std.testing.expect(std.meta.eql(donor_marker, try self.donors[i].orderedApplyReceipt()));
             var read = try self.donors[i].core.store.beginReadTxn();
             defer read.abort();
             try std.testing.expect((try @import("../storage/db/empty_generation_handoff.zig").loadInstallReceipt(&read)) == null);
@@ -161,7 +161,7 @@ const Fixture = struct {
         }
         const i = try index(name);
         self.donor_indices[i] += 1;
-        if (self.non_raft) try self.donors[i].batch(request) else try self.donors[i].batchRaftReplicatedApply(request, .{ .index = self.donor_indices[i], .term = 1 });
+        if (self.non_raft) try self.donors[i].batch(request) else try @import("../storage/server_db_adapter.zig").applyOrdered(&self.donors[i], request, .{ .index = self.donor_indices[i], .term = 1 });
         return {};
     }
     fn sourceLookup(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, key: []const u8, opts: db.types.LookupOptions, _: read_gate.ReadConsistency) !?reads.LookupResponse {
@@ -289,7 +289,7 @@ const Fixture = struct {
             mutation.restore_staging_scope = self.fixture.scopes[self.index].digest();
             const is_import_page = if (request.restore_staging) |command| command == .import_page else false;
             const apply_started_ns = if (is_import_page) @import("antfly_platform").time.monotonicNs() else 0;
-            if (self.fixture.non_raft) try self.fixture.dbs[self.index].batchWithVisibilityCancellation(mutation, context.cancellation) else try self.fixture.dbs[self.index].batchRaftReplicatedApply(mutation, .{ .index = self.fixture.indices[self.index], .term = 1 });
+            if (self.fixture.non_raft) try self.fixture.dbs[self.index].batchWithVisibilityCancellation(mutation, context.cancellation) else try @import("../storage/server_db_adapter.zig").applyOrdered(&self.fixture.dbs[self.index], mutation, .{ .index = self.fixture.indices[self.index], .term = 1 });
             if (is_import_page) {
                 const elapsed_ns = @import("antfly_platform").time.monotonicNs() - apply_started_ns;
                 self.fixture.import_apply_elapsed_ns +|= elapsed_ns;
@@ -590,7 +590,7 @@ fn runRewriteWithFailure(comptime Driver: type, invalid_tail: bool, non_raft: bo
         const source_identity = try original.relationalTopologyIdentity();
         try std.testing.expectEqual(@as(@TypeOf(source_identity.generation_handoff_receipt_authority), if (non_raft) .native else .raft), source_identity.generation_handoff_receipt_authority);
         const initial: db.types.BatchRequest = .{ .timestamp_ns = 123, .writes = &.{ .{ .key = "row", .value = "{\"id\":1,\"x\":2}" }, .{ .key = "removed", .value = "{\"id\":3,\"x\":4}" } } };
-        if (non_raft) try original.batch(initial) else try original.batchRaftReplicatedApply(initial, .{ .index = 1, .term = 1 });
+        if (non_raft) try original.batch(initial) else try @import("../storage/server_db_adapter.zig").applyOrdered(&original, initial, .{ .index = 1, .term = 1 });
         // v1 rows remain physically present but no active/read definition
         // names their epoch. Admission must include the native history map.
         if (i == 0) try original.setSchemaJson(alloc, active_schema);
@@ -690,8 +690,8 @@ fn runRewriteWithFailure(comptime Driver: type, invalid_tail: bool, non_raft: bo
     try std.testing.expectEqual(@as(usize, if (!unsupported_native_empty and !invalid_tail) 3 else 0), fixture.destination_handoff_writes);
     try std.testing.expectEqual(empty_generation or !invalid_tail, fixture.destination_handoff_identity_reads != 0);
     if (non_raft) {
-        for (fixture.donors) |donor| try std.testing.expect((try donor.raftAppliedEntry()) == null);
-        for (fixture.dbs, fixture.target_open) |target, opened| if (opened) try std.testing.expect((try target.raftAppliedEntry()) == null);
+        for (fixture.donors) |donor| try std.testing.expect((try donor.orderedApplyReceipt()) == null);
+        for (fixture.dbs, fixture.target_open) |target, opened| if (opened) try std.testing.expect((try target.orderedApplyReceipt()) == null);
     }
     var published = (try source.adminSnapshot()).?;
     defer source.freeAdminSnapshot(&published);
@@ -774,7 +774,7 @@ pub fn runWithPersistence(comptime Driver: type, invalid_child: bool, override: 
     return runWithPolicy(Driver, invalid_child, override, persistence, .{});
 }
 
-pub const Policy = struct { failover_safe: bool = false, guard: ?http.RestoreExecutionGuard = null, gate: ?db.HAWriteGate = null, mirror: ?db.HAAsyncEffectMirror = null, term: u64 = 1, portable: bool = false, restart_after_commit: bool = false, table_restore: bool = false, migration: bool = false, generated: bool = false, remote_owner: bool = false, benchmark_rows: usize = 1, benchmark_deadline_ms: u32 = 30_000, validation_route_gaps: usize = 0 };
+pub const Policy = struct { failover_safe: bool = false, guard: ?http.RestoreExecutionGuard = null, gate: ?db.ReplicationWriteGate = null, mirror: ?db.ReplicationAsyncEffectMirror = null, term: u64 = 1, portable: bool = false, restart_after_commit: bool = false, table_restore: bool = false, migration: bool = false, generated: bool = false, remote_owner: bool = false, benchmark_rows: usize = 1, benchmark_deadline_ms: u32 = 30_000, validation_route_gaps: usize = 0 };
 
 fn generatedSchema(alloc: std.mem.Allocator, input: []const u8, default_base: []const u8) ![]const u8 {
     var schema = try std.json.parseFromSlice(std.json.Value, alloc, input, .{});
@@ -1072,7 +1072,7 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
         fixture.cache_paths[i] = try std.fmt.allocPrint(a, "{s}/decoder-{d}", .{ root, i });
         const database = try alloc.create(db.DB);
         fixture.target_paths[i] = try std.fmt.allocPrint(a, "{s}/target-{d}", .{ root, i });
-        database.* = try db.DB.open(alloc, fixture.target_paths[i], .{ .backend_runtime = &runtime, .identity_namespace = scope.target_namespace, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false, .ha_write_gate = policy.gate });
+        database.* = try db.DB.open(alloc, fixture.target_paths[i], .{ .backend_runtime = &runtime, .identity_namespace = scope.target_namespace, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false, .replication_write_gate = policy.gate });
         fixture.dbs[i] = database;
         fixture.target_open[i] = true;
         opened += 1;
@@ -1084,7 +1084,7 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
         _ = try @import("../metadata/table_provisioner.zig").reconcileDbIndexesWithOptions(alloc, database, target.table.indexes_json, .{ .restore_build_only = true });
         // Match production provisioning: initialization is local and hidden;
         // only the authorized owner generation may start emitting HA effects.
-        try database.attachRestoreStagingHAMirror(policy.mirror);
+        try database.attachRestoreStagingReplicationMirror(policy.mirror);
     }
     var hidden = (try source.adminSnapshot()).?;
     try std.testing.expectEqual(@as(usize, 0), hidden.tables.len);

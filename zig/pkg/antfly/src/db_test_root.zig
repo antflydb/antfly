@@ -13,6 +13,10 @@
 // limitations.
 
 test {
+    _ = @import("storage/hot_standby/restore_staging_integration_test.zig");
+    _ = @import("storage/hot_standby/native_topology_receipt_integration_test.zig");
+    _ = @import("storage/hot_standby/online_source_integration_test.zig");
+    _ = @import("storage/hot_standby/db_integration_test.zig");
     _ = @import("vopr/index_maintenance.zig");
     _ = @import("antfly_source_root").antfly_sources.physical_db;
     _ = @import("graph/query.zig");

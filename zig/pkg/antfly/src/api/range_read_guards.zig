@@ -4,11 +4,11 @@
 //! must never be routed as ordinary document keys. Admission callbacks/clocks
 //! are process-local and are deliberately stripped from durable ownership.
 const std = @import("std");
-const metadata = @import("../metadata/api.zig");
+const metadata = @import("../metadata/catalog_route_contract.zig");
 pub const Proof = @import("../storage/range_protection.zig").Proof;
 pub const OwnerRangeProof = struct { fence: metadata.CatalogRouteFence, proofs: []const Proof };
 pub const max_owners = 4096;
-pub const max_proofs = 16384;
+pub const max_proofs = tracking.max_proofs;
 const tracking = @import("../storage/range_protection.zig");
 const ProofKey = struct {
     bucket: u16,

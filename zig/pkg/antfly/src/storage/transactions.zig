@@ -227,6 +227,8 @@ pub const VersionPredicate = struct {
     key: []const u8,
     expected_version: u64 = 0, // 0 = key must not exist
     expected_content_digest: ?[32]u8 = null,
+    /// A server-authored INSERT identity constraint, rather than an observed read.
+    unique_absence: bool = false,
     /// Internal integrity records are raw metadata, not timestamped primary
     /// rows. Their CAS compares complete bytes and retains the same shared
     /// dependency guard as a document predicate. NULL means absent, not empty.
@@ -379,18 +381,18 @@ pub const IntentSnapshotValidation = struct {
     replay_sequence: u64,
 };
 
-pub const HAOutbox = struct {
+pub const ReplicationOutbox = struct {
     batch_payload: ?[]u8 = null,
     replay_payload: ?[]u8 = null,
 
-    pub fn deinit(self: *HAOutbox, alloc: Allocator) void {
+    pub fn deinit(self: *ReplicationOutbox, alloc: Allocator) void {
         if (self.batch_payload) |payload| alloc.free(payload);
         if (self.replay_payload) |payload| alloc.free(payload);
         self.* = undefined;
     }
 };
 
-pub const HAOutboxKind = enum { batch, replay };
+pub const ReplicationOutboxKind = enum { batch, replay };
 
 pub const ReplayAppend = struct {
     sequence: u64,
@@ -1313,10 +1315,10 @@ pub const TxnManager = struct {
         };
     }
 
-    pub fn loadHAOutbox(self: *TxnManager, alloc: Allocator, txn_id: TxnId) !HAOutbox {
-        const batch_key = makeTransactionHABatchOutboxKey(txn_id);
-        const replay_key = makeTransactionHAReplayOutboxKey(txn_id);
-        var out: HAOutbox = .{};
+    pub fn loadReplicationOutbox(self: *TxnManager, alloc: Allocator, txn_id: TxnId) !ReplicationOutbox {
+        const batch_key = makeTransactionReplicationBatchOutboxKey(txn_id);
+        const replay_key = makeTransactionReplicationReplayOutboxKey(txn_id);
+        var out: ReplicationOutbox = .{};
         errdefer out.deinit(alloc);
         out.batch_payload = self.getAlloc(alloc, &batch_key) catch |err| switch (err) {
             error.NotFound => null,
@@ -1329,20 +1331,20 @@ pub const TxnManager = struct {
         return out;
     }
 
-    pub fn hasHAOutbox(self: *TxnManager, txn_id: TxnId) !bool {
-        const batch_key = makeTransactionHABatchOutboxKey(txn_id);
-        const replay_key = makeTransactionHAReplayOutboxKey(txn_id);
+    pub fn hasReplicationOutbox(self: *TxnManager, txn_id: TxnId) !bool {
+        const batch_key = makeTransactionReplicationBatchOutboxKey(txn_id);
+        const replay_key = makeTransactionReplicationReplayOutboxKey(txn_id);
         return try self.keyExists(&batch_key) or try self.keyExists(&replay_key);
     }
 
-    pub fn clearHAOutbox(self: *TxnManager, txn_id: TxnId, kind: HAOutboxKind) !void {
+    pub fn clearReplicationOutbox(self: *TxnManager, txn_id: TxnId, kind: ReplicationOutboxKind) !void {
         switch (kind) {
             .batch => {
-                const key = makeTransactionHABatchOutboxKey(txn_id);
+                const key = makeTransactionReplicationBatchOutboxKey(txn_id);
                 try self.applyBatch(&.{}, &.{&key}, null);
             },
             .replay => {
-                const key = makeTransactionHAReplayOutboxKey(txn_id);
+                const key = makeTransactionReplicationReplayOutboxKey(txn_id);
                 try self.applyBatch(&.{}, &.{&key}, null);
             },
         }
@@ -1885,7 +1887,7 @@ pub const TxnManager = struct {
             else
                 !try self.hasAnyIntents(txn_id);
             if (refreshed.status != .pending and refreshed.finalized_at < cleanup_cutoff and
-                no_intents and !try self.hasHAOutbox(txn_id))
+                no_intents and !try self.hasReplicationOutbox(txn_id))
             {
                 try self.deleteTransactionMetadata(txn_id);
                 stats.cleaned_records += 1;
@@ -1909,11 +1911,12 @@ pub const TxnManager = struct {
     ) !void {
         var relational_primary: ?bool = null;
         for (predicates) |pred| {
+            if (pred.unique_absence and (pred.comparison != .document_version or pred.expected_version != 0)) return error.InvalidArgument;
             switch (pred.comparison) {
                 .document_version => {
                     const current_ts = try self.readTimestamp(pred.key);
                     if (pred.expected_version == 0) {
-                        if (current_ts != null) return TxnError.VersionConflict;
+                        if (current_ts != null) return if (pred.unique_absence) error.UniqueConstraintViolation else TxnError.VersionConflict;
                     } else {
                         const ts = current_ts orelse return TxnError.VersionConflict;
                         if (ts != pred.expected_version) return TxnError.VersionConflict;
@@ -2333,7 +2336,7 @@ pub const TxnManager = struct {
             false
         else
             try self.hasAnyIntents(txn_id);
-        if (record.status == .pending or has_intents or try self.hasHAOutbox(txn_id)) {
+        if (record.status == .pending or has_intents or try self.hasReplicationOutbox(txn_id)) {
             try self.applyMutationExtraBatch(extra_batch);
             return false;
         }
@@ -2513,8 +2516,8 @@ pub const TxnManager = struct {
         const record_key = makeRecordKey(txn_id);
         const participant_key = makeSidecarKey(participants_prefix, txn_id);
         const resolved_key = makeSidecarKey(resolved_participants_prefix, txn_id);
-        const ha_batch_key = makeTransactionHABatchOutboxKey(txn_id);
-        const ha_replay_key = makeTransactionHAReplayOutboxKey(txn_id);
+        const ha_batch_key = makeTransactionReplicationBatchOutboxKey(txn_id);
+        const ha_replay_key = makeTransactionReplicationReplayOutboxKey(txn_id);
         const intent_keys_key = makeSidecarKey(intent_keys_prefix, txn_id);
         const schema_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);
         var deletes = std.ArrayListUnmanaged([]const u8).empty;
@@ -2898,11 +2901,11 @@ fn participantListCountInRead(
     return count;
 }
 
-pub fn makeTransactionHABatchOutboxKey(txn_id: TxnId) [ha_batch_outbox_prefix.len + 16]u8 {
+pub fn makeTransactionReplicationBatchOutboxKey(txn_id: TxnId) [ha_batch_outbox_prefix.len + 16]u8 {
     return makeSidecarKey(ha_batch_outbox_prefix, txn_id);
 }
 
-pub fn makeTransactionHAReplayOutboxKey(txn_id: TxnId) [ha_replay_outbox_prefix.len + 16]u8 {
+pub fn makeTransactionReplicationReplayOutboxKey(txn_id: TxnId) [ha_replay_outbox_prefix.len + 16]u8 {
     return makeSidecarKey(ha_replay_outbox_prefix, txn_id);
 }
 
@@ -3932,6 +3935,14 @@ test "version predicate conflict" {
     });
     try std.testing.expectError(TxnError.VersionConflict, result1);
 
+    try std.testing.expectError(error.UniqueConstraintViolation, mgr.writeIntents(txn_id, &.{
+        .{ .key = "existing_key", .value = "new_value" },
+    }, &.{.{ .key = "existing_key", .expected_version = 0, .unique_absence = true }}));
+    try std.testing.expectError(error.InvalidArgument, mgr.checkVersionPredicates(
+        &.{.{ .key = "existing_key", .expected_version = 5000, .unique_absence = true }},
+        null,
+    ));
+
     // Predicate: wrong version — should conflict
     const result2 = mgr.writeIntents(txn_id, &.{
         .{ .key = "existing_key", .value = "new_value" },
@@ -4789,10 +4800,10 @@ test "topology fence retains committed coordinator recovery obligations" {
 
     // HA delivery debt is equally topology-sensitive even after every 2PC
     // participant has acknowledged the decision.
-    const outbox_key = makeTransactionHABatchOutboxKey(txn_id);
+    const outbox_key = makeTransactionReplicationBatchOutboxKey(txn_id);
     try mgr.putValue(&outbox_key, "pending-mirror-delivery");
     try std.testing.expect(try mgr.hasTopologySensitiveTransactions());
-    try mgr.clearHAOutbox(txn_id, .batch);
+    try mgr.clearReplicationOutbox(txn_id, .batch);
     try std.testing.expect(!try mgr.hasTopologySensitiveTransactions());
 }
 

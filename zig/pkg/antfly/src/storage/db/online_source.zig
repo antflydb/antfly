@@ -15,6 +15,8 @@
 //! Transactional source retention lifecycle. Exactly sixteen reusable catalog
 //! slots bound metadata growth; the retained journal's epoch high-watermark
 //! prevents old admissions from resurrecting after a terminal slot is reused.
+
+const replication_ingress = @import("replication_ingress.zig");
 const std = @import("std");
 const retained = @import("../retained_effects.zig");
 const topology = @import("relational_integrity_topology.zig");
@@ -441,14 +443,14 @@ test "relational index system online source controls survive LSM reopen with ato
         var uncertifiable = scope;
         uncertifiable.fence.namespace.range_id = 0;
         try std.testing.expectError(error.InvalidOnlineSourceCommand, uncertifiable.validate());
-        try std.testing.expectError(error.InvalidOnlineSourceCommand, db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = uncertifiable, .limit = retained.max_frame_bytes } } }, .{ .term = 1, .index = 1 }));
-        try std.testing.expectError(error.InvalidOnlineSourceCommand, db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope } }, .restore_staging_plan_id = @splat(1) }, .{ .term = 1, .index = 1 }));
+        try std.testing.expectError(error.InvalidOnlineSourceCommand, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = uncertifiable, .limit = retained.max_frame_bytes } } }, .{ .term = 1, .index = 1 }));
+        try std.testing.expectError(error.InvalidOnlineSourceCommand, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } }, .restore_staging_plan_id = @splat(1) }, .{ .term = 1, .index = 1 }));
         {
             var read = try db.core.store.beginReadTxn();
             defer read.abort();
             try std.testing.expect(try retained.load(&read) == null);
         }
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope, .limit = retained.max_frame_bytes } } }, .{ .term = 1, .index = 1 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope, .limit = retained.max_frame_bytes } } }, .{ .term = 1, .index = 1 });
         try std.testing.expectEqual(@as(u64, 0), (try db.onlineSourceStatus(scope)).start);
         try std.testing.expectEqual(@as(u64, 1), (try db.onlineSourceStatus(scope)).admitted_applied_index);
         {
@@ -465,13 +467,13 @@ test "relational index system online source controls survive LSM reopen with ato
         }
         // Admission itself leaves source writes online, with a single retained
         // after-image frame committed alongside the two rows and apply marker.
-        try db.batchRaftReplicatedApply(.{ .timestamp_ns = 111, .writes = &.{ .{ .key = "a", .value = "{\"v\":1}" }, .{ .key = "b", .value = "{\"v\":2}" } } }, .{ .term = 1, .index = 2 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .timestamp_ns = 111, .writes = &.{ .{ .key = "a", .value = "{\"v\":1}" }, .{ .key = "b", .value = "{\"v\":2}" } } }, .{ .term = 1, .index = 2 });
         try std.testing.expectEqual(@as(u64, 1), db.core.table_catalog.row_count);
         var second = scope;
         second.consumer_epoch = 2;
         // Reserve a complete maximum frame before admitting another consumer:
         // a lagging receiver cannot reduce write headroom to a zero-progress trap.
-        try std.testing.expectError(error.RetainedEffectsFull, db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = second, .limit = retained.max_frame_bytes } } }, .{ .term = 1, .index = 3 }));
+        try std.testing.expectError(error.RetainedEffectsFull, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = second, .limit = retained.max_frame_bytes } } }, .{ .term = 1, .index = 3 }));
         try std.testing.expectError(error.OnlineSourceScopeChanged, db.onlineSourceStatus(second));
         {
             var read = try db.core.store.beginReadTxn();
@@ -488,14 +490,14 @@ test "relational index system online source controls survive LSM reopen with ato
             try stage(&txn, .{ .acknowledge = .{ .scope = scope, .previous = 0, .next = 1 } }, 0);
         }
         try std.testing.expectEqual(@as(u64, 0), (try db.onlineSourceStatus(scope)).acknowledged);
-        try std.testing.expectError(error.IntegrityTopologyFenceMissing, db.batchRaftReplicatedApply(.{ .online_source = .{ .final_fence = .{ .scope = scope, .expected_sequence = 1 } } }, .{ .term = 1, .index = 3 }));
+        try std.testing.expectError(error.IntegrityTopologyFenceMissing, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .final_fence = .{ .scope = scope, .expected_sequence = 1 } } }, .{ .term = 1, .index = 3 }));
         var wrong = scope;
         wrong.fence.attempt += 1;
-        try std.testing.expectError(error.OnlineSourceScopeChanged, db.batchRaftReplicatedApply(.{ .online_source = .{ .acknowledge = .{ .scope = wrong, .previous = 0, .next = 1 } } }, .{ .term = 1, .index = 3 }));
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .acknowledge = .{ .scope = scope, .previous = 0, .next = 1 } } }, .{ .term = 1, .index = 3 });
-        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .fence = scope.fence, .action = .begin } }, .{ .term = 1, .index = 4 });
-        try std.testing.expectError(error.RetainedEffectsCursorMismatch, db.batchRaftReplicatedApply(.{ .online_source = .{ .final_fence = .{ .scope = scope, .expected_sequence = 0 } } }, .{ .term = 1, .index = 5 }));
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .final_fence = .{ .scope = scope, .expected_sequence = 1 } } }, .{ .term = 1, .index = 5 });
+        try std.testing.expectError(error.OnlineSourceScopeChanged, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .acknowledge = .{ .scope = wrong, .previous = 0, .next = 1 } } }, .{ .term = 1, .index = 3 }));
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .acknowledge = .{ .scope = scope, .previous = 0, .next = 1 } } }, .{ .term = 1, .index = 3 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .relational_topology = .{ .fence = scope.fence, .action = .begin } }, .{ .term = 1, .index = 4 });
+        try std.testing.expectError(error.RetainedEffectsCursorMismatch, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .final_fence = .{ .scope = scope, .expected_sequence = 0 } } }, .{ .term = 1, .index = 5 }));
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .final_fence = .{ .scope = scope, .expected_sequence = 1 } } }, .{ .term = 1, .index = 5 });
         const cut = try db.onlineSourceStatus(scope);
         try std.testing.expectEqual(Phase.fenced, cut.phase);
         try std.testing.expectEqual(@as(u64, 5), cut.applied_index);
@@ -506,25 +508,25 @@ test "relational index system online source controls survive LSM reopen with ato
         defer db.close();
         const cut = try db.onlineSourceStatus(scope);
         try std.testing.expectEqual(Phase.fenced, cut.phase);
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .final_fence = .{ .scope = scope, .expected_sequence = 1 } } }, .{ .term = 1, .index = 5 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .final_fence = .{ .scope = scope, .expected_sequence = 1 } } }, .{ .term = 1, .index = 5 });
         try std.testing.expectEqualSlices(u8, &cut.cut_digest, &(try db.onlineSourceStatus(scope)).cut_digest);
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .release = scope } }, .{ .term = 1, .index = 6 });
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .reclaim = .{ .scope = scope, .frame_limit = 1, .byte_limit = 1 } } }, .{ .term = 1, .index = 7 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .release = scope } }, .{ .term = 1, .index = 6 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .reclaim = .{ .scope = scope, .frame_limit = 1, .byte_limit = 1 } } }, .{ .term = 1, .index = 7 });
         // An old admission receipt is still a no-op after release/reclaim;
         // replay must not resurrect the pin or require its removed files.
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 });
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
         const state = (try retained.load(&read)).?;
         try std.testing.expectEqual(@as(u64, 0), state.retained_bytes);
         try std.testing.expectEqual(@as(u64, 1), state.reclaimed);
-        try std.testing.expectError(error.OnlineSourceScopeChanged, db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 8 }));
+        try std.testing.expectError(error.OnlineSourceScopeChanged, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 8 }));
     }
 }
 
 test "relational index system online source standby replay preserves admission certificate and final cut clocks" {
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-    const effects = @import("../hot_standby/effects.zig");
+    const effects = @import("replication_effects.zig");
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -563,15 +565,15 @@ test "relational index system online source standby replay preserves admission c
         const request = commands[i];
         const raft_index: u64 = 11 + @as(u64, @intCast(i));
         const lsn: u64 = 1 + @as(u64, @intCast(i));
-        try source.batchRaftReplicatedApply(request, .{ .term = 1, .index = raft_index });
+        try @import("../server_db_adapter.zig").applyOrdered(&source, request, .{ .term = 1, .index = raft_index });
         const payload = if (request.online_source != null)
             try effects.encodeOnlineSourceMutationRequestAlloc(alloc, request, raft_index)
         else
             try effects.encodeBatchMutationRequestAlloc(alloc, request);
         defer alloc.free(payload);
-        const record: @import("../hot_standby/replication_record.zig").RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = lsn, .previous_lsn = lsn - 1, .payload = payload };
-        try standby.applyHAReplicationRecord(record);
-        try standby.applyHAReplicationRecord(record);
+        const record: @import("replication_record.zig").RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = lsn, .previous_lsn = lsn - 1, .payload = payload };
+        try replication_ingress.applyRecord(&standby, record);
+        try replication_ingress.applyRecord(&standby, record);
         if (i == 0) {
             certificate = try source.prepareOnlineSourcePublication(scope, .none);
             const replica_certificate = try standby.prepareOnlineSourcePublication(scope, .none);
@@ -587,7 +589,7 @@ test "relational index system online source standby replay preserves admission c
         const primary_progress = encode(primary_value);
         const standby_progress = encode(standby_value);
         try std.testing.expectEqualSlices(u8, &primary_progress, &standby_progress);
-        try std.testing.expectEqual(lsn, try standby.haAppliedReplicationLsn());
+        try std.testing.expectEqual(lsn, try standby.replicationAppliedSequence());
     }
     try std.testing.expectEqual(@as(u64, 11), (try standby.onlineSourceStatus(scope)).admitted_applied_index);
     try std.testing.expectEqual(@as(u64, 14), (try standby.onlineSourceStatus(scope)).applied_index);
@@ -595,97 +597,14 @@ test "relational index system online source standby replay preserves admission c
     try std.testing.expectEqualSlices(u8, &expected_certificate, &(try standby.onlineSourceStatus(scope)).snapshot_certificate);
     var wrong = certificate;
     wrong.cut.retained_start = 1;
-    try std.testing.expectError(error.SourceSnapshotCutMismatch, source.batchRaftReplicatedApply(.{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = wrong } } }, .{ .term = 1, .index = 15 }));
+    try std.testing.expectError(error.SourceSnapshotCutMismatch, @import("../server_db_adapter.zig").applyOrdered(&source, .{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = wrong } } }, .{ .term = 1, .index = 15 }));
     try std.testing.expectEqualSlices(u8, &expected_certificate, &(try source.onlineSourceStatus(scope)).snapshot_certificate);
-}
-
-test "relational index system online source durable standby outbox resumes before already applied Raft receipt" {
-    try sourceOutboxRecovery(false);
-}
-
-test "relational index system native rewrite source clock is forwarded by durable outbox across lost acknowledgement" {
-    try sourceOutboxRecovery(true);
-}
-
-fn sourceOutboxRecovery(native_authority: bool) !void {
-    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-    const primary_mod = @import("../hot_standby/primary.zig");
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const owned = arena.allocator();
-    const path = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/source-outbox", .{tmp.sub_path});
-    const log_path = try std.fmt.allocPrintSentinel(owned, ".zig-cache/tmp/{s}/log", .{tmp.sub_path}, 0);
-    const slots_path = try std.fmt.allocPrintSentinel(owned, ".zig-cache/tmp/{s}/slots", .{tmp.sub_path}, 0);
-    var primary = try primary_mod.Primary.open(alloc, log_path, slots_path, .{ .cluster_id = 1, .timeline_id = 1, .epoch = 1, .table_id = 1, .shard_id = 2 }, .{});
-    defer primary.close();
-    try primary.createSlot("standby", 0);
-    const Ack = struct {
-        calls: usize = 0,
-        fn wait(ptr: *anyopaque, stream: *primary_mod.Primary, lsn: u64, _: primary_mod.SyncPolicy) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.calls += 1;
-            if (self.calls == 1) return error.InjectedSourceMirrorWaitFailure;
-            try stream.standbyStatusUpdate("standby", 1, lsn, lsn);
-        }
-    };
-    var ack: Ack = .{};
-    const options: db_mod.OpenOptions = .{ .online_source_authority = if (native_authority) .native else null, .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
-    var scope: Scope = undefined;
-    {
-        var db = try db_mod.DB.open(alloc, path, options);
-        defer db.close();
-        try db.setSchemaJson(alloc, "{}");
-        const owner = try db.relationalTopologyIdentity();
-        scope = .{
-            .authority = if (native_authority) .native else .raft,
-            .fence = .{ .admission_epoch = owner.next_epoch, .transition_id = 44, .attempt = 1, .peer_group_id = 3, .owner_group_id = 2, .role = if (native_authority) .rewrite_source else .merge_source, .namespace = owner.namespace, .catalog_digest = owner.catalog_digest },
-            .receiver_namespace = .{ .table_id = if (native_authority) 4 else 1, .shard_id = 3, .range_id = 3 },
-            .consumer_epoch = 1,
-            .copy_attempt = .{ .donor_term = if (native_authority) 0 else 1, .sequence = 1 },
-        };
-        db.ha_async_batch_mirror = .{ .primary = &primary, .sync_policy = .{ .mode = .remote_write, .standby_names = &.{"standby"}, .failure_policy = .block }, .sync_wait_ctx = &ack, .sync_wait_fn = Ack.wait };
-        const request: @import("types.zig").BatchRequest = .{ .online_source = .{ .admit = .{ .scope = scope } } };
-        try std.testing.expectError(error.InjectedSourceMirrorWaitFailure, if (native_authority) db.batch(request) else db.batchRaftReplicatedApply(request, .{ .term = 1, .index = 11 }));
-        try std.testing.expectEqual(@as(u64, if (native_authority) 1 else 11), (try db.onlineSourceStatus(scope)).admitted_applied_index);
-        try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
-        // Simulate loss of process-local mirror state before its outstanding
-        // acknowledgement can complete. The owner/outbox remain durable.
-        db.ha_async_batch_mirror = null;
-    }
-    {
-        var db = try db_mod.DB.open(alloc, path, options);
-        defer db.close();
-        db.ha_async_batch_mirror = .{ .primary = &primary, .sync_policy = .{ .mode = .remote_write, .standby_names = &.{"standby"}, .failure_policy = .block }, .sync_wait_ctx = &ack, .sync_wait_fn = Ack.wait };
-        const request: @import("types.zig").BatchRequest = .{ .online_source = .{ .admit = .{ .scope = scope } } };
-        if (native_authority) try db.batch(request) else try db.batchRaftReplicatedApply(request, .{ .term = 1, .index = 11 });
-        try std.testing.expect(ack.calls >= 2);
-        try std.testing.expectEqual(@as(u64, if (native_authority) 2 else 1), primary.lastLsn());
-        var entry = (try primary.log.entryAt(alloc, 1)) orelse return error.TestUnexpectedResult;
-        defer entry.deinit(alloc);
-        var decoded = try @import("../hot_standby/effects.zig").decodeBatchMutationRequest(alloc, entry.record);
-        defer decoded.deinit();
-        try std.testing.expectEqual(@as(?u64, if (native_authority) 1 else 11), decoded.value.online_source_applied_index);
-        try std.testing.expectEqualSlices(u8, &scope.pin(), &decoded.value.request.online_source.?.scope().pin());
-        if (native_authority) {
-            var retry = (try primary.log.entryAt(alloc, 2)).?;
-            defer retry.deinit(alloc);
-            var retry_decoded = try @import("../hot_standby/effects.zig").decodeBatchMutationRequest(alloc, retry.record);
-            defer retry_decoded.deinit();
-            try std.testing.expectEqual(@as(?u64, 2), retry_decoded.value.online_source_applied_index);
-            try std.testing.expectEqual(.native, retry_decoded.value.request.online_source.?.scope().authority);
-            try std.testing.expectEqual(@as(u64, 1), (try db.onlineSourceStatus(scope)).admitted_applied_index);
-            try std.testing.expect((try db.raftAppliedEntry()) == null);
-        }
-    }
 }
 
 test "relational index system native rewrite authority clocks survive pin crash ordinary writes and exact standby replay" {
     const DB = @import("antfly_source_root").antfly_sources.physical_db;
     const clock = @import("../source_authority.zig");
-    const effects = @import("../hot_standby/effects.zig");
+    const effects = @import("replication_effects.zig");
     const pin = @import("source_pin.zig");
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -713,9 +632,9 @@ test "relational index system native rewrite authority clocks survive pin crash 
         fn replay(db: *DB.DB, request: @import("types.zig").BatchRequest, sequence_value: u64, lsn: u64) !void {
             const payload = if (request.online_source != null) try effects.encodeOnlineSourceMutationRequestAlloc(alloc, request, sequence_value) else try effects.encodeBatchMutationRequestAlloc(alloc, request);
             defer alloc.free(payload);
-            const record: @import("../hot_standby/replication_record.zig").RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = lsn, .previous_lsn = lsn - 1, .payload = payload };
-            try db.applyHAReplicationRecord(record);
-            try db.applyHAReplicationRecord(record);
+            const record: @import("replication_record.zig").RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = lsn, .previous_lsn = lsn - 1, .payload = payload };
+            try replication_ingress.applyRecord(db, record);
+            try replication_ingress.applyRecord(db, record);
         }
     };
     const admit: @import("types.zig").BatchRequest = .{ .online_source = .{ .admit = .{ .scope = scope } } };
@@ -749,23 +668,23 @@ test "relational index system native rewrite authority clocks survive pin crash 
     try Helper.replay(&replica, begin, 0, 4);
     const finish: @import("types.zig").BatchRequest = .{ .online_source = .{ .final_fence = .{ .scope = scope, .expected_sequence = 1 } } };
     try std.testing.expectError(error.OnlineSourceScopeChanged, Helper.replay(&replica, finish, 9, 5));
-    try std.testing.expectEqual(@as(u64, 4), try replica.haAppliedReplicationLsn());
+    try std.testing.expectEqual(@as(u64, 4), try replica.replicationAppliedSequence());
     try primary.batch(finish);
-    try Helper.replay(&replica, finish, 4, 5);
+    try Helper.replay(&replica, finish, try Helper.sequence(&primary), 5);
     const final = try primary.onlineSourceStatus(scope);
-    try std.testing.expectEqual(@as(u64, 4), final.applied_index);
+    try std.testing.expectEqual(try Helper.sequence(&primary), final.applied_index);
     try std.testing.expectEqualSlices(u8, &final.cut_digest, &(try replica.onlineSourceStatus(scope)).cut_digest);
-    try std.testing.expect((try primary.raftAppliedEntry()) == null);
-    try std.testing.expect((try replica.raftAppliedEntry()) == null);
+    try std.testing.expect((try primary.orderedApplyReceipt()) == null);
+    try std.testing.expect((try replica.orderedApplyReceipt()) == null);
     var forged = scope;
     forged.authority = .raft;
     forged.copy_attempt.donor_term = 1;
-    try std.testing.expectError(error.OnlineSourceScopeChanged, primary.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = forged } } }, .{ .term = 1, .index = 1 }));
-    try std.testing.expectError(error.OnlineSourceScopeChanged, primary.batchRaftReplicatedApply(.{}, .{ .term = 1, .index = 1 }));
-    try std.testing.expectEqual(@as(u64, 4), try Helper.sequence(&primary));
+    try std.testing.expectError(error.OnlineSourceScopeChanged, @import("../server_db_adapter.zig").applyOrdered(&primary, .{ .online_source = .{ .admit = .{ .scope = forged } } }, .{ .term = 1, .index = 1 }));
+    try std.testing.expectError(error.OnlineSourceScopeChanged, @import("../server_db_adapter.zig").applyOrdered(&primary, .{}, .{ .term = 1, .index = 1 }));
+    try std.testing.expectEqual(final.applied_index, try Helper.sequence(&primary));
     replica.close();
     replica = try DB.DB.open(alloc, replica_path, options);
-    try std.testing.expectEqual(@as(u64, 4), try Helper.sequence(&replica));
+    try std.testing.expectEqual(final.applied_index, try Helper.sequence(&replica));
     try std.testing.expectEqualSlices(u8, &final.cut_digest, &(try replica.onlineSourceStatus(scope)).cut_digest);
 }
 

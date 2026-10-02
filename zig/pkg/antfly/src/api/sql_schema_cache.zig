@@ -172,7 +172,7 @@ fn derive(entry: *Entry, json: []const u8) !void {
         .path = try owned.dupe(u8, column.path),
         .nullable = !column.required or column.allows_null,
         .generated = generated.contains(column.name),
-        .type = switch (column.column_type) {
+        .type = @import("../sql/document_row.zig").relationalType(parsed, column.name, switch (column.column_type) {
             .string => .string,
             .integer => .integer,
             .number => .number,
@@ -180,7 +180,7 @@ fn derive(entry: *Entry, json: []const u8) !void {
             .datetime => .datetime,
             .json => .json,
             else => return error.UnsupportedSqlExecution,
-        },
+        }),
     };
     entry.columns = columns;
     var indexes: std.ArrayList(catalog.Index) = .empty;
@@ -276,4 +276,17 @@ test "SQL schema cache document shapes are declared stable unions" {
     try std.testing.expect((try table.column("only_a")).nullable);
     try std.testing.expectEqual(@import("../sql/ast.zig").ColumnType.json, (try table.column("nested")).type);
     try std.testing.expectError(error.UndefinedColumn, table.column("sampled_from_a_row"));
+}
+
+test "SQL schema cache preserves logical UUID over physical keywords" {
+    const alloc = std.testing.allocator;
+    var cache = Cache.init(alloc);
+    defer cache.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const table = try cache.resolve(std.testing.io, arena.allocator(),
+        \\{"version":0,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"u":{"type":"keyword","format":"uuid"},"label":{"type":"keyword"}},"additionalProperties":false}}}}
+    , 7, "items");
+    try std.testing.expectEqual(@import("../sql/ast.zig").ColumnType.uuid, (try table.column("u")).type);
+    try std.testing.expectEqual(@import("../sql/ast.zig").ColumnType.string, (try table.column("label")).type);
 }

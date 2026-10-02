@@ -12,6 +12,8 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const hot_standby_write_gate_adapter = @import("../../storage/hot_standby/write_gate.zig");
+const hot_standby_publisher_adapter = @import("../../storage/hot_standby/db_commit.zig");
 const std = @import("std");
 const store_report_baseline = @import("../store_report_baseline.zig");
 const secret_store = @import("../secret_store.zig");
@@ -27,8 +29,8 @@ const sql_settings = @import("../../system_catalog/settings.zig");
 const sql_policies = @import("../../system_catalog/policies.zig");
 const builtin = @import("builtin");
 const raft_engine = @import("raft_engine");
-const fs_paths = @import("../../common/fs_paths.zig");
-const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
+const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const group_ids = @import("../../common/group_ids.zig");
 const docstore = @import("../../storage/docstore.zig");
 const lsm_backend = @import("../../storage/lsm_backend.zig");
@@ -41,7 +43,7 @@ const topology_protocol = @import("../topology_protocol.zig");
 const transition_state = @import("../transition_state.zig");
 const extension_domain = @import("../../extensions/mod.zig");
 const metadata_table_manager = @import("../table_manager.zig");
-const raft_catalog = @import("../../raft/catalog.zig");
+const raft_catalog = @import("../../raft/storage/catalog.zig");
 const raft_reconciler = @import("../../raft/reconciler.zig");
 const raft_storage_mod = @import("../../raft/storage/mod.zig");
 const wal_replica_state_mod = @import("../../raft/storage/wal_replica_state.zig");
@@ -456,7 +458,7 @@ test "initial self FK reserves one hidden child owner and no duplicate parent ro
         var db = try @import("../../storage/db/db.zig").DB.open(alloc, db_path, db_options);
         defer db.close();
         try std.testing.expectError(error.InitialChildNotPublished, db.lookup(alloc, "unpublished", .{}));
-        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .provision_initial_child, .fence = child_fence, .initial_child_provision = .{
+        try @import("../../storage/server_db_adapter.zig").applyOrdered(&db, .{ .relational_topology = .{ .action = .provision_initial_child, .fence = child_fence, .initial_child_provision = .{
             .schema_json = bound_schema,
             .child_table_name = child.name,
             .plan_id = id,
@@ -498,7 +500,7 @@ test "initial self FK reserves one hidden child owner and no duplicate parent ro
         var db = try @import("../../storage/db/db.zig").DB.open(alloc, db_path, db_options);
         defer db.close();
         try std.testing.expectError(error.InitialChildNotPublished, db.lookup(alloc, "unpublished", .{}));
-        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .release_initial_child, .fence = child_fence, .initial_child_control = .{
+        try @import("../../storage/server_db_adapter.zig").applyOrdered(&db, .{ .relational_topology = .{ .action = .release_initial_child, .fence = child_fence, .initial_child_control = .{
             .plan_id = id,
             .plan_digest = bootstrap.plan_digest,
             .schema_version = candidate.schema_version,
@@ -2033,7 +2035,7 @@ fn decodeMetadataCheckpoint(bytes: []const u8) !AppliedMetadataCheckpoint {
 pub const CatalogProjectionSnapshot = apply_contract.CatalogProjectionSnapshot;
 pub const CatalogCursor = apply_contract.CatalogCursor;
 
-fn catalogProjectionDeadline(deadline_ns: ?u64, deadline_io: ?@import("../../runtime_io_abi.zig").Borrow) !void {
+fn catalogProjectionDeadline(deadline_ns: ?u64, deadline_io: ?@import("antfly_runtime_abi").io_abi.Borrow) !void {
     if (deadline_ns) |deadline| {
         const now_ns: u64 = if (deadline_io) |borrow| blk: {
             var receiver = try borrow.receive();
@@ -5394,6 +5396,8 @@ test "metadata raft apply store snapshot replaces one complete projection and pr
 }
 
 pub const RaftApplyStoreConfig = struct {
+    /// Borrowed durable system keyspace; must outlive this authority.
+    borrowed_store: ?*@import("../../storage/backend_erased.zig").Store = null,
     root_dir: []const u8,
     map_size: usize = 16 * 1024 * 1024,
     no_sync: bool = false,
@@ -5593,7 +5597,7 @@ test "standalone metadata released JSON replay is atomic exact and checkpoint du
     const table: metadata.TableRecord = .{ .table_id = 7, .name = "legacy", .storage = .{ .dense_embeddings = .vector_store }, .storage_migration = .{ .request = .{ .job_id = "vectors", .mode = .online } } };
     const ranges = [_]metadata.RangeRecord{.{ .table_id = 7, .group_id = 17, .range_id = 19, .start_key = "" }};
     const payload = try std.json.Stringify.valueAlloc(scratch, RaftApplyStore.LegacyCatalogCreate{ .table = table, .ranges = &ranges }, .{});
-    var record: @import("../../storage/hot_standby/replication_record.zig").Record = .{ .kind = .metadata_mutation, .payload_codec = .json, .cluster_id = 7, .timeline_id = 1, .epoch = 1, .lsn = 5, .previous_lsn = 4, .payload = payload };
+    var record: @import("../../storage/db/replication_record.zig").Record = .{ .kind = .metadata_mutation, .payload_codec = .json, .cluster_id = 7, .timeline_id = 1, .epoch = 1, .lsn = 5, .previous_lsn = 4, .payload = payload };
     const group = group_ids.main_metadata_group_id;
     {
         var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
@@ -5666,7 +5670,7 @@ test "standalone metadata released JSON replay verifies imported ranges and pres
     wrong_ranges[0].range_id += 1;
     const invalid_payload = try std.json.Stringify.valueAlloc(alloc, RaftApplyStore.LegacyCatalogCreate{ .table = table, .ranges = &wrong_ranges }, .{});
     defer alloc.free(invalid_payload);
-    var record: @import("../../storage/hot_standby/replication_record.zig").Record = .{ .kind = .metadata_mutation, .payload_codec = .json, .cluster_id = 7, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = invalid_payload };
+    var record: @import("../../storage/db/replication_record.zig").Record = .{ .kind = .metadata_mutation, .payload_codec = .json, .cluster_id = 7, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = invalid_payload };
     try std.testing.expectError(error.TableLifecycleConflict, store.applyHARecord(record));
     try std.testing.expectError(error.NotFound, store.store.get(alloc, RaftApplyStore.metadata_ha.replay_key));
     try std.testing.expectEqual(@as(u64, 1), try store.standaloneRevision());
@@ -5810,7 +5814,7 @@ test "standalone metadata HA preserves incremental jobs outbox recovery and full
     {
         var source = try RaftApplyStore.init(alloc, .{ .root_dir = source_root });
         defer source.deinit();
-        try source.bindHA(.{ .primary = &primary }, .{ .primary = &primary });
+        try source.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary) });
         try source.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = logical_key, .value = queued } });
         var first = (try primary.log.entryAt(alloc, 1)).?;
         defer first.deinit(alloc);
@@ -5821,12 +5825,12 @@ test "standalone metadata HA preserves incremental jobs outbox recovery and full
         defer alloc.free(actual);
         try std.testing.expectEqualStrings(queued, actual);
         const Failure = struct {
-            fn wait(_: *anyopaque, _: *primary_mod.Primary, _: u64, _: primary_mod.SyncPolicy) !void {
+            fn wait(_: *anyopaque, _: *anyopaque, _: u64, _: primary_mod.SyncPolicy) !void {
                 return error.InjectedAfterMetadataHAAppend;
             }
         };
         var context: u8 = 0;
-        try source.bindHA(.{ .primary = &primary }, .{ .primary = &primary, .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &context, .sync_wait_fn = Failure.wait });
+        try source.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &context, .sync_wait_fn = Failure.wait });
         try std.testing.expectError(error.InjectedAfterMetadataHAAppend, source.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = logical_key, .value = importing } }));
         try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
         try std.testing.expectError(error.MetadataHAOutboxPending, source.exportHACheckpoint(io, checkpoint));
@@ -5834,7 +5838,7 @@ test "standalone metadata HA preserves incremental jobs outbox recovery and full
     {
         var source = try RaftApplyStore.init(alloc, .{ .root_dir = source_root });
         defer source.deinit();
-        try source.bindHA(.{ .primary = &primary }, .{ .primary = &primary });
+        try source.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary) });
         try source.flushHAOutbox();
         try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
         try source.store.put("\x00\x00__metadata__:private_fixture", "private-reservation-proof");
@@ -5904,12 +5908,12 @@ test "standalone metadata chunked HA resumes large effects through checkpoint wi
         var source = try RaftApplyStore.init(alloc, .{ .root_dir = source_root });
         defer source.deinit();
         const Failure = struct {
-            fn wait(_: *anyopaque, _: *primary_mod.Primary, _: u64, _: primary_mod.SyncPolicy) !void {
+            fn wait(_: *anyopaque, _: *anyopaque, _: u64, _: primary_mod.SyncPolicy) !void {
                 return error.InjectedAfterMetadataHAAppend;
             }
         };
         var context: u8 = 0;
-        try source.bindHA(.{ .primary = &primary }, .{ .primary = &primary, .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &context, .sync_wait_fn = Failure.wait });
+        try source.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &context, .sync_wait_fn = Failure.wait });
         try std.testing.expectError(error.MetadataMutationOutcomeUnknown, source.replaceStandaloneCatalog(group, 0, &.{}, &.{}, value));
     }
     const final_lsn = primary.lastLsn();
@@ -5917,7 +5921,7 @@ test "standalone metadata chunked HA resumes large effects through checkpoint wi
     {
         var source = try RaftApplyStore.init(alloc, .{ .root_dir = source_root });
         defer source.deinit();
-        try source.bindHA(.{ .primary = &primary }, .{ .primary = &primary });
+        try source.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary) });
         try source.flushHAOutbox();
         try std.testing.expectEqual(final_lsn, primary.lastLsn());
     }
@@ -5929,7 +5933,7 @@ test "standalone metadata chunked HA resumes large effects through checkpoint wi
         while (lsn <= 3) : (lsn += 1) {
             var entry = (try primary.log.entryAt(alloc, lsn)).?;
             defer entry.deinit(alloc);
-            try std.testing.expect(entry.record.payload.len + @import("../../storage/hot_standby/replication_record.zig").header_size <= 1024 * 1024);
+            try std.testing.expect(entry.record.payload.len + @import("../../storage/db/replication_record.zig").header_size <= 1024 * 1024);
             try target.applyHARecord(entry.record);
             try target.applyHARecord(entry.record);
             try std.testing.expect((try target.loadStandaloneCatalog(alloc)) == null);
@@ -6010,9 +6014,9 @@ test "standalone metadata chunked HA resumes large effects through checkpoint wi
     var promoted = try RaftApplyStore.init(alloc, .{ .root_dir = promoted_root });
     defer promoted.deinit();
     try promoted.importHACheckpoint(io, checkpoint, checkpoint_size);
-    try promoted.bindHA(.{ .primary = &primary }, .{ .primary = &primary });
+    try promoted.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary) });
     try std.testing.expectError(error.MetadataHAIncompleteEffect, promoted.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = key, .value = "promoted" } }));
-    try promoted.bindHA(.{ .primary = &new_primary }, .{ .primary = &new_primary });
+    try promoted.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&new_primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&new_primary) });
     try promoted.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = key, .value = "promoted" } });
     var follower = try RaftApplyStore.init(alloc, .{ .root_dir = follower_root });
     defer follower.deinit();
@@ -6053,7 +6057,7 @@ pub const RaftApplyStore = struct {
     io_impl: std.Io.Threaded,
     root_dir: []u8,
     path: []u8,
-    backend: lsm_backend.BackendHandle,
+    backend: ?lsm_backend.BackendHandle,
     block_cache: ?*lsm_backend.Cache = null,
     store: docstore.DocStore,
     checkpoints: std.AutoHashMapUnmanaged(u64, AppliedMetadataCheckpoint) = .empty,
@@ -6066,9 +6070,9 @@ pub const RaftApplyStore = struct {
     active_outcome: ?*CommittedApplyOutcome = null,
     verified_catalog_groups: std.AutoHashMapUnmanaged(u64, void) = .empty,
     read_only: bool = false,
-    ha_gate: ?@import("../../storage/db/ha_contract.zig").WriteGate = null,
-    ha_mirror: ?@import("../../storage/db/ha_contract.zig").AsyncEffectMirror = null,
-    ha_port: ?@import("../../storage/metadata_ha_port.zig").Port = null,
+    ha_gate: ?@import("../../storage/db/replication_contract.zig").WriteGate = null,
+    ha_mirror: ?@import("../../storage/db/replication_contract.zig").AsyncEffectMirror = null,
+    ha_port: ?@import("../../storage/metadata_hot_standby_port.zig").Port = null,
 
     const ProjectedPlacementIntent = struct {
         metadata_group_id: u64,
@@ -6081,13 +6085,13 @@ pub const RaftApplyStore = struct {
 
         const root_dir = try alloc.dupe(u8, cfg.root_dir);
         errdefer alloc.free(root_dir);
-        if (!cfg.read_only) try fs_paths.createDirPathPortable(io_impl.io(), root_dir);
+        if (!cfg.read_only and cfg.borrowed_store == null) try fs_paths.createDirPathPortable(io_impl.io(), root_dir);
 
         const path = try std.fmt.allocPrint(alloc, "{s}/metadata-apply-store", .{root_dir});
         errdefer alloc.free(path);
-        if (!cfg.read_only) try fs_paths.createDirPathPortable(io_impl.io(), path);
+        if (!cfg.read_only and cfg.borrowed_store == null) try fs_paths.createDirPathPortable(io_impl.io(), path);
 
-        const block_cache = if (cfg.block_cache_bytes == 0) null else blk: {
+        const block_cache = if (cfg.block_cache_bytes == 0 or cfg.borrowed_store != null) null else blk: {
             const cache = try alloc.create(lsm_backend.Cache);
             cache.* = lsm_backend.Cache.init(alloc, cfg.block_cache_bytes);
             break :blk cache;
@@ -6096,7 +6100,7 @@ pub const RaftApplyStore = struct {
             cache.deinit();
             alloc.destroy(cache);
         };
-        var backend = try lsm_backend.BackendHandle.open(alloc, path, .{
+        var backend: ?lsm_backend.BackendHandle = if (cfg.borrowed_store == null) try lsm_backend.BackendHandle.open(alloc, path, .{
             .backend = .{
                 .durability = if (cfg.no_sync) .none else .full,
                 .read_only = cfg.read_only,
@@ -6104,11 +6108,16 @@ pub const RaftApplyStore = struct {
             },
             .flush_threshold = cfg.flush_threshold,
             .cache = block_cache,
-        });
-        errdefer backend.close();
-
-        var runtime_store = try backend.backend.runtimeStore(alloc, .{ .name = "metadata-apply" });
-        errdefer runtime_store.deinit();
+        }) else null;
+        errdefer if (backend) |*owned| owned.close();
+        var store = if (cfg.borrowed_store) |borrowed|
+            try docstore.DocStore.openRuntime(alloc, borrowed)
+        else blk: {
+            var runtime_store = try backend.?.backend.runtimeStore(alloc, .{ .name = "metadata-apply" });
+            errdefer runtime_store.deinit();
+            break :blk try docstore.DocStore.openRuntime(alloc, runtime_store);
+        };
+        errdefer store.close();
 
         return .{
             .alloc = alloc,
@@ -6118,7 +6127,7 @@ pub const RaftApplyStore = struct {
             .path = path,
             .backend = backend,
             .block_cache = block_cache,
-            .store = try docstore.DocStore.openRuntime(alloc, runtime_store),
+            .store = store,
         };
     }
 
@@ -6131,7 +6140,7 @@ pub const RaftApplyStore = struct {
         self.projection_listeners.deinit(self.alloc);
         self.committed_key_listeners.deinit(self.alloc);
         self.store.close();
-        self.backend.close();
+        if (self.backend) |*backend| backend.close();
         if (self.block_cache) |cache| {
             cache.deinit();
             self.alloc.destroy(cache);
@@ -6200,7 +6209,7 @@ pub const RaftApplyStore = struct {
 
     /// The embedding owns the shared HA mutation lease BEFORE its catalog
     /// mutex. Do not recursively acquire the writer-preferring seed barrier.
-    pub fn bindHA(self: *RaftApplyStore, gate: ?@import("../../storage/db/ha_contract.zig").WriteGate, mirror: ?@import("../../storage/db/ha_contract.zig").AsyncEffectMirror) !void {
+    pub fn bindHA(self: *RaftApplyStore, gate: ?@import("../../storage/db/replication_contract.zig").WriteGate, mirror: ?@import("../../storage/db/replication_contract.zig").AsyncEffectMirror) !void {
         if (!self.apply_mutex.tryLock()) return error.MetadataHABindingBusy;
         defer self.apply_mutex.unlock(self.io_impl.io());
         self.ha_gate = gate;
@@ -6208,7 +6217,7 @@ pub const RaftApplyStore = struct {
         self.ha_port = null;
     }
 
-    pub fn bindHAPort(self: *RaftApplyStore, port: ?@import("../../storage/metadata_ha_port.zig").Port) !void {
+    pub fn bindHAPort(self: *RaftApplyStore, port: ?@import("../../storage/metadata_hot_standby_port.zig").Port) !void {
         if (!self.apply_mutex.tryLock()) return error.MetadataHABindingBusy;
         defer self.apply_mutex.unlock(self.io_impl.io());
         self.ha_port = port;
@@ -6238,10 +6247,10 @@ pub const RaftApplyStore = struct {
     fn stageStandaloneHA(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, capture: *@import("../../storage/txn_mutation_capture.zig").Capture, group_id: u64) !void {
         txn.mutation_capture = null;
         if (!self.hasHAMirror()) return;
-        const identity: @import("../../storage/metadata_ha_port.zig").Identity = if (self.ha_port) |port| try port.identity() else .{
-            .next_lsn = self.ha_mirror.?.primary.nextLsn(),
-            .timeline_id = self.ha_mirror.?.primary.identity.timeline_id,
-            .epoch = self.ha_mirror.?.primary.identity.epoch,
+        const identity: @import("../../storage/metadata_hot_standby_port.zig").Identity = if (self.ha_port) |port| try port.identity() else .{
+            .next_lsn = self.ha_mirror.?.publisher.nextLsn(),
+            .timeline_id = self.ha_mirror.?.publisher.identity().timeline_id,
+            .epoch = self.ha_mirror.?.publisher.identity().epoch,
         };
         var source: [16]u8 = undefined;
         const pending = if (try stagingGet(txn, metadata_pending_key)) |bytes| try MetadataPending.decode(bytes) else null;
@@ -6310,7 +6319,7 @@ pub const RaftApplyStore = struct {
         defer if (transition_locked) self.unlockHATransition();
         const gate = if (self.ha_gate) |value| value.pinned() else null;
         if (gate) |value| try value.check();
-        const same_timeline = std.mem.readInt(u64, raw[8..16], .little) == mirror.primary.identity.timeline_id and std.mem.readInt(u64, raw[16..24], .little) == mirror.primary.identity.epoch;
+        const same_timeline = std.mem.readInt(u64, raw[8..16], .little) == mirror.publisher.identity().timeline_id and std.mem.readInt(u64, raw[16..24], .little) == mirror.publisher.identity().epoch;
         var search_from = std.mem.readInt(u64, raw[0..8], .little);
         var lsn: u64 = 0;
         var index: u32 = 0;
@@ -6324,16 +6333,16 @@ pub const RaftApplyStore = struct {
             try self.lockHATransition();
             transition_locked = true;
             if (gate) |value| try value.check();
-            const prior = if (same_timeline) try mirror.primary.findMatchingRecordFrom(search_from, .metadata_mutation, frame, 0, 0) else null;
-            lsn = prior orelse try mirror.primary.append(.{ .kind = .metadata_mutation, .payload_codec = .binary, .shard_id = 0, .table_id = 0, .payload = frame });
+            const prior = if (same_timeline) try (try hot_standby_publisher_adapter.runtimePrimary(mirror)).findMatchingRecordFrom(search_from, .metadata_mutation, frame, 0, 0) else null;
+            lsn = prior orelse try (try hot_standby_publisher_adapter.runtimePrimary(mirror)).append(.{ .kind = .metadata_mutation, .payload_codec = .binary, .shard_id = 0, .table_id = 0, .payload = frame });
             search_from = lsn +| 1;
         }
         if (mirror.last_lsn) |last| last.store(lsn, .release);
         self.unlockHATransition();
         transition_locked = false;
         if (mirror.sync_policy.mode != .async) {
-            if (mirror.sync_wait_fn) |wait| try wait(mirror.sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.primary, lsn, mirror.sync_policy);
-            const decision = try @import("../../storage/hot_standby/commit_gate.zig").evaluate(mirror.primary, lsn, mirror.sync_policy);
+            if (mirror.sync_wait_fn) |wait| try wait(mirror.sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.publisher.ptr, lsn, mirror.sync_policy);
+            const decision = try @import("../../storage/hot_standby/commit_gate.zig").evaluate(try hot_standby_publisher_adapter.runtimePrimary(mirror), lsn, mirror.sync_policy);
             if (!decision.shouldAcknowledge()) return error.HASyncCommitWouldBlock;
         }
         // A remote acknowledgment can outlive the role generation that
@@ -6356,7 +6365,7 @@ pub const RaftApplyStore = struct {
         try self.flushHAOutboxLocked();
     }
 
-    pub fn applyHARecord(self: *RaftApplyStore, record: @import("../../storage/hot_standby/replication_record.zig").RecordView) !void {
+    pub fn applyHARecord(self: *RaftApplyStore, record: @import("../../storage/db/replication_record.zig").RecordView) !void {
         if (record.payload_codec == .json) return self.applyLegacyCatalogCreate(record);
         return self.applyHAChunk(record);
     }
@@ -6374,7 +6383,7 @@ pub const RaftApplyStore = struct {
         } = null,
     };
 
-    fn applyLegacyCatalogCreate(self: *RaftApplyStore, record: @import("../../storage/hot_standby/replication_record.zig").RecordView) !void {
+    fn applyLegacyCatalogCreate(self: *RaftApplyStore, record: @import("../../storage/db/replication_record.zig").RecordView) !void {
         if (record.kind != .metadata_mutation or record.table_id != 0 or record.shard_id != 0 or record.lsn == 0 or record.previous_lsn >= record.lsn or record.payload.len > metadata_ha.max_effect_bytes) return error.InvalidMetadataHAEffect;
         const parsed = std.json.parseFromSlice(LegacyCatalogCreate, self.alloc, record.payload, .{}) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -6473,7 +6482,7 @@ pub const RaftApplyStore = struct {
         try self.commitStandaloneTxn(&txn, &outcome, &committed);
     }
 
-    fn metadataReplayReceipt(txn: *docstore.DocStore.Txn, record: @import("../../storage/hot_standby/replication_record.zig").RecordView) !void {
+    fn metadataReplayReceipt(txn: *docstore.DocStore.Txn, record: @import("../../storage/db/replication_record.zig").RecordView) !void {
         if (try stagingGet(txn, metadata_ha.replay_key)) |previous| {
             if (previous.len != 40) return error.InvalidMetadataHAEffect;
             if (std.mem.readInt(u64, previous[0..8], .little) != record.cluster_id) return error.MetadataHASourceChanged;
@@ -6493,7 +6502,7 @@ pub const RaftApplyStore = struct {
         try txn.delete(metadata_pending_key);
     }
 
-    fn applyHAChunk(self: *RaftApplyStore, record: @import("../../storage/hot_standby/replication_record.zig").RecordView) !void {
+    fn applyHAChunk(self: *RaftApplyStore, record: @import("../../storage/db/replication_record.zig").RecordView) !void {
         if (record.kind != .metadata_mutation or record.payload_codec != .binary or record.table_id != 0 or record.shard_id != 0) return error.InvalidMetadataHAEffect;
         const frame = try metadata_chunks.decodeFrame(record.payload);
         const descriptor = frame.descriptor;
@@ -7014,11 +7023,11 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn snapshotWriteStats(self: *const RaftApplyStore) lsm_backend.Backend.WriteStats {
-        return self.backend.backend.snapshotWriteStats();
+        return if (self.backend) |backend| backend.backend.snapshotWriteStats() else .{};
     }
 
     pub fn snapshotMaintenanceStats(self: *const RaftApplyStore) lsm_backend.Backend.MaintenanceStats {
-        return self.backend.snapshotMaintenanceStats();
+        return if (self.backend) |backend| backend.snapshotMaintenanceStats() else .{};
     }
 
     pub fn latestCheckpoint(self: *RaftApplyStore, group_id: u64) !?AppliedMetadataCheckpoint {
@@ -9437,6 +9446,15 @@ pub const RaftApplyStore = struct {
         self.alloc.free(result);
     }
 
+    fn validateCatalogTopology(command: SystemCatalogCommand) !void {
+        const physical = command.mutation.kind == .table and (command.mutation.action == .create or command.mutation.action == .drop);
+        if (physical != (command.topology != null)) return error.InvalidCatalogMutation;
+        if (command.topology) |topology| switch (topology) {
+            .create => |create| if (command.mutation.action != .create or create.table.table_id != command.mutation.table_id or !std.mem.eql(u8, create.table.name, command.mutation.storage_name)) return error.InvalidCatalogMutation,
+            .drop => |drop| if (command.mutation.action != .drop or drop.table_id != command.mutation.table_id or !std.mem.eql(u8, drop.expected_name, command.mutation.storage_name)) return error.InvalidCatalogMutation,
+        };
+    }
+
     /// Validate and serialize the exact admitted projection before proposing.
     pub fn prepareSystemCatalogResult(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, command: SystemCatalogCommand) ![]u8 {
         var txn = try self.beginQueryCatalogReadTxn(group_id);
@@ -9447,19 +9465,15 @@ pub const RaftApplyStore = struct {
         const meta = try system_catalog_storage.readMeta(a, &txn, group_id);
         if (meta.revision != command.expected_revision) return error.CatalogGenerationChanged;
         const reader: CatalogReader = .{ .store = self, .view = .{ .alloc = a, .txn = &txn, .group_id = group_id, .meta = meta } };
-        var delta = try system_catalog.planWithReader(a, reader, meta.next_id, command.mutation);
+        try validateCatalogTopology(command);
+        var delta = try system_catalog.planWithTopology(a, reader, meta.next_id, command.mutation, command.mutation.kind == .table and command.mutation.action == .drop);
         defer delta.deinit(a);
-        if ((command.mutation.kind == .table and command.mutation.action == .create) != (command.topology != null)) return error.InvalidCatalogMutation;
         if (command.placement_update) |update| {
             if (command.mutation.kind != .table or command.mutation.action != .set_tablespace or update.expected.table_id != update.replacement.table_id or !std.mem.eql(u8, update.expected.name, update.replacement.name)) return error.InvalidCatalogMutation;
             if ((try self.loadTableTransitionFenceTxn(&txn, group_id, update.expected.table_id)).active()) return error.TableTransitionActive;
             const current = (try self.getTableByNameTxn(self.alloc, &txn, group_id, update.expected.name)) orelse return error.TableNotFound;
             defer metadata_table_manager.freeTable(self.alloc, current);
             if (!metadata_table_manager.tableDefinitionsEqual(current, update.expected)) return error.TableGenerationChanged;
-        }
-        if (command.topology) |topology| {
-            if (topology != .create or topology.create.table.table_id != command.mutation.table_id or
-                !std.mem.eql(u8, topology.create.table.name, command.mutation.storage_name)) return error.InvalidCatalogMutation;
         }
         return std.json.Stringify.valueAlloc(alloc, try system_catalog.mutationResult(reader, meta.revision + 1, delta), .{});
     }
@@ -9624,12 +9638,12 @@ pub const RaftApplyStore = struct {
                 return;
         }
         const reader: CatalogReader = .{ .store = self, .view = .{ .alloc = a, .txn = txn, .group_id = group_id, .meta = meta } };
-        var delta = system_catalog.planWithReader(a, reader, meta.next_id, command.mutation) catch |err| switch (err) {
+        validateCatalogTopology(command) catch return;
+        var delta = system_catalog.planWithTopology(a, reader, meta.next_id, command.mutation, command.mutation.kind == .table and command.mutation.action == .drop) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return, // A concurrent catalog/topology operation defeated admission.
         };
         defer delta.deinit(a);
-        if ((command.mutation.kind == .table and command.mutation.action == .create) != (command.topology != null)) return;
         if (command.placement_update) |update| {
             if (command.mutation.kind != .table or command.mutation.action != .set_tablespace or update.expected.table_id != update.replacement.table_id or !std.mem.eql(u8, update.expected.name, update.replacement.name)) return;
             if ((try self.loadTableTransitionFenceTxn(txn, group_id, update.expected.table_id)).active()) return;
@@ -9639,17 +9653,20 @@ pub const RaftApplyStore = struct {
             try self.applyTableCompareAndReplaceTxn(txn, group_id, update.expected, update.replacement);
         }
         if (command.topology) |topology| {
-            if (topology != .create or topology.create.table.table_id != command.mutation.table_id or
-                !std.mem.eql(u8, topology.create.table.name, command.mutation.storage_name)) return;
             try self.applyTableTopologyMutationTxn(txn, group_id, topology);
             var key_buf: [160]u8 = undefined;
             const encoded = txn.get(try tableKeyForGroup(&key_buf, group_id, command.mutation.table_id)) catch |err| switch (err) {
-                error.NotFound => return,
+                error.NotFound => null,
                 else => return err,
             };
-            const table = try decodeTableRecord(self.alloc, encoded);
-            defer metadata_table_manager.freeTable(self.alloc, table);
-            if (!metadata_table_manager.tableDefinitionsEqual(table, topology.create.table)) return;
+            switch (topology) {
+                .create => |create| {
+                    const table = try decodeTableRecord(self.alloc, encoded orelse return);
+                    defer metadata_table_manager.freeTable(self.alloc, table);
+                    if (!metadata_table_manager.tableDefinitionsEqual(table, create.table)) return;
+                },
+                .drop => if (encoded != null) return,
+            }
         }
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
@@ -9735,7 +9752,7 @@ pub const RaftApplyStore = struct {
         txn: *docstore.DocStore.Txn,
         group_id: u64,
         deadline_ns: ?u64,
-        deadline_io: ?@import("../../runtime_io_abi.zig").Borrow,
+        deadline_io: ?@import("antfly_runtime_abi").io_abi.Borrow,
     ) ![]metadata.TableRecord {
         try catalogProjectionDeadline(deadline_ns, deadline_io);
         var prefix_buf: [128]u8 = undefined;
@@ -9776,7 +9793,7 @@ pub const RaftApplyStore = struct {
         alloc: std.mem.Allocator,
         group_id: u64,
         deadline_ns: ?u64,
-        deadline_io: ?@import("../../runtime_io_abi.zig").Borrow,
+        deadline_io: ?@import("antfly_runtime_abi").io_abi.Borrow,
     ) !CatalogProjectionSnapshot {
         try catalogProjectionDeadline(deadline_ns, deadline_io);
         var txn = try self.store.beginReadTxn();
@@ -10492,7 +10509,7 @@ pub const RaftApplyStore = struct {
         txn: *docstore.DocStore.Txn,
         group_id: u64,
         deadline_ns: ?u64,
-        deadline_io: ?@import("../../runtime_io_abi.zig").Borrow,
+        deadline_io: ?@import("antfly_runtime_abi").io_abi.Borrow,
     ) ![]metadata.RangeRecord {
         try catalogProjectionDeadline(deadline_ns, deadline_io);
         var prefix_buf: [128]u8 = undefined;
@@ -23765,7 +23782,7 @@ test "metadata raft apply store catalog projection uses storage snapshot indepen
     // Projection scans must retain the caller's clock across every page.
     var vopr_io = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 7 * std.time.ns_per_s });
     defer vopr_io.deinit();
-    const clock = @import("../../runtime_io_abi.zig").Borrow.init(&vopr_io.io());
+    const clock = @import("antfly_runtime_abi").io_abi.Borrow.init(&vopr_io.io());
     const deadline = 8 * std.time.ns_per_s;
     {
         const snapshot = try store.captureCatalogProjectionWithClock(std.testing.allocator, 41, deadline, clock);
@@ -28916,6 +28933,40 @@ fn applySystemCatalogTestCommand(store: *RaftApplyStore, index: u64, command: Sy
     try store.snapshotBuilder().applyBatch(.{ .group_id = 21, .commit_index = index, .entries_bytes = entries });
 }
 
+test "system catalog qualified DROP removes topology atomically and rejects stale identity" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog-drop", .{tmp.sub_path});
+    defer alloc.free(root);
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    const table: metadata.TableRecord = .{ .table_id = 42, .name = "table:42", .min_ranges = 1 };
+    const ranges = [_]metadata.RangeRecord{.{ .table_id = 42, .group_id = 301, .range_id = 301, .start_key = "" }};
+    try applySystemCatalogTestCommand(&store, 1, .{ .expected_revision = 0, .mutation = .{ .action = .create, .kind = .table, .name = "events", .table_id = 42, .storage_name = "table:42" }, .topology = .{ .create = .{ .expected_transition_generation = 0, .table = table, .ranges = &ranges } } });
+    var membership: topology_protocol.RangeMembershipAccumulator = .{};
+    try membership.add(301);
+    var drop: SystemCatalogCommand = .{ .expected_revision = 1, .mutation = .{ .action = .drop, .kind = .table, .name = "events", .table_id = 42, .storage_name = "table:42" }, .topology = .{ .drop = .{ .table_id = 42, .expected_name = "table:42", .expected_transition_generation = 1, .range_contract = .{ .membership = membership.finish(42) } } } };
+    const admitted = try store.prepareSystemCatalogResult(alloc, 21, drop);
+    defer alloc.free(admitted);
+    drop.topology.?.drop.table_id = 43;
+    try std.testing.expectError(error.InvalidCatalogMutation, store.prepareSystemCatalogResult(alloc, 21, drop));
+    drop.topology.?.drop.table_id = 42;
+    drop.topology.?.drop.expected_transition_generation = 0;
+    try applySystemCatalogTestCommand(&store, 2, drop);
+    try std.testing.expectEqual(@as(u64, 1), (try store.systemCatalogMeta(alloc, 21)).revision);
+    drop.topology.?.drop.expected_transition_generation = 1;
+    try applySystemCatalogTestCommand(&store, 3, drop);
+    try std.testing.expectEqual(@as(?metadata.TableRecord, null), try store.resolveSystemCatalogTable(alloc, 21, .{ .table = "events" }));
+    const remaining = try store.listTables(alloc, 21);
+    defer {
+        for (remaining) |entry| metadata_table_manager.freeTable(alloc, entry);
+        alloc.free(remaining);
+    }
+    try std.testing.expectEqual(@as(usize, 0), remaining.len);
+    try std.testing.expectEqual(@as(u64, 2), (try store.systemCatalogMeta(alloc, 21)).revision);
+}
+
 test "system catalog publishes names and table topology atomically and fences stale mutations" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -30727,4 +30778,38 @@ test "metadata replay advances new noops without changing catalog authority or o
     const value = (try store.getRestoreJobValue(T.alloc, T.group_id, key)).?;
     defer T.alloc.free(value);
     try std.testing.expectEqualStrings("retained", value);
+}
+
+test "system catalog borrowed authority retains ownership and recovers a failed sync" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/borrowed", .{tmp.sub_path});
+    defer alloc.free(root);
+    var backend = try lsm_backend.BackendHandle.open(alloc, root, .{});
+    defer backend.close();
+    var runtime_store = try backend.backend.runtimeStore(alloc, .{ .name = "system/metadata" });
+    defer runtime_store.deinit();
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root, .borrowed_store = &runtime_store });
+    defer store.deinit();
+    try std.testing.expect(store.backend == null);
+    const group = group_ids.main_metadata_group_id;
+    try store.replaceStandaloneCatalog(group, 0, &.{}, &.{}, "{}");
+    try std.testing.expectEqual(@as(u64, 1), try store.standaloneRevision());
+    const Fail = struct {
+        fn sync(_: *anyopaque, _: bool) anyerror!void {
+            return error.InjectedSyncFailure;
+        }
+    };
+    const original = store.store.runtime_store.vtable;
+    var failing = original.*;
+    failing.sync = Fail.sync;
+    store.store.runtime_store.vtable = &failing;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, store.updateStandaloneCatalog(group, 1, .{ .auxiliary_json = "{\"recovered\":true}" }));
+    store.deinit();
+    store = try RaftApplyStore.init(alloc, .{ .root_dir = root, .borrowed_store = &runtime_store });
+    try std.testing.expectEqual(@as(u64, 2), try store.standaloneRevision());
+    const recovered = (try store.loadStandaloneCatalog(alloc)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(recovered);
+    try std.testing.expectEqualStrings("{\"recovered\":true}", recovered);
 }

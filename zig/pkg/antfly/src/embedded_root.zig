@@ -66,4 +66,7 @@ test {
 }
 
 /// Implementation source choices for this compilation root.
-pub const antfly_sources = @import("source_owner_physical.zig");
+pub const antfly_sources = if (@import("builtin").os.tag == .freestanding)
+    @import("source_owner_embedded_db.zig")
+else
+    @import("source_owner_storage.zig");

@@ -24,6 +24,9 @@ pub const magic = [8]u8{ 'A', 'N', 'T', 'F', 'L', 'Y', 'B', '\n' };
 /// AFB1 remains readable. AFB2 is the common transport envelope for portable
 /// logical streams and native physical generations, including self-describing
 /// relational-row document entries.
+/// Descriptor used by logical snapshots and replication seed transports.
+pub const logical_snapshot_manifest_file_name = "SNAPSHOT.json";
+
 pub const legacy_format_version: u32 = 1;
 pub const format_version: u32 = 2;
 

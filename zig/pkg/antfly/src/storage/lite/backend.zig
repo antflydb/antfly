@@ -40,6 +40,7 @@ pub const native = @import("native.zig");
 pub const CheckReport = native.CheckReport;
 pub const StableSnapshotReport = native.StableSnapshotReport;
 pub const VacuumReport = native.VacuumReport;
+pub const ReclamationOptions = docstore.reclamation.Options;
 
 pub const Profile = capabilities.Profile;
 pub const supported_inference_modes = capabilities.supported_inference_modes;
@@ -68,6 +69,7 @@ pub const EngineSelection = enum {
 };
 
 pub const OpenOptions = struct {
+    reclamation: docstore.reclamation.Options = .{},
     engine: EngineSelection = .auto,
     read_only: bool = false,
     no_sync: bool = false,
@@ -78,6 +80,7 @@ pub const OpenOptions = struct {
 };
 
 pub const CreateOptions = struct {
+    reclamation: docstore.reclamation.Options = .{},
     exclusive: bool = false,
     no_sync: bool = false,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
@@ -90,6 +93,7 @@ pub fn isAflitePath(path: []const u8) bool {
 }
 
 pub const StorageStatus = struct {
+    reclamation: ?docstore.reclamation.Status = null,
     format: []const u8 = "aflite",
     engine: []const u8,
     primary_layout: []const u8,
@@ -198,6 +202,7 @@ pub const Handle = struct {
     pub fn openOrCreate(allocator: Allocator, path: []const u8, opts: OpenOptions) !Handle {
         return open(allocator, path, opts) catch |err| switch (err) {
             error.FileNotFound => createWithOptions(allocator, path, .{
+                .reclamation = opts.reclamation,
                 .exclusive = true,
                 .no_sync = opts.no_sync,
                 .resource_manager = opts.resource_manager,
@@ -380,7 +385,7 @@ pub const Handle = struct {
         );
         defer self.allocator.free(key);
 
-        if (try store.file.getCatalogRecordAlloc(self.allocator, key)) |raw| {
+        if (try store.getCatalogRecordAlloc(self.allocator, key)) |raw| {
             defer self.allocator.free(raw);
             if (raw.len != @sizeOf(u128)) return error.InvalidLiteRootIncarnation;
             const incarnation = std.mem.readInt(u128, raw[0..@sizeOf(u128)], .little);
@@ -398,7 +403,7 @@ pub const Handle = struct {
         if (incarnation == 0) incarnation = 1;
         var encoded: [@sizeOf(u128)]u8 = undefined;
         std.mem.writeInt(u128, &encoded, incarnation, .little);
-        try store.file.putCatalogRecord(key, &encoded);
+        try store.putCatalogRecord(key, &encoded);
         return incarnation;
     }
 
@@ -422,7 +427,7 @@ pub const Handle = struct {
         if (self.namespace_runtimes.get(canonical)) |runtime| {
             if (runtime.key_prefix.len != 0) return error.LiteNamespaceAlreadyOpened;
         }
-        try self.native_docstore.?.file.putCatalogRecord(root_namespace_alias_catalog_key, canonical);
+        try self.native_docstore.?.putCatalogRecord(root_namespace_alias_catalog_key, canonical);
         self.root_namespace_alias = canonical;
     }
 
@@ -434,7 +439,7 @@ pub const Handle = struct {
     pub fn markEmbeddedArtifact(self: *Handle) !void {
         if (self.engine != .native_single_file) return error.InvalidArgument;
         if (try self.isEmbeddedArtifact()) return;
-        try self.native_docstore.?.file.putCatalogRecord(artifact_profile_catalog_key, embedded_artifact_profile);
+        try self.native_docstore.?.putCatalogRecord(artifact_profile_catalog_key, embedded_artifact_profile);
     }
 
     pub fn isEmbeddedArtifact(self: *const Handle) !bool {
@@ -444,7 +449,7 @@ pub const Handle = struct {
     pub fn markStandaloneArtifact(self: *Handle) !void {
         if (self.engine != .native_single_file) return error.InvalidArgument;
         if (try self.isStandaloneArtifact()) return;
-        try self.native_docstore.?.file.putCatalogRecord(artifact_profile_catalog_key, standalone_artifact_profile);
+        try self.native_docstore.?.putCatalogRecord(artifact_profile_catalog_key, standalone_artifact_profile);
     }
 
     pub fn isStandaloneArtifact(self: *const Handle) !bool {
@@ -453,7 +458,7 @@ pub const Handle = struct {
 
     fn artifactHasProfile(self: *const Handle, expected: []const u8) !bool {
         if (self.engine != .native_single_file) return false;
-        const value = (try self.native_docstore.?.file.getCatalogRecordAlloc(self.allocator, artifact_profile_catalog_key)) orelse return false;
+        const value = (try self.native_docstore.?.getCatalogRecordAlloc(self.allocator, artifact_profile_catalog_key)) orelse return false;
         defer self.allocator.free(value);
         return std.mem.eql(u8, value, expected);
     }
@@ -488,17 +493,20 @@ pub const Handle = struct {
     }
 
     pub fn storageStatus(self: *Handle) StorageStatus {
+        if (self.native_docstore) |store| platform_sync.lockYielding(&store.mutex);
+        defer if (self.native_docstore) |store| store.mutex.unlock();
         return switch (self.engine) {
             .native_single_file => blk: {
                 const file = &self.native_docstore.?.file;
                 const checkpoint = file.activeCheckpoint();
                 break :blk .{
+                    .reclamation = self.native_docstore.?.reclamationStatusAssumeLocked() catch null,
                     .engine = @tagName(self.engine),
                     .primary_layout = "native_document_pages",
                     .replay_layout = "native_replay_lanes_in_document_catalog",
                     .index_layout = native_index_layout,
                     .index_namespace = native_index_base_path,
-                    .format_version = native.format_version,
+                    .format_version = if (file.header.indexed_reclamation) 4 else native.format_version,
                     .page_size = file.header.page_size,
                     .active_checkpoint = file.header.active_checkpoint,
                     .checkpoint_sequence = checkpoint.commit_sequence,
@@ -560,8 +568,6 @@ pub const Handle = struct {
 
     fn maintenanceStatus(ptr: *anyopaque) maintenance.Status {
         const self: *Handle = @ptrCast(@alignCast(ptr));
-        if (self.native_docstore) |store| platform_sync.lockYielding(&store.mutex);
-        defer if (self.native_docstore) |store| store.mutex.unlock();
         const status = self.storageStatus();
         return .{
             .engine = "lite",
@@ -671,6 +677,7 @@ fn openNativeSingleFile(allocator: Allocator, path: []const u8, opts: OpenOption
     };
 
     const initial_store = try docstore.Store.openWithOptions(allocator, path, .{
+        .reclamation = opts.reclamation,
         .read_only = opts.read_only,
         .no_sync = opts.no_sync,
         .resource_manager = resource_manager,
@@ -693,6 +700,7 @@ fn createNativeSingleFile(allocator: Allocator, path: []const u8, opts: CreateOp
     };
 
     const initial_store = try docstore.Store.createWithOptions(allocator, path, .{
+        .reclamation = opts.reclamation,
         .exclusive = opts.exclusive,
         .no_sync = opts.no_sync,
         .resource_manager = resource_manager,
@@ -742,6 +750,9 @@ fn initNativeSingleFile(
     if (root_namespace_alias) |alias| {
         if (!isStableGroupNamespace(alias)) return error.InvalidLiteRootNamespaceAlias;
     }
+    // Construction returns/moves a value. Only this heap owner has a stable
+    // address that a maintenance task may retain, including on idle reopen.
+    store.startMaintenance();
     return .{
         .allocator = allocator,
         .engine = .native_single_file,
@@ -833,6 +844,33 @@ fn hasMode(modes: []const []const u8, expected: []const u8) bool {
         if (std.mem.eql(u8, mode, expected)) return true;
     }
     return false;
+}
+
+test "lite reclamation backend reopen activates idle retirement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "reopen-retirement.aflite");
+    defer a.free(path);
+    {
+        var handle = try Handle.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+        defer handle.deinit();
+        const owner = handle.native_docstore.?;
+        owner.maintenance_cancel.request();
+        try owner.putCatalogRecord("meta", "old");
+        try owner.putCatalogRecord("meta", "new");
+    }
+    var handle = try Handle.open(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer handle.deinit();
+    const owner = handle.native_docstore.?;
+    try std.testing.expect(owner.maintenance_future != null);
+    const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(5));
+    // No mutations, transactions, or explicit maintainOnce calls after open.
+    while ((try owner.reclamationStatus()).pending_data_retirement_objects != 0) {
+        if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= deadline.nanoseconds) return error.TestUnexpectedResult;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect((try owner.checkWithCancel(null)).valid);
 }
 
 test "lite backend capabilities distinguish native and hosted profiles" {
@@ -1066,6 +1104,8 @@ test "lite backend native engine creates and checks aflite file" {
     var handle = try Handle.create(allocator, path, true);
     defer handle.deinit();
 
+    // Keep this format/maintenance test deterministic while using NativeFile directly.
+    handle.native_docstore.?.maintenance_cancel.request();
     try handle.native_docstore.?.file.putDocument("doc:1", "value");
     try std.testing.expect(handle.maintenanceSource().status().maintenance.online);
     var cancel = maintenance.CancelToken{};
@@ -1102,8 +1142,10 @@ test "lite backend native engine creates and checks aflite file" {
     const configured_report = try handle.check();
     const vacuumed = try handle.vacuum();
     try std.testing.expectEqual(configured_report.file_size, vacuumed.before_size);
-    try std.testing.expectEqual(configured_report.compact_size, vacuumed.after_size);
-    try std.testing.expectEqual(vacuumed.before_size - vacuumed.after_size, vacuumed.reclaimed_bytes);
+    // Publishing the replacement adds allocator metadata beyond the image estimate.
+    try std.testing.expectEqual((try handle.native_docstore.?.file.file.stat(std.testing.io)).size, vacuumed.after_size);
+    try std.testing.expect(vacuumed.after_size >= configured_report.compact_size);
+    try std.testing.expectEqual(vacuumed.before_size -| vacuumed.after_size, vacuumed.reclaimed_bytes);
 }
 
 test "lite backend propagates no_sync to native engine" {
@@ -1168,7 +1210,7 @@ test "lite backend reports native storage status from active checkpoint" {
     try std.testing.expectEqualStrings("native_replay_lanes_in_document_catalog", status.replay_layout);
     try std.testing.expectEqualStrings(native_index_layout, status.index_layout);
     try std.testing.expectEqualStrings(native_index_base_path, status.index_namespace.?);
-    try std.testing.expectEqual(native.format_version, status.format_version.?);
+    try std.testing.expectEqual(@as(u32, 4), status.format_version.?);
     try std.testing.expectEqual(native.default_page_size, status.page_size.?);
     try std.testing.expectEqual(handle.native_docstore.?.file.header.active_checkpoint, status.active_checkpoint.?);
     try std.testing.expectEqual(checkpoint.commit_sequence, status.checkpoint_sequence.?);
@@ -1643,7 +1685,13 @@ test "lite backend recovers vector crash orphans only on writer reopen" {
             try storage.writeFileAbsolute(orphan, "orphan");
             try storage.writeFileAbsolute(root ++ "/unmanaged", "keep");
             try storage.writeFileAbsolute(unrelated, "keep");
-            sequence = handle.native_docstore.?.file.activeCheckpoint().commit_sequence;
+        }
+        // Closing joins maintenance; measure the checkpoint after its final
+        // retirement publication so the read-only reopen is the only activity.
+        {
+            var snapshot = try @import("native.zig").NativeFile.open(alloc, fixture.path(), true);
+            defer snapshot.close();
+            sequence = snapshot.activeCheckpoint().commit_sequence;
         }
         for ([_]db_mod.OpenOptions.OpenMode{ .query_readonly, .writer }) |mode| {
             var db = try Connection.open(alloc, fixture.path(), mode);

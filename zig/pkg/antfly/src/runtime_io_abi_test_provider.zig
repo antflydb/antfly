@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Elastic-2.0
 
 const std = @import("std");
-const bridge = @import("runtime_io_abi.zig");
+const bridge = @import("antfly_runtime_abi").io_abi;
 var inject = false;
 const vtable: std.Io.VTable = blk: {
     var table = std.Options.debug_io.vtable.*;

@@ -13,6 +13,13 @@ const Io = std.Io;
 pub const Scheduler = struct {
     pub const Class = enum { maintenance, producer, derived, propagation };
     const class_count = @typeInfo(Class).@"enum".fields.len;
+
+    /// Callbacks may wait for work in another class. Preserve one progress
+    /// slot per class even when fractional CPU quota permits no parallel CPU
+    /// stages; the runtime's async limit independently bounds those stages.
+    pub fn cpuLimitedCapacity(cpu_parallelism: usize, lane_capacity: usize) usize {
+        return @min(lane_capacity, @max(class_count, cpu_parallelism));
+    }
     alloc: std.mem.Allocator,
     io: Io,
     max_active: usize,
@@ -264,42 +271,44 @@ test "maintenance scheduler cancellation closes admission before owner destructi
 }
 
 test "maintenance scheduler handles hundreds of parked owners with bounded runnable capacity" {
-    var threaded = Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(4) });
-    defer threaded.deinit();
-    const io = threaded.io();
-    const scheduler = try Scheduler.create(std.testing.allocator, io, 2);
-    defer scheduler.destroy();
-    const Probe = struct {
-        calls: std.atomic.Value(usize) = .init(0),
-        fn step(self: *@This()) ?u64 {
-            _ = self.calls.fetchAdd(1, .acq_rel);
-            return null;
+    inline for (.{ 1, 2 }) |capacity| {
+        var threaded = Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(4) });
+        defer threaded.deinit();
+        const io = threaded.io();
+        const scheduler = try Scheduler.create(std.testing.allocator, io, capacity);
+        defer scheduler.destroy();
+        const Probe = struct {
+            calls: std.atomic.Value(usize) = .init(0),
+            fn step(self: *@This()) ?u64 {
+                _ = self.calls.fetchAdd(1, .acq_rel);
+                return null;
+            }
+        };
+        var probes: [256]Probe = @splat(.{});
+        var handles: [256]Scheduler.Handle = undefined;
+        var initialized: usize = 0;
+        defer for (handles[0..initialized]) |*handle| handle.await(io);
+        for (&probes, &handles) |*probe, *handle| {
+            handle.* = try scheduler.register(probe, Probe.step);
+            initialized += 1;
         }
-    };
-    var probes: [256]Probe = @splat(.{});
-    var handles: [256]Scheduler.Handle = undefined;
-    var initialized: usize = 0;
-    defer for (handles[0..initialized]) |*handle| handle.await(io);
-    for (&probes, &handles) |*probe, *handle| {
-        handle.* = try scheduler.register(probe, Probe.step);
-        initialized += 1;
+        const deadline = Io.Clock.awake.now(io).nanoseconds + 10 * std.time.ns_per_s;
+        while (true) {
+            var complete = true;
+            for (&probes) |*probe| complete = complete and probe.calls.load(.acquire) == 1;
+            if (complete) break;
+            if (Io.Clock.awake.now(io).nanoseconds >= deadline) return error.TestUnexpectedResult;
+            try io.sleep(Io.Duration.fromMilliseconds(1), .awake);
+        }
+        scheduler.wake(&probes[0]);
+        while (probes[0].calls.load(.acquire) != 2) {
+            if (Io.Clock.awake.now(io).nanoseconds >= deadline) return error.TestUnexpectedResult;
+            try io.sleep(Io.Duration.fromMilliseconds(1), .awake);
+        }
+        scheduler.mutex.lockUncancelable(io);
+        try std.testing.expect(scheduler.peak_active <= capacity);
+        scheduler.mutex.unlock(io);
     }
-    const deadline = Io.Clock.awake.now(io).nanoseconds + 10 * std.time.ns_per_s;
-    while (true) {
-        var complete = true;
-        for (&probes) |*probe| complete = complete and probe.calls.load(.acquire) == 1;
-        if (complete) break;
-        if (Io.Clock.awake.now(io).nanoseconds >= deadline) return error.TestUnexpectedResult;
-        try io.sleep(Io.Duration.fromMilliseconds(1), .awake);
-    }
-    scheduler.wake(&probes[0]);
-    while (probes[0].calls.load(.acquire) != 2) {
-        if (Io.Clock.awake.now(io).nanoseconds >= deadline) return error.TestUnexpectedResult;
-        try io.sleep(Io.Duration.fromMilliseconds(1), .awake);
-    }
-    scheduler.mutex.lockUncancelable(io);
-    try std.testing.expect(scheduler.peak_active <= 2);
-    scheduler.mutex.unlock(io);
 }
 
 test "maintenance wake during active pass is retained and cancel joins its invocation" {
@@ -338,7 +347,7 @@ test "maintenance producer waiters cannot consume derived publication capacity" 
     var threaded = Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(5) });
     defer threaded.deinit();
     const io = threaded.io();
-    const scheduler = try Scheduler.create(std.testing.allocator, io, 3);
+    const scheduler = try Scheduler.create(std.testing.allocator, io, Scheduler.cpuLimitedCapacity(1, 4));
     defer scheduler.destroy();
     const Probe = struct {
         io: Io,
@@ -402,4 +411,10 @@ test "maintenance scheduler shutdown fences registration and drains owner handle
         try io.sleep(Io.Duration.fromMilliseconds(1), .awake);
     }
     try std.testing.expectError(error.BackendRuntimeShuttingDown, scheduler.register(&probe, Probe.step));
+}
+
+test "CPU limited maintenance capacity preserves dependency progress slots" {
+    try std.testing.expectEqual(@as(usize, 4), Scheduler.cpuLimitedCapacity(1, 16));
+    try std.testing.expectEqual(@as(usize, 8), Scheduler.cpuLimitedCapacity(8, 16));
+    try std.testing.expectEqual(@as(usize, 4), Scheduler.cpuLimitedCapacity(8, 4));
 }

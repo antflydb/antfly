@@ -22,7 +22,7 @@ const api_http_server = @import("../api/http_server.zig");
 const api_batch = @import("../api/batch.zig");
 const api_distributed_graph = @import("../api/distributed_graph.zig");
 const api_distributed_join = @import("../api/distributed_join.zig");
-const query_embedding_cache = @import("../inference/query_embedding_cache.zig");
+const query_embedding_cache = @import("antfly_inference_query_embedding_cache");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const api_table_write_source = @import("../api/table_write_source.zig");
 const test_contract_helpers = @import("../api/test_contract_helpers.zig");
@@ -5978,7 +5978,7 @@ pub const Fixture = struct {
         self.beginStandbyScalingOperation("catch up fenced standby boundary");
         try owners.catchUp(self.executor.executor(), owners.primary_uri.?);
         if (owners.observed_progress.applied_lsn <= previous_applied) return error.ProductionStandbyStreamingProgressMissing;
-        try std.testing.expectError(error.HAFencedPrimary, owners.primary_server.?.write_source.ha_write_gate.?.check());
+        try std.testing.expectError(error.HAFencedPrimary, owners.primary_server.?.write_source.replication_write_gate.?.check());
         const old_metadata_leader = self.metadata.?.cluster.currentMetadataLeaderIndex() orelse return error.MetadataLeaderUnavailable;
         // Retire the old process's callback admission before reconstruction;
         // the new metadata owner must reinstall its production shard RPCs.

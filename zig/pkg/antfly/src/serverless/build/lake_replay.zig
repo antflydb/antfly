@@ -18,7 +18,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const rowsource = @import("../../storage/rowsource/types.zig");
 const source_binding = @import("../segment/source_binding.zig");
 const lake_build_limits = @import("lake_build_limits.zig");

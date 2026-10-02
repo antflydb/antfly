@@ -17,16 +17,16 @@ const httpx = @import("httpx");
 const lib = @import("antfly_generating");
 const inference = @import("../inference/mod.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
-const RequestContext = @import("../inference/execution_context.zig").RequestContext;
-const openai_provider = @import("../inference/openai.zig");
-const antfly_provider = @import("../inference/local.zig");
-const vertex_provider = @import("../inference/vertex.zig");
+const RequestContext = @import("antfly_inference_execution_context").RequestContext;
+const openai_provider = @import("antfly_inference_openai");
+const antfly_provider = @import("antfly_inference_local");
+const vertex_provider = @import("antfly_inference_vertex");
 const common_secrets = @import("../common/secrets.zig");
-const execution_context = @import("../inference/execution_context.zig");
+const execution_context = @import("antfly_inference_execution_context");
 const platform_time = @import("antfly_platform").time;
 const provider_limits = @import("../common/provider_limits.zig");
 const credential_identity = @import("../common/credential_source_identity.zig");
-const provider_defaults = @import("../common/provider_defaults.zig");
+const provider_defaults = @import("antfly_inference_provider_defaults");
 
 const remote_generate_max_timeout_ms: u64 = 300_000;
 
@@ -189,8 +189,10 @@ const BackendState = struct {
         state.io = http.io;
         state.cfg = cfg;
         state.api_key = switch (cfg.provider) {
-            .antfly => try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.api_key orelse inference_api_key, "ANTFLY_INFERENCE_API_KEY"),
-            .gemini => try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.api_key, "GEMINI_API_KEY"),
+            .antfly => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key orelse inference_api_key, "ANTFLY_INFERENCE_API_KEY"),
+            .openai => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key, "OPENAI_API_KEY"),
+            .openrouter => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key, "OPENROUTER_API_KEY"),
+            .gemini => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key, "GEMINI_API_KEY"),
             else => try common_secrets.SecretValue.initConfig(alloc, cfg.api_key),
         };
         errdefer if (state.api_key) |*api_key| api_key.deinit(alloc);
@@ -521,7 +523,7 @@ fn optionalBearerAuthHeaderOwned(
 ) !?[]u8 {
     return state.auth_header_cache.getOwned(state.alloc, alloc, api_key_ref, state.secret_store) catch |err| switch (err) {
         error.SecretNotFound => switch (api_key_ref.*) {
-            .env_var => return null,
+            .env_var, .provider_default => return null,
             else => return err,
         },
         else => return err,
@@ -538,7 +540,7 @@ fn textContent(message: ChatMessage) ?[]const u8 {
 
 test "generating optional env auth is skipped when unset" {
     const alloc = std.testing.allocator;
-    var api_key = try common_secrets.SecretValue.initConfigOrEnv(alloc, null, "ANTFLY_TEST_GENERATING_MISSING_API_KEY");
+    var api_key = try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, null, "ANTFLY_TEST_GENERATING_MISSING_API_KEY");
     defer api_key.deinit(alloc);
 
     var state = BackendState{
@@ -1024,7 +1026,7 @@ pub fn acquireGenerationQuota(
     if (cfg.provider != .antfly or cfg.url.len == 0)
         return error.InvalidGeneratorConfig;
     const policy = try provider_limits.Policy.fromConfig(cfg.rate_limit);
-    var secret = try common_secrets.SecretValue.initConfigOrEnv(
+    var secret = try common_secrets.SecretValue.initConfigOrProviderDefault(
         alloc,
         cfg.api_key orelse options.inference_api_key,
         "ANTFLY_INFERENCE_API_KEY",
@@ -1081,7 +1083,7 @@ test "generating backend batch preserves cancellation alongside quota policy" {
     }, &.{"hello"}));
     var cancelled = std.atomic.Value(bool).init(true);
     context.deadline_ns = null;
-    context.cancellation = @import("../common/cancellation.zig").CancellationToken.fromAtomic(&cancelled);
+    context.cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&cancelled);
     try std.testing.expectError(error.Cancelled, generateAntflyTextBatchResponse(alloc, &client, cfg, .{
         .limits = &limits,
         .request_context = context,
@@ -1381,6 +1383,52 @@ test "generating backend tools complete agent conversations across all remote ad
         defer final.deinit();
         try std.testing.expectEqualStrings("done", final.content);
         try std.testing.expectEqual(@as(usize, 0), final.tool_calls.len);
+        try group.await(io);
+        if (failure) |err| return err;
+    }
+}
+
+test "generating backend defaults OpenAI and OpenRouter credentials from the store" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/test-generator-defaults-{d}.json", .{std.Io.Clock.awake.now(io).nanoseconds});
+    defer alloc.free(path);
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var store = try common_secrets.FileStore.init(alloc, path);
+    defer store.deinit();
+    const Check = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer stored-key", req.header("Authorization") orelse return error.TestUnexpectedResult);
+        }
+        fn serve(server: *httpx.TestServer, failure: *?anyerror) void {
+            server.handleOne() catch |err| {
+                failure.* = err;
+            };
+        }
+    };
+    inline for (.{ Provider.openai, Provider.openrouter }) |provider| {
+        const key = if (provider == .openai) "openai.api_key" else "openrouter.api_key";
+        var entry = try store.put(alloc, key, "stored-key");
+        defer entry.deinit(alloc);
+        var server = try httpx.TestServer.start(alloc, io, &.{.{
+            .method = .POST,
+            .path = "/chat/completions",
+            .assert_request = Check.request,
+            .respond = .{ .body = "{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}" },
+        }});
+        defer server.deinit();
+        var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+        defer client.deinit();
+        var factory = BackendFactory.initWithOptions(alloc, &client, .{ .secret_store = &store });
+        var generator = try factory.factory().create(alloc, .{ .provider = provider, .model = "test", .url = server.baseUrl() });
+        defer generator.deinit();
+        var failure: ?anyerror = null;
+        var group = std.Io.Group.init;
+        defer group.cancel(io);
+        try group.concurrent(io, Check.serve, .{ &server, &failure });
+        var result = try generator.generate(alloc, "test", &.{.{ .role = .user, .content = .{ .text = "hello" } }});
+        defer result.deinit();
+        try std.testing.expectEqualStrings("ok", result.content);
         try group.await(io);
         if (failure) |err| return err;
     }

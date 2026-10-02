@@ -30,10 +30,13 @@ const integrity_wire = @import("relational_integrity_wire.zig");
 const integrity_activation = @import("../storage/db/relational_integrity_activation_contract.zig");
 const integrity_retirement = @import("../storage/db/relational_integrity_retirement_contract.zig");
 
-pub const table_participant_prefix = "table:";
-const table_participant_v2_prefix = "table2:";
-const table_participant_v3_prefix = "table3:";
-pub const group_participant_marker = ":group:";
+pub const table_participant_prefix = @import("local_transaction_contract.zig").table_participant_prefix;
+
+const table_participant_v2_prefix = @import("local_transaction_contract.zig").table_participant_v2_prefix;
+
+const table_participant_v3_prefix = @import("local_transaction_contract.zig").table_participant_v3_prefix;
+
+pub const group_participant_marker = @import("local_transaction_contract.zig").group_participant_marker;
 
 pub const TxnBeginRequest = struct {
     txn_id: db_mod.types.TxnId,
@@ -188,11 +191,15 @@ pub fn resolveGroupLocalWithRequest(writes: table_writes.TableWriteSource, alloc
     return writes.txnResolveGroupLocalWithCancellation(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level, cancellation);
 }
 
-pub const TableCommitRequest = contract.TableCommitRequest;
-pub const CommitConflict = contract.CommitConflict;
+pub const TableCommitRequest = @import("local_transaction_contract.zig").TableCommitRequest;
+
+pub const CommitConflict = @import("local_transaction_contract.zig").CommitConflict;
+
 pub const ParticipantPhase = contract.ParticipantPhase;
-pub const CommitOutcome = contract.CommitOutcome;
-pub const PreDecisionContext = contract.PreDecisionContext;
+pub const CommitOutcome = @import("local_transaction_contract.zig").CommitOutcome;
+
+pub const PreDecisionContext = @import("local_transaction_contract.zig").PreDecisionContext;
+
 pub const pre_decision_server_response_reserve_ms = contract.pre_decision_server_response_reserve_ms;
 
 pub const ParticipantWorker = struct {
@@ -348,6 +355,10 @@ pub const RecoveryResolver = struct {
     local_participant: ?[]const u8 = null,
 
     pub fn config(self: *const RecoveryResolver) db_mod.transaction_runtime.Config {
+        return @import("../storage/server_transaction_recovery.zig").configFor(RecoveryResolver, @constCast(self), serverConfig);
+    }
+
+    pub fn serverConfig(self: *const RecoveryResolver) @import("../storage/server_transaction_recovery.zig").Config {
         return .{
             .enabled = true,
             .lease_owned = self.lease_owned,
@@ -2294,69 +2305,13 @@ fn ensureParticipantTxn(
     return &grouped.items[grouped.items.len - 1];
 }
 
-pub fn participantIdForGroup(alloc: std.mem.Allocator, table_name: []const u8, group_id: u64) ![]u8 {
-    if (table_name.len > std.math.maxInt(u32)) return error.TableNameTooLong;
-    return try std.fmt.allocPrint(alloc, "{s}{x:0>8}:{s}:{d}", .{ table_participant_v2_prefix, table_name.len, table_name, group_id });
-}
+pub const participantIdForGroup = @import("local_transaction_contract.zig").participantIdForGroup;
 
-pub const ParticipantRef = struct {
-    table_name: []const u8,
-    group_id: u64,
-    restore_staging_scope: ?[32]u8 = null,
-    restore_staging_plan_id: ?[16]u8 = null,
-};
+pub const ParticipantRef = @import("local_transaction_contract.zig").ParticipantRef;
 
-/// The existing durable participant set owns recovery routing. Hidden owners
-/// add a fixed-size exact locator, so restart never depends on a resident cache
-/// or a scan through all restore jobs. Ordinary participant IDs are unchanged.
-pub fn participantIdForGroupScoped(alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, scope: ?[32]u8, plan_id: ?[16]u8) ![]u8 {
-    if (scope == null and plan_id == null) return participantIdForGroup(alloc, table_name, group_id);
-    try validateRestorePlan(scope, plan_id);
-    if (scope == null or plan_id == null or table_name.len == 0 or table_name.len > std.math.maxInt(u32) or group_id == 0) return error.InvalidTxnRequest;
-    return std.fmt.allocPrint(alloc, "{s}{x:0>8}:{s}:{d}:{s}:{s}", .{ table_participant_v3_prefix, table_name.len, table_name, group_id, std.fmt.bytesToHex(plan_id.?, .lower), std.fmt.bytesToHex(scope.?, .lower) });
-}
+pub const participantIdForGroupScoped = @import("local_transaction_contract.zig").participantIdForGroupScoped;
 
-pub fn parseParticipantRef(participant: []const u8) ?ParticipantRef {
-    if (std.mem.startsWith(u8, participant, table_participant_v3_prefix)) {
-        const body = participant[table_participant_v3_prefix.len..];
-        if (body.len < 9 or body[8] != ':') return null;
-        const table_name_len = std.fmt.parseUnsigned(u32, body[0..8], 16) catch return null;
-        if (table_name_len == 0 or table_name_len > body.len - 9) return null;
-        const group_separator = 9 + @as(usize, table_name_len);
-        if (group_separator >= body.len or body[group_separator] != ':') return null;
-        const suffix = body[group_separator + 1 ..];
-        const group_end = std.mem.indexOfScalar(u8, suffix, ':') orelse return null;
-        if (suffix.len - group_end != 1 + 32 + 1 + 64 or suffix[group_end + 33] != ':') return null;
-        const group_id = std.fmt.parseUnsigned(u64, suffix[0..group_end], 10) catch return null;
-        if (group_id == 0) return null;
-        var plan: [16]u8 = undefined;
-        var scope: [32]u8 = undefined;
-        _ = std.fmt.hexToBytes(&plan, suffix[group_end + 1 ..][0..32]) catch return null;
-        _ = std.fmt.hexToBytes(&scope, suffix[group_end + 34 ..]) catch return null;
-        if (std.mem.allEqual(u8, &plan, 0)) return null;
-        return .{ .table_name = body[9..group_separator], .group_id = group_id, .restore_staging_scope = scope, .restore_staging_plan_id = plan };
-    }
-    if (std.mem.startsWith(u8, participant, table_participant_v2_prefix)) {
-        const body = participant[table_participant_v2_prefix.len..];
-        if (body.len < 9 or body[8] != ':') return null;
-        const table_name_len = std.fmt.parseUnsigned(u32, body[0..8], 16) catch return null;
-        const table_start: usize = 9;
-        const group_separator = table_start + @as(usize, table_name_len);
-        if (body.len <= group_separator or body[group_separator] != ':') return null;
-        const table_name = body[table_start..group_separator];
-        if (table_name.len == 0) return null;
-        const group_id = std.fmt.parseUnsigned(u64, body[group_separator + 1 ..], 10) catch return null;
-        return .{ .table_name = table_name, .group_id = group_id };
-    }
-
-    if (!std.mem.startsWith(u8, participant, table_participant_prefix)) return null;
-    const rest = participant[table_participant_prefix.len..];
-    const marker_index = std.mem.indexOf(u8, rest, group_participant_marker) orelse return null;
-    const table_name = rest[0..marker_index];
-    if (table_name.len == 0) return null;
-    const group_id = std.fmt.parseUnsigned(u64, rest[marker_index + group_participant_marker.len ..], 10) catch return null;
-    return .{ .table_name = table_name, .group_id = group_id };
-}
+pub const parseParticipantRef = @import("local_transaction_contract.zig").parseParticipantRef;
 
 pub fn resolveParticipant(
     alloc: std.mem.Allocator,
@@ -2441,7 +2396,8 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     const guarded = req.req.range_guards.len != 0;
-    if (guarded) try out.appendSlice(alloc, "[\"range-prepare-v1\",");
+    const row_semantics = @import("batch.zig").requiresRowSemanticsEnvelope(req.req.writes, req.req.predicates);
+    if (row_semantics) try out.appendSlice(alloc, "[\"row-semantics-prepare-v1\",") else if (guarded) try out.appendSlice(alloc, "[\"range-prepare-v1\",");
     try out.appendSlice(alloc, "{\"txn_id\":\"");
     try out.appendSlice(alloc, &txn_hex);
     try out.appendSlice(alloc, "\",\"topology_epoch\":");
@@ -2459,11 +2415,18 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
         if (i > 0) try out.append(alloc, ',');
         const encoded = try std.fmt.allocPrint(
             alloc,
-            "{{\"key\":{f},\"value\":{s}}}",
+            "{{\"key\":{f},\"value\":{s}",
             .{ std.json.fmt(write.key, .{}), write.value },
         );
         defer alloc.free(encoded);
         try out.appendSlice(alloc, encoded);
+        if (write.json_null_fields.len != 0) {
+            const fields = try std.json.Stringify.valueAlloc(alloc, write.json_null_fields, .{});
+            defer alloc.free(fields);
+            try out.appendSlice(alloc, ",\"json_null_fields\":");
+            try out.appendSlice(alloc, fields);
+        }
+        try out.append(alloc, '}');
     }
     try out.appendSlice(alloc, "],\"deletes\":[");
     for (req.req.deletes, 0..) |key, i| {
@@ -2507,6 +2470,7 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
         const encoded = try std.json.Stringify.valueAlloc(alloc, .{
             .key = predicate.key,
             .expected_version = predicate.expected_version,
+            .unique_absence = if (predicate.unique_absence) @as(?bool, true) else null,
             .expected_content_digest = if (predicate.expected_content_digest != null) @as(?[]const u8, &digest_hex) else null,
         }, .{ .emit_null_optional_fields = false });
         defer alloc.free(encoded);
@@ -2559,7 +2523,7 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
         try out.appendSlice(alloc, encoded);
     }
     try out.append(alloc, '}');
-    if (guarded) try out.append(alloc, ']');
+    if (guarded or row_semantics) try out.append(alloc, ']');
     return try out.toOwnedSlice(alloc);
 }
 
@@ -2591,9 +2555,7 @@ pub fn encodeTxnResolveRequest(alloc: std.mem.Allocator, req: TxnResolveRequest)
     return try out.toOwnedSlice(alloc);
 }
 
-fn validateRestorePlan(scope: ?[32]u8, plan_id: ?[16]u8) !void {
-    if (plan_id) |id| if (scope == null or std.mem.allEqual(u8, &id, 0)) return error.InvalidTxnRequest;
-}
+const validateRestorePlan = @import("local_transaction_contract.zig").validateRestorePlan;
 
 fn appendRestorePlan(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), plan_id: ?[16]u8) !void {
     if (plan_id) |id| {
@@ -2729,10 +2691,13 @@ pub fn freeTxnBeginRequest(alloc: std.mem.Allocator, req: *TxnBeginRequest) void
 pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPrepareRequest {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false });
     defer parsed.deinit();
-    const guarded = parsed.value == .array;
-    const root = if (guarded) blk: {
+    const wrapped = parsed.value == .array;
+    var row_semantics = false;
+    const root = if (wrapped) blk: {
         const entries = parsed.value.array.items;
-        if (entries.len != 2 or entries[0] != .string or !std.mem.eql(u8, entries[0].string, "range-prepare-v1")) return error.InvalidTxnRequest;
+        if (entries.len != 2 or entries[0] != .string) return error.InvalidTxnRequest;
+        row_semantics = std.mem.eql(u8, entries[0].string, "row-semantics-prepare-v1");
+        if (!row_semantics and !std.mem.eql(u8, entries[0].string, "range-prepare-v1")) return error.InvalidTxnRequest;
         break :blk entries[1];
     } else parsed.value;
     const obj = switch (root) {
@@ -2779,7 +2744,10 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     var route_fence = if (obj.get("route_fence")) |value| try std.json.parseFromValue(@import("../metadata/api.zig").CatalogRouteFence, alloc, value, .{}) else null;
     defer if (route_fence) |*fence| fence.deinit();
     if (range_guards_owner != null and range_guards_owner.?.value.len != 0 and route_fence == null) return error.InvalidTxnRequest;
-    if (guarded != (range_guards_owner != null and range_guards_owner.?.value.len != 0)) return error.InvalidTxnRequest;
+    const has_guards = range_guards_owner != null and range_guards_owner.?.value.len != 0;
+    if (has_guards and !wrapped) return error.InvalidTxnRequest;
+    if (wrapped and !row_semantics and !has_guards) return error.InvalidTxnRequest;
+    if (@import("batch.zig").requiresRowSemanticsEnvelope(writes, predicates) and !row_semantics) return error.InvalidTxnRequest;
     return .{
         .route_fence = if (route_fence) |fence| fence.value else null,
         .txn_id = txn_id,
@@ -2851,6 +2819,27 @@ test "SQL document schema epoch survives distributed prepare transport" {
         defer freeTxnPrepareRequest(alloc, &parsed);
         try std.testing.expectEqual(@as(?u32, version), parsed.req.schema_version);
         try std.testing.expect(parsed.req.relational_schema_version == null);
+    }
+}
+
+test "distributed txn prepare preserves JSON null provenance and rejects invalid fields" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeTxnPrepareRequest(alloc, .{ .txn_id = @splat(1), .req = .{
+        .writes = &.{.{ .key = "row", .value = "{\"j\":null,\"sql_null\":null}", .json_null_fields = &.{"j"} }},
+    } });
+    defer alloc.free(encoded);
+    var parsed = try parseTxnPrepareRequest(alloc, encoded);
+    defer freeTxnPrepareRequest(alloc, &parsed);
+    try std.testing.expectEqual(@as(usize, 1), parsed.req.writes[0].json_null_fields.len);
+    try std.testing.expectEqualStrings("j", parsed.req.writes[0].json_null_fields[0]);
+    for ([_][]const u8{
+        "{\"value\":{\"j\":null},\"key\":\"row\",\"json_null_fields\":[\"missing\"]}",
+        "{\"value\":{\"j\":1},\"key\":\"row\",\"json_null_fields\":[\"j\"]}",
+        "{\"value\":{\"j\":null},\"key\":\"row\",\"json_null_fields\":[\"j\",\"j\"]}",
+    }) |write| {
+        const body = try std.fmt.allocPrint(alloc, "{{\"txn_id\":\"01010101010101010101010101010101\",\"writes\":[{s}],\"deletes\":[],\"transforms\":[],\"predicates\":[]}}", .{write});
+        defer alloc.free(body);
+        try std.testing.expectError(error.InvalidTxnRequest, parseTxnPrepareRequest(alloc, body));
     }
 }
 
@@ -3047,7 +3036,7 @@ test "distributed txn scoped participant recovery survives LSM reopen without re
     var resolver: RecoveryResolver = .{ .alloc = alloc, .worker = .{ .ptr = &recorder, .vtable = &.{ .begin_group = Recorder.begin, .prepare_group = Recorder.prepare, .resolve_group = Recorder.resolve, .status_group = Recorder.status } }, .lease_owned = true };
     var reopened = try db_mod.DB.open(alloc, path, .{ .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false });
     defer reopened.close();
-    const stats = try reopened.runTransactionRecoveryOnce(resolver.config());
+    const stats = try @import("../storage/server_transaction_recovery.zig").runDbRecoveryOnce(&reopened, resolver.serverConfig());
     try std.testing.expectEqual(@as(usize, 1), recorder.calls);
     try std.testing.expectEqual(@as(u64, 1), stats.notification_successes);
     try std.testing.expectError(error.TxnNotFound, reopened.getTransactionStatus(txn_id));
@@ -3174,6 +3163,8 @@ fn parseTxnWrites(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.typ
         for (out[0..initialized]) |write| {
             alloc.free(@constCast(write.key));
             alloc.free(@constCast(write.value));
+            for (write.json_null_fields) |field| alloc.free(field);
+            if (write.json_null_fields.len != 0) alloc.free(write.json_null_fields);
         }
         if (out.len > 0) alloc.free(out);
     }
@@ -3186,9 +3177,24 @@ fn parseTxnWrites(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.typ
         errdefer alloc.free(key);
         const raw_value = obj.get("value") orelse return error.InvalidTxnRequest;
         const encoded_value = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(raw_value, .{})});
+        errdefer alloc.free(encoded_value);
+        var fields: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer fields.deinit(alloc);
+        if (obj.get("json_null_fields")) |names| {
+            if (names != .array or names.array.items.len > 256 or raw_value != .object) return error.InvalidTxnRequest;
+            for (names.array.items) |name| {
+                if (name != .string or name.string.len == 0) return error.InvalidTxnRequest;
+                const cell = raw_value.object.get(name.string) orelse return error.InvalidTxnRequest;
+                if (cell != .null) return error.InvalidTxnRequest;
+                for (fields.items) |prior| if (std.mem.eql(u8, prior, name.string)) return error.InvalidTxnRequest;
+                try fields.append(alloc, name.string);
+            }
+        }
+        const owned_fields = try db_mod.types.cloneJsonNullFields(alloc, fields.items);
         out[i] = .{
             .key = key,
             .value = encoded_value,
+            .json_null_fields = owned_fields,
         };
         initialized += 1;
     }
@@ -3199,6 +3205,8 @@ fn freeTxnWrites(alloc: std.mem.Allocator, writes: []const db_mod.types.Transact
     for (writes) |write| {
         alloc.free(@constCast(write.key));
         alloc.free(@constCast(write.value));
+        for (write.json_null_fields) |field| alloc.free(field);
+        if (write.json_null_fields.len != 0) alloc.free(write.json_null_fields);
     }
     if (writes.len > 0) alloc.free(@constCast(writes));
 }
@@ -3351,10 +3359,12 @@ fn parseTxnPredicates(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod
             _ = std.fmt.hexToBytes(&digest, encoded.string) catch return error.InvalidTxnRequest;
             content_digest = digest;
         }
+        const unique_absence = if (obj.get("unique_absence")) |flag| if (flag == .bool and (expected_version == 0 or !flag.bool)) flag.bool else return error.InvalidTxnRequest else false;
         out[i] = .{
             .key = try alloc.dupe(u8, requireString(obj, "key")),
             .expected_version = expected_version,
             .expected_content_digest = content_digest,
+            .unique_absence = unique_absence,
         };
         initialized += 1;
     }
@@ -3906,7 +3916,7 @@ fn implementationTests() type {
             });
             try db.resolveTransactionIntents(txn_id, .committed, 2_000);
 
-            const stats = try db.runTransactionRecoveryOnce(resolver.config());
+            const stats = try @import("../storage/server_transaction_recovery.zig").runDbRecoveryOnce(&db, resolver.serverConfig());
             try std.testing.expect(stats.notification_attempts > 0);
             try std.testing.expect(stats.notification_successes > 0);
             try std.testing.expectEqual(@as(usize, 1), recorder.calls);
@@ -3963,7 +3973,7 @@ fn implementationTests() type {
                 .writes = &.{.{ .key = "doc:fresh-pending", .value = "{\"title\":\"value\"}" }},
             });
 
-            const stats = try db.runTransactionRecoveryOnce(resolver.config());
+            const stats = try @import("../storage/server_transaction_recovery.zig").runDbRecoveryOnce(&db, resolver.serverConfig());
             try std.testing.expectEqual(@as(u64, 0), stats.notification_attempts);
             try std.testing.expectEqual(@as(u64, 0), stats.auto_aborted);
             try std.testing.expectEqual(@as(usize, 0), recorder.calls);
@@ -4104,7 +4114,7 @@ fn consumerTests() type {
         test "transaction attempt budgets follow the borrowed transport clock" {
             var vopr_io = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 7 * std.time.ns_per_s });
             defer vopr_io.deinit();
-            const borrow = @import("../runtime_io_abi.zig").Borrow.init(&vopr_io.io());
+            const borrow = @import("antfly_runtime_abi").io_abi.Borrow.init(&vopr_io.io());
             const worker = HostedParticipantWorker{
                 .catalog = undefined,
                 .router = undefined,
@@ -6946,4 +6956,30 @@ fn consumerTests() type {
 }
 comptime {
     if (@import("builtin").is_test) _ = consumer_tests;
+}
+
+test "distributed txn prepare JSON null and insert preconditions survive allocation failures" {
+    const Harness = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            const encoded = try encodeTxnPrepareRequest(alloc, .{ .txn_id = @splat(1), .req = .{ .writes = &.{.{ .key = "row", .value = "{\"j\":null}", .json_null_fields = &.{"j"} }}, .predicates = &.{.{ .key = "row", .expected_version = 0, .unique_absence = true }} } });
+            defer alloc.free(encoded);
+            var parsed = try parseTxnPrepareRequest(alloc, encoded);
+            defer freeTxnPrepareRequest(alloc, &parsed);
+            try std.testing.expectEqualStrings("j", parsed.req.writes[0].json_null_fields[0]);
+            try std.testing.expect(parsed.req.predicates[0].unique_absence);
+            const prefix = "[\"row-semantics-prepare-v1\",";
+            try std.testing.expect(std.mem.startsWith(u8, encoded, prefix));
+            // Released decoders accept only an object (or the known range
+            // marker); they reject this new envelope before parsing writes.
+            var legacy = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+            defer legacy.deinit();
+            try std.testing.expect(legacy.value == .array);
+            if (parseTxnPrepareRequest(alloc, encoded[prefix.len .. encoded.len - 1])) |value| {
+                var unexpected = value;
+                freeTxnPrepareRequest(alloc, &unexpected);
+                return error.TestExpectedError;
+            } else |err| if (err != error.InvalidTxnRequest) return err;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }

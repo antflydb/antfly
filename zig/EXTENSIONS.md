@@ -27,7 +27,7 @@ existed, the closest Antfly equivalents were split across:
 - shard-local durable index, enrichment, and resolver catalogs in
   `zig/pkg/antfly/src/storage/db/catalog/index_manager.zig`
 - provider registries in `zig/pkg/antfly/src/common/provider_registry.zig`
-- embedded DB lifecycle APIs in `zig/pkg/antfly/src/embedded/db.zig`
+- embedded DB lifecycle APIs in `zig/pkg/antfly-embedded/src/engine/db.zig`
 
 That gave Antfly many extension-like object types but not a single extension
 catalog or lifecycle. The extension catalog below sits on top of those

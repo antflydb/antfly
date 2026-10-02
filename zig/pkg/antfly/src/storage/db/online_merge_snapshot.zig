@@ -16,6 +16,8 @@
 //! positions are committed with receiver row receipts; no primary scan or live
 //! recapture is permitted. A replica-local cache only avoids repeated decoding
 //! of the same oversized row and is never authoritative progress.
+const server_test_adapter = if (builtin.is_test) @import("../server_db_adapter.zig") else struct {};
+const builtin = @import("builtin");
 const std = @import("std");
 const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
 const source = @import("online_source.zig");
@@ -137,7 +139,7 @@ fn number(comptime T: type, reader: *verifier.ObjectReader, object: u32, offset:
 pub fn executeJson(db: *DB, alloc: Allocator, scope: source.Scope, receipt: pages.Progress, certificate: Certificate, cancellation: types.CancellationToken) ![]u8 {
     try @import("online_merge_io.zig").requireSnapshotIndexes(db, alloc, receipt.source, certificate);
     const io = db.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
-    const shared = &db.online_merge_reader;
+    const shared = &db.local_execution.online_merge_reader;
     try shared.mutex.lock(io);
     defer shared.mutex.unlock(io);
     const progress = try db.onlineSourceStatus(scope);
@@ -478,8 +480,8 @@ fn testVectorReceiver(active_vectors: bool, full_sync: bool, transfer_proof: boo
     try donor.updateRange(.{ .start = "a", .end = "m" });
     try receiver.updateRange(.{ .start = "m", .end = "z" });
     const raw = "{\"v\":[1,2],\"s\":{\"indices\":[1,3],\"values\":[2,4]},\"_embeddings\":{\"retired\":[7,8]}}";
-    try donor.batchRaftReplicatedApply(.{ .writes = &.{ .{ .key = "a", .value = raw }, .{ .key = "b", .value = raw } }, .sync_level = .full_index }, .{ .term = 1, .index = 1 });
-    try receiver.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "n", .value = raw }}, .sync_level = .full_index }, .{ .term = 1, .index = 1 });
+    try server_test_adapter.applyOrdered(&donor, .{ .writes = &.{ .{ .key = "a", .value = raw }, .{ .key = "b", .value = raw } }, .sync_level = .full_index }, .{ .term = 1, .index = 1 });
+    try server_test_adapter.applyOrdered(&receiver, .{ .writes = &.{.{ .key = "n", .value = raw }}, .sync_level = .full_index }, .{ .term = 1, .index = 1 });
     if (active_vectors) try expectSparseSourceHits(&donor, "initial", 2);
     const keys = @import("../internal_keys.zig");
     const codec = @import("enrichment/artifact_codec.zig");
@@ -553,19 +555,19 @@ fn testVectorReceiver(active_vectors: bool, full_sync: bool, transfer_proof: boo
     }
     const identity = try donor.relationalTopologyIdentity();
     const scope: source.Scope = .{ .fence = .{ .role = .merge_source, .transition_id = 77, .attempt = 1, .admission_epoch = identity.next_epoch, .peer_group_id = 3, .owner_group_id = 2, .namespace = identity.namespace, .catalog_digest = identity.catalog_digest }, .receiver_namespace = receiver_options.identity_namespace.?, .consumer_epoch = 1, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } };
-    try donor.batchRaftReplicatedApply(.{ .artifact_catalog = donor_catalog, .online_source = .{ .admit = .{ .scope = scope, .artifact_catalog = donor_catalog.binding } } }, .{ .term = 1, .index = 2 });
+    try server_test_adapter.applyOrdered(&donor, .{ .artifact_catalog = donor_catalog, .online_source = .{ .admit = .{ .scope = scope, .artifact_catalog = donor_catalog.binding } } }, .{ .term = 1, .index = 2 });
     const certificate = try donor.prepareOnlineSourcePublication(scope, .none);
     if (late_authority == .before_publication) {
         var namespace: @import("artifact_publication.zig").Namespace = undefined;
         @import("doc_identity.zig").encodeNamespace(&namespace, donor_options.identity_namespace.?);
         try activateTestAuthority(&donor, namespace, donor_catalog.binding.digest);
-        try std.testing.expectError(error.OnlineMergeProvenanceTransferRequired, donor.batchRaftReplicatedApply(.{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = certificate } } }, .{ .term = 1, .index = 3 }));
+        try std.testing.expectError(error.OnlineMergeProvenanceTransferRequired, server_test_adapter.applyOrdered(&donor, .{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = certificate } } }, .{ .term = 1, .index = 3 }));
         try std.testing.expectEqual(source.SnapshotPhase.pinned, (try donor.onlineSourceStatus(scope)).snapshot_phase);
         return;
     }
-    try donor.batchRaftReplicatedApply(.{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = certificate } } }, .{ .term = 1, .index = 3 });
-    try donor.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "a", .value = "{\"v\":[3,4],\"s\":{\"indices\":[1],\"values\":[9]},\"_embeddings\":{\"retired\":[9,10]}}" }}, .sync_level = .full_index }, .{ .term = 1, .index = 4 });
-    try donor.batchRaftReplicatedApply(.{ .deletes = &.{"b"}, .sync_level = .full_index }, .{ .term = 1, .index = 5 });
+    try server_test_adapter.applyOrdered(&donor, .{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = certificate } } }, .{ .term = 1, .index = 3 });
+    try server_test_adapter.applyOrdered(&donor, .{ .writes = &.{.{ .key = "a", .value = "{\"v\":[3,4],\"s\":{\"indices\":[1],\"values\":[9]},\"_embeddings\":{\"retired\":[9,10]}}" }}, .sync_level = .full_index }, .{ .term = 1, .index = 4 });
+    try server_test_adapter.applyOrdered(&donor, .{ .deletes = &.{"b"}, .sync_level = .full_index }, .{ .term = 1, .index = 5 });
     if (active_vectors) try expectSparseSourceHits(&donor, "updated", 1);
     const retained_head = head: {
         const status_raw = try online_io.executeJson(&donor, alloc, .{ .scope = scope, .operation = .{ .status = .donor } }, .none);
@@ -574,29 +576,29 @@ fn testVectorReceiver(active_vectors: bool, full_sync: bool, transfer_proof: boo
         defer status.deinit();
         break :head status.value.retained_head;
     };
-    try donor.batchRaftReplicatedApply(.{ .relational_topology = .{ .fence = scope.fence, .action = .begin } }, .{ .term = 1, .index = 6 });
+    try server_test_adapter.applyOrdered(&donor, .{ .relational_topology = .{ .fence = scope.fence, .action = .begin } }, .{ .term = 1, .index = 6 });
     if (late_authority == .before_fence) {
         var namespace: @import("artifact_publication.zig").Namespace = undefined;
         @import("doc_identity.zig").encodeNamespace(&namespace, donor_options.identity_namespace.?);
         try activateTestAuthority(&donor, namespace, donor_catalog.binding.digest);
-        try std.testing.expectError(error.OnlineMergeProvenanceTransferRequired, donor.batchRaftReplicatedApply(.{ .online_source = .{ .final_fence = .{ .scope = scope, .expected_sequence = retained_head } } }, .{ .term = 1, .index = 7 }));
+        try std.testing.expectError(error.OnlineMergeProvenanceTransferRequired, server_test_adapter.applyOrdered(&donor, .{ .online_source = .{ .final_fence = .{ .scope = scope, .expected_sequence = retained_head } } }, .{ .term = 1, .index = 7 }));
         try std.testing.expectEqual(source.Phase.retaining, (try donor.onlineSourceStatus(scope)).phase);
         return;
     }
-    try donor.batchRaftReplicatedApply(.{ .online_source = .{ .final_fence = .{ .scope = scope, .expected_sequence = retained_head } } }, .{ .term = 1, .index = 7 });
+    try server_test_adapter.applyOrdered(&donor, .{ .online_source = .{ .final_fence = .{ .scope = scope, .expected_sequence = retained_head } } }, .{ .term = 1, .index = 7 });
     const source_identity: pages.Source = .{ .namespace = identity.namespace, .pin_digest = try certificate.digest(), .applied_index = certificate.cut.applied_index, .retention = .{ .epoch = 1, .after_sequence = certificate.cut.retained_start }, .artifact_catalog = donor_catalog.binding, .provenance_required = certificate.provenance_required };
     var checkpoint: types.MergeReplicationCheckpoint = .{ .kind = .accept, .transition_id = 77, .donor_group_id = 2, .receiver_group_id = 3, .receiver_base_start = "m", .receiver_base_end = "z", .merged_start = "a", .merged_end = "z", .page_receiver_namespace = scope.receiver_namespace, .page_source = source_identity };
     const context: types.MergeReplicationContext = .{ .transition_id = 77, .donor_group_id = 2, .receiver_group_id = 3, .identity_namespace = scope.receiver_namespace, .copy_attempt = scope.copy_attempt };
     var accept_context = context;
     accept_context.copy_attempt = .{};
     const accept: types.BatchRequest = .{ .artifact_catalog = receiver_catalog, .merge_replication = accept_context, .merge_checkpoint = checkpoint };
-    try receiver.batchRaftReplicatedApply(accept, .{ .term = 1, .index = 2 });
+    try server_test_adapter.applyOrdered(&receiver, accept, .{ .term = 1, .index = 2 });
     receiver.close();
     receiver = try DB.open(alloc, receiver_path, receiver_options);
-    try receiver.batchRaftReplicatedApply(accept, .{ .term = 1, .index = 2 });
+    try server_test_adapter.applyOrdered(&receiver, accept, .{ .term = 1, .index = 2 });
     checkpoint.kind = .begin_copy;
     checkpoint.copy_attempt = scope.copy_attempt;
-    try receiver.batchRaftReplicatedApply(.{ .merge_replication = context, .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 3 });
+    try server_test_adapter.applyOrdered(&receiver, .{ .merge_replication = context, .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 3 });
     var index: u64 = 4;
     var restarted = false;
     var chunk_restarted = false;
@@ -630,7 +632,7 @@ fn testVectorReceiver(active_vectors: bool, full_sync: bool, transfer_proof: boo
         request.sync_level = if (full_sync) .full_index else .write;
         if (transfer_proof and request.merge_page.?.tail != null and request.merge_page.?.tail.? == .finish) {
             try std.testing.expect((proof_pages != 0) == selected_proof);
-            try std.testing.expectError(error.OnlineMergeProvenanceAdoptionRequired, receiver.batchRaftReplicatedApply(request, .{ .term = 1, .index = index }));
+            try std.testing.expectError(error.OnlineMergeProvenanceAdoptionRequired, server_test_adapter.applyOrdered(&receiver, request, .{ .term = 1, .index = index }));
             var namespace: @import("artifact_publication.zig").Namespace = undefined;
             @import("doc_identity.zig").encodeNamespace(&namespace, donor_options.identity_namespace.?);
             const proof_key = @import("source_proof_batch.zig").mergeKey(namespace, source_identity.pin_digest, @splat(5));
@@ -656,7 +658,7 @@ fn testVectorReceiver(active_vectors: bool, full_sync: bool, transfer_proof: boo
             try std.testing.expectError(error.NotFound, receiver.core.store.get(alloc, @import("artifact_publication.zig").authority_key));
             return;
         }
-        try receiver.batchRaftReplicatedApply(request, .{ .term = 1, .index = index });
+        try server_test_adapter.applyOrdered(&receiver, request, .{ .term = 1, .index = index });
         const page = request.merge_page.?;
         if (page.provenance_effects.len != 0 or (if (page.chunk) |chunk| chunk.payload == .provenance and chunk.complete() else false)) proof_pages += 1;
         if (page.artifact_effects.len != 0 or (if (page.chunk) |chunk| chunk.payload == .artifact and chunk.complete() else false)) {
@@ -695,7 +697,7 @@ fn testVectorReceiver(active_vectors: bool, full_sync: bool, transfer_proof: boo
         }
         // The reply was lost; exact replay after restart must not recopy or
         // advance a receipt twice, including artifact-only pages.
-        try receiver.batchRaftReplicatedApply(request, .{ .term = 1, .index = index });
+        try server_test_adapter.applyOrdered(&receiver, request, .{ .term = 1, .index = index });
         index += 1;
         if (!checked_replay_without_catalog and request.merge_page.?.artifact_effects.len != 0) {
             // A delayed retry must retire its new Raft position without
@@ -709,7 +711,7 @@ fn testVectorReceiver(active_vectors: bool, full_sync: bool, transfer_proof: boo
             const inventory = try receiver.core.store.get(alloc, inventory_key);
             defer alloc.free(inventory);
             try receiver.core.store.delete(inventory_key);
-            const replay = receiver.batchRaftReplicatedApply(request, .{ .term = 1, .index = index });
+            const replay = server_test_adapter.applyOrdered(&receiver, request, .{ .term = 1, .index = index });
             try receiver.core.store.put(inventory_key, inventory);
             try replay;
             const replay_revision = try receiver.core.store.get(alloc, &revision_key);
@@ -726,10 +728,10 @@ fn testVectorReceiver(active_vectors: bool, full_sync: bool, transfer_proof: boo
     checkpoint.page_source = null;
     checkpoint.page_receiver_namespace = null;
     checkpoint.bootstrap_applied_index = final_applied_index;
-    try receiver.batchRaftReplicatedApply(.{ .merge_replication = context, .merge_checkpoint = checkpoint }, .{ .term = 1, .index = index });
+    try server_test_adapter.applyOrdered(&receiver, .{ .merge_replication = context, .merge_checkpoint = checkpoint }, .{ .term = 1, .index = index });
     index += 1;
     checkpoint.kind = .finalize;
-    try receiver.batchRaftReplicatedApply(.{ .merge_replication = context, .merge_checkpoint = checkpoint }, .{ .term = 1, .index = index });
+    try server_test_adapter.applyOrdered(&receiver, .{ .merge_replication = context, .merge_checkpoint = checkpoint }, .{ .term = 1, .index = index });
     try std.testing.expectEqualStrings("a", receiver.getRange().start);
     try std.testing.expectEqualStrings("z", receiver.getRange().end);
     for ([_]struct { key: []const u8, digest: pages.Digest }{ .{ .key = large_key, .digest = large_digest }, .{ .key = wide_key, .digest = wide_digest } }) |expected| {
@@ -804,13 +806,13 @@ test "relational index system online snapshot locator resumes immutable rows and
             if (relational) try db.setSchemaJson(alloc,
                 \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"v":{"type":"string"}},"additionalProperties":false}}}}
             );
-            try db.batchRaftReplicatedApply(.{ .timestamp_ns = 111, .writes = &.{ .{ .key = "a", .value = large }, .{ .key = "b", .value = "{\"v\":\"second\"}" } } }, .{ .term = 1, .index = 1 });
+            try server_test_adapter.applyOrdered(&db, .{ .timestamp_ns = 111, .writes = &.{ .{ .key = "a", .value = large }, .{ .key = "b", .value = "{\"v\":\"second\"}" } } }, .{ .term = 1, .index = 1 });
             const identity = try db.relationalTopologyIdentity();
             scope = .{ .fence = .{ .role = .merge_source, .transition_id = 77, .attempt = 1, .admission_epoch = identity.next_epoch, .peer_group_id = 3, .owner_group_id = 2, .namespace = identity.namespace, .catalog_digest = identity.catalog_digest }, .receiver_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .consumer_epoch = 1, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } };
-            try db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 2 });
+            try server_test_adapter.applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 2 });
             certificate = try db.prepareOnlineSourcePublication(scope, .none);
-            try db.batchRaftReplicatedApply(.{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = certificate } } }, .{ .term = 1, .index = 3 });
-            try db.batchRaftReplicatedApply(.{ .timestamp_ns = 222, .writes = &.{.{ .key = "a", .value = "{\"v\":\"changed\"}" }} }, .{ .term = 1, .index = 4 });
+            try server_test_adapter.applyOrdered(&db, .{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = certificate } } }, .{ .term = 1, .index = 3 });
+            try server_test_adapter.applyOrdered(&db, .{ .timestamp_ns = 222, .writes = &.{.{ .key = "a", .value = "{\"v\":\"changed\"}" }} }, .{ .term = 1, .index = 4 });
         }
         var db = try DB.open(alloc, path, options);
         defer db.close();

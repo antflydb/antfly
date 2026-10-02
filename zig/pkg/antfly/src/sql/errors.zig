@@ -95,7 +95,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlStatementSnapshotRequired => .{ .code = "0A000", .message = "This query requires a consistent statement snapshot that is not available.", .hint = "Narrow the query to one bounded page or use a runtime with statement snapshots." },
         error.SqlRangeTrackingRequired => .{ .code = "0A000", .message = "This transaction requires activated, owner-fenced range protection.", .hint = "Use a runtime that supports the requested isolation level; isolation was not downgraded.", .retryable = false },
         error.InvalidSqlSyntax => .{ .code = "42601", .message = "The SQL statement has invalid syntax.", .hint = "Check the reported position and submit one supported statement." },
-        error.TableNotFound, error.NotFound, error.CatalogNotFound => .{ .code = "42P01", .message = "The requested catalog object does not exist.", .hint = "Check the database, namespace, and object name." },
+        error.UndefinedTable, error.TableNotFound, error.NotFound, error.CatalogNotFound => .{ .code = "42P01", .message = "The requested catalog object does not exist.", .hint = "Check the database, namespace, and object name." },
         error.CatalogAlreadyExists, error.TableAlreadyExists => .{ .code = "42P07", .message = "The requested catalog object already exists.", .retryable = false },
         error.DatabaseNotFound => .{ .code = "3D000", .message = "The requested database does not exist.", .retryable = false },
         error.NamespaceNotFound => .{ .code = "3F000", .message = "The requested schema does not exist.", .retryable = false },

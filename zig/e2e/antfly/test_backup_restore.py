@@ -1346,6 +1346,21 @@ class ThreeByThreeBackupCluster:
                 return False
         return True
 
+    def refresh_table_identity(self, table_name: str) -> bool:
+        # Restore publishes a fresh physical owner behind the logical name.
+        # Capture its authoritative public binding before topology convergence.
+        for base in self.data_api_urls:
+            try:
+                response = requests.get(f"{base}/tables/{table_name}", timeout=1.0)
+            except requests.RequestException:
+                continue
+            if response.status_code in (404, 503):
+                continue
+            response.raise_for_status()
+            self.table_ids[table_name] = int(response.json()["table_id"])
+            return True
+        return False
+
     def fully_replicated_topology(self, table_name: str) -> tuple[int, set[int]] | None:
         self.assert_processes_alive()
         expected_node_ids = set(range(4, 7))
@@ -2661,6 +2676,7 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
     assert restore["committed_table_count"] == 1
     assert restore["failed_table_count"] == 0
 
+    assert wait_until(lambda: cluster.refresh_table_identity(table_name), timeout_s=30)
     restored_topology = wait_until(
         lambda: cluster.fully_replicated_topology(table_name),
         timeout_s=90.0,
@@ -2989,6 +3005,9 @@ def test_three_by_three_mixed_relational_restore_survives_coordinator_and_owner_
         assert completed["result"]["committed_table_count"] == 2, completed
         assert completed["result"]["failed_table_count"] == 0, completed
         for table in tables:
+            assert wait_until(
+                lambda table=table: cluster.refresh_table_identity(table), timeout_s=30
+            )
             current = wait_until(
                 lambda table=table: cluster.fully_replicated_topology(table),
                 timeout_s=90,
@@ -3588,6 +3607,6 @@ def test_restore_missing_backup_returns_bad_request(backup_api):
                 "restore_mode": "fail_if_exists",
             },
         )
-        cluster_job = _wait_for_terminal_restore_job(backup_api, cluster_restore)
-        assert cluster_job["phase"] == "failed"
-        assert cluster_job["error"] == "InvalidRequest"
+        # Cluster restore also validates repository admission before creating a job.
+        assert cluster_restore.status_code == 400, cluster_restore.text
+        assert "error" in cluster_restore.json(), cluster_restore.text

@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const catalog = @import("catalog.zig");
+const catalog = @import("storage/catalog.zig");
 const host = @import("host.zig");
 const managed_host = @import("managed_host.zig");
 const metadata_mod = @import("../metadata/mod.zig");

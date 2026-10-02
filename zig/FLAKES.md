@@ -1,5 +1,210 @@
 # Zig runtime flakes
 
+## 2026-10-01: shared-module wiring and snapshot publication scheduling
+
+[Run 36961250636](https://github.com/antflydb/antfly/actions/runs/36961250636)
+failed both build-cache shards because serverless's transitive import graph
+included the Raft read observer. Serverless now imports only the provisioning
+contract it uses. GPU-enabled cache checks also exposed inference implementation
+imports in common archive wiring: inference-host code belongs to the inference
+owner and explicit implementation fixtures, while directory resolution is now
+independent of backend implementations. Backend-name parsing lives on the
+canonical `BackendType`. The cache audit reports the complete import path when
+a backend identity escapes its owner.
+
+The full unit gate exposed standalone roots missing shared runtime contracts,
+a deleted `hot_standby/primary_effect.zig` manifest import (the retained source
+is already covered as `db/primary_effect.zig`), obsolete catalog/recovery/HA test
+API calls, an outdated generated-client invocation, and Lite command consumers
+without their storage-owner provider archives. These roots now receive their
+explicit dependencies and providers. Shared runtime and query-cache tests run
+at their owning module boundaries rather than through unreachable cross-module
+filters; both remain in the aggregate unit and API gates.
+
+Local full-gate execution also reproduced a snapshot-publication fixture race:
+the test injected a publication failure after a Ready drain could already start
+compaction. The recorder now has separate snapshot-publication and ordinary
+persistence controls. The failure and publication hold are armed before the
+proposal, preserving durable write progress and the read-during-publication,
+retry, and compaction-fence assertions. The focused test passed 200/200
+fresh-process repetitions using `scripts/ci/zig_vopr_soak.py`'s process runner.
+
+The full storage gate also exposed stale fixture assumptions about generation
+proofs, native source clocks, key-scoped reads, topology fences, and initial
+catalog flushes. Fixtures now exercise the current authority contracts. Asset
+cleanup exposed a real batch-overlay defect: direct graph reconciliation read
+an old contender count after the same batch had retired its membership. Counts
+and membership now share the pending write/delete view, preserving the strict
+producer-absence proof. Enrichment callback contexts now retain the durable
+root incarnation required to checkpoint worker turns after reopen. Focused
+regressions exercise both graph deletion paths and reopened worker progress.
+Both graph callback regressions and the native clock/replay regression passed
+200/200 fresh-process repetitions with the same bounded process runner.
+
+Fresh review reproduced two additional failures after merging `origin/main`.
+The Lite status fixture opened `native.inspect` while its writer still held the
+store lock. It now checks the format version through the open handle's storage
+status, preserving the actual revision check without conflicting file locks.
+
+The entity-merge helper rewrote provenance edges as direct contributions, so
+producer replay recreated the merged-away target. Rewriting now discovers the
+edge's document owners through its membership range and transfers each
+producer's contender, manifest, count, and TTL lifetime in one primary mutation.
+Existing destination assertions win collisions. Resolver decisions are persisted
+through the existing curation artifact so unchanged-source re-resolution retains
+the survivor. The same commit carries source revisions, durable derived replay,
+native source-clock advancement, and the HA primary-effect outbox. This local
+administrative entry point rejects unpositioned Raft curation.
+
+Regressions cover reopen and unchanged-source re-resolution, producer deletion,
+shared ownership with a distinct topological source, collision precedence, TTL
+preservation, native authority advancement, and hosted-authority rejection.
+The three focused rewrite tests, all 16 graph TTL regressions, and all 35 Lite
+CLI tests pass in Debug with no leaks. The rewrite regressions passed 200/200 fresh processes (600 test executions)
+with zero skips, failures, or leaks using the same bounded process runner.
+An additional unfiltered DB-core run reached test 401 without reporting a
+failure before it was stopped; it is not a complete-suite qualification. Prior
+broad-suite measurements remain scoped to their original revision.
+
+A further review found that entity rewrite left acknowledged HA outboxes
+behind, synthesized document-asset replay keys for scoped unit/chunk sources,
+and drained graph replay before acquiring the primary publication fence.
+The rewrite now validates its selected graph's applied/target cut while holding
+publication and apply admission. It releases those fences before catch-up and
+rechecks after reacquiring them, so a racing primary mutation cannot leave the
+adjacency behind the primary rows being curated. Catch-up selects only that
+graph, including when index workers are disabled; it does not drain unrelated
+enrichment providers. Existing authority, restore, retirement, and hidden-child
+admission remain checked at the final primary cut.
+
+Scoped source replay uses the existing scope-aware artifact-key helper. Resolver
+curation updates parse and serialize each override object once, preserving
+unrelated decisions and escaped identities; allocation failures propagate.
+The rewrite clears only its acknowledged HA outbox after durability and authority
+checks, and retains the record on failed acknowledgement for recovery.
+
+The six rewrite regressions passed 200/200 fresh Debug processes (1,200 test
+executions), split across two local lanes using `scripts/ci/zig_vopr_soak.py`'s
+bounded process runner. There were no skipped tests, failures, leaks, or retries.
+The final binary also passed all 37 resolver runtime tests and 16 graph TTL
+regressions. The stale-adjacency test replaces a source while retaining its
+inbound target and proves that rewriting catches up only the selected graph.
+Scoped curation starts from a resolution produced through the production resolver
+seam and published through durable graph replay; unit and chunk variants both
+retain the survivor after replay and reopen. HA fixtures check both successful
+acknowledgement cleanup/reopen and retained outboxes after failed acknowledgement.
+
+The next fresh review identified two independent entity-rewrite deadlocks.
+Rewrite now acquires DB apply before graph publication, both initially and after
+catch-up, following the primary publisher lock hierarchy. Its regression probes
+that hierarchy at both admission points. After the local commit and HA append,
+the shared replication mutation lease is released before remote durability waits;
+the acknowledgement fixture must acquire exclusive seed-capture admission before
+it can complete, and still verifies acknowledged/failed outbox retirement.
+
+Multi-owner preparation retains one incrementally extended contender overlay.
+Bucket identities are owned independently of replaceable payloads. Each owner's
+reconciliation and parsed JSON use reclaimable scratch storage, while only final
+commit effects survive. TTL due-record membership uses indexed sets instead of
+repeated mutation scans. A 64-owner regression bounds overlay examinations by a
+linear function of owner count and verifies both rewritten adjacency and producer
+deletion. This establishes work growth, not a measured latency speedup.
+
+The C ABI Lite fixture also reads its format version through the open handle.
+It holds an exclusive data-file lock during that read, deterministically proving
+that status does not reopen the file as a competing external reader. The focused
+C ABI test, all 37 resolver runtime tests, and all 16 graph TTL tests pass in Debug
+with no leaks.
+
+The lock-order and HA acknowledgement regressions passed 200/200 fresh Debug
+processes (400 test executions), split across two local lanes using
+`scripts/ci/zig_vopr_soak.py`'s bounded process runner. There were no skips,
+failures, leaks, or retries. The deterministic 64-owner work-bound fixture is
+qualified separately; it is not included in that admission soak. The soak
+preceded the final resolver-only scratch-allocation cleanup, which does not
+change either admission fixture's exercised path.
+
+Aggregate test ownership is audited against the original selected union. The
+shared module gates own their contract tests; implementation gates receive
+explicit runtime dependencies and exclude only tests executed by another gate.
+Six ordered merge/split regressions belong to the server storage integration
+gate; the data-runtime selector no longer demands those absent declarations.
+The final audit retains all 19,046 named tests with zero repeated executions.
+Focused targets keep their original selections. Public API fixtures with local
+database mocks now declare standalone deployment explicitly, while the restore
+binding fixture authoritatively answers the no-policy publication probe.
+
+## 2026-10-01: full CI discovery drift and virtual HTTP teardown
+
+[Run 36903575966](https://github.com/antflydb/antfly/actions/runs/36903575966)
+failed physical storage compilation discovery after a fourth owner fixture was
+added. The bounded audit now names its three measured owner fixtures and four
+consumer fixtures explicitly. Missing and duplicate identities still fail;
+unrelated owner fixtures remain covered by their normal targets. Real build
+graph regressions prove that an unrelated, deliberately uncompilable owner
+fixture is excluded and that omitting either a required owner or consumer fails.
+The storage shard manifest also now imports `hot_standby/primary_effect.zig`
+and the Lite allocator/reclamation test sources added on main.
+
+The cancelled Zig job had already reported two deterministic API fixture
+failures. The authority fixture now exercises a partially configured dedicated
+authority, since absent dedicated fields intentionally inherit valid trusted
+principal credentials. The rewrite fixture supplies its mandatory generation
+handoff proof, including a nonzero owner retirement digest, while preserving
+the atomic admission, idempotency, and unchanged live-schema assertions.
+
+The same job timed out with a data-runtime test process still alive. Local
+Debug reproduction retained the active UNIQUE/FK three-owner history and a
+stack blocked in `Client.drainShutdown` during deferred `DataServer.deinit`.
+Admitted HTTP requests still needed virtual tasks to unwind, but teardown had
+stopped driving the scheduler. Composite shutdown now closes outbound read
+admission with the other owners. The history publishes every initialized
+node's stop, runs bounded scheduler cancellation/drain, checks that read-client
+leases are gone, and only then reclaims node state. This also runs on failure
+paths so a scenario failure can be reported instead of hidden by cleanup.
+
+Once teardown could report failures, local Debug execution also exposed a
+replicated merge stack overflow. A hardware watchpoint caught LSM open
+scratch writes overwriting a parked driver's context. The managed DB opener
+now selects `OpenOptions` before a single `DB.open`, instead of allocating a
+large DB-valued return slot for each policy branch. The original 8 MiB VOPR
+stack is retained, and the isolated merge regression passes.
+
+The embedded provisioned point-read path did not advertise authoritative
+read-index absence and still allowed a leader-loss stale fallback. The hosted
+UNIQUE/FK coordinator therefore exhausted placements on an uncertified 404
+following split cutover. Both physical and orchestration sources now expose
+the strict capability, admission preserves quorum failures, and direct
+`read_index` lookups cannot downgrade to stale. The history retains one physical
+ownership path and passes its merge/split/restart and constraint assertions.
+Apply-control shutdown also publishes its stop and wake separately from joining,
+so a borrowed scheduler can complete its uncancellable wait before reclamation.
+
+The store-report retry fixture now injects registration failures through the
+registration transport, rather than an unused snapshot-fetch seam. Its runner
+waits for the round's own completion and preserves unrelated runtime tasks
+between rounds. The focused retry regression passes.
+
+The full E2E binary build completed all 35 compilation steps at its 90-minute
+deadline and was cancelled before upload. Narrow ReleaseSafe CPU reservations
+now admit storage and inference concurrently under the existing 22 GiB budget,
+with margins above that run's rounded compiler MaxRSS. See
+[COMPILATION.md](COMPILATION.md#runtime-compilation-memory-reservations).
+These measurements identify admission serialization; they do not yet establish
+the fixed build's CI wall time.
+
+Validation: the full data-runtime target passed 53 implementation and 177
+consumer tests; the two reported API fixtures passed; all 461 hot-standby tests
+and the storage ownership audit passed; 19 build-discovery/shard tests and both
+memory-admission tests passed. The reproduced merge stack regression passed
+200/200 fresh-process repetitions using `scripts/ci/zig_vopr_soak.py`'s bounded
+process runner. The UNIQUE/FK merge/split/restart history also completed 200
+passing repetitions; one interrupted process-runner invocation was rerun before
+continuing the loop. Both soaks used the pre-merge revision; the full data-runtime
+target also passed after merging main. The mocked compilation rollover test now fixes its disk-free
+observation so a nearly full developer disk cannot alter its expected build
+sequence.
+
 ## 2026-09-29: metadata WAL barriers and uncertain promotion outcomes (#919)
 
 [Issue #919](https://github.com/antflydb/antfly/issues/919) records an Autograph

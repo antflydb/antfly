@@ -36,7 +36,7 @@ const query_mod = @import("search/query.zig");
 const distributed_stats_mod = @import("search/distributed_stats.zig");
 const platform_time = @import("antfly_platform").time;
 const resource_manager_mod = @import("storage/resource_manager.zig");
-const CancellationToken = @import("common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 const mapped_residency_cold: u8 = 0;
 const mapped_residency_resident: u8 = 1;

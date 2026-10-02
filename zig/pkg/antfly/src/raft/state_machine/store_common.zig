@@ -13,8 +13,8 @@
 // limitations.
 
 const std = @import("std");
-const fs_paths = @import("../../common/fs_paths.zig");
-const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
+const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const mod = @import("mod.zig");
 
 pub fn ApplyStore(comptime namespace: []const u8) type {
