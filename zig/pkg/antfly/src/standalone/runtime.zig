@@ -925,7 +925,10 @@ const LocalStandaloneMetadata = struct {
 
     fn beginCatalogMutationLocked(self: *LocalStandaloneMetadata) !CatalogMutation {
         if (self.lifecycle_store) |store| if (try store.standaloneRevision() != self.durable_revision) return error.TableLifecycleConflict;
-        if (self.catalog_durability_failed) return error.MetadataMutationOutcomeUnknown;
+        // A prior commit in this failed state is genuinely ambiguous (it may
+        // have landed before the outage). A brand-new proposal starting now
+        // never reaches the log, so its outcome is a known drop, not unknown.
+        if (self.catalog_durability_failed) return error.ProposalDropped;
         return .{ .previous_epoch = self.epoch };
     }
 
@@ -14346,6 +14349,9 @@ test "system catalog standalone imports main checkpoints and current logical see
                 } else try writeFileAtomically(alloc, runtime.ptr().io().?, path, input);
                 var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, runtime.ptr(), store, engine);
                 defer metadata.deinit();
+                // Every standalone engine now shares the same authoritative
+                // lifecycle journal, so init() atomically imports catalog rows
+                // for both .local and .lite, not .local only.
                 try std.testing.expect(metadata.catalog_rows_initialized);
                 const renamed = try metadata.statusSource().systemCatalog(alloc, .{}, .{ .mutate = .{ .mutation = if (from_main) .{ .action = .create, .kind = .database, .name = "warehouse" } else .{ .action = .rename, .kind = .database, .name = "analytics", .new_name = "warehouse" } } });
                 alloc.free(renamed);
@@ -14375,8 +14381,6 @@ test "system catalog standalone imports main checkpoints and current logical see
                     txn_open = false;
                     try durable.sync(true);
                 } else {
-                    // Native authority no longer reads or overwrites the old
-                    // JSON checkpoint after the atomic one-time import.
                     try writeFileAtomically(alloc, runtime.ptr().io().?, path, "{broken legacy checkpoint");
                 }
             }
@@ -14384,6 +14388,8 @@ test "system catalog standalone imports main checkpoints and current logical see
                 var lite: ?antfly.lite.backend.Handle = if (engine == .lite) try antfly.lite.backend.Handle.open(alloc, path, .{}) else null;
                 defer if (lite) |*handle| handle.deinit();
                 const store = if (lite) |*handle| try handle.runtimeStoreForNamespace("system/metadata") else null;
+                // Both engines are unaffected by the legacy-key corruption
+                // above; native authority owns the catalog exclusively.
                 var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, runtime.ptr(), store, engine);
                 defer metadata.deinit();
                 try std.testing.expect(metadata.system_catalog_state.?.index.find(.database, 0, "warehouse") != null);
