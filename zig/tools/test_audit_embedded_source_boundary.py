@@ -73,14 +73,19 @@ class EmbeddedBoundaryTest(unittest.TestCase):
             "standby_names",
             "fenced_primary",
             "raft_applied_entry_marker",
+            "HAMirrorUnavailable",
+            "primary_ha",
         ):
-            with (
-                self.subTest(token=token),
-                self.assertRaisesRegex(ValueError, "server replication policy"),
+            for path in (
+                "storage/db/replication_contract.zig",
+                "storage/db/commit_integration.zig",
+                "storage/db/db.zig",
             ):
-                check_replication_contract(
-                    "storage/db/replication_contract.zig", f"pub const {token} = 0;"
-                )
+                with (
+                    self.subTest(token=token, path=path),
+                    self.assertRaisesRegex(ValueError, "server replication policy"),
+                ):
+                    check_replication_contract(path, f"pub const {token} = 0;")
         check_replication_contract(
             "storage/hot_standby/db_commit.zig", "pub const sync_policy = 0;"
         )

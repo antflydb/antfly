@@ -6478,6 +6478,21 @@ test "committed owner apply never opens or closes storage under the raft apply l
             platform_sync.lockYielding(&self.raft_mutex);
             self.raft_mutex.unlock();
         }
+
+        fn applyCommitted(self: *@This(), owner_source: *Source, descriptor: descriptor_contract.Descriptor, batch: db_types.BatchRequest, index: u64) !void {
+            const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+            while (true) {
+                owner_source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(std.testing.allocator, 1, "docs", descriptor, batch, 1, index) catch |err| switch (err) {
+                    error.RaftApplyWriterUnavailable => {
+                        if (platform_time.monotonicNs() >= deadline) return error.TestOwnerDidNotAdmit;
+                        try self.io.sleep(.fromMilliseconds(1), .awake);
+                        continue;
+                    },
+                    else => return err,
+                };
+                return;
+            }
+        }
     };
     var gate = Gate{ .io = io };
     defer {
@@ -6501,28 +6516,39 @@ test "committed owner apply never opens or closes storage under the raft apply l
         .key = "doc:a",
         .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
     }} };
-    try std.testing.expectError(error.RaftApplyWriterUnavailable, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", first, first_batch, 1, 1));
-    try gate.cold_entered.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    // A bounded admission rejection need not enqueue an open: the registry
+    // itself may be busy. Force that history, then retry the same committed
+    // entry just as the progress driver does until the control worker enters.
+    {
+        Source.lock(&source.mutex);
+        defer source.mutex.unlock();
+        try std.testing.expectError(error.RaftApplyWriterUnavailable, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", first, first_batch, 1, 1));
+        try std.testing.expectEqual(@as(usize, 0), source.apply_control_pending.items.len);
+    }
+    const cold_deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!gate.cold_entered.isSet()) {
+        try std.testing.expectError(error.RaftApplyWriterUnavailable, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", first, first_batch, 1, 1));
+        if (platform_time.monotonicNs() >= cold_deadline) return error.TestColdOwnerDidNotQueue;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
     // The worker is held before physical open; a repeated committed apply
     // remains a bounded retry and cannot itself open the owner.
     try std.testing.expectError(error.RaftApplyWriterUnavailable, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", first, first_batch, 1, 1));
     gate.cold_release.set(io);
-    const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
-    while (true) {
-        source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", first, first_batch, 1, 1) catch |err| switch (err) {
-            error.RaftApplyWriterUnavailable => {
-                if (platform_time.monotonicNs() >= deadline) return error.TestColdOwnerDidNotOpen;
-                try io.sleep(.fromMilliseconds(1), .awake);
-                continue;
-            },
-            else => return err,
-        };
-        break;
-    }
+    try gate.applyCommitted(&source, first, first_batch, 1);
     // A different group's cold open can hold the owner registry while a
     // recovery callback awaits Raft progress. The already-admitted apply
     // lease must be releasable even in that exact lock order.
-    var warm_lease = try source.acquireApplyOnly(1, "docs", first);
+    const lease_deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    var warm_lease = while (true) {
+        const lease = source.acquireApplyOnly(1, "docs", first) catch |err| {
+            try std.testing.expect(err == error.RaftApplyWriterUnavailable);
+            if (platform_time.monotonicNs() >= lease_deadline) return error.TestWarmOwnerDidNotAdmit;
+            try io.sleep(.fromMilliseconds(1), .awake);
+            continue;
+        };
+        break lease;
+    };
     const Release = struct {
         lease: *Source.Lease,
         io: std.Io,
@@ -6571,22 +6597,22 @@ test "committed owner apply never opens or closes storage under the raft apply l
     }
     try apply.done.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } });
     try std.testing.expectEqual(@as(?anyerror, error.RaftApplyWriterUnavailable), apply.failure);
-    try gate.close_entered.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    // Retirement admission is also a retry, not proof that this attempt
+    // queued the descriptor. Keep Raft's mutex held while advancing the exact
+    // entry; physical close still belongs to the independent control worker.
+    const close_deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!gate.close_entered.isSet()) {
+        try std.testing.expectError(error.RaftApplyWriterUnavailable, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", second, second_batch, 1, 2));
+        if (platform_time.monotonicNs() >= close_deadline) return error.TestRetiredOwnerDidNotQueue;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
     gate.raft_mutex.unlock();
     raft_mutex_held = false;
     gate.close_release.set(io);
-    while (true) {
-        source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", second, second_batch, 1, 2) catch |err| switch (err) {
-            error.RaftApplyWriterUnavailable => {
-                if (platform_time.monotonicNs() >= deadline +| 5 * std.time.ns_per_s) return error.TestRetiredOwnerDidNotReopen;
-                try io.sleep(.fromMilliseconds(1), .awake);
-                continue;
-            },
-            else => return err,
-        };
-        break;
-    }
-    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", second, second_batch, 1, 2);
+    try gate.applyCommitted(&source, second, second_batch, 2);
+    // Idempotency uses the same admission contract: the successful apply wakes
+    // release reconciliation, which can briefly contend with this retry.
+    try gate.applyCommitted(&source, second, second_batch, 2);
     var lease = try source.acquireDescriptorOnce(1, "docs", path, second, .shared, .resident, .{ .historical_raft_apply = true });
     defer lease.deinit();
     var value = try lease.owner().lookupJson("docs", "{\"key\":\"doc:a\",\"include_all_fields\":true}");

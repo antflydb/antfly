@@ -943,7 +943,7 @@ pub const AntflyApiHandler = struct {
         try server.use(httpx.Middleware.bind("antfly-internal-service-auth", self, enforceInternalServiceAuth));
         try server.use(httpx.Middleware.bind("antfly-auth-before-encoded-body", self, authorizeBeforeEncodedBody));
         try server.use(httpx.Middleware.bind("antfly-request-content-encoding", self, decodeRequestContent));
-        try server.use(httpx.Middleware.bind("antfly-ha-mutation-policy", self, enforceHaMutationPolicy));
+        try server.use(httpx.Middleware.bind("antfly-ha-mutation-policy", self, enforceHotStandbyMutationPolicy));
     }
 
     /// Authenticate and authorize compressed requests before spending CPU or
@@ -1103,7 +1103,7 @@ pub const AntflyApiHandler = struct {
     /// compatibility dispatcher or individual business handlers. The
     /// classifier consumes canonical application paths, so generated
     /// `/db/v1` routes and root contextual routes share one inventory.
-    fn enforceHaMutationPolicy(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
+    fn enforceHotStandbyMutationPolicy(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
         if (try self.hotStandbyMutationRejection(ctx)) |response| return response;
         return next.call(ctx);
     }
@@ -1195,7 +1195,7 @@ pub const AntflyApiHandler = struct {
         const policy = self.api_server.hotStandbyMutationPolicy();
         if (!policy.failover_safe_mutations_only) return null;
         const path = http_server_mod.stripApiPrefix(ctx.request.uri.path);
-        const mutation = classifyHaMutation(ctx.request.method, path) orelse return null;
+        const mutation = classifyHotStandbyMutation(ctx.request.method, path) orelse return null;
         // Backup and table restore are adapters over the same durable cohort
         // and staging authority; handlers reject uncertified historical cuts.
         if ((mutation.surface == .cluster_restore or mutation.surface == .restore_job or mutation.surface == .table_restore or mutation.surface == .backup) and
@@ -1217,7 +1217,7 @@ pub const AntflyApiHandler = struct {
         });
     }
 
-    fn classifyHaMutation(method: httpx.Method, path: []const u8) ?hot_standby_mutation_inventory.Classification {
+    fn classifyHotStandbyMutation(method: httpx.Method, path: []const u8) ?hot_standby_mutation_inventory.Classification {
         const inventory_method: http_common.Method = switch (method) {
             .GET, .HEAD, .OPTIONS => return null,
             .POST => .POST,
@@ -10287,19 +10287,19 @@ test "internal transaction ingress establishes and validates pre-decision deadli
 }
 
 test "HA mutation middleware fails closed for unregistered HTTP methods" {
-    try std.testing.expect(AntflyApiHandler.classifyHaMutation(.GET, "/tables/docs") == null);
-    try std.testing.expect(AntflyApiHandler.classifyHaMutation(.HEAD, "/tables/docs") == null);
-    try std.testing.expect(AntflyApiHandler.classifyHaMutation(.OPTIONS, "/tables/docs") == null);
+    try std.testing.expect(AntflyApiHandler.classifyHotStandbyMutation(.GET, "/tables/docs") == null);
+    try std.testing.expect(AntflyApiHandler.classifyHotStandbyMutation(.HEAD, "/tables/docs") == null);
+    try std.testing.expect(AntflyApiHandler.classifyHotStandbyMutation(.OPTIONS, "/tables/docs") == null);
 
-    const global_query = AntflyApiHandler.classifyHaMutation(.POST, routes.global_query).?;
+    const global_query = AntflyApiHandler.classifyHotStandbyMutation(.POST, routes.global_query).?;
     try std.testing.expectEqual(hot_standby_mutation_inventory.Surface.read_like_post, global_query.surface);
     try std.testing.expectEqual(hot_standby_mutation_inventory.Disposition.read_only, global_query.disposition);
 
-    const unknown_query_suffix = AntflyApiHandler.classifyHaMutation(.POST, "/query/future-action").?;
+    const unknown_query_suffix = AntflyApiHandler.classifyHotStandbyMutation(.POST, "/query/future-action").?;
     try std.testing.expectEqual(hot_standby_mutation_inventory.Surface.unclassified_non_get, unknown_query_suffix.surface);
     try std.testing.expectEqual(hot_standby_mutation_inventory.Disposition.reject, unknown_query_suffix.disposition);
 
-    const patch = AntflyApiHandler.classifyHaMutation(.PATCH, "/tables/docs").?;
+    const patch = AntflyApiHandler.classifyHotStandbyMutation(.PATCH, "/tables/docs").?;
     try std.testing.expectEqual(hot_standby_mutation_inventory.Surface.unclassified_non_get, patch.surface);
     try std.testing.expectEqual(hot_standby_mutation_inventory.Disposition.reject, patch.disposition);
 }

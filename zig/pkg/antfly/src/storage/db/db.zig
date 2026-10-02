@@ -34550,7 +34550,7 @@ pub const DB = struct {
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
         if (self.local_execution.replication_async_batch_mirror != null and self.local_execution.replication_async_effect_mirror == null)
-            return error.HAMirrorUnavailable;
+            return error.ReplicationPublisherUnavailable;
         try self.executor.failIfUnhealthy();
         var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
         defer snapshot_mutation.release();
@@ -34654,9 +34654,9 @@ pub const DB = struct {
         }
         try appendArtifactSourceRevisionWritesFromReplay(self.alloc, replay, sequence, &writes, &revision_keys, &revision_values);
         var context = self.batchContext();
-        var primary_ha = try PrimaryReplicationEffect.prepare(&context, writes.items, mutation.deletes.items, replay);
-        defer primary_ha.deinit(self.alloc);
-        try primary_ha.stage(&context, &writes);
+        var primary_replication = try PrimaryReplicationEffect.prepare(&context, writes.items, mutation.deletes.items, replay);
+        defer primary_replication.deinit(self.alloc);
+        try primary_replication.stage(&context, &writes);
         var backlog = try self.executor.admitBacklogBytes(@intCast(replay.len));
         defer backlog.cancel();
         try policy.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
@@ -34666,7 +34666,7 @@ pub const DB = struct {
         graph_publication.release();
         var gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(&context));
         defer gates.releaseTransition();
-        gates.append(try primary_ha.appendLocked(&context));
+        gates.append(try primary_replication.appendLocked(&context));
         self.core.unlockApply();
         apply_held = false;
         snapshot_mutation.release();
@@ -34676,7 +34676,7 @@ pub const DB = struct {
         gates.releaseTransition();
         releaseReplicationMutationShared(&replication_mutation);
         try gates.waitForDurabilityAndAuthority(context.replication_write_gate);
-        try primary_ha.clear(&context);
+        try primary_replication.clear(&context);
         return mutation.rewritten;
     }
 
@@ -63162,9 +63162,9 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
     }
     const replay_payload = try encodeChangeRecordPayload(ctx, derived_batch, sequence);
     defer ctx.alloc.free(replay_payload);
-    var primary_ha = try PrimaryReplicationEffect.prepare(ctx, store_writes.items, delete_keys.items, replay_payload);
-    defer primary_ha.deinit(ctx.alloc);
-    try primary_ha.stage(ctx, &store_writes);
+    var primary_replication = try PrimaryReplicationEffect.prepare(ctx, store_writes.items, delete_keys.items, replay_payload);
+    defer primary_replication.deinit(ctx.alloc);
+    try primary_replication.stage(ctx, &store_writes);
     var backlog_admission = try ctx.executor.admitBacklogBytes(@intCast(replay_payload.len));
     defer backlog_admission.cancel();
     try ctx.store.putBatchWithReplay(ctx.io, store_writes.items, delete_keys.items, .{
@@ -63179,7 +63179,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
     }
     var deferred_replication_gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(ctx));
     defer deferred_replication_gates.releaseTransition();
-    deferred_replication_gates.append(try primary_ha.appendLocked(ctx));
+    deferred_replication_gates.append(try primary_replication.appendLocked(ctx));
     ctx.apply_mutex.unlockExclusive();
     apply_mutex_held = false;
     if (snapshot_mutation) |*lease| lease.release();
@@ -63187,7 +63187,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
     DB.notifyQueryVisibilityTargetAdvancedScopedContext(ctx, sequence, sync_targets);
     releaseReplicationMutationShared(&replication_mutation);
     try deferred_replication_gates.waitForDurabilityAndAuthority(ctx.replication_write_gate);
-    try primary_ha.clear(ctx);
+    try primary_replication.clear(ctx);
     try markPrecomputedEnrichmentAppliedForSyncContext(ctx, sync_level, sequence);
     try applyDerivedBacklogPressureContext(ctx, sequence, sync_level, sync_targets);
     if (ctx.executor.hasWorkers()) {
@@ -63519,11 +63519,11 @@ fn expireDirectGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: 
     derived_batch.sequence = sequence;
     const replay_payload = try encodeChangeRecordPayload(ctx, derived_batch, sequence);
     defer ctx.alloc.free(replay_payload);
-    var primary_ha = try PrimaryReplicationEffect.prepare(ctx, &.{}, &.{ candidate.artifact_key, due_key }, replay_payload);
-    defer primary_ha.deinit(ctx.alloc);
+    var primary_replication = try PrimaryReplicationEffect.prepare(ctx, &.{}, &.{ candidate.artifact_key, due_key }, replay_payload);
+    defer primary_replication.deinit(ctx.alloc);
     var primary_writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty;
     defer primary_writes.deinit(ctx.alloc);
-    try primary_ha.stage(ctx, &primary_writes);
+    try primary_replication.stage(ctx, &primary_writes);
     var backlog_admission = try ctx.executor.admitBacklogBytes(@intCast(replay_payload.len));
     defer backlog_admission.cancel();
     var guard = GraphDirectTtlCommitGuard{
@@ -63556,7 +63556,7 @@ fn expireDirectGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: 
     ctx.executor.commitBacklogAdmission(sequence, &backlog_admission);
     var deferred_replication_gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(ctx));
     defer deferred_replication_gates.releaseTransition();
-    deferred_replication_gates.append(try primary_ha.appendLocked(ctx));
+    deferred_replication_gates.append(try primary_replication.appendLocked(ctx));
     ctx.apply_mutex.unlockExclusive();
     apply_mutex_held = false;
     if (snapshot_mutation) |*lease| lease.release();
@@ -63564,7 +63564,7 @@ fn expireDirectGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: 
     DB.notifyQueryVisibilityTargetAdvancedScopedContext(ctx, sequence, sync_targets);
     releaseReplicationMutationShared(&replication_mutation);
     try deferred_replication_gates.waitForDurabilityAndAuthority(ctx.replication_write_gate);
-    try primary_ha.clear(ctx);
+    try primary_replication.clear(ctx);
     try applyDerivedBacklogPressureContext(ctx, sequence, .full_index, sync_targets);
     if (ctx.executor.hasWorkers()) {
         notifyExecutorForSyncLevelWithDenseBulkDeferral(ctx.async_context, ctx.executor, .full_index, sequence, sync_targets);
@@ -63757,12 +63757,12 @@ fn expireGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: GraphT
     derived_batch.sequence = sequence;
     const replay_payload = try encodeChangeRecordPayload(ctx, derived_batch, sequence);
     defer ctx.alloc.free(replay_payload);
-    var primary_ha = try PrimaryReplicationEffect.prepareGraphRetirement(ctx, .{ .candidate = candidate, .source_digest = source_digest }, replay_payload);
-    defer primary_ha.deinit(ctx.alloc);
+    var primary_replication = try PrimaryReplicationEffect.prepareGraphRetirement(ctx, .{ .candidate = candidate, .source_digest = source_digest }, replay_payload);
+    defer primary_replication.deinit(ctx.alloc);
     var primary_writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty;
     defer primary_writes.deinit(ctx.alloc);
     try primary_writes.appendSlice(ctx.alloc, mutation.writes.items);
-    try primary_ha.stage(ctx, &primary_writes);
+    try primary_replication.stage(ctx, &primary_writes);
     var backlog_admission = try ctx.executor.admitBacklogBytes(@intCast(replay_payload.len));
     defer backlog_admission.cancel();
     _ = ctx.store.putBatchWithPromotionsReplayAndBuiltWrite(
@@ -63785,7 +63785,7 @@ fn expireGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: GraphT
     ctx.executor.commitBacklogAdmission(sequence, &backlog_admission);
     var deferred_replication_gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(ctx));
     defer deferred_replication_gates.releaseTransition();
-    deferred_replication_gates.append(try primary_ha.appendLocked(ctx));
+    deferred_replication_gates.append(try primary_replication.appendLocked(ctx));
     ctx.apply_mutex.unlockExclusive();
     apply_mutex_held = false;
     if (snapshot_mutation) |*lease| lease.release();
@@ -63793,7 +63793,7 @@ fn expireGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: GraphT
     DB.notifyQueryVisibilityTargetAdvancedScopedContext(ctx, sequence, sync_targets);
     releaseReplicationMutationShared(&replication_mutation);
     try deferred_replication_gates.waitForDurabilityAndAuthority(ctx.replication_write_gate);
-    try primary_ha.clear(ctx);
+    try primary_replication.clear(ctx);
     try applyDerivedBacklogPressureContext(ctx, sequence, .full_index, sync_targets);
     if (ctx.executor.hasWorkers()) {
         notifyExecutorForSyncLevelWithDenseBulkDeferral(ctx.async_context, ctx.executor, .full_index, sequence, sync_targets);
@@ -96197,7 +96197,7 @@ test "db rewriteEntityEdges retains scoped source replay and curation" {
     }
 }
 
-test "db rewriteEntityEdges clears acknowledged HA outbox and retains failed acknowledgement" {
+test "db rewriteEntityEdges clears acknowledged replication outbox and retains failed acknowledgement" {
     const alloc = std.testing.allocator;
     const contract = @import("replication_contract.zig");
     const FakePublisher = struct {
@@ -96225,7 +96225,7 @@ test "db rewriteEntityEdges clears acknowledged HA outbox and retains failed ack
             const self: *@This() = @ptrCast(@alignCast(mirror.publisher.ptr));
             // A replacement seed must freeze the local commit/tail pair
             // before remote recovery can acknowledge this mutation.
-            var capture = self.barrier.tryAcquireExclusive() orelse return error.HASeedCaptureBlockedByRemoteDurabilityWait;
+            var capture = self.barrier.tryAcquireExclusive() orelse return error.CheckpointCaptureBlockedByCompletionWait;
             capture.release();
             if (self.fail) return error.TestAcknowledgementFailed;
         }
@@ -96242,6 +96242,20 @@ test "db rewriteEntityEdges clears acknowledged HA outbox and retains failed ack
         try db.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "doc:a", .target = "old", .edge_type = "links" }}, .sync_level = .full_index });
         var barrier: MutationBarrier = .{};
         var publisher: FakePublisher = .{ .fail = fail, .barrier = &barrier };
+        // A coarse batch publisher cannot represent the exact artifact and
+        // producer-ownership changes. Reject before mutating or publishing.
+        db.local_execution.replication_async_batch_mirror = .{ .publisher = publisher.publisher() };
+        try std.testing.expectError(error.ReplicationPublisherUnavailable, db.rewriteEntityEdges(alloc, "g", "old", "survivor"));
+        try std.testing.expectEqual(@as(usize, 0), publisher.published);
+        {
+            const unchanged = try db.getEdges(alloc, "g", "old", "links", .in);
+            defer graph_mod.GraphIndex.freeEdges(alloc, unchanged);
+            try std.testing.expectEqual(@as(usize, 1), unchanged.len);
+            var pending = try durable_outbox_store.readPending(alloc, db.core.store);
+            defer pending.deinit(alloc);
+            try std.testing.expect(pending.isEmpty());
+        }
+        db.local_execution.replication_async_batch_mirror = null;
         db.local_execution.replication_async_effect_mirror = .{ .publisher = publisher.publisher(), .mutation_barrier = &barrier };
         if (fail) try std.testing.expectError(error.TestAcknowledgementFailed, db.rewriteEntityEdges(alloc, "g", "old", "survivor")) else try std.testing.expectEqual(@as(usize, 1), try db.rewriteEntityEdges(alloc, "g", "old", "survivor"));
         try std.testing.expectEqual(@as(usize, 1), publisher.published);

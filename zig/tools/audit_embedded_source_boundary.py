@@ -259,6 +259,8 @@ def check_replication_contract(relative: str, source: str) -> None:
         "FencedWriteGate",
         "RaftAppliedEntryIdentity",
         "raft_applied_entry_marker",
+        "HAMirrorUnavailable",
+        "primary_ha",
     }
     found = forbidden.intersection(re.findall(r"\b\w+\b", source))
     if found:

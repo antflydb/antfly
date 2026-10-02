@@ -79,7 +79,18 @@ background-work permission, lock release during waits, final admission rechecks,
 and unchanged durable receipt encodings. Physical package moves and relicensing
 belong to the dependent PRs.
 
+New local mutation paths must use the same admission and publication ports.
+For example, entity-edge rewrite retains its local mutation/replay/outbox
+ordering and checkpoint barrier while using generic publication errors and
+completion hooks. The audit rejects legacy hot-standby publisher names in the
+local owner, so incoming server changes cannot silently restore that coupling.
+
 `unit-storage-test-audit` checks explicit test ownership before storage unit
 compilation. An adapter that acquires tests must be registered in
 `storage/test_manifest.zig`, even when focused tests already reach it through
 another import. The inventory and disjoint shard checks remain required.
+
+The focused storage gate validates caller filters against the combined local
+and server test inventories before dispatching to either owner. A filter may
+select just one owner; unknown filters still fail. The server's aggregate
+slice remains independent of filters intended for the local root.

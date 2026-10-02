@@ -35247,9 +35247,9 @@ fn consumerTests() type {
         }
 
         test "data server keeps upstream replication availability failures nonfatal" {
-            try std.testing.expect(isHAStandbyUpstreamTransportError(error.UnexpectedEof));
-            try std.testing.expect(isNonFatalHAStandbyReplicationError(error.UnexpectedEof));
-            try std.testing.expectEqual(HAStandbyReplicationErrorCode.InvalidResponse, haStandbyReplicationErrorCode(error.UnexpectedEof));
+            try std.testing.expect(isHotStandbyStandbyUpstreamTransportError(error.UnexpectedEof));
+            try std.testing.expect(isNonFatalHotStandbyStandbyReplicationError(error.UnexpectedEof));
+            try std.testing.expectEqual(HAStandbyReplicationErrorCode.InvalidResponse, hotStandbyStandbyReplicationErrorCode(error.UnexpectedEof));
             inline for (.{
                 error.HttpConnectionClosing,
                 error.ConnectionResetByPeer,
