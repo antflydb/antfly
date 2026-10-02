@@ -52081,12 +52081,23 @@ fn encodeThinReplayRecordPayload(
     for (req.writes, 0..) |write, i| {
         if (!derived_changed_flags[i]) continue;
         const extracted_write = extracted[i];
-        if (extracted_write.hasDocument() or include_generated_enrichment_hint) {
+        // PR #957 review, blocker 8: a write with no content (an
+        // `_edges`-only document is one shape; an `_embeddings`-only write
+        // is another) can never match a generated enrichment request --
+        // those are declared against document FIELDS, and a content-less
+        // write has none to chunk or embed. Gating this whole block on
+        // hasDocument() (rather than waking the enrichment worker for
+        // every write whenever any generated-enrichment target exists)
+        // keeps that content-less write's key out of changed_doc_keys
+        // entirely. Recording it there would otherwise put the #938 fix
+        // right back where it started: full-text/algebraic replay also
+        // consumes this list, and once this batch's OTHER writes give the
+        // record a full_text hint, it would wait forever for a primary row
+        // this key will never have.
+        if (extracted_write.hasDocument()) {
             try appendUniqueReplayRecordKeyWithSet(alloc, &changed_doc_keys, &changed_doc_key_set, write.key);
-            if (extracted_write.hasDocument()) {
-                try appendUniqueReplayRecordHint(alloc, &target_hints, .full_text);
-                try appendUniqueReplayRecordHint(alloc, &target_hints, .algebraic);
-            }
+            try appendUniqueReplayRecordHint(alloc, &target_hints, .full_text);
+            try appendUniqueReplayRecordHint(alloc, &target_hints, .algebraic);
             if (include_generated_enrichment_hint) {
                 try appendUniqueReplayRecordHint(alloc, &target_hints, .enrichment);
             }
@@ -117774,6 +117785,57 @@ test "db encodeThinReplayRecordPayload keeps an edges-only sibling out of a full
     try std.testing.expectEqualStrings("node:b", decoded.record.changed_doc_keys[0]);
 }
 
+// PR #957 review, blocker 8: `include_generated_enrichment_hint` is a
+// whole-table flag (true whenever ANY index has a generated-enrichment
+// target), not scoped to writes that could actually match one. It used to
+// put every write's key into changed_doc_keys whenever that flag was set,
+// regardless of hasDocument() -- reopening exactly the #938 gap for a
+// table with a configured generated enrichment.
+test "db encodeThinReplayRecordPayload keeps an edges-only sibling out of a full-text-hinted record even with a generated enrichment target configured" {
+    const alloc = std.testing.allocator;
+
+    const req = types.BatchRequest{
+        .writes = &.{
+            .{ .key = "node:a", .value = "{\"_edges\":{\"graph\":{\"KNOWS\":[{\"target\":\"node:b\"}]}}}" },
+            .{ .key = "node:b", .value = "{\"name\":\"b\"}" },
+        },
+    };
+
+    var extracted_a = try mapper.extractWrite(alloc, req.writes[0].key, req.writes[0].value);
+    defer extracted_a.deinit(alloc);
+    var extracted_b = try mapper.extractWrite(alloc, req.writes[1].key, req.writes[1].value);
+    defer extracted_b.deinit(alloc);
+
+    const payload = try encodeThinReplayRecordPayload(
+        alloc,
+        req,
+        &.{ extracted_a, extracted_b },
+        &.{},
+        &.{},
+        &.{ false, false },
+        &.{ true, true },
+        51,
+        true, // include_generated_enrichment_hint: a generated-enrichment target exists somewhere on the table.
+        null,
+        null,
+    );
+    defer alloc.free(payload);
+
+    var decoded = try change_journal_mod.decodeRecord(alloc, payload);
+    defer decoded.deinit();
+
+    // Reviewer's reproduction: cloning the unflagged test above with
+    // include_generated_enrichment_hint=true previously yielded 2 keys
+    // (node:a leaked in) instead of 1. node:a has no field content a
+    // generated enrichment could ever match, so it must stay out of
+    // changed_doc_keys regardless of this flag.
+    try std.testing.expect(journalRecordHasHint(decoded.record, .full_text));
+    try std.testing.expect(journalRecordHasHint(decoded.record, .graph));
+    try std.testing.expect(journalRecordHasHint(decoded.record, .enrichment));
+    try std.testing.expectEqual(@as(usize, 1), decoded.record.changed_doc_keys.len);
+    try std.testing.expectEqualStrings("node:b", decoded.record.changed_doc_keys[0]);
+}
+
 test "db run_until_idle does not hang on a document whose only content is graph edges" {
     const alloc = std.testing.allocator;
 
@@ -117808,6 +117870,52 @@ test "db run_until_idle does not hang on a document whose only content is graph 
     const b_value = (try db.get(alloc, "node:b")).?;
     defer alloc.free(b_value);
     try std.testing.expect(std.mem.indexOf(u8, b_value, "\"b\"") != null);
+}
+
+test "db run_until_idle does not hang on an edges-only row when a generated enrichment is configured" {
+    const alloc = std.testing.allocator;
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{ .dense_embedder = deterministic.interface() },
+    });
+    defer db.close();
+
+    try db.addIndex(.{ .name = "graph", .kind = .graph, .config_json = "{}" });
+    try db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
+    try db.addIndex(.{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"embedding","dims":3,"generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"semantic"}}
+        ,
+    });
+    try std.testing.expect(db.core.index_manager.hasGeneratedEnrichmentTargets());
+
+    // PR #957 review, blocker 8: with a generated enrichment configured
+    // anywhere on the table, include_generated_enrichment_hint used to put
+    // node:a's key into changed_doc_keys too, regardless of hasDocument()
+    // -- node:b's "body" field giving the record both a full_text hint and
+    // an enrichment hint reopened exactly the #938 hang, this time behind a
+    // configured generated enrichment instead of a plain mixed batch.
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "node:b", .value = "{\"body\":\"hello\"}" },
+            .{ .key = "node:a", .value = "{\"_edges\":{\"graph\":{\"KNOWS\":[{\"target\":\"node:b\"}]}}}" },
+        },
+    });
+
+    try db.runUntilIdle();
+
+    try std.testing.expectEqual(@as(?[]u8, null), try db.get(alloc, "node:a"));
+    const b_value = (try db.get(alloc, "node:b")).?;
+    defer alloc.free(b_value);
+    try std.testing.expect(std.mem.indexOf(u8, b_value, "hello") != null);
 }
 
 test "collectTextDocumentWritesForIndex tolerates a missing document only when told to give up" {
