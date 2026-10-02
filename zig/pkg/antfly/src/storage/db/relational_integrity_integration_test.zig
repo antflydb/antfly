@@ -2408,8 +2408,8 @@ fn verifyMergeReplicationReplay(primary: *@import("../hot_standby/primary.zig").
     while (lsn <= primary.lastLsn()) : (lsn += 1) {
         var entry = (try primary.log.entryAt(std.testing.allocator, lsn)) orelse return error.TestUnexpectedResult;
         defer entry.deinit(std.testing.allocator);
-        try replication_ingress.applyRecord(&standby, entry.record);
-        try replication_ingress.applyRecord(&standby, entry.record);
+        try replication_ingress.applyRecord(standby, entry.record);
+        try replication_ingress.applyRecord(standby, entry.record);
     }
     try std.testing.expect((try standby.relationalTopologyStatus()).fence == null);
     try std.testing.expectEqualStrings(if (rollback) "m" else "", standby.getRange().end);
