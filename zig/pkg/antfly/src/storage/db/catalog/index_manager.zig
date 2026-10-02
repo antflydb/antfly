@@ -18,8 +18,8 @@ const storage_build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const platform_clock = platform.clock;
 const Allocator = std.mem.Allocator;
-const fs_paths = @import("../../../common/fs_paths.zig");
-const CancellationToken = @import("../../../common/cancellation.zig").CancellationToken;
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const full_text_index_defaults = @import("../../../common/full_text_index_defaults.zig");
 const native_artifact_sink = @import("../../native_artifact_sink.zig");
 const native_backup = @import("../native_backup.zig");
@@ -5512,7 +5512,7 @@ pub const IndexManager = struct {
             const projection_ready = entry.index.projectionConfigReady();
 
             // Carry forward user-tunable runtime knobs (the durable regeneration
-            // in api/tables.zig preserves the same set) so a schema/template
+            // in api/local_tables.zig preserves the same set) so a schema/template
             // change does not silently reset planner/adaptive tuning in place.
             new_parsed.value.adaptive = cur.adaptive;
             new_parsed.value.pathfact_policy = cur.pathfact_policy;

@@ -19,7 +19,7 @@ const graph_segment_mod = @import("../graph_segment/mod.zig");
 const manifest_mod = @import("../manifest/mod.zig");
 const request_mod = @import("request.zig");
 const runtime_mod = @import("runtime.zig");
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const work_budget_mod = @import("../../graph/work_budget.zig");
 
 /// Retain distinct traversal identities, not visited adjacency. Streaming

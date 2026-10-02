@@ -220,13 +220,14 @@ pub const index_manager_vopr = @import("storage/index_manager_vopr.zig");
 pub const db_split_vopr = @import("storage/db_split_vopr.zig");
 
 test {
+    _ = @import("system_catalog/server_call.zig");
     _ = @import("vopr/index_maintenance.zig");
     _ = @import("cmd/serverless.zig");
     // Storage shard builds compile this authoritative discovery root and then
     // select disjoint test-name prefixes. Keep it unconditional in test mode:
     // an unimported test file must fail the pre-build audit, never disappear.
     _ = @import("storage/test_manifest.zig");
-    _ = @import("runtime_private_error_diagnostics.zig");
+    _ = @import("antfly_private_error_diagnostics");
 
     if (comptime build_options.standalone_runtime_focused_test) {
         _ = standalone;

@@ -19,20 +19,20 @@
 //   - Local inference (ONNX inference, binary embedding format)
 //   - OpenAI (also works with Ollama, vLLM, and any OpenAI-compatible API)
 
-pub const types = @import("types.zig");
-pub const bedrock = @import("bedrock.zig");
-pub const local = @import("local.zig");
-pub const openai = @import("openai.zig");
-pub const vertex = @import("vertex.zig");
+pub const types = @import("antfly_inference_types");
+pub const bedrock = @import("antfly_inference_bedrock");
+pub const local = @import("antfly_inference_local");
+pub const openai = @import("antfly_inference_openai");
+pub const vertex = @import("antfly_inference_vertex");
 pub const managed_embedder = @import("managed_embedder.zig");
-pub const execution_context = @import("execution_context.zig");
+pub const execution_context = @import("antfly_inference_execution_context");
 /// Compatibility namespace for callers compiled against the pre-unification
 /// module spelling. It aliases the canonical execution-control module.
 pub const request_context = execution_context;
-pub const list_models = @import("list_models.zig");
-pub const query_embedding_cache = @import("query_embedding_cache.zig");
-pub const work = @import("work.zig");
-pub const remote_capabilities = @import("remote_capabilities.zig");
+pub const list_models = @import("antfly_inference_list_models");
+pub const query_embedding_cache = @import("antfly_inference_query_embedding_cache");
+pub const work = @import("antfly_inference_work");
+pub const remote_capabilities = @import("antfly_inference_remote_capabilities");
 const credential_source_identity = @import("../common/credential_source_identity.zig");
 const google_auth = @import("antfly_google").auth;
 

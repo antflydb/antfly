@@ -20,7 +20,7 @@ const graph_query_mod = @import("../graph/query.zig");
 const graph_exec_mod = @import("db/query/graph_exec.zig");
 const query_api = @import("../api/query.zig");
 const query_contract = @import("../api/query_contract.zig");
-const distributed_graph = @import("../api/distributed_graph.zig");
+const local_graph = @import("../api/local_graph.zig");
 const platform_time = @import("antfly_platform").time;
 const distributed_stats_mod = @import("../search/distributed_stats.zig");
 const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
@@ -76,7 +76,7 @@ const tensorFragmentSlicesEqual = contract.tensorFragmentSlicesEqual;
 const validateAlgebraicPartialsAccessPaths = contract.validateAlgebraicPartialsAccessPaths;
 const validateAlgebraicProgramPartialsProof = contract.validateAlgebraicProgramPartialsProof;
 
-pub fn validateGraphHydrateResolvedDocFilterForDb(req: distributed_graph.GraphHydrateRequest, db: *db_mod.DB) !void {
+pub fn validateGraphHydrateResolvedDocFilterForDb(req: local_graph.GraphHydrateRequest, db: *db_mod.DB) !void {
     if (!graphHydrateRequestHasResolvedDocFilter(req)) return;
     const ctx = req.resolved_doc_filter_wire_context orelse return error.UnsupportedQueryRequest;
     if (!ctx.namespace.eql(db.core.identity_namespace)) return error.DocIdentityNamespaceMismatch;
@@ -88,10 +88,10 @@ pub fn executeStorageKernelGraphExpand(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
     table_name: []const u8,
-    req: distributed_graph.GraphExpandRequest,
-) !distributed_graph.GraphExpandResponse {
+    req: local_graph.GraphExpandRequest,
+) !local_graph.GraphExpandResponse {
     if (req.topology_epoch != 0) return error.InvalidArgument;
-    const expansions = try alloc.alloc(distributed_graph.GraphExpansion, req.frontier.len);
+    const expansions = try alloc.alloc(local_graph.GraphExpansion, req.frontier.len);
     var initialized: usize = 0;
     errdefer {
         for (expansions[0..initialized]) |*expansion| expansion.deinit(alloc);
@@ -100,14 +100,14 @@ pub fn executeStorageKernelGraphExpand(
     for (req.frontier, 0..) |item, i| {
         const frontier_key = try alloc.dupe(u8, item.key);
         errdefer alloc.free(frontier_key);
-        const search_req = try distributed_graph.frontierItemToSearchRequest(alloc, req, item);
-        defer distributed_graph.freeExpandSearchRequest(alloc, search_req);
+        const search_req = try local_graph.frontierItemToSearchRequest(alloc, req, item);
+        defer local_graph.freeExpandSearchRequest(alloc, search_req);
         var result = try db.search(alloc, search_req);
         defer result.deinit();
         var graph_result = if (result.graph_results.len > 0)
-            try distributed_graph.filterGraphSearchResult(alloc, table_name, result.graph_results[0], req.exclude_nodes, req.exclude_edges)
+            try local_graph.filterGraphSearchResult(alloc, table_name, result.graph_results[0], req.exclude_nodes, req.exclude_edges)
         else
-            try distributed_graph.emptyGraphSearchResult(alloc, req.name);
+            try local_graph.emptyGraphSearchResult(alloc, req.name);
         errdefer graph_result.deinit(alloc);
         for (graph_result.hits) |*hit| hit.deinit(alloc);
         if (graph_result.hits.len > 0) alloc.free(graph_result.hits);
@@ -126,8 +126,8 @@ pub fn executeStorageKernelGraphExpand(
 pub fn executeStorageKernelGraphHydrate(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
-    req: distributed_graph.GraphHydrateRequest,
-) !distributed_graph.GraphHydrateResponse {
+    req: local_graph.GraphHydrateRequest,
+) !local_graph.GraphHydrateResponse {
     if (req.topology_epoch != 0) return error.InvalidArgument;
     try validateGraphHydrateResolvedDocFilterForDb(req, db);
     try validateGraphHydrateIncomingIndexIdentity(req, db);
@@ -154,7 +154,7 @@ pub fn executeStorageKernelGraphHydrate(
     var metric_status: []db_mod.types.GraphMetricStatus = @constCast((&[_]db_mod.types.GraphMetricStatus{})[0..]);
     errdefer db_mod.types.freeGraphMetricStatuses(alloc, metric_status);
     if (req.metric_reads.len > 0) {
-        try distributed_graph.validateGraphMetricReadsForDistributedTransport(req.metric_reads);
+        try local_graph.validateGraphMetricReadsForDistributedTransport(req.metric_reads);
         if (!req.metric_index_identity.valid()) return error.IndexGenerationMismatch;
         const identity = db.core.index_manager.coverageIdentityForIndex(req.metric_index_name) orelse
             return error.IndexGenerationMismatch;
@@ -210,16 +210,16 @@ pub fn executeStorageKernelGraphHydrate(
 pub fn executeStorageKernelGraphEdges(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
-    req: distributed_graph.GraphEdgesRequest,
-) !distributed_graph.GraphEdgesResponse {
+    req: local_graph.GraphEdgesRequest,
+) !local_graph.GraphEdgesResponse {
     if (req.topology_epoch != 0) return error.InvalidArgument;
     const control_req = db_mod.types.SearchRequest{
         .identity_read_generation = req.identity_read_generation,
-        .execution_deadline_ns = req.execution_deadline_ns orelse distributed_graph.executionDeadlineFromTimeoutMs(req.timeout_ms),
+        .execution_deadline_ns = req.execution_deadline_ns orelse local_graph.executionDeadlineFromTimeoutMs(req.timeout_ms),
         .cancellation = req.cancellation,
     };
     try checkQueryDeadline(control_req);
-    try distributed_graph.validateGraphEdgesTensorAccessPath(alloc, req);
+    try local_graph.validateGraphEdgesTensorAccessPath(alloc, req);
     const result = try db.graphEdgesForInternalReadBoundedAt(alloc, req.index_name, req.key, req.edge_types, req.direction, req.identity_read_generation, req.ttl_now_ns, req.max_edges, req.max_owned_bytes, req.max_scanned_rows);
     errdefer {
         graph_mod.GraphIndex.freeEdges(alloc, result.edges);
@@ -229,7 +229,7 @@ pub fn executeStorageKernelGraphEdges(
 }
 
 pub fn validateGraphHydrateIncomingIndexIdentity(
-    req: distributed_graph.GraphHydrateRequest,
+    req: local_graph.GraphHydrateRequest,
     db: *db_mod.DB,
 ) !void {
     if (req.incoming_index_name.len > 0) {

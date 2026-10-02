@@ -59,6 +59,7 @@ test "relational backup cohort topology HA split cutover preserves binary range 
 }
 
 fn testTopologyHAControls(comptime replicated: bool, comptime split: bool) !void {
+    const replication_ingress = @import("../storage/db/replication_ingress.zig");
     const std = @import("std");
     const db = @import("../storage/db/mod.zig");
     const ha = @import("../storage/hot_standby/primary.zig");
@@ -75,7 +76,7 @@ fn testTopologyHAControls(comptime replicated: bool, comptime split: bool) !void
     var runtime = try db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer runtime.deinit();
     const namespace: @import("../storage/db/doc_identity.zig").Namespace = .{ .table_id = 2, .shard_id = 3, .range_id = 4 };
-    var source = try db.DB.open(alloc, try std.fmt.allocPrint(a, "{s}/source", .{root}), .{ .backend_runtime = runtime.ptr(), .identity_namespace = namespace, .ha_async_batch_mirror = .{ .primary = &primary }, .ha_write_gate = .{ .primary = &primary }, .start_optional_runtimes = false, .start_index_workers = false });
+    var source = try db.DB.open(alloc, try std.fmt.allocPrint(a, "{s}/source", .{root}), .{ .backend_runtime = runtime.ptr(), .identity_namespace = namespace, .replication_async_batch_mirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary) }, .replication_write_gate = .{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .start_optional_runtimes = false, .start_index_workers = false });
     defer source.close();
     var target = try db.DB.open(alloc, try std.fmt.allocPrint(a, "{s}/target", .{root}), .{ .backend_runtime = runtime.ptr(), .identity_namespace = namespace, .start_optional_runtimes = false, .start_index_workers = false });
     defer target.close();
@@ -90,14 +91,14 @@ fn testTopologyHAControls(comptime replicated: bool, comptime split: bool) !void
     const fence: topology.Fence = .{ .transition_id = 81, .attempt = 1, .admission_epoch = identity.next_epoch, .owner_group_id = 31, .peer_group_id = if (replicated) 32 else 31, .role = if (split) .split_source else if (replicated) .merge_source else .backup_snapshot, .namespace = namespace, .catalog_digest = identity.catalog_digest };
     const begin_request: @import("../storage/db/types.zig").BatchRequest = .{ .relational_topology = .{ .fence = fence, .action = .begin } };
     if (replicated) {
-        try source.batchRaftReplicatedApply(begin_request, .{ .index = 1, .term = 1 });
+        try @import("../storage/server_db_adapter.zig").applyOrdered(&source, begin_request, .{ .index = 1, .term = 1 });
         const first_lsn = primary.lastLsn();
-        try source.batchRaftReplicatedApply(begin_request, .{ .index = 1, .term = 1 });
+        try @import("../storage/server_db_adapter.zig").applyOrdered(&source, begin_request, .{ .index = 1, .term = 1 });
         try std.testing.expectEqual(first_lsn, primary.lastLsn());
     } else try source.batch(begin_request);
     var begin = (try primary.log.entryAt(alloc, primary.lastLsn())).?;
     defer begin.deinit(alloc);
-    try target.applyHAReplicationRecord(begin.record);
+    try replication_ingress.applyRecord(&target, begin.record);
     try std.testing.expect((try target.relationalTopologyStatus()).fence.?.eql(fence));
     if (replicated) {
         const fresh = try target.beginTransaction(1);
@@ -109,15 +110,15 @@ fn testTopologyHAControls(comptime replicated: bool, comptime split: bool) !void
     else
         .{ .relational_topology = .{ .fence = fence, .action = if (replicated) .abort_transition else .release } };
     if (replicated) {
-        try source.batchRaftReplicatedApply(release_request, .{ .index = 2, .term = 1 });
+        try @import("../storage/server_db_adapter.zig").applyOrdered(&source, release_request, .{ .index = 2, .term = 1 });
         const final_lsn = primary.lastLsn();
-        try source.batchRaftReplicatedApply(release_request, .{ .index = 2, .term = 1 });
+        try @import("../storage/server_db_adapter.zig").applyOrdered(&source, release_request, .{ .index = 2, .term = 1 });
         try std.testing.expectEqual(final_lsn, primary.lastLsn());
     } else try source.batch(release_request);
     var release = (try primary.log.entryAt(alloc, primary.lastLsn())).?;
     defer release.deinit(alloc);
-    try target.applyHAReplicationRecord(release.record);
-    try target.applyHAReplicationRecord(release.record);
+    try replication_ingress.applyRecord(&target, release.record);
+    try replication_ingress.applyRecord(&target, release.record);
     try std.testing.expect((try target.relationalTopologyStatus()).fence == null);
     if (split) {
         try std.testing.expectEqualSlices(u8, "\x80", source.getRange().end);
@@ -129,3 +130,5 @@ fn testTopologyHAControls(comptime replicated: bool, comptime split: bool) !void
     }
     if (!replicated) try target.batch(.{ .writes = &.{.{ .key = "resumed", .value = "{}" }} });
 }
+const hot_standby_publisher_adapter = @import("../storage/hot_standby/db_commit.zig");
+const hot_standby_write_gate_adapter = @import("../storage/hot_standby/write_gate.zig");

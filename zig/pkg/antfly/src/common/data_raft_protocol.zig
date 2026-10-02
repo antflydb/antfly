@@ -37,7 +37,7 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// Version 14 includes typed direct-vector snapshot/tail payloads and their
 /// retained-transaction admission accounting. Ordered artifact merges require
 /// the complete decoder before admission, even for an empty first page.
-pub const batch_protocol_version: u16 = 18;
+pub const batch_protocol_version: u16 = 19;
 pub const batch_artifact_catalog_protocol_version: u16 = 14;
 /// Full producer publications require a separate all-member barrier; the
 /// direct-vector decoder proof does not authorize asynchronous effect writes.
@@ -66,3 +66,6 @@ pub const batch_source_scope_protocol_version: u16 = 12;
 
 /// Version 18 transfers durable relationship retirements during merges.
 pub const batch_merge_retirements_protocol_version: u16 = 18;
+
+/// Version 19 carries incarnation-fenced endpoint cleanup pages and versioned jobs.
+pub const batch_graph_cleanup_generation_protocol_version: u16 = 19;

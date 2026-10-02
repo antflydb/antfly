@@ -13,7 +13,7 @@
 // limitations.
 
 const Sink = @import("runtime_scan_sink.zig").ScanStreamSink;
-const errors = @import("runtime_error_abi.zig");
+const errors = @import("antfly_runtime_abi").error_abi;
 
 export fn scan_sink_test_consume(sink: *const Sink, bytes: [*]const u8, len: usize) callconv(.c) errors.Status {
     sink.start() catch |err| return errors.statusFromError(err);

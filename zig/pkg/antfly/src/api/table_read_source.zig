@@ -16,18 +16,18 @@
 //! Implementations stay in table_reads.zig.
 
 const std = @import("std");
-const read_gate = @import("../raft/read_gate.zig");
+const read_gate = @import("../storage/read_consistency.zig");
 const db_types = @import("../storage/db/types.zig");
 const runtime_preflight = @import("../storage/db/runtime_preflight.zig");
 const dynamic_field_capability = @import("../storage/db/dynamic_field_capability.zig");
 const background_text_stats = @import("../storage/db/background_text_stats.zig");
 const distributed_stats_mod = @import("../search/distributed_stats.zig");
 const query_api = @import("query_response.zig");
-const distributed_graph = @import("distributed_graph.zig");
+const distributed_graph = @import("local_graph.zig");
 const runtime_status = @import("runtime_status.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
-const metadata_api = @import("../metadata/api.zig");
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const metadata_api = @import("../metadata/catalog_route_contract.zig");
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 pub const LookupResponse = struct {
     json: []u8,
@@ -113,10 +113,15 @@ pub const ParsedTextStatsHttpResponse = union(enum) {
     }
 };
 /// Request-owned immutable topology plus a read adapter bound to that topology.
+pub const RoutingSessionHandle = opaque {};
+pub const IncomingGraphRouteCache = opaque {};
+
 pub const JoinReadView = struct {
-    session: @import("table_catalog.zig").RoutingSession,
+    /// Server-owned routing lease; only server adapters interpret this handle.
+    routing_session: ?*RoutingSessionHandle = null,
     source: TableReadSource,
     destroy: *const fn (*JoinReadView) void,
+
     pub fn deinit(self: *JoinReadView) void {
         self.destroy(self);
     }
@@ -247,7 +252,7 @@ pub const TableReadSource = struct {
         open_relational_read: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, []const u8, db_types.ScanOptions, read_gate.ReadConsistency) anyerror!?RelationalReadView = null,
         open_relational_read_group_local_routed: ?*const fn (*anyopaque, std.mem.Allocator, metadata_api.CatalogRouteFence, u64, []const u8, []const u8, []const u8, db_types.ScanOptions, read_gate.ReadConsistency) anyerror!?RelationalReadView = null,
         try_statement_read_fence_group_local_routed: ?*const fn (*anyopaque, std.mem.Allocator, metadata_api.CatalogRouteFence, u64, []const u8, db_types.ScanOptions, read_gate.ReadConsistency) anyerror!?StatementReadFence = null,
-        acquire_join_view: ?*const fn (*anyopaque, std.mem.Allocator, @import("table_router.zig").RouteBudget) anyerror!*JoinReadView = null,
+        acquire_join_view: ?*const fn (*anyopaque, std.mem.Allocator, @import("routing_budget.zig").RouteBudget) anyerror!*JoinReadView = null,
 
         lookup: *const fn (
             ptr: *anyopaque,
@@ -573,7 +578,7 @@ pub const TableReadSource = struct {
         document_artifact_manifests_group_local_routed: ?*const fn (*anyopaque, std.mem.Allocator, metadata_api.CatalogRouteFence, u64, []const u8, []const u8, read_gate.ReadConsistency) anyerror!?db_types.DocumentArtifactManifestList = null,
         bind_incoming_graph_routes: ?*const fn (
             ptr: *anyopaque,
-            cache: *distributed_graph.IncomingSourceGroupCache,
+            cache: *IncomingGraphRouteCache,
         ) void = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
@@ -610,7 +615,7 @@ pub const TableReadSource = struct {
         return BoundaryAbi.call("open_relational_read_group_local_routed", self.boundary_dispatch, open, .{ self.ptr, alloc, fence, group, table, from, to, opts, consistency });
     }
 
-    pub fn acquireJoinView(self: TableReadSource, alloc: std.mem.Allocator, budget: @import("table_router.zig").RouteBudget) !?*JoinReadView {
+    pub fn acquireJoinView(self: TableReadSource, alloc: std.mem.Allocator, budget: @import("routing_budget.zig").RouteBudget) !?*JoinReadView {
         const acquire = self.vtable.acquire_join_view orelse return null;
         return try BoundaryAbi.call("acquire_join_view", self.boundary_dispatch, acquire, .{ self.ptr, alloc, budget });
     }
@@ -1187,7 +1192,7 @@ pub const TableReadSource = struct {
 
     pub fn bindIncomingGraphRoutes(
         self: TableReadSource,
-        cache: *distributed_graph.IncomingSourceGroupCache,
+        cache: *IncomingGraphRouteCache,
     ) void {
         const bind = self.vtable.bind_incoming_graph_routes orelse return;
         bind(self.ptr, cache);
@@ -1348,7 +1353,7 @@ fn consumerTests() type {
                 },
             };
             fence.admission_deadline_ns = 999;
-            fence.admission_deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&std.testing.io);
+            fence.admission_deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io);
             fence.admission_cancellation = CancellationToken.fromAtomic(&wire_cancellation);
             const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, fence, .{});
             defer std.testing.allocator.free(encoded);

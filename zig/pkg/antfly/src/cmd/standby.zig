@@ -501,7 +501,7 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
             if (comptime control_only_storage_sources) {
                 const request_json = try std.json.Stringify.valueAlloc(alloc, request, .{});
                 defer alloc.free(request_json);
-                var response = try kernel_owner_client.haSeedActivate(request_json);
+                var response = try kernel_owner_client.hotStandbySeedActivate(request_json);
                 defer response.deinit();
                 try writeArtifactResult(io, response.bytes());
             } else {
@@ -563,7 +563,7 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
             if (comptime control_only_storage_sources) {
                 const request_json = try std.json.Stringify.valueAlloc(alloc, request, .{});
                 defer alloc.free(request_json);
-                var response = try kernel_owner_client.haSeedPruneActivatedGenerations(request_json);
+                var response = try kernel_owner_client.hotStandbySeedPruneActivatedGenerations(request_json);
                 defer response.deinit();
                 try writeArtifactResult(io, response.bytes());
             } else {

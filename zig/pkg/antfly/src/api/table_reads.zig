@@ -29,14 +29,14 @@ const metadata_api = @import("../metadata/api.zig");
 const metadata_mod = @import("../metadata/domain.zig");
 const metadata_reconciler = @import("../metadata/reconciler.zig");
 const common_secrets = @import("../common/secrets.zig");
-const threaded_io_limits = @import("../common/threaded_io_limits.zig");
+const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_table_provisioner = @import("../metadata/table_provisioner.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
-const remote_capabilities = @import("../inference/remote_capabilities.zig");
-const execution_context = @import("../inference/execution_context.zig");
-const inference_request_context = @import("../inference/execution_context.zig");
+const remote_capabilities = @import("antfly_inference_remote_capabilities");
+const execution_context = @import("antfly_inference_execution_context");
+const inference_request_context = @import("antfly_inference_execution_context");
 const raft_mod = @import("../raft/mod.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = if (control_only_storage_sources)
@@ -48,7 +48,7 @@ const doc_identity = if (control_only_storage_sources) struct {} else @import(".
 const db_embedder = if (control_only_storage_sources) struct {} else @import("../storage/db/enrichment/embedder.zig");
 const ha_public_gate_state = @import("../storage/hot_standby/public_gate_state.zig");
 const ha_read_gate_mod = @import("../storage/hot_standby/read_gate.zig");
-const ha_standby_mod = @import("../storage/hot_standby/standby.zig");
+const hot_standby_standby_mod = @import("../storage/hot_standby/standby.zig");
 const storage_schema = @import("../storage/schema.zig");
 const dynamic_field_capability = @import("../storage/db/dynamic_field_capability.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
@@ -81,7 +81,7 @@ const table_router = @import("table_router.zig");
 const tables_api = @import("tables.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
-const public_limits = @import("public_limits.zig");
+const public_limits = @import("antfly_public_limits");
 const distributed_graph = @import("distributed_graph.zig");
 const runtime_status = @import("runtime_status.zig");
 const table_read_source = @import("table_read_source.zig");
@@ -132,6 +132,7 @@ fn JoinReadBinding(comptime Source: type) type {
         view: @import("table_read_source.zig").JoinReadView,
         alloc: std.mem.Allocator,
         routed: Source,
+        session: table_catalog.RoutingSession,
         fn acquire(ptr: *anyopaque, alloc: std.mem.Allocator, budget: table_router.RouteBudget) !*@import("table_read_source.zig").JoinReadView {
             try budget.check();
             const source: *Source = @ptrCast(@alignCast(ptr));
@@ -139,20 +140,21 @@ fn JoinReadBinding(comptime Source: type) type {
             errdefer alloc.destroy(self);
             self.alloc = alloc;
             self.routed = source.*;
+            self.session = try table_catalog.RoutingSession.init(alloc, source.catalog, source.catalog.deadlineFrom(budget.clock));
             self.view = .{
-                .session = try table_catalog.RoutingSession.init(alloc, source.catalog, source.catalog.deadlineFrom(budget.clock)),
+                .routing_session = @ptrCast(&self.session),
                 .source = undefined,
                 .destroy = destroy,
             };
-            errdefer self.view.session.deinit();
+            errdefer self.session.deinit();
             try budget.check();
-            self.routed.catalog = self.view.session.catalog();
+            self.routed.catalog = self.session.catalog();
             self.view.source = self.routed.source();
             return &self.view;
         }
         fn destroy(view: *@import("table_read_source.zig").JoinReadView) void {
             const self: *@This() = @fieldParentPtr("view", view);
-            self.view.session.deinit();
+            self.session.deinit();
             self.alloc.destroy(self);
         }
     };
@@ -1541,7 +1543,7 @@ pub const GraphReadBarrier = struct {
 };
 
 pub const HAReadGate = union(enum) {
-    standby: *const ha_standby_mod.Standby,
+    standby: *const hot_standby_standby_mod.Standby,
     shared: *const ha_public_gate_state.State,
 
     pub fn check(self: HAReadGate, consistency: raft_mod.ReadConsistency) !void {
@@ -2619,7 +2621,7 @@ pub const BoundTableReadSource = struct {
         snapshots: []@import("../storage/statement_read_fence.zig").Snapshot,
         table: []u8,
         schema_version: u32,
-        cancellation: ?@import("../common/cancellation.zig").CancellationToken,
+        cancellation: ?@import("antfly_cancellation").CancellationToken,
         deadline_ns: ?u64,
         opened: usize = 0,
 
@@ -2686,7 +2688,7 @@ pub const BoundTableReadSource = struct {
         snapshot: db_mod.DB.RelationalStatementSnapshot,
         schema_version: u32,
         consistency: raft_mod.ReadConsistency,
-        cancellation: ?@import("../common/cancellation.zig").CancellationToken,
+        cancellation: ?@import("antfly_cancellation").CancellationToken,
         deadline_ns: ?u64,
         opened: usize = 0,
 
@@ -2723,7 +2725,7 @@ pub const BoundTableReadSource = struct {
         }
     };
 
-    fn openRelationalStatementSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, schema_version: u32, consistency: raft_mod.ReadConsistency, cancellation: ?@import("../common/cancellation.zig").CancellationToken, deadline_ns: ?u64) !@import("table_read_source.zig").RelationalStatementSnapshot {
+    fn openRelationalStatementSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, schema_version: u32, consistency: raft_mod.ReadConsistency, cancellation: ?@import("antfly_cancellation").CancellationToken, deadline_ns: ?u64) !@import("table_read_source.zig").RelationalStatementSnapshot {
         const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table)) return error.TableNotFound;
         if (consistency != .read_index) return error.SqlStatementSnapshotRequired;
@@ -3439,7 +3441,7 @@ pub const ProvisionedTableReadSource = struct {
 
     fn distributedInternalExecutor(self: *ProvisionedTableReadSource) http_common.RequestExecutor {
         std.debug.assert(self.distributed_executor != null);
-        return .{ .ptr = self, .clock_io = if (self.io_impl) |*owner| @import("../runtime_io_abi.zig").Borrow.init(&owner.backend) else self.distributed_executor.?.clock_io, .vtable = &.{ .execute = executeDistributedInternalRequest } };
+        return .{ .ptr = self, .clock_io = if (self.io_impl) |*owner| @import("antfly_runtime_abi").io_abi.Borrow.init(&owner.backend) else self.distributed_executor.?.clock_io, .vtable = &.{ .execute = executeDistributedInternalRequest } };
     }
 
     /// Reuse the production hosted-route implementation for public operations
@@ -3838,7 +3840,7 @@ pub const ProvisionedTableReadSource = struct {
         };
     }
 
-    fn openRelationalStatementSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, schema_version: u32, consistency: raft_mod.ReadConsistency, cancellation: ?@import("../common/cancellation.zig").CancellationToken, deadline_ns: ?u64) !@import("table_read_source.zig").RelationalStatementSnapshot {
+    fn openRelationalStatementSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, schema_version: u32, consistency: raft_mod.ReadConsistency, cancellation: ?@import("antfly_cancellation").CancellationToken, deadline_ns: ?u64) !@import("table_read_source.zig").RelationalStatementSnapshot {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
         if (self.local_read_source == null) return error.SqlStatementSnapshotRequired;
@@ -4149,9 +4151,9 @@ pub const ProvisionedTableReadSource = struct {
         };
     }
 
-    fn bindIncomingGraphRoutes(ptr: *anyopaque, cache: *distributed_graph.IncomingSourceGroupCache) void {
+    fn bindIncomingGraphRoutes(ptr: *anyopaque, cache: *@import("table_read_source.zig").IncomingGraphRouteCache) void {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        _ = self.withIncomingGraphRoutes(cache);
+        _ = self.withIncomingGraphRoutes(@ptrCast(@alignCast(cache)));
     }
 
     pub fn warmTableGroup(self: *ProvisionedTableReadSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8) !void {
@@ -6902,9 +6904,9 @@ pub const HostedProvisionedTableReadSource = struct {
         };
     }
 
-    fn bindIncomingGraphRoutes(ptr: *anyopaque, cache: *distributed_graph.IncomingSourceGroupCache) void {
+    fn bindIncomingGraphRoutes(ptr: *anyopaque, cache: *@import("table_read_source.zig").IncomingGraphRouteCache) void {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        _ = self.withIncomingGraphRoutes(cache);
+        _ = self.withIncomingGraphRoutes(@ptrCast(@alignCast(cache)));
     }
 
     fn lookup(
@@ -18553,7 +18555,7 @@ fn consumerTests() type {
             const catalog = table_catalog.CatalogSource{
                 .ptr = undefined,
                 .vtable = undefined,
-                .io = @import("../runtime_io_abi.zig").Borrow.init(&routing_io.io()),
+                .io = @import("antfly_runtime_abi").io_abi.Borrow.init(&routing_io.io()),
             };
             const native_deadline = platform_time.monotonicNs() + 5 * ns;
             const req = db_mod.types.SearchRequest{ .execution_deadline_ns = native_deadline };
@@ -18571,7 +18573,7 @@ fn consumerTests() type {
             defer request_io.deinit();
             const opts = db_mod.types.LookupOptions{
                 .execution_deadline_ns = 8 * ns,
-                .execution_io = @import("../runtime_io_abi.zig").Borrow.init(&request_io.io()),
+                .execution_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&request_io.io()),
             };
             try std.testing.expectEqual(routing_now + ns, lookupRoutingDeadline(catalog, opts).?);
             var fence = metadata_api.CatalogRouteFence{
@@ -21291,7 +21293,7 @@ fn consumerTests() type {
                     scores[1] = 0.9;
                     return scores;
                 }
-                fn capabilities(_: *anyopaque, _: std.mem.Allocator, _: []const u8, task: @import("../inference/work.zig").Task) anyerror!@import("../inference/work.zig").InferenceCapabilities {
+                fn capabilities(_: *anyopaque, _: std.mem.Allocator, _: []const u8, task: @import("antfly_inference_work").Task) anyerror!@import("antfly_inference_work").InferenceCapabilities {
                     return .{ .task = task, .input_modalities = .{ .text = true, .image = true }, .input_granularity = .item, .output = .ranked_items, .result_cardinality = .one_per_request };
                 }
             };
@@ -21895,7 +21897,7 @@ fn consumerTests() type {
             const progress_path = try alloc.dupeZ(u8, progress_path_raw);
             defer alloc.free(progress_path);
 
-            var standby = try ha_standby_mod.Standby.open(alloc, receive_path.ptr, progress_path.ptr, .{
+            var standby = try hot_standby_standby_mod.Standby.open(alloc, receive_path.ptr, progress_path.ptr, .{
                 .cluster_id = 100,
                 .shard_id = 10,
                 .table_id = 20,
@@ -32719,7 +32721,7 @@ fn implementationTests() type {
                     model: []const u8,
                     roles: []const []const u8,
                     contents: []const []const u8,
-                    _: @import("../inference/types.zig").GenerationOptions,
+                    _: @import("antfly_inference_types").GenerationOptions,
                 ) anyerror![]u8 {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.calls += 1;

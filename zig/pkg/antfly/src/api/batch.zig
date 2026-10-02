@@ -93,7 +93,7 @@ test "artifact publication upload control is private, bounded, and single purpos
 const db_mod = @import("../storage/db/selected_root.zig").db;
 const ant_json = @import("antfly-json");
 const document_mapper = @import("../storage/db/document_mapper.zig");
-const public_limits = @import("public_limits.zig");
+const public_limits = @import("antfly_public_limits");
 const merge_pages = @import("../storage/db/merge_page_contract.zig");
 const MergePageEffects = struct { writes: []db_mod.types.BatchWrite, deletes: [][]const u8 };
 
@@ -431,6 +431,7 @@ pub const OwnedBatchRequest = struct {
     transforms: []db_mod.types.DocumentTransform = &.{},
     graph_writes: []db_mod.types.GraphEdgeWrite = &.{},
     graph_deletes: []db_mod.types.GraphEdgeDelete = &.{},
+    graph_endpoint_cleanup_guards: ?std.json.Parsed([]const @import("../storage/graph_cleanup_contract.zig").Guard) = null,
     predicates: []db_mod.types.TransactionVersionPredicate = &.{},
     integrity: []const db_mod.types.TransactionIntegrityOperation = &.{},
     integrity_commands: ?std.json.Parsed([]const @import("../storage/db/relational_integrity_contract.zig").Command) = null,
@@ -465,6 +466,7 @@ pub const OwnedBatchRequest = struct {
     pub fn deinit(self: *OwnedBatchRequest, alloc: std.mem.Allocator) void {
         @import("relational_integrity_wire.zig").free(alloc, self.integrity);
         if (self.integrity_commands) |*commands| commands.deinit();
+        if (self.graph_endpoint_cleanup_guards) |*guards| guards.deinit();
         if (self.range_guards) |*guards| guards.deinit();
         if (self.relational_activation) |*activation| activation.deinit();
         if (self.relational_retirement) |*retirement| retirement.deinit();
@@ -675,7 +677,7 @@ fn parseBatchRequestWithOptions(
         break :guards @as(?std.json.Parsed([]const @import("../storage/range_protection.zig").Proof), try std.json.parseFromValue([]const @import("../storage/range_protection.zig").Proof, alloc, value, .{ .allocate = .alloc_always }));
     } else null;
     errdefer if (range_guards) |*guards| guards.deinit();
-    if (range_guards) |guards| if (guards.value.len > @import("range_read_guards.zig").max_proofs) return error.InvalidBatchRequest;
+    if (range_guards) |guards| if (guards.value.len > @import("../storage/range_protection.zig").max_proofs) return error.InvalidBatchRequest;
     var relational_activation = if (root.get("_relational_activation")) |value| activation: {
         if (!allow_internal) return error.InvalidBatchRequest;
         break :activation @as(?std.json.Parsed(@import("../storage/db/relational_integrity_activation_contract.zig").Command), try std.json.parseFromValue(@import("../storage/db/relational_integrity_activation_contract.zig").Command, alloc, value, .{ .allocate = .alloc_always }));
@@ -862,6 +864,13 @@ fn parseBatchRequestWithOptions(
         break :graph_deletes parsed_graph_deletes;
     };
     errdefer freeGraphDeletes(alloc, graph_deletes);
+
+    var graph_endpoint_cleanup_guards: ?std.json.Parsed([]const @import("../storage/graph_cleanup_contract.zig").Guard) = null;
+    errdefer if (graph_endpoint_cleanup_guards) |*guards| guards.deinit();
+    if (root.get("_graph_endpoint_cleanup_guards")) |value| {
+        if (!allow_internal or value != .array or value.array.items.len > 256) return error.InvalidBatchRequest;
+        graph_endpoint_cleanup_guards = try std.json.parseFromValue([]const @import("../storage/graph_cleanup_contract.zig").Guard, alloc, value, .{ .allocate = .alloc_always });
+    }
 
     const predicates: []db_mod.types.TransactionVersionPredicate = predicates: {
         const value = root.get("_predicates") orelse break :predicates &.{};
@@ -1413,6 +1422,7 @@ fn parseBatchRequestWithOptions(
         .transforms = transforms,
         .graph_writes = graph_writes,
         .graph_deletes = graph_deletes,
+        .graph_endpoint_cleanup_guards = graph_endpoint_cleanup_guards,
         .predicates = predicates,
         .integrity = integrity,
         .integrity_commands = integrity_commands,
@@ -1476,6 +1486,7 @@ fn parseBatchRequestWithOptions(
             .graph_endpoint_cleanup = if (root.get("_graph_endpoint_cleanup")) |value| if (allow_internal and value == .bool) value.bool else return error.InvalidBatchRequest else false,
             .graph_writes = graph_writes,
             .graph_deletes = graph_deletes,
+            .graph_endpoint_cleanup_guards = if (graph_endpoint_cleanup_guards) |guards| guards.value else &.{},
             .predicates = predicates,
             .timestamp_ns = timestamp_ns,
             .sync_level = sync_level,
@@ -1531,7 +1542,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
             req.split_checkpoint != null or req.merge_checkpoint != null or req.online_source != null or req.restore_staging != null)
             return error.InvalidBatchRequest;
     } else if (req.row_policy_install_bundle.len != 0) return error.InvalidBatchRequest;
-    if (req.range_guards.len != 0 and (req.range_guards.len > @import("range_read_guards.zig").max_proofs or req.transaction == null or req.transaction.? != .prepare)) return error.InvalidBatchRequest;
+    if (req.range_guards.len != 0 and (req.range_guards.len > @import("../storage/range_protection.zig").max_proofs or req.transaction == null or req.transaction.? != .prepare)) return error.InvalidBatchRequest;
     try @import("../storage/range_protection.zig").validateRequest(req);
     try @import("../storage/db/merge_proof_adoption.zig").validateRequest(req);
     try @import("../storage/db/online_source_contract.zig").validateRequest(req);
@@ -1780,6 +1791,12 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
         try writer.writeAll(encoded_integrity.items);
     }
     if (req.graph_endpoint_cleanup_planned) try writer.writeAll(",\"_graph_endpoint_cleanup_planned\":true");
+    if (req.graph_endpoint_cleanup_guards.len != 0) {
+        try writer.writeAll(",\"_graph_endpoint_cleanup_guards\":");
+        const guards_json = try std.json.Stringify.valueAlloc(alloc, req.graph_endpoint_cleanup_guards, .{});
+        defer alloc.free(guards_json);
+        try writer.writeAll(guards_json);
+    }
     if (req.graph_endpoint_cleanup) try writer.writeAll(",\"_graph_endpoint_cleanup\":true");
     if (req.graph_writes.len > 0) {
         try writer.writeAll(",\"_graph_writes\":[");
@@ -3081,11 +3098,16 @@ test "internal batch graph endpoint cleanup command isolates planned effects" {
     const keys = @import("../storage/internal_keys.zig");
     const job = try keys.graphEndpointCleanupKeyAlloc(alloc, "hub");
     defer alloc.free(job);
-    const encoded = try encodeBatchRequest(alloc, .{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true, .deletes = &.{job}, .graph_deletes = &.{.{ .index_name = "g", .source = "a", .target = "hub", .edge_type = "R", .edge_id = "id", .owner = "owner" }} });
+    const encoded = try encodeBatchRequest(alloc, .{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true, .graph_endpoint_cleanup_guards = &.{.{ .endpoint = "hub", .generation = 0 }}, .deletes = &.{job}, .graph_deletes = &.{.{ .index_name = "g", .source = "a", .target = "hub", .edge_type = "R", .edge_id = "id", .owner = "owner" }} });
     defer alloc.free(encoded);
     var parsed = try parseInternalBatchRequest(alloc, encoded);
     defer parsed.deinit(alloc);
     try std.testing.expect(parsed.req.graph_endpoint_cleanup_planned);
+    try std.testing.expectEqualStrings("hub", parsed.req.graph_endpoint_cleanup_guards[0].endpoint);
+    try std.testing.expectEqual(@as(u64, 0), parsed.req.graph_endpoint_cleanup_guards[0].generation);
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, .{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true, .deletes = &.{job} }));
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, .{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true, .deletes = &.{job}, .graph_endpoint_cleanup_guards = &.{.{ .endpoint = "other", .generation = 1 }} }));
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, .{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true, .graph_endpoint_cleanup_guards = &.{ .{ .endpoint = "hub", .generation = 1 }, .{ .endpoint = "hub", .generation = 2 } } }));
     try std.testing.expectEqualStrings(job, parsed.req.deletes[0]);
     try std.testing.expectEqualStrings("owner", parsed.req.graph_deletes[0].owner);
     try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));

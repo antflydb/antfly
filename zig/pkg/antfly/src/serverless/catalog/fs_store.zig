@@ -15,7 +15,7 @@
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const Allocator = std.mem.Allocator;
-const fs_paths = @import("../../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const catalog_types = @import("types.zig");
 const catalog_store = @import("store.zig");
 

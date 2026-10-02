@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const secrets = @import("common/secrets.zig");
-const error_abi = @import("runtime_error_abi.zig");
+const error_abi = @import("antfly_runtime_abi").error_abi;
 
 extern fn secret_store_abi_create(*const std.mem.Allocator, [*]const u8, usize, *?*secrets.FileStore) callconv(.c) error_abi.Status;
 extern fn secret_store_abi_destroy(*secrets.FileStore) callconv(.c) void;

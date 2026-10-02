@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const Allocator = std.mem.Allocator;
 
 pub const SourceKind = enum {

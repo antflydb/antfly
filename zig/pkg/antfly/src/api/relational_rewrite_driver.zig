@@ -458,7 +458,7 @@ fn testOwnerWaves(concurrent: bool) !void {
     var threaded: std.Io.Threaded = .init(fixture.alloc, .{ .async_limit = .limited(4) });
     defer threaded.deinit();
     const io = threaded.io();
-    const control: operation.RequestContext = if (concurrent) .{ .fanout_io = @import("../runtime_io_abi.zig").Borrow.init(&io) } else .{};
+    const control: operation.RequestContext = if (concurrent) .{ .fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io) } else .{};
     for (0..100) |iteration| {
         worker.rewrite_progress = fixture.restore_job_store.progress;
         fixture.restore_job_store.lose_checkpoint = iteration % 7 == 0;

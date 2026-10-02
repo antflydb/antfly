@@ -128,7 +128,7 @@ pub const replay_key_len: usize = 1 + 1 + @sizeOf(u64);
 pub const replay_meta_init_key = [_]u8{ replay_namespace, 0xff, 0x01 };
 pub const replay_meta_next_sequence_key = [_]u8{ replay_namespace, 0xff, 0x02 };
 pub const replay_meta_latest_sequence_kind: u8 = 0x03;
-pub const ha_applied_lsn_key = [_]u8{ replay_namespace, 0xff, 0x04 };
+pub const replication_applied_lsn_key = [_]u8{ replay_namespace, 0xff, 0x04 };
 /// Latest document-store mutation applied from the local data Raft log. The
 /// value stores term/index and is committed in the same primary batch as the
 /// document effects so restart replay cannot repeat non-idempotent transforms.
@@ -3486,9 +3486,10 @@ pub fn graphEndpointCleanupKeyAlloc(alloc: Allocator, endpoint: []const u8) ![]u
 }
 
 /// Local admission summary. Missing summaries conservatively fence old queues.
+pub const graph_endpoint_cleanup_generation_key = "\x00\x00__metadata__:graph_endpoint_cleanup_generation:v2";
 pub const graph_endpoint_cleanup_count_key = "\x00\x00__metadata__:graph_endpoint_cleanup_active_count:v1";
 pub const graph_endpoint_cleanup_ref_prefix = "\x00\x00__metadata__:graph_endpoint_cleanup_active:v1:";
 pub fn isGraphEndpointCleanupControlKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, graph_endpoint_cleanup_prefix) or
-        std.mem.startsWith(u8, key, graph_endpoint_cleanup_ref_prefix) or std.mem.eql(u8, key, graph_endpoint_cleanup_count_key);
+        std.mem.startsWith(u8, key, graph_endpoint_cleanup_ref_prefix) or std.mem.eql(u8, key, graph_endpoint_cleanup_count_key) or std.mem.eql(u8, key, graph_endpoint_cleanup_generation_key);
 }

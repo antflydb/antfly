@@ -298,7 +298,7 @@ const PortableOutputMode = union(enum) {
 };
 
 const PortableOutput = struct {
-    cancellation: @import("../common/cancellation.zig").CancellationToken = .none,
+    cancellation: @import("antfly_cancellation").CancellationToken = .none,
     alloc: Allocator,
     writer: ?*std.Io.Writer = null,
     mode: PortableOutputMode,
@@ -483,7 +483,7 @@ pub const ExportOptions = struct {
         output: *?[]SourceGenerationAdmissionSummaryEntry,
     } = null,
     source_copy: ?SourceCopyProof = null,
-    cancellation: @import("../common/cancellation.zig").CancellationToken = .none,
+    cancellation: @import("antfly_cancellation").CancellationToken = .none,
     stats: ?*ExportStats = null,
     header_backup_id: [16]u8 = [_]u8{0} ** 16,
     backup_id: []const u8 = "",
@@ -2431,7 +2431,7 @@ pub const ImportOptions = struct {
     unpublished_staging: bool = false,
     progress_context: ?*anyopaque = null,
     progress_fn: ?*const fn (?*anyopaque, ImportProgress) void = null,
-    cancellation: @import("../common/cancellation.zig").CancellationToken = .none,
+    cancellation: @import("antfly_cancellation").CancellationToken = .none,
     /// Decoded historical epochs, not total archive history. A single oversized
     /// epoch may exceed this budget while its row is being validated.
     schema_cache_bytes: usize = default_schema_cache_bytes,
@@ -2532,11 +2532,11 @@ fn loadCohortArchive(alloc: Allocator, store: *DocStore, proof: StagedImportProo
 /// The caller owns an unpublished LSM directory and has verified the full file
 /// digest. Each call commits at most one bounded row/metadata page together
 /// with its exact archive cursor. Source identities are rebuilt, not copied.
-pub fn importCohortFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: std.Io.File, size: u64, proof: CohortProof, scope: [32]u8, max_rows: usize, cancellation: @import("../common/cancellation.zig").CancellationToken) !bool {
+pub fn importCohortFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: std.Io.File, size: u64, proof: CohortProof, scope: [32]u8, max_rows: usize, cancellation: @import("antfly_cancellation").CancellationToken) !bool {
     return importStagedFilePage(alloc, store, io, file, size, .{ .cohort = proof }, scope, max_rows, cancellation);
 }
 
-pub fn importSourceCopyFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: std.Io.File, size: u64, proof: SourceCopyProof, scope: [32]u8, max_rows: usize, cancellation: @import("../common/cancellation.zig").CancellationToken) !bool {
+pub fn importSourceCopyFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: std.Io.File, size: u64, proof: SourceCopyProof, scope: [32]u8, max_rows: usize, cancellation: @import("antfly_cancellation").CancellationToken) !bool {
     return importStagedFilePage(alloc, store, io, file, size, .{ .source_copy = proof }, scope, max_rows, cancellation);
 }
 
@@ -2548,7 +2548,7 @@ fn syncImportCheckpoint(store: *DocStore) !void {
     try store.syncReplayState();
 }
 
-fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: std.Io.File, size: u64, proof: StagedImportProof, scope: [32]u8, max_rows: usize, cancellation: @import("../common/cancellation.zig").CancellationToken) !bool {
+fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: std.Io.File, size: u64, proof: StagedImportProof, scope: [32]u8, max_rows: usize, cancellation: @import("antfly_cancellation").CancellationToken) !bool {
     if (max_rows == 0 or max_rows > 128) return error.InvalidBackupRequest;
     try cancellation.check();
     if (!try file.tryLock(io, .shared)) return error.WriterLocked;
@@ -2961,7 +2961,7 @@ pub fn verifySourceCertificateFile(
     file: std.Io.File,
     file_size: u64,
     expected: source_snapshot.Certificate,
-    cancellation: @import("../common/cancellation.zig").CancellationToken,
+    cancellation: @import("antfly_cancellation").CancellationToken,
 ) !void {
     try cancellation.check();
     _ = try expected.encode();
@@ -4060,7 +4060,7 @@ test "relational index system source snapshot certificate survives transfer rest
         if (relational) try db.setSchemaJson(alloc,
             \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"},"padding":{"type":"string"}},"required":["n"],"additionalProperties":false}}}}
         );
-        try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "a", .value = document }} }, .{ .term = 2, .index = cut.applied_index });
+        try @import("server_db_adapter.zig").applyOrdered(&db, .{ .writes = &.{.{ .key = "a", .value = document }} }, .{ .term = 2, .index = cut.applied_index });
         {
             var txn = try db.core.store.beginWriteTxn();
             errdefer txn.abort();
@@ -4101,7 +4101,7 @@ test "relational index system source snapshot certificate survives transfer rest
             const verifier = @import("portable_source_verifier.zig");
             const verify_root = try std.fmt.allocPrint(alloc, "{s}.verify", .{path});
             defer alloc.free(verify_root);
-            try @import("../common/fs_paths.zig").createDirPathPortable(io, verify_root);
+            try @import("antfly_runtime_fs").fs_paths.createDirPathPortable(io, verify_root);
             var done = false;
             var total_read: u64 = 0;
             var initialize_count: usize = 0;
@@ -4190,7 +4190,7 @@ test "relational index system source snapshot certificate survives transfer rest
         try std.testing.expectError(error.Canceled, exportPortableToWriterWithOptions(alloc, db.core.store, &output.writer, .{ .source_certificate = .{ .cut = cut, .output = &certificate }, .cancellation = .fromAtomic(&canceled) }));
         try std.testing.expect(certificate == null);
         // A later owner generation cannot be mislabeled as the admitted cut.
-        try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "b", .value = "{\"n\":4}" }} }, .{ .term = 2, .index = 12 });
+        try @import("server_db_adapter.zig").applyOrdered(&db, .{ .writes = &.{.{ .key = "b", .value = "{\"n\":4}" }} }, .{ .term = 2, .index = 12 });
         try std.testing.expectError(error.SourceSnapshotCutMismatch, exportPortableToWriterWithOptions(alloc, db.core.store, &output.writer, .{ .source_certificate = .{ .cut = cut, .output = &certificate } }));
         try std.testing.expect(certificate == null);
         var wrong_retained_cut = cut;

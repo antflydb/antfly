@@ -26,11 +26,11 @@ const table_create_contract = @import("table_create_contract.zig");
 const backup_contract = @import("backup_contract.zig");
 const distributed_txn = @import("distributed_txn_contract.zig");
 const metadata_topology_protocol = @import("../metadata/topology_protocol.zig");
-const metadata_api = @import("../metadata/api.zig");
+const metadata_api = @import("../metadata/catalog_mutation_stamp.zig");
 const runtime_status = @import("runtime_status.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
-const runtime_error_abi = @import("../runtime_error_abi.zig");
-const runtime_native_abi = @import("../runtime_native_abi.zig");
+const runtime_error_abi = @import("antfly_runtime_abi").error_abi;
+const runtime_native_abi = @import("antfly_runtime_abi").native_abi;
 
 pub const LocalStructuralReconcileState = enum {
     complete,
@@ -464,8 +464,8 @@ pub const TableWriteSource = struct {
             group_id: u64,
             table_name: []const u8,
         ) anyerror!?void = null,
-        capture_ha_seed_snapshot_group_local: ?*const fn (ptr: *anyopaque, group_id: u64, table_name: []const u8, token: []const u8, destination: []const u8) anyerror!?void = null,
-        prepare_ha_seed_snapshot_group_local: ?*const fn (
+        capture_hot_standby_seed_snapshot_group_local: ?*const fn (ptr: *anyopaque, group_id: u64, table_name: []const u8, token: []const u8, destination: []const u8) anyerror!?void = null,
+        prepare_hot_standby_seed_snapshot_group_local: ?*const fn (
             ptr: *anyopaque,
             group_id: u64,
             table_name: []const u8,
@@ -1426,19 +1426,19 @@ pub const TableWriteSource = struct {
         return try BoundaryAbi.call("preflight_write_admission_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, group_id, table_name });
     }
 
-    pub fn captureHASeedSnapshotGroupLocal(self: TableWriteSource, group_id: u64, table_name: []const u8, token: []const u8, destination: []const u8) !?void {
-        const fn_ptr = self.vtable.capture_ha_seed_snapshot_group_local orelse return null;
-        return try BoundaryAbi.call("capture_ha_seed_snapshot_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, group_id, table_name, token, destination });
+    pub fn captureHotStandbySeedSnapshotGroupLocal(self: TableWriteSource, group_id: u64, table_name: []const u8, token: []const u8, destination: []const u8) !?void {
+        const fn_ptr = self.vtable.capture_hot_standby_seed_snapshot_group_local orelse return null;
+        return try BoundaryAbi.call("capture_hot_standby_seed_snapshot_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, group_id, table_name, token, destination });
     }
 
-    pub fn prepareHASeedSnapshotGroupLocal(
+    pub fn prepareHotStandbySeedSnapshotGroupLocal(
         self: TableWriteSource,
         group_id: u64,
         table_name: []const u8,
         deadline_ns: u64,
     ) !?void {
-        const fn_ptr = self.vtable.prepare_ha_seed_snapshot_group_local orelse return null;
-        return try BoundaryAbi.call("prepare_ha_seed_snapshot_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, group_id, table_name, deadline_ns });
+        const fn_ptr = self.vtable.prepare_hot_standby_seed_snapshot_group_local orelse return null;
+        return try BoundaryAbi.call("prepare_hot_standby_seed_snapshot_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, group_id, table_name, deadline_ns });
     }
 
     pub fn findMedianKeyGroupLocal(

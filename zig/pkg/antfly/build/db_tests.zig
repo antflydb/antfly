@@ -17,6 +17,7 @@ const addRuntimeTestFilters = @import("test_support.zig").addRuntimeTestFilters;
 const compileFiltersWithAnchors = @import("test_support.zig").compileFiltersWithAnchors;
 const addFilteredTestRunArtifact = @import("test_support.zig").addFilteredTestRunArtifact;
 const addCuratedTestRunArtifact = @import("test_support.zig").addCuratedTestRunArtifact;
+const selectTestFilters = @import("test_support.zig").selectTestFilters;
 
 pub const AddTestsOptions = struct {
     antfly_test_mod: *std.Build.Module,
@@ -76,6 +77,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "graph replay node clears do not subsume independently owned fact deletions",
         "graph redundant source ownership is canonical across writes probes and deletes",
         "graph document cleanup pages",
+        "graph maintenance capped pages and native scans release allocations on failure",
     };
     const relationship_identity_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -323,8 +325,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.db.test.db writer open resumes generated enrichment replay from journal",
         "storage.db.db.test.enrichment worker bounds retries against a durable foreign lease",
         "storage.db.db.test.generated enrichment preparation helpers release partial allocations",
-        "storage.db.db.test.storage.hot_standby db waits for remote apply before completing derived enrichment",
-        "storage.db.db.test.storage.hot_standby seed snapshot predrains enrichment before exclusive capture",
+        "storage.hot_standby.db_integration_test.test.storage.hot_standby db waits for remote apply before completing derived enrichment",
+        "storage.hot_standby.db_integration_test.test.storage.hot_standby seed snapshot predrains enrichment before exclusive capture",
         "storage.db.derived.io_threaded_runtime.test.derived enrichment visibility guard observes cancellation and deadline",
         "storage.db.derived.runtime_types.test.derived visibility wait retains its deadline clock and cancellation",
         "storage.db.derived.replay_source.test.replay source primary store collects enrichment groups from hint lane",
@@ -703,7 +705,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const lib_db_txn_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{
+        .filters = selectTestFilters(b, &.{
             "storage.db.db.test.db writes and reads timestamp",
             "storage.db.db.test.db lookup hides expired",
             "storage.db.db.test.db search filters expired",
@@ -711,6 +713,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.db.test.db exposes local transaction lifecycle",
             "storage.db.db.test.db transaction ",
             "storage.db.db.test.db explicit resolveTransactionIntents",
+            "storage.db.db.test.db replicated transaction commits each raft receipt atomically",
+            "storage.db.db.test.db native FK generation receipts survive restart without Raft watermark",
             "storage.db.db.test.db recoverTransactions",
             "storage.db.db.test.db participant recovery",
             "storage.db.db.test.db batch enforces optimistic version predicates",
@@ -729,7 +733,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "topology fence retains committed coordinator recovery obligations",
             "ttl runtime executes production pass on borrowed VoprIo",
             "transaction recovery executes production pass on borrowed VoprIo",
-        },
+        }),
     });
     const run_lib_db_txn_tests = addFilteredTestRunArtifact(b, lib_db_txn_tests);
     const lib_db_txn_step = b.step("antfly-storage-db-txn-test", "Run root-module DB TTL/transaction tests");

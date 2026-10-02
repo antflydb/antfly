@@ -18,8 +18,8 @@
 //! allocated with the caller-provided ABI allocator and become caller-owned.
 
 const std = @import("std");
-const error_abi = @import("runtime_error_abi.zig");
-const http_abi = @import("runtime_http_abi.zig");
+const error_abi = @import("antfly_runtime_abi").error_abi;
+const http_abi = @import("antfly_runtime_abi").http_abi;
 const memory_abi = @import("runtime_memory_abi");
 
 pub const abi_version: u32 = 3;

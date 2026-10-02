@@ -233,13 +233,13 @@ pub fn create(config: Config) Graph {
     const pjrt_mod = if (backend.enable_pjrt) qualification_pjrt_mod else null;
 
     const generating_openapi_mod = shared.generating_openapi orelse addOrCreateModule(b, config.register_public_modules, "antfly_generating_openapi", .{
-        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly/src/openapi/generated/antfly_generating_openapi/root.zig")),
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly-embedded/src/openapi/generated/antfly_generating_openapi/root.zig")),
         .target = target,
         .optimize = optimize,
     });
     var shared_with_generating = shared;
     if (shared.generating_openapi == null) generating_openapi_mod.addImport("antfly_provider_openapi", b.createModule(.{
-        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly/src/openapi/generated/antfly_provider_openapi/root.zig")),
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly-embedded/src/openapi/generated/antfly_provider_openapi/root.zig")),
         .target = target,
         .optimize = optimize,
     }));
@@ -260,9 +260,9 @@ pub fn create(config: Config) Graph {
     };
     const reader_config_mod = shared.reader_config orelse createSharedModule(config, "lib/readers/src/config.zig");
     const inference_api_mod = shared.inference_api orelse addInferenceApiModule(b, target, optimize, httpx_mod, backend.skip_openapi, paths, config.register_public_modules, shared_with_generating);
-    const s3_openapi_mod = shared.s3_openapi orelse createSharedModule(config, "pkg/antfly/src/openapi/generated/antfly_s3_openapi/root.zig");
+    const s3_openapi_mod = shared.s3_openapi orelse createSharedModule(config, "pkg/antfly-embedded/src/openapi/generated/antfly_s3_openapi/root.zig");
     const audio_openapi_mod = shared.audio_openapi orelse blk: {
-        const mod = createSharedModule(config, "pkg/antfly/src/openapi/generated/antfly_audio_openapi/root.zig");
+        const mod = createSharedModule(config, "pkg/antfly-embedded/src/openapi/generated/antfly_audio_openapi/root.zig");
         mod.addImport("antfly_s3_openapi", s3_openapi_mod);
         break :blk mod;
     };
@@ -437,7 +437,7 @@ pub fn create(config: Config) Graph {
 pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, inference_root: []const u8, link_libc: bool) *std.Build.Step.Compile {
     const exe = b.addExecutable(.{
         .name = "antfly-inference",
-        .max_rss = 7 * 1024 * 1024 * 1024,
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 10 else 7) * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = b.path(pathJoin(b, inference_root, "src/main.zig")),
             .target = target,
@@ -584,12 +584,12 @@ fn addInferenceApiModule(
     shared: SharedModules,
 ) *std.Build.Module {
     const generating_openapi_mod = shared.generating_openapi orelse addOrCreateModule(b, register_public_modules, "antfly_generating_openapi", .{
-        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly/src/openapi/generated/antfly_generating_openapi/root.zig")),
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly-embedded/src/openapi/generated/antfly_generating_openapi/root.zig")),
         .target = target,
         .optimize = optimize,
     });
     if (shared.generating_openapi == null) generating_openapi_mod.addImport("antfly_provider_openapi", b.createModule(.{
-        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly/src/openapi/generated/antfly_provider_openapi/root.zig")),
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly-embedded/src/openapi/generated/antfly_provider_openapi/root.zig")),
         .target = target,
         .optimize = optimize,
     }));
@@ -648,7 +648,7 @@ fn addChunkingApiOpenApiModule(
     generating_openapi_mod: *std.Build.Module,
 ) *std.Build.Module {
     const mod = b.createModule(.{
-        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly/src/openapi/generated/antfly_chunking_api_openapi/root.zig")),
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly-embedded/src/openapi/generated/antfly_chunking_api_openapi/root.zig")),
         .target = target,
         .optimize = optimize,
     });
@@ -664,7 +664,7 @@ fn addExtractionOpenApiModule(
     generating_openapi_mod: *std.Build.Module,
 ) *std.Build.Module {
     const mod = b.createModule(.{
-        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly/src/openapi/generated/antfly_extraction_openapi/root.zig")),
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly-embedded/src/openapi/generated/antfly_extraction_openapi/root.zig")),
         .target = target,
         .optimize = optimize,
     });

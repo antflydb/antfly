@@ -36,7 +36,7 @@ const adjacency_blocks = @import("adjacency.zig");
 const topology_owner = @import("topology_owner.zig");
 const typed_edges = @import("typed_edges.zig");
 const maintenance = @import("maintenance.zig");
-const cancellation_mod = @import("../common/cancellation.zig");
+const cancellation_mod = @import("antfly_cancellation");
 const backend_erased = @import("../storage/backend_erased.zig");
 const backend_scan = @import("../storage/backend_scan.zig");
 const docstore = @import("../storage/docstore.zig");
@@ -37966,9 +37966,9 @@ test "graph maintenance capped pages and native scans release allocations on fai
                         if (retained) {
                             var scan = index.nativeEdgeScan("a", &.{ "link", "link" }, .both);
                             defer scan.deinit(allocator);
-                            while (try scan.nextPage(allocator, count, 128)) |page| GraphIndex.freeEdges(allocator, page);
+                            while (try scan.nextPage(allocator, count, @sizeOf(Edge) + "ablink{}".len)) |page| GraphIndex.freeEdges(allocator, page);
                         } else {
-                            var page = try index.getEdgesByTypesPage(allocator, "a", &.{"link"}, .both, null, .{ .max_edges = count, .max_owned_bytes = 128 });
+                            var page = try index.getEdgesByTypesPage(allocator, "a", &.{"link"}, .both, null, .{ .max_edges = count, .max_owned_bytes = @sizeOf(Edge) + "ablink{}".len });
                             page.deinit(allocator);
                         }
                     }

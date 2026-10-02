@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Elastic-2.0
 
 const std = @import("std");
-const bridge = @import("runtime_io_abi.zig");
+const bridge = @import("antfly_runtime_abi").io_abi;
 extern fn runtime_io_abi_test_borrow(*bridge.Borrow) callconv(.c) void;
 extern fn runtime_io_abi_test_inject(bool) callconv(.c) void;
 extern fn runtime_io_abi_test_destroy(*const bridge.Borrow) callconv(.c) void;

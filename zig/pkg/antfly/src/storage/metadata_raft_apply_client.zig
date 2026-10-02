@@ -82,7 +82,7 @@ pub const RaftApplyStore = struct {
     handle: ?*anyopaque,
     listeners: std.ArrayListUnmanaged(*ListenerRegistration) = .empty,
     listeners_mutex: std.Io.Mutex = .init,
-    ha_adapter: ?*@import("metadata_ha_adapter.zig").Adapter = null,
+    ha_adapter: ?*@import("metadata_hot_standby_adapter.zig").Adapter = null,
 
     pub const RestoreJobRow = struct {
         key: []u8,
@@ -224,8 +224,8 @@ pub const RaftApplyStore = struct {
         return try std.json.parseFromSlice(T, alloc, response.slice(), .{ .allocate = .alloc_always });
     }
 
-    pub fn bindHA(self: *RaftApplyStore, gate: ?@import("db/ha_contract.zig").WriteGate, mirror: ?@import("db/ha_contract.zig").AsyncEffectMirror) !void {
-        const Adapter = @import("metadata_ha_adapter.zig").Adapter;
+    pub fn bindHA(self: *RaftApplyStore, gate: ?@import("db/replication_contract.zig").WriteGate, mirror: ?@import("db/replication_contract.zig").AsyncEffectMirror) !void {
+        const Adapter = @import("metadata_hot_standby_adapter.zig").Adapter;
         const next = try self.alloc.create(Adapter);
         errdefer self.alloc.destroy(next);
         next.* = .{ .alloc = self.alloc, .io_impl = std.Io.Threaded.init(self.alloc, .{}), .gate = gate, .mirror = mirror };
@@ -241,8 +241,8 @@ pub const RaftApplyStore = struct {
     pub fn flushHAOutbox(self: *RaftApplyStore) !void {
         _ = try self.projection(bool, .{ .kind = .flush_ha_outbox });
     }
-    pub fn applyHARecord(self: *RaftApplyStore, record: @import("hot_standby/replication_record.zig").RecordView) !void {
-        const bytes = try @import("hot_standby/replication_record.zig").encodeAlloc(self.alloc, record);
+    pub fn applyHARecord(self: *RaftApplyStore, record: @import("db/replication_record.zig").RecordView) !void {
+        const bytes = try @import("db/replication_record.zig").encodeAlloc(self.alloc, record);
         defer self.alloc.free(bytes);
         _ = try self.projection(bool, .{ .kind = .apply_ha_record, .key = .fromSlice(bytes) });
     }

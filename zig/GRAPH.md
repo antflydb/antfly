@@ -137,7 +137,7 @@ that write retirement records themselves use ordinary transactional writes.
 Merge artifact pages include primary retirement records. Receiver replay applies
 exact relationship deletions to existing projections as well as suppressing
 future materialization. Commands that can generate retirements during apply
-require data-Raft protocol version 18, including ordinary document deletion,
+require data-Raft protocol version 19, including ordinary document deletion,
 legacy relationship deletion, cleanup, transforms, committed transaction
 decisions, and merge pages. Classification occurs before proposal even when retirement records
 are absent from the input. Ordinary artifact-only batches retain their existing
@@ -155,6 +155,23 @@ necessary. It does not hydrate relationship metadata. Independent incident facts
 survive endpoint cleanup; their owner directory drives fact-document deletion.
 Each page uses the normal graph mutation path, and interrupted replay resumes by
 scanning remaining records before advancing its durable coverage checkpoint.
+
+Endpoint cleanup jobs carry a durable generation assigned in the same primary
+commit as the deletion. Planned pages include that generation for every affected
+endpoint. Apply checks each job under the primary mutation fence and skips the
+effects of missing or replaced jobs, while still advancing the ordered command
+receipt. Replaying an old page therefore cannot delete a recreated relationship
+or finish a newer deletion. Legacy jobs with raw endpoint values use generation
+zero; newly enqueued jobs always have a positive generation. Guard identities
+count toward the page byte budget. HA cleanup payloads require schema version 18,
+or version 19 when carrying an ordinary Raft receipt; older envelopes are rejected.
+
+The distributed cleanup worker retains one immutable indexed routing generation
+per sweep and visits each range once, checking current local leadership before
+proposal. It probes at most eight ranges and submits at most one cleanup page per
+round. Table lookup uses the routing generation's index. A following sweep adopts
+current topology, and shutdown releases the retained generation. This avoids
+repeated catalog captures and quadratic range searches as the shard count grows.
 
 This preserves the local-store ownership scope of primary artifacts; it does not
 introduce a global cross-shard endpoint-deletion protocol.

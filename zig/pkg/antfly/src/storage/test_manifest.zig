@@ -21,6 +21,20 @@
 //! duplicate, stale, or multiply-owned entries before any shard is compiled.
 
 comptime {
+    _ = @import("db/apply_receipts.zig");
+    _ = @import("db/durable_outbox.zig");
+    _ = @import("db/durable_outbox_store.zig");
+    _ = @import("db/primary_effect.zig");
+    _ = @import("db/replication_contract.zig");
+    _ = @import("db/replication_ingress.zig");
+    _ = @import("db/replication_effects.zig");
+
+    _ = @import("backup_restore.zig");
+    _ = @import("hot_standby/restore_staging_integration_test.zig");
+    _ = @import("hot_standby/native_topology_receipt_integration_test.zig");
+    _ = @import("hot_standby/online_source_integration_test.zig");
+    _ = @import("hot_standby/db_integration_test.zig");
+    _ = @import("hot_standby/graph_endpoint_cleanup_test.zig");
     _ = @import("portable_wal.zig");
     _ = @import("relational_index.zig");
     _ = @import("db/relational_index_keys.zig");
@@ -120,6 +134,7 @@ comptime {
     _ = @import("db/column_scan_plan.zig");
     _ = @import("db/config.zig");
     _ = @import("db/db.zig");
+    _ = @import("db/commit_integration.zig");
     _ = @import("db/dense_exact.zig");
     _ = @import("db/derived/apply_state.zig");
     _ = @import("db/derived/backlog_tracker.zig");
@@ -171,7 +186,6 @@ comptime {
     _ = @import("db/merge_contract.zig");
     _ = @import("db/merge_page_system_test.zig");
     _ = @import("db/merge_page_wire.zig");
-    _ = @import("db/native_raft_snapshot.zig");
     _ = @import("db/online_merge_io.zig");
     _ = @import("db/online_integrity_shadow.zig");
     _ = @import("db/online_merge_io_contract.zig");
@@ -249,7 +263,7 @@ comptime {
     _ = @import("hot_standby/restore_terminal_ledger.zig");
     _ = @import("hot_standby/metrics.zig");
     _ = @import("hot_standby/mod.zig");
-    _ = @import("hot_standby/mutation_barrier.zig");
+    _ = @import("antfly_runtime_abi").mutation_barrier;
     _ = @import("hot_standby/mutation_inventory.zig");
     _ = @import("hot_standby/operator.zig");
     _ = @import("hot_standby/owner_job_gate.zig");
@@ -259,10 +273,10 @@ comptime {
     _ = @import("hot_standby/rejoin.zig");
     _ = @import("hot_standby/replication_api.zig");
     _ = @import("hot_standby/replication_log.zig");
-    _ = @import("hot_standby/replication_record.zig");
+    _ = @import("db/replication_record.zig");
     _ = @import("hot_standby/seed_activation.zig");
     _ = @import("hot_standby/seed_artifact.zig");
-    _ = @import("hot_standby/primary_effect.zig");
+    _ = @import("db/primary_effect.zig");
     _ = @import("hot_standby/seed_capture.zig");
     _ = @import("hot_standby/seed_namespace_control.zig");
     _ = @import("hot_standby/seed_prefix_cleanup_test.zig");
@@ -416,7 +430,6 @@ comptime {
     _ = @import("db/graph_mutation_scopes.zig");
     _ = @import("db/merge_artifact_catalog.zig");
     _ = @import("db/merge_proof_adoption.zig");
-    _ = @import("db/native_topology_receipt.zig");
     _ = @import("db/online_graph_artifacts.zig");
     _ = @import("db/online_graph_receiver_test.zig");
     _ = @import("db/online_vector_artifacts.zig");

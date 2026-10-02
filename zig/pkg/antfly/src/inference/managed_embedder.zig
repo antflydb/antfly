@@ -14,8 +14,8 @@
 
 const std = @import("std");
 const ant_json = @import("antfly-json");
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
-const request_context = @import("execution_context.zig");
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
+const request_context = @import("antfly_inference_execution_context");
 pub const RequestContext = request_context.RequestContext;
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
@@ -26,16 +26,16 @@ const google_auth = @import("antfly_google").auth;
 const common_secrets = @import("../common/secrets.zig");
 const credential_source_identity = @import("../common/credential_source_identity.zig");
 const credential_safety = @import("../common/credential_safety.zig");
-const provider_defaults = @import("../common/provider_defaults.zig");
+const provider_defaults = @import("antfly_inference_provider_defaults");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const embeddings_openapi = @import("antfly_embeddings_openapi");
 const embeddings_types = @import("antfly_embeddings");
 const scraping = @import("antfly_scraping");
-const inference_types = @import("types.zig");
-const bedrock_provider = @import("bedrock.zig");
-const vertex_provider = @import("vertex.zig");
-const openai_provider = @import("openai.zig");
-const antfly_provider_mod = @import("local.zig");
+const inference_types = @import("antfly_inference_types");
+const bedrock_provider = @import("antfly_inference_bedrock");
+const vertex_provider = @import("antfly_inference_vertex");
+const openai_provider = @import("antfly_inference_openai");
+const antfly_provider_mod = @import("antfly_inference_local");
 const chunking_types = @import("../chunking/types.zig");
 const inference_chunker = @import("inference_chunker");
 const transcribing = @import("antfly_transcribing");
@@ -50,14 +50,14 @@ const template_remote = if (builtin.os.tag == .freestanding or builtin.is_test)
 else
     @import("../template_remote.zig");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
-const http_common = @import("../raft/transport/http_common.zig");
-const std_http_listener = @import("../raft/transport/std_http_listener.zig");
+const http_common = @import("../common/http/http_common.zig");
+const std_http_listener = @import("../common/http/std_http_listener.zig");
 const enrichment_types = @import("../storage/db/enrichment/enrichment_types.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
-const inference_work = @import("work.zig");
-const embedding_wire = @import("embedding_wire.zig");
-const remote_capabilities = @import("remote_capabilities.zig");
-const execution_context = @import("execution_context.zig");
+const inference_work = @import("antfly_inference_work");
+const embedding_wire = @import("antfly_inference_embedding_wire");
+const remote_capabilities = @import("antfly_inference_remote_capabilities");
+const execution_context = @import("antfly_inference_execution_context");
 const shared_vector = @import("antfly_vector").vector;
 const antfly_image = @import("antfly_image");
 var traced_local_batches = @import("antfly_platform").atomic.Value(u64).init(0);
@@ -83,34 +83,8 @@ pub const ProviderKind = enum {
 /// Antfly assigns retrieval roles from the operation: artifact/index writes
 /// are documents and semantic-search inputs are queries. Provider adapters
 /// translate these canonical roles to their wire-specific spelling.
-pub const EmbeddingTaskType = enum {
-    retrieval_query,
-    retrieval_document,
-
-    pub fn canonical(self: EmbeddingTaskType) []const u8 {
-        return switch (self) {
-            .retrieval_query => "RETRIEVAL_QUERY",
-            .retrieval_document => "RETRIEVAL_DOCUMENT",
-        };
-    }
-
-    pub fn cohereInputType(self: EmbeddingTaskType) []const u8 {
-        return switch (self) {
-            .retrieval_query => "search_query",
-            .retrieval_document => "search_document",
-        };
-    }
-};
-
-pub const EmbeddingRequestContext = struct {
-    request: RequestContext,
-    task_type: EmbeddingTaskType = .retrieval_document,
-    instruction: ?[]const u8 = null,
-
-    pub fn check(self: EmbeddingRequestContext) !void {
-        return self.request.check();
-    }
-};
+pub const EmbeddingTaskType = @import("antfly_inference_request_types").EmbeddingTaskType;
+pub const EmbeddingRequestContext = @import("antfly_inference_request_types").EmbeddingRequestContext;
 
 pub const AntflyProvider = struct {
     ptr: *anyopaque,
@@ -392,17 +366,8 @@ pub const AntflyProvider = struct {
     }
 };
 
-pub const ClassificationRequest = struct {
-    texts: []const []const u8,
-    labels: []const []const u8,
-    hypothesis_template: ?[]const u8 = null,
-    multi_label: bool = false,
-};
-
-pub const ClassificationScore = struct {
-    label: []const u8,
-    score: f32,
-};
+pub const ClassificationRequest = @import("antfly_inference_request_types").ClassificationRequest;
+pub const ClassificationScore = @import("antfly_inference_request_types").ClassificationScore;
 
 pub fn deinitRewrittenTexts(alloc: std.mem.Allocator, texts: []const []const u8) void {
     for (texts) |text| alloc.free(text);
@@ -6500,7 +6465,10 @@ fn effectiveInputType(entry: *const ManagedEmbeddingEntry, task_type: EmbeddingT
     // Backward-compatible expert override: the legacy field applies to both
     // roles. New configurations should prefer the role-specific fields.
     if (entry.input_type.len > 0) return entry.input_type;
-    return task_type.cohereInputType();
+    return switch (task_type) {
+        .retrieval_query => "search_query",
+        .retrieval_document => "search_document",
+    };
 }
 
 fn effectiveInstruction(entry: *const ManagedEmbeddingEntry, task_type: EmbeddingTaskType) ?[]const u8 {

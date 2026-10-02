@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const runtime_callback_abi = @import("../../runtime_callback_abi.zig");
-const CancellationToken = @import("../cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 pub const metadata_not_leader_header = "X-Antfly-Metadata-Not-Leader";
 pub const metadata_not_leader_value = "true";
@@ -264,7 +264,7 @@ pub const RequestExecutor = struct {
     /// Authentication and retry envelopes use this instead of escaping to the
     /// host clock when an executor is backed by a simulated or embedded Io.
     realtime_ns_fn: ?*const fn (ptr: *anyopaque) i128 = null,
-    clock_io: ?@import("../../runtime_io_abi.zig").Borrow = null,
+    clock_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
 
     pub const VTable = struct {
         execute: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, req: HttpRequest) anyerror!HttpResponse,

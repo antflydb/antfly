@@ -236,14 +236,14 @@ test "relational index system online integrity shadow cleanup publication and re
         try std.testing.expectEqualDeep(generations, facts.value.integrity.?.generation_set);
         try std.testing.expectEqualDeep(donor_identity.catalog_digest, facts.value.integrity.?.catalog_digest);
     }
-    try donor.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 });
+    try @import("../server_db_adapter.zig").applyOrdered(&donor, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 });
     const certificate = try donor.prepareOnlineSourcePublication(scope, .none);
     try std.testing.expect(certificate.integrity != null);
     try std.testing.expectEqualDeep(generations, certificate.integrity.?.generation_set);
     var stale_certificate = certificate;
     stale_certificate.integrity.?.catalog_digest[0] ^= 1;
-    try std.testing.expectError(error.SourceSnapshotCutMismatch, donor.batchRaftReplicatedApply(.{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = stale_certificate } } }, .{ .term = 1, .index = 2 }));
-    try donor.batchRaftReplicatedApply(.{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = certificate } } }, .{ .term = 1, .index = 2 });
+    try std.testing.expectError(error.SourceSnapshotCutMismatch, @import("../server_db_adapter.zig").applyOrdered(&donor, .{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = stale_certificate } } }, .{ .term = 1, .index = 2 }));
+    try @import("../server_db_adapter.zig").applyOrdered(&donor, .{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = certificate } } }, .{ .term = 1, .index = 2 });
     const source: pages.Source = .{ .namespace = donor_identity.namespace, .pin_digest = try certificate.digest(), .applied_index = certificate.cut.applied_index, .retention = .{ .epoch = 1, .after_sequence = certificate.cut.retained_start }, .integrity = certificate.integrity };
     var checkpoint: types.MergeReplicationCheckpoint = .{ .kind = .accept, .transition_id = 9, .donor_group_id = 2, .receiver_group_id = 3, .receiver_base_start = "\xff", .receiver_base_end = "", .merged_start = "", .merged_end = "", .page_source = source, .page_receiver_namespace = options.identity_namespace };
     try db.batch(.{ .merge_checkpoint = checkpoint });
@@ -321,8 +321,8 @@ test "relational index system online integrity shadow cleanup publication and re
     const attach = try donor.beginTransactionWithId(@splat(72), 200);
     try donor.writeTransaction(attach, .{ .relational_schema_version = 1, .relational_integrity_generation_set = generations, .writes = &.{.{ .key = "parent", .value = "{\"id\":1}" }}, .integrity_commands = &.{.{ .address = address, .operation = .{ .attach = reference } }} });
     try donor.commitTransaction(attach, 222);
-    try donor.batchRaftReplicatedApply(.{ .relational_topology = .{ .fence = scope.fence, .action = .begin } }, .{ .term = 1, .index = 3 });
-    try donor.batchRaftReplicatedApply(.{ .online_source = .{ .final_fence = .{ .scope = scope, .expected_sequence = 1 } } }, .{ .term = 1, .index = 4 });
+    try @import("../server_db_adapter.zig").applyOrdered(&donor, .{ .relational_topology = .{ .fence = scope.fence, .action = .begin } }, .{ .term = 1, .index = 3 });
+    try @import("../server_db_adapter.zig").applyOrdered(&donor, .{ .online_source = .{ .final_fence = .{ .scope = scope, .expected_sequence = 1 } } }, .{ .term = 1, .index = 4 });
     donor.close();
     donor = try @import("antfly_source_root").antfly_sources.physical_db.DB.open(alloc, donor_path, donor_options);
     try Apply.pump(&donor, &db, scope, certificate, .complete);

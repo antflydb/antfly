@@ -9,7 +9,7 @@ const registry_mod = @import("../storage/retained_read_registry.zig");
 const reads = @import("table_read_source.zig");
 const types = @import("../storage/db/types.zig");
 const metadata = @import("../metadata/api.zig");
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const time = @import("antfly_platform").time;
 
 /// Stable owner lifetime with one bounded sweeper, never one timer per cursor.

@@ -24,7 +24,7 @@ const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const Allocator = std.mem.Allocator;
 const AtomicU64 = platform.atomic.Value(u64);
-const fs_paths = @import("../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const backend_adapter = @import("backend_adapter.zig");
 const backend_erased = @import("backend_erased.zig");
 const backend_scan = @import("backend_scan.zig");
@@ -375,6 +375,7 @@ fn columnarMutationToken(txn: anytype, cached: *?internal_keys.ColumnarMutationT
 
 fn updateGraphEndpointCleanupAdmission(txn: anytype, alloc: Allocator, key: []const u8, endpoint: ?[]const u8) anyerror!void {
     if (!std.mem.startsWith(u8, key, internal_keys.graph_endpoint_cleanup_prefix)) return;
+    const decoded_endpoint = if (endpoint) |value| (try @import("graph_cleanup_contract.zig").decode(key, value)).endpoint else null;
     const ref = try std.mem.concat(alloc, u8, &.{ internal_keys.graph_endpoint_cleanup_ref_prefix, key[internal_keys.graph_endpoint_cleanup_prefix.len..] });
     defer alloc.free(ref);
     const raw_count = txn.get(internal_keys.graph_endpoint_cleanup_count_key) catch |err| switch (err) {
@@ -397,7 +398,7 @@ fn updateGraphEndpointCleanupAdmission(txn: anytype, alloc: Allocator, key: []co
         }
     }
     const already_active = if (txn.get(ref)) |_| true else |err| if (err == error.NotFound) false else return err;
-    if (endpoint) |target| {
+    if (decoded_endpoint) |target| {
         if (!already_active) {
             const ready = if (txn.get(internal_keys.graph_incoming_ready_key)) |_| true else |err| if (err == error.NotFound) false else return err;
             var active = !ready;
@@ -1392,12 +1393,15 @@ pub const DocStore = struct {
     }
 
     pub const GraphEndpointCleanupPage = struct {
+        guards: []const @import("graph_cleanup_contract.zig").Guard = &.{},
         alloc: Allocator,
         writes: []KVPair,
         deletes: []const []const u8,
         inspected: usize,
         bytes: usize,
         pub fn deinit(self: *@This()) void {
+            for (self.guards) |guard| self.alloc.free(guard.endpoint);
+            if (self.guards.len != 0) self.alloc.free(self.guards);
             for (self.writes) |row| {
                 self.alloc.free(row.key);
                 self.alloc.free(row.value);
@@ -1469,6 +1473,11 @@ pub const DocStore = struct {
     /// at the prefix is both a durable cursor and an idempotent retry.
     pub fn prepareGraphEndpointCleanupPage(self: *DocStore, alloc: Allocator) !?GraphEndpointCleanupPage {
         if (!try self.backfillGraphIncomingDirectoryPage()) return .{ .alloc = alloc, .writes = try alloc.alloc(KVPair, 0), .deletes = try alloc.alloc([]const u8, 0), .inspected = 0, .bytes = 0 };
+        var guards = std.ArrayListUnmanaged(@import("graph_cleanup_contract.zig").Guard).empty;
+        errdefer {
+            for (guards.items) |guard| alloc.free(guard.endpoint);
+            guards.deinit(alloc);
+        }
         var writes = std.ArrayListUnmanaged(KVPair).empty;
         var deletes = std.ArrayListUnmanaged([]const u8).empty;
         errdefer {
@@ -1494,12 +1503,21 @@ pub const DocStore = struct {
             while (job_row) |job| {
                 if (!std.mem.startsWith(u8, job.key, internal_keys.graph_endpoint_cleanup_prefix)) break;
                 if (inspected + deletes.items.len >= 256) break;
-                const expected_job = try internal_keys.graphEndpointCleanupKeyAlloc(alloc, job.value);
+                const incarnation = try @import("graph_cleanup_contract.zig").decode(job.key, job.value);
+                const expected_job = try internal_keys.graphEndpointCleanupKeyAlloc(alloc, incarnation.endpoint);
                 defer alloc.free(expected_job);
                 if (!std.mem.eql(u8, expected_job, job.key)) return error.InvalidGraphSegment;
                 const job_key = try alloc.dupe(u8, job.key);
                 defer alloc.free(job_key);
-                const prefix = try internal_keys.graphIncomingPrefixAlloc(alloc, job.value);
+                const guard_bytes = @sizeOf(@import("graph_cleanup_contract.zig").Guard) +| incarnation.endpoint.len;
+                if (inspected + deletes.items.len > 0 and bytes +| guard_bytes > 256 * 1024) break;
+                bytes +|= guard_bytes;
+                const owned_endpoint = try alloc.dupe(u8, incarnation.endpoint);
+                guards.append(alloc, .{ .endpoint = owned_endpoint, .generation = incarnation.generation }) catch |err| {
+                    alloc.free(owned_endpoint);
+                    return err;
+                };
+                const prefix = try internal_keys.graphIncomingPrefixAlloc(alloc, incarnation.endpoint);
                 defer alloc.free(prefix);
                 var row = try incoming.seekAtOrAfter(prefix);
                 while (row) |entry| {
@@ -1541,7 +1559,12 @@ pub const DocStore = struct {
             }
             alloc.free(owned_writes);
         }
-        return .{ .alloc = alloc, .writes = owned_writes, .deletes = try deletes.toOwnedSlice(alloc), .inspected = inspected, .bytes = bytes };
+        const owned_guards = try guards.toOwnedSlice(alloc);
+        errdefer {
+            for (owned_guards) |guard| alloc.free(guard.endpoint);
+            alloc.free(owned_guards);
+        }
+        return .{ .guards = owned_guards, .alloc = alloc, .writes = owned_writes, .deletes = try deletes.toOwnedSlice(alloc), .inspected = inspected, .bytes = bytes };
     }
 
     /// Exact maintenance query: explicitly completes directory migration.

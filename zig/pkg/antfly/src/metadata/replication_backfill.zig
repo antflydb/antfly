@@ -33,7 +33,7 @@ const db_mod = @import("../storage/db/selected_root.zig").db;
 const backend_types = @import("../storage/backend_types.zig");
 const secrets = @import("../common/secrets.zig");
 const pattern_filter = @import("../search/pattern_filter.zig");
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 const Allocator = std.mem.Allocator;
 // CDC checkpoints are external resume positions. Only publish progress after

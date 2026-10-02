@@ -12,6 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const server_test_adapter = if (builtin.is_test) @import("../../server_db_adapter.zig") else struct {};
 const std = @import("std");
 const antfly_image = @import("antfly_image");
 const builtin = @import("builtin");
@@ -19,8 +20,8 @@ const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
-const CancellationToken = @import("../../../common/cancellation.zig").CancellationToken;
-const inference_request_context = @import("../../../inference/execution_context.zig");
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
+const inference_request_context = @import("antfly_inference_execution_context");
 const common_secrets = @import("../../../common/secrets.zig");
 const backend_erased = @import("../../backend_erased.zig");
 const docstore_mod = @import("../../docstore.zig");
@@ -51,7 +52,7 @@ const enrichment_lease = @import("enrichment_lease.zig");
 const enrichment_state = @import("enrichment_state.zig");
 const embedder_mod = @import("embedder.zig");
 const asset_producer_mod = @import("asset_producer.zig");
-const inference_work = @import("../../../inference/work.zig");
+const inference_work = @import("antfly_inference_work");
 const chunk_provider = @import("../../../chunking/provider.zig");
 const document_extraction_mod = @import("document_extraction.zig");
 const runtime_failure_abi = @import("runtime_failure_abi");
@@ -31732,7 +31733,7 @@ test "ordered artifact inventory unit chunk callback reconstructs publishes and 
         fn apply(self: *@This(), db: *db_mod.DB, index: u64) !void {
             var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(db.alloc, self.encoded.?);
             defer decoded.deinit();
-            try db.batchRaftReplicatedApply(.{ .artifact_publication = decoded.command }, .{ .term = 1, .index = index });
+            try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = decoded.command }, .{ .term = 1, .index = index });
         }
     };
     var harness: Harness = .{};
@@ -31747,14 +31748,14 @@ test "ordered artifact inventory unit chunk callback reconstructs publishes and 
     try db.addEnrichment(.{ .name = "units", .kind = .asset, .field = "url", .producer_json = "{\"type\":\"document_extraction\"}" });
     try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .source_artifact_name = "units", .chunk_size = 4 });
     try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"chunks\"}]}" });
-    try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{\"url\":\"input\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
+    try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"url\":\"input\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
     var catalog = try db.artifactInventoryCommand(alloc);
     defer catalog.catalogs.deinit(alloc);
     catalog.binding.effect_protocol = 15;
-    try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
     var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activation.publication_digest = activation.digest();
-    try db.batchRaftReplicatedApply(.{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
     const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc", "units", "page-1");
     defer alloc.free(unit_key);
     const unit: document_extraction_mod.Unit = .{ .unit_id = @constCast("page-1"), .unit_type = @constCast("page"), .text = @constCast("hello world"), .method = @constCast("text"), .page_number = 7, .char_start = 30, .char_end = 41 };
@@ -31877,7 +31878,7 @@ test "ordered artifact inventory chunk callback waits for acceptance and atomica
     try db.setSchemaJson(alloc, "{}");
     try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 4 });
     try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"chunks\"}]}" });
-    try db.batchRaftReplicatedApply(.{ .writes = &.{ .{ .key = "doc", .value = "{\"body\":\"hello world\"}" }, .{ .key = "unreconciled", .value = "{\"body\":\"pending\"}" } }, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
+    try server_test_adapter.applyOrdered(&db, .{ .writes = &.{ .{ .key = "doc", .value = "{\"body\":\"hello world\"}" }, .{ .key = "unreconciled", .value = "{\"body\":\"pending\"}" } }, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
     const manifest_key = try inventory.keyAlloc(alloc, "doc", "chunks");
     defer alloc.free(manifest_key);
     // An inventory reconstructed before activation. The second document has
@@ -31891,10 +31892,10 @@ test "ordered artifact inventory chunk callback waits for acceptance and atomica
     var catalog = try db.artifactInventoryCommand(alloc);
     defer catalog.catalogs.deinit(alloc);
     catalog.binding.effect_protocol = 15;
-    try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
     var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activation.publication_digest = activation.digest();
-    try db.batchRaftReplicatedApply(.{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
     const progress = @import("../artifact_stream_progress.zig");
     var previous: ?progress.DocumentClosure = null;
     defer if (previous) |*value| value.deinit();
@@ -31928,7 +31929,7 @@ test "ordered artifact inventory chunk callback waits for acceptance and atomica
             defer decoded.deinit();
             try std.testing.expectEqual(.census, decoded.command.mode);
             try std.testing.expectEqual(.enrichment, decoded.command.producer_kind);
-            try db.batchRaftReplicatedApply(.{ .artifact_publication = decoded.command }, .{ .term = 1, .index = 4 });
+            try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = decoded.command }, .{ .term = 1, .index = 4 });
             var read = try db.core.store.beginReadTxn();
             defer read.abort();
             // Inventory alone is never proof that a provider finished.
@@ -31939,13 +31940,13 @@ test "ordered artifact inventory chunk callback waits for acceptance and atomica
         {
             var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
             defer decoded.deinit();
-            try db.batchRaftReplicatedApply(.{ .artifact_publication = decoded.command }, .{ .term = 1, .index = 5 });
+            try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = decoded.command }, .{ .term = 1, .index = 5 });
         }
         try processChunkText(runtime, unreconciled, &cache, &window);
         try std.testing.expectEqual(@as(usize, 2), harness.calls);
         for (0..3) |pass| {
-            if (pass == 1) try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .timestamp_ns = 101 }, .{ .term = 1, .index = 7 });
-            if (pass == 2) try db.batchRaftReplicatedApply(.{ .deletes = &.{"doc"}, .timestamp_ns = 102 }, .{ .term = 1, .index = 9 });
+            if (pass == 1) try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .timestamp_ns = 101 }, .{ .term = 1, .index = 7 });
+            if (pass == 2) try server_test_adapter.applyOrdered(&db, .{ .deletes = &.{"doc"}, .timestamp_ns = 102 }, .{ .term = 1, .index = 9 });
             try std.testing.expectError(error.ArtifactPublicationPending, processChunkText(runtime, request, &cache, &window));
             try std.testing.expectEqual(pass + 3, harness.calls);
             if (previous) |*value| {
@@ -31958,7 +31959,7 @@ test "ordered artifact inventory chunk callback waits for acceptance and atomica
             const manifest = decoded.command.mutations[decoded.command.mutations.len - 1];
             const next = try inventory.Manifest.decode(manifest.value.?);
             try std.testing.expect(if (pass == 0) next.count > 1 else next.count == 0);
-            try db.batchRaftReplicatedApply(.{ .artifact_publication = decoded.command }, .{ .term = 1, .index = pass * 2 + 6 });
+            try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = decoded.command }, .{ .term = 1, .index = pass * 2 + 6 });
             const cache_count = cache.items.len;
             try processChunkText(runtime, request, &cache, &window);
             try std.testing.expectEqual(pass + 3, harness.calls);
@@ -32146,7 +32147,7 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
         fn apply(self: *@This(), db: *db_mod.DB, index: u64) !void {
             var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(std.testing.allocator, self.encoded.?);
             defer decoded.deinit();
-            try db.batchRaftReplicatedApply(.{ .artifact_publication = decoded.command }, .{ .term = 1, .index = index });
+            try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = decoded.command }, .{ .term = 1, .index = index });
         }
     };
     var harness: Harness = .{};
@@ -32168,7 +32169,7 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
     try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 100 });
     try db.addEnrichment(.{ .name = "model", .kind = .embedding, .field = "body", .source_artifact_name = "chunks", .expected_dims = if (dense) 2 else 0 });
     try db.addIndex(.{ .name = "sparse", .kind = if (dense) .dense_vector else .sparse_vector, .config_json = if (dense) "{\"field\":\"dense\",\"dims\":2,\"embedding_name\":\"model\"}" else "{\"field\":\"sparse\",\"embedding_name\":\"model\"}" });
-    try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"hello world\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
+    try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"hello world\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
     const manifest_key = try inventory.keyAlloc(alloc, "doc", "chunks");
     defer alloc.free(manifest_key);
     {
@@ -32180,10 +32181,10 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
     var catalog = try db.artifactInventoryCommand(alloc);
     defer catalog.catalogs.deinit(alloc);
     catalog.binding.effect_protocol = 15;
-    try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
     var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activation.publication_digest = activation.digest();
-    try db.batchRaftReplicatedApply(.{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
     try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
     const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
     try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
@@ -32230,7 +32231,7 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
         try std.testing.expectEqual(@as(usize, 0), harness.calls);
     }
     for (0..2) |pass| {
-        if (pass == 1) try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .timestamp_ns = 101 }, .{ .term = 1, .index = 7 });
+        if (pass == 1) try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .timestamp_ns = 101 }, .{ .term = 1, .index = 7 });
         try std.testing.expectError(error.ArtifactPublicationPending, processChunkText(runtime, chunk_request, &cache, &window));
         try harness.apply(&db, if (pass == 0) 4 else 8);
         const census = @import("../artifact_stream_census.zig");
@@ -32533,8 +32534,8 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
         defer queued.deinit();
         try std.testing.expectEqualDeep(census_command, queued.command);
     }
-    try db.batchRaftReplicatedApply(.{ .artifact_publication = decoded_census.command }, .{ .term = 1, .index = 10 });
-    try db.batchRaftReplicatedApply(.{ .artifact_publication = decoded_census.command }, .{ .term = 1, .index = 10 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = decoded_census.command }, .{ .term = 1, .index = 10 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = decoded_census.command }, .{ .term = 1, .index = 10 });
     {
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
@@ -32547,7 +32548,7 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
     var wrong_generation = census_command;
     wrong_generation.producer_generation += 1;
     wrong_generation.publication_digest = wrong_generation.digest();
-    try db.batchRaftReplicatedApply(.{ .artifact_publication = wrong_generation }, .{ .term = 1, .index = 11 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = wrong_generation }, .{ .term = 1, .index = 11 });
     {
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
@@ -32583,7 +32584,7 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
         cross_document.authority_epoch += 1;
         try std.testing.expectError(error.ArtifactCatalogDrift, local.observeProof("doc", cross_document));
     }
-    try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "other", .value = "{}" }}, .timestamp_ns = 103 }, .{ .term = 1, .index = 12 });
+    try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "other", .value = "{}" }}, .timestamp_ns = 103 }, .{ .term = 1, .index = 12 });
     {
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
@@ -32591,7 +32592,7 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
         try std.testing.expectError(error.EnrichmentSourceChanged, foreign.requireCurrent(&read, "doc"));
         try last_closure.?.requireCurrent(&read, db.root_incarnation);
     }
-    try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"changed\"}" }}, .timestamp_ns = 104 }, .{ .term = 1, .index = 13 });
+    try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"changed\"}" }}, .timestamp_ns = 104 }, .{ .term = 1, .index = 13 });
     {
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
@@ -32604,7 +32605,7 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
         defer writer.abort();
         try std.testing.expectError(error.EnrichmentSourceChanged, stream_progress.stage(&writer, db.root_incarnation, &last_verified.?));
     }
-    try db.batchRaftReplicatedApply(.{ .artifact_publication = census_command }, .{ .term = 1, .index = 14 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = census_command }, .{ .term = 1, .index = 14 });
     {
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
@@ -32709,14 +32710,14 @@ fn testOrderedAssetLifecycle(generated: bool, graph: bool, delete_live: bool) !v
     const asset_body = if (graph) "{\"type\":\"mentions\",\"target\":\"other\"}" else "hello";
     const document = try std.json.Stringify.valueAlloc(alloc, .{ .body = asset_body }, .{});
     defer alloc.free(document);
-    try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = document }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
+    try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = document }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
     var catalog = try db.artifactInventoryCommand(alloc);
     defer catalog.catalogs.deinit(alloc);
     catalog.binding.effect_protocol = 15;
-    try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
     var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activation.publication_digest = activation.digest();
-    try db.batchRaftReplicatedApply(.{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
     try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true, .asset_producer = if (generated) .{ .ptr = &harness, .vtable = &.{
         .produce = Harness.produce,
         .can_produce_batch = Harness.canBatch,
@@ -32752,8 +32753,8 @@ fn testOrderedAssetLifecycle(generated: bool, graph: bool, delete_live: bool) !v
         const deleted = pass == 2 or (delete_live and pass == 1);
         if (pass != 0) {
             if (!deleted) {
-                try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .timestamp_ns = 101 }, .{ .term = 1, .index = pass * entries_per_pass + 3 });
-            } else try db.batchRaftReplicatedApply(.{ .deletes = &.{"doc"}, .timestamp_ns = 102 }, .{ .term = 1, .index = pass * entries_per_pass + 3 });
+                try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .timestamp_ns = 101 }, .{ .term = 1, .index = pass * entries_per_pass + 3 });
+            } else try server_test_adapter.applyOrdered(&db, .{ .deletes = &.{"doc"}, .timestamp_ns = 102 }, .{ .term = 1, .index = pass * entries_per_pass + 3 });
             // The old upstream bytes still exist, but their proof refers to
             // the old primary. No downstream provider may consume them.
             if (!deleted) try std.testing.expectError(error.EnrichmentSourceChanged, processAsset(runtime, downstream, &batch, &prepared_sources, &window, &scope));
@@ -32778,7 +32779,7 @@ fn testOrderedAssetLifecycle(generated: bool, graph: bool, delete_live: bool) !v
             try std.testing.expectError(error.NotFound, read.get(key));
             try std.testing.expectEqualStrings(asset_body, decoded.command.mutations[0].value.?);
         } else try std.testing.expect(decoded.command.mutations[0].value == null);
-        try db.batchRaftReplicatedApply(.{ .artifact_publication = decoded.command }, .{ .term = 1, .index = pass * entries_per_pass + 4 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = decoded.command }, .{ .term = 1, .index = pass * entries_per_pass + 4 });
         if (graph) {
             harness.refuse_next = true;
             try std.testing.expectError(error.QueueFull, processAsset(runtime, request, &batch, &prepared_sources, &window, &scope));
@@ -32787,7 +32788,7 @@ fn testOrderedAssetLifecycle(generated: bool, graph: bool, delete_live: bool) !v
             var graph_command = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
             defer graph_command.deinit();
             try std.testing.expect(graph_command.command.producer_kind == .graph);
-            try db.batchRaftReplicatedApply(.{ .artifact_publication = graph_command.command }, .{ .term = 1, .index = pass * entries_per_pass + 5 });
+            try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = graph_command.command }, .{ .term = 1, .index = pass * entries_per_pass + 5 });
             const edge_key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, "doc", "g", "mentions", "other", "doc");
             defer alloc.free(edge_key);
             var read = try db.core.store.beginReadTxn();
@@ -32810,7 +32811,7 @@ fn testOrderedAssetLifecycle(generated: bool, graph: bool, delete_live: bool) !v
             try std.testing.expectEqualStrings(head, child.command.artifact_sources[1].key);
             try std.testing.expect(child.command.artifact_sources[1].content_digest == null);
         }
-        try db.batchRaftReplicatedApply(.{ .artifact_publication = child.command }, .{ .term = 1, .index = pass * entries_per_pass + entries_per_pass + 2 });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = child.command }, .{ .term = 1, .index = pass * entries_per_pass + entries_per_pass + 2 });
         try processAsset(runtime, downstream, &batch, &prepared_sources, &window, &scope);
         try std.testing.expectEqual((pass + 1) * calls_per_pass, harness.calls);
         var read = try db.core.store.beginReadTxn();

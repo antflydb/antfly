@@ -20,10 +20,11 @@
 //! target LSN satisfies the configured async/remote-write/remote-apply policy.
 
 const std = @import("std");
+const replication_policy = @import("../db/replication_policy.zig");
 const Allocator = std.mem.Allocator;
 const backup_manifest = @import("backup_manifest.zig");
 const replication_log = @import("replication_log.zig");
-const replication_record = @import("replication_record.zig");
+const replication_record = @import("../db/replication_record.zig");
 const slot_store = @import("slot_store.zig");
 const standby_mod = @import("standby.zig");
 const validation = @import("validation.zig");
@@ -65,50 +66,17 @@ pub const BaseBackupEndResult = struct {
     manifest_id: []const u8,
 };
 
-pub const DurabilityMode = enum {
-    async,
-    remote_write,
-    remote_apply,
-};
+pub const DurabilityMode = replication_policy.DurabilityMode;
 
-pub const StandbySelection = enum {
-    any,
-    first,
-    all,
-};
+pub const StandbySelection = replication_policy.StandbySelection;
 
-pub const FailurePolicy = enum {
-    block,
-    fail_closed,
-    degrade_to_async,
-};
+pub const FailurePolicy = replication_policy.FailurePolicy;
 
-pub const SyncPolicy = struct {
-    mode: DurabilityMode = .async,
-    selection: StandbySelection = .any,
-    required: usize = 1,
-    standby_names: []const []const u8 = &.{},
-    failure_policy: FailurePolicy = .block,
-};
+pub const SyncPolicy = replication_policy.SyncPolicy;
 
-pub const DurabilityStatus = enum {
-    satisfied,
-    would_block,
-    fail_closed,
-    degraded_to_async,
-};
+pub const DurabilityStatus = replication_policy.DurabilityStatus;
 
-pub const DurabilityDecision = struct {
-    status: DurabilityStatus,
-    mode: DurabilityMode,
-    selection: StandbySelection,
-    target_lsn: u64,
-    progress_lsn: u64,
-    missing_lsn_count: u64,
-    satisfied_count: usize,
-    required_count: usize,
-    candidate_count: usize,
-};
+pub const DurabilityDecision = replication_policy.DurabilityDecision;
 
 pub const Primary = struct {
     alloc: Allocator,

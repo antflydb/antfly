@@ -32,7 +32,7 @@ const resource_manager_mod = @import("../resource_manager.zig");
 const index_repair_status = @import("../../common/index_repair_status.zig");
 const dense_native_storage_phase = @import("../../common/dense_native_storage_phase.zig");
 const document_content_hash = @import("document_content_hash.zig");
-pub const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+pub const CancellationToken = @import("antfly_cancellation").CancellationToken;
 pub const IndexRepairStatus = index_repair_status.IndexRepairStatus;
 pub const DenseNativeStoragePhase = dense_native_storage_phase.DenseNativeStoragePhase;
 pub const DocumentContentHash = document_content_hash.Digest;
@@ -382,6 +382,7 @@ pub const BatchRequest = struct {
     graph_endpoint_cleanup: bool = false,
     /// Exact leader-selected effects; replicas must never replan this page.
     graph_endpoint_cleanup_planned: bool = false,
+    graph_endpoint_cleanup_guards: []const @import("../graph_cleanup_contract.zig").Guard = &.{},
     graph_writes: []const GraphEdgeWrite = &.{},
     graph_deletes: []const GraphEdgeDelete = &.{},
     predicates: []const TransactionVersionPredicate = &.{},
@@ -1420,7 +1421,7 @@ pub const LookupOptions = struct {
     /// Internal, absolute monotonic deadline used by routed lookups. It is not
     /// part of the public lookup projection contract and is never serialized.
     execution_deadline_ns: ?u64 = null,
-    execution_io: ?@import("../../runtime_io_abi.zig").Borrow = null,
+    execution_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
     /// Borrowed request cancellation source. Callers must keep it alive for
     /// the synchronous lookup call.
     cancellation: ?CancellationToken = null,
@@ -3997,11 +3998,14 @@ pub const IndexRepairWake = union(enum) {
     }
 };
 
-/// Exact data-Raft entry persisted atomically with one document mutation.
-pub const RaftAppliedEntryIdentity = struct {
+/// Exact ordered mutation receipt persisted atomically with primary effects.
+pub const OrderedApplyReceipt = struct {
     term: u64,
     index: u64,
 };
+
+/// Server source compatibility; the durable term/index encoding is unchanged.
+pub const RaftAppliedEntryIdentity = OrderedApplyReceipt;
 
 pub const ArtifactRepairResult = struct {
     scanned: u64 = 0,
@@ -5049,14 +5053,14 @@ pub fn requiresGraphRelationshipProtocol(req: BatchRequest) bool {
 /// attached to a public mutation or a lifecycle control.
 pub fn validateGraphEndpointCleanupCommand(req: BatchRequest) !void {
     if (!req.graph_endpoint_cleanup) {
-        if (req.graph_endpoint_cleanup_planned) return error.InvalidBatchRequest;
+        if (req.graph_endpoint_cleanup_planned or req.graph_endpoint_cleanup_guards.len != 0) return error.InvalidBatchRequest;
         return;
     }
     if (req.graph_endpoint_cleanup_planned) try validatePlannedGraphEndpointCleanup(req);
     const defaults = BatchRequest{};
     inline for (std.meta.fields(BatchRequest)) |field| {
         if (comptime !std.mem.eql(u8, field.name, "graph_endpoint_cleanup") and !std.mem.eql(u8, field.name, "graph_endpoint_cleanup_planned") and !std.mem.eql(u8, field.name, "timestamp_ns") and !std.mem.eql(u8, field.name, "sync_level")) {
-            if (comptime std.mem.eql(u8, field.name, "deletes") or std.mem.eql(u8, field.name, "graph_deletes")) {
+            if (comptime std.mem.eql(u8, field.name, "deletes") or std.mem.eql(u8, field.name, "graph_deletes") or std.mem.eql(u8, field.name, "graph_endpoint_cleanup_guards")) {
                 if (!req.graph_endpoint_cleanup_planned and @field(req, field.name).len != 0) return error.InvalidBatchRequest;
             } else {
                 const value = @field(req, field.name);
@@ -5072,12 +5076,28 @@ pub fn validateGraphEndpointCleanupCommand(req: BatchRequest) !void {
 /// In particular, the constraint exemption never admits a document deletion.
 fn validatePlannedGraphEndpointCleanup(req: BatchRequest) !void {
     const keys = @import("../internal_keys.zig");
-    if (req.graph_deletes.len + req.deletes.len > 256) return error.InvalidBatchRequest;
+    if (req.graph_deletes.len + req.deletes.len > 256 or req.graph_endpoint_cleanup_guards.len > 256) return error.InvalidBatchRequest;
+    const contract = @import("../graph_cleanup_contract.zig");
+    for (req.graph_endpoint_cleanup_guards, 0..) |guard, i| {
+        for (req.graph_endpoint_cleanup_guards[0..i]) |prior| if (std.mem.eql(u8, guard.endpoint, prior.endpoint)) return error.InvalidBatchRequest;
+    }
     for (req.deletes) |key| {
         if (!std.mem.startsWith(u8, key, keys.graph_endpoint_cleanup_prefix) or key.len != keys.graph_endpoint_cleanup_prefix.len + 64) return error.InvalidBatchRequest;
         for (key[keys.graph_endpoint_cleanup_prefix.len..]) |byte| if (!std.ascii.isHex(byte)) return error.InvalidBatchRequest;
+        var covered = false;
+        for (req.graph_endpoint_cleanup_guards) |guard| if (contract.matchesKey(key, guard.endpoint)) {
+            covered = true;
+            break;
+        };
+        if (!covered) return error.InvalidBatchRequest;
     }
     for (req.graph_deletes) |edge| {
         if (edge.owner_document.len != 0 or edge.index_name.len == 0 or edge.source.len == 0 or edge.target.len == 0) return error.InvalidBatchRequest;
+        var covered = false;
+        for (req.graph_endpoint_cleanup_guards) |guard| if (std.mem.eql(u8, guard.endpoint, edge.target)) {
+            covered = true;
+            break;
+        };
+        if (!covered) return error.InvalidBatchRequest;
     }
 }
