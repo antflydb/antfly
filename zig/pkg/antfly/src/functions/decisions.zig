@@ -127,10 +127,16 @@ pub fn validateQuestions(questions: Json, caps: Capabilities) !void {
         if (schema_bytes > caps.max_input_bytes) return error.DecisionLimitExceeded;
     }
 }
+fn parseSpecificationJson(a: std.mem.Allocator, bytes: []const u8) !Json {
+    return std.json.parseFromSliceLeaky(Json, a, bytes, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidDecisionSpecification,
+    };
+}
 pub fn questionsFor(a: std.mem.Allocator, function: Function, args: []const Json) !Json {
     if (args.len != descriptor(@tagName(function)).?.argument_count) return error.InvalidDecisionSpecification;
     if (function == .ai_decide) {
-        if (args[1] == .string) return std.json.parseFromSliceLeaky(Json, a, args[1].string, .{ .allocate = .alloc_always });
+        if (args[1] == .string) return parseSpecificationJson(a, args[1].string);
         return args[1];
     }
     var question = jsonObject();
@@ -142,7 +148,7 @@ pub fn questionsFor(a: std.mem.Allocator, function: Function, args: []const Json
     };
     try put(a, &question, "type", .{ .string = @tagName(kind) });
     try put(a, &question, "instructions", args[1]);
-    if (kind != .noul) try put(a, &question, "criteria", if (args[2] == .string) try std.json.parseFromSliceLeaky(Json, a, args[2].string, .{ .allocate = .alloc_always }) else args[2]);
+    if (kind != .noul) try put(a, &question, "criteria", if (args[2] == .string) try parseSpecificationJson(a, args[2].string) else args[2]);
     var questions = jsonObject();
     try put(a, &questions, "answer", question);
     return questions;

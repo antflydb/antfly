@@ -2179,6 +2179,17 @@ pub const SemanticResolver = struct {
     }
 };
 
+fn applyDecisionGraphInputProjection(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest) !void {
+    if (req.evaluation_limit == 0) return;
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const raw = try std.json.parseFromSliceLeaky(std.json.Value, scratch.allocator(), req.evaluation_json, .{});
+    const plan = try @import("../functions/expressions.zig").Plan.parse(scratch.allocator(), raw);
+    if (plan.graph_query) |name| for (@constCast(req.graph_queries)) |*graph| {
+        if (std.mem.eql(u8, graph.name, name)) graph.query.defer_document_projection = true;
+    };
+}
+
 fn applyCommonSearchRequestOptions(
     alloc: std.mem.Allocator,
     request: anytype,
@@ -2777,6 +2788,7 @@ pub fn parseQueryRequestWithDeadline(
     if (contract_fields.has_embedding_limits)
         try applyInternalEmbeddingLimits(alloc, effective_body, &req);
     req.graph_queries = try buildGraphQueries(alloc, request);
+    try applyDecisionGraphInputProjection(alloc, &req);
     req.graph_metric_queries = try parseGraphMetricQueriesAlloc(alloc, effective_body);
     req.graph_metric_rerank = try parseGraphMetricRerankAlloc(alloc, request.graph_metric_rerank, effective_body);
     if (req.graph_metric_rerank) |rerank| {
@@ -3201,6 +3213,7 @@ fn buildPreflightSearchRequestAlloc(
     req.sparse_queries = vector_queries.sparse;
     try normalizeVectorMatchAllComponent(alloc, request, &req);
     req.graph_queries = try buildGraphQueries(alloc, request);
+    try applyDecisionGraphInputProjection(alloc, &req);
     if (comptime @hasField(@TypeOf(request), "expand_strategy")) {
         if (request.expand_strategy) |expand_strategy| {
             req.expand_strategy = try parseExpandStrategy(expand_strategy);
@@ -5016,6 +5029,10 @@ const GraphDocumentLookup = struct {
         hits: []const db_mod.types.SearchHit,
         enabled: bool,
     ) !GraphDocumentLookup {
+        return initProjected(alloc, hits, enabled, .{});
+    }
+
+    fn initProjected(alloc: std.mem.Allocator, hits: []const db_mod.types.SearchHit, enabled: bool, projection: db_mod.types.LookupOptions) !GraphDocumentLookup {
         var self = GraphDocumentLookup{ .enabled = enabled };
         errdefer self.deinit(alloc);
         if (!enabled) return self;
@@ -5027,8 +5044,7 @@ const GraphDocumentLookup = struct {
             };
             if (self.entries.contains(identity)) continue;
             const parsed_document = if (hit.stored_data) |stored_data|
-                ant_json.parseFromSliceLeaky(std.json.ArrayHashMap(std.json.Value), alloc, stored_data, .{}) catch
-                    return error.InvalidRemoteResponse
+                try takeOpenApiObjectMap(alloc, try projectPublicStoredSourceValue(alloc, stored_data, projection))
             else
                 null;
             _ = try self.entries.putIfAbsent(alloc, identity, .{ .document = parsed_document });
@@ -5077,10 +5093,11 @@ fn toOpenApiStatefulGraphResultWithFormat(
     graph_result: db_mod.types.GraphSearchResult,
     response_format: GraphResponseFormat,
 ) !indexes_openapi.StatefulGraphResult {
-    var document_lookup = try GraphDocumentLookup.init(
+    var document_lookup = try GraphDocumentLookup.initProjected(
         alloc,
         graph_result.hits,
         query.include_documents,
+        .{ .fields = query.fields, .include_all_fields = query.include_all_fields },
     );
     defer document_lookup.deinit(alloc);
 

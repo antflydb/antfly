@@ -7,10 +7,11 @@ const httpx = @import("httpx");
 const decisions = @import("decisions.zig");
 const registry_mod = @import("../common/provider_registry.zig");
 const secrets = @import("../common/secrets.zig");
-const execution = @import("../inference/execution_context.zig");
+const execution = @import("antfly_inference_execution_context");
 const quotas = @import("../common/provider_limits.zig");
 const admission_mod = @import("../common/request_admission.zig");
 const managed = @import("../inference/managed_embedder.zig");
+pub const max_response_bytes = 1024 * 1024;
 var admission: admission_mod.RequestAdmission = admission_mod.RequestAdmission.init(16);
 
 fn operationalError(err: anyerror) anyerror {
@@ -25,14 +26,14 @@ fn operationalError(err: anyerror) anyerror {
         error.DecisionUpstreamFailure,
         error.InvalidDecisionOutput,
         => err,
-        error.ProviderTokenBudgetExceeded => error.DecisionLimitExceeded,
+        error.ResponseTooLarge, error.ProviderTokenBudgetExceeded => error.DecisionLimitExceeded,
         error.InvalidRateLimitPolicy, error.ConflictingRateLimitPolicy => error.InvalidDeciderConfig,
         error.SecretNotFound => error.MissingDecisionApiKey,
         else => error.DecisionUpstreamFailure,
     };
 }
 fn parseResponse(a: std.mem.Allocator, bytes: []const u8) !decisions.Json {
-    if (bytes.len > 1024 * 1024) return error.DecisionLimitExceeded;
+    if (bytes.len > max_response_bytes) return error.DecisionLimitExceeded;
     return std.json.parseFromSliceLeaky(decisions.Json, a, bytes, .{ .allocate = .alloc_always }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidDecisionOutput;
 }
 
@@ -137,6 +138,9 @@ pub const Runtime = struct {
             const ctx = self.runtime.context;
             var response = self.runtime.http.post(url, .{
                 .json = body,
+                .max_response_size = max_response_bytes,
+                .max_retries = 0,
+                .cookies_enabled = false,
                 .attempt_observer = observer,
                 .headers = headers[0..count],
                 .timeout_ms = if (ctx) |context| try context.remainingTimeoutMs() else 30000,
@@ -294,6 +298,49 @@ test "decision functions Antfly and Jev HTTP adapters preserve payload credentia
     }
     try std.testing.expectError(error.DecisionLimitExceeded, runtime.provider().evaluateBatch(arena.allocator(), &.{.{ .input = "refund", .decider = "local", .questions = questions }}));
     var cancelled = std.atomic.Value(bool).init(true);
-    runtime.context = .{ .io = io, .deadline_ns = null, .cancellation = @import("../common/cancellation.zig").CancellationToken.fromAtomic(&cancelled) };
+    runtime.context = .{ .io = io, .deadline_ns = null, .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&cancelled) };
     try std.testing.expectError(error.Cancelled, runtime.provider().evaluateBatch(arena.allocator(), &.{.{ .input = "refund", .decider = "local", .questions = questions }}));
+}
+
+test "decision functions HTTP ceiling rejects oversized advertised bodies before downloading" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const oversized = try a.alloc(u8, max_response_bytes + 1);
+    defer a.free(oversized);
+    @memset(oversized, 'x');
+    var server = try httpx.TestServer.start(a, io, &.{
+        .{ .method = .POST, .path = "/decide", .max_uses = 1, .respond = .{ .body = oversized, .truncate_body_at = 0 } },
+        .{ .method = .POST, .path = "/v1/systemone", .max_uses = 1, .respond = .{ .body = oversized, .truncate_body_at = 0 } },
+    });
+    defer server.deinit();
+    var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false, .max_response_size = 64 * 1024 * 1024 });
+    defer client.deinit();
+    var registry = registry_mod.Registry.init(a);
+    defer registry.deinit();
+    try registry.registerDeciderConfig("local", .{ .provider = .antfly, .model = "mock", .url = server.baseUrl() });
+    try registry.registerDeciderConfig("remote", .{ .provider = .jev, .api_key = "test", .url = server.baseUrl() });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const questions = try decisions.questionsFor(arena.allocator(), .ai_probability, &.{ .{ .string = "refund" }, .{ .string = "Refund?" }, .{ .string = "local" } });
+    const Run = struct {
+        fn run(r: *Runtime, alloc: std.mem.Allocator, name: []const u8, q: decisions.Json, failure: *?anyerror) void {
+            _ = r.provider().evaluateBatch(alloc, &.{.{ .decider = name, .questions = q, .input = "refund" }}) catch |err| {
+                failure.* = err;
+                return;
+            };
+        }
+    };
+    for ([_][]const u8{ "local", "remote" }) |name| {
+        var runtime: Runtime = .{ .registry = &registry, .http = &client, .io = io };
+        var failure: ?anyerror = null;
+        var group = std.Io.Group.init;
+        defer group.cancel(io);
+        try group.concurrent(io, Run.run, .{ &runtime, arena.allocator(), name, questions, &failure });
+        try server.handleOne();
+        try group.await(io);
+        try std.testing.expectEqual(@as(?anyerror, error.DecisionLimitExceeded), failure);
+        try std.testing.expectEqual(@as(u64, 0), runtime.rows);
+    }
 }

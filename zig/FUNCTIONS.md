@@ -174,9 +174,12 @@ ordinary scalar evaluation. Avoid blocking provider I/O inside per-row
 Evaluate join-dependent calls once referenced columns exist. Initially exclude
 external calls from schema/index expressions, constraints, and row policies.
 
-CTE and derived-table expressions evaluate bounded pages, including predicates
-and projections. Projection inference runs only for rows surviving the relation's
-predicate and OFFSET/LIMIT. Reusing a computed CTE column does not re-evaluate it.
+CTE and derived-table expressions evaluate bounded pages with row and byte
+ceilings, including predicates and projections. Projection inference runs only
+for rows surviving the relation's predicate and OFFSET/LIMIT. Streaming execution
+validates nested decision specifications before opening reads. Ordering
+expressions evaluate in bounded batches over qualifying rows, including grouped
+and windowed results. Reusing a computed CTE column does not re-evaluate it.
 
 Decision functions also work in mutation expressions, including MERGE arms,
 conflict-update predicates and assignments, and RETURNING. Validate every bound
@@ -295,13 +298,16 @@ than filtering out rows. Provider HTTP failures expose bounded diagnostics.
 Worker requests carry the retrieval projection required by coordinator-owned
 evaluation, independently of the caller's final projection. Deferred projection
 fetches complete stored inputs from local and remote shards; the coordinator
-applies the original output fields. Text-only source templates are supported for
+applies the original output fields. Graph MATCH hydration follows the same rule:
+evaluation inputs are fetched independently of returned document fields, which
+are applied during response encoding. Text-only source templates are supported for
 materialized decisions, including rendered neighbor context. Media and malformed
 content parts remain unsupported.
 
 Request admission is bounded, with up to 32 concurrent single-state requests
 per batch, shared deadlines/cancellation, per-query row/token budgets, and
-8 MiB per transport job. The conservative token reservation happens before
+8 MiB per transport job and a 1 MiB HTTP response ceiling enforced before
+downloading the body. The conservative token reservation happens before
 inference; actual usage is checked after each response as well. A failing batch
 may already have consumed upstream tokens. No automatic retries or provider
 fallback occur.

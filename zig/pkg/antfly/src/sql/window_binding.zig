@@ -91,6 +91,9 @@ const Builder = struct {
         return index;
     }
     fn rewrite(self: *Builder, node_: *const ast.Scalar) anyerror!*const ast.Scalar {
+        // Configuration literals and parameters must remain statement constants
+        // when scalar functions consume window results.
+        if (scalar.statementConstant(node_)) return node_;
         if (!contains(node_)) return self.slot("input", try self.input(node_));
         if (node_.* == .call and node_.call.window != null) {
             const call = node_.call;

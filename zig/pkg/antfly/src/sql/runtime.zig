@@ -429,11 +429,15 @@ pub const Context = struct {
                 try @import("decision_eval.zig").evaluateBatch(page_arena.allocator(), self.backend.decision_provider, program, selected_cells.items, self.parameters)
             else
                 null;
+            const order_values = try page_arena.allocator().alloc(?[]const Datum, self.binding.scalars.orders.len);
+            for (self.binding.scalars.orders, order_values) |optional, *values| values.* = if (top_k != null and optional != null)
+                try @import("decision_eval.zig").evaluateBatch(page_arena.allocator(), self.backend.decision_provider, &optional.?, selected_cells.items, self.parameters)
+            else
+                null;
             for (page.rows, 0..) |row, row_index| {
                 try self.checkpoint();
                 visited += 1;
                 if (visited > self.limits.scan_rows) return error.SqlProgramLimitExceeded;
-                const expression_cells = page_cells[row_index];
                 if (predicate_values) |values| {
                     if (values[row_index].sql_null) continue;
                     if (values[row_index].value != .bool) return error.SqlTypeMismatch;
@@ -452,7 +456,7 @@ pub const Context = struct {
                     const keys = try page_arena.allocator().alloc(Datum, self.binding.order_keys.len);
                     for (self.binding.order_keys, keys) |key, *out| out.* = switch (key.source) {
                         .output => |index| values[index],
-                        .expression => |index| try self.evaluate(page_arena.allocator(), self.binding.scalars.orders[index].?, expression_cells),
+                        .expression => |index| order_values[index].?[selected_positions[row_index].?],
                         .column => |column| blk: {
                             const cell = try row.cell(column.path);
                             break :blk .{ .value = try coerce(page_arena.allocator(), cell.value, column.type), .sql_null = cell.sql_null };
@@ -2386,4 +2390,52 @@ test "SQL virtual relation byte pages preserve continuation and release exhauste
     try std.testing.expectEqualStrings("5000", result.output.rows[0][0].string);
     try std.testing.expectEqual(backend.statement_opens, backend.statement_closes);
     try std.testing.expect(result.peakMemoryBytes() < 512 * 1024);
+}
+
+test "SQL decision ordering batches qualifying rows and preserves lazy evaluation" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { sql: []const u8, calls: usize, rows: usize }{
+        .{ .sql = "WITH q AS (SELECT id FROM things) SELECT id FROM q ORDER BY ai_probability(CAST(id AS TEXT),'Refund?','local') DESC LIMIT 3", .calls = 19, .rows = 3 },
+        .{ .sql = "WITH q AS (SELECT _id FROM things) SELECT _id,count(*) FROM q GROUP BY _id ORDER BY ai_probability(CAST(count(*) AS TEXT),'Refund?','local') DESC LIMIT 3", .calls = 19, .rows = 3 },
+        .{ .sql = "WITH q AS (SELECT _id FROM things) SELECT _id,row_number() OVER (ORDER BY _id) AS n FROM q ORDER BY ai_probability(CAST(row_number() OVER (ORDER BY _id) AS TEXT),'Refund?','local') DESC LIMIT 3", .calls = 19, .rows = 3 },
+        .{ .sql = "WITH q AS (SELECT _id FROM things) SELECT _id FROM q WHERE _id<>'0' ORDER BY ai_probability(_id,'Refund?','local') DESC LIMIT 3", .calls = 18, .rows = 3 },
+        .{ .sql = "WITH q AS (SELECT id FROM things) SELECT id FROM q ORDER BY CASE WHEN FALSE THEN ai_probability(CAST(id AS TEXT),'Refund?','local') ELSE 0 END LIMIT 3", .calls = 0, .rows = 3 },
+        .{ .sql = "WITH q AS (SELECT id FROM things) SELECT id FROM q ORDER BY ai_probability(CAST(id AS TEXT),'Refund?','local') LIMIT 0", .calls = 0, .rows = 0 },
+    };
+    for (cases) |case| {
+        var fixture: TestBackend = .{ .row_count = 19 };
+        var mock: @import("decision_eval.zig").testing.Provider = .{};
+        var backend = fixture.coordinated();
+        backend.decision_provider = mock.provider();
+        var compiled = try compiler.compile(a, case.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, backend, &compiled, &.{}, .{ .page_rows = 4 });
+        defer result.deinit();
+        try std.testing.expectEqual(case.calls, mock.calls);
+        try std.testing.expectEqual(case.rows, result.output.rows.len);
+        try std.testing.expectEqual(@as(usize, if (case.calls == 0) 0 else 4), mock.max_batch);
+        try std.testing.expectEqual(fixture.statement_opens, fixture.statement_closes);
+    }
+}
+
+test "SQL malformed decision specifications report client errors before reads" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT ai_decide('refund','{','local') FROM things",
+        "SELECT ai_choice('refund','Refund?','{','local') FROM things",
+        "SELECT ai_score('refund','Urgency','[','local') FROM things",
+    }) |sql| {
+        var fixture: TestBackend = .{};
+        var mock: @import("decision_eval.zig").testing.Provider = .{};
+        var backend = fixture.coordinated();
+        backend.decision_provider = mock.provider();
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.InvalidDecisionSpecification, execute(a, backend, &compiled, &.{}, .{}));
+        try std.testing.expectEqual(@as(usize, 0), fixture.pages);
+        try std.testing.expectEqual(@as(usize, 0), mock.calls);
+    }
+    const diagnostic = @import("errors.zig").describe(error.InvalidDecisionSpecification);
+    try std.testing.expectEqualStrings("22023", diagnostic.code);
+    try std.testing.expectEqual(@as(u16, 400), diagnostic.httpStatus());
 }

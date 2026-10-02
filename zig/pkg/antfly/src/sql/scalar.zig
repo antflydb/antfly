@@ -172,7 +172,7 @@ fn literalType(value: ast.Value) Type {
         .string => .string,
     }, .nullable = value == .null or value == .parameter };
 }
-fn statementConstant(node: *const ast.Scalar) bool {
+pub fn statementConstant(node: *const ast.Scalar) bool {
     return switch (node.*) {
         .literal => true,
         .cast => |cast| statementConstant(cast.operand),

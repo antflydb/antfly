@@ -2048,7 +2048,7 @@ fn buildPatternDocumentHits(
 
         const documents = if (query.include_documents) blk: {
             if (executor.load_projected_documents) |load_many| {
-                const loaded = try load_many(executor.ctx, alloc, query, keys[0..batch_len]);
+                const loaded = try load_many(executor.ctx, alloc, query.documentRetrievalQuery(), keys[0..batch_len]);
                 if (loaded.len != batch_len) {
                     freeOptionalOwnedBytes(alloc, loaded);
                     return error.InvalidQueryResult;
@@ -2064,7 +2064,7 @@ fn buildPatternDocumentHits(
                 if (loaded.len > 0) alloc.free(loaded);
             }
             for (keys[0..batch_len], 0..) |key, i| {
-                loaded[i] = try executor.load_projected_document(executor.ctx, alloc, query, key);
+                loaded[i] = try executor.load_projected_document(executor.ctx, alloc, query.documentRetrievalQuery(), key);
                 initialized += 1;
             }
             break :blk loaded;
@@ -6039,7 +6039,7 @@ test "cloneNamedSetAsResult preserves hit ordinals" {
     try std.testing.expectEqualStrings("{\"title\":\"A\"}", with_stored.hits[0].stored_data.?);
 }
 
-test "buildPatternDocumentHits preserves resolved binding ordinals" {
+test "decision functions graph hydration fetches hidden inputs and preserves binding ordinals" {
     const alloc = std.testing.allocator;
 
     var bindings = try alloc.alloc(types.GraphPatternBinding, 2);
@@ -6071,6 +6071,7 @@ test "buildPatternDocumentHits preserves resolved binding ordinals" {
 
     const Harness = struct {
         batch_loaded: bool = false,
+        full_inputs: bool = false,
         seen_generation: ?u64 = null,
 
         fn matchPattern(
@@ -6102,9 +6103,11 @@ test "buildPatternDocumentHits preserves resolved binding ordinals" {
         ) anyerror![]?[]u8 {
             const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
             self.batch_loaded = true;
-            try std.testing.expect(!query.include_all_fields);
-            try std.testing.expectEqual(@as(usize, 1), query.fields.len);
-            try std.testing.expectEqualStrings("title", query.fields[0]);
+            try std.testing.expectEqual(self.full_inputs, query.include_all_fields);
+            if (self.full_inputs) try std.testing.expectEqual(@as(usize, 0), query.fields.len) else {
+                try std.testing.expectEqual(@as(usize, 1), query.fields.len);
+                try std.testing.expectEqualStrings("title", query.fields[0]);
+            }
             try std.testing.expectEqual(@as(usize, 2), keys.len);
             try std.testing.expectEqualStrings("doc:a", keys[0]);
             try std.testing.expectEqualStrings("doc:b", keys[1]);
@@ -6166,6 +6169,28 @@ test "buildPatternDocumentHits preserves resolved binding ordinals" {
     try std.testing.expectEqualStrings("doc:b", hits[1].id);
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 12), hits[1].doc_ordinal);
     try std.testing.expectEqualStrings("{\"title\":\"binding-1\"}", hits[1].stored_data.?);
+
+    harness.full_inputs = true;
+    const decision_hits = try buildPatternDocumentHits(alloc, .{
+        .query_type = .pattern,
+        .index_name = "graph",
+        .start_nodes = .{ .keys = &.{} },
+        .include_documents = true,
+        .fields = &.{"title"},
+        .include_all_fields = false,
+        .defer_document_projection = true,
+    }, 42, &matches, .{
+        .ctx = &harness,
+        .match_pattern = Harness.matchPattern,
+        .load_projected_document = Harness.loadProjectedDocument,
+        .load_projected_documents = Harness.loadProjectedDocuments,
+        .lookup_doc_ordinal = Harness.lookupOrdinal,
+    });
+    defer {
+        for (decision_hits) |*hit| hit.deinit(alloc);
+        alloc.free(decision_hits);
+    }
+    try std.testing.expectEqual(@as(usize, 2), decision_hits.len);
 
     bindings[1].node.table = try alloc.dupe(u8, "entities");
     try std.testing.expectError(error.UnsupportedQueryRequest, buildPatternDocumentHits(

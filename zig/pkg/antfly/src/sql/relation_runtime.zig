@@ -428,6 +428,7 @@ fn Engine(comptime Context: type) type {
                     const scratch = self.scratch.allocator();
                     self.query_buffer = &.{};
                     self.query_buffer_index = 0;
+                    var page_bytes: usize = 0;
                     var rows: std.ArrayList(catalog.Row) = .empty;
                     var cells: std.ArrayList([]const Datum) = .empty;
                     const wanted = @min(context.limits.page_rows, self.query_remaining +| self.query_skip);
@@ -443,6 +444,8 @@ fn Engine(comptime Context: type) type {
                         const row: catalog.Row = .{ .id = "", .version = 0, .value = .{ .object = object }, .sql_nulls = nulls };
                         try rows.append(scratch, row);
                         try cells.append(scratch, try context.binding.scalars.cells(scratch, row));
+                        for (input) |cell| page_bytes +|= try operators.datumBytes(cell);
+                        if (page_bytes >= context.limits.page_bytes) break;
                     }
                     if (rows.items.len == 0) return null;
                     const predicates = if (context.binding.scalars.predicate) |*program|

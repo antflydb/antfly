@@ -78,6 +78,46 @@ fn addRows(context: anytype, bound: *const binding.Bound, grouped: *operators.Gr
     for (keys, inputs) |key, input| try grouped.add(key, input);
 }
 
+fn addGroupedDecisionPages(context: anytype, bound: *const binding.Bound, grouped: *operators.Grouped, top: *operators.TopK) !void {
+    const decision = @import("decision_eval.zig");
+    var begin: usize = 0;
+    while (begin < grouped.groupCount()) {
+        try context.checkpoint();
+        var arena = std.heap.ArenaAllocator.init(context.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var cells: std.ArrayList([]const Datum) = .empty;
+        var ordinals: std.ArrayList(u64) = .empty;
+        var bytes: usize = 0;
+        while (begin < grouped.groupCount() and cells.items.len < context.limits.page_rows) {
+            const group = try grouped.resultAt(a, begin);
+            const row = try a.alloc(Datum, group.keys.len + group.aggregates.len);
+            @memcpy(row[0..group.keys.len], group.keys);
+            @memcpy(row[group.keys.len..], group.aggregates);
+            try cells.append(a, row);
+            try ordinals.append(a, group.ordinal);
+            begin += 1;
+            for (row) |cell| bytes +|= try operators.datumBytes(cell);
+            if (bytes >= context.limits.page_bytes) break;
+        }
+        const predicates = if (bound.having) |*program| try decision.evaluateBatch(a, context.backend.decision_provider, program, cells.items, context.parameters) else null;
+        var accepted: std.ArrayList([]const Datum) = .empty;
+        var positions: std.ArrayList(usize) = .empty;
+        for (cells.items, 0..) |row, index| {
+            if (predicates) |values| {
+                if (values[index].sql_null) continue;
+                if (values[index].value != .bool) return error.SqlTypeMismatch;
+                if (!values[index].value.bool) continue;
+            }
+            try accepted.append(a, row);
+            try positions.append(a, index);
+        }
+        const values = try decision.evaluateProgramsBatch(a, context.backend.decision_provider, bound.outputs, accepted.items, context.parameters);
+        const keys = try decision.evaluateProgramsBatch(a, context.backend.decision_provider, bound.orders, accepted.items, context.parameters);
+        for (values, keys, positions.items) |row, order, index| try top.add(.{ .values = row, .keys = order, .ordinal = ordinals.items[index] });
+    }
+}
+
 pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").Output {
     const bound = context.binding.aggregate orelse return error.InvalidSqlBackendResponse;
     try bound.input.validateDecisions(context.arena, context.parameters, context.backend.decision_provider);
@@ -148,7 +188,12 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
     // large INSERT source) without changing which rows can be returned.
     var top = try operators.TopK.init(context.alloc, @min(capacity, grouped.groupCount()), orders, context.limits.retained_bytes);
     defer top.deinit();
-    for (0..grouped.groupCount()) |index| {
+    const decision = @import("decision_eval.zig");
+    const external_results = decision.hasExternalPrograms(bound.outputs) or decision.hasExternalPrograms(bound.orders) or
+        (if (bound.having) |*program| decision.hasExternal(program) else false);
+    if (external_results) {
+        try addGroupedDecisionPages(context, bound, grouped, &top);
+    } else for (0..grouped.groupCount()) |index| {
         try context.checkpoint();
         var arena = std.heap.ArenaAllocator.init(context.alloc);
         defer arena.deinit();

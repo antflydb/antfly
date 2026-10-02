@@ -556,7 +556,27 @@ pub fn execute(context: anytype, statement: ast.Select) anyerror!@import("runtim
     defer top.deinit();
     var eval = std.heap.ArenaAllocator.init(context.alloc);
     defer eval.deinit();
-    for (cells, 0..) |row, index| {
+    const decision = @import("decision_eval.zig");
+    if (decision.hasExternalPrograms(bound.outputs) or decision.hasExternalPrograms(bound.orders)) {
+        var begin: usize = 0;
+        while (begin < cells.len) {
+            try context.checkpoint();
+            if (!eval.reset(.retain_capacity)) return error.OutOfMemory;
+            const a = eval.allocator();
+            var page: std.ArrayList([]const Datum) = .empty;
+            var bytes: usize = 0;
+            while (begin + page.items.len < cells.len and page.items.len < context.limits.page_rows) {
+                const row = cells[begin + page.items.len];
+                try page.append(a, row);
+                for (row) |cell| bytes +|= try operators.datumBytes(cell);
+                if (bytes >= context.limits.page_bytes) break;
+            }
+            const values = try decision.evaluateProgramsBatch(a, context.backend.decision_provider, bound.outputs, page.items, context.parameters);
+            const keys = try decision.evaluateProgramsBatch(a, context.backend.decision_provider, bound.orders, page.items, context.parameters);
+            for (values, keys, 0..) |row, order, index| try top.add(.{ .values = row, .keys = order, .ordinal = begin + index });
+            begin += page.items.len;
+        }
+    } else for (cells, 0..) |row, index| {
         try context.checkpoint();
         _ = eval.reset(.retain_capacity);
         const values = try eval.allocator().alloc(Datum, bound.outputs.len);

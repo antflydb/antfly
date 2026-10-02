@@ -249,7 +249,7 @@ pub const Stream = struct {
         const params = try arena.alloc(Json, parameters.len);
         for (parameters, params) |value, *out| out.* = try self.context.outputValue(value);
         self.context.parameters = params;
-        try binding.scalars.validateDecisions(arena, params, statement_backend.decision_provider);
+        try @import("decision_eval.zig").validateStatement(arena, statement_backend.decision_provider, binding, params);
         const table = binding.table.?;
         const predicates = try self.context.conditions(table, statement.predicate);
         var fields: std.ArrayList([]const u8) = .empty;
@@ -470,4 +470,24 @@ test "SQL decisions pull streaming batches predicates before offset and projecti
     try std.testing.expectEqual(@as(usize, 2), page.output.rows.len);
     try std.testing.expectEqual(@as(usize, 5), fake.calls);
     try std.testing.expectEqual(@as(usize, 3), fake.max_batch);
+}
+
+test "SQL decision streams validate nested specifications before opening reads" {
+    const a = std.testing.allocator;
+    const queries = [_][]const u8{
+        "WITH q AS (SELECT CASE WHEN FALSE THEN ai_decide(CAST(n AS TEXT), '{}', 'local') ELSE NULL END AS p FROM docs) SELECT p FROM q",
+        "SELECT p FROM (SELECT ai_decide(CAST(n AS TEXT), $1::jsonb, 'local') AS p FROM docs LIMIT 0) q",
+    };
+    for (queries, 0..) |sql, i| {
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var mock: @import("decision_eval.zig").testing.Provider = .{};
+        var backend = fixture.backend();
+        backend.decision_provider = mock.provider();
+        const parameters: []const Json = if (i == 0) &.{} else &.{.{ .object = .empty }};
+        try std.testing.expectError(error.DecisionLimitExceeded, Stream.open(a, backend, &compiled, parameters, .{}));
+        try std.testing.expectEqual(@as(usize, 0), fixture.opened);
+        try std.testing.expectEqual(@as(usize, 0), mock.calls);
+    }
 }

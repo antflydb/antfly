@@ -133,6 +133,22 @@ pub fn evaluateBatch(a: std.mem.Allocator, provider: ?decisions.DecisionProvider
     }
     return output;
 }
+/// Evaluate a bounded relation page against several independent scalar programs.
+/// Each program retains its own conditional demand and per-occurrence results.
+pub fn evaluateProgramsBatch(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, programs: []const scalar.Program, rows: []const []const scalar.Datum, parameters: []const std.json.Value) ![]const []const scalar.Datum {
+    const output = try a.alloc([]scalar.Datum, rows.len);
+    for (output) |*row| row.* = try a.alloc(scalar.Datum, programs.len);
+    for (programs, 0..) |*program, column| {
+        const values = try evaluateBatch(a, provider, program, rows, parameters);
+        for (output, values) |row, value| row[column] = value;
+    }
+    return output;
+}
+pub fn hasExternalPrograms(programs: []const scalar.Program) bool {
+    for (programs) |*program| if (hasExternal(program)) return true;
+    return false;
+}
+
 pub fn evaluate(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, program: *const scalar.Program, cells: []const scalar.Datum, parameters: []const std.json.Value) !scalar.Datum {
     if (!hasExternal(program)) return program.evaluate(a, cells, parameters, .{});
     return (try evaluateBatch(a, provider, program, &.{cells}, parameters))[0];

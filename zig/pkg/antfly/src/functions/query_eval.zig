@@ -244,7 +244,7 @@ test "decision functions candidate filtering sorting and aggregates reuse a name
     const a = std.testing.allocator;
     const Fake = struct {
         calls: std.atomic.Value(usize) = .init(0),
-        fn decide(ptr: *anyopaque, alloc: std.mem.Allocator, body: []const u8, _: ?@import("../inference/execution_context.zig").RequestContext) ![]u8 {
+        fn decide(ptr: *anyopaque, alloc: std.mem.Allocator, body: []const u8, _: ?@import("antfly_inference_execution_context").RequestContext) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             _ = self.calls.fetchAdd(1, .monotonic);
             const parsed = try std.json.parseFromSlice(Json, alloc, body, .{});
@@ -294,7 +294,7 @@ test "decision functions candidate filtering sorting and aggregates reuse a name
     const matches = "{\"scope\":\"matches\",\"max_rows\":3,\"compute\":{\"x\":{\"literal\":1}}}";
     try std.testing.expectError(error.DecisionLimitExceeded, apply(a, .{ .evaluation_json = matches, .evaluation_limit = 3, .evaluation_matches = true }, &incomplete, &meta, options));
     const graph_hits = try a.alloc(types.SearchHit, 2);
-    for (graph_hits, 0..) |*hit, i| hit.* = .{ .id = try std.fmt.allocPrint(a, "node{d}", .{i}), .stored_data = try a.dupe(u8, if (i == 0) "{\"body\":\"refund\"}" else "{\"body\":\"other\"}") };
+    for (graph_hits, 0..) |*hit, i| hit.* = .{ .id = try std.fmt.allocPrint(a, "node{d}", .{i}), .stored_data = try a.dupe(u8, if (i == 0) "{\"title\":\"Public\",\"body\":\"refund\"}" else "{\"title\":\"Public\",\"body\":\"other\"}") };
     const graph_matches = try a.alloc(types.GraphPatternMatch, 2);
     for (graph_matches, 0..) |*match, i| {
         const bindings = try a.alloc(types.GraphPatternBinding, 1);
@@ -306,7 +306,27 @@ test "decision functions candidate filtering sorting and aggregates reuse a name
     var graph_result: types.SearchResult = .{ .alloc = a, .hits = &.{}, .total_hits = 0, .graph_results = graphs };
     defer graph_result.deinit();
     const graph_stage = "{\"graph_query\":\"customers\",\"scope\":\"matches\",\"max_rows\":2,\"compute\":{\"p\":{\"call\":\"ai_probability\",\"input\":{\"field\":\"customer.document.body\"},\"statement\":\"Refund?\",\"decider\":\"local\"}},\"where\":{\"gte\":[{\"ref\":\"p\"},{\"literal\":0.8}]}}";
-    try apply(a, .{ .evaluation_json = graph_stage, .evaluation_limit = 2, .limit = 2 }, &graph_result, &meta, options);
+    const query = @import("../api/query_contract.zig");
+    const body = try std.fmt.allocPrint(a, "{{\"limit\":2,\"graph_queries\":{{\"customers\":{{\"index\":\"graph\",\"match\":{{\"anchor\":\"customer\",\"nodes\":{{\"customer\":{{}}}},\"edges\":[]}},\"return\":{{\"bindings\":[\"customer\"],\"include_documents\":true,\"fields\":[\"title\"],\"limit\":2}}}}}},\"evaluate\":{s}}}", .{graph_stage});
+    defer a.free(body);
+    var request = try query.parseQueryRequest(a, null, "docs", body);
+    defer request.deinit(a);
+    const graph_query = request.req.graph_queries[0].query;
+    try std.testing.expect(graph_query.defer_document_projection);
+    try std.testing.expect(!graph_query.include_all_fields);
+    const retrieval = graph_query.documentRetrievalQuery();
+    try std.testing.expect(retrieval.include_all_fields);
+    try std.testing.expectEqual(@as(usize, 0), retrieval.fields.len);
+    try apply(a, request.req, &graph_result, &meta, options);
+    var encoded = try query.encodeQueryResponses(a, "docs", request.req, .{ .evaluation_json = meta.evaluation_json }, graph_result);
+    defer encoded.deinit(a);
+    const wire = try std.json.parseFromSlice(Json, a, encoded.json, .{});
+    defer wire.deinit();
+    const graph_wire = wire.value.object.get("responses").?.array.items[0].object.get("graph_results").?.object.get("customers").?;
+    const document = graph_wire.object.get("rows").?.array.items[0].object.get("customer").?.object.get("document").?;
+    try std.testing.expect(document.object.contains("title"));
+    try std.testing.expect(!document.object.contains("body"));
+    try std.testing.expect(graph_wire.object.get("computed").?.array.items[0].object.contains("p"));
     try std.testing.expectEqual(@as(usize, 1), graphs[0].matches.len);
     try std.testing.expectEqualStrings("node0", graphs[0].matches[0].bindings[0].node.key);
     try std.testing.expect(graphs[0].matches[0].computed_json != null);
