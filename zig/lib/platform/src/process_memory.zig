@@ -150,7 +150,13 @@ fn readCpuHierarchyWithReader(mount_point: []const u8, mount_root: []const u8, p
         const raw = readFile(path, &quota_buffer);
         // Namespace-relative paths may match several controller mounts.
         // Only ancestors of a leaf present on this mount constrain us.
-        if (at_leaf and raw == null) return null;
+        if (at_leaf and raw == null) {
+            if (version != .v2) return null;
+            // A v2 child without an enabled CPU controller still inherits
+            // its parent's quota. Confirm the leaf via the core interface.
+            const type_path = std.fmt.bufPrint(&path_buffer, "{s}/cgroup.type", .{directory}) catch return null;
+            if (readFile(type_path, &period_buffer) == null) return null;
+        }
         at_leaf = false;
         const limit = if (version == .v2)
             if (raw) |value| parseCpuMax(value) else null
@@ -819,6 +825,7 @@ test "CPU capacity preserves fractional quotas and checks visible ancestors" {
         fn read(path: []const u8, _: []u8) ?[]const u8 {
             const files = .{
                 .{ "/cpu/tenant/child/cpu.max", "max 100000" },
+                .{ "/cpu/tenant/disabled/cgroup.type", "domain\n" },
                 .{ "/cpu/tenant/cpu.max", "50000 100000" },
                 .{ "/cpu/cpu.max", "200000 100000" },
                 .{ "/cpu/tenant/child/cpu.cfs_quota_us", "150000\n" },
@@ -835,6 +842,8 @@ test "CPU capacity preserves fractional quotas and checks visible ancestors" {
     const v2 = readCpuHierarchyWithReader("/cpu", "/subtree", "/subtree/tenant/child", .v2, Fixture.read).?;
     try std.testing.expectEqual(@as(u64, 500), v2.millicpus);
     try std.testing.expectEqual(EnvelopeSource.cgroup_v2, v2.source);
+    const disabled = readCpuHierarchyWithReader("/cpu", "/subtree", "/subtree/tenant/disabled", .v2, Fixture.read).?;
+    try std.testing.expectEqual(@as(u64, 500), disabled.millicpus);
     const v1 = readCpuHierarchyWithReader("/cpu", "/subtree", "/subtree/tenant/child", .v1, Fixture.read).?;
     try std.testing.expectEqual(@as(u64, 250), v1.millicpus);
     try std.testing.expectEqual(EnvelopeSource.cgroup_v1, v1.source);
