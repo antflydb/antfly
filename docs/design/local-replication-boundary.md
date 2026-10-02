@@ -61,6 +61,9 @@ Existing receipt keys, outbox keys, envelope versions, and binary encodings are
 unchanged. Historical `raft` provenance discriminants remain where they are
 part of existing serialized source-authority and artifact-position formats.
 The runtime error ABI preserves the existing corruption status identity.
+Direct local dispatch returns the generic receipt error; foreign runtime
+dispatch decodes the released canonical error name. Compatibility tests cover
+both paths without renumbering or renaming the wire detail.
 
 ## Naming and enforcement
 
@@ -75,3 +78,8 @@ borrowed counters, policy-to-requirement mapping, admission generations,
 background-work permission, lock release during waits, final admission rechecks,
 and unchanged durable receipt encodings. Physical package moves and relicensing
 belong to the dependent PRs.
+
+`unit-storage-test-audit` checks explicit test ownership before storage unit
+compilation. An adapter that acquires tests must be registered in
+`storage/test_manifest.zig`, even when focused tests already reach it through
+another import. The inventory and disjoint shard checks remain required.

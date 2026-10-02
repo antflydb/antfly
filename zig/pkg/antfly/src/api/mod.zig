@@ -241,6 +241,7 @@ test "join inequality: incomparable types return 0" {
 }
 
 test "api module compiles" {
+    _ = @import("online_merge_io.zig");
     _ = @import("sql_truncate.zig");
     _ = @import("sql_policy_ddl.zig");
     _ = sql_execution;

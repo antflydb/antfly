@@ -2645,9 +2645,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .mode = .simple,
         },
     });
-    const run_ha_tests = addFilteredTestRunArtifact(b, hot_standby_tests);
+    const run_hot_standby_tests = addFilteredTestRunArtifact(b, hot_standby_tests);
     const hot_standby_test_step = b.step("antfly-storage-hot-standby-test", "Run hot-standby storage tests");
-    hot_standby_test_step.dependOn(&run_ha_tests.step);
+    hot_standby_test_step.dependOn(&run_hot_standby_tests.step);
 
     // cmd/standby.zig is owned by the distributed runtime unit. Keep its
     // focused parser root inside pkg/antfly/src so relative imports stay

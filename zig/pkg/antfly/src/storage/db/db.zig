@@ -11613,7 +11613,7 @@ pub const DB = struct {
         // walking and encoding every document in a large request.
         var preencoded_replication_batch_payload: ?[]u8 = null;
         defer if (preencoded_replication_batch_payload) |payload| preparation_alloc.free(payload);
-        const scoped_restore_ha = opts.restore_staging != null or replication_contract.requiresDurableLifecycleReplication(effective_req);
+        const scoped_replication = opts.restore_staging != null or replication_contract.requiresDurableLifecycleReplication(effective_req);
         if (!opts.bypass_replication_write_gate) if (self.local_execution.replication_async_batch_mirror) |mirror| {
             preencoded_replication_batch_payload = (if (req.artifact_catalog != null)
                 replication_effects_mod.encodeArtifactCatalogMutationRequestAlloc(preparation_alloc, req, opts.ordered_apply_receipt orelse return error.InvalidArtifactCatalogCommand)
@@ -11625,7 +11625,7 @@ pub const DB = struct {
                 // Non-resource encoding failures retain best-effort async
                 // behavior. Admission failures must never retry allocation
                 // uncharged after commit.
-                if (scoped_restore_ha or replicationMirrorSyncEnabled(mirror)) return err;
+                if (scoped_replication or replicationMirrorSyncEnabled(mirror)) return err;
                 break :blk null;
             };
         };
@@ -13041,8 +13041,8 @@ pub const DB = struct {
         var durable_replication_replay_payload: ?[]u8 = null;
         var durable_replication_batch_outbox_key: ?[]const u8 = null;
         var durable_replication_replay_outbox_key: ?[]const u8 = null;
-        if (!opts.bypass_replication_write_gate and (opts.transaction_resolution == null or scoped_restore_ha)) {
-            if (self.local_execution.replication_async_batch_mirror) |mirror| if (scoped_restore_ha or replicationMirrorRequiresDurableOutbox(mirror)) {
+        if (!opts.bypass_replication_write_gate and (opts.transaction_resolution == null or scoped_replication)) {
+            if (self.local_execution.replication_async_batch_mirror) |mirror| if (scoped_replication or replicationMirrorRequiresDurableOutbox(mirror)) {
                 const payload = preencoded_replication_batch_payload orelse return error.ReplicationPublisherUnavailable;
                 const from_lsn = mirror.publisher.nextLsn();
                 const outbox = try encodeDurableReplicationOutboxAlloc(self.alloc, from_lsn, payload);
@@ -13052,7 +13052,7 @@ pub const DB = struct {
                 };
                 const outbox_key = try durableReplicationOutboxKeyAlloc(
                     self.alloc,
-                    if (scoped_restore_ha) .restore_batch else .batch,
+                    if (scoped_replication) .restore_batch else .batch,
                     from_lsn,
                     self.core.root_generation,
                     outbox[replication_outbox_header_len .. outbox.len - replication_outbox_checksum_len],
@@ -13065,7 +13065,7 @@ pub const DB = struct {
                 durable_replication_batch_payload = outbox[replication_outbox_header_len .. outbox.len - replication_outbox_checksum_len];
                 durable_replication_batch_outbox_key = outbox_key;
             };
-            if (append_derived_replay and !scoped_restore_ha) if (self.local_execution.replication_async_effect_mirror) |mirror| if (replicationMirrorRequiresDurableOutbox(mirror)) {
+            if (append_derived_replay and !scoped_replication) if (self.local_execution.replication_async_effect_mirror) |mirror| if (replicationMirrorRequiresDurableOutbox(mirror)) {
                 const from_lsn = mirror.publisher.nextLsn();
                 const outbox = try encodeDurableReplicationOutboxAlloc(self.alloc, from_lsn, replay_payload);
                 owned_store_values.append(self.alloc, outbox) catch |err| {
@@ -13350,7 +13350,7 @@ pub const DB = struct {
         // data from already-deleted intents.
         var transaction_replication_batch_payload: ?[]const u8 = null;
         var transaction_replication_replay_payload: ?[]const u8 = null;
-        if (opts.transaction_resolution) |resolution| if (!opts.bypass_replication_write_gate and !scoped_restore_ha) {
+        if (opts.transaction_resolution) |resolution| if (!opts.bypass_replication_write_gate and !scoped_replication) {
             if (self.local_execution.replication_async_batch_mirror) |mirror| if (replicationMirrorSyncEnabled(mirror)) {
                 const payload = preencoded_replication_batch_payload orelse return error.ReplicationPublisherUnavailable;
                 // The outbox borrows the request-owned buffer through commit
@@ -13463,7 +13463,7 @@ pub const DB = struct {
             if (transaction_replication_batch_payload) |payload| {
                 deferred_replication_gates.append(try appendReplicationEncodedBatchMutationCommitLockedContext(&replication_ctx, payload));
             } else if (durable_replication_batch_payload) |payload| {
-                deferred_replication_gates.append(try appendReplicationEncodedBatchMutationCommitLockedContextStrict(&replication_ctx, payload, scoped_restore_ha));
+                deferred_replication_gates.append(try appendReplicationEncodedBatchMutationCommitLockedContextStrict(&replication_ctx, payload, scoped_replication));
             } else if (preencoded_replication_batch_payload) |payload| {
                 deferred_replication_gates.append(try appendReplicationEncodedBatchMutationCommitLockedContext(&replication_ctx, payload));
             } else deferred_replication_gates.append(try appendReplicationBatchMutationCommitLockedContext(&replication_ctx, effective_req));
@@ -13471,7 +13471,7 @@ pub const DB = struct {
                 deferred_replication_gates.append(try appendReplicationReplayPayloadCommitLockedContext(&replication_ctx, payload));
             } else if (durable_replication_replay_payload) |payload| {
                 deferred_replication_gates.append(try appendReplicationReplayPayloadCommitLockedContext(&replication_ctx, payload));
-            } else if (append_derived_replay and !scoped_restore_ha) deferred_replication_gates.append(try appendReplicationReplayPayloadCommitLockedContext(&replication_ctx, replay_payload));
+            } else if (append_derived_replay and !scoped_replication) deferred_replication_gates.append(try appendReplicationReplayPayloadCommitLockedContext(&replication_ctx, replay_payload));
         }
         if (opts.committed_batch_effects_observer) |observer| {
             try observer.observe(if (append_derived_replay) replay_payload else "");
@@ -30426,10 +30426,10 @@ pub const DB = struct {
         defer if (staging_progress) |*progress| progress.deinit();
         const restore_scope: ?[32]u8 = if (staging_progress) |progress| progress.value.scope.digest() else null;
         const mirror_scoped_restore = restore_scope != null and self.local_execution.replication_async_batch_mirror != null;
-        const bypass_ha = ordered_receipt != null and !mirror_scoped_restore;
-        var replication_mutation = if (!bypass_ha) self.acquireReplicationMutationShared() else null;
+        const bypass_replication_write_gate = ordered_receipt != null and !mirror_scoped_restore;
+        var replication_mutation = if (!bypass_replication_write_gate) self.acquireReplicationMutationShared() else null;
         defer if (replication_mutation) |*lease| lease.release();
-        if (!bypass_ha) try self.enforceReplicationWriteGate();
+        if (!bypass_replication_write_gate) try self.enforceReplicationWriteGate();
         if (mirror_scoped_restore) try self.flushDurableReplicationOutboxes();
         if (status != .committed) {
             try self.lockApplyForPortableRuntime();
@@ -30521,7 +30521,7 @@ pub const DB = struct {
                 .restore_staging_scope = restore_scope,
             }, null, .{
                 .visibility_cancellation = visibility_cancellation,
-                .bypass_replication_write_gate = bypass_ha,
+                .bypass_replication_write_gate = bypass_replication_write_gate,
                 .ordered_apply_receipt = ordered_receipt,
                 .durable_rows = &durable_rows,
                 .transaction_resolution = .{

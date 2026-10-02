@@ -92,6 +92,10 @@ test "storage.hot_standby apply receipts preserve independent Raft and HA encodi
     var replication_buf: [replication_applied_lsn_value_len]u8 = undefined;
     const ordered = orderedApplyReceiptWrite(.{ .term = 0x0102030405060708, .index = 9 }, &ordered_buf);
     const replication = replicationAppliedSequenceWrite(11, &replication_buf);
+    // These released keys are independent of the implementation names. A
+    // rename must not strand persisted progress or replay a committed write.
+    try std.testing.expectEqualSlices(u8, &.{ 0x02, 0xff, 0x05 }, ordered.key);
+    try std.testing.expectEqualSlices(u8, &.{ 0x02, 0xff, 0x04 }, replication.key);
     try std.testing.expectEqualSlices(u8, &.{ 8, 7, 6, 5, 4, 3, 2, 1, 9, 0, 0, 0, 0, 0, 0, 0 }, ordered.value);
     try std.testing.expectEqualSlices(u8, &.{ 11, 0, 0, 0, 0, 0, 0, 0 }, replication.value);
     try std.testing.expect(!std.mem.eql(u8, ordered.key, replication.key));
