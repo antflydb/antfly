@@ -192,6 +192,19 @@ test "SQL original cross-table MERGE executes matched and source-only rows atomi
     try std.testing.expectEqual(@as(usize, 6), provider.calls);
     try std.testing.expectEqual(@as(usize, 2), provider.max_batch);
     try std.testing.expectEqual(@as(usize, 1), probe.commits);
+    for ([_]runtime.Limits{ .{ .page_rows = 2 }, .{ .page_bytes = 1 } }) |limits| {
+        probe = .{ .both_matched = true };
+        provider = .{};
+        var paged = try runtime.execute(std.testing.allocator, backend, &ai, &.{}, limits);
+        defer paged.deinit();
+        try std.testing.expectEqual(@as(usize, 6), provider.calls);
+        try std.testing.expectEqual(@as(usize, if (limits.page_bytes == 1) 1 else 2), provider.max_batch);
+        try std.testing.expectEqual(@as(usize, 1), probe.commits);
+        probe = .{ .both_matched = true };
+        provider = .{ .fail_after = 2 };
+        try std.testing.expectError(error.DecisionProviderUnavailable, runtime.execute(std.testing.allocator, backend, &ai, &.{}, limits));
+        try std.testing.expectEqual(@as(usize, 0), probe.commits);
+    }
     probe = .{};
     provider = .{ .fail_after = 2 };
     try std.testing.expectError(error.DecisionProviderUnavailable, runtime.execute(std.testing.allocator, backend, &ai, &.{}, .{}));

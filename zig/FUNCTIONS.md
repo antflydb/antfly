@@ -181,8 +181,10 @@ validates nested decision specifications before opening reads. Ordering
 expressions evaluate in bounded batches over qualifying rows, including grouped
 and windowed results. Reusing a computed CTE column does not re-evaluate it. Native SELECT, aggregate
 input, and pull-stream inference also split cursor pages at byte boundaries and
-release inference scratch between pages. Independent SELECT projection calls
-run after sorting and pagination; calls used as sort keys remain before sorting.
+release inference scratch between pages. Independent SELECT projection calls, including grouped and windowed outputs,
+run after sorting and pagination; calls used as sort keys remain before sorting
+and direct sort aliases reuse the same evaluated output. Window arguments,
+partition keys, and window ordering still evaluate over the full input relation.
 Top-K owns the required deferred input cells under its existing memory quota.
 
 Decision functions also work in ordinary UPDATE/DELETE predicates, UPDATE

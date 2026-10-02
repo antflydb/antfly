@@ -2703,3 +2703,50 @@ fn deferredDecisionAllocationScenario(a: std.mem.Allocator) !void {
 test "SQL deferred decision projections unwind every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, deferredDecisionAllocationScenario, .{});
 }
+
+test "SQL grouped and window decisions defer independent projections and reuse sort outputs" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { sql: []const u8, calls: usize }{
+        .{ .sql = "SELECT ai_probability(_id,'Refund?','local') FROM things GROUP BY _id ORDER BY _id LIMIT 2 OFFSET 1", .calls = 2 },
+        .{ .sql = "SELECT ai_probability(_id,'Refund?','local'), row_number() OVER (ORDER BY id) FROM things ORDER BY id LIMIT 2 OFFSET 1", .calls = 2 },
+        .{ .sql = "SELECT ai_probability(CAST(count(*) AS TEXT),'Refund?','local') FROM things GROUP BY _id LIMIT 2 OFFSET 1", .calls = 2 },
+        .{ .sql = "SELECT ai_probability(CAST(row_number() OVER (ORDER BY id) AS TEXT),'Refund?','local') FROM things ORDER BY id LIMIT 2 OFFSET 1", .calls = 2 },
+        .{ .sql = "SELECT ai_probability(_id,'Refund?','local') AS p FROM things GROUP BY _id ORDER BY p LIMIT 2 OFFSET 1", .calls = 8 },
+        .{ .sql = "SELECT ai_probability(_id,'Refund?','local') AS p, row_number() OVER (ORDER BY id) FROM things ORDER BY p LIMIT 2 OFFSET 1", .calls = 8 },
+        .{ .sql = "SELECT ai_probability(_id,'Refund?','local'), row_number() OVER (ORDER BY ai_probability(_id,'Refund?','local')) FROM things LIMIT 2 OFFSET 1", .calls = 10 },
+        .{ .sql = "SELECT CASE WHEN FALSE THEN ai_probability(_id,'Refund?','local') ELSE 1.0 END, row_number() OVER (ORDER BY id) FROM things LIMIT 2 OFFSET 1", .calls = 0 },
+    };
+    for (cases) |case| for ([_]usize{ 1, 65536 }) |page_bytes| {
+        var fixture: TestBackend = .{ .row_count = 8 };
+        var provider: @import("decision_eval.zig").testing.Provider = .{ .fail_after = if (case.calls == 2) 2 else null };
+        var backend = fixture.iface();
+        backend.decision_provider = provider.provider();
+        var compiled = try compiler.compile(a, case.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, backend, &compiled, &.{}, .{ .page_rows = 4, .page_bytes = page_bytes });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+        try std.testing.expectEqual(case.calls, provider.calls);
+        if (case.calls != 0) try std.testing.expectEqual(@as(usize, if (page_bytes == 1) 1 else @min(case.calls, 4)), provider.max_batch);
+        if (case.calls == 2) for (result.output.rows) |row| try std.testing.expectApproxEqAbs(@as(f64, 0.9), row[0].float, 0.001);
+    };
+}
+fn groupedWindowAllocationScenario(a: std.mem.Allocator) !void {
+    for ([_][]const u8{
+        "SELECT ai_probability(_id,'Refund?','local') FROM things GROUP BY _id ORDER BY _id LIMIT 1",
+        "SELECT ai_probability(_id,'Refund?','local'),row_number() OVER (ORDER BY id) FROM things ORDER BY id LIMIT 1",
+    }) |sql| {
+        var fixture: TestBackend = .{ .row_count = 2 };
+        var provider: @import("decision_eval.zig").testing.Provider = .{};
+        var backend = fixture.iface();
+        backend.decision_provider = provider.provider();
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, backend, &compiled, &.{}, .{ .page_rows = 1 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), provider.calls);
+    }
+}
+test "SQL grouped and window deferred projections unwind allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, groupedWindowAllocationScenario, .{});
+}

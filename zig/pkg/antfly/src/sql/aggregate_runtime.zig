@@ -76,7 +76,7 @@ fn addRows(context: anytype, bound: *const binding.Bound, grouped: *operators.Gr
     for (keys, inputs) |key, input| try grouped.add(key, input);
 }
 
-fn addGroupedDecisionPages(context: anytype, bound: *const binding.Bound, grouped: *operators.Grouped, top: *operators.TopK) !void {
+fn addGroupedDecisionPages(context: anytype, bound: *const binding.Bound, grouped: *operators.Grouped, top: *operators.TopK, projection: @import("decision_eval.zig").SortedProjection) !void {
     const decision = @import("decision_eval.zig");
     var begin: usize = 0;
     while (begin < grouped.groupCount()) {
@@ -110,9 +110,9 @@ fn addGroupedDecisionPages(context: anytype, bound: *const binding.Bound, groupe
             try accepted.append(a, row);
             try positions.append(a, index);
         }
-        const values = try decision.evaluateProgramsBatch(a, context.backend.decision_provider, bound.outputs, accepted.items, context.parameters);
-        const keys = try decision.evaluateProgramsBatch(a, context.backend.decision_provider, bound.orders, accepted.items, context.parameters);
-        for (values, keys, positions.items) |row, order, index| try top.add(.{ .values = row, .keys = order, .ordinal = ordinals.items[index] });
+        const accepted_ordinals = try a.alloc(u64, positions.items.len);
+        for (positions.items, accepted_ordinals) |index, *ordinal| ordinal.* = ordinals.items[index];
+        try projection.add(context, a, top, accepted.items, accepted_ordinals);
     }
 }
 
@@ -198,7 +198,9 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
     const external_results = decision.hasExternalPrograms(bound.outputs) or decision.hasExternalPrograms(bound.orders) or
         (if (bound.having) |*program| decision.hasExternal(program) else false);
     if (external_results) {
-        try addGroupedDecisionPages(context, bound, grouped, &top);
+        const projection = try decision.SortedProjection.init(context.arena, bound.outputs, bound.orders, bound.order_outputs);
+        try addGroupedDecisionPages(context, bound, grouped, &top, projection);
+        return projection.finish(context, &top, offset, limit, statement.limit == null);
     } else for (0..grouped.groupCount()) |index| {
         try context.checkpoint();
         var arena = std.heap.ArenaAllocator.init(context.alloc);

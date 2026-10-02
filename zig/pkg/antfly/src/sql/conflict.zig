@@ -239,6 +239,7 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
     var decision_arena = std.heap.ArenaAllocator.init(context.alloc);
     defer decision_arena.deinit();
     var pending: std.ArrayList(DecisionConflictRow) = .empty;
+    var page_budget: decision_eval.PageBudget = .{ .row_limit = context.limits.page_rows, .byte_limit = context.limits.page_bytes };
     var point_pages: usize = 0;
     for (result, captured_buffer[0..count]) |*mutation, captured_row| {
         try context.checkpoint();
@@ -319,9 +320,11 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
             const owned = try scratch.alloc(scalar.Datum, cells.len);
             for (cells, owned) |cell, *out| out.* = try @import("operators.zig").cloneDatum(scratch, cell);
             try pending.append(context.arena, .{ .mutation = mutation, .previous = old, .cells = owned });
-            if (pending.items.len == 128) {
+            if (try page_budget.add(owned)) {
                 try applyDecisionConflicts(context, scratch, table, clause, binding, pending.items, deferred_cache);
                 pending.clearRetainingCapacity();
+                page_budget.rows = 0;
+                page_budget.bytes = 0;
                 if (!decision_arena.reset(.retain_capacity)) return error.OutOfMemory;
             }
             continue;

@@ -254,12 +254,109 @@ test "SQL decisions bind all builtins and validate prepared question parameters 
 /// Native cursor pages and inference pages have independent lifetimes.
 pub fn rowPage(a: std.mem.Allocator, bound: @import("bound_scalars.zig").Bound, rows: []const @import("catalog.zig").Row, row_limit: usize, byte_limit: usize) ![]const []const scalar.Datum {
     var cells: std.ArrayList([]const scalar.Datum) = .empty;
-    var bytes: usize = 0;
+    var budget: PageBudget = .{ .row_limit = row_limit, .byte_limit = byte_limit };
     for (rows) |row| {
         const values = try bound.cells(a, row);
         try cells.append(a, values);
-        for (values) |cell| bytes +|= try @import("operators.zig").datumBytes(cell);
-        if (cells.items.len >= row_limit or bytes >= byte_limit) break;
+        if (try budget.add(values)) break;
     }
     return cells.items;
 }
+
+/// Shared row/byte accounting for inference pages. One oversized row makes
+/// progress, but no subsequent row shares that page.
+pub const PageBudget = struct {
+    row_limit: usize,
+    byte_limit: usize,
+    rows: usize = 0,
+    bytes: usize = 0,
+    pub fn add(self: *@This(), cells: []const scalar.Datum) !bool {
+        self.rows += 1;
+        for (cells) |cell| self.bytes +|= try @import("operators.zig").datumBytes(cell);
+        return self.rows >= self.row_limit or self.bytes >= self.byte_limit;
+    }
+};
+
+/// Preserve sort-dependent outputs once, and retain deferred input cells in
+/// Top-K's owned, budgeted rows until final pagination selects their consumers.
+pub const SortedProjection = struct {
+    outputs: []const scalar.Program,
+    orders: []const scalar.Program,
+    order_outputs: []const ?usize,
+    deferred: []bool,
+    has_deferred: bool,
+    pub fn init(a: std.mem.Allocator, outputs: []const scalar.Program, orders: []const scalar.Program, order_outputs: []const ?usize) !@This() {
+        const deferred = try a.alloc(bool, outputs.len);
+        for (outputs, deferred) |*program, *flag| flag.* = hasExternal(program);
+        for (order_outputs) |optional| if (optional) |index| {
+            deferred[index] = false;
+        };
+        return .{ .outputs = outputs, .orders = orders, .order_outputs = order_outputs, .deferred = deferred, .has_deferred = std.mem.indexOfScalar(bool, deferred, true) != null };
+    }
+    pub fn add(self: @This(), context: anytype, a: std.mem.Allocator, top: *@import("operators.zig").TopK, inputs: []const []const scalar.Datum, ordinals: []const u64) !void {
+        const values = try a.alloc([]scalar.Datum, inputs.len);
+        for (inputs, values) |input, *row| {
+            row.* = try a.alloc(scalar.Datum, self.outputs.len + if (self.has_deferred) input.len else @as(usize, 0));
+            @memset(row.*, .{});
+            if (self.has_deferred) @memcpy(row.*[self.outputs.len..], input);
+        }
+        for (self.outputs, self.deferred, 0..) |*program, deferred, column| if (!deferred) {
+            const output = try evaluateBatch(a, context.backend.decision_provider, program, inputs, context.parameters);
+            for (values, output) |row, value| row[column] = value;
+        };
+        const keys = try a.alloc([]scalar.Datum, inputs.len);
+        for (keys) |*row| row.* = try a.alloc(scalar.Datum, self.orders.len);
+        for (self.orders, 0..) |*program, column| {
+            if (column < self.order_outputs.len and self.order_outputs[column] != null) {
+                for (keys, values) |row, value| row[column] = value[self.order_outputs[column].?];
+            } else {
+                const output = try evaluateBatch(a, context.backend.decision_provider, program, inputs, context.parameters);
+                for (keys, output) |row, value| row[column] = value;
+            }
+        }
+        for (values, keys, ordinals) |row, key, ordinal| try top.add(.{ .values = row, .keys = key, .ordinal = ordinal });
+    }
+    pub fn finish(self: @This(), context: anytype, top: *@import("operators.zig").TopK, offset: usize, limit: usize, implicit_limit: bool) !@import("runtime.zig").Output {
+        const ordered = try top.finish(context.arena);
+        const remaining = ordered.len -| offset;
+        if (implicit_limit and remaining > limit) return error.SqlResultTooLarge;
+        const start = @min(offset, ordered.len);
+        for (0..start) |index| top.releaseFinishedRow(index);
+        const selected = ordered[start..][0..@min(remaining, limit)];
+        const rows = try context.arena.alloc([]const std.json.Value, selected.len);
+        const flags = try context.arena.alloc([]const bool, selected.len);
+        var first: usize = 0;
+        while (first < selected.len) {
+            try context.checkpoint();
+            var arena = std.heap.ArenaAllocator.init(context.alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            var inputs: std.ArrayList([]const scalar.Datum) = .empty;
+            var budget: PageBudget = .{ .row_limit = context.limits.page_rows, .byte_limit = context.limits.page_bytes };
+            for (selected[first..]) |row| {
+                const input = row.values[self.outputs.len..];
+                try inputs.append(a, input);
+                if (try budget.add(input)) break;
+            }
+            const values = try a.alloc([]scalar.Datum, inputs.items.len);
+            for (selected[first..][0..inputs.items.len], values) |row, *out| out.* = try a.dupe(scalar.Datum, row.values[0..self.outputs.len]);
+            for (self.outputs, self.deferred, 0..) |*program, deferred, column| if (deferred) {
+                const output = try evaluateBatch(a, context.backend.decision_provider, program, inputs.items, context.parameters);
+                for (values, output) |row, value| row[column] = value;
+            };
+            for (values, first..) |row, index| {
+                const output = try context.arena.alloc(std.json.Value, self.outputs.len);
+                const nulls = try context.arena.alloc(bool, self.outputs.len);
+                for (row, output, nulls) |value, *out, *flag| {
+                    out.* = try context.outputValue(value.value);
+                    flag.* = value.sql_null;
+                }
+                rows[index] = output;
+                flags[index] = nulls;
+                top.releaseFinishedRow(start + index);
+            }
+            first += inputs.items.len;
+        }
+        return .{ .columns = context.binding.columns, .rows = rows, .sql_nulls = flags, .command_tag = "SELECT" };
+    }
+};

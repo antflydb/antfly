@@ -558,6 +558,7 @@ pub fn execute(context: anytype, statement: ast.Select) anyerror!@import("runtim
     defer eval.deinit();
     const decision = @import("decision_eval.zig");
     if (decision.hasExternalPrograms(bound.outputs) or decision.hasExternalPrograms(bound.orders)) {
+        const projection = try decision.SortedProjection.init(context.arena, bound.outputs, bound.orders, bound.order_outputs);
         var begin: usize = 0;
         while (begin < cells.len) {
             try context.checkpoint();
@@ -571,11 +572,12 @@ pub fn execute(context: anytype, statement: ast.Select) anyerror!@import("runtim
                 for (row) |cell| bytes +|= try operators.datumBytes(cell);
                 if (bytes >= context.limits.page_bytes) break;
             }
-            const values = try decision.evaluateProgramsBatch(a, context.backend.decision_provider, bound.outputs, page.items, context.parameters);
-            const keys = try decision.evaluateProgramsBatch(a, context.backend.decision_provider, bound.orders, page.items, context.parameters);
-            for (values, keys, 0..) |row, order, index| try top.add(.{ .values = row, .keys = order, .ordinal = begin + index });
+            const ordinals = try a.alloc(u64, page.items.len);
+            for (ordinals, begin..) |*ordinal, index| ordinal.* = index;
+            try projection.add(context, a, &top, page.items, ordinals);
             begin += page.items.len;
         }
+        return projection.finish(context, &top, offset, limit, statement.limit == null);
     } else for (cells, 0..) |row, index| {
         try context.checkpoint();
         _ = eval.reset(.retain_capacity);

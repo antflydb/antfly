@@ -70,13 +70,13 @@ pub const Candidates = struct {
     /// MERGE, unlike DELETE USING, must reject a target selected for more than
     /// one UPDATE/DELETE action rather than deduplicating or choosing a winner.
     pub fn classifyRows(self: Candidates, alloc: Allocator, rows: []const []const std.json.Value, nulls: []const []const bool, parameters: []const std.json.Value) ![]const ?usize {
-        return self.classifyRowsChecked(alloc, alloc, rows, nulls, parameters, null);
+        return self.classifyRowsChecked(alloc, alloc, rows, nulls, parameters, null, .{ .row_limit = (@import("runtime.zig").Limits{}).page_rows, .byte_limit = (@import("runtime.zig").Limits{}).page_bytes });
     }
 
-    fn classifyRowsChecked(self: Candidates, alloc: Allocator, scratch_allocator: Allocator, rows: []const []const std.json.Value, nulls: []const []const bool, parameters: []const std.json.Value, backend: ?catalog.Backend) ![]const ?usize {
+    fn classifyRowsChecked(self: Candidates, alloc: Allocator, scratch_allocator: Allocator, rows: []const []const std.json.Value, nulls: []const []const bool, parameters: []const std.json.Value, backend: ?catalog.Backend, page_limits: decision_eval.PageBudget) ![]const ?usize {
         if (rows.len != nulls.len) return error.InvalidSqlBackendResponse;
         for (self.arms) |arm| if (arm.predicate) |*program| {
-            if (decision_eval.hasExternal(program)) return self.classifyDecisionRows(alloc, scratch_allocator, rows, nulls, parameters, backend);
+            if (decision_eval.hasExternal(program)) return self.classifyDecisionRows(alloc, scratch_allocator, rows, nulls, parameters, backend, page_limits);
         };
         const selected = try alloc.alloc(?usize, rows.len);
         const cells = try alloc.alloc(scalar.Datum, self.query.columns.len);
@@ -105,7 +105,7 @@ pub const Candidates = struct {
 
     /// Arm order is SQL control flow: only unmatched rows of the appropriate
     /// matched/source-only kind are eligible for the next predicate wave.
-    fn classifyDecisionRows(self: Candidates, alloc: Allocator, scratch_allocator: Allocator, rows: []const []const std.json.Value, nulls: []const []const bool, parameters: []const std.json.Value, backend: ?catalog.Backend) ![]const ?usize {
+    fn classifyDecisionRows(self: Candidates, alloc: Allocator, scratch_allocator: Allocator, rows: []const []const std.json.Value, nulls: []const []const bool, parameters: []const std.json.Value, backend: ?catalog.Backend, page_limits: decision_eval.PageBudget) ![]const ?usize {
         const selected = try alloc.alloc(?usize, rows.len);
         @memset(selected, null);
         var affected: std.StringHashMapUnmanaged(void) = .empty;
@@ -115,12 +115,16 @@ pub const Candidates = struct {
         while (first < rows.len) {
             if (!arena.reset(.retain_capacity)) return error.OutOfMemory;
             const scratch = arena.allocator();
-            const end = @min(first + 128, rows.len);
-            const cells = try scratch.alloc([]const scalar.Datum, end - first);
-            for (rows[first..end], nulls[first..end], cells) |row, flags, *out| {
+            var budget = page_limits;
+            var page_cells: std.ArrayList([]const scalar.Datum) = .empty;
+            for (rows[first..], nulls[first..]) |row, flags| {
                 if (backend) |active| try active.vtable.checkpoint(active.ptr);
-                out.* = try self.rowCells(scratch, row, flags);
+                const input = try self.rowCells(scratch, row, flags);
+                try page_cells.append(scratch, input);
+                if (try budget.add(input)) break;
             }
+            const cells = page_cells.items;
+            const end = first + cells.len;
             for (self.arms, 0..) |arm, arm_index| {
                 var eligible: std.ArrayList([]const scalar.Datum) = .empty;
                 var positions: std.ArrayList(usize) = .empty;
@@ -163,7 +167,7 @@ pub const Candidates = struct {
 
     /// Resolve assignments only for each selected arm and retain their values
     /// in the mutation arena. Pure mutation plans keep their existing hot path.
-    fn decisionAssignmentValues(self: Candidates, alloc: Allocator, scratch_allocator: Allocator, backend: catalog.Backend, rows: []const []const std.json.Value, nulls: []const []const bool, selected: []const ?usize, parameters: []const std.json.Value) !?[]const ?[]const scalar.Datum {
+    fn decisionAssignmentValues(self: Candidates, alloc: Allocator, scratch_allocator: Allocator, backend: catalog.Backend, rows: []const []const std.json.Value, nulls: []const []const bool, selected: []const ?usize, parameters: []const std.json.Value, page_limits: decision_eval.PageBudget) !?[]const ?[]const scalar.Datum {
         var needed = false;
         for (self.arms) |arm| switch (arm.action) {
             .insert, .update => |assignments| for (assignments) |assignment| {
@@ -187,7 +191,8 @@ pub const Candidates = struct {
                 const scratch = arena.allocator();
                 var cells: std.ArrayList([]const scalar.Datum) = .empty;
                 var positions: std.ArrayList(usize) = .empty;
-                while (first < rows.len and positions.items.len < 128) : (first += 1) {
+                var budget = page_limits;
+                while (first < rows.len) : (first += 1) {
                     if (selected[first] == null or selected[first].? != arm_index) continue;
                     try backend.vtable.checkpoint(backend.ptr);
                     try cells.append(scratch, try self.rowCells(scratch, rows[first], nulls[first]));
@@ -195,6 +200,10 @@ pub const Candidates = struct {
                     const output = try alloc.alloc(scalar.Datum, assignments.len);
                     @memset(output, .{});
                     values[first] = output;
+                    if (try budget.add(cells.items[cells.items.len - 1])) {
+                        first += 1;
+                        break;
+                    }
                 }
                 for (assignments, 0..) |assignment, column| {
                     const program = assignment.program orelse continue;
@@ -225,9 +234,13 @@ pub const Candidates = struct {
     /// Keep transient provider pages outside the owned mutation arena, so
     /// releasing a page actually returns its memory to the request budget.
     pub fn prepareWithSourceRowsUsingScratch(self: Candidates, alloc: Allocator, scratch_allocator: Allocator, backend: catalog.Backend, rows: []const []const std.json.Value, nulls: []const []const bool, parameters: []const std.json.Value, max_rows: usize, max_bytes: usize) !Prepared {
+        return self.prepareWithPageLimits(alloc, scratch_allocator, backend, rows, nulls, parameters, max_rows, max_bytes, .{ .row_limit = (@import("runtime.zig").Limits{}).page_rows, .byte_limit = (@import("runtime.zig").Limits{}).page_bytes });
+    }
+
+    fn prepareWithPageLimits(self: Candidates, alloc: Allocator, scratch_allocator: Allocator, backend: catalog.Backend, rows: []const []const std.json.Value, nulls: []const []const bool, parameters: []const std.json.Value, max_rows: usize, max_bytes: usize, page_limits: decision_eval.PageBudget) !Prepared {
         if (rows.len > max_rows or rows.len != nulls.len) return error.SqlResultTooLarge;
-        const selections = try self.classifyRowsChecked(alloc, scratch_allocator, rows, nulls, parameters, backend);
-        const assignment_values = try self.decisionAssignmentValues(alloc, scratch_allocator, backend, rows, nulls, selections, parameters);
+        const selections = try self.classifyRowsChecked(alloc, scratch_allocator, rows, nulls, parameters, backend, page_limits);
+        const assignment_values = try self.decisionAssignmentValues(alloc, scratch_allocator, backend, rows, nulls, selections, parameters, page_limits);
         const cells = try alloc.alloc(scalar.Datum, self.query.columns.len);
         var mutations: std.ArrayList(catalog.Mutation) = .empty;
         var source_rows: std.ArrayList(usize) = .empty;
@@ -996,7 +1009,7 @@ pub fn execute(context: anytype, bound: Candidates) !@import("runtime.zig").Outp
         try read.select(bound.query);
     const flags = selected.sql_nulls orelse if (selected.rows.len == 0) &.{} else return error.InvalidSqlBackendResponse;
     if (flags.len != selected.rows.len) return error.InvalidSqlBackendResponse;
-    const prepared = try bound.prepareWithSourceRowsUsingScratch(context.arena, context.alloc, context.backend, selected.rows, flags, context.parameters, context.limits.mutation_rows, context.limits.retained_bytes);
+    const prepared = try bound.prepareWithPageLimits(context.arena, context.alloc, context.backend, selected.rows, flags, context.parameters, context.limits.mutation_rows, context.limits.retained_bytes, .{ .row_limit = context.limits.page_rows, .byte_limit = context.limits.page_bytes });
     if (bound.returning_plan) |plan| {
         if (prepared.mutations.len > context.limits.result_rows or prepared.source_rows.len != prepared.mutations.len) return error.SqlResultTooLarge;
         const normalized = if (prepared.mutations.len == 0) prepared.mutations else blk: {
@@ -1052,7 +1065,13 @@ pub fn execute(context: anytype, bound: Candidates) !@import("runtime.zig").Outp
                 try context.checkpoint();
                 if (!arena.reset(.retain_capacity)) return error.OutOfMemory;
                 const scratch = arena.allocator();
-                const end = @min(first + 128, all.len);
+                var budget: decision_eval.PageBudget = .{ .row_limit = context.limits.page_rows, .byte_limit = context.limits.page_bytes };
+                var end = first;
+                while (end < all.len) {
+                    const full = try budget.add(all[end]);
+                    end += 1;
+                    if (full) break;
+                }
                 const columns = try scratch.alloc([]const scalar.Datum, plan.programs.len);
                 for (plan.programs, columns) |*program, *values| values.* = try decision_eval.evaluateBatch(scratch, context.backend.decision_provider, program, all[first..end], context.parameters);
                 for (first..end) |index| {
