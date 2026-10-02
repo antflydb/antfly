@@ -358,6 +358,20 @@ pub const AntflyClient = struct {
         path: []const u8,
         body: openapi.types.QueryRequest,
     ) !openapi.ApiResponse(openapi.types.QueryResponses) {
+        return self.queryCanonicalPathWithTimeout(path, body, null);
+    }
+
+    /// Preserve HTTP failures so a serving-readiness caller can distinguish
+    /// temporary admission failures from invalid requests and authorization.
+    pub fn queryTableResponseWithTimeout(self: *AntflyClient, table_name: []const u8, body: openapi.types.QueryRequest, timeout_ms: u64) !openapi.ApiResponse(openapi.types.QueryResponses) {
+        const table_path = try self.tablePathAlloc(table_name);
+        defer self.allocator.free(table_path);
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/query", .{table_path});
+        defer self.allocator.free(path);
+        return self.queryCanonicalPathWithTimeout(path, body, @max(timeout_ms, 1));
+    }
+
+    fn queryCanonicalPathWithTimeout(self: *AntflyClient, path: []const u8, body: openapi.types.QueryRequest, timeout_ms: ?u64) !openapi.ApiResponse(openapi.types.QueryResponses) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ self.inner.base_url, path });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
@@ -366,7 +380,7 @@ pub const AntflyClient = struct {
             @as(*const [1][2][]const u8, header)
         else
             null;
-        var response = try self.inner.http.post(url, .{ .json = json_body, .headers = headers });
+        var response = try self.inner.http.post(url, .{ .json = json_body, .headers = headers, .timeout_ms = timeout_ms });
         return openapi.ApiResponse(openapi.types.QueryResponses).fromResponse(self.allocator, &response);
     }
 
