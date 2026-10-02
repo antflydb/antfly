@@ -633,8 +633,8 @@ test "relational index system native rewrite authority clocks survive pin crash 
             const payload = if (request.online_source != null) try effects.encodeOnlineSourceMutationRequestAlloc(alloc, request, sequence_value) else try effects.encodeBatchMutationRequestAlloc(alloc, request);
             defer alloc.free(payload);
             const record: @import("replication_record.zig").RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = lsn, .previous_lsn = lsn - 1, .payload = payload };
-            try replication_ingress.applyRecord(&db, record);
-            try replication_ingress.applyRecord(&db, record);
+            try replication_ingress.applyRecord(db, record);
+            try replication_ingress.applyRecord(db, record);
         }
     };
     const admit: @import("types.zig").BatchRequest = .{ .online_source = .{ .admit = .{ .scope = scope } } };
