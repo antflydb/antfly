@@ -1879,7 +1879,7 @@ test "relational integrity live two phase HA replay preserves rows and binary cl
     const invalid_key = invalid_address.claimKey();
     const invalid_value = try claim.encode(alloc, invalid_address);
     defer alloc.free(invalid_value);
-    const invalid_lsn = try effects.appendBatchMutationRequest(alloc, &primary, .{
+    const invalid_lsn = try @import("../hot_standby/effects.zig").appendBatchMutationRequest(alloc, &primary, .{
         .writes = &.{.{ .key = &invalid_key, .value = invalid_value }},
     }, .{});
     var invalid_entry = (try primary.log.entryAt(alloc, invalid_lsn)).?;
