@@ -66,6 +66,34 @@ An additional unfiltered DB-core run reached test 401 without reporting a
 failure before it was stopped; it is not a complete-suite qualification. Prior
 broad-suite measurements remain scoped to their original revision.
 
+A further review found that entity rewrite left acknowledged HA outboxes
+behind, synthesized document-asset replay keys for scoped unit/chunk sources,
+and drained graph replay before acquiring the primary publication fence.
+The rewrite now validates its selected graph's applied/target cut while holding
+publication and apply admission. It releases those fences before catch-up and
+rechecks after reacquiring them, so a racing primary mutation cannot leave the
+adjacency behind the primary rows being curated. Catch-up selects only that
+graph, including when index workers are disabled; it does not drain unrelated
+enrichment providers. Existing authority, restore, retirement, and hidden-child
+admission remain checked at the final primary cut.
+
+Scoped source replay uses the existing scope-aware artifact-key helper. Resolver
+curation updates parse and serialize each override object once, preserving
+unrelated decisions and escaped identities; allocation failures propagate.
+The rewrite clears only its acknowledged HA outbox after durability and authority
+checks, and retains the record on failed acknowledgement for recovery.
+
+The six rewrite regressions passed 200/200 fresh Debug processes (1,200 test
+executions), split across two local lanes using `scripts/ci/zig_vopr_soak.py`'s
+bounded process runner. There were no skipped tests, failures, leaks, or retries.
+The final binary also passed all 37 resolver runtime tests and 16 graph TTL
+regressions. The stale-adjacency test replaces a source while retaining its
+inbound target and proves that rewriting catches up only the selected graph.
+Scoped curation starts from a resolution produced through the production resolver
+seam and published through durable graph replay; unit and chunk variants both
+retain the survivor after replay and reopen. HA fixtures check both successful
+acknowledgement cleanup/reopen and retained outboxes after failed acknowledgement.
+
 Aggregate test ownership is audited against the original selected union. The
 shared module gates own their contract tests; implementation gates receive
 explicit runtime dependencies and exclude only tests executed by another gate.

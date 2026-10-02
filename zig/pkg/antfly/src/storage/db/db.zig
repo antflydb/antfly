@@ -34559,14 +34559,13 @@ pub const DB = struct {
         var policy = try self.local_execution.row_policy_gate.enterRaw();
         defer policy.release();
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try self.ensureDurableReplicationStartupBarrier();
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
         if (self.local_execution.replication_async_batch_mirror != null and self.local_execution.replication_async_effect_mirror == null)
             return error.HAMirrorUnavailable;
         try self.executor.failIfUnhealthy();
-        // Read the adjacency only after its durable replay has caught up.
-        try self.runUntilIdle();
         var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
         defer snapshot_mutation.release();
         var graph_publication = self.core.index_manager.beginGraphPrimaryMutation();
@@ -34574,16 +34573,56 @@ pub const DB = struct {
         try self.lockApplyForPortableRuntime();
         var apply_held = true;
         defer if (apply_held) self.core.unlockApply();
-        {
-            var read = try self.core.store.beginProbeTxn();
-            defer read.abort();
-            try self.requireOnlineArtifactCatalogMutableLocked(&read);
-            try self.requireArtifactReconcileUnfenced(&read, null);
-            // This local administrative entry point cannot invent a Raft
-            // position. Hosted owners must order curation through their owner.
-            if (try @import("../source_authority.zig").load(&read)) |authority| {
-                if (authority.kind == .raft) return error.OnlineSourceScopeChanged;
+        // Primary publication excludes both new graph mutations and replay.
+        // Verify the projection cut under this fence, and release every fence
+        // before waiting. Recheck after waiting so a racing mutation cannot
+        // make the adjacency older than the primary snapshot we rewrite.
+        const clock = self.backend_runtime.monotonicClock();
+        const wait = derived_executor_mod.VisibilityWait{
+            .clock = clock,
+            .deadline_ns = clock.nowRealtimeNs() +| default_visibility_wait_timeout_ms * std.time.ns_per_ms,
+        };
+        while (true) {
+            try wait.check();
+            {
+                var read = try self.core.store.beginProbeTxn();
+                defer read.abort();
+                try self.requireOnlineArtifactCatalogMutableLocked(&read);
+                try self.requireArtifactReconcileUnfenced(&read, null);
+                try @import("relational_integrity_retirement.zig").requireMutable(&read);
+                try @import("restore_staging.zig").requireScope(alloc, &read, null, false);
+                if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+                // This local administrative entry point cannot invent a Raft
+                // position. Hosted owners must order curation through their owner.
+                if (try @import("../source_authority.zig").load(&read)) |authority| {
+                    if (authority.kind == .raft) return error.OnlineSourceScopeChanged;
+                }
             }
+            if (self.core.index_manager.graphIndex(index_name) == null) return error.IndexNotFound;
+            if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
+            const applied = try self.managedIndexAppliedSequence(alloc, index_name);
+            const target = try self.managedIndexReplayTargetSequence(alloc, index_name, .graph, applied);
+            if (applied >= target) break;
+            self.core.unlockApply();
+            apply_held = false;
+            graph_publication.release();
+            snapshot_mutation.release();
+            if (self.executor.hasWorkers()) {
+                try self.runDerivedUntilTargetsWithVisibilityWait(target, &.{index_name}, wait);
+            } else {
+                try replayPendingDerivedBatches(self, null, null, .{
+                    .index_names = &.{index_name},
+                    .truncate_replay = false,
+                    .deadline_ns = wait.deadline_ns,
+                });
+            }
+            snapshot_mutation = self.core.snapshot_admission.acquireMutation();
+            graph_publication = self.core.index_manager.beginGraphPrimaryMutation();
+            try self.lockApplyForPortableRuntime();
+            apply_held = true;
+            try self.enforceReplicationWriteGate();
+            if (!self.executor.hasWorkers() and try self.managedIndexAppliedSequence(alloc, index_name) < target)
+                return error.GraphMaintenanceInProgress;
         }
         const entry = self.core.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
         const inbound = try entry.index.getEdges(alloc, old_key, "", .in);
@@ -34648,6 +34687,8 @@ pub const DB = struct {
         self.notifyResolverReplayRuntimes(sequence);
         gates.releaseTransition();
         try gates.waitForDurabilityAndAuthority(context.replication_write_gate);
+        releaseReplicationMutationShared(&replication_mutation);
+        try primary_ha.clear(&context);
         return mutation.rewritten;
     }
 
@@ -35775,6 +35816,8 @@ pub const DB = struct {
 
     const ReplayDrainOptions = struct {
         truncate_replay: bool = true,
+        /// Empty selects all indexes; foreground curation selects its graph.
+        index_names: []const []const u8 = &.{},
         wait_for_enrichment_retries: bool = false,
         cancellation: types.CancellationToken = .none,
         max_windows_per_index: usize = 0,
@@ -56369,32 +56412,28 @@ fn prepareEntityGraphRewrite(alloc: Allocator, db: *DB, index_name: []const u8, 
             const entities = if (parsed.value == .object) parsed.value.object.getPtr("entities") orelse continue else continue;
             if (entities.* != .array) return error.InvalidGraphEdgeArtifact;
             const override_key = try resolution_runtime_mod.reviewOverrideArtifactKeyAlloc(alloc, group.doc, cfg.source_artifact, cfg.resolution_artifact);
-            var override: ?[]const u8 = db.core.store.get(alloc, override_key) catch |err| switch (err) {
+            const override: ?[]const u8 = db.core.store.get(alloc, override_key) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
             };
-            var updated = false;
+            var decisions: std.ArrayListUnmanaged(resolution_runtime_mod.ReviewDecision) = .empty;
             for (entities.array.items) |*entity| {
                 if (entity.* != .object) continue;
                 const ref = entity.object.getPtr("doc_ref") orelse continue;
                 if (ref.* != .object) continue;
                 const target = ref.object.getPtr("key") orelse continue;
                 if (target.* != .string) continue;
-                var matches = false;
-                for (inbound) |edge| if (std.mem.eql(u8, target.string, edge.target)) {
-                    matches = true;
-                    break;
-                };
-                if (!matches) continue;
+                // Every inbound edge has the same merged-away target.
+                if (!std.mem.eql(u8, target.string, inbound[0].target)) continue;
                 const local_id = jsonStringField(entity.*, "local_id") orelse return error.InvalidGraphEdgeArtifact;
-                override = try resolution_runtime_mod.buildReviewDecisionBytesAlloc(alloc, override, local_id, .match, jsonStringField(ref.*, "table") orelse cfg.table, new_target);
+                try decisions.append(alloc, .{ .local_id = local_id, .decision = .match, .table = jsonStringField(ref.*, "table") orelse cfg.table, .key = new_target });
                 target.* = .{ .string = new_target };
-                updated = true;
             }
-            if (!updated) continue;
-            try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, override_key, @constCast(override.?));
+            if (decisions.items.len == 0) continue;
+            const override_bytes = try resolution_runtime_mod.buildReviewDecisionsBytesAlloc(alloc, override, decisions.items);
+            try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, override_key, override_bytes);
             try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, resolution_key, try std.json.Stringify.valueAlloc(alloc, parsed.value, .{}));
-            const source_key = try internal_keys.artifactNamedPrefixAlloc(alloc, group.doc, "asset", cfg.source_artifact);
+            const source_key = try sourceArtifactKeyForResolutionAlloc(alloc, group.doc, cfg.source_artifact);
             try appendUniqueOwnedKeyIndexed(alloc, &changed, &changed_set, source_key);
             try appendUniqueOwnedKeyIndexed(alloc, &changed, &changed_set, resolution_key);
         }
@@ -64096,7 +64135,7 @@ fn replicationTransitionMutexFromContext(ctx: *const BatchExecutionContext) ?*st
     return transition_mutex;
 }
 
-const DurableReplicationOutboxKind = durable_outbox.Kind;
+const DurableReplicationOutboxKind = @import("durable_outbox.zig").Kind;
 
 /// Finish a crash-left local outbox without appending its non-idempotent
 /// mutation twice. The transition mutex serializes this lookup-and-append with
@@ -67324,6 +67363,7 @@ fn replayPendingDerivedBatches(
         .dense_bulk_session_scope = .external,
     };
     for (managed_indexes) |index_ref| {
+        if (options.index_names.len != 0 and !containsName(options.index_names, index_ref.name)) continue;
         const applied = try self.core.loadAppliedSequence(self.alloc, index_ref.name);
         const use_dense_catch_up = index_ref.kind == .dense_vector;
         const resources = self.core.batchExecutionResources();
@@ -96007,6 +96047,140 @@ test "db rewriteEntityEdges preserves owners TTL and destination collisions" {
         const retired = try db.getEdges(alloc, "g", "survivor", "links", .in);
         defer graph_mod.GraphIndex.freeEdges(alloc, retired);
         try std.testing.expectEqual(@as(usize, 0), retired.len);
+    }
+}
+
+test "db rewriteEntityEdges fences stale adjacency and leaves unrelated replay pending" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("entity-rewrite-cut");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+    try db.addIndex(.{ .name = "unrelated", .kind = .graph, .config_json = "{}" });
+    try db.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "before", .target = "old", .edge_type = "links" }}, .sync_level = .full_index });
+    try db.runUntilIdle();
+    // A writer replaces the source while retaining the target. Primary state
+    // has never lacked an inbound edge, but adjacency still names `before`.
+    try db.batch(.{
+        .graph_deletes = &.{.{ .index_name = "g", .source = "before", .target = "old", .edge_type = "links" }},
+        .graph_writes = &.{
+            .{ .index_name = "g", .source = "after", .target = "old", .edge_type = "links" },
+            .{ .index_name = "unrelated", .source = "another", .target = "old", .edge_type = "links" },
+        },
+        .sync_level = .write,
+    });
+    const unrelated_applied = try db.managedIndexAppliedSequence(alloc, "unrelated");
+    try std.testing.expectEqual(@as(usize, 1), try db.rewriteEntityEdges(alloc, "g", "old", "survivor"));
+    try std.testing.expectEqual(unrelated_applied, try db.managedIndexAppliedSequence(alloc, "unrelated"));
+    const new_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "after", "g", "links", "survivor");
+    defer alloc.free(new_key);
+    const payload = try db.core.store.get(alloc, new_key);
+    defer alloc.free(payload);
+    try db.runUntilIdle();
+    const edges = try db.getEdges(alloc, "g", "survivor", "links", .in);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("after", edges[0].source);
+}
+
+test "db rewriteEntityEdges retains scoped source replay and curation" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |chunk| {
+        var directory = try TestDirectory.init("entity-rewrite-scoped");
+        defer directory.cleanup();
+        var db = try DB.open(alloc, directory.path(), .{});
+        defer db.close();
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"source\":{\"artifact\":\"relations\",\"mention_edge_type\":\"mentions\"},\"artifact\":{\"name\":\"relations\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"relations\"},\"content_type\":\"application/json\"}}" });
+        try db.addResolver(.{ .name = "kg", .table = "entities", .source_artifact = "relations", .source_artifact_kind = if (chunk) .chunk else .asset, .resolution_artifact = "resolution", .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}", .config_generation = 1 });
+        const source_key = if (chunk) try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc:a", "relations", "page:1", 0) else try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:a", "relations", "page:1");
+        defer alloc.free(source_key);
+        const extraction = "{\"entities\":[{\"id\":\"e0\",\"label\":\"person\",\"text\":\"Ada Lovelace\"},{\"id\":\"e1\",\"label\":\"person\",\"text\":\"Ada Lovelace\"}]}";
+        // Seed the authoritative scoped resolution explicitly, through the
+        // production resolver seam. The rewrite owns already-materialized
+        // contributions; source-production scheduling is a separate contract.
+        try db.core.store.putBatch(&.{.{ .key = source_key, .value = extraction }}, &.{});
+        var artifacts: resolution_runtime_mod.DbArtifactStore(@TypeOf(db.core.store.runtime_store)) = .{ .store = &db.core.store.runtime_store, .index_manager = db.core.index_manager };
+        const outcome = (try resolution_runtime_mod.processChangedExtraction(alloc, db.core.index_manager.resolvers.items, artifacts.artifactStore(), null, source_key, null, null)).?;
+        defer alloc.free(outcome.resolution_key);
+        const initial_resolution = try db.core.store.get(alloc, outcome.resolution_key);
+        defer alloc.free(initial_resolution);
+        _ = try db.applyDocumentArtifactChildRangeBatch(.{ .artifact_writes = &.{.{ .key = outcome.resolution_key, .value = initial_resolution }}, .sync_level = .write });
+        try db.runUntilIdle();
+        const before = try db.getEdges(alloc, "g", "person/ada_lovelace", "mentions", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, before);
+        try std.testing.expectEqual(@as(usize, 1), before.len);
+        try std.testing.expectEqual(@as(usize, 1), try db.rewriteEntityEdges(alloc, "g", "person/ada_lovelace", "survivor"));
+        try db.runUntilIdle();
+        db.close();
+        db = try DB.open(alloc, directory.path(), .{});
+        try db.runUntilIdle();
+        const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, source_key, "resolution");
+        defer alloc.free(resolution_key);
+        const raw = try db.core.store.get(alloc, resolution_key);
+        defer alloc.free(raw);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+        defer parsed.deinit();
+        for (parsed.value.object.get("entities").?.array.items) |entity|
+            try std.testing.expectEqualStrings("survivor", entity.object.get("doc_ref").?.object.get("key").?.string);
+        const edges = try db.getEdges(alloc, "g", "survivor", "mentions", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+    }
+}
+
+test "db rewriteEntityEdges clears acknowledged HA outbox and retains failed acknowledgement" {
+    const alloc = std.testing.allocator;
+    const contract = @import("replication_contract.zig");
+    const FakePublisher = struct {
+        fail: bool = false,
+        published: usize = 0,
+        fn next(_: *anyopaque) u64 {
+            return 1;
+        }
+        fn identity(_: *anyopaque) contract.Publisher.Identity {
+            return .{ .table_id = 0, .shard_id = 0, .timeline_id = 1, .epoch = 1 };
+        }
+        fn publish(mirror: contract.AsyncEffectMirror, kind: @import("durable_outbox.zig").Kind, payload: []const u8, _: doc_identity.Namespace) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(mirror.publisher.ptr));
+            try std.testing.expectEqual(@import("durable_outbox.zig").Kind.primary_effect, kind);
+            try std.testing.expect(replication_effects_mod.primary_effect.isPrimaryEffect(payload));
+            self.published += 1;
+            return 1;
+        }
+        fn recover(_: contract.AsyncEffectMirror, _: @import("durable_outbox.zig").Kind, _: @import("durable_outbox.zig").DurableReplicationOutbox, _: doc_identity.Namespace) !u64 {
+            return error.UnexpectedRecovery;
+        }
+        fn preflight(_: contract.AsyncEffectMirror, _: bool) !void {}
+        fn complete(mirror: contract.AsyncEffectMirror, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(mirror.publisher.ptr));
+            if (self.fail) return error.TestAcknowledgementFailed;
+        }
+        fn publisher(self: *@This()) contract.Publisher {
+            return .{ .ptr = self, .vtable = &.{ .next_lsn = next, .identity = identity, .publish = publish, .recover = recover, .preflight = preflight, .complete = complete } };
+        }
+    };
+    for ([_]bool{ false, true }) |fail| {
+        var directory = try TestDirectory.init("entity-rewrite-ha");
+        defer directory.cleanup();
+        var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+        try db.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "doc:a", .target = "old", .edge_type = "links" }}, .sync_level = .full_index });
+        var publisher: FakePublisher = .{ .fail = fail };
+        db.local_execution.replication_async_effect_mirror = .{ .publisher = publisher.publisher() };
+        if (fail) try std.testing.expectError(error.TestAcknowledgementFailed, db.rewriteEntityEdges(alloc, "g", "old", "survivor")) else try std.testing.expectEqual(@as(usize, 1), try db.rewriteEntityEdges(alloc, "g", "old", "survivor"));
+        try std.testing.expectEqual(@as(usize, 1), publisher.published);
+        var pending = try durable_outbox_store.readPending(alloc, db.core.store);
+        defer pending.deinit(alloc);
+        try std.testing.expectEqual(!fail, pending.isEmpty());
+        // Avoid recovery through a fixture publisher after its lifetime ends.
+        db.local_execution.replication_async_effect_mirror = null;
+        if (!fail) {
+            db.close();
+            db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+            try db.batch(.{ .writes = &.{.{ .key = "still-writable", .value = "{}" }}, .sync_level = .write });
+        }
     }
 }
 
