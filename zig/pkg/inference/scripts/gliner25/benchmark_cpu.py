@@ -332,6 +332,13 @@ def checked_ready(arm: str, ready: dict[str, Any], bundle: dict[str, Any], cases
         raise BenchmarkError("Python interop thread budget differs")
 
 
+def thread_environment(threads: int) -> dict[str, str]:
+    # BLAS supports the full benchmark budget. The native fallback pool has
+    # its own eight-worker maximum, including in BLAS-enabled workers.
+    return {**{name: str(threads) for name in THREAD_ENV},
+            "ANTFLY_INFERENCE_CPU_THREADS": str(min(threads, 8))}
+
+
 def run_variant(args: argparse.Namespace, variant: str, directory: Path) -> dict[str, Any]:
     directory.mkdir()
     model_dir = args.model_root / variant
@@ -351,8 +358,7 @@ def run_variant(args: argparse.Namespace, variant: str, directory: Path) -> dict
         raise BenchmarkError("requested benchmark exceeds worker command budget")
     expected = {name: canonical_result(all_cases[name]["expected"]) for name in selected}
     env = dict(os.environ)
-    env.update({name: str(args.threads) for name in THREAD_ENV})
-    env["ANTFLY_INFERENCE_CPU_THREADS"] = str(args.threads)
+    env.update(thread_environment(args.threads))
     env.update(PYTHONDONTWRITEBYTECODE="1", TOKENIZERS_PARALLELISM="false", HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
     env.pop("USE_FLASHDEBERTA", None)
     native_command = [str(args.native_bin), "--model-dir", str(model_dir), "--cases", str(case_path), "--threads", str(args.threads), "--timeout-ms", str(args.timeout_ms), "--max-commands", str(command_count)]

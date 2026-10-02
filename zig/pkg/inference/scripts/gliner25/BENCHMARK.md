@@ -135,7 +135,9 @@ automatic dispatch and the affinity/cgroup budget.
 
 The CPU comparison worker now accepts bounded native math pools without BLAS.
 The driver sets the native thread cap along with BLAS/Torch thread variables,
-and records selected kernels and effective thread counts. Request timeouts can
+keeping the native fallback at at most eight workers while preserving the
+requested BLAS/Torch budget of up to 32 threads. It records selected kernels
+and effective thread counts. Request timeouts can
 be increased to 300000 ms to capture the old Linux baseline. Kernel benchmark
 `*_ms` fields now report time per measured iteration, rather than the sum of
 all iterations (primitive fields still include `primitive_repeats`).

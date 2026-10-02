@@ -183,10 +183,11 @@ rss_mb_from_kb() {
     awk -v kb="$1" 'BEGIN { printf "%.2f", kb / 1024 }'
 }
 
-echo "timestamp	elapsed_s	pid	rss_kb	rss_mb	command" > "${timeline}"
+printf 'timestamp\telapsed_s\tpid\trss_kb\trss_mb\tcommand\tsample_id\n' > "${timeline}"
 
 start_epoch="$(date +%s)"
 sample_taken="0"
+sample_id="0"
 sample_pid=""
 max_rss_kb="0"
 max_pid=""
