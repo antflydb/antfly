@@ -146,13 +146,13 @@ test {
 }
 
 test "admin facade mirrors generated HA OpenAPI contract types" {
-    inline for (ha_contract_type_names) |name| {
+    inline for (hot_standby_contract_type_names) |name| {
         try expectFacadeTypeAlias(name);
     }
 }
 
 test "admin facade exposes deprecated HA aliases and canonical Standby names as the same type" {
-    inline for (ha_to_standby_alias_pairs) |pair| {
+    inline for (hot_standby_to_standby_alias_pairs) |pair| {
         try std.testing.expect(@hasDecl(@This(), pair.ha));
         try std.testing.expect(@hasDecl(@This(), pair.standby));
         try std.testing.expect(@hasDecl(openapi, pair.standby));
@@ -176,129 +176,129 @@ test "admin facade re-exports HA action receipt result types" {
 }
 
 test "admin facade preserves HA failover receipt schema fields" {
-    inline for (ha_action_receipt_fields) |name| {
+    inline for (hot_standby_action_receipt_fields) |name| {
         try expectFacadeStructField(HAActionReceipt, name);
     }
-    inline for (ha_promotion_assessment_fields) |name| {
+    inline for (hot_standby_promotion_assessment_fields) |name| {
         try expectFacadeStructField(HAPromotionAssessment, name);
     }
-    inline for (ha_promotion_assess_response_fields) |name| {
+    inline for (hot_standby_promotion_assess_response_fields) |name| {
         try expectFacadeStructField(HAPromotionAssessResponse, name);
     }
-    inline for (ha_promotion_response_fields) |name| {
+    inline for (hot_standby_promotion_response_fields) |name| {
         try expectFacadeStructField(HAPromotionResponse, name);
     }
-    inline for (ha_promotion_result_fields) |name| {
+    inline for (hot_standby_promotion_result_fields) |name| {
         try expectFacadeStructField(HAPromotionResult, name);
     }
-    inline for (ha_rejoin_assess_response_fields) |name| {
+    inline for (hot_standby_rejoin_assess_response_fields) |name| {
         try expectFacadeStructField(HARejoinAssessResponse, name);
     }
-    inline for (ha_rejoin_assessment_fields) |name| {
+    inline for (hot_standby_rejoin_assessment_fields) |name| {
         try expectFacadeStructField(HARejoinAssessment, name);
     }
-    inline for (ha_rejoin_rewind_result_fields) |name| {
+    inline for (hot_standby_rejoin_rewind_result_fields) |name| {
         try expectFacadeStructField(HARejoinRewindResult, name);
     }
-    inline for (ha_rejoin_reseed_result_fields) |name| {
+    inline for (hot_standby_rejoin_reseed_result_fields) |name| {
         try expectFacadeStructField(HARejoinReseedResult, name);
     }
 }
 
 test "admin facade preserves HA status and gate schema fields" {
-    inline for (ha_primary_status_response_fields) |name| {
+    inline for (hot_standby_primary_status_response_fields) |name| {
         try expectFacadeStructField(HAPrimaryStatusResponse, name);
     }
-    inline for (ha_standby_status_response_fields) |name| {
+    inline for (hot_standby_standby_status_response_fields) |name| {
         try expectFacadeStructField(HAStandbyStatusResponse, name);
     }
-    inline for (ha_primary_snapshot_fields) |name| {
+    inline for (hot_standby_primary_snapshot_fields) |name| {
         try expectFacadeStructField(HAPrimarySnapshot, name);
     }
-    inline for (ha_standby_snapshot_fields) |name| {
+    inline for (hot_standby_standby_snapshot_fields) |name| {
         try expectFacadeStructField(HAStandbySnapshot, name);
     }
-    inline for (ha_slot_snapshot_fields) |name| {
+    inline for (hot_standby_slot_snapshot_fields) |name| {
         try expectFacadeStructField(HASlotSnapshot, name);
     }
-    inline for (ha_retention_snapshot_fields) |name| {
+    inline for (hot_standby_retention_snapshot_fields) |name| {
         try expectFacadeStructField(HARetentionSnapshot, name);
     }
-    inline for (ha_durability_decision_fields) |name| {
+    inline for (hot_standby_durability_decision_fields) |name| {
         try expectFacadeStructField(HADurabilityDecision, name);
     }
-    inline for (ha_commit_check_response_fields) |name| {
+    inline for (hot_standby_commit_check_response_fields) |name| {
         try expectFacadeStructField(HACommitCheckResponse, name);
     }
-    inline for (ha_commit_append_response_fields) |name| {
+    inline for (hot_standby_commit_append_response_fields) |name| {
         try expectFacadeStructField(HACommitAppendResponse, name);
     }
-    inline for (ha_commit_gate_fields) |name| {
+    inline for (hot_standby_commit_gate_fields) |name| {
         try expectFacadeStructField(HACommitGate, name);
     }
-    inline for (ha_read_check_response_fields) |name| {
+    inline for (hot_standby_read_check_response_fields) |name| {
         try expectFacadeStructField(HAReadCheckResponse, name);
     }
-    inline for (ha_read_decision_fields) |name| {
+    inline for (hot_standby_read_decision_fields) |name| {
         try expectFacadeStructField(HAReadDecision, name);
     }
-    inline for (ha_write_check_response_fields) |name| {
+    inline for (hot_standby_write_check_response_fields) |name| {
         try expectFacadeStructField(HAWriteCheckResponse, name);
     }
-    inline for (ha_write_decision_fields) |name| {
+    inline for (hot_standby_write_decision_fields) |name| {
         try expectFacadeStructField(HAWriteDecision, name);
     }
-    inline for (ha_owner_job_check_response_fields) |name| {
+    inline for (hot_standby_owner_job_check_response_fields) |name| {
         try expectFacadeStructField(HAOwnerJobCheckResponse, name);
     }
-    inline for (ha_owner_job_decision_fields) |name| {
+    inline for (hot_standby_owner_job_decision_fields) |name| {
         try expectFacadeStructField(HAOwnerJobDecision, name);
     }
-    inline for (ha_promotion_handoff_fields) |name| {
+    inline for (hot_standby_promotion_handoff_fields) |name| {
         try expectFacadeStructField(HAPromotionHandoff, name);
     }
 }
 
 test "admin facade preserves HA slot seed and fence schema fields" {
-    inline for (ha_identity_fields) |name| {
+    inline for (hot_standby_identity_fields) |name| {
         try expectFacadeStructField(HAIdentity, name);
     }
-    inline for (ha_replication_slot_fields) |name| {
+    inline for (hot_standby_replication_slot_fields) |name| {
         try expectFacadeStructField(HAReplicationSlot, name);
     }
-    inline for (ha_replication_slot_action_response_fields) |name| {
+    inline for (hot_standby_replication_slot_action_response_fields) |name| {
         try expectFacadeStructField(HAReplicationSlotActionResponse, name);
     }
-    inline for (ha_replication_slot_list_response_fields) |name| {
+    inline for (hot_standby_replication_slot_list_response_fields) |name| {
         try expectFacadeStructField(HAReplicationSlotListResponse, name);
     }
-    inline for (ha_base_backup_begin_response_fields) |name| {
+    inline for (hot_standby_base_backup_begin_response_fields) |name| {
         try expectFacadeStructField(HABaseBackupBeginResponse, name);
     }
-    inline for (ha_base_backup_finish_response_fields) |name| {
+    inline for (hot_standby_base_backup_finish_response_fields) |name| {
         try expectFacadeStructField(HABaseBackupFinishResponse, name);
     }
-    inline for (ha_standby_bootstrap_response_fields) |name| {
+    inline for (hot_standby_standby_bootstrap_response_fields) |name| {
         try expectFacadeStructField(HAStandbyBootstrapResponse, name);
     }
-    inline for (ha_standby_upstream_fields) |name| {
+    inline for (hot_standby_standby_upstream_fields) |name| {
         try expectFacadeStructField(HAStandbyUpstream, name);
     }
-    inline for (ha_standby_upstream_response_fields) |name| {
+    inline for (hot_standby_standby_upstream_response_fields) |name| {
         try expectFacadeStructField(HAStandbyUpstreamResponse, name);
     }
-    inline for (ha_fence_receipt_fields) |name| {
+    inline for (hot_standby_fence_receipt_fields) |name| {
         try expectFacadeStructField(HAFenceReceipt, name);
     }
-    inline for (ha_fence_response_fields) |name| {
+    inline for (hot_standby_fence_response_fields) |name| {
         try expectFacadeStructField(HAFenceResponse, name);
     }
-    inline for (ha_current_fence_response_fields) |name| {
+    inline for (hot_standby_current_fence_response_fields) |name| {
         try expectFacadeStructField(HACurrentFenceResponse, name);
     }
 }
 
-const ha_contract_type_names = [_][]const u8{
+const hot_standby_contract_type_names = [_][]const u8{
     "ReplicationSlotCreateRequest",
     "BaseBackupStartRequest",
     "BaseBackupManifestPathRequest",
@@ -360,7 +360,7 @@ const HaToStandbyAliasPair = struct { ha: []const u8, standby: []const u8 };
 
 // Deprecated aliases, remove after 0.4: every `HA*` facade name above that has
 // a same-shape `Standby*` counterpart, paired for the alias-equivalence test.
-const ha_to_standby_alias_pairs = [_]HaToStandbyAliasPair{
+const hot_standby_to_standby_alias_pairs = [_]HaToStandbyAliasPair{
     .{ .ha = "HASyncPolicy", .standby = "StandbySyncPolicy" },
     .{ .ha = "HAIdentity", .standby = "StandbyIdentity" },
     .{ .ha = "HALeaseWatchdogProof", .standby = "StandbyLeaseWatchdogProof" },
@@ -409,7 +409,7 @@ const ha_to_standby_alias_pairs = [_]HaToStandbyAliasPair{
     .{ .ha = "HAActionReceipt", .standby = "StandbyActionReceipt" },
 };
 
-const ha_action_receipt_fields = [_][]const u8{
+const hot_standby_action_receipt_fields = [_][]const u8{
     "action_id",
     "action_kind",
     "target",
@@ -417,7 +417,7 @@ const ha_action_receipt_fields = [_][]const u8{
     "node_id",
 };
 
-const ha_promotion_assessment_fields = [_][]const u8{
+const hot_standby_promotion_assessment_fields = [_][]const u8{
     "required_lsn",
     "received_lsn",
     "applied_lsn",
@@ -433,7 +433,7 @@ const ha_promotion_assessment_fields = [_][]const u8{
     "can_promote",
 };
 
-const ha_promotion_response_fields = [_][]const u8{
+const hot_standby_promotion_response_fields = [_][]const u8{
     "schema_version",
     "action",
     "assessment",
@@ -443,13 +443,13 @@ const ha_promotion_response_fields = [_][]const u8{
     "forced",
 };
 
-const ha_promotion_assess_response_fields = [_][]const u8{
+const hot_standby_promotion_assess_response_fields = [_][]const u8{
     "schema_version",
     "action",
     "assessment",
 };
 
-const ha_promotion_result_fields = [_][]const u8{
+const hot_standby_promotion_result_fields = [_][]const u8{
     "node_id",
     "switch_lsn",
     "old_identity",
@@ -458,7 +458,7 @@ const ha_promotion_result_fields = [_][]const u8{
     "data_loss_possible",
 };
 
-const ha_rejoin_assess_response_fields = [_][]const u8{
+const hot_standby_rejoin_assess_response_fields = [_][]const u8{
     "schema_version",
     "action",
     "assessment",
@@ -466,7 +466,7 @@ const ha_rejoin_assess_response_fields = [_][]const u8{
     "reseed",
 };
 
-const ha_rejoin_rewind_result_fields = [_][]const u8{
+const hot_standby_rejoin_rewind_result_fields = [_][]const u8{
     "node_id",
     "fork_lsn",
     "previous_last_lsn",
@@ -478,7 +478,7 @@ const ha_rejoin_rewind_result_fields = [_][]const u8{
     "data_loss_discarded",
 };
 
-const ha_rejoin_reseed_result_fields = [_][]const u8{
+const hot_standby_rejoin_reseed_result_fields = [_][]const u8{
     "node_id",
     "slot_name",
     "target_timeline_id",
@@ -489,17 +489,17 @@ const ha_rejoin_reseed_result_fields = [_][]const u8{
     "base_backup_required",
 };
 
-const ha_primary_status_response_fields = [_][]const u8{
+const hot_standby_primary_status_response_fields = [_][]const u8{
     "schema_version",
     "snapshot",
 };
 
-const ha_standby_status_response_fields = [_][]const u8{
+const hot_standby_standby_status_response_fields = [_][]const u8{
     "schema_version",
     "snapshot",
 };
 
-const ha_primary_snapshot_fields = [_][]const u8{
+const hot_standby_primary_snapshot_fields = [_][]const u8{
     "role",
     "node_id",
     "identity",
@@ -509,7 +509,7 @@ const ha_primary_snapshot_fields = [_][]const u8{
     "durability",
 };
 
-const ha_standby_snapshot_fields = [_][]const u8{
+const hot_standby_standby_snapshot_fields = [_][]const u8{
     "role",
     "node_id",
     "identity",
@@ -529,7 +529,7 @@ const ha_standby_snapshot_fields = [_][]const u8{
     "can_serve_safe_reads",
 };
 
-const ha_slot_snapshot_fields = [_][]const u8{
+const hot_standby_slot_snapshot_fields = [_][]const u8{
     "name",
     "timeline_id",
     "active",
@@ -546,7 +546,7 @@ const ha_slot_snapshot_fields = [_][]const u8{
     "last_error",
 };
 
-const ha_retention_snapshot_fields = [_][]const u8{
+const hot_standby_retention_snapshot_fields = [_][]const u8{
     "primary_lsn",
     "oldest_restart_lsn",
     "retained_lsn_count",
@@ -556,7 +556,7 @@ const ha_retention_snapshot_fields = [_][]const u8{
     "reseed_recommended",
 };
 
-const ha_durability_decision_fields = [_][]const u8{
+const hot_standby_durability_decision_fields = [_][]const u8{
     "status",
     "mode",
     "selection",
@@ -568,29 +568,29 @@ const ha_durability_decision_fields = [_][]const u8{
     "candidate_count",
 };
 
-const ha_commit_check_response_fields = [_][]const u8{
+const hot_standby_commit_check_response_fields = [_][]const u8{
     "schema_version",
     "gate",
 };
 
-const ha_commit_append_response_fields = [_][]const u8{
+const hot_standby_commit_append_response_fields = [_][]const u8{
     "schema_version",
     "lsn",
     "gate",
 };
 
-const ha_commit_gate_fields = [_][]const u8{
+const hot_standby_commit_gate_fields = [_][]const u8{
     "target_lsn",
     "action",
     "durability",
 };
 
-const ha_read_check_response_fields = [_][]const u8{
+const hot_standby_read_check_response_fields = [_][]const u8{
     "schema_version",
     "decision",
 };
 
-const ha_read_decision_fields = [_][]const u8{
+const hot_standby_read_decision_fields = [_][]const u8{
     "action",
     "consistency",
     "required_lsn",
@@ -604,12 +604,12 @@ const ha_read_decision_fields = [_][]const u8{
     "metadata_missing_lsn_count",
 };
 
-const ha_write_check_response_fields = [_][]const u8{
+const hot_standby_write_check_response_fields = [_][]const u8{
     "schema_version",
     "decision",
 };
 
-const ha_write_decision_fields = [_][]const u8{
+const hot_standby_write_decision_fields = [_][]const u8{
     "role",
     "action",
     "identity",
@@ -618,12 +618,12 @@ const ha_write_decision_fields = [_][]const u8{
     "promotion_handoff",
 };
 
-const ha_owner_job_check_response_fields = [_][]const u8{
+const hot_standby_owner_job_check_response_fields = [_][]const u8{
     "schema_version",
     "decision",
 };
 
-const ha_owner_job_decision_fields = [_][]const u8{
+const hot_standby_owner_job_decision_fields = [_][]const u8{
     "kind",
     "role",
     "action",
@@ -633,13 +633,13 @@ const ha_owner_job_decision_fields = [_][]const u8{
     "promotion_handoff",
 };
 
-const ha_promotion_handoff_fields = [_][]const u8{
+const hot_standby_promotion_handoff_fields = [_][]const u8{
     "identity",
     "switch_lsn",
     "next_lsn",
 };
 
-const ha_identity_fields = [_][]const u8{
+const hot_standby_identity_fields = [_][]const u8{
     "cluster_id",
     "shard_id",
     "table_id",
@@ -647,7 +647,7 @@ const ha_identity_fields = [_][]const u8{
     "epoch",
 };
 
-const ha_replication_slot_fields = [_][]const u8{
+const hot_standby_replication_slot_fields = [_][]const u8{
     "slot_name",
     "timeline_id",
     "restart_lsn",
@@ -661,19 +661,19 @@ const ha_replication_slot_fields = [_][]const u8{
     "dropped",
 };
 
-const ha_replication_slot_action_response_fields = [_][]const u8{
+const hot_standby_replication_slot_action_response_fields = [_][]const u8{
     "schema_version",
     "action",
     "slot_action",
     "slot",
 };
 
-const ha_replication_slot_list_response_fields = [_][]const u8{
+const hot_standby_replication_slot_list_response_fields = [_][]const u8{
     "schema_version",
     "slots",
 };
 
-const ha_base_backup_begin_response_fields = [_][]const u8{
+const hot_standby_base_backup_begin_response_fields = [_][]const u8{
     "schema_version",
     "action",
     "slot_name",
@@ -682,7 +682,7 @@ const ha_base_backup_begin_response_fields = [_][]const u8{
     "start_record_lsn",
 };
 
-const ha_base_backup_finish_response_fields = [_][]const u8{
+const hot_standby_base_backup_finish_response_fields = [_][]const u8{
     "schema_version",
     "action",
     "manifest_id",
@@ -690,7 +690,7 @@ const ha_base_backup_finish_response_fields = [_][]const u8{
     "end_record_lsn",
 };
 
-const ha_standby_bootstrap_response_fields = [_][]const u8{
+const hot_standby_standby_bootstrap_response_fields = [_][]const u8{
     "schema_version",
     "action",
     "manifest_id",
@@ -698,12 +698,12 @@ const ha_standby_bootstrap_response_fields = [_][]const u8{
     "checkpoint_lsn",
 };
 
-const ha_standby_upstream_fields = [_][]const u8{
+const hot_standby_standby_upstream_fields = [_][]const u8{
     "upstream_url",
     "slot_name",
 };
 
-const ha_standby_upstream_response_fields = [_][]const u8{
+const hot_standby_standby_upstream_response_fields = [_][]const u8{
     "schema_version",
     "action",
     "identity",
@@ -712,7 +712,7 @@ const ha_standby_upstream_response_fields = [_][]const u8{
     "changed",
 };
 
-const ha_fence_receipt_fields = [_][]const u8{
+const hot_standby_fence_receipt_fields = [_][]const u8{
     "identity",
     "old_primary_id",
     "promoted_node_id",
@@ -728,13 +728,13 @@ const ha_fence_receipt_fields = [_][]const u8{
     "reason",
 };
 
-const ha_fence_response_fields = [_][]const u8{
+const hot_standby_fence_response_fields = [_][]const u8{
     "schema_version",
     "action",
     "receipt",
 };
 
-const ha_rejoin_assessment_fields = [_][]const u8{
+const hot_standby_rejoin_assessment_fields = [_][]const u8{
     "action",
     "reason",
     "former_node_id",
@@ -751,7 +751,7 @@ const ha_rejoin_assessment_fields = [_][]const u8{
     "data_loss_discarded",
 };
 
-const ha_current_fence_response_fields = [_][]const u8{
+const hot_standby_current_fence_response_fields = [_][]const u8{
     "schema_version",
     "held",
     "receipt",

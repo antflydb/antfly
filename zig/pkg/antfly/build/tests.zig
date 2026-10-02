@@ -2637,7 +2637,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_storage_test_step = b.step("antfly-storage-test", "Run root-module storage tests only");
     lib_storage_test_step.dependOn(&run_lib_storage_tests.step);
 
-    const ha_tests = b.addTest(.{
+    const hot_standby_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{"storage.hot_standby"},
         .test_runner = .{
@@ -2645,9 +2645,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .mode = .simple,
         },
     });
-    const run_ha_tests = addFilteredTestRunArtifact(b, ha_tests);
-    const ha_test_step = b.step("antfly-storage-hot-standby-test", "Run hot-standby storage tests");
-    ha_test_step.dependOn(&run_ha_tests.step);
+    const run_ha_tests = addFilteredTestRunArtifact(b, hot_standby_tests);
+    const hot_standby_test_step = b.step("antfly-storage-hot-standby-test", "Run hot-standby storage tests");
+    hot_standby_test_step.dependOn(&run_ha_tests.step);
 
     // cmd/standby.zig is owned by the distributed runtime unit. Keep its
     // focused parser root inside pkg/antfly/src so relative imports stay
@@ -2668,7 +2668,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{"standby cmd"},
     });
     const run_standby_cli_tests = b.addRunArtifact(standby_cli_tests);
-    ha_test_step.dependOn(&run_standby_cli_tests.step);
+    hot_standby_test_step.dependOn(&run_standby_cli_tests.step);
 
     const lsm_backend_runtime_filters = selectTestFilters(b, &.{"storage.lsm_backend."});
     const lsm_backend_tests = b.addTest(.{

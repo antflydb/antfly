@@ -926,7 +926,7 @@ pub const Config = struct {
             // `hot_standby` is the current config key; `ha` is accepted for one
             // minor release as a deprecated alias. If both are set, `hot_standby`
             // wins and `ha` is silently ignored (no conflict error).
-            .ha = try haConfigFromOpenApi(alloc, validated.value.hot_standby orelse validated.value.ha),
+            .ha = try hotStandbyConfigFromOpenApi(alloc, validated.value.hot_standby orelse validated.value.ha),
             .inference = if (validated.value.inference) |inference| .{
                 .api_url = if (inference.api_url) |url| (if (url.len > 0) try alloc.dupe(u8, url) else null) else null,
                 .api_key = try rawOptionalStringField(alloc, raw_root.get("inference"), "api_key"),
@@ -1027,7 +1027,7 @@ pub const Config = struct {
         return @intCast(raw);
     }
 
-    fn haConfigFromOpenApi(alloc: std.mem.Allocator, value: ?common_openapi.HotStandbyConfig) !?HAConfig {
+    fn hotStandbyConfigFromOpenApi(alloc: std.mem.Allocator, value: ?common_openapi.HotStandbyConfig) !?HAConfig {
         const cfg = value orelse return null;
         var out = HAConfig{};
         errdefer out.deinit(alloc);

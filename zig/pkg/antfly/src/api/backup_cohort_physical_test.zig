@@ -47,18 +47,18 @@ test "relational backup cohort pin cancellation survives absent live catalog and
 }
 
 test "relational backup cohort HA controls retain freeze and release across replay" {
-    try testTopologyHAControls(false, false);
+    try testTopologyHotStandbyControls(false, false);
 }
 
 test "relational backup cohort and topology Raft controls retain freeze and abort across HA replay" {
-    try testTopologyHAControls(true, false);
+    try testTopologyHotStandbyControls(true, false);
 }
 
 test "relational backup cohort topology HA split cutover preserves binary range and coverage" {
-    try testTopologyHAControls(true, true);
+    try testTopologyHotStandbyControls(true, true);
 }
 
-fn testTopologyHAControls(comptime replicated: bool, comptime split: bool) !void {
+fn testTopologyHotStandbyControls(comptime replicated: bool, comptime split: bool) !void {
     const replication_ingress = @import("../storage/db/replication_ingress.zig");
     const std = @import("std");
     const db = @import("../storage/db/mod.zig");

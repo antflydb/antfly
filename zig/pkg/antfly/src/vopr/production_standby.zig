@@ -160,7 +160,7 @@ pub const Owners = struct {
     }
 
     pub fn catchUp(self: *Owners, executor: http.RequestExecutor, upstream: []const u8) !void {
-        _ = try self.server.?.replicateHAStandbyUntilCaughtUp(executor, upstream, "standby", .{ .max_records = 8 });
+        _ = try self.server.?.replicateHotStandbyStandbyUntilCaughtUp(executor, upstream, "standby", .{ .max_records = 8 });
         if (self.primary.?.lastLsn() == 0) return error.ProductionStandbyEmptyReplicationStream;
         const progress = self.standby.?.currentProgress();
         self.observed_progress = progress;
@@ -217,9 +217,9 @@ pub const Owners = struct {
         self.fences = null;
         self.fences = try hot_standby.fencing.Store.open(self.alloc, fence_path, .{ .wal_options = self.options });
         try self.standbyAdmin(executor, 200);
-        if (self.standby != null or self.server.?.ha_promoted_primary == null)
+        if (self.standby != null or self.server.?.hot_standby_promoted_primary == null)
             return error.ProductionStandbyPromotionNotAdopted;
-        const promoted = &self.server.?.ha_promoted_primary.?;
+        const promoted = &self.server.?.hot_standby_promoted_primary.?;
         self.promoted_lsn = promoted.lastLsn();
         self.promoted_sound = promoted.identity.timeline_id == 2 and
             promoted.identity.epoch == 2 and promoted.lastLsn() > self.boundary;

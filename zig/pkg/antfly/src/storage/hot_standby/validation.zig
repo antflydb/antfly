@@ -26,7 +26,7 @@ pub const HAStringValidation = enum {
     padded,
 };
 
-pub fn classifyHAString(value_or_null: ?[]const u8) HAStringValidation {
+pub fn classifyHotStandbyString(value_or_null: ?[]const u8) HAStringValidation {
     const raw = value_or_null orelse return .missing;
     var start: usize = 0;
     while (start < raw.len and isASCIIWhitespace(raw[start])) : (start += 1) {}
@@ -124,15 +124,15 @@ fn isASCIIWhitespace(byte: u8) bool {
 }
 
 test "storage.hot_standby validation classifies missing padded and valid strings" {
-    try std.testing.expectEqual(HAStringValidation.missing, classifyHAString(null));
-    try std.testing.expectEqual(HAStringValidation.missing, classifyHAString(""));
-    try std.testing.expectEqual(HAStringValidation.missing, classifyHAString(" \t\r\n"));
-    try std.testing.expectEqual(HAStringValidation.missing, classifyHAString("\x0b\x0c"));
-    try std.testing.expectEqual(HAStringValidation.padded, classifyHAString(" primary-a"));
-    try std.testing.expectEqual(HAStringValidation.padded, classifyHAString("primary-a\n"));
-    try std.testing.expectEqual(HAStringValidation.padded, classifyHAString("\x0bprimary-a"));
-    try std.testing.expectEqual(HAStringValidation.padded, classifyHAString("primary-a\x0c"));
-    try std.testing.expectEqual(HAStringValidation.ok, classifyHAString("primary-a"));
+    try std.testing.expectEqual(HAStringValidation.missing, classifyHotStandbyString(null));
+    try std.testing.expectEqual(HAStringValidation.missing, classifyHotStandbyString(""));
+    try std.testing.expectEqual(HAStringValidation.missing, classifyHotStandbyString(" \t\r\n"));
+    try std.testing.expectEqual(HAStringValidation.missing, classifyHotStandbyString("\x0b\x0c"));
+    try std.testing.expectEqual(HAStringValidation.padded, classifyHotStandbyString(" primary-a"));
+    try std.testing.expectEqual(HAStringValidation.padded, classifyHotStandbyString("primary-a\n"));
+    try std.testing.expectEqual(HAStringValidation.padded, classifyHotStandbyString("\x0bprimary-a"));
+    try std.testing.expectEqual(HAStringValidation.padded, classifyHotStandbyString("primary-a\x0c"));
+    try std.testing.expectEqual(HAStringValidation.ok, classifyHotStandbyString("primary-a"));
 }
 
 test "storage.hot_standby validation checks identifiers env names and normalized paths" {

@@ -67,33 +67,33 @@ pub const standby_rejoin_reseed = standby ++ "/rejoin/reseed";
 // unchanged; they resolve to the same canonical strings as the `standby_*`
 // constants above, NOT to `/admin/v1/ha/...` literals.
 pub const ha = standby;
-pub const ha_primary_status = standby_primary_status;
-pub const ha_watchdog_proof = standby_watchdog_proof;
-pub const ha_standby_status = standby_status;
-pub const ha_commit_check = standby_commit_check;
-pub const ha_commit_append = standby_commit_append;
-pub const ha_read_check = standby_read_check;
-pub const ha_write_check = standby_write_check;
-pub const ha_owner_job_check = standby_owner_job_check;
-pub const ha_replication_slots = standby_replication_slots;
-pub const ha_replication_slot_prefix = standby_replication_slot_prefix;
-pub const ha_replication_slot_pause_suffix = standby_replication_slot_pause_suffix;
-pub const ha_replication_slot_resume_suffix = standby_replication_slot_resume_suffix;
-pub const ha_base_backups = standby_base_backups;
-pub const ha_base_backups_finish = standby_base_backups_finish;
-pub const ha_base_backups_capture = standby_base_backups_capture;
-pub const ha_base_backups_activate = standby_base_backups_activate;
-pub const ha_seed_lifecycle_receipts = standby_seed_lifecycle_receipts;
-pub const ha_standby_bootstrap = standby_bootstrap;
-pub const ha_standby_upstream = standby_upstream;
-pub const ha_fence = standby_fence;
-pub const ha_fence_current = standby_fence_current;
-pub const ha_promotion = standby_promotion;
-pub const ha_promotion_assess = standby_promotion_assess;
-pub const ha_promotion_current_fence = standby_promotion_current_fence;
-pub const ha_rejoin_assess = standby_rejoin_assess;
-pub const ha_rejoin_rewind = standby_rejoin_rewind;
-pub const ha_rejoin_reseed = standby_rejoin_reseed;
+pub const hot_standby_primary_status = standby_primary_status;
+pub const hot_standby_watchdog_proof = standby_watchdog_proof;
+pub const hot_standby_standby_status = standby_status;
+pub const hot_standby_commit_check = standby_commit_check;
+pub const hot_standby_commit_append = standby_commit_append;
+pub const hot_standby_read_check = standby_read_check;
+pub const hot_standby_write_check = standby_write_check;
+pub const hot_standby_owner_job_check = standby_owner_job_check;
+pub const hot_standby_replication_slots = standby_replication_slots;
+pub const hot_standby_replication_slot_prefix = standby_replication_slot_prefix;
+pub const hot_standby_replication_slot_pause_suffix = standby_replication_slot_pause_suffix;
+pub const hot_standby_replication_slot_resume_suffix = standby_replication_slot_resume_suffix;
+pub const hot_standby_base_backups = standby_base_backups;
+pub const hot_standby_base_backups_finish = standby_base_backups_finish;
+pub const hot_standby_base_backups_capture = standby_base_backups_capture;
+pub const hot_standby_base_backups_activate = standby_base_backups_activate;
+pub const hot_standby_seed_lifecycle_receipts = standby_seed_lifecycle_receipts;
+pub const hot_standby_standby_bootstrap = standby_bootstrap;
+pub const hot_standby_standby_upstream = standby_upstream;
+pub const hot_standby_fence = standby_fence;
+pub const hot_standby_fence_current = standby_fence_current;
+pub const hot_standby_promotion = standby_promotion;
+pub const hot_standby_promotion_assess = standby_promotion_assess;
+pub const hot_standby_promotion_current_fence = standby_promotion_current_fence;
+pub const hot_standby_rejoin_assess = standby_rejoin_assess;
+pub const hot_standby_rejoin_rewind = standby_rejoin_rewind;
+pub const hot_standby_rejoin_reseed = standby_rejoin_reseed;
 
 /// Legacy `/admin/v1/ha` prefix, accepted as an alias for `standby` above.
 pub const legacy_standby_prefix = base ++ "/ha";
@@ -168,16 +168,16 @@ pub fn legacyAdminPathAlloc(alloc: Allocator, path: []const u8) !?[]u8 {
 pub fn replicationSlotPathAlloc(alloc: Allocator, slot_name: []const u8) ![]u8 {
     const escaped = try percentEncodePathSegmentAlloc(alloc, slot_name);
     defer alloc.free(escaped);
-    return try std.fmt.allocPrint(alloc, "{s}{s}", .{ ha_replication_slot_prefix, escaped });
+    return try std.fmt.allocPrint(alloc, "{s}{s}", .{ hot_standby_replication_slot_prefix, escaped });
 }
 
 pub fn replicationSlotPausePathAlloc(alloc: Allocator, slot_name: []const u8) ![]u8 {
     const escaped = try percentEncodePathSegmentAlloc(alloc, slot_name);
     defer alloc.free(escaped);
     return try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{
-        ha_replication_slot_prefix,
+        hot_standby_replication_slot_prefix,
         escaped,
-        ha_replication_slot_pause_suffix,
+        hot_standby_replication_slot_pause_suffix,
     });
 }
 
@@ -185,17 +185,17 @@ pub fn replicationSlotResumePathAlloc(alloc: Allocator, slot_name: []const u8) !
     const escaped = try percentEncodePathSegmentAlloc(alloc, slot_name);
     defer alloc.free(escaped);
     return try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{
-        ha_replication_slot_prefix,
+        hot_standby_replication_slot_prefix,
         escaped,
-        ha_replication_slot_resume_suffix,
+        hot_standby_replication_slot_resume_suffix,
     });
 }
 
 pub fn replicationSlotNameFromPath(path: []const u8, suffix: []const u8) ?[]const u8 {
-    if (!std.mem.startsWith(u8, path, ha_replication_slot_prefix)) return null;
+    if (!std.mem.startsWith(u8, path, hot_standby_replication_slot_prefix)) return null;
     if (!std.mem.endsWith(u8, path, suffix)) return null;
 
-    const name_start = ha_replication_slot_prefix.len;
+    const name_start = hot_standby_replication_slot_prefix.len;
     const name_end = path.len - suffix.len;
     if (name_end <= name_start) return null;
 
@@ -263,29 +263,29 @@ fn isPathSegmentUnreserved(byte: u8) bool {
 }
 
 test "admin routes define standby control-plane paths" {
-    try std.testing.expectEqualStrings("/admin/v1/standby/primary/status", ha_primary_status);
-    try std.testing.expectEqualStrings("/admin/v1/standby/watchdog-proof", ha_watchdog_proof);
-    try std.testing.expectEqualStrings("/admin/v1/standby/status", ha_standby_status);
-    try std.testing.expectEqualStrings("/admin/v1/standby/commit/check", ha_commit_check);
-    try std.testing.expectEqualStrings("/admin/v1/standby/commit/append", ha_commit_append);
-    try std.testing.expectEqualStrings("/admin/v1/standby/read/check", ha_read_check);
-    try std.testing.expectEqualStrings("/admin/v1/standby/write/check", ha_write_check);
-    try std.testing.expectEqualStrings("/admin/v1/standby/owner-jobs/check", ha_owner_job_check);
-    try std.testing.expectEqualStrings("/admin/v1/standby/replication-slots", ha_replication_slots);
-    try std.testing.expectEqualStrings("/admin/v1/standby/base-backups", ha_base_backups);
-    try std.testing.expectEqualStrings("/admin/v1/standby/base-backups/finish", ha_base_backups_finish);
-    try std.testing.expectEqualStrings("/admin/v1/standby/base-backups/activate", ha_base_backups_activate);
-    try std.testing.expectEqualStrings("/admin/v1/standby/seed-lifecycle/receipts", ha_seed_lifecycle_receipts);
-    try std.testing.expectEqualStrings("/admin/v1/standby/bootstrap", ha_standby_bootstrap);
-    try std.testing.expectEqualStrings("/admin/v1/standby/upstream", ha_standby_upstream);
-    try std.testing.expectEqualStrings("/admin/v1/standby/fence", ha_fence);
-    try std.testing.expectEqualStrings("/admin/v1/standby/fence/current", ha_fence_current);
-    try std.testing.expectEqualStrings("/admin/v1/standby/promotion", ha_promotion);
-    try std.testing.expectEqualStrings("/admin/v1/standby/promotion/assess", ha_promotion_assess);
-    try std.testing.expectEqualStrings("/admin/v1/standby/promotion/current-fence", ha_promotion_current_fence);
-    try std.testing.expectEqualStrings("/admin/v1/standby/rejoin/assess", ha_rejoin_assess);
-    try std.testing.expectEqualStrings("/admin/v1/standby/rejoin/rewind", ha_rejoin_rewind);
-    try std.testing.expectEqualStrings("/admin/v1/standby/rejoin/reseed", ha_rejoin_reseed);
+    try std.testing.expectEqualStrings("/admin/v1/standby/primary/status", hot_standby_primary_status);
+    try std.testing.expectEqualStrings("/admin/v1/standby/watchdog-proof", hot_standby_watchdog_proof);
+    try std.testing.expectEqualStrings("/admin/v1/standby/status", hot_standby_standby_status);
+    try std.testing.expectEqualStrings("/admin/v1/standby/commit/check", hot_standby_commit_check);
+    try std.testing.expectEqualStrings("/admin/v1/standby/commit/append", hot_standby_commit_append);
+    try std.testing.expectEqualStrings("/admin/v1/standby/read/check", hot_standby_read_check);
+    try std.testing.expectEqualStrings("/admin/v1/standby/write/check", hot_standby_write_check);
+    try std.testing.expectEqualStrings("/admin/v1/standby/owner-jobs/check", hot_standby_owner_job_check);
+    try std.testing.expectEqualStrings("/admin/v1/standby/replication-slots", hot_standby_replication_slots);
+    try std.testing.expectEqualStrings("/admin/v1/standby/base-backups", hot_standby_base_backups);
+    try std.testing.expectEqualStrings("/admin/v1/standby/base-backups/finish", hot_standby_base_backups_finish);
+    try std.testing.expectEqualStrings("/admin/v1/standby/base-backups/activate", hot_standby_base_backups_activate);
+    try std.testing.expectEqualStrings("/admin/v1/standby/seed-lifecycle/receipts", hot_standby_seed_lifecycle_receipts);
+    try std.testing.expectEqualStrings("/admin/v1/standby/bootstrap", hot_standby_standby_bootstrap);
+    try std.testing.expectEqualStrings("/admin/v1/standby/upstream", hot_standby_standby_upstream);
+    try std.testing.expectEqualStrings("/admin/v1/standby/fence", hot_standby_fence);
+    try std.testing.expectEqualStrings("/admin/v1/standby/fence/current", hot_standby_fence_current);
+    try std.testing.expectEqualStrings("/admin/v1/standby/promotion", hot_standby_promotion);
+    try std.testing.expectEqualStrings("/admin/v1/standby/promotion/assess", hot_standby_promotion_assess);
+    try std.testing.expectEqualStrings("/admin/v1/standby/promotion/current-fence", hot_standby_promotion_current_fence);
+    try std.testing.expectEqualStrings("/admin/v1/standby/rejoin/assess", hot_standby_rejoin_assess);
+    try std.testing.expectEqualStrings("/admin/v1/standby/rejoin/rewind", hot_standby_rejoin_rewind);
+    try std.testing.expectEqualStrings("/admin/v1/standby/rejoin/reseed", hot_standby_rejoin_reseed);
 }
 
 test "admin routes translate between canonical and legacy admin path spellings" {
@@ -331,16 +331,16 @@ test "admin routes match generated OpenAPI HA operations" {
     for (expected_ha_routes) |route| {
         try expectGeneratedRoute(route.operation_id, route.method, route.full_path);
     }
-    try expectEveryGeneratedHARouteCovered();
+    try expectEveryGeneratedHotStandbyRouteCovered();
 }
 
 test "admin routes own HA admin path literals consumed by Zig runtime code" {
-    try expectNoHardCodedHAAdminPath("../cmd/standby.zig", @embedFile("../cmd/standby.zig"));
-    try expectNoHardCodedHAAdminPath("../storage/hot_standby/admin_exec.zig", @embedFile("../storage/hot_standby/admin_exec.zig"));
-    try expectNoHardCodedHAAdminPath("../storage/hot_standby/http_admin.zig", @embedFile("../storage/hot_standby/http_admin.zig"));
-    try expectNoHardCodedHAAdminPath("../storage/hot_standby/http_client.zig", @embedFile("../storage/hot_standby/http_client.zig"));
-    try expectNoHardCodedHAAdminPath("../storage/hot_standby/operator.zig", @embedFile("../storage/hot_standby/operator.zig"));
-    try expectNoHardCodedHAAdminPath("../standalone/runtime.zig", @embedFile("../standalone/runtime.zig"));
+    try expectNoHardCodedHotStandbyAdminPath("../cmd/standby.zig", @embedFile("../cmd/standby.zig"));
+    try expectNoHardCodedHotStandbyAdminPath("../storage/hot_standby/admin_exec.zig", @embedFile("../storage/hot_standby/admin_exec.zig"));
+    try expectNoHardCodedHotStandbyAdminPath("../storage/hot_standby/http_admin.zig", @embedFile("../storage/hot_standby/http_admin.zig"));
+    try expectNoHardCodedHotStandbyAdminPath("../storage/hot_standby/http_client.zig", @embedFile("../storage/hot_standby/http_client.zig"));
+    try expectNoHardCodedHotStandbyAdminPath("../storage/hot_standby/operator.zig", @embedFile("../storage/hot_standby/operator.zig"));
+    try expectNoHardCodedHotStandbyAdminPath("../standalone/runtime.zig", @embedFile("../standalone/runtime.zig"));
 }
 
 test "admin routes build and match replication slot lifecycle paths" {
@@ -359,7 +359,7 @@ test "admin routes build and match replication slot lifecycle paths" {
     try std.testing.expectEqualStrings("/admin/v1/standby/replication-slots/standby-a/pause", pause_path);
     try std.testing.expectEqualStrings(
         "standby-a",
-        replicationSlotNameFromPath(pause_path, ha_replication_slot_pause_suffix).?,
+        replicationSlotNameFromPath(pause_path, hot_standby_replication_slot_pause_suffix).?,
     );
 
     const resume_path = try replicationSlotResumePathAlloc(alloc, "standby-a");
@@ -367,11 +367,11 @@ test "admin routes build and match replication slot lifecycle paths" {
     try std.testing.expectEqualStrings("/admin/v1/standby/replication-slots/standby-a/resume", resume_path);
     try std.testing.expectEqualStrings(
         "standby-a",
-        replicationSlotNameFromPath(resume_path, ha_replication_slot_resume_suffix).?,
+        replicationSlotNameFromPath(resume_path, hot_standby_replication_slot_resume_suffix).?,
     );
 
     try std.testing.expect(replicationSlotNameFromPath("/admin/v1/standby/replication-slots/standby-a/extra", "") == null);
-    try std.testing.expect(replicationSlotNameFromPath("/admin/v1/standby/replication-slots/standby-a", ha_replication_slot_pause_suffix) == null);
+    try std.testing.expect(replicationSlotNameFromPath("/admin/v1/standby/replication-slots/standby-a", hot_standby_replication_slot_pause_suffix) == null);
 }
 
 test "admin routes encode and decode replication slot path segments" {
@@ -381,9 +381,9 @@ test "admin routes encode and decode replication slot path segments" {
     const pause_path = try replicationSlotPausePathAlloc(alloc, slot_name);
     defer alloc.free(pause_path);
     try std.testing.expectEqualStrings("/admin/v1/standby/replication-slots/standby%2Fa%20b%25/pause", pause_path);
-    try std.testing.expectEqualStrings("standby%2Fa%20b%25", replicationSlotNameFromPath(pause_path, ha_replication_slot_pause_suffix).?);
+    try std.testing.expectEqualStrings("standby%2Fa%20b%25", replicationSlotNameFromPath(pause_path, hot_standby_replication_slot_pause_suffix).?);
 
-    const decoded = (try replicationSlotNameFromPathAlloc(alloc, pause_path, ha_replication_slot_pause_suffix)).?;
+    const decoded = (try replicationSlotNameFromPathAlloc(alloc, pause_path, hot_standby_replication_slot_pause_suffix)).?;
     defer alloc.free(decoded);
     try std.testing.expectEqualStrings(slot_name, decoded);
 
@@ -404,34 +404,34 @@ const ExpectedRoute = struct {
 };
 
 const expected_ha_routes = [_]ExpectedRoute{
-    .{ .operation_id = "getHAPrimaryStatus", .method = "GET", .full_path = ha_primary_status },
-    .{ .operation_id = "getHAWatchdogProof", .method = "GET", .full_path = ha_watchdog_proof },
-    .{ .operation_id = "getHAStandbyStatus", .method = "GET", .full_path = ha_standby_status },
-    .{ .operation_id = "checkHACommit", .method = "POST", .full_path = ha_commit_check },
-    .{ .operation_id = "appendHACommit", .method = "POST", .full_path = ha_commit_append },
-    .{ .operation_id = "checkHARead", .method = "POST", .full_path = ha_read_check },
-    .{ .operation_id = "checkHAWrite", .method = "POST", .full_path = ha_write_check },
-    .{ .operation_id = "checkHAOwnerJob", .method = "POST", .full_path = ha_owner_job_check },
-    .{ .operation_id = "listHAReplicationSlots", .method = "GET", .full_path = ha_replication_slots },
-    .{ .operation_id = "createHAReplicationSlot", .method = "POST", .full_path = ha_replication_slots },
-    .{ .operation_id = "dropHAReplicationSlot", .method = "DELETE", .full_path = ha_replication_slot_prefix ++ "{slot_name}" },
-    .{ .operation_id = "pauseHAReplicationSlot", .method = "PUT", .full_path = ha_replication_slot_prefix ++ "{slot_name}" ++ ha_replication_slot_pause_suffix },
-    .{ .operation_id = "resumeHAReplicationSlot", .method = "PUT", .full_path = ha_replication_slot_prefix ++ "{slot_name}" ++ ha_replication_slot_resume_suffix },
-    .{ .operation_id = "beginHABaseBackup", .method = "POST", .full_path = ha_base_backups },
-    .{ .operation_id = "finishHABaseBackup", .method = "POST", .full_path = ha_base_backups_finish },
-    .{ .operation_id = "captureHASeedArtifact", .method = "POST", .full_path = ha_base_backups_capture },
-    .{ .operation_id = "activateHASeededSlot", .method = "POST", .full_path = ha_base_backups_activate },
-    .{ .operation_id = "getHASeedLifecycleReceipts", .method = "GET", .full_path = ha_seed_lifecycle_receipts },
-    .{ .operation_id = "bootstrapHAStandby", .method = "POST", .full_path = ha_standby_bootstrap },
-    .{ .operation_id = "setHAStandbyUpstream", .method = "POST", .full_path = ha_standby_upstream },
-    .{ .operation_id = "acquireHAFence", .method = "POST", .full_path = ha_fence },
-    .{ .operation_id = "getHACurrentFence", .method = "GET", .full_path = ha_fence_current },
-    .{ .operation_id = "assessHAPromotion", .method = "POST", .full_path = ha_promotion_assess },
-    .{ .operation_id = "promoteHAWithCurrentFence", .method = "POST", .full_path = ha_promotion_current_fence },
-    .{ .operation_id = "promoteHA", .method = "POST", .full_path = ha_promotion },
-    .{ .operation_id = "assessHARejoin", .method = "POST", .full_path = ha_rejoin_assess },
-    .{ .operation_id = "rewindHARejoin", .method = "POST", .full_path = ha_rejoin_rewind },
-    .{ .operation_id = "reseedHARejoin", .method = "POST", .full_path = ha_rejoin_reseed },
+    .{ .operation_id = "getHAPrimaryStatus", .method = "GET", .full_path = hot_standby_primary_status },
+    .{ .operation_id = "getHAWatchdogProof", .method = "GET", .full_path = hot_standby_watchdog_proof },
+    .{ .operation_id = "getHAStandbyStatus", .method = "GET", .full_path = hot_standby_standby_status },
+    .{ .operation_id = "checkHACommit", .method = "POST", .full_path = hot_standby_commit_check },
+    .{ .operation_id = "appendHACommit", .method = "POST", .full_path = hot_standby_commit_append },
+    .{ .operation_id = "checkHARead", .method = "POST", .full_path = hot_standby_read_check },
+    .{ .operation_id = "checkHAWrite", .method = "POST", .full_path = hot_standby_write_check },
+    .{ .operation_id = "checkHAOwnerJob", .method = "POST", .full_path = hot_standby_owner_job_check },
+    .{ .operation_id = "listHAReplicationSlots", .method = "GET", .full_path = hot_standby_replication_slots },
+    .{ .operation_id = "createHAReplicationSlot", .method = "POST", .full_path = hot_standby_replication_slots },
+    .{ .operation_id = "dropHAReplicationSlot", .method = "DELETE", .full_path = hot_standby_replication_slot_prefix ++ "{slot_name}" },
+    .{ .operation_id = "pauseHAReplicationSlot", .method = "PUT", .full_path = hot_standby_replication_slot_prefix ++ "{slot_name}" ++ hot_standby_replication_slot_pause_suffix },
+    .{ .operation_id = "resumeHAReplicationSlot", .method = "PUT", .full_path = hot_standby_replication_slot_prefix ++ "{slot_name}" ++ hot_standby_replication_slot_resume_suffix },
+    .{ .operation_id = "beginHABaseBackup", .method = "POST", .full_path = hot_standby_base_backups },
+    .{ .operation_id = "finishHABaseBackup", .method = "POST", .full_path = hot_standby_base_backups_finish },
+    .{ .operation_id = "captureHASeedArtifact", .method = "POST", .full_path = hot_standby_base_backups_capture },
+    .{ .operation_id = "activateHASeededSlot", .method = "POST", .full_path = hot_standby_base_backups_activate },
+    .{ .operation_id = "getHASeedLifecycleReceipts", .method = "GET", .full_path = hot_standby_seed_lifecycle_receipts },
+    .{ .operation_id = "bootstrapHAStandby", .method = "POST", .full_path = hot_standby_standby_bootstrap },
+    .{ .operation_id = "setHAStandbyUpstream", .method = "POST", .full_path = hot_standby_standby_upstream },
+    .{ .operation_id = "acquireHAFence", .method = "POST", .full_path = hot_standby_fence },
+    .{ .operation_id = "getHACurrentFence", .method = "GET", .full_path = hot_standby_fence_current },
+    .{ .operation_id = "assessHAPromotion", .method = "POST", .full_path = hot_standby_promotion_assess },
+    .{ .operation_id = "promoteHAWithCurrentFence", .method = "POST", .full_path = hot_standby_promotion_current_fence },
+    .{ .operation_id = "promoteHA", .method = "POST", .full_path = hot_standby_promotion },
+    .{ .operation_id = "assessHARejoin", .method = "POST", .full_path = hot_standby_rejoin_assess },
+    .{ .operation_id = "rewindHARejoin", .method = "POST", .full_path = hot_standby_rejoin_rewind },
+    .{ .operation_id = "reseedHARejoin", .method = "POST", .full_path = hot_standby_rejoin_reseed },
 };
 
 fn expectGeneratedRoute(operation_id: []const u8, method: []const u8, full_path: []const u8) !void {
@@ -449,10 +449,10 @@ fn expectGeneratedRoute(operation_id: []const u8, method: []const u8, full_path:
     return error.TestExpectedGeneratedRoute;
 }
 
-fn expectEveryGeneratedHARouteCovered() !void {
+fn expectEveryGeneratedHotStandbyRouteCovered() !void {
     for (openapi.server.routes) |generated| {
         if (!std.mem.startsWith(u8, generated.path, "/standby/")) continue;
-        if (expectedHARoute(generated) != null) continue;
+        if (expectedHotStandbyRoute(generated) != null) continue;
 
         std.debug.print(
             "generated admin OpenAPI HA route {s} {s} ({s}) is not covered by zig/pkg/antfly/src/admin/routes.zig\n",
@@ -462,13 +462,13 @@ fn expectEveryGeneratedHARouteCovered() !void {
     }
 }
 
-fn expectNoHardCodedHAAdminPath(label: []const u8, source: []const u8) !void {
+fn expectNoHardCodedHotStandbyAdminPath(label: []const u8, source: []const u8) !void {
     if (std.mem.indexOf(u8, source, "\"/admin/v1/ha") == null) return;
     std.debug.print("{s} hard-codes a /admin/v1/ha path; use zig/pkg/antfly/src/admin/routes.zig constants\n", .{label});
     return error.TestExpectedNoHardCodedHAAdminPath;
 }
 
-fn expectedHARoute(generated: openapi.server.Route) ?ExpectedRoute {
+fn expectedHotStandbyRoute(generated: openapi.server.Route) ?ExpectedRoute {
     for (expected_ha_routes) |expected| {
         if (!std.mem.eql(u8, generated.operation_id, expected.operation_id)) continue;
         if (!std.mem.eql(u8, generated.method, expected.method)) continue;

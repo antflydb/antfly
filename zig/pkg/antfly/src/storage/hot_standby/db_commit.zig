@@ -78,8 +78,8 @@ fn preflight(mirror: ReplicationAsyncEffectMirror, record_decision: bool) !void 
     const primary = try runtimePrimary(mirror);
     const target_lsn = primary.nextLsn();
     const decision = try primary.evaluateAppendDurability(target_lsn, mirror.sync_policy);
-    const gate = haCommitGateResultFromDecision(target_lsn, decision);
-    if (record_decision or gate.action == .reject) recordHAMirrorGate(mirror, gate);
+    const gate = hotStandbyCommitGateResultFromDecision(target_lsn, decision);
+    if (record_decision or gate.action == .reject) recordHotStandbyMirrorGate(mirror, gate);
     if (gate.action == .reject) {
         return error.SyncPolicyUnsatisfied;
     }
@@ -89,7 +89,7 @@ pub fn evaluateReplicationMirrorCommitGate(mirror: ReplicationAsyncEffectMirror,
     if (mirror.sync_policy.mode == .async) return;
     const primary = try runtimePrimary(mirror);
     var gate = try hot_standby_commit_gate_mod.evaluate(primary, lsn, mirror.sync_policy);
-    recordHAMirrorGate(mirror, gate);
+    recordHotStandbyMirrorGate(mirror, gate);
     switch (gate.action) {
         .acknowledge => return,
         .acknowledge_degraded => return,
@@ -99,7 +99,7 @@ pub fn evaluateReplicationMirrorCommitGate(mirror: ReplicationAsyncEffectMirror,
             const wait_ctx = mirror.sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext;
             try wait_fn(wait_ctx, mirror.publisher.ptr, lsn, mirror.sync_policy);
             gate = try hot_standby_commit_gate_mod.evaluate(primary, lsn, mirror.sync_policy);
-            recordHAMirrorGate(mirror, gate);
+            recordHotStandbyMirrorGate(mirror, gate);
             switch (gate.action) {
                 .acknowledge => return,
                 .acknowledge_degraded => return,
@@ -110,7 +110,7 @@ pub fn evaluateReplicationMirrorCommitGate(mirror: ReplicationAsyncEffectMirror,
     }
 }
 
-pub fn recordHAMirrorGate(mirror: ReplicationAsyncEffectMirror, gate: hot_standby_commit_gate_mod.GateResult) void {
+pub fn recordHotStandbyMirrorGate(mirror: ReplicationAsyncEffectMirror, gate: hot_standby_commit_gate_mod.GateResult) void {
     if (mirror.last_gate_lsn) |last_lsn| last_lsn.store(gate.target_lsn, .release);
     if (mirror.last_gate_action) |last_action| last_action.store(@intFromEnum(gate.action), .release);
     switch (gate.action) {
@@ -127,7 +127,7 @@ pub fn recordHAMirrorGate(mirror: ReplicationAsyncEffectMirror, gate: hot_standb
     }
 }
 
-pub fn haCommitGateResultFromDecision(target_lsn: u64, decision: hot_standby_primary_mod.DurabilityDecision) hot_standby_commit_gate_mod.GateResult {
+pub fn hotStandbyCommitGateResultFromDecision(target_lsn: u64, decision: hot_standby_primary_mod.DurabilityDecision) hot_standby_commit_gate_mod.GateResult {
     return .{
         .target_lsn = target_lsn,
         .action = switch (decision.status) {

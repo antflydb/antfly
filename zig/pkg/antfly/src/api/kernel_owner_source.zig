@@ -32,7 +32,7 @@ const replication_contract = @import("../storage/db/replication_contract.zig");
 const document_artifact_child_range = @import("../storage/db/document_artifact_child_range.zig");
 const text_memory = @import("../storage/db/text_memory_stats.zig");
 const replication_effects = @import("../storage/db/replication_effects.zig");
-const ha_replication_record = @import("../storage/db/replication_record.zig");
+const hot_standby_replication_record = @import("../storage/db/replication_record.zig");
 const runtime_preflight = @import("../storage/db/runtime_preflight.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_domain = @import("../metadata/domain.zig");
@@ -279,7 +279,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     native_migration_policy: ?runtime_callbacks.DenseNativeMigrationPolicySource = null,
     promotion_leadership_source: ?table_writes.PromotionLeadershipSource = null,
     replication_write_gate: ?replication_contract.WriteGate = null,
-    ha_async_mirror: ?replication_contract.AsyncEffectMirror = null,
+    hot_standby_async_mirror: ?replication_contract.AsyncEffectMirror = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     remote_content_configured: bool = false,
     secret_store: ?*anyopaque = null,
@@ -742,7 +742,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         mirror: ?replication_contract.AsyncEffectMirror,
     ) *ProvisionedKernelOwnerSource {
         self.replication_write_gate = gate;
-        self.ha_async_mirror = mirror;
+        self.hot_standby_async_mirror = mirror;
         return self;
     }
 
@@ -1716,7 +1716,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         self: *ProvisionedKernelOwnerSource,
         group_id: u64,
         table_name: []const u8,
-        record: ha_replication_record.RecordView,
+        record: hot_standby_replication_record.RecordView,
     ) !void {
         var lease = try self.acquire(group_id, table_name);
         defer lease.deinit();
@@ -1875,7 +1875,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer abi.antfly_storage_owner_buffer_destroy(&output);
     }
 
-    pub fn applyHotStandbyHiddenOwnerRecord(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: [32]u8, record: ha_replication_record.RecordView) !void {
+    pub fn applyHotStandbyHiddenOwnerRecord(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: [32]u8, record: hot_standby_replication_record.RecordView) !void {
         var descriptor = (try self.cachedRestoreDescriptor(alloc, group_id, table_name, scope)) orelse return error.RestoreStagingScopeChanged;
         defer descriptor.deinit(alloc);
         const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
@@ -1898,7 +1898,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         });
     }
 
-    pub fn applyHotStandbyInitialChildOwnerRecord(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, record: ha_replication_record.RecordView) !void {
+    pub fn applyHotStandbyInitialChildOwnerRecord(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, record: hot_standby_replication_record.RecordView) !void {
         var lease = try self.acquirePreparedOwner(group_id, table_name);
         defer lease.deinit();
         if (lease.entry.initial_child_bootstrap_json.len == 0 or lease.entry.identity.table_id != record.table_id or
@@ -5036,7 +5036,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         descriptor: ?descriptor_contract.Descriptor,
     ) !?void {
         if (self.replication_write_gate) |gate| try gate.check();
-        var replication_mutation = if (self.ha_async_mirror) |mirror|
+        var replication_mutation = if (self.hot_standby_async_mirror) |mirror|
             if (mirror.mutation_barrier) |barrier| barrier.acquireShared() else null
         else
             null;
@@ -5091,7 +5091,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     fn preflightHotStandbyMirrorSyncCommit(self: *ProvisionedKernelOwnerSource) !void {
-        const mirror = self.ha_async_mirror orelse return;
+        const mirror = self.hot_standby_async_mirror orelse return;
         try mirror.publisher.preflightRecordingDecision(mirror);
     }
 
@@ -5122,7 +5122,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         req: db_types.BatchRequest,
         identity: Identity,
     ) !void {
-        const mirror = self.ha_async_mirror orelse return;
+        const mirror = self.hot_standby_async_mirror orelse return;
         const transition_mutex = mirror.transition_mutex;
         if (transition_mutex) |mutex| lock(mutex);
         var transition_locked = transition_mutex != null;
@@ -5161,7 +5161,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         replay_payload: []const u8,
         identity: Identity,
     ) !void {
-        const mirror = self.ha_async_mirror orelse return;
+        const mirror = self.hot_standby_async_mirror orelse return;
         const transition_mutex = mirror.transition_mutex;
         if (transition_mutex) |mutex| lock(mutex);
         var transition_locked = transition_mutex != null;

@@ -30,7 +30,7 @@ const platform_sync = @import("antfly_platform").sync;
 const admin_api = @import("../../admin/mod.zig");
 const http_common = @import("../../common/http/http_common.zig");
 const http_operation = @import("http_operation.zig");
-const ha_admin = @import("admin.zig");
+const hot_standby_admin = @import("admin.zig");
 const http_internal = @import("http_internal.zig");
 const internal_api = @import("../../internal/mod.zig");
 const admin_cli = @import("admin_cli.zig");
@@ -298,15 +298,15 @@ pub const Server = struct {
         if (req.method == .get and std.mem.eql(u8, path, Routes.health)) {
             return try textResponse(self.alloc, 200, "ok");
         }
-        if (req.method == .post and std.mem.eql(u8, path, admin_api.routes.ha_base_backups_capture)) {
+        if (req.method == .post and std.mem.eql(u8, path, admin_api.routes.hot_standby_base_backups_capture)) {
             defer if (self.auth.state_changed) |hook| hook.run();
             return try self.handleAdminCaptureSeedArtifact(req);
         }
-        if (std.mem.eql(u8, path, admin_api.routes.ha_seed_lifecycle_receipts)) {
+        if (std.mem.eql(u8, path, admin_api.routes.hot_standby_seed_lifecycle_receipts)) {
             if (req.method != .get) return try textResponse(self.alloc, 405, "method not allowed");
             return try self.handleAdminLifecycleReceipts(req);
         }
-        if (std.mem.eql(u8, path, admin_api.routes.ha_watchdog_proof)) {
+        if (std.mem.eql(u8, path, admin_api.routes.hot_standby_watchdog_proof)) {
             if (req.method != .get) return try textResponse(self.alloc, 405, "method not allowed");
             return try self.handleAdminWatchdogProof();
         }
@@ -315,12 +315,12 @@ pub const Server = struct {
         // order. This is an advisory observation; the primary role and HA
         // snapshot are still checked under state_mutex below.
         const waiting_for_tables: ?bool = if (req.method == .get and
-            std.mem.eql(u8, path, admin_api.routes.ha_primary_status))
+            std.mem.eql(u8, path, admin_api.routes.hot_standby_primary_status))
         blk: {
             break :blk if (self.auth.catalog_empty) |source| try source.read_fn(source.ptr) else null;
         } else null;
         var primary_fence_lease: ?mutation_barrier.MutationBarrier.ExclusiveLease = null;
-        if (req.method == .post and std.mem.eql(u8, path, admin_api.routes.ha_fence)) {
+        if (req.method == .post and std.mem.eql(u8, path, admin_api.routes.hot_standby_fence)) {
             if (self.auth.primary_fence_barrier) |barrier| {
                 primary_fence_lease = barrier.acquireExclusive();
             }
@@ -342,16 +342,16 @@ pub const Server = struct {
                     if (self.ready()) return try textResponse(self.alloc, 200, "ready");
                     return try textResponse(self.alloc, 503, "not ready");
                 }
-                if (std.mem.eql(u8, path, admin_api.routes.ha_primary_status)) {
+                if (std.mem.eql(u8, path, admin_api.routes.hot_standby_primary_status)) {
                     return try self.handleAdminPrimaryStatus(req, waiting_for_tables);
                 }
-                if (std.mem.eql(u8, path, admin_api.routes.ha_standby_status)) {
+                if (std.mem.eql(u8, path, admin_api.routes.hot_standby_standby_status)) {
                     return try self.handleAdminStandbyStatus(req);
                 }
-                if (std.mem.eql(u8, path, admin_api.routes.ha_replication_slots)) {
+                if (std.mem.eql(u8, path, admin_api.routes.hot_standby_replication_slots)) {
                     return try self.handleAdminReplicationSlots();
                 }
-                if (std.mem.eql(u8, path, admin_api.routes.ha_fence_current)) {
+                if (std.mem.eql(u8, path, admin_api.routes.hot_standby_fence_current)) {
                     return try self.handleAdminFenceCurrent();
                 }
                 if (knownRoute(path)) {
@@ -363,58 +363,58 @@ pub const Server = struct {
                 if (std.mem.eql(u8, path, Routes.command)) {
                     return try self.handleCommand(req);
                 }
-                if (std.mem.eql(u8, path, admin_api.routes.ha_replication_slots)) {
+                if (std.mem.eql(u8, path, admin_api.routes.hot_standby_replication_slots)) {
                     return try self.handleAdminCreateReplicationSlot(req);
                 }
-                if (std.mem.eql(u8, path, admin_api.routes.ha_commit_check)) {
+                if (std.mem.eql(u8, path, admin_api.routes.hot_standby_commit_check)) {
                     return try self.handleAdminCommitCheck(req);
                 }
-                if (std.mem.eql(u8, path, admin_api.routes.ha_commit_append)) {
+                if (std.mem.eql(u8, path, admin_api.routes.hot_standby_commit_append)) {
                     return try self.handleAdminCommitAppend(req);
                 }
-                if (std.mem.eql(u8, path, admin_api.routes.ha_read_check)) {
+                if (std.mem.eql(u8, path, admin_api.routes.hot_standby_read_check)) {
                     return try self.handleAdminReadCheck(req);
                 }
-                if (std.mem.eql(u8, path, admin_api.routes.ha_write_check)) {
+                if (std.mem.eql(u8, path, admin_api.routes.hot_standby_write_check)) {
                     return try self.handleAdminWriteCheck(req);
                 }
-                if (std.mem.eql(u8, path, admin_api.routes.ha_owner_job_check)) {
+                if (std.mem.eql(u8, path, admin_api.routes.hot_standby_owner_job_check)) {
                     return try self.handleAdminOwnerJobCheck(req);
                 }
-                if (std.mem.eql(u8, path, admin_api.routes.ha_base_backups)) {
+                if (std.mem.eql(u8, path, admin_api.routes.hot_standby_base_backups)) {
                     return try self.handleAdminBeginBaseBackup(req);
                 }
-                if (std.mem.eql(u8, path, admin_api.routes.ha_base_backups_finish)) {
+                if (std.mem.eql(u8, path, admin_api.routes.hot_standby_base_backups_finish)) {
                     return try self.handleAdminFinishBaseBackup(req);
                 }
-                if (std.mem.eql(u8, path, admin_api.routes.ha_base_backups_activate)) {
+                if (std.mem.eql(u8, path, admin_api.routes.hot_standby_base_backups_activate)) {
                     return try self.handleAdminActivateSeededSlot(req);
                 }
-                if (std.mem.eql(u8, path, admin_api.routes.ha_standby_bootstrap)) {
+                if (std.mem.eql(u8, path, admin_api.routes.hot_standby_standby_bootstrap)) {
                     return try self.handleAdminBootstrapStandby(req);
                 }
-                if (std.mem.eql(u8, path, admin_api.routes.ha_standby_upstream)) {
+                if (std.mem.eql(u8, path, admin_api.routes.hot_standby_standby_upstream)) {
                     return try self.handleAdminSetStandbyUpstream(req);
                 }
-                if (std.mem.eql(u8, path, admin_api.routes.ha_fence)) {
+                if (std.mem.eql(u8, path, admin_api.routes.hot_standby_fence)) {
                     return try self.handleAdminAcquireFence(req);
                 }
-                if (std.mem.eql(u8, path, admin_api.routes.ha_promotion_assess)) {
+                if (std.mem.eql(u8, path, admin_api.routes.hot_standby_promotion_assess)) {
                     return try self.handleAdminAssessPromotion(req);
                 }
-                if (std.mem.eql(u8, path, admin_api.routes.ha_promotion_current_fence)) {
+                if (std.mem.eql(u8, path, admin_api.routes.hot_standby_promotion_current_fence)) {
                     return try self.handleAdminPromoteCurrentFence();
                 }
-                if (std.mem.eql(u8, path, admin_api.routes.ha_promotion)) {
+                if (std.mem.eql(u8, path, admin_api.routes.hot_standby_promotion)) {
                     return try self.handleAdminPromote(req);
                 }
-                if (std.mem.eql(u8, path, admin_api.routes.ha_rejoin_assess)) {
+                if (std.mem.eql(u8, path, admin_api.routes.hot_standby_rejoin_assess)) {
                     return try self.handleAdminAssessRejoin(req);
                 }
-                if (std.mem.eql(u8, path, admin_api.routes.ha_rejoin_rewind)) {
+                if (std.mem.eql(u8, path, admin_api.routes.hot_standby_rejoin_rewind)) {
                     return try self.handleAdminRewindRejoin(req);
                 }
-                if (std.mem.eql(u8, path, admin_api.routes.ha_rejoin_reseed)) {
+                if (std.mem.eql(u8, path, admin_api.routes.hot_standby_rejoin_reseed)) {
                     return try self.handleAdminReseedRejoin(req);
                 }
                 if (knownRoute(path)) {
@@ -423,11 +423,11 @@ pub const Server = struct {
                 return try textResponse(self.alloc, 404, "not found");
             },
             .put => {
-                if (self.replicationSlotNameFromPath(path, admin_api.routes.ha_replication_slot_pause_suffix) catch return try textResponse(self.alloc, 400, "invalid HA replication slot path")) |slot_name| {
+                if (self.replicationSlotNameFromPath(path, admin_api.routes.hot_standby_replication_slot_pause_suffix) catch return try textResponse(self.alloc, 400, "invalid HA replication slot path")) |slot_name| {
                     defer self.alloc.free(slot_name);
                     return try self.handleAdminReplicationSlotLifecycle(slot_name, .pause);
                 }
-                if (self.replicationSlotNameFromPath(path, admin_api.routes.ha_replication_slot_resume_suffix) catch return try textResponse(self.alloc, 400, "invalid HA replication slot path")) |slot_name| {
+                if (self.replicationSlotNameFromPath(path, admin_api.routes.hot_standby_replication_slot_resume_suffix) catch return try textResponse(self.alloc, 400, "invalid HA replication slot path")) |slot_name| {
                     defer self.alloc.free(slot_name);
                     return try self.handleAdminReplicationSlotLifecycle(slot_name, .@"resume");
                 }
@@ -481,7 +481,7 @@ pub const Server = struct {
         errdefer sync.deinit(self.alloc);
         defer sync.deinit(self.alloc);
 
-        var snapshot = ha_admin.primaryStatus(self.alloc, primary, .{
+        var snapshot = hot_standby_admin.primaryStatus(self.alloc, primary, .{
             .max_lag_lsn = max_lag_lsn,
             .max_retained_bytes = max_retained_bytes,
             .max_retained_age_ns = max_retained_age_ns,
@@ -526,7 +526,7 @@ pub const Server = struct {
         else
             null;
 
-        var snapshot = ha_admin.standbyStatus(standby, upstream_lsn);
+        var snapshot = hot_standby_admin.standbyStatus(standby, upstream_lsn);
         if (self.auth.standby_status_extras) |extras| {
             snapshot.last_error = extras.lastError();
             snapshot.last_attempt_ns = extras.lastAttemptNs();
@@ -545,7 +545,7 @@ pub const Server = struct {
 
     fn handleAdminReplicationSlots(self: *Server) !http_operation.OwnedResponse {
         const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
-        var snapshot = ha_admin.primaryStatus(self.alloc, primary, .{}, null) catch |err| {
+        var snapshot = hot_standby_admin.primaryStatus(self.alloc, primary, .{}, null) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
         defer snapshot.deinit(self.alloc);
@@ -573,7 +573,7 @@ pub const Server = struct {
         } else null;
         const node_id = self.primaryNodeID() orelse return try textResponse(self.alloc, 409, "PrimaryNodeIDUnavailable");
 
-        const result = ha_admin.applySlotAction(primary, .create, .{
+        const result = hot_standby_admin.applySlotAction(primary, .create, .{
             .slot_name = parsed.value.slot_name,
             .initial_lsn = initial_lsn,
         }) catch |err| {
@@ -592,11 +592,11 @@ pub const Server = struct {
     fn handleAdminReplicationSlotLifecycle(
         self: *Server,
         slot_name: []const u8,
-        action: ha_admin.SlotAction,
+        action: hot_standby_admin.SlotAction,
     ) !http_operation.OwnedResponse {
         const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
         const node_id = self.primaryNodeID() orelse return try textResponse(self.alloc, 409, "PrimaryNodeIDUnavailable");
-        const result = ha_admin.applySlotAction(primary, action, .{
+        const result = hot_standby_admin.applySlotAction(primary, action, .{
             .slot_name = slot_name,
         }) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
@@ -642,7 +642,7 @@ pub const Server = struct {
         const policy = syncPolicyFromOpenApi(parsed.value.sync_policy) catch {
             return try textResponse(self.alloc, 400, "invalid HA commit check request");
         };
-        const gate = ha_admin.evaluateCommit(primary, target_lsn, policy) catch |err| {
+        const gate = hot_standby_admin.evaluateCommit(primary, target_lsn, policy) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
         return try self.handleTypedJson(admin_api.HACommitCheckResponse{
@@ -693,7 +693,7 @@ pub const Server = struct {
         const effective_request = admin_exec.readRequestWithContext(self.ctx, request) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
-        const decision = ha_admin.evaluateStandbyRead(standby, effective_request) catch |err| {
+        const decision = hot_standby_admin.evaluateStandbyRead(standby, effective_request) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
         return try self.handleTypedJson(admin_api.HAReadCheckResponse{
@@ -725,17 +725,17 @@ pub const Server = struct {
                     else
                         return try textResponse(self.alloc, 409, "PrimaryNodeIDUnavailable")
                 else
-                    ha_admin.evaluatePrimaryWrite(primary, request.request);
+                    hot_standby_admin.evaluatePrimaryWrite(primary, request.request);
                 break :blk decision catch |err| {
                     return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
                 };
             },
             .standby => blk: {
                 const evaluated = if (self.ctx.standby) |standby|
-                    ha_admin.evaluateStandbyWrite(standby, request.request)
+                    hot_standby_admin.evaluateStandbyWrite(standby, request.request)
                 else if (self.ctx.primary) |primary|
                     if (self.ctx.promoted_standby_handoff) |handoff|
-                        ha_admin.evaluatePromotedPrimaryWrite(primary, handoff, request.request)
+                        hot_standby_admin.evaluatePromotedPrimaryWrite(primary, handoff, request.request)
                     else
                         return try textResponse(self.alloc, 409, "StandbyUnavailable")
                 else
@@ -764,16 +764,16 @@ pub const Server = struct {
         const decision = switch (request.role) {
             .primary => blk: {
                 const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
-                break :blk ha_admin.evaluatePrimaryOwnerJob(primary, request.request) catch |err| {
+                break :blk hot_standby_admin.evaluatePrimaryOwnerJob(primary, request.request) catch |err| {
                     return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
                 };
             },
             .standby => blk: {
                 const evaluated = if (self.ctx.standby) |standby|
-                    ha_admin.evaluateStandbyOwnerJob(standby, request.request)
+                    hot_standby_admin.evaluateStandbyOwnerJob(standby, request.request)
                 else if (self.ctx.primary) |primary|
                     if (self.ctx.promoted_standby_handoff) |handoff|
-                        ha_admin.evaluatePromotedPrimaryOwnerJob(primary, handoff, request.request)
+                        hot_standby_admin.evaluatePromotedPrimaryOwnerJob(primary, handoff, request.request)
                     else
                         return try textResponse(self.alloc, 409, "StandbyUnavailable")
                 else
@@ -799,7 +799,7 @@ pub const Server = struct {
         defer parsed.deinit();
         const node_id = self.primaryNodeID() orelse return try textResponse(self.alloc, 409, "PrimaryNodeIDUnavailable");
 
-        const result = ha_admin.beginBaseBackup(primary, .{
+        const result = hot_standby_admin.beginBaseBackup(primary, .{
             .slot_name = parsed.value.slot_name,
             .manifest_id = parsed.value.manifest_id,
         }) catch |err| {
@@ -831,7 +831,7 @@ pub const Server = struct {
         ) catch return try textResponse(self.alloc, 400, "invalid HA base backup finish request");
         defer parsed.deinit();
         const node_id = self.primaryNodeID() orelse return try textResponse(self.alloc, 409, "PrimaryNodeIDUnavailable");
-        const manifest_path = validateAdminHAPath(parsed.value.manifest_path, .manifest) catch |err| {
+        const manifest_path = validateAdminHotStandbyPath(parsed.value.manifest_path, .manifest) catch |err| {
             return try textResponse(self.alloc, 400, @errorName(err));
         };
 
@@ -1076,7 +1076,7 @@ pub const Server = struct {
         else
             false;
 
-        ha_admin.activateSeededSlot(primary, request.slot_name, timeline_id, checkpoint_lsn) catch |err| {
+        hot_standby_admin.activateSeededSlot(primary, request.slot_name, timeline_id, checkpoint_lsn) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
         const action_id = try std.fmt.allocPrint(self.alloc, "seeded_slot_activate:{s}", .{request.generation});
@@ -1110,11 +1110,11 @@ pub const Server = struct {
         ) catch return try textResponse(self.alloc, 400, "invalid HA standby bootstrap request");
         defer parsed.deinit();
         const node_id = self.standbyNodeID() orelse return try textResponse(self.alloc, 409, "StandbyNodeIDUnavailable");
-        const manifest_path = validateAdminHAPath(parsed.value.manifest_path, .manifest) catch |err| {
+        const manifest_path = validateAdminHotStandbyPath(parsed.value.manifest_path, .manifest) catch |err| {
             return try textResponse(self.alloc, 400, @errorName(err));
         };
         const content_root = if (parsed.value.content_root.valueOrNull()) |root|
-            validateAdminHAPath(root, .content_root) catch |err| {
+            validateAdminHotStandbyPath(root, .content_root) catch |err| {
                 return try textResponse(self.alloc, 400, @errorName(err));
             }
         else
@@ -1213,7 +1213,7 @@ pub const Server = struct {
 
     fn handleAdminFenceCurrent(self: *Server) !http_operation.OwnedResponse {
         const fence_store = self.ctx.fence_store orelse return try textResponse(self.alloc, 409, "FenceStoreUnavailable");
-        var current = ha_admin.currentPromotionFence(self.alloc, fence_store) catch |err| {
+        var current = hot_standby_admin.currentPromotionFence(self.alloc, fence_store) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
         defer if (current) |*result| result.deinit(self.alloc);
@@ -1259,7 +1259,7 @@ pub const Server = struct {
                 fence.observed_lsn = durable_tail;
             }
         }
-        var result = ha_admin.acquirePromotionFence(self.alloc, fence_store, fence) catch |err| {
+        var result = hot_standby_admin.acquirePromotionFence(self.alloc, fence_store, fence) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
         defer result.deinit(self.alloc);
@@ -1331,7 +1331,7 @@ pub const Server = struct {
     fn handleAdminPromoteCurrentFence(self: *Server) !http_operation.OwnedResponse {
         const fence_store = self.ctx.fence_store orelse return try textResponse(self.alloc, 409, "FenceStoreUnavailable");
         const standby = self.ctx.standby orelse return try textResponse(self.alloc, 409, "StandbyUnavailable");
-        var result = ha_admin.promoteWithCurrentFence(self.alloc, fence_store, standby) catch |err| {
+        var result = hot_standby_admin.promoteWithCurrentFence(self.alloc, fence_store, standby) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
         defer result.deinit(self.alloc);
@@ -1346,7 +1346,7 @@ pub const Server = struct {
         const fence = self.parsePromoteFenceRequest(req) catch {
             return try textResponse(self.alloc, 400, "invalid HA promotion request");
         };
-        var result = ha_admin.promoteWithFence(self.alloc, fence_store, standby, .{ .fence = fence }) catch |err| {
+        var result = hot_standby_admin.promoteWithFence(self.alloc, fence_store, standby, .{ .fence = fence }) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
         defer result.deinit(self.alloc);
@@ -1408,7 +1408,7 @@ pub const Server = struct {
             }
         }
 
-        const assessment = ha_admin.assessFormerPrimaryRejoin(.{
+        const assessment = hot_standby_admin.assessFormerPrimaryRejoin(.{
             .node_id = parsed.value.node_id,
             .identity = identity,
             .last_lsn = last_lsn,
@@ -1430,7 +1430,7 @@ pub const Server = struct {
             if (expected == .rewind) {
                 const log = self.rejoinRewindLog() orelse
                     return try textResponse(self.alloc, 409, "FormerPrimaryLogUnavailable");
-                const rewind = ha_admin.rewindFormerPrimaryReplicationLog(self.alloc, log, assessment) catch |err| {
+                const rewind = hot_standby_admin.rewindFormerPrimaryReplicationLog(self.alloc, log, assessment) catch |err| {
                     return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
                 };
                 // The rewind log append is durable before either receipt is
@@ -1465,7 +1465,7 @@ pub const Server = struct {
                 const primary = self.ctx.primary orelse
                     return try textResponse(self.alloc, 409, "PrimaryUnavailable");
                 const node_id = self.primaryNodeID() orelse return try textResponse(self.alloc, 409, "PrimaryNodeIDUnavailable");
-                const reseed = ha_admin.markFormerPrimaryForReseed(primary, assessment) catch |err| {
+                const reseed = hot_standby_admin.markFormerPrimaryForReseed(primary, assessment) catch |err| {
                     return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
                 };
                 if (receipt) |fence| {
@@ -1664,20 +1664,20 @@ const AdminHAPathField = enum {
     content_root,
 };
 
-fn validateAdminHAPath(raw: []const u8, field: AdminHAPathField) ![]const u8 {
-    switch (validation.classifyHAString(raw)) {
+fn validateAdminHotStandbyPath(raw: []const u8, field: AdminHAPathField) ![]const u8 {
+    switch (validation.classifyHotStandbyString(raw)) {
         .ok => {},
         .missing => return switch (field) {
             .manifest => error.ManifestPathMissing,
             .content_root => error.ContentRootMissing,
         },
-        .padded => return adminHAPathInvalidError(field),
+        .padded => return adminHotStandbyPathInvalidError(field),
     }
-    if (!validation.isAbsoluteNormalizedPath(raw)) return adminHAPathInvalidError(field);
+    if (!validation.isAbsoluteNormalizedPath(raw)) return adminHotStandbyPathInvalidError(field);
     return raw;
 }
 
-fn adminHAPathInvalidError(field: AdminHAPathField) anyerror {
+fn adminHotStandbyPathInvalidError(field: AdminHAPathField) anyerror {
     return switch (field) {
         .manifest => error.ManifestPathInvalid,
         .content_root => error.ContentRootInvalid,
@@ -1741,7 +1741,7 @@ fn actionReceiptAlloc(
     };
 }
 
-fn promotionDocument(alloc: Allocator, result: ha_admin.FencedPromotionResult) !admin_api.HAPromotionResponse {
+fn promotionDocument(alloc: Allocator, result: hot_standby_admin.FencedPromotionResult) !admin_api.HAPromotionResponse {
     const target = result.promoted_node_id;
     const action_id = try std.fmt.allocPrint(alloc, "promotion:{s}", .{target});
     errdefer alloc.free(action_id);
@@ -2129,37 +2129,37 @@ fn knownFixedRoute(path: []const u8) bool {
     return std.mem.eql(u8, path, Routes.health) or
         std.mem.eql(u8, path, Routes.ready) or
         std.mem.eql(u8, path, Routes.command) or
-        std.mem.eql(u8, path, admin_api.routes.ha_primary_status) or
-        std.mem.eql(u8, path, admin_api.routes.ha_watchdog_proof) or
-        std.mem.eql(u8, path, admin_api.routes.ha_standby_status) or
-        std.mem.eql(u8, path, admin_api.routes.ha_commit_check) or
-        std.mem.eql(u8, path, admin_api.routes.ha_commit_append) or
-        std.mem.eql(u8, path, admin_api.routes.ha_read_check) or
-        std.mem.eql(u8, path, admin_api.routes.ha_write_check) or
-        std.mem.eql(u8, path, admin_api.routes.ha_owner_job_check) or
-        std.mem.eql(u8, path, admin_api.routes.ha_replication_slots) or
-        std.mem.eql(u8, path, admin_api.routes.ha_base_backups) or
-        std.mem.eql(u8, path, admin_api.routes.ha_base_backups_finish) or
-        std.mem.eql(u8, path, admin_api.routes.ha_base_backups_capture) or
-        std.mem.eql(u8, path, admin_api.routes.ha_base_backups_activate) or
-        std.mem.eql(u8, path, admin_api.routes.ha_seed_lifecycle_receipts) or
-        std.mem.eql(u8, path, admin_api.routes.ha_standby_bootstrap) or
-        std.mem.eql(u8, path, admin_api.routes.ha_standby_upstream) or
-        std.mem.eql(u8, path, admin_api.routes.ha_fence) or
-        std.mem.eql(u8, path, admin_api.routes.ha_fence_current) or
-        std.mem.eql(u8, path, admin_api.routes.ha_promotion) or
-        std.mem.eql(u8, path, admin_api.routes.ha_promotion_assess) or
-        std.mem.eql(u8, path, admin_api.routes.ha_promotion_current_fence) or
-        std.mem.eql(u8, path, admin_api.routes.ha_rejoin_assess) or
-        std.mem.eql(u8, path, admin_api.routes.ha_rejoin_rewind) or
-        std.mem.eql(u8, path, admin_api.routes.ha_rejoin_reseed);
+        std.mem.eql(u8, path, admin_api.routes.hot_standby_primary_status) or
+        std.mem.eql(u8, path, admin_api.routes.hot_standby_watchdog_proof) or
+        std.mem.eql(u8, path, admin_api.routes.hot_standby_standby_status) or
+        std.mem.eql(u8, path, admin_api.routes.hot_standby_commit_check) or
+        std.mem.eql(u8, path, admin_api.routes.hot_standby_commit_append) or
+        std.mem.eql(u8, path, admin_api.routes.hot_standby_read_check) or
+        std.mem.eql(u8, path, admin_api.routes.hot_standby_write_check) or
+        std.mem.eql(u8, path, admin_api.routes.hot_standby_owner_job_check) or
+        std.mem.eql(u8, path, admin_api.routes.hot_standby_replication_slots) or
+        std.mem.eql(u8, path, admin_api.routes.hot_standby_base_backups) or
+        std.mem.eql(u8, path, admin_api.routes.hot_standby_base_backups_finish) or
+        std.mem.eql(u8, path, admin_api.routes.hot_standby_base_backups_capture) or
+        std.mem.eql(u8, path, admin_api.routes.hot_standby_base_backups_activate) or
+        std.mem.eql(u8, path, admin_api.routes.hot_standby_seed_lifecycle_receipts) or
+        std.mem.eql(u8, path, admin_api.routes.hot_standby_standby_bootstrap) or
+        std.mem.eql(u8, path, admin_api.routes.hot_standby_standby_upstream) or
+        std.mem.eql(u8, path, admin_api.routes.hot_standby_fence) or
+        std.mem.eql(u8, path, admin_api.routes.hot_standby_fence_current) or
+        std.mem.eql(u8, path, admin_api.routes.hot_standby_promotion) or
+        std.mem.eql(u8, path, admin_api.routes.hot_standby_promotion_assess) or
+        std.mem.eql(u8, path, admin_api.routes.hot_standby_promotion_current_fence) or
+        std.mem.eql(u8, path, admin_api.routes.hot_standby_rejoin_assess) or
+        std.mem.eql(u8, path, admin_api.routes.hot_standby_rejoin_rewind) or
+        std.mem.eql(u8, path, admin_api.routes.hot_standby_rejoin_reseed);
 }
 
 fn knownRoute(path: []const u8) bool {
     return knownFixedRoute(path) or
         admin_api.routes.replicationSlotNameFromPath(path, "") != null or
-        admin_api.routes.replicationSlotNameFromPath(path, admin_api.routes.ha_replication_slot_pause_suffix) != null or
-        admin_api.routes.replicationSlotNameFromPath(path, admin_api.routes.ha_replication_slot_resume_suffix) != null;
+        admin_api.routes.replicationSlotNameFromPath(path, admin_api.routes.hot_standby_replication_slot_pause_suffix) != null or
+        admin_api.routes.replicationSlotNameFromPath(path, admin_api.routes.hot_standby_replication_slot_resume_suffix) != null;
 }
 
 fn isTypedAdminRoute(path: []const u8) bool {
@@ -2840,7 +2840,7 @@ test "storage.hot_standby http admin executes typed former primary log rewind wh
         "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":2,\"retained_from_lsn\":1,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}";
     var rewind = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_rejoin_rewind,
+        .uri = admin_api.routes.hot_standby_rejoin_rewind,
         .content_type = "application/json",
         .body = body,
     });
@@ -2865,7 +2865,7 @@ test "storage.hot_standby http admin executes typed former primary log rewind wh
 
     var stale = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_rejoin_rewind,
+        .uri = admin_api.routes.hot_standby_rejoin_rewind,
         .content_type = "application/json",
         .body = body,
     });
@@ -2881,7 +2881,7 @@ test "storage.hot_standby http admin rejects typed former primary rewind on node
 
     var response = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_rejoin_rewind,
+        .uri = admin_api.routes.hot_standby_rejoin_rewind,
         .content_type = "application/json",
         .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":2,\"retained_from_lsn\":1,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
     });
@@ -2905,7 +2905,7 @@ test "storage.hot_standby http admin does not persist rejoin assess receipts" {
 
     var response = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_rejoin_assess,
+        .uri = admin_api.routes.hot_standby_rejoin_assess,
         .content_type = "application/json",
         .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":2,\"retained_from_lsn\":1,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
     });
@@ -2939,7 +2939,7 @@ test "storage.hot_standby http admin assesses the local former primary durable t
     // applied divergent write as safe to rewind.
     var response = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_rejoin_assess,
+        .uri = admin_api.routes.hot_standby_rejoin_assess,
         .content_type = "application/json",
         .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":2,\"retained_from_lsn\":1,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
     });
@@ -2968,7 +2968,7 @@ test "storage.hot_standby http admin rejects unbound rejoin receipts before pers
 
     var response = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_rejoin_rewind,
+        .uri = admin_api.routes.hot_standby_rejoin_rewind,
         .content_type = "application/json",
         .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":3,\"retained_from_lsn\":1,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-b\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
     });
@@ -2993,7 +2993,7 @@ test "storage.hot_standby http admin marks former primary slot for typed reseed"
 
     var response = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_rejoin_reseed,
+        .uri = admin_api.routes.hot_standby_rejoin_reseed,
         .content_type = "application/json",
         .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":3,\"retained_from_lsn\":3,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
     });
@@ -3036,7 +3036,7 @@ test "storage.hot_standby reseed serialization survives a concurrent admitted st
             const server = self.admin_server orelse return error.TestExpectedEqual;
             var response = try server.handle(.{
                 .method = .POST,
-                .uri = admin_api.routes.ha_rejoin_reseed,
+                .uri = admin_api.routes.hot_standby_rejoin_reseed,
                 .content_type = "application/json",
                 .body = self.reseed_body,
             });
@@ -3103,7 +3103,7 @@ test "storage.hot_standby reseed serialization survives a concurrent admitted st
         var internal_server = http_internal.Server.initWithOptions(alloc, &primary, .{ .state_mutex = &state_mutex });
         var status_update = try internal_server.handle(.{
             .method = .POST,
-            .uri = internal_api.routes.ha_replication_status,
+            .uri = internal_api.routes.hot_standby_replication_status,
             .body = "{\"slot_name\":\"primary-a\",\"timeline_id\":1,\"received_lsn\":0,\"applied_lsn\":0,\"safe_read_lsn\":0}",
         });
         defer status_update.deinit(alloc);
@@ -3119,7 +3119,7 @@ test "storage.hot_standby reseed serialization survives a concurrent admitted st
 
         var status = try admin_server.handle(.{
             .method = .GET,
-            .uri = admin_api.routes.ha_primary_status,
+            .uri = admin_api.routes.hot_standby_primary_status,
         });
         defer status.deinit(alloc);
         try std.testing.expectEqual(@as(u16, 200), status.status);
@@ -3143,7 +3143,7 @@ test "storage.hot_standby http admin rejects typed former primary reseed on node
 
     var response = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_rejoin_reseed,
+        .uri = admin_api.routes.hot_standby_rejoin_reseed,
         .content_type = "application/json",
         .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":3,\"retained_from_lsn\":3,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
     });
@@ -3218,7 +3218,7 @@ test "storage.hot_standby http admin serves health and command endpoint" {
 
     var typed_status = try server.handle(.{
         .method = .GET,
-        .uri = admin_api.routes.ha_primary_status,
+        .uri = admin_api.routes.hot_standby_primary_status,
     });
     defer typed_status.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_status.status);
@@ -3230,7 +3230,7 @@ test "storage.hot_standby http admin serves health and command endpoint" {
 
     var typed_create_a = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_replication_slots,
+        .uri = admin_api.routes.hot_standby_replication_slots,
         .content_type = "application/json",
         .body = "{\"slot_name\":\"standby-a\",\"initial_lsn\":0}",
     });
@@ -3239,7 +3239,7 @@ test "storage.hot_standby http admin serves health and command endpoint" {
 
     var typed_create = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_replication_slots,
+        .uri = admin_api.routes.hot_standby_replication_slots,
         .content_type = "application/json",
         .body = "{\"slot_name\":\"standby-b\",\"initial_lsn\":0}",
     });
@@ -3255,7 +3255,7 @@ test "storage.hot_standby http admin serves health and command endpoint" {
 
     var typed_slots = try server.handle(.{
         .method = .GET,
-        .uri = admin_api.routes.ha_replication_slots,
+        .uri = admin_api.routes.hot_standby_replication_slots,
     });
     defer typed_slots.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_slots.status);
@@ -3312,7 +3312,7 @@ test "storage.hot_standby http admin serves health and command endpoint" {
 
     var invalid_typed_slot_path = try server.handle(.{
         .method = .DELETE,
-        .uri = admin_api.routes.ha_replication_slot_prefix ++ "standby%XX",
+        .uri = admin_api.routes.hot_standby_replication_slot_prefix ++ "standby%XX",
     });
     defer invalid_typed_slot_path.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), invalid_typed_slot_path.status);
@@ -3320,7 +3320,7 @@ test "storage.hot_standby http admin serves health and command endpoint" {
 
     var invalid_typed_create = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_replication_slots,
+        .uri = admin_api.routes.hot_standby_replication_slots,
         .content_type = "application/json",
         .body = "{}",
     });
@@ -3330,7 +3330,7 @@ test "storage.hot_standby http admin serves health and command endpoint" {
 
     var duplicate_create = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_replication_slots,
+        .uri = admin_api.routes.hot_standby_replication_slots,
         .content_type = "application/json",
         .body = "{\"slot_name\":\"standby-a\",\"initial_lsn\":0}",
     });
@@ -3354,7 +3354,7 @@ test "storage.hot_standby http admin serves health and command endpoint" {
 
     var typed_standby_status = try server.handle(.{
         .method = .GET,
-        .uri = admin_api.routes.ha_standby_status,
+        .uri = admin_api.routes.hot_standby_standby_status,
     });
     defer typed_standby_status.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_standby_status.status);
@@ -3366,7 +3366,7 @@ test "storage.hot_standby http admin serves health and command endpoint" {
 
     var typed_read_wait_metadata = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_read_check,
+        .uri = admin_api.routes.hot_standby_read_check,
         .content_type = "application/json",
         .body = "{\"consistency\":\"at_least_lsn\",\"required_lsn\":1}",
     });
@@ -3379,7 +3379,7 @@ test "storage.hot_standby http admin serves health and command endpoint" {
     metadata_progress.lsn = 1;
     var typed_read_ready = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_read_check,
+        .uri = admin_api.routes.hot_standby_read_check,
         .content_type = "application/json",
         .body = "{\"consistency\":\"at_least_lsn\",\"required_lsn\":1}",
     });
@@ -3391,7 +3391,7 @@ test "storage.hot_standby http admin serves health and command endpoint" {
     const typed_primary_policy_uri = try std.fmt.allocPrint(
         alloc,
         "{s}?max_lag_lsn=1&sync_mode=remote-apply&sync_standby=standby-a&sync_failure=fail-closed",
-        .{admin_api.routes.ha_primary_status},
+        .{admin_api.routes.hot_standby_primary_status},
     );
     defer alloc.free(typed_primary_policy_uri);
     var typed_primary_policy_status = try server.handle(.{
@@ -3408,7 +3408,7 @@ test "storage.hot_standby http admin serves health and command endpoint" {
     const typed_standby_upstream_uri = try std.fmt.allocPrint(
         alloc,
         "{s}?upstream_lsn=2",
-        .{admin_api.routes.ha_standby_status},
+        .{admin_api.routes.hot_standby_standby_status},
     );
     defer alloc.free(typed_standby_upstream_uri);
     var typed_standby_upstream_status = try server.handle(.{
@@ -3433,7 +3433,7 @@ test "storage.hot_standby http admin serves health and command endpoint" {
 
     var invalid_seed = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_base_backups,
+        .uri = admin_api.routes.hot_standby_base_backups,
         .content_type = "application/json",
         .body = "{\"slot_name\":\"standby-a\",\"manifest_id\":\"\"}",
     });
@@ -3455,7 +3455,7 @@ test "storage.hot_standby http admin serves health and command endpoint" {
 
     var invalid_sync_policy = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_commit_check,
+        .uri = admin_api.routes.hot_standby_commit_check,
         .content_type = "application/json",
         .body = "{\"target_lsn\":1,\"sync_policy\":{\"mode\":\"remote_write\",\"selection\":\"any\",\"required\":2,\"standby_names\":[\"standby-a\"]}}",
     });
@@ -3465,7 +3465,7 @@ test "storage.hot_standby http admin serves health and command endpoint" {
 
     var fail_closed_append = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_commit_append,
+        .uri = admin_api.routes.hot_standby_commit_append,
         .content_type = "application/json",
         .body = "{\"payload\":\"two\",\"sync_policy\":{\"mode\":\"remote_write\",\"standby_names\":[\"standby-a\"],\"failure_policy\":\"fail_closed\"}}",
     });
@@ -3476,7 +3476,7 @@ test "storage.hot_standby http admin serves health and command endpoint" {
 
     var typed_commit_append = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_commit_append,
+        .uri = admin_api.routes.hot_standby_commit_append,
         .content_type = "application/json",
         .body = "{\"payload\":\"two\",\"sync_policy\":{\"mode\":\"async\"}}",
     });
@@ -3500,7 +3500,7 @@ test "storage.hot_standby http admin serves health and command endpoint" {
 
     var unfenced_promote = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_promotion_current_fence,
+        .uri = admin_api.routes.hot_standby_promotion_current_fence,
         .content_type = "application/json",
     });
     defer unfenced_promote.deinit(alloc);
@@ -3510,7 +3510,7 @@ test "storage.hot_standby http admin serves health and command endpoint" {
 
     var typed_fence = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_fence,
+        .uri = admin_api.routes.hot_standby_fence,
         .content_type = "application/json",
         .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"generation\":1,\"required_lsn\":1,\"observed_lsn\":1,\"force\":false,\"reason\":\"http-admin-test\"}",
     });
@@ -3534,7 +3534,7 @@ test "storage.hot_standby http admin serves health and command endpoint" {
 
     var typed_current_fence = try server.handle(.{
         .method = .GET,
-        .uri = admin_api.routes.ha_fence_current,
+        .uri = admin_api.routes.hot_standby_fence_current,
     });
     defer typed_current_fence.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_current_fence.status);
@@ -3545,7 +3545,7 @@ test "storage.hot_standby http admin serves health and command endpoint" {
 
     var typed_rejoin_unfenced = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_rejoin_assess,
+        .uri = admin_api.routes.hot_standby_rejoin_assess,
         .content_type = "application/json",
         .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":1,\"retained_from_lsn\":0,\"allow_rewind_after_forced_promotion\":false}",
     });
@@ -3568,7 +3568,7 @@ test "storage.hot_standby http admin serves health and command endpoint" {
 
     var typed_rejoin_fenced = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_rejoin_assess,
+        .uri = admin_api.routes.hot_standby_rejoin_assess,
         .content_type = "application/json",
         .body = typed_rejoin_fenced_body,
     });
@@ -3581,7 +3581,7 @@ test "storage.hot_standby http admin serves health and command endpoint" {
 
     var typed_rejoin_rewind = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_rejoin_rewind,
+        .uri = admin_api.routes.hot_standby_rejoin_rewind,
         .content_type = "application/json",
         .body = typed_rejoin_fenced_body,
     });
@@ -3591,7 +3591,7 @@ test "storage.hot_standby http admin serves health and command endpoint" {
 
     var typed_rejoin_reseed_mismatch = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_rejoin_reseed,
+        .uri = admin_api.routes.hot_standby_rejoin_reseed,
         .content_type = "application/json",
         .body = typed_rejoin_fenced_body,
     });
@@ -3602,7 +3602,7 @@ test "storage.hot_standby http admin serves health and command endpoint" {
 
     var typed_promote_assess = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_promotion_assess,
+        .uri = admin_api.routes.hot_standby_promotion_assess,
         .content_type = "application/json",
         .body = "{\"required_lsn\":1,\"fencing_confirmed\":false,\"force\":false,\"use_current_fence\":true}",
     });
@@ -3619,7 +3619,7 @@ test "storage.hot_standby http admin serves health and command endpoint" {
 
     var typed_promote = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_promotion_current_fence,
+        .uri = admin_api.routes.hot_standby_promotion_current_fence,
         .content_type = "application/json",
     });
     defer typed_promote.deinit(alloc);
@@ -3691,9 +3691,9 @@ test "storage.hot_standby http admin accepts legacy /admin/v1/ha typed routes as
 
     // GET, exact fixed route: canonical and legacy spellings must reach the
     // same handler and return byte-identical bodies.
-    var canonical_status = try server.handle(.{ .method = .GET, .uri = admin_api.routes.ha_primary_status });
+    var canonical_status = try server.handle(.{ .method = .GET, .uri = admin_api.routes.hot_standby_primary_status });
     defer canonical_status.deinit(alloc);
-    const legacy_primary_status = (try admin_api.routes.legacyAdminPathAlloc(alloc, admin_api.routes.ha_primary_status)).?;
+    const legacy_primary_status = (try admin_api.routes.legacyAdminPathAlloc(alloc, admin_api.routes.hot_standby_primary_status)).?;
     defer alloc.free(legacy_primary_status);
     try std.testing.expectEqualStrings(admin_api.routes.legacy_standby_prefix ++ "/primary/status", legacy_primary_status);
     var legacy_status = try server.handle(.{ .method = .GET, .uri = legacy_primary_status });
@@ -3814,7 +3814,7 @@ test "storage.hot_standby http admin reports unsafe promotion as conflict" {
 
     var typed_fence = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_fence,
+        .uri = admin_api.routes.hot_standby_fence,
         .content_type = "application/json",
         .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"generation\":1,\"required_lsn\":2,\"observed_lsn\":2,\"force\":false,\"reason\":\"unsafe-promotion-test\"}",
     });
@@ -3823,7 +3823,7 @@ test "storage.hot_standby http admin reports unsafe promotion as conflict" {
 
     var unsafe_promote = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_promotion_current_fence,
+        .uri = admin_api.routes.hot_standby_promotion_current_fence,
         .content_type = "application/json",
     });
     defer unsafe_promote.deinit(alloc);
@@ -3840,7 +3840,7 @@ test "storage.hot_standby http admin rejects invalid rejoin fence receipt" {
 
     var response = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_rejoin_assess,
+        .uri = admin_api.routes.hot_standby_rejoin_assess,
         .content_type = "application/json",
         .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":2,\"retained_from_lsn\":0,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":1,\"generation\":1,\"forced\":false,\"token\":\"\",\"reason\":\"invalid\"}}",
     });
@@ -3873,7 +3873,7 @@ test "storage.hot_standby http admin rejects invalid rejoin node identifiers" {
 
         var response = try server.handle(.{
             .method = .POST,
-            .uri = admin_api.routes.ha_rejoin_assess,
+            .uri = admin_api.routes.hot_standby_rejoin_assess,
             .content_type = "application/json",
             .body = body,
         });
@@ -3903,14 +3903,14 @@ test "storage.hot_standby http admin enforces optional bearer token on typed adm
     try std.testing.expectEqual(@as(u16, 401), command_missing.status);
     try expectContains(command_missing.body, "unauthorized");
 
-    var missing = try server.handle(.{ .method = .GET, .uri = admin_api.routes.ha_primary_status });
+    var missing = try server.handle(.{ .method = .GET, .uri = admin_api.routes.hot_standby_primary_status });
     defer missing.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 401), missing.status);
     try expectContains(missing.body, "unauthorized");
 
     var wrong = try server.handle(.{
         .method = .GET,
-        .uri = admin_api.routes.ha_primary_status,
+        .uri = admin_api.routes.hot_standby_primary_status,
         .authorization = "Bearer wrong-token",
     });
     defer wrong.deinit(alloc);
@@ -3929,7 +3929,7 @@ test "storage.hot_standby http admin enforces optional bearer token on typed adm
 
     var authorized = try server.handle(.{
         .method = .GET,
-        .uri = admin_api.routes.ha_primary_status,
+        .uri = admin_api.routes.hot_standby_primary_status,
         .authorization = "Bearer secret-token",
     });
     defer authorized.deinit(alloc);
@@ -3990,7 +3990,7 @@ test "storage.hot_standby watchdog proof remains available outside HA state mute
     defer state_mutex.unlock();
     var response = try server.handle(.{
         .method = .GET,
-        .uri = admin_api.routes.ha_watchdog_proof,
+        .uri = admin_api.routes.hot_standby_watchdog_proof,
         .authorization = "Bearer secret-token",
     });
     defer response.deinit(alloc);
@@ -4011,7 +4011,7 @@ test "storage.hot_standby http admin empty configured bearer token fails closed"
         defer health.deinit(alloc);
         try std.testing.expectEqual(@as(u16, 200), health.status);
 
-        var admin = try server.handle(.{ .method = .GET, .uri = admin_api.routes.ha_primary_status });
+        var admin = try server.handle(.{ .method = .GET, .uri = admin_api.routes.hot_standby_primary_status });
         defer admin.deinit(alloc);
         try std.testing.expectEqual(@as(u16, 401), admin.status);
 
@@ -4035,7 +4035,7 @@ test "storage.hot_standby http admin required bearer token fails closed when unc
     defer health.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), health.status);
 
-    var admin = try server.handle(.{ .method = .GET, .uri = admin_api.routes.ha_primary_status });
+    var admin = try server.handle(.{ .method = .GET, .uri = admin_api.routes.hot_standby_primary_status });
     defer admin.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 401), admin.status);
 }
@@ -4047,7 +4047,7 @@ test "storage.hot_standby http admin trims configured bearer token before compar
 
     var authorized = try server.handle(.{
         .method = .GET,
-        .uri = admin_api.routes.ha_primary_status,
+        .uri = admin_api.routes.hot_standby_primary_status,
         .authorization = "Bearer secret-token",
     });
     defer authorized.deinit(alloc);
@@ -4077,7 +4077,7 @@ test "storage.hot_standby http admin rejects invalid fence request identity and 
     for (invalid_requests) |body| {
         var response = try server.handle(.{
             .method = .POST,
-            .uri = admin_api.routes.ha_fence,
+            .uri = admin_api.routes.hot_standby_fence,
             .content_type = "application/json",
             .body = body,
         });
@@ -4099,7 +4099,7 @@ test "storage.hot_standby http admin allocates fence generation when omitted fro
 
     var response = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_fence,
+        .uri = admin_api.routes.hot_standby_fence,
         .content_type = "application/json",
         .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":1,\"force\":false,\"reason\":\"omitted-generation\"}",
     });
@@ -4130,7 +4130,7 @@ test "storage.hot_standby http admin accepts whole instance identity" {
 
     var typed_fence = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_fence,
+        .uri = admin_api.routes.hot_standby_fence,
         .content_type = "application/json",
         .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":0,\"table_id\":0,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"generation\":1,\"required_lsn\":1,\"observed_lsn\":0,\"force\":true,\"reason\":\"whole-instance\"}",
     });
@@ -4142,7 +4142,7 @@ test "storage.hot_standby http admin accepts whole instance identity" {
 
     var typed_promote = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_promotion_current_fence,
+        .uri = admin_api.routes.hot_standby_promotion_current_fence,
         .content_type = "application/json",
     });
     defer typed_promote.deinit(alloc);
@@ -4175,7 +4175,7 @@ test "storage.hot_standby http admin promotes from operation-specific fence requ
 
     var typed_promote = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_promotion,
+        .uri = admin_api.routes.hot_standby_promotion,
         .content_type = "application/json",
         .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":0,\"table_id\":0,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"generation\":1,\"required_lsn\":1,\"observed_lsn\":0,\"force\":true,\"reason\":\"direct-promote\"}",
     });
@@ -4211,7 +4211,7 @@ test "storage.hot_standby http admin serves typed base backup seed endpoints" {
 
     var typed_begin = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_base_backups,
+        .uri = admin_api.routes.hot_standby_base_backups,
         .content_type = "application/json",
         .body = "{\"slot_name\":\"standby-seed\",\"manifest_id\":\"base-http\"}",
     });
@@ -4251,7 +4251,7 @@ test "storage.hot_standby http admin serves typed base backup seed endpoints" {
     defer alloc.free(finish_body);
     var typed_finish = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_base_backups_finish,
+        .uri = admin_api.routes.hot_standby_base_backups_finish,
         .content_type = "application/json",
         .body = finish_body,
     });
@@ -4273,7 +4273,7 @@ test "storage.hot_standby http admin serves typed base backup seed endpoints" {
     defer alloc.free(activate_body);
     var typed_activate = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_base_backups_activate,
+        .uri = admin_api.routes.hot_standby_base_backups_activate,
         .content_type = "application/json",
         .body = activate_body,
     });
@@ -4291,7 +4291,7 @@ test "storage.hot_standby http admin serves typed base backup seed endpoints" {
 
     var typed_activate_retry = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_base_backups_activate,
+        .uri = admin_api.routes.hot_standby_base_backups_activate,
         .content_type = "application/json",
         .body = activate_body,
     });
@@ -4307,7 +4307,7 @@ test "storage.hot_standby http admin serves typed base backup seed endpoints" {
     defer alloc.free(bootstrap_body);
     var typed_bootstrap = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_standby_bootstrap,
+        .uri = admin_api.routes.hot_standby_standby_bootstrap,
         .content_type = "application/json",
         .body = bootstrap_body,
     });
@@ -4358,7 +4358,7 @@ test "storage.hot_standby http admin validates typed seed manifest paths before 
         defer alloc.free(finish_body);
         var finish = try server.handle(.{
             .method = .POST,
-            .uri = admin_api.routes.ha_base_backups_finish,
+            .uri = admin_api.routes.hot_standby_base_backups_finish,
             .content_type = "application/json",
             .body = finish_body,
         });
@@ -4374,7 +4374,7 @@ test "storage.hot_standby http admin validates typed seed manifest paths before 
         defer alloc.free(bootstrap_body);
         var bootstrap = try server.handle(.{
             .method = .POST,
-            .uri = admin_api.routes.ha_standby_bootstrap,
+            .uri = admin_api.routes.hot_standby_standby_bootstrap,
             .content_type = "application/json",
             .body = bootstrap_body,
         });
@@ -4405,7 +4405,7 @@ test "storage.hot_standby http admin validates typed seed manifest paths before 
         defer alloc.free(bootstrap_body);
         var bootstrap = try server.handle(.{
             .method = .POST,
-            .uri = admin_api.routes.ha_standby_bootstrap,
+            .uri = admin_api.routes.hot_standby_standby_bootstrap,
             .content_type = "application/json",
             .body = bootstrap_body,
         });
@@ -4433,11 +4433,11 @@ test "storage.hot_standby http admin returns route method and command errors" {
     defer wrong_method.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 405), wrong_method.status);
 
-    var get_to_post_route = try server.handle(.{ .method = .GET, .uri = admin_api.routes.ha_fence });
+    var get_to_post_route = try server.handle(.{ .method = .GET, .uri = admin_api.routes.hot_standby_fence });
     defer get_to_post_route.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 405), get_to_post_route.status);
 
-    var post_to_get_route = try server.handle(.{ .method = .POST, .uri = admin_api.routes.ha_fence_current });
+    var post_to_get_route = try server.handle(.{ .method = .POST, .uri = admin_api.routes.hot_standby_fence_current });
     defer post_to_get_route.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 405), post_to_get_route.status);
 
@@ -4475,7 +4475,7 @@ test "storage.hot_standby http admin requires node id before typed action receip
 
     var response = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_replication_slots,
+        .uri = admin_api.routes.hot_standby_replication_slots,
         .content_type = "application/json",
         .body = "{\"slot_name\":\"standby-a\",\"initial_lsn\":0}",
     });
@@ -4512,7 +4512,7 @@ test "storage.hot_standby http admin rejects invalid primary node id before type
 
         var response = try server.handle(.{
             .method = .POST,
-            .uri = admin_api.routes.ha_replication_slots,
+            .uri = admin_api.routes.hot_standby_replication_slots,
             .content_type = "application/json",
             .body = "{\"slot_name\":\"standby-a\",\"initial_lsn\":0}",
         });
@@ -4553,7 +4553,7 @@ test "storage.hot_standby http admin rejects invalid fenced primary node id in t
 
         var response = try server.handle(.{
             .method = .POST,
-            .uri = admin_api.routes.ha_write_check,
+            .uri = admin_api.routes.hot_standby_write_check,
             .content_type = "application/json",
             .body = "{\"role\":\"primary\"}",
         });
@@ -4590,7 +4590,7 @@ test "storage.hot_standby http admin rejects invalid standby node id in typed st
 
         var response = try server.handle(.{
             .method = .GET,
-            .uri = admin_api.routes.ha_standby_status,
+            .uri = admin_api.routes.hot_standby_standby_status,
         });
         defer response.deinit(alloc);
 
@@ -4655,7 +4655,7 @@ test "storage.hot_standby http admin applies typed standby upstream swap" {
 
     var response = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_standby_upstream,
+        .uri = admin_api.routes.hot_standby_standby_upstream,
         .content_type = "application/json",
         .body = standby_upstream_request_body,
     });
@@ -4697,7 +4697,7 @@ test "storage.hot_standby http admin reports unchanged standby upstream as idemp
 
     var response = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_standby_upstream,
+        .uri = admin_api.routes.hot_standby_standby_upstream,
         .content_type = "application/json",
         .body = standby_upstream_request_body,
     });
@@ -4726,7 +4726,7 @@ test "storage.hot_standby http admin rejects standby upstream identity mismatch 
 
     var response = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_standby_upstream,
+        .uri = admin_api.routes.hot_standby_standby_upstream,
         .content_type = "application/json",
         .body = standby_upstream_request_body,
     });
@@ -4753,7 +4753,7 @@ test "storage.hot_standby http admin rejects standby upstream without a wired ho
 
     var response = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_standby_upstream,
+        .uri = admin_api.routes.hot_standby_standby_upstream,
         .content_type = "application/json",
         .body = standby_upstream_request_body,
     });
@@ -4770,7 +4770,7 @@ test "storage.hot_standby http admin rejects standby upstream when node is not a
 
     var response = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_standby_upstream,
+        .uri = admin_api.routes.hot_standby_standby_upstream,
         .content_type = "application/json",
         .body = standby_upstream_request_body,
     });
@@ -4798,7 +4798,7 @@ test "storage.hot_standby http admin rejects malformed standby upstream requests
 
     var empty = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_standby_upstream,
+        .uri = admin_api.routes.hot_standby_standby_upstream,
         .content_type = "application/json",
         .body = "",
     });
@@ -4807,7 +4807,7 @@ test "storage.hot_standby http admin rejects malformed standby upstream requests
 
     var bad_url = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_standby_upstream,
+        .uri = admin_api.routes.hot_standby_standby_upstream,
         .content_type = "application/json",
         .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"upstream_url\":\"not-a-url\",\"slot_name\":\"standby-a\"}",
     });
@@ -4817,7 +4817,7 @@ test "storage.hot_standby http admin rejects malformed standby upstream requests
 
     var bad_slot = try server.handle(.{
         .method = .POST,
-        .uri = admin_api.routes.ha_standby_upstream,
+        .uri = admin_api.routes.hot_standby_standby_upstream,
         .content_type = "application/json",
         .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"upstream_url\":\"https://primary-b.antfly.svc:8080\",\"slot_name\":\"standby a\"}",
     });
@@ -4877,27 +4877,27 @@ test "storage.hot_standby http admin implemented admin routes are documented" {
         path: []const u8,
     };
     const static_routes = [_]ImplementedRoute{
-        .{ .method = "GET", .path = admin_api.routes.ha_primary_status },
-        .{ .method = "GET", .path = admin_api.routes.ha_standby_status },
-        .{ .method = "GET", .path = admin_api.routes.ha_replication_slots },
-        .{ .method = "GET", .path = admin_api.routes.ha_fence_current },
-        .{ .method = "POST", .path = admin_api.routes.ha_replication_slots },
-        .{ .method = "POST", .path = admin_api.routes.ha_commit_check },
-        .{ .method = "POST", .path = admin_api.routes.ha_commit_append },
-        .{ .method = "POST", .path = admin_api.routes.ha_read_check },
-        .{ .method = "POST", .path = admin_api.routes.ha_write_check },
-        .{ .method = "POST", .path = admin_api.routes.ha_owner_job_check },
-        .{ .method = "POST", .path = admin_api.routes.ha_base_backups },
-        .{ .method = "POST", .path = admin_api.routes.ha_base_backups_finish },
-        .{ .method = "POST", .path = admin_api.routes.ha_standby_bootstrap },
-        .{ .method = "POST", .path = admin_api.routes.ha_standby_upstream },
-        .{ .method = "POST", .path = admin_api.routes.ha_fence },
-        .{ .method = "POST", .path = admin_api.routes.ha_promotion_assess },
-        .{ .method = "POST", .path = admin_api.routes.ha_promotion_current_fence },
-        .{ .method = "POST", .path = admin_api.routes.ha_promotion },
-        .{ .method = "POST", .path = admin_api.routes.ha_rejoin_assess },
-        .{ .method = "POST", .path = admin_api.routes.ha_rejoin_rewind },
-        .{ .method = "POST", .path = admin_api.routes.ha_rejoin_reseed },
+        .{ .method = "GET", .path = admin_api.routes.hot_standby_primary_status },
+        .{ .method = "GET", .path = admin_api.routes.hot_standby_standby_status },
+        .{ .method = "GET", .path = admin_api.routes.hot_standby_replication_slots },
+        .{ .method = "GET", .path = admin_api.routes.hot_standby_fence_current },
+        .{ .method = "POST", .path = admin_api.routes.hot_standby_replication_slots },
+        .{ .method = "POST", .path = admin_api.routes.hot_standby_commit_check },
+        .{ .method = "POST", .path = admin_api.routes.hot_standby_commit_append },
+        .{ .method = "POST", .path = admin_api.routes.hot_standby_read_check },
+        .{ .method = "POST", .path = admin_api.routes.hot_standby_write_check },
+        .{ .method = "POST", .path = admin_api.routes.hot_standby_owner_job_check },
+        .{ .method = "POST", .path = admin_api.routes.hot_standby_base_backups },
+        .{ .method = "POST", .path = admin_api.routes.hot_standby_base_backups_finish },
+        .{ .method = "POST", .path = admin_api.routes.hot_standby_standby_bootstrap },
+        .{ .method = "POST", .path = admin_api.routes.hot_standby_standby_upstream },
+        .{ .method = "POST", .path = admin_api.routes.hot_standby_fence },
+        .{ .method = "POST", .path = admin_api.routes.hot_standby_promotion_assess },
+        .{ .method = "POST", .path = admin_api.routes.hot_standby_promotion_current_fence },
+        .{ .method = "POST", .path = admin_api.routes.hot_standby_promotion },
+        .{ .method = "POST", .path = admin_api.routes.hot_standby_rejoin_assess },
+        .{ .method = "POST", .path = admin_api.routes.hot_standby_rejoin_rewind },
+        .{ .method = "POST", .path = admin_api.routes.hot_standby_rejoin_reseed },
     };
 
     for (static_routes) |route| {
@@ -4924,9 +4924,9 @@ test "storage.hot_standby http admin implemented admin routes are documented" {
         .{ .method = "PUT", .path = resume_path },
     };
     const documented_dynamic_routes = [_]ImplementedRoute{
-        .{ .method = "DELETE", .path = admin_api.routes.ha_replication_slot_prefix ++ "{slot_name}" },
-        .{ .method = "PUT", .path = admin_api.routes.ha_replication_slot_prefix ++ "{slot_name}" ++ admin_api.routes.ha_replication_slot_pause_suffix },
-        .{ .method = "PUT", .path = admin_api.routes.ha_replication_slot_prefix ++ "{slot_name}" ++ admin_api.routes.ha_replication_slot_resume_suffix },
+        .{ .method = "DELETE", .path = admin_api.routes.hot_standby_replication_slot_prefix ++ "{slot_name}" },
+        .{ .method = "PUT", .path = admin_api.routes.hot_standby_replication_slot_prefix ++ "{slot_name}" ++ admin_api.routes.hot_standby_replication_slot_pause_suffix },
+        .{ .method = "PUT", .path = admin_api.routes.hot_standby_replication_slot_prefix ++ "{slot_name}" ++ admin_api.routes.hot_standby_replication_slot_resume_suffix },
     };
 
     for (dynamic_routes, documented_dynamic_routes) |route, documented| {
@@ -5105,7 +5105,7 @@ test "storage.hot_standby primary status observes catalog outside the HA lock wi
     defer server.deinit();
     for ([_]bool{ true, false, true }) |empty| {
         catalog.empty = empty;
-        var response = try server.handle(.{ .method = .GET, .uri = admin_api.routes.ha_primary_status });
+        var response = try server.handle(.{ .method = .GET, .uri = admin_api.routes.hot_standby_primary_status });
         defer response.deinit(alloc);
         try std.testing.expectEqual(@as(u16, 200), response.status);
         try expectContains(response.body, if (empty) "\"waiting_for_tables\":true" else "\"waiting_for_tables\":false");

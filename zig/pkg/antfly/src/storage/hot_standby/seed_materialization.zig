@@ -152,7 +152,7 @@ pub fn materialize(alloc: Allocator, request: MaterializeRequest) !MaterializeRe
         defer alloc.free(metadata_store_root);
         var metadata_store = try @import("../../metadata/storage/raft_apply_store.zig").RaftApplyStore.init(alloc, .{ .root_dir = metadata_store_root });
         defer metadata_store.deinit();
-        try metadata_store.importHACheckpoint(io, source_path, artifact.size_bytes);
+        try metadata_store.importHotStandbyCheckpoint(io, source_path, artifact.size_bytes);
         try verifyStandaloneMetadataTopology(alloc, &metadata_store, parsed.value);
     }
     if (parsed.value.private_provisioning) |projection| {

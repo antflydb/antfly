@@ -5602,10 +5602,10 @@ test "standalone metadata released JSON replay is atomic exact and checkpoint du
     {
         var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
         defer store.deinit();
-        try store.applyHARecord(record);
+        try store.applyHotStandbyRecord(record);
         const revision = try store.standaloneRevision();
         try std.testing.expectEqual(@as(u64, 1), revision);
-        try store.applyHARecord(record);
+        try store.applyHotStandbyRecord(record);
         try std.testing.expectEqual(revision, try store.standaloneRevision());
         const tables = try store.listTables(alloc, group);
         defer store.freeTables(alloc, tables);
@@ -5621,29 +5621,29 @@ test "standalone metadata released JSON replay is atomic exact and checkpoint du
         var altered_table = table;
         altered_table.description = "conflicting";
         record.payload = try std.json.Stringify.valueAlloc(scratch, RaftApplyStore.LegacyCatalogCreate{ .table = altered_table, .ranges = &ranges }, .{});
-        try std.testing.expectError(error.MetadataHASourceChanged, store.applyHARecord(record));
+        try std.testing.expectError(error.MetadataHASourceChanged, store.applyHotStandbyRecord(record));
         record.lsn = 9;
         record.previous_lsn = 8;
-        try std.testing.expectError(error.TableLifecycleConflict, store.applyHARecord(record));
+        try std.testing.expectError(error.TableLifecycleConflict, store.applyHotStandbyRecord(record));
         try std.testing.expectEqual(revision, try store.standaloneRevision());
         record.payload = payload;
         record.cluster_id = 8;
-        try std.testing.expectError(error.MetadataHASourceChanged, store.applyHARecord(record));
+        try std.testing.expectError(error.MetadataHASourceChanged, store.applyHotStandbyRecord(record));
         record.cluster_id = 7;
         record.timeline_id = 2;
-        try std.testing.expectError(error.MetadataHASourceChanged, store.applyHARecord(record));
+        try std.testing.expectError(error.MetadataHASourceChanged, store.applyHotStandbyRecord(record));
         record.timeline_id = 1;
         // Metadata effects may have document WAL entries between them.
-        try store.applyHARecord(record);
+        try store.applyHotStandbyRecord(record);
         try std.testing.expectEqual(revision + 1, try store.standaloneRevision());
     }
     var reopened = try RaftApplyStore.init(alloc, .{ .root_dir = root });
     defer reopened.deinit();
-    const artifact = try reopened.exportHACheckpoint(std.testing.io, checkpoint);
+    const artifact = try reopened.exportHotStandbyCheckpoint(std.testing.io, checkpoint);
     var restored = try RaftApplyStore.init(alloc, .{ .root_dir = restored_root });
     defer restored.deinit();
-    try restored.importHACheckpoint(std.testing.io, checkpoint, artifact.size_bytes);
-    try restored.applyHARecord(record);
+    try restored.importHotStandbyCheckpoint(std.testing.io, checkpoint, artifact.size_bytes);
+    try restored.applyHotStandbyRecord(record);
     try std.testing.expectEqual(@as(u64, 2), try restored.standaloneRevision());
     const receipt = try restored.store.get(alloc, RaftApplyStore.metadata_ha.replay_key);
     defer alloc.free(receipt);
@@ -5671,13 +5671,13 @@ test "standalone metadata released JSON replay verifies imported ranges and pres
     const invalid_payload = try std.json.Stringify.valueAlloc(alloc, RaftApplyStore.LegacyCatalogCreate{ .table = table, .ranges = &wrong_ranges }, .{});
     defer alloc.free(invalid_payload);
     var record: @import("../../storage/db/replication_record.zig").Record = .{ .kind = .metadata_mutation, .payload_codec = .json, .cluster_id = 7, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = invalid_payload };
-    try std.testing.expectError(error.TableLifecycleConflict, store.applyHARecord(record));
+    try std.testing.expectError(error.TableLifecycleConflict, store.applyHotStandbyRecord(record));
     try std.testing.expectError(error.NotFound, store.store.get(alloc, RaftApplyStore.metadata_ha.replay_key));
     try std.testing.expectEqual(@as(u64, 1), try store.standaloneRevision());
     const payload = try std.json.Stringify.valueAlloc(alloc, RaftApplyStore.LegacyCatalogCreate{ .table = table, .ranges = &ranges }, .{});
     defer alloc.free(payload);
     record.payload = payload;
-    try store.applyHARecord(record);
+    try store.applyHotStandbyRecord(record);
     const loaded = (try store.loadStandaloneCatalog(alloc)).?;
     defer alloc.free(loaded);
     try std.testing.expectEqualStrings(auxiliary, loaded);
@@ -5687,10 +5687,10 @@ test "standalone metadata released JSON replay verifies imported ranges and pres
     var txn = try store.store.beginWriteTxn();
     try txn.put(RaftApplyStore.metadata_ha.source_key, &([_]u8{1} ** 16));
     try txn.commit();
-    try store.applyHARecord(record);
+    try store.applyHotStandbyRecord(record);
     record.lsn = 2;
     record.previous_lsn = 1;
-    try std.testing.expectError(error.MetadataHASourceChanged, store.applyHARecord(record));
+    try std.testing.expectError(error.MetadataHASourceChanged, store.applyHotStandbyRecord(record));
     try std.testing.expectEqual(@as(u64, 2), try store.standaloneRevision());
 }
 
@@ -5814,13 +5814,13 @@ test "standalone metadata HA preserves incremental jobs outbox recovery and full
     {
         var source = try RaftApplyStore.init(alloc, .{ .root_dir = source_root });
         defer source.deinit();
-        try source.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary) });
+        try source.bindHotStandby(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary) });
         try source.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = logical_key, .value = queued } });
         var first = (try primary.log.entryAt(alloc, 1)).?;
         defer first.deinit(alloc);
         try std.testing.expect(first.record.payload.len < 4096);
-        try target.applyHARecord(first.record);
-        try target.applyHARecord(first.record);
+        try target.applyHotStandbyRecord(first.record);
+        try target.applyHotStandbyRecord(first.record);
         const actual = (try target.getRestoreJobValue(alloc, group, logical_key)).?;
         defer alloc.free(actual);
         try std.testing.expectEqualStrings(queued, actual);
@@ -5830,22 +5830,22 @@ test "standalone metadata HA preserves incremental jobs outbox recovery and full
             }
         };
         var context: u8 = 0;
-        try source.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &context, .sync_wait_fn = Failure.wait });
+        try source.bindHotStandby(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &context, .sync_wait_fn = Failure.wait });
         try std.testing.expectError(error.InjectedAfterMetadataHAAppend, source.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = logical_key, .value = importing } }));
         try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
-        try std.testing.expectError(error.MetadataHAOutboxPending, source.exportHACheckpoint(io, checkpoint));
+        try std.testing.expectError(error.MetadataHAOutboxPending, source.exportHotStandbyCheckpoint(io, checkpoint));
     }
     {
         var source = try RaftApplyStore.init(alloc, .{ .root_dir = source_root });
         defer source.deinit();
-        try source.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary) });
-        try source.flushHAOutbox();
+        try source.bindHotStandby(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary) });
+        try source.flushHotStandbyOutbox();
         try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
         try source.store.put("\x00\x00__metadata__:private_fixture", "private-reservation-proof");
-        const artifact = try source.exportHACheckpoint(io, checkpoint);
+        const artifact = try source.exportHotStandbyCheckpoint(io, checkpoint);
         var restored = try RaftApplyStore.init(alloc, .{ .root_dir = restored_root });
         defer restored.deinit();
-        try restored.importHACheckpoint(io, checkpoint, artifact.size_bytes);
+        try restored.importHotStandbyCheckpoint(io, checkpoint, artifact.size_bytes);
         const private = try restored.store.get(alloc, "\x00\x00__metadata__:private_fixture");
         defer alloc.free(private);
         try std.testing.expectEqualStrings("private-reservation-proof", private);
@@ -5854,14 +5854,14 @@ test "standalone metadata HA preserves incremental jobs outbox recovery and full
         try std.testing.expectEqualStrings(importing, actual);
         var second = (try primary.log.entryAt(alloc, 2)).?;
         defer second.deinit(alloc);
-        try restored.applyHARecord(second.record);
-        try std.testing.expectError(error.MetadataHACheckpointTargetNotEmpty, restored.importHACheckpoint(io, checkpoint, artifact.size_bytes));
+        try restored.applyHotStandbyRecord(second.record);
+        try std.testing.expectError(error.MetadataHACheckpointTargetNotEmpty, restored.importHotStandbyCheckpoint(io, checkpoint, artifact.size_bytes));
         try source.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = logical_key, .value = complete } });
         var third = (try primary.log.entryAt(alloc, 3)).?;
         defer third.deinit(alloc);
-        try std.testing.expectError(error.MetadataHASequenceGap, target.applyHARecord(third.record));
-        try restored.applyHARecord(third.record);
-        try restored.applyHARecord(second.record);
+        try std.testing.expectError(error.MetadataHASequenceGap, target.applyHotStandbyRecord(third.record));
+        try restored.applyHotStandbyRecord(third.record);
+        try restored.applyHotStandbyRecord(second.record);
         const receipt = try restored.store.get(alloc, RaftApplyStore.metadata_ha.replay_key);
         defer alloc.free(receipt);
         try std.testing.expectEqual(third.record.lsn, std.mem.readInt(u64, receipt[24..32], .little));
@@ -5872,7 +5872,7 @@ test "standalone metadata HA preserves incremental jobs outbox recovery and full
         const bad = try scratch.dupe(u8, third.record.payload);
         bad[bad.len - 1] ^= 1;
         corrupted.payload = bad;
-        try std.testing.expectError(error.InvalidMetadataHAEffectChunk, restored.applyHARecord(corrupted));
+        try std.testing.expectError(error.InvalidMetadataHAEffectChunk, restored.applyHotStandbyRecord(corrupted));
     }
 }
 
@@ -5913,7 +5913,7 @@ test "standalone metadata chunked HA resumes large effects through checkpoint wi
             }
         };
         var context: u8 = 0;
-        try source.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &context, .sync_wait_fn = Failure.wait });
+        try source.bindHotStandby(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &context, .sync_wait_fn = Failure.wait });
         try std.testing.expectError(error.MetadataMutationOutcomeUnknown, source.replaceStandaloneCatalog(group, 0, &.{}, &.{}, value));
     }
     const final_lsn = primary.lastLsn();
@@ -5921,8 +5921,8 @@ test "standalone metadata chunked HA resumes large effects through checkpoint wi
     {
         var source = try RaftApplyStore.init(alloc, .{ .root_dir = source_root });
         defer source.deinit();
-        try source.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary) });
-        try source.flushHAOutbox();
+        try source.bindHotStandby(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary) });
+        try source.flushHotStandbyOutbox();
         try std.testing.expectEqual(final_lsn, primary.lastLsn());
     }
     var checkpoint_size: u64 = 0;
@@ -5934,14 +5934,14 @@ test "standalone metadata chunked HA resumes large effects through checkpoint wi
             var entry = (try primary.log.entryAt(alloc, lsn)).?;
             defer entry.deinit(alloc);
             try std.testing.expect(entry.record.payload.len + @import("../../storage/db/replication_record.zig").header_size <= 1024 * 1024);
-            try target.applyHARecord(entry.record);
-            try target.applyHARecord(entry.record);
+            try target.applyHotStandbyRecord(entry.record);
+            try target.applyHotStandbyRecord(entry.record);
             try std.testing.expect((try target.loadStandaloneCatalog(alloc)) == null);
             try std.testing.expectError(error.NotFound, target.store.get(alloc, RaftApplyStore.metadata_ha.replay_key));
         }
         var skipped = (try primary.log.entryAt(alloc, 5)).?;
         defer skipped.deinit(alloc);
-        try std.testing.expectError(error.MetadataHAChunkSequenceGap, target.applyHARecord(skipped.record));
+        try std.testing.expectError(error.MetadataHAChunkSequenceGap, target.applyHotStandbyRecord(skipped.record));
         var first = (try primary.log.entryAt(alloc, 1)).?;
         defer first.deinit(alloc);
         const decoded = try chunks.decodeFrame(first.record.payload);
@@ -5951,14 +5951,14 @@ test "standalone metadata chunked HA resumes large effects through checkpoint wi
         defer alloc.free(forged);
         var foreign_record = first.record;
         foreign_record.payload = forged;
-        try std.testing.expectError(error.MetadataHASourceChanged, target.applyHARecord(foreign_record));
-        const artifact = try target.exportHACheckpoint(io, checkpoint);
+        try std.testing.expectError(error.MetadataHASourceChanged, target.applyHotStandbyRecord(foreign_record));
+        const artifact = try target.exportHotStandbyCheckpoint(io, checkpoint);
         checkpoint_size = artifact.size_bytes;
     }
     {
         var target = try RaftApplyStore.init(alloc, .{ .root_dir = corrupt_root });
         defer target.deinit();
-        try target.importHACheckpoint(io, checkpoint, checkpoint_size);
+        try target.importHotStandbyCheckpoint(io, checkpoint, checkpoint_size);
         var fourth = (try primary.log.entryAt(alloc, 4)).?;
         defer fourth.deinit(alloc);
         const decoded = try chunks.decodeFrame(fourth.record.payload);
@@ -5969,12 +5969,12 @@ test "standalone metadata chunked HA resumes large effects through checkpoint wi
         defer alloc.free(forged);
         var bad_record = fourth.record;
         bad_record.payload = forged;
-        try target.applyHARecord(bad_record);
+        try target.applyHotStandbyRecord(bad_record);
         var lsn: u64 = 5;
         while (lsn <= final_lsn) : (lsn += 1) {
             var entry = (try primary.log.entryAt(alloc, lsn)).?;
             defer entry.deinit(alloc);
-            if (lsn == final_lsn) try std.testing.expectError(error.InvalidMetadataHAEffect, target.applyHARecord(entry.record)) else try target.applyHARecord(entry.record);
+            if (lsn == final_lsn) try std.testing.expectError(error.InvalidMetadataHAEffect, target.applyHotStandbyRecord(entry.record)) else try target.applyHotStandbyRecord(entry.record);
         }
         try std.testing.expect((try target.loadStandaloneCatalog(alloc)) == null);
         try std.testing.expectError(error.NotFound, target.store.get(alloc, RaftApplyStore.metadata_ha.replay_key));
@@ -5982,7 +5982,7 @@ test "standalone metadata chunked HA resumes large effects through checkpoint wi
     {
         var target = try RaftApplyStore.init(alloc, .{ .root_dir = restored_root });
         defer target.deinit();
-        try target.importHACheckpoint(io, checkpoint, checkpoint_size);
+        try target.importHotStandbyCheckpoint(io, checkpoint, checkpoint_size);
     }
     {
         var target = try RaftApplyStore.init(alloc, .{ .root_dir = restored_root });
@@ -5991,7 +5991,7 @@ test "standalone metadata chunked HA resumes large effects through checkpoint wi
         while (lsn <= final_lsn) : (lsn += 1) {
             var entry = (try primary.log.entryAt(alloc, lsn)).?;
             defer entry.deinit(alloc);
-            try target.applyHARecord(entry.record);
+            try target.applyHotStandbyRecord(entry.record);
             if (lsn < final_lsn) try std.testing.expect((try target.loadStandaloneCatalog(alloc)) == null);
         }
         const actual = (try target.loadStandaloneCatalog(alloc)).?;
@@ -6013,23 +6013,23 @@ test "standalone metadata chunked HA resumes large effects through checkpoint wi
     defer new_primary.close();
     var promoted = try RaftApplyStore.init(alloc, .{ .root_dir = promoted_root });
     defer promoted.deinit();
-    try promoted.importHACheckpoint(io, checkpoint, checkpoint_size);
-    try promoted.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary) });
+    try promoted.importHotStandbyCheckpoint(io, checkpoint, checkpoint_size);
+    try promoted.bindHotStandby(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary) });
     try std.testing.expectError(error.MetadataHAIncompleteEffect, promoted.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = key, .value = "promoted" } }));
-    try promoted.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&new_primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&new_primary) });
+    try promoted.bindHotStandby(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&new_primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&new_primary) });
     try promoted.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = key, .value = "promoted" } });
     var follower = try RaftApplyStore.init(alloc, .{ .root_dir = follower_root });
     defer follower.deinit();
-    try follower.importHACheckpoint(io, checkpoint, checkpoint_size);
+    try follower.importHotStandbyCheckpoint(io, checkpoint, checkpoint_size);
     var replacement = (try new_primary.log.entryAt(alloc, 1)).?;
     defer replacement.deinit(alloc);
-    try follower.applyHARecord(replacement.record);
+    try follower.applyHotStandbyRecord(replacement.record);
     const replaced = (try follower.getRestoreJobValue(alloc, group, key)).?;
     defer alloc.free(replaced);
     try std.testing.expectEqualStrings("promoted", replaced);
     var late = (try primary.log.entryAt(alloc, final_lsn)).?;
     defer late.deinit(alloc);
-    try std.testing.expectError(error.MetadataHASourceChanged, follower.applyHARecord(late.record));
+    try std.testing.expectError(error.MetadataHASourceChanged, follower.applyHotStandbyRecord(late.record));
 }
 
 fn policyHasUnsupportedArtifactIndexes(alloc: std.mem.Allocator, indexes_json: []const u8) !bool {
@@ -6070,9 +6070,9 @@ pub const RaftApplyStore = struct {
     active_outcome: ?*CommittedApplyOutcome = null,
     verified_catalog_groups: std.AutoHashMapUnmanaged(u64, void) = .empty,
     read_only: bool = false,
-    ha_gate: ?@import("../../storage/db/replication_contract.zig").WriteGate = null,
-    ha_mirror: ?@import("../../storage/db/replication_contract.zig").AsyncEffectMirror = null,
-    ha_port: ?@import("../../storage/metadata_hot_standby_port.zig").Port = null,
+    hot_standby_gate: ?@import("../../storage/db/replication_contract.zig").WriteGate = null,
+    hot_standby_mirror: ?@import("../../storage/db/replication_contract.zig").AsyncEffectMirror = null,
+    hot_standby_port: ?@import("../../storage/metadata_hot_standby_port.zig").Port = null,
 
     const ProjectedPlacementIntent = struct {
         metadata_group_id: u64,
@@ -6209,48 +6209,48 @@ pub const RaftApplyStore = struct {
 
     /// The embedding owns the shared HA mutation lease BEFORE its catalog
     /// mutex. Do not recursively acquire the writer-preferring seed barrier.
-    pub fn bindHA(self: *RaftApplyStore, gate: ?@import("../../storage/db/replication_contract.zig").WriteGate, mirror: ?@import("../../storage/db/replication_contract.zig").AsyncEffectMirror) !void {
+    pub fn bindHotStandby(self: *RaftApplyStore, gate: ?@import("../../storage/db/replication_contract.zig").WriteGate, mirror: ?@import("../../storage/db/replication_contract.zig").AsyncEffectMirror) !void {
         if (!self.apply_mutex.tryLock()) return error.MetadataHABindingBusy;
         defer self.apply_mutex.unlock(self.io_impl.io());
-        self.ha_gate = gate;
-        self.ha_mirror = mirror;
-        self.ha_port = null;
+        self.hot_standby_gate = gate;
+        self.hot_standby_mirror = mirror;
+        self.hot_standby_port = null;
     }
 
-    pub fn bindHAPort(self: *RaftApplyStore, port: ?@import("../../storage/metadata_hot_standby_port.zig").Port) !void {
+    pub fn bindHotStandbyPort(self: *RaftApplyStore, port: ?@import("../../storage/metadata_hot_standby_port.zig").Port) !void {
         if (!self.apply_mutex.tryLock()) return error.MetadataHABindingBusy;
         defer self.apply_mutex.unlock(self.io_impl.io());
-        self.ha_port = port;
-        self.ha_gate = null;
-        self.ha_mirror = null;
+        self.hot_standby_port = port;
+        self.hot_standby_gate = null;
+        self.hot_standby_mirror = null;
     }
 
-    fn hasHAMirror(self: *const RaftApplyStore) bool {
-        return self.ha_mirror != null or (if (self.ha_port) |port| port.has_mirror else false);
+    fn hasHotStandbyMirror(self: *const RaftApplyStore) bool {
+        return self.hot_standby_mirror != null or (if (self.hot_standby_port) |port| port.has_mirror else false);
     }
 
-    fn lockHATransition(self: *RaftApplyStore) !void {
-        if (self.ha_port) |port| return port.lock();
-        if (self.ha_mirror) |mirror| if (mirror.transition_mutex) |mutex| {
+    fn lockHotStandbyTransition(self: *RaftApplyStore) !void {
+        if (self.hot_standby_port) |port| return port.lock();
+        if (self.hot_standby_mirror) |mirror| if (mirror.transition_mutex) |mutex| {
             @import("antfly_platform").sync.lockYieldingIo(mutex, self.io_impl.io());
         };
     }
-    fn unlockHATransition(self: *RaftApplyStore) void {
-        if (self.ha_port) |port| return port.unlock();
-        if (self.ha_mirror) |mirror| if (mirror.transition_mutex) |mutex| mutex.unlock();
+    fn unlockHotStandbyTransition(self: *RaftApplyStore) void {
+        if (self.hot_standby_port) |port| return port.unlock();
+        if (self.hot_standby_mirror) |mirror| if (mirror.transition_mutex) |mutex| mutex.unlock();
     }
-    fn checkHA(self: *RaftApplyStore) !void {
-        if (self.ha_port) |port| return port.check();
-        if (self.ha_gate) |gate| try gate.check();
+    fn checkHotStandby(self: *RaftApplyStore) !void {
+        if (self.hot_standby_port) |port| return port.check();
+        if (self.hot_standby_gate) |gate| try gate.check();
     }
 
-    fn stageStandaloneHA(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, capture: *@import("../../storage/txn_mutation_capture.zig").Capture, group_id: u64) !void {
+    fn stageStandaloneHotStandby(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, capture: *@import("../../storage/txn_mutation_capture.zig").Capture, group_id: u64) !void {
         txn.mutation_capture = null;
-        if (!self.hasHAMirror()) return;
-        const identity: @import("../../storage/metadata_hot_standby_port.zig").Identity = if (self.ha_port) |port| try port.identity() else .{
-            .next_lsn = self.ha_mirror.?.publisher.nextLsn(),
-            .timeline_id = self.ha_mirror.?.publisher.identity().timeline_id,
-            .epoch = self.ha_mirror.?.publisher.identity().epoch,
+        if (!self.hasHotStandbyMirror()) return;
+        const identity: @import("../../storage/metadata_hot_standby_port.zig").Identity = if (self.hot_standby_port) |port| try port.identity() else .{
+            .next_lsn = self.hot_standby_mirror.?.publisher.nextLsn(),
+            .timeline_id = self.hot_standby_mirror.?.publisher.identity().timeline_id,
+            .epoch = self.hot_standby_mirror.?.publisher.identity().epoch,
         };
         var source: [16]u8 = undefined;
         const pending = if (try stagingGet(txn, metadata_pending_key)) |bytes| try MetadataPending.decode(bytes) else null;
@@ -6291,14 +6291,14 @@ pub const RaftApplyStore = struct {
 
     /// Caller retains the outer mutation lease. apply_mutex serializes the
     /// single durable outbox; transition lock covers only authority + append.
-    fn flushHAOutboxLocked(self: *RaftApplyStore) !void {
+    fn flushHotStandbyOutboxLocked(self: *RaftApplyStore) !void {
         const raw = self.store.get(self.alloc, metadata_ha.outbox_key) catch |err| switch (err) {
             error.NotFound => return,
             else => return err,
         };
         defer self.alloc.free(raw);
         if (raw.len < 24) return error.InvalidMetadataHAEffect;
-        if (self.ha_port) |port| {
+        if (self.hot_standby_port) |port| {
             _ = try metadata_ha.Decoder.init(raw[24..]);
             try port.publishAndLock(raw);
             defer port.unlock();
@@ -6311,26 +6311,26 @@ pub const RaftApplyStore = struct {
             try self.store.sync(true);
             return;
         }
-        const mirror = self.ha_mirror orelse return error.MetadataHAOutboxPending;
+        const mirror = self.hot_standby_mirror orelse return error.MetadataHAOutboxPending;
         _ = try metadata_ha.Decoder.init(raw[24..]);
         const descriptor = try metadata_chunks.Descriptor.fromEffect(raw[24..]);
-        try self.lockHATransition();
+        try self.lockHotStandbyTransition();
         var transition_locked = true;
-        defer if (transition_locked) self.unlockHATransition();
-        const gate = if (self.ha_gate) |value| value.pinned() else null;
+        defer if (transition_locked) self.unlockHotStandbyTransition();
+        const gate = if (self.hot_standby_gate) |value| value.pinned() else null;
         if (gate) |value| try value.check();
         const same_timeline = std.mem.readInt(u64, raw[8..16], .little) == mirror.publisher.identity().timeline_id and std.mem.readInt(u64, raw[16..24], .little) == mirror.publisher.identity().epoch;
         var search_from = std.mem.readInt(u64, raw[0..8], .little);
         var lsn: u64 = 0;
         var index: u32 = 0;
         while (index < descriptor.chunk_count) : (index += 1) {
-            self.unlockHATransition();
+            self.unlockHotStandbyTransition();
             transition_locked = false;
             const offset = @as(usize, index) * metadata_chunks.max_chunk_payload_bytes;
             const end = @min(raw.len - 24, offset + metadata_chunks.max_chunk_payload_bytes);
             const frame = try metadata_chunks.encodeFrame(self.alloc, descriptor, index, raw[24..][offset..end]);
             defer self.alloc.free(frame);
-            try self.lockHATransition();
+            try self.lockHotStandbyTransition();
             transition_locked = true;
             if (gate) |value| try value.check();
             const prior = if (same_timeline) try (try hot_standby_publisher_adapter.runtimePrimary(mirror)).findMatchingRecordFrom(search_from, .metadata_mutation, frame, 0, 0) else null;
@@ -6338,7 +6338,7 @@ pub const RaftApplyStore = struct {
             search_from = lsn +| 1;
         }
         if (mirror.last_lsn) |last| last.store(lsn, .release);
-        self.unlockHATransition();
+        self.unlockHotStandbyTransition();
         transition_locked = false;
         if (mirror.sync_policy.mode != .async) {
             if (mirror.sync_wait_fn) |wait| try wait(mirror.sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.publisher.ptr, lsn, mirror.sync_policy);
@@ -6347,7 +6347,7 @@ pub const RaftApplyStore = struct {
         }
         // A remote acknowledgment can outlive the role generation that
         // appended it. Retain the outbox if that authority changed.
-        try self.lockHATransition();
+        try self.lockHotStandbyTransition();
         transition_locked = true;
         if (gate) |value| try value.check();
         var txn = try self.store.beginWriteTxn();
@@ -6359,15 +6359,15 @@ pub const RaftApplyStore = struct {
         try self.store.sync(true);
     }
 
-    pub fn flushHAOutbox(self: *RaftApplyStore) !void {
+    pub fn flushHotStandbyOutbox(self: *RaftApplyStore) !void {
         self.apply_mutex.lockUncancelable(self.io_impl.io());
         defer self.apply_mutex.unlock(self.io_impl.io());
-        try self.flushHAOutboxLocked();
+        try self.flushHotStandbyOutboxLocked();
     }
 
-    pub fn applyHARecord(self: *RaftApplyStore, record: @import("../../storage/db/replication_record.zig").RecordView) !void {
+    pub fn applyHotStandbyRecord(self: *RaftApplyStore, record: @import("../../storage/db/replication_record.zig").RecordView) !void {
         if (record.payload_codec == .json) return self.applyLegacyCatalogCreate(record);
-        return self.applyHAChunk(record);
+        return self.applyHotStandbyChunk(record);
     }
 
     // Released standalone primaries wrote this JSON envelope before atomic
@@ -6502,7 +6502,7 @@ pub const RaftApplyStore = struct {
         try txn.delete(metadata_pending_key);
     }
 
-    fn applyHAChunk(self: *RaftApplyStore, record: @import("../../storage/db/replication_record.zig").RecordView) !void {
+    fn applyHotStandbyChunk(self: *RaftApplyStore, record: @import("../../storage/db/replication_record.zig").RecordView) !void {
         if (record.kind != .metadata_mutation or record.payload_codec != .binary or record.table_id != 0 or record.shard_id != 0) return error.InvalidMetadataHAEffect;
         const frame = try metadata_chunks.decodeFrame(record.payload);
         const descriptor = frame.descriptor;
@@ -6613,7 +6613,7 @@ pub const RaftApplyStore = struct {
 
     /// Seed caller already holds exclusive mutation barrier and transition
     /// mutex. This method never appends HA or recursively takes those locks.
-    pub fn exportHACheckpoint(self: *RaftApplyStore, io: std.Io, path: []const u8) !metadata_ha.CheckpointArtifact {
+    pub fn exportHotStandbyCheckpoint(self: *RaftApplyStore, io: std.Io, path: []const u8) !metadata_ha.CheckpointArtifact {
         self.apply_mutex.lockUncancelable(io);
         defer self.apply_mutex.unlock(io);
         var txn = try self.store.beginReadTxn();
@@ -6639,7 +6639,7 @@ pub const RaftApplyStore = struct {
     /// Imports only into a fresh, unpublished store. Bounded transactions may
     /// commit during import; the enclosing seed root remains invisible until
     /// its authenticated artifact digest and every owner proof are verified.
-    pub fn importHACheckpoint(self: *RaftApplyStore, io: std.Io, path: []const u8, size_bytes: u64) !void {
+    pub fn importHotStandbyCheckpoint(self: *RaftApplyStore, io: std.Io, path: []const u8, size_bytes: u64) !void {
         if (size_bytes < 8) return error.InvalidMetadataHACheckpoint;
         self.apply_mutex.lockUncancelable(io);
         defer self.apply_mutex.unlock(io);
@@ -6696,7 +6696,7 @@ pub const RaftApplyStore = struct {
         const marker = "\x00\x00__metadata__:standalone_restore_jobs_migrated";
         self.apply_mutex.lockUncancelable(self.io_impl.io());
         defer self.apply_mutex.unlock(self.io_impl.io());
-        if (self.hasHAMirror()) return error.MetadataHAMigrationAfterBinding;
+        if (self.hasHotStandbyMirror()) return error.MetadataHAMigrationAfterBinding;
         var outcome = CommittedApplyOutcome{ .alloc = self.alloc, .collect_transition_deltas = false };
         defer outcome.deinit();
         std.debug.assert(self.active_outcome == null);
@@ -6787,11 +6787,11 @@ pub const RaftApplyStore = struct {
         const io = self.io_impl.io();
         self.apply_mutex.lockUncancelable(io);
         defer self.apply_mutex.unlock(io);
-        try self.flushHAOutboxLocked();
-        try self.lockHATransition();
+        try self.flushHotStandbyOutboxLocked();
+        try self.lockHotStandbyTransition();
         var transition_locked = true;
-        defer if (transition_locked) self.unlockHATransition();
-        try self.checkHA();
+        defer if (transition_locked) self.unlockHotStandbyTransition();
+        try self.checkHotStandby();
         var capture = @import("../../storage/txn_mutation_capture.zig").Capture.init(self.alloc);
         defer capture.deinit();
         var outcome = CommittedApplyOutcome{ .alloc = self.alloc, .collect_transition_deltas = false };
@@ -6802,15 +6802,15 @@ pub const RaftApplyStore = struct {
         var txn = try self.store.beginWriteTxn();
         var committed = false;
         defer if (!committed) txn.abort();
-        if (self.hasHAMirror()) txn.mutation_capture = &capture;
+        if (self.hasHotStandbyMirror()) txn.mutation_capture = &capture;
         try self.applyTransitionCommandTxn(&txn, group_id, command);
         try advanceStandaloneRevision(&txn);
-        try self.stageStandaloneHA(&txn, &capture, group_id);
-        try self.checkHA();
+        try self.stageStandaloneHotStandby(&txn, &capture, group_id);
+        try self.checkHotStandby();
         try self.commitStandaloneTxn(&txn, &outcome, &committed);
-        self.unlockHATransition();
+        self.unlockHotStandbyTransition();
         transition_locked = false;
-        try self.flushHAOutboxLocked();
+        try self.flushHotStandbyOutboxLocked();
     }
 
     pub fn replaceStandaloneCatalog(self: *RaftApplyStore, group_id: u64, expected_revision: u64, tables: []const metadata.TableRecord, ranges: []const metadata.RangeRecord, auxiliary_json: []const u8) !void {
@@ -6823,11 +6823,11 @@ pub const RaftApplyStore = struct {
         const io = self.io_impl.io();
         self.apply_mutex.lockUncancelable(io);
         defer self.apply_mutex.unlock(io);
-        try self.flushHAOutboxLocked();
-        try self.lockHATransition();
+        try self.flushHotStandbyOutboxLocked();
+        try self.lockHotStandbyTransition();
         var transition_locked = true;
-        defer if (transition_locked) self.unlockHATransition();
-        try self.checkHA();
+        defer if (transition_locked) self.unlockHotStandbyTransition();
+        try self.checkHotStandby();
         var capture = @import("../../storage/txn_mutation_capture.zig").Capture.init(self.alloc);
         defer capture.deinit();
         var outcome = CommittedApplyOutcome{ .alloc = self.alloc, .collect_transition_deltas = false };
@@ -6838,7 +6838,7 @@ pub const RaftApplyStore = struct {
         var txn = try self.store.beginWriteTxn();
         var committed = false;
         defer if (!committed) txn.abort();
-        if (self.hasHAMirror()) txn.mutation_capture = &capture;
+        if (self.hasHotStandbyMirror()) txn.mutation_capture = &capture;
         _ = try self.ensureDerivedCatalogIndexesTxn(&txn, group_id);
         const bootstrap = try stagingGet(&txn, standalone_catalog_key) == null;
         const revision = try stagingGet(&txn, standalone_revision_key);
@@ -6985,8 +6985,8 @@ pub const RaftApplyStore = struct {
         if (update.auxiliary_json) |auxiliary| try txn.put(standalone_catalog_key, auxiliary);
         if (bootstrap and update.auxiliary_json == null) return error.InvalidStandaloneCatalog;
         try advanceStandaloneRevision(&txn);
-        try self.stageStandaloneHA(&txn, &capture, group_id);
-        try self.checkHA();
+        try self.stageStandaloneHotStandby(&txn, &capture, group_id);
+        try self.checkHotStandby();
         self.commitStandaloneTxn(&txn, &outcome, &committed) catch |err| {
             // Only this transaction's commit establishes an ambiguous write.
             // A concurrent revision advance or an outbox preflight failure
@@ -6994,9 +6994,9 @@ pub const RaftApplyStore = struct {
             if (committed) return error.MetadataMutationOutcomeUnknown;
             return err;
         };
-        self.unlockHATransition();
+        self.unlockHotStandbyTransition();
         transition_locked = false;
-        self.flushHAOutboxLocked() catch return error.MetadataMutationOutcomeUnknown;
+        self.flushHotStandbyOutboxLocked() catch return error.MetadataMutationOutcomeUnknown;
     }
 
     fn commitStandaloneTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, outcome: *CommittedApplyOutcome, committed: *bool) !void {
@@ -25976,10 +25976,10 @@ test "standalone metadata storage migration survives reopen checkpoint and exact
     defer reopened.freeTables(alloc, records);
     try std.testing.expectEqual(@as(usize, 1), records.len);
     try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(table, records[0]));
-    const artifact = try reopened.exportHACheckpoint(std.testing.io, checkpoint);
+    const artifact = try reopened.exportHotStandbyCheckpoint(std.testing.io, checkpoint);
     var restored = try RaftApplyStore.init(alloc, .{ .root_dir = target });
     defer restored.deinit();
-    try restored.importHACheckpoint(std.testing.io, checkpoint, artifact.size_bytes);
+    try restored.importHotStandbyCheckpoint(std.testing.io, checkpoint, artifact.size_bytes);
     var replacement = table;
     replacement.storage.dense_embeddings = .vector_store;
     replacement.storage_migration = null;
