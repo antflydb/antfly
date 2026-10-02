@@ -370,6 +370,15 @@ pub const Context = struct {
             for (self.binding.order_keys, orders) |key, *order| order.* = .{ .descending = key.descending, .nulls_first = key.nulls_first };
             top_k = try operators.TopK.init(self.alloc, offset + limit + @intFromBool(statement.limit == null), orders, self.limits.retained_bytes);
         }
+        const deferred = try self.arena.alloc(bool, fields.items.len);
+        @memset(deferred, false);
+        if (top_k != null) for (self.binding.scalars.projections, 0..) |optional, index| {
+            if (optional) |*program| deferred[index] = @import("decision_eval.zig").hasExternal(program);
+        };
+        for (self.binding.order_keys) |key| if (key.source == .output) {
+            deferred[key.source.output] = false;
+        };
+        const defer_projection = std.mem.indexOfScalar(bool, deferred, true) != null;
         var rows: std.ArrayList([]const Json) = .empty;
         var null_rows: std.ArrayList([]const bool) = .empty;
         var scanned: usize = 0;
@@ -402,93 +411,102 @@ pub const Context = struct {
             defer page.deinit();
             if (page.rows.len > wanted) return error.InvalidSqlBackendResponse;
             if (page.rows.len > self.limits.scan_rows -| visited) return error.SqlProgramLimitExceeded;
-            const page_cells = try page_arena.allocator().alloc([]const Datum, page.rows.len);
-            for (page.rows, page_cells) |row, *cells| cells.* = try self.binding.scalars.cells(page_arena.allocator(), row);
-            const predicate_values = if (self.binding.scalars.predicate) |*predicate|
-                try @import("decision_eval.zig").evaluateBatch(page_arena.allocator(), self.backend.decision_provider, predicate, page_cells, self.parameters)
-            else
-                null;
-            var selected_cells: std.ArrayList([]const Datum) = .empty;
-            const selected_positions = try page_arena.allocator().alloc(?usize, page.rows.len);
-            @memset(selected_positions, null);
-            var page_scanned = scanned;
-            for (page_cells, 0..) |cells, index| {
-                if (predicate_values) |values| {
-                    if (values[index].sql_null) continue;
-                    if (values[index].value != .bool) return error.SqlTypeMismatch;
-                    if (!values[index].value.bool) continue;
+            var first: usize = 0;
+            while (first < page.rows.len) {
+                var decision_page = std.heap.ArenaAllocator.init(self.alloc);
+                defer decision_page.deinit();
+                const scratch = decision_page.allocator();
+                const chunk_cells = try @import("decision_eval.zig").rowPage(scratch, self.binding.scalars, page.rows[first..], self.limits.page_rows, self.limits.page_bytes);
+                const chunk_rows = page.rows[first..][0..chunk_cells.len];
+                const page_cells = chunk_cells;
+                const predicate_values = if (self.binding.scalars.predicate) |*predicate|
+                    try @import("decision_eval.zig").evaluateBatch(scratch, self.backend.decision_provider, predicate, page_cells, self.parameters)
+                else
+                    null;
+                var selected_cells: std.ArrayList([]const Datum) = .empty;
+                const selected_positions = try scratch.alloc(?usize, chunk_rows.len);
+                @memset(selected_positions, null);
+                var page_scanned = scanned;
+                for (page_cells, 0..) |cells, index| {
+                    if (predicate_values) |values| {
+                        if (values[index].sql_null) continue;
+                        if (values[index].value != .bool) return error.SqlTypeMismatch;
+                        if (!values[index].value.bool) continue;
+                    }
+                    page_scanned += 1;
+                    if (statement.count_all or (top_k == null and page_scanned <= offset)) continue;
+                    if (top_k == null and selected_cells.items.len >= limit - rows.items.len) continue;
+                    selected_positions[index] = selected_cells.items.len;
+                    try selected_cells.append(scratch, cells);
                 }
-                page_scanned += 1;
-                if (statement.count_all or (top_k == null and page_scanned <= offset)) continue;
-                if (top_k == null and selected_cells.items.len >= limit - rows.items.len) continue;
-                selected_positions[index] = selected_cells.items.len;
-                try selected_cells.append(page_arena.allocator(), cells);
-            }
-            const projection_values = try page_arena.allocator().alloc(?[]const Datum, self.binding.scalars.projections.len);
-            for (self.binding.scalars.projections, projection_values) |optional, *values| values.* = if (optional) |*program|
-                try @import("decision_eval.zig").evaluateBatch(page_arena.allocator(), self.backend.decision_provider, program, selected_cells.items, self.parameters)
-            else
-                null;
-            const order_values = try page_arena.allocator().alloc(?[]const Datum, self.binding.scalars.orders.len);
-            for (self.binding.scalars.orders, order_values) |optional, *values| values.* = if (top_k != null and optional != null)
-                try @import("decision_eval.zig").evaluateBatch(page_arena.allocator(), self.backend.decision_provider, &optional.?, selected_cells.items, self.parameters)
-            else
-                null;
-            for (page.rows, 0..) |row, row_index| {
-                try self.checkpoint();
-                visited += 1;
-                if (visited > self.limits.scan_rows) return error.SqlProgramLimitExceeded;
-                if (predicate_values) |values| {
-                    if (values[row_index].sql_null) continue;
-                    if (values[row_index].value != .bool) return error.SqlTypeMismatch;
-                    if (!values[row_index].value.bool) continue;
+                const projection_values = try scratch.alloc(?[]const Datum, self.binding.scalars.projections.len);
+                for (self.binding.scalars.projections, projection_values, 0..) |optional, *values, index| values.* = if (!deferred[index] and optional != null)
+                    try @import("decision_eval.zig").evaluateBatch(scratch, self.backend.decision_provider, &optional.?, selected_cells.items, self.parameters)
+                else
+                    null;
+                const order_values = try scratch.alloc(?[]const Datum, self.binding.scalars.orders.len);
+                for (self.binding.scalars.orders, order_values) |optional, *values| values.* = if (top_k != null and optional != null)
+                    try @import("decision_eval.zig").evaluateBatch(scratch, self.backend.decision_provider, &optional.?, selected_cells.items, self.parameters)
+                else
+                    null;
+                for (chunk_rows, 0..) |row, row_index| {
+                    try self.checkpoint();
+                    visited += 1;
+                    if (visited > self.limits.scan_rows) return error.SqlProgramLimitExceeded;
+                    if (predicate_values) |values| {
+                        if (values[row_index].sql_null) continue;
+                        if (values[row_index].value != .bool) return error.SqlTypeMismatch;
+                        if (!values[row_index].value.bool) continue;
+                    }
+                    scanned += 1;
+                    if (statement.count_all) continue;
+                    if (top_k) |*operator| {
+                        const values = try scratch.alloc(Datum, fields.items.len + if (defer_projection) self.binding.scalars.columns.len else @as(usize, 0));
+                        if (defer_projection) @memcpy(values[fields.items.len..], page_cells[row_index]);
+                        for (fields.items, values[0..fields.items.len], 0..) |field, *projected_value, index| projected_value.* = if (deferred[index]) .{} else if (index < projection_values.len and projection_values[index] != null)
+                            projection_values[index].?[selected_positions[row_index].?]
+                        else blk: {
+                            const cell = try row.cell(field);
+                            break :blk .{ .value = try coerce(scratch, cell.value, columns[index].type), .sql_null = cell.sql_null };
+                        };
+                        const keys = try scratch.alloc(Datum, self.binding.order_keys.len);
+                        for (self.binding.order_keys, keys) |key, *out| out.* = switch (key.source) {
+                            .output => |index| values[index],
+                            .expression => |index| order_values[index].?[selected_positions[row_index].?],
+                            .column => |column| blk: {
+                                const cell = try row.cell(column.path);
+                                break :blk .{ .value = try coerce(scratch, cell.value, column.type), .sql_null = cell.sql_null };
+                            },
+                        };
+                        try operator.add(.{ .values = values, .keys = keys, .ordinal = visited });
+                        continue;
+                    }
+                    if (scanned <= offset) continue;
+                    if (rows.items.len == limit) {
+                        if (statement.limit == null) return error.SqlResultTooLarge;
+                        return .{ .columns = columns, .rows = rows.items, .sql_nulls = null_rows.items, .command_tag = "SELECT" };
+                    }
+                    const cells = try self.arena.alloc(Json, fields.items.len);
+                    const nulls = try self.arena.alloc(bool, fields.items.len);
+                    for (fields.items, columns, cells, nulls, 0..) |field, column, *cell, *is_null, index| {
+                        const program = if (index < self.binding.scalars.projections.len) self.binding.scalars.projections[index] else null;
+                        const input_cell: catalog.Row.Cell = if (program) |expression| blk: {
+                            _ = expression;
+                            const evaluated = projection_values[index].?[selected_positions[row_index].?];
+                            break :blk .{ .value = evaluated.value, .sql_null = evaluated.sql_null };
+                        } else try row.cell(field);
+                        const typed = try coerce(self.arena, input_cell.value, column.type);
+                        is_null.* = input_cell.sql_null;
+                        // SQL bigint results are lossless even in JS SDKs.
+                        cell.* = try self.outputValue(typed);
+                        retained = std.math.add(usize, retained, jsonSize(cell.*)) catch return error.SqlProgramLimitExceeded;
+                        if (retained > self.limits.retained_bytes) return error.SqlProgramLimitExceeded;
+                    }
+                    try rows.append(self.arena, cells);
+                    try null_rows.append(self.arena, nulls);
+                    if (rows.items.len == limit and statement.limit != null) return .{ .columns = columns, .rows = rows.items, .sql_nulls = null_rows.items, .command_tag = "SELECT" };
                 }
-                scanned += 1;
-                if (statement.count_all) continue;
-                if (top_k) |*operator| {
-                    const values = try page_arena.allocator().alloc(Datum, fields.items.len);
-                    for (fields.items, values, 0..) |field, *projected_value, index| projected_value.* = if (index < projection_values.len and projection_values[index] != null)
-                        projection_values[index].?[selected_positions[row_index].?]
-                    else blk: {
-                        const cell = try row.cell(field);
-                        break :blk .{ .value = try coerce(page_arena.allocator(), cell.value, columns[index].type), .sql_null = cell.sql_null };
-                    };
-                    const keys = try page_arena.allocator().alloc(Datum, self.binding.order_keys.len);
-                    for (self.binding.order_keys, keys) |key, *out| out.* = switch (key.source) {
-                        .output => |index| values[index],
-                        .expression => |index| order_values[index].?[selected_positions[row_index].?],
-                        .column => |column| blk: {
-                            const cell = try row.cell(column.path);
-                            break :blk .{ .value = try coerce(page_arena.allocator(), cell.value, column.type), .sql_null = cell.sql_null };
-                        },
-                    };
-                    try operator.add(.{ .values = values, .keys = keys, .ordinal = visited });
-                    continue;
-                }
-                if (scanned <= offset) continue;
-                if (rows.items.len == limit) {
-                    if (statement.limit == null) return error.SqlResultTooLarge;
-                    return .{ .columns = columns, .rows = rows.items, .sql_nulls = null_rows.items, .command_tag = "SELECT" };
-                }
-                const cells = try self.arena.alloc(Json, fields.items.len);
-                const nulls = try self.arena.alloc(bool, fields.items.len);
-                for (fields.items, columns, cells, nulls, 0..) |field, column, *cell, *is_null, index| {
-                    const program = if (index < self.binding.scalars.projections.len) self.binding.scalars.projections[index] else null;
-                    const input_cell: catalog.Row.Cell = if (program) |expression| blk: {
-                        _ = expression;
-                        const evaluated = projection_values[index].?[selected_positions[row_index].?];
-                        break :blk .{ .value = evaluated.value, .sql_null = evaluated.sql_null };
-                    } else try row.cell(field);
-                    const typed = try coerce(self.arena, input_cell.value, column.type);
-                    is_null.* = input_cell.sql_null;
-                    // SQL bigint results are lossless even in JS SDKs.
-                    cell.* = try self.outputValue(typed);
-                    retained = std.math.add(usize, retained, jsonSize(cell.*)) catch return error.SqlProgramLimitExceeded;
-                    if (retained > self.limits.retained_bytes) return error.SqlProgramLimitExceeded;
-                }
-                try rows.append(self.arena, cells);
-                try null_rows.append(self.arena, nulls);
-                if (rows.items.len == limit and statement.limit != null) return .{ .columns = columns, .rows = rows.items, .sql_nulls = null_rows.items, .command_tag = "SELECT" };
+                first += chunk_rows.len;
             }
             const next = page.after orelse break;
             if (!scan_state.retained(self)) return error.SqlStatementSnapshotRequired;
@@ -502,7 +520,43 @@ pub const Context = struct {
             const remaining = ordered.len -| offset;
             if (statement.limit == null and remaining > limit) return error.SqlResultTooLarge;
             for (0..@min(offset, ordered.len)) |index| operator.releaseFinishedRow(index);
-            for (ordered[@min(offset, ordered.len)..][0..@min(remaining, limit)], @min(offset, ordered.len)..) |row, index| {
+            const selected = ordered[@min(offset, ordered.len)..][0..@min(remaining, limit)];
+            if (defer_projection) {
+                var first: usize = 0;
+                while (first < selected.len) {
+                    try self.checkpoint();
+                    var page = std.heap.ArenaAllocator.init(self.alloc);
+                    defer page.deinit();
+                    const scratch = page.allocator();
+                    var inputs: std.ArrayList([]const Datum) = .empty;
+                    var bytes: usize = 0;
+                    for (selected[first..]) |row| {
+                        const input = row.values[fields.items.len..];
+                        try inputs.append(scratch, input);
+                        for (input) |cell| bytes +|= try operators.datumBytes(cell);
+                        if (inputs.items.len >= self.limits.page_rows or bytes >= self.limits.page_bytes) break;
+                    }
+                    const output = try scratch.alloc([]Datum, inputs.items.len);
+                    for (selected[first..][0..inputs.items.len], output) |row, *cells| cells.* = try scratch.dupe(Datum, row.values[0..fields.items.len]);
+                    for (deferred, 0..) |needed, column| if (needed) {
+                        const program = self.binding.scalars.projections[column].?;
+                        const values = try @import("decision_eval.zig").evaluateBatch(scratch, self.backend.decision_provider, &program, inputs.items, self.parameters);
+                        for (output, values) |cells, datum| cells[column] = datum;
+                    };
+                    for (output, first + @min(offset, ordered.len)..) |values, index| {
+                        const cells = try self.arena.alloc(Json, values.len);
+                        const nulls = try self.arena.alloc(bool, values.len);
+                        for (values, cells, nulls) |datum, *cell, *flag| {
+                            cell.* = try self.outputValue(datum.value);
+                            flag.* = datum.sql_null;
+                        }
+                        try rows.append(self.arena, cells);
+                        try null_rows.append(self.arena, nulls);
+                        operator.releaseFinishedRow(index);
+                    }
+                    first += inputs.items.len;
+                }
+            } else for (ordered[@min(offset, ordered.len)..][0..@min(remaining, limit)], @min(offset, ordered.len)..) |row, index| {
                 try self.checkpoint();
                 const cells = try self.arena.alloc(Json, row.values.len);
                 const nulls = try self.arena.alloc(bool, row.values.len);
@@ -2592,4 +2646,60 @@ test "SQL ordinary mutations batch decisions and fail before commit" {
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 7), provider.calls);
     try std.testing.expectEqual(@as(usize, 4), provider.max_batch);
+}
+
+test "SQL decision reads enforce byte pages across projection predicate and aggregate" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT ai_probability(_id,'Refund?','local') FROM things",
+        "SELECT id FROM things WHERE ai_probability(_id,'Refund?','local')>0.8",
+        "SELECT avg(ai_probability(_id,'Refund?','local')) FROM things",
+    }) |sql| {
+        var fixture: TestBackend = .{ .row_count = 8 };
+        var provider: @import("decision_eval.zig").testing.Provider = .{};
+        var backend = fixture.iface();
+        backend.decision_provider = provider.provider();
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, backend, &compiled, &.{}, .{ .page_rows = 4, .page_bytes = 1 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 8), provider.calls);
+        try std.testing.expectEqual(@as(usize, 1), provider.max_batch);
+    }
+}
+
+test "SQL sorted decisions project only selected rows and preserve sort dependencies" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT ai_probability(_id,'Refund?','local') FROM things ORDER BY id+1 LIMIT 2 OFFSET 1",
+        "SELECT ai_probability(_id,'Refund?','local') AS p FROM things ORDER BY p LIMIT 2 OFFSET 1",
+    }, 0..) |sql, index| {
+        var fixture: TestBackend = .{ .row_count = 8 };
+        var provider: @import("decision_eval.zig").testing.Provider = .{};
+        var backend = fixture.iface();
+        backend.decision_provider = provider.provider();
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, backend, &compiled, &.{}, .{ .page_rows = 4 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+        try std.testing.expectEqual(@as(usize, if (index == 0) 2 else 8), provider.calls);
+        try std.testing.expectEqual(@as(usize, if (index == 0) 2 else 4), provider.max_batch);
+    }
+}
+
+fn deferredDecisionAllocationScenario(a: std.mem.Allocator) !void {
+    var fixture: TestBackend = .{ .row_count = 4 };
+    var provider: @import("decision_eval.zig").testing.Provider = .{};
+    var backend = fixture.iface();
+    backend.decision_provider = provider.provider();
+    var compiled = try compiler.compile(a, "SELECT ai_probability(_id,'Refund?','local') FROM things ORDER BY id+1 LIMIT 1", .{});
+    defer compiled.deinit();
+    var result = try execute(a, backend, &compiled, &.{}, .{ .page_rows = 2 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), provider.calls);
+}
+
+test "SQL deferred decision projections unwind every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, deferredDecisionAllocationScenario, .{});
 }

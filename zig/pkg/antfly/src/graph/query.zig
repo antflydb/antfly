@@ -488,6 +488,7 @@ pub const GraphQuery = struct {
     /// Query-wide row limit for canonical MATCH results. Shards may over-fetch
     /// to let the coordinator determine truncation accurately.
     return_limit: u32 = 0,
+    evaluation_output_limit: ?u32 = null,
     aggregates: []const NamedCountAggregate = &.{},
     include_documents: bool = false,
     fields: []const []const u8 = &.{},

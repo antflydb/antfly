@@ -2186,7 +2186,13 @@ fn applyDecisionGraphInputProjection(alloc: std.mem.Allocator, req: *db_mod.type
     const raw = try std.json.parseFromSliceLeaky(std.json.Value, scratch.allocator(), req.evaluation_json, .{});
     const plan = try @import("../functions/expressions.zig").Plan.parse(scratch.allocator(), raw);
     if (plan.graph_query) |name| for (@constCast(req.graph_queries)) |*graph| {
-        if (std.mem.eql(u8, graph.name, name)) graph.query.defer_document_projection = true;
+        if (std.mem.eql(u8, graph.name, name)) {
+            graph.query.defer_document_projection = true;
+            graph.query.evaluation_output_limit = graph.query.return_limit;
+            graph.query.return_limit = plan.candidate_count;
+            graph.query.params.max_results = plan.candidate_count;
+            if (@as(usize, plan.candidate_count) * graph.query.return_aliases.len > public_limits.max_graph_hydrated_bindings) return error.DecisionLimitExceeded;
+        }
     };
 }
 
@@ -5121,7 +5127,7 @@ fn toOpenApiStatefulGraphResultWithFormat(
         return .{ .legacy_graph_search_result = response };
     }
     if (query.match_pattern != null and query.aggregates.len == 0) {
-        const return_limit: usize = @intCast(if (query.return_limit == 0) 100 else query.return_limit);
+        const return_limit: usize = @intCast(query.evaluation_output_limit orelse (if (query.return_limit == 0) 100 else query.return_limit));
         if (graph_result.matches.len > return_limit)
             return error.InvalidRemoteResponse;
         const rows = try toOpenApiGraphRows(

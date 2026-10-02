@@ -472,6 +472,9 @@ pub fn executeGraphQueriesWithSets(
         alloc.free(results);
     }
 
+    var dependency_arena = std.heap.ArenaAllocator.init(alloc);
+    defer dependency_arena.deinit();
+    const dependency_results = try dependency_arena.allocator().alloc(types.GraphSearchResult, graph_queries.len);
     for (sorted_query_indexes, 0..) |query_index, i| {
         results[i] = executor.func(
             executor.ctx,
@@ -502,17 +505,19 @@ pub fn executeGraphQueriesWithSets(
             return err;
         };
         initialized += 1;
+        dependency_results[i] = try results[i].dependencyView(dependency_arena.allocator(), graph_queries[query_index].query.evaluation_output_limit, req.graph_owning_table);
+        const dependency = &dependency_results[i];
         var resolved_doc_set: ?*const doc_set.ResolvedDocSet = null;
         var resolved_doc_set_complete = false;
         // A source-table doc set cannot represent a qualified graph identity.
         // Canonical dependencies resolve directly from the typed graph result;
         // do not manufacture a key-only compatibility set that can reinterpret
         // `other_table/shared` as `source_table/shared`.
-        if (!graphResultHasQualifiedIdentity(results[i]) and executor.resolve_hits_to_doc_set != null) {
+        if (!graphResultHasQualifiedIdentity(dependency.*) and executor.resolve_hits_to_doc_set != null) {
             const resolve = executor.resolve_hits_to_doc_set.?;
-            if (results[i].nodes.len == results[i].total_hits) {
+            if (dependency.nodes.len == dependency.total_hits) {
                 if (executor.resolve_nodes_to_doc_set) |resolve_nodes| {
-                    resolved_sets[i] = try resolve_nodes(executor.ctx, alloc, req, results[i].nodes);
+                    resolved_sets[i] = try resolve_nodes(executor.ctx, alloc, req, dependency.nodes);
                     if (resolved_sets[i]) |*set| {
                         resolved_doc_set = set;
                         resolved_doc_set_complete = true;
@@ -520,20 +525,20 @@ pub fn executeGraphQueriesWithSets(
                 }
             }
             if (resolved_doc_set == null) {
-                resolved_sets[i] = try resolve(executor.ctx, alloc, req, results[i].hits);
+                resolved_sets[i] = try resolve(executor.ctx, alloc, req, dependency.hits);
                 if (resolved_sets[i]) |*set| {
                     resolved_doc_set = set;
-                    resolved_doc_set_complete = @as(u64, results[i].total_hits) <= results[i].hits.len;
+                    resolved_doc_set_complete = @as(u64, dependency.total_hits) <= dependency.hits.len;
                 }
             }
         }
         try available_sets.append(alloc, .{
-            .name = results[i].name,
-            .hits = results[i].hits,
-            .total_hits = results[i].total_hits,
+            .name = dependency.name,
+            .hits = dependency.hits,
+            .total_hits = dependency.total_hits,
             .resolved_doc_set = resolved_doc_set,
             .resolved_doc_set_complete = resolved_doc_set_complete,
-            .graph_result = &results[i],
+            .graph_result = dependency,
         });
     }
 

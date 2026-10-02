@@ -30,10 +30,8 @@ fn addRow(context: anytype, bound: *const binding.Bound, grouped: *operators.Gro
     try grouped.add(values, inputs);
 }
 
-fn addRows(context: anytype, bound: *const binding.Bound, grouped: *operators.Grouped, alloc: std.mem.Allocator, rows: []const catalog.Row) !void {
+fn addRows(context: anytype, bound: *const binding.Bound, grouped: *operators.Grouped, alloc: std.mem.Allocator, cells: []const []const Datum) !void {
     const decision = @import("decision_eval.zig");
-    const cells = try alloc.alloc([]const Datum, rows.len);
-    for (rows, cells) |row, *out| out.* = try bound.input.cells(alloc, row);
     const predicates = if (bound.input.predicate) |*program| try decision.evaluateBatch(alloc, context.backend.decision_provider, program, cells, context.parameters) else null;
     var accepted: std.ArrayList([]const Datum) = .empty;
     for (cells, 0..) |row, i| {
@@ -160,7 +158,15 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
             if (visited + page.rows.len > context.limits.scan_rows) return error.SqlProgramLimitExceeded;
             if (external) {
                 visited += page.rows.len;
-                try addRows(context, bound, grouped, arena.allocator(), page.rows);
+                var first: usize = 0;
+                while (first < page.rows.len) {
+                    var decision_page = std.heap.ArenaAllocator.init(context.alloc);
+                    defer decision_page.deinit();
+                    const scratch = decision_page.allocator();
+                    const cells = try @import("decision_eval.zig").rowPage(scratch, bound.input, page.rows[first..], context.limits.page_rows, context.limits.page_bytes);
+                    try addRows(context, bound, grouped, scratch, cells);
+                    first += cells.len;
+                }
             } else for (page.rows) |row| {
                 try context.checkpoint();
                 visited += 1;

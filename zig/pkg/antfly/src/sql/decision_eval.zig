@@ -250,3 +250,16 @@ test "SQL decisions bind all builtins and validate prepared question parameters 
         }
     }
 }
+
+/// Native cursor pages and inference pages have independent lifetimes.
+pub fn rowPage(a: std.mem.Allocator, bound: @import("bound_scalars.zig").Bound, rows: []const @import("catalog.zig").Row, row_limit: usize, byte_limit: usize) ![]const []const scalar.Datum {
+    var cells: std.ArrayList([]const scalar.Datum) = .empty;
+    var bytes: usize = 0;
+    for (rows) |row| {
+        const values = try bound.cells(a, row);
+        try cells.append(a, values);
+        for (values) |cell| bytes +|= try @import("operators.zig").datumBytes(cell);
+        if (cells.items.len >= row_limit or bytes >= byte_limit) break;
+    }
+    return cells.items;
+}

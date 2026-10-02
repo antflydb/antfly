@@ -9861,7 +9861,14 @@ fn resolveResultRefNodes(
 
     if (std.mem.startsWith(u8, result_ref.ref, "$graph_results.")) {
         const name = result_ref.ref["$graph_results.".len..];
-        for (prior_results) |graph_result| {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        for (prior_results) |original| {
+            var output_limit: ?u32 = null;
+            for (req.graph_queries) |query| if (std.mem.eql(u8, query.name, original.name)) {
+                output_limit = query.query.evaluation_output_limit;
+            };
+            const graph_result = try original.dependencyView(scratch.allocator(), output_limit, source_table);
             if (!std.mem.eql(u8, graph_result.name, name)) continue;
             if (result_ref.binding) |binding| {
                 if (result_ref.limit == 0 and

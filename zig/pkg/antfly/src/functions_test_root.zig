@@ -94,3 +94,38 @@ test "decision functions worker transport fetches hidden inputs independently of
     defer worker.deinit(a);
     try std.testing.expect(!worker.req.include_stored);
 }
+
+test "decision functions graph evaluation separates collection and output windows" {
+    const std = @import("std");
+    const query = @import("api/query_contract.zig");
+    const a = std.testing.allocator;
+    var request = try query.parseQueryRequest(a, null, "docs",
+        \\{"limit":1,"graph_queries":{"customers":{"index":"graph","match":{"anchor":"customer","nodes":{"customer":{}},"edges":[]},"return":{"bindings":["customer"],"include_documents":true,"limit":1}}},"evaluate":{"graph_query":"customers","scope":"matches","max_rows":8,"compute":{"x":{"literal":1}}}}
+    );
+    defer request.deinit(a);
+    try std.testing.expectEqual(@as(u32, 8), request.req.graph_queries[0].query.return_limit);
+    try std.testing.expectEqual(@as(?u32, 1), request.req.graph_queries[0].query.evaluation_output_limit);
+}
+
+test "decision functions graph dependency views keep the original prefix" {
+    const std = @import("std");
+    const types = @import("storage/db/types.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var bindings = [_]types.GraphPatternBinding{
+        .{ .alias = @constCast("customer"), .node = .{ .key = @constCast("first"), .depth = 0, .distance = 0 } },
+        .{ .alias = @constCast("customer"), .node = .{ .key = @constCast("second"), .depth = 0, .distance = 0 } },
+    };
+    var matches = [_]types.GraphPatternMatch{
+        .{ .bindings = bindings[0..1], .path = &.{} },
+        .{ .bindings = bindings[1..2], .path = &.{} },
+    };
+    var hits = [_]types.SearchHit{ .{ .id = @constCast("first") }, .{ .id = @constCast("second") } };
+    const result: types.GraphSearchResult = .{ .name = @constCast("customers"), .matches = &matches, .hits = &hits, .total_hits = 2 };
+    const view = try result.dependencyView(arena.allocator(), 1, "docs");
+    try std.testing.expectEqual(@as(usize, 1), view.matches.len);
+    try std.testing.expectEqual(@as(usize, 1), view.hits.len);
+    try std.testing.expectEqualStrings("first", view.hits[0].id);
+    try std.testing.expect(view.truncated);
+    try std.testing.expectEqual(@as(usize, 2), result.matches.len);
+}

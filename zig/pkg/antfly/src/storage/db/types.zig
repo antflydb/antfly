@@ -2883,6 +2883,27 @@ pub const GraphSearchResult = struct {
     metric_status: []GraphMetricStatus = &.{},
     truncated: bool = false,
 
+    /// Borrowed dependency view: inference collection must not enlarge the
+    /// graph relation seen by subsequent named operations. Only the slice
+    /// containers belong to scratch; never deinit this view as an owned result.
+    pub fn dependencyView(self: GraphSearchResult, scratch: Allocator, limit: ?u32, source_table: []const u8) !GraphSearchResult {
+        const maximum = limit orelse return self;
+        if (self.matches.len <= maximum) return self;
+        var view = self;
+        view.matches = self.matches[0..maximum];
+        view.truncated = true;
+        var hits: std.ArrayList(SearchHit) = .empty;
+        for (self.hits) |hit| {
+            var included = false;
+            for (view.matches) |match| for (match.bindings) |binding| {
+                if (std.mem.eql(u8, hit.id, binding.node.key) and std.mem.eql(u8, hit.source_table orelse source_table, binding.node.table orelse source_table)) included = true;
+            };
+            if (included) try hits.append(scratch, hit);
+        }
+        view.hits = hits.items;
+        return view;
+    }
+
     /// Detach request-scoped retained-state release hooks at the result
     /// ownership boundary. The request budget remains consumptively charged,
     /// while result deinit continues to own and free the allocations.

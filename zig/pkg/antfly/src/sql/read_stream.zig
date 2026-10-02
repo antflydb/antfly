@@ -218,7 +218,7 @@ pub const Stream = struct {
     pub fn open(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, parameters: []const Json, limits: runtime.Limits) !?*Stream {
         if (compiled.statement != .select) return null;
         if (parameters.len != compiled.parameter_count) return error.InvalidSqlParameters;
-        if (limits.page_rows == 0 or limits.page_rows > 4096 or limits.scan_rows == 0 or limits.scan_pages == 0) return error.InvalidSqlLimit;
+        if (limits.page_rows == 0 or limits.page_rows > 4096 or limits.page_bytes == 0 or limits.scan_rows == 0 or limits.scan_pages == 0) return error.InvalidSqlLimit;
         try backend.vtable.checkpoint(backend.ptr);
         const self = try alloc.create(Stream);
         errdefer alloc.destroy(self);
@@ -337,85 +337,91 @@ pub const Stream = struct {
             if (self.pages > self.context.limits.scan_pages) return error.SqlProgramLimitExceeded;
             var page_arena = std.heap.ArenaAllocator.init(self.budget.allocator());
             defer page_arena.deinit();
-            const scratch = page_arena.allocator();
+            const native_scratch = page_arena.allocator();
             const wanted: u32 = @intCast(@min(self.context.limits.page_rows, @min(self.remaining, max_rows - rows.items.len) +| self.skip));
             const cursor = self.cursor orelse return error.InvalidSqlBackendResponse;
-            const page = try cursor.next(cursor.ptr, scratch, wanted);
+            const page = try cursor.next(cursor.ptr, native_scratch, wanted);
             defer page.deinit();
             if (page.rows.len > wanted) return error.InvalidSqlBackendResponse;
             if (self.visited + page.rows.len > self.context.limits.scan_rows) return error.SqlProgramLimitExceeded;
-            const decisions = @import("decision_eval.zig");
-            var external = if (self.context.binding.scalars.predicate) |*p| decisions.hasExternal(p) else false;
-            for (self.context.binding.scalars.projections) |optional| if (optional) |*p| {
-                external = external or decisions.hasExternal(p);
-            };
-            const page_cells = if (external) blk: {
-                const values = try scratch.alloc([]const @import("scalar.zig").Datum, page.rows.len);
-                for (page.rows, values) |row, *value| value.* = try self.context.binding.scalars.cells(scratch, row);
-                break :blk values;
-            } else null;
-            const predicate_values = if (page_cells) |values| if (self.context.binding.scalars.predicate) |*p| try decisions.evaluateBatch(scratch, self.context.backend.decision_provider, p, values, self.context.parameters) else null else null;
-            var selected_cells: std.ArrayList([]const @import("scalar.zig").Datum) = .empty;
-            const positions: []?usize = if (external) try scratch.alloc(?usize, page.rows.len) else @constCast(&.{});
-            if (external) {
-                @memset(positions, null);
-                var skip = self.skip;
-                for (page_cells.?, 0..) |cells, index| {
-                    if (predicate_values) |values| {
-                        if (values[index].sql_null) continue;
-                        if (values[index].value != .bool) return error.SqlTypeMismatch;
-                        if (!values[index].value.bool) continue;
+            var first: usize = 0;
+            while (first < page.rows.len) {
+                var decision_page = std.heap.ArenaAllocator.init(self.budget.allocator());
+                defer decision_page.deinit();
+                const scratch = decision_page.allocator();
+                const chunk_cells = try @import("decision_eval.zig").rowPage(scratch, self.context.binding.scalars, page.rows[first..], self.context.limits.page_rows, self.context.limits.page_bytes);
+                const chunk_rows = page.rows[first..][0..chunk_cells.len];
+                const decisions = @import("decision_eval.zig");
+                var external = if (self.context.binding.scalars.predicate) |*p| decisions.hasExternal(p) else false;
+                for (self.context.binding.scalars.projections) |optional| if (optional) |*p| {
+                    external = external or decisions.hasExternal(p);
+                };
+                const page_cells = if (external) chunk_cells else null;
+                const predicate_values = if (page_cells) |values| if (self.context.binding.scalars.predicate) |*p| try decisions.evaluateBatch(scratch, self.context.backend.decision_provider, p, values, self.context.parameters) else null else null;
+                var selected_cells: std.ArrayList([]const @import("scalar.zig").Datum) = .empty;
+                const positions: []?usize = if (external) try scratch.alloc(?usize, chunk_rows.len) else @constCast(&.{});
+                if (external) {
+                    @memset(positions, null);
+                    var skip = self.skip;
+                    for (page_cells.?, 0..) |cells, index| {
+                        if (predicate_values) |values| {
+                            if (values[index].sql_null) continue;
+                            if (values[index].value != .bool) return error.SqlTypeMismatch;
+                            if (!values[index].value.bool) continue;
+                        }
+                        if (skip > 0) {
+                            skip -= 1;
+                            continue;
+                        }
+                        positions[index] = selected_cells.items.len;
+                        try selected_cells.append(scratch, cells);
                     }
-                    if (skip > 0) {
-                        skip -= 1;
+                }
+                const projection_values = if (external) blk: {
+                    const values = try scratch.alloc(?[]const @import("scalar.zig").Datum, self.context.binding.scalars.projections.len);
+                    for (self.context.binding.scalars.projections, values) |optional, *value| value.* = if (optional) |*p| try decisions.evaluateBatch(scratch, self.context.backend.decision_provider, p, selected_cells.items, self.context.parameters) else null;
+                    break :blk values;
+                } else null;
+                for (chunk_rows, 0..) |row, row_index| {
+                    try self.context.checkpoint();
+                    self.visited += 1;
+                    if (self.visited > self.context.limits.scan_rows) return error.SqlProgramLimitExceeded;
+                    // Reset expression temporaries per row, not once per entire
+                    // result, so filters with large discarded values stay bounded.
+                    _ = eval.reset(.retain_capacity);
+                    const values = if (page_cells) |cells| cells[row_index] else try self.context.binding.scalars.cells(eval.allocator(), row);
+                    if (external) {
+                        if (predicate_values) |predicates| if (predicates[row_index].sql_null or !predicates[row_index].value.bool) continue;
+                    } else if (!try self.context.binding.scalars.matches(eval.allocator(), values, self.context.parameters)) continue;
+                    if (self.skip != 0) {
+                        self.skip -= 1;
                         continue;
                     }
-                    positions[index] = selected_cells.items.len;
-                    try selected_cells.append(scratch, cells);
+                    const projected = if (projection_values) |projections| blk: {
+                        const fields = try eval.allocator().alloc(@import("scalar.zig").Datum, self.fields.len);
+                        for (self.fields, fields, 0..) |field, *cell, index| cell.* = if (index < projections.len and projections[index] != null)
+                            projections[index].?[positions[row_index].?]
+                        else typed: {
+                            const stored = try row.cell(field);
+                            break :typed .{ .value = try describe.coerce(stored.value, self.context.binding.columns[index].type), .sql_null = stored.sql_null };
+                        };
+                        break :blk fields;
+                    } else try self.context.projectValues(eval.allocator(), row, self.fields, values);
+                    const cells = try out.alloc(Json, projected.len);
+                    const nulls = try out.alloc(bool, projected.len);
+                    var output_context = self.context;
+                    output_context.arena = out;
+                    for (projected, cells, nulls) |value, *cell, *is_null| {
+                        cell.* = try output_context.outputValue(value.value);
+                        is_null.* = value.sql_null;
+                    }
+                    try rows.append(out, cells);
+                    try flags.append(out, nulls);
+                    self.remaining -= 1;
+                    self.emitted += 1;
+                    if (self.remaining == 0) break;
                 }
-            }
-            const projection_values = if (external) blk: {
-                const values = try scratch.alloc(?[]const @import("scalar.zig").Datum, self.context.binding.scalars.projections.len);
-                for (self.context.binding.scalars.projections, values) |optional, *value| value.* = if (optional) |*p| try decisions.evaluateBatch(scratch, self.context.backend.decision_provider, p, selected_cells.items, self.context.parameters) else null;
-                break :blk values;
-            } else null;
-            for (page.rows, 0..) |row, row_index| {
-                try self.context.checkpoint();
-                self.visited += 1;
-                if (self.visited > self.context.limits.scan_rows) return error.SqlProgramLimitExceeded;
-                // Reset expression temporaries per row, not once per entire
-                // result, so filters with large discarded values stay bounded.
-                _ = eval.reset(.retain_capacity);
-                const values = if (page_cells) |cells| cells[row_index] else try self.context.binding.scalars.cells(eval.allocator(), row);
-                if (external) {
-                    if (predicate_values) |predicates| if (predicates[row_index].sql_null or !predicates[row_index].value.bool) continue;
-                } else if (!try self.context.binding.scalars.matches(eval.allocator(), values, self.context.parameters)) continue;
-                if (self.skip != 0) {
-                    self.skip -= 1;
-                    continue;
-                }
-                const projected = if (projection_values) |projections| blk: {
-                    const fields = try eval.allocator().alloc(@import("scalar.zig").Datum, self.fields.len);
-                    for (self.fields, fields, 0..) |field, *cell, index| cell.* = if (index < projections.len and projections[index] != null)
-                        projections[index].?[positions[row_index].?]
-                    else typed: {
-                        const stored = try row.cell(field);
-                        break :typed .{ .value = try describe.coerce(stored.value, self.context.binding.columns[index].type), .sql_null = stored.sql_null };
-                    };
-                    break :blk fields;
-                } else try self.context.projectValues(eval.allocator(), row, self.fields, values);
-                const cells = try out.alloc(Json, projected.len);
-                const nulls = try out.alloc(bool, projected.len);
-                var output_context = self.context;
-                output_context.arena = out;
-                for (projected, cells, nulls) |value, *cell, *is_null| {
-                    cell.* = try output_context.outputValue(value.value);
-                    is_null.* = value.sql_null;
-                }
-                try rows.append(out, cells);
-                try flags.append(out, nulls);
-                self.remaining -= 1;
-                self.emitted += 1;
+                first += chunk_rows.len;
                 if (self.remaining == 0) break;
             }
             if (page.after) |after| {
@@ -490,4 +496,24 @@ test "SQL decision streams validate nested specifications before opening reads" 
         try std.testing.expectEqual(@as(usize, 0), fixture.opened);
         try std.testing.expectEqual(@as(usize, 0), mock.calls);
     }
+}
+
+test "SQL decision pull pages honor byte limits without losing cursor rows" {
+    const a = std.testing.allocator;
+    var fixture: Fixture = .{ .count = 8 };
+    var provider: @import("decision_eval.zig").testing.Provider = .{};
+    var backend = fixture.backend();
+    backend.decision_provider = provider.provider();
+    var compiled = try compiler.compile(a, "SELECT ai_probability(CAST(n AS TEXT),'Refund?','local') FROM docs LIMIT 5 OFFSET 1", .{});
+    defer compiled.deinit();
+    const stream = (try Stream.open(a, backend, &compiled, &.{}, .{ .page_rows = 4, .page_bytes = 1 })).?;
+    defer stream.close();
+    var first = try stream.next(3);
+    defer first.deinit();
+    var second = try stream.next(3);
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 3), first.output.rows.len);
+    try std.testing.expectEqual(@as(usize, 2), second.output.rows.len);
+    try std.testing.expectEqual(@as(usize, 5), provider.calls);
+    try std.testing.expectEqual(@as(usize, 1), provider.max_batch);
 }

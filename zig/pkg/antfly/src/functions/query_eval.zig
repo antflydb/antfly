@@ -188,6 +188,9 @@ fn applyGraph(a: std.mem.Allocator, scratch: std.mem.Allocator, req: types.Searc
     const stage_json = try std.json.Stringify.valueAlloc(scratch, stage, .{});
     var stage_req = req;
     stage_req.evaluation_json = stage_json;
+    for (req.graph_queries) |query| if (std.mem.eql(u8, query.name, name)) {
+        if (query.query.evaluation_output_limit) |limit| stage_req.limit = @min(stage_req.limit, limit);
+    };
     try applyBounded(a, stage_req, &relation, meta, options, scratch);
     const matches = try a.alloc(types.GraphPatternMatch, relation.hits.len);
     errdefer a.free(matches);
