@@ -325,6 +325,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     @import("storage.zig").configureLmdb(b, data_consumer_module, lmdb_engine_mod, true);
     data_consumer_module.addImport("antfly_admin_openapi", antfly_imports.admin_openapi);
     data_consumer_module.addImport("antfly_internal_openapi", antfly_imports.internal_openapi);
+    // HA replication test fixtures in data/runtime.zig construct a real
+    // physical DB (not just the ABI owner boundary), which pulls the vector
+    // index engine in directly.
+    data_consumer_module.addImport("antfly_vectorindex", vectorindex_mod);
     const data_implementation_module = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/data_runtime_implementation_test_root.zig"),
         .target = target,
@@ -758,15 +762,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     secret_store_abi_test_step.dependOn(&run_secret_store_abi_tests.step);
     lib_common_secrets_test_step.dependOn(&run_secret_store_abi_tests.step);
 
+    const runtime_io_abi_provider_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/runtime_io_abi_test_provider.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
     const runtime_io_abi_provider = b.addLibrary(.{
         .name = "runtime-io-abi-test-provider",
         .linkage = .static,
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("pkg/antfly/src/runtime_io_abi_test_provider.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
+        .root_module = runtime_io_abi_provider_mod,
     });
     const runtime_io_abi_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/runtime_io_abi_test.zig"),
@@ -784,14 +789,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_runtime_io_abi_tests = b.addRunArtifact(runtime_io_abi_tests);
     b.step("runtime-io-abi-test", "Run executor contracts across independent error domains").dependOn(&run_runtime_io_abi_tests.step);
 
+    const scan_sink_provider_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/runtime_scan_sink_test_provider.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const scan_sink_provider = b.addLibrary(.{
         .name = "runtime-scan-sink-test-provider",
         .linkage = .static,
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("pkg/antfly/src/runtime_scan_sink_test_provider.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+        .root_module = scan_sink_provider_mod,
     });
     const scan_sink_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/runtime_scan_sink_test.zig"),
