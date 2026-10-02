@@ -41,6 +41,31 @@ regressions exercise both graph deletion paths and reopened worker progress.
 Both graph callback regressions and the native clock/replay regression passed
 200/200 fresh-process repetitions with the same bounded process runner.
 
+Fresh review reproduced two additional failures after merging `origin/main`.
+The Lite status fixture opened `native.inspect` while its writer still held the
+store lock. It now checks the format version through the open handle's storage
+status, preserving the actual revision check without conflicting file locks.
+
+The entity-merge helper rewrote provenance edges as direct contributions, so
+producer replay recreated the merged-away target. Rewriting now discovers the
+edge's document owners through its membership range and transfers each
+producer's contender, manifest, count, and TTL lifetime in one primary mutation.
+Existing destination assertions win collisions. Resolver decisions are persisted
+through the existing curation artifact so unchanged-source re-resolution retains
+the survivor. The same commit carries source revisions, durable derived replay,
+native source-clock advancement, and the HA primary-effect outbox. This local
+administrative entry point rejects unpositioned Raft curation.
+
+Regressions cover reopen and unchanged-source re-resolution, producer deletion,
+shared ownership with a distinct topological source, collision precedence, TTL
+preservation, native authority advancement, and hosted-authority rejection.
+The three focused rewrite tests, all 16 graph TTL regressions, and all 35 Lite
+CLI tests pass in Debug with no leaks. The rewrite regressions passed 200/200 fresh processes (600 test executions)
+with zero skips, failures, or leaks using the same bounded process runner.
+An additional unfiltered DB-core run reached test 401 without reporting a
+failure before it was stopped; it is not a complete-suite qualification. Prior
+broad-suite measurements remain scoped to their original revision.
+
 Aggregate test ownership is audited against the original selected union. The
 shared module gates own their contract tests; implementation gates receive
 explicit runtime dependencies and exclude only tests executed by another gate.

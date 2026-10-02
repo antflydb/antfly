@@ -34543,8 +34543,9 @@ pub const DB = struct {
     /// Eager edge rewrite for an entity merge: repoint every inbound edge of
     /// `old_key` (the merged-away entity) at `new_key` (the survivor) in the
     /// given graph index, preserving edge type, weight, and metadata. Already
-    /// materialized provenance mention edges do not follow `merged_into` on their
-    /// own; this brings the graph in line with a merge.
+    /// materialized contributions move with their producer manifests, counts,
+    /// and deadlines. Resolver curation keeps replay on the survivor. This local
+    /// administrative entry point requires native/unscoped owner authority.
     /// Returns the number of edges rewritten.
     pub fn rewriteEntityEdges(
         self: *DB,
@@ -34554,29 +34555,100 @@ pub const DB = struct {
         new_key: []const u8,
     ) !usize {
         if (std.mem.eql(u8, old_key, new_key)) return 0;
-        const inbound = try self.getEdges(alloc, index_name, old_key, "", .in);
+        if (new_key.len == 0) return error.InvalidGraphEdgeArtifact;
+        var policy = try self.local_execution.row_policy_gate.enterRaw();
+        defer policy.release();
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
+        if (self.local_execution.replication_async_batch_mirror != null and self.local_execution.replication_async_effect_mirror == null)
+            return error.HAMirrorUnavailable;
+        try self.executor.failIfUnhealthy();
+        // Read the adjacency only after its durable replay has caught up.
+        try self.runUntilIdle();
+        var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
+        defer snapshot_mutation.release();
+        var graph_publication = self.core.index_manager.beginGraphPrimaryMutation();
+        defer graph_publication.release();
+        try self.lockApplyForPortableRuntime();
+        var apply_held = true;
+        defer if (apply_held) self.core.unlockApply();
+        {
+            var read = try self.core.store.beginProbeTxn();
+            defer read.abort();
+            try self.requireOnlineArtifactCatalogMutableLocked(&read);
+            try self.requireArtifactReconcileUnfenced(&read, null);
+            // This local administrative entry point cannot invent a Raft
+            // position. Hosted owners must order curation through their owner.
+            if (try @import("../source_authority.zig").load(&read)) |authority| {
+                if (authority.kind == .raft) return error.OnlineSourceScopeChanged;
+            }
+        }
+        const entry = self.core.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
+        const inbound = try entry.index.getEdges(alloc, old_key, "", .in);
         defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
         if (inbound.len == 0) return 0;
-
-        var writes = try alloc.alloc(types.GraphEdgeWrite, inbound.len);
-        defer alloc.free(writes);
-        var deletes = try alloc.alloc(types.GraphEdgeDelete, inbound.len);
-        defer alloc.free(deletes);
-        for (inbound, 0..) |edge, i| {
-            deletes[i] = .{ .index_name = index_name, .source = edge.source, .target = old_key, .edge_type = edge.edge_type };
-            writes[i] = .{
-                .index_name = index_name,
-                .source = edge.source,
-                .target = new_key,
-                .edge_type = edge.edge_type,
-                .weight = edge.weight,
-                .created_at = edge.created_at,
-                .updated_at = edge.updated_at,
-                .metadata_json = edge.metadata,
-            };
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const mutation = try prepareEntityGraphRewrite(scratch, self, index_name, inbound, new_key);
+        if (mutation.rewritten == 0) return 0;
+        // The outbox appends using the DB allocator, independently of scratch.
+        var writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty;
+        defer writes.deinit(self.alloc);
+        try writes.appendSlice(self.alloc, mutation.writes.items);
+        {
+            var read = try self.core.store.beginProbeTxn();
+            defer read.abort();
+            const authority_mod = @import("../source_authority.zig");
+            if (try authority_mod.load(&read)) |observed| {
+                var authority = try authority_mod.require(&read, .native, observed.namespace);
+                authority.sequence = std.math.add(u64, authority.sequence, 1) catch return error.OnlineSourceCorrupt;
+                const bytes = authority.encode();
+                try writes.append(self.alloc, .{ .key = authority_mod.key, .value = try scratch.dupe(u8, &bytes) });
+            }
         }
-        try self.batch(.{ .graph_writes = writes, .graph_deletes = deletes, .sync_level = .write });
-        return inbound.len;
+        const sequence = self.core.reserveDerivedAppendSequence();
+        const replay = try encodeChangeRecordPayload(&self.batchContext(), .{
+            .sequence = sequence,
+            .changed_artifact_keys = mutation.changed.items,
+        }, sequence);
+        defer self.alloc.free(replay);
+        var revision_keys: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (revision_keys.items) |key| self.alloc.free(key);
+            revision_keys.deinit(self.alloc);
+        }
+        var revision_values: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (revision_values.items) |value| self.alloc.free(value);
+            revision_values.deinit(self.alloc);
+        }
+        try appendArtifactSourceRevisionWritesFromReplay(self.alloc, replay, sequence, &writes, &revision_keys, &revision_values);
+        var context = self.batchContext();
+        var primary_ha = try PrimaryReplicationEffect.prepare(&context, writes.items, mutation.deletes.items, replay);
+        defer primary_ha.deinit(self.alloc);
+        try primary_ha.stage(&context, &writes);
+        var backlog = try self.executor.admitBacklogBytes(@intCast(replay.len));
+        defer backlog.cancel();
+        try policy.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+        try self.core.store.putBatchWithReplay(self.backend_runtime.io(), writes.items, mutation.deletes.items, .{ .sequence = sequence, .payload = replay });
+        self.executor.commitBacklogAdmission(sequence, &backlog);
+        if (shouldAppendSplitDelta(self)) try self.core.appendSplitDelta(currentTimeNs(), writes.items, mutation.deletes.items);
+        graph_publication.release();
+        var gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(&context));
+        defer gates.releaseTransition();
+        gates.append(try primary_ha.appendLocked(&context));
+        self.core.unlockApply();
+        apply_held = false;
+        snapshot_mutation.release();
+        notifyQueryVisibilityTargetAdvanced(self.async_context, sequence);
+        self.executor.notifySequence(sequence);
+        self.notifyResolverReplayRuntimes(sequence);
+        gates.releaseTransition();
+        try gates.waitForDurabilityAndAuthority(context.replication_write_gate);
+        return mutation.rewritten;
     }
 
     pub fn hasIndex(self: *DB, name: []const u8) bool {
@@ -56149,6 +56221,197 @@ const GraphContenderChange = struct {
 };
 
 const GraphContenderChanges = std.StringHashMapUnmanaged(std.ArrayListUnmanaged(GraphContenderChange));
+
+/// Prepare a source-preserving rewrite from the same apply-fenced primary
+/// snapshot as the inbound adjacency. Caller commits all rows with one replay.
+fn prepareEntityGraphRewrite(alloc: Allocator, db: *DB, index_name: []const u8, inbound: []const graph_mod.Edge, new_target: []const u8) !struct {
+    writes: std.ArrayListUnmanaged(docstore_mod.KVPair),
+    deletes: std.ArrayListUnmanaged([]const u8),
+    changed: std.ArrayListUnmanaged([]u8),
+    rewritten: usize,
+} {
+    const entry = db.core.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
+    const generation = entry.config.coverage_generation;
+    const Group = struct {
+        doc: []const u8,
+        changes: GraphContenderChanges = .empty,
+        states: std.StringHashMapUnmanaged(void) = .empty,
+    };
+    var groups: std.ArrayListUnmanaged(Group) = .empty;
+    var group_positions: std.StringHashMapUnmanaged(usize) = .empty;
+    var replacements: std.StringHashMapUnmanaged([]const u8) = .empty;
+    var writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty;
+    var deletes: std.ArrayListUnmanaged([]const u8) = .empty;
+    var changed: std.ArrayListUnmanaged([]u8) = .empty;
+    var changed_set: std.StringHashMapUnmanaged(void) = .empty;
+    var write_positions: StoreWritePositions = .empty;
+    var rewritten: usize = 0;
+    for (inbound) |edge| {
+        var moved = false;
+        var owners = try entry.index.edgeOwnersAlloc(alloc, edge.source, edge.edge_type, edge.target);
+        if (owners.len == 0) owners = try alloc.dupe([]u8, &.{try alloc.dupe(u8, edge.source)});
+        for (owners) |owner| {
+            const gop = try group_positions.getOrPut(alloc, owner);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = groups.items.len;
+                try groups.append(alloc, .{ .doc = owner });
+            }
+            const group = &groups.items[gop.value_ptr.*];
+            const old_key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, owner, index_name, edge.edge_type, edge.target, edge.source);
+            const new_key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, owner, index_name, edge.edge_type, new_target, edge.source);
+            try replacements.put(alloc, old_key, new_key);
+            const prefix = try internal_keys.graphGlobalEdgeContenderEdgePrefixAlloc(alloc, index_name, generation, old_key);
+            const contenders = try db.core.store.scanPrefix(alloc, prefix);
+            if (contenders.len == 0) {
+                // Source-free direct graphs have no contender sidecars yet.
+                // Preserve their complete primary payload, including TTL.
+                const payload = db.core.store.get(alloc, old_key) catch |err| switch (err) {
+                    error.NotFound => continue,
+                    else => return err,
+                };
+                moved = true;
+                if (entry.artifact_sources.len == 0) {
+                    const canonical = db.core.store.get(alloc, new_key) catch |err| switch (err) {
+                        error.NotFound => payload,
+                        else => return err,
+                    };
+                    try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, new_key, canonical);
+                    try deletes.append(alloc, old_key);
+                    try appendUniqueOwnedKeyIndexed(alloc, &changed, &changed_set, old_key);
+                    try appendUniqueOwnedKeyIndexed(alloc, &changed, &changed_set, new_key);
+                    var owned_keys: std.ArrayListUnmanaged([]u8) = .empty;
+                    var owned_values: std.ArrayListUnmanaged([]u8) = .empty;
+                    try appendDirectGraphTtlDueWrite(alloc, db.core.index_manager, .{ .key = new_key, .value = canonical }, &writes, &owned_keys, &owned_values);
+                    continue;
+                }
+                const state = try internal_keys.graphDirectStateKeyAlloc(alloc, owner, index_name);
+                try appendGraphContenderChange(alloc, &group.changes, old_key, state, @intCast(graph_mod.direct_source_priority), null);
+                try appendGraphContenderChange(alloc, &group.changes, new_key, state, @intCast(graph_mod.direct_source_priority), payload);
+            }
+            if (contenders.len != 0) moved = true;
+            for (contenders) |row| {
+                const view = (try graph_edge_contender.decode(row.value, generation)) orelse return error.InvalidGraphEdgeContender;
+                const expected = try internal_keys.graphGlobalEdgeContenderKeyAlloc(alloc, index_name, generation, old_key, view.source_priority, view.state_key);
+                if (!std.mem.eql(u8, row.key, expected)) return error.InvalidGraphEdgeContender;
+                const destination = try internal_keys.graphGlobalEdgeContenderKeyAlloc(alloc, index_name, generation, new_key, view.source_priority, view.state_key);
+                const existing = db.core.store.get(alloc, destination) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                // An already canonical assertion by the same producer wins a
+                // collision. Moving another assertion must not overwrite it.
+                const payload = if (existing) |raw| blk: {
+                    const canonical = (try graph_edge_contender.decode(raw, generation)) orelse return error.InvalidGraphEdgeContender;
+                    if (!std.mem.eql(u8, canonical.edge_key, new_key) or !std.mem.eql(u8, canonical.state_key, view.state_key) or canonical.source_priority != view.source_priority)
+                        return error.InvalidGraphEdgeContender;
+                    break :blk canonical.payload;
+                } else view.payload;
+                try appendGraphContenderChange(alloc, &group.changes, old_key, view.state_key, view.source_priority, null);
+                try appendGraphContenderChange(alloc, &group.changes, new_key, view.state_key, view.source_priority, payload);
+                if (view.source_priority != graph_mod.direct_source_priority and internal_keys.isGraphAssetStateRootKey(view.state_key)) try group.states.put(alloc, view.state_key, {});
+                if (entry.ttl_duration_ns != 0) {
+                    const old_lifetime = try internal_keys.graphEdgeTtlLifetimeKeyAlloc(alloc, old_key, index_name, generation, view.state_key);
+                    const new_lifetime = try internal_keys.graphEdgeTtlLifetimeKeyAlloc(alloc, new_key, index_name, generation, view.state_key);
+                    const lifetime = db.core.store.get(alloc, old_lifetime) catch |err| switch (err) {
+                        error.NotFound => null,
+                        else => return err,
+                    };
+                    if (lifetime) |raw| if (existing == null) try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, new_lifetime, raw);
+                    try deletes.append(alloc, old_lifetime);
+                }
+            }
+            try appendUniqueOwnedKeyIndexed(alloc, &changed, &changed_set, old_key);
+            try appendUniqueOwnedKeyIndexed(alloc, &changed, &changed_set, new_key);
+        }
+        if (moved) rewritten += 1;
+    }
+    for (groups.items) |*group| {
+        if (group.changes.count() == 0) continue;
+        var states = group.states.keyIterator();
+        while (states.next()) |state| {
+            const previous = try loadGraphAssetStateKeysAlloc(alloc, db.core.store, state.*, generation) orelse return error.InvalidGraphAssetState;
+            var keys: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty;
+            var seen: std.StringHashMapUnmanaged(void) = .empty;
+            for (previous) |key| {
+                const replacement = replacements.get(key) orelse key;
+                const pos = try seen.getOrPut(alloc, replacement);
+                if (!pos.found_existing) try keys.append(alloc, .{ .key = replacement, .value = "" });
+            }
+            try appendGraphAssetStateSegmentDeleteKeys(alloc, db.core.store, state.*, &deletes);
+            const manifest = try encodeGraphAssetStateKeysAlloc(alloc, generation, keys.items);
+            try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, state.*, manifest);
+        }
+        const reconciled = try reconcileGraphEdgeContendersWithLifetimePolicy(alloc, db.core.store, group.doc, index_name, generation, entry.ttl_duration_ns, &group.changes, writes.items, deletes.items, true);
+        if (reconciled.visible_count > graph_asset_state.effectiveEdgeLimit(entry.max_edges_per_document)) return error.ResourceLimitExceeded;
+        const affected = try alloc.alloc([]const u8, group.changes.count());
+        var changes = group.changes.keyIterator();
+        var i: usize = 0;
+        while (changes.next()) |key| : (i += 1) affected[i] = key.*;
+        const mutation = try prepareGraphContenderReconcilePage(alloc, affected, &reconciled, &.{}, &.{});
+        for (mutation.writes.items) |write| try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, write.key, try alloc.dupe(u8, write.value));
+        try deletes.appendSlice(alloc, mutation.deletes.items);
+        // Persist resolver decisions at their source, not as a new direct
+        // contributor. Unchanged-source replay and repair keep the survivor;
+        // deleting the producer document still retires its ordinary manifest.
+        for (db.core.index_manager.resolvers.items) |cfg| {
+            var relevant = false;
+            for (entry.artifact_sources) |source| if (std.mem.eql(u8, source.artifact_name, cfg.source_artifact)) {
+                relevant = true;
+                break;
+            };
+            if (!relevant) continue;
+            const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, group.doc, cfg.resolution_artifact);
+            const raw = db.core.store.get(alloc, resolution_key) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+            const entities = if (parsed.value == .object) parsed.value.object.getPtr("entities") orelse continue else continue;
+            if (entities.* != .array) return error.InvalidGraphEdgeArtifact;
+            const override_key = try resolution_runtime_mod.reviewOverrideArtifactKeyAlloc(alloc, group.doc, cfg.source_artifact, cfg.resolution_artifact);
+            var override: ?[]const u8 = db.core.store.get(alloc, override_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            var updated = false;
+            for (entities.array.items) |*entity| {
+                if (entity.* != .object) continue;
+                const ref = entity.object.getPtr("doc_ref") orelse continue;
+                if (ref.* != .object) continue;
+                const target = ref.object.getPtr("key") orelse continue;
+                if (target.* != .string) continue;
+                var matches = false;
+                for (inbound) |edge| if (std.mem.eql(u8, target.string, edge.target)) {
+                    matches = true;
+                    break;
+                };
+                if (!matches) continue;
+                const local_id = jsonStringField(entity.*, "local_id") orelse return error.InvalidGraphEdgeArtifact;
+                override = try resolution_runtime_mod.buildReviewDecisionBytesAlloc(alloc, override, local_id, .match, jsonStringField(ref.*, "table") orelse cfg.table, new_target);
+                target.* = .{ .string = new_target };
+                updated = true;
+            }
+            if (!updated) continue;
+            try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, override_key, @constCast(override.?));
+            try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, resolution_key, try std.json.Stringify.valueAlloc(alloc, parsed.value, .{}));
+            const source_key = try internal_keys.artifactNamedPrefixAlloc(alloc, group.doc, "asset", cfg.source_artifact);
+            try appendUniqueOwnedKeyIndexed(alloc, &changed, &changed_set, source_key);
+            try appendUniqueOwnedKeyIndexed(alloc, &changed, &changed_set, resolution_key);
+        }
+    }
+    var owned_due_deletes: std.ArrayListUnmanaged([]u8) = .empty;
+    try appendRetiredDirectGraphTtlDueDeletes(alloc, db.core.store, db.core.index_manager, writes.items, deletes.items, &deletes, &owned_due_deletes);
+    // Store batches apply deletes before puts. Normalize the same view for
+    // reconciliation and replication so a surviving write cannot be deleted.
+    var filtered: std.ArrayListUnmanaged([]const u8) = .empty;
+    var delete_set: std.StringHashMapUnmanaged(void) = .empty;
+    for (deletes.items) |key| {
+        if (write_positions.contains(key)) continue;
+        const pos = try delete_set.getOrPut(alloc, key);
+        if (!pos.found_existing) try filtered.append(alloc, key);
+    }
+    return .{ .writes = writes, .deletes = filtered, .changed = changed, .rewritten = rewritten };
+}
 
 /// Batch-local contender overlay. Reconciliation may touch thousands of
 /// logical edges, so pending writes/deletes must be indexed once rather than
@@ -95635,6 +95898,125 @@ test "db rewriteEntityEdges repoints provenance edges to a merge survivor" {
         try std.testing.expectEqualStrings("doc:a", new_inbound[0].source);
         try std.testing.expectEqualStrings("person/ada_canonical", new_inbound[0].target);
     }
+    // Curation and producer ownership survive reopen and re-resolution of the
+    // unchanged extraction. No higher-priority direct contender is invented.
+    try std.testing.expectEqual(@as(usize, 0), try db.rewriteEntityEdges(alloc, "prov_graph", "person/ada_lovelace", "person/ada_canonical"));
+    db.close();
+    db = try DB.open(alloc, std.mem.span(path), .{});
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"updated\",\"relations\":{\"entities\":[{\"id\":\"e0\",\"label\":\"person\",\"text\":\"Ada Lovelace\"}]}}" }}, .sync_level = .enrichments });
+    try db.runUntilIdle();
+    {
+        const edges = try db.getEdges(alloc, "prov_graph", "person/ada_canonical", "mentions", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+        const old = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, old);
+        try std.testing.expectEqual(@as(usize, 0), old.len);
+        const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "prov_graph", "mentions", "person/ada_canonical");
+        defer alloc.free(key);
+        const prefix = try internal_keys.graphGlobalEdgeContenderEdgePrefixAlloc(alloc, "prov_graph", db.core.index_manager.graphIndex("prov_graph").?.config.coverage_generation, key);
+        defer alloc.free(prefix);
+        const contenders = try db.core.store.scanPrefix(alloc, prefix);
+        defer docstore_mod.DocStore.freeResults(alloc, contenders);
+        try std.testing.expectEqual(@as(usize, 1), contenders.len);
+        const view = (try graph_edge_contender.decode(contenders[0].value, db.core.index_manager.graphIndex("prov_graph").?.config.coverage_generation)).?;
+        try std.testing.expect(view.source_priority != graph_mod.direct_source_priority);
+    }
+    try db.batch(.{ .deletes = &.{"doc:a"}, .sync_level = .enrichments });
+    try db.runUntilIdle();
+    const retired = try db.getEdges(alloc, "prov_graph", "person/ada_canonical", "mentions", .in);
+    defer graph_mod.GraphIndex.freeEdges(alloc, retired);
+    try std.testing.expectEqual(@as(usize, 0), retired.len);
+}
+
+test "db rewriteEntityEdges preserves owners TTL and destination collisions" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |asset| {
+        var directory = try TestDirectory.init("entity-rewrite-collision");
+        defer directory.cleanup();
+        const options: OpenOptions = .{ .online_source_authority = .native, .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 } };
+        var db = try DB.open(alloc, directory.path(), options);
+        defer db.close();
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = if (asset)
+            "{\"ttl\":{\"duration\":\"1h\"},\"source\":{\"artifact\":\"relations\"},\"artifact\":{\"name\":\"relations\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"relations\"},\"content_type\":\"application/json\"}}"
+        else
+            "{\"ttl\":{\"duration\":\"1h\"}}" });
+        if (asset) {
+            try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value =
+                \\{"relations":[{"type":"links","source":"node:a","target":{"document_id":"old"},"weight":1},{"type":"links","source":"node:a","target":{"document_id":"survivor"},"weight":2}]}
+            }}, .sync_level = .enrichments });
+        } else {
+            try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{}" }}, .graph_writes = &.{
+                .{ .index_name = "g", .source = "node:a", .owner = "doc:a", .target = "old", .edge_type = "links", .weight = 1 },
+                .{ .index_name = "g", .source = "node:a", .owner = "doc:a", .target = "survivor", .edge_type = "links", .weight = 2 },
+            }, .sync_level = .full_index });
+        }
+        if (asset) try db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = "{\"relations\":[{\"type\":\"links\",\"source\":\"node:a\",\"target\":{\"document_id\":\"old\"},\"weight\":3}]}" }}, .sync_level = .enrichments });
+        try db.runUntilIdle();
+        const destination = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, "doc:a", "g", "links", "survivor", "node:a");
+        defer alloc.free(destination);
+        const before_raw = try db.core.store.get(alloc, destination);
+        defer alloc.free(before_raw);
+        var before = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, before_raw);
+        defer before.deinit(alloc);
+        try std.testing.expect(before.ttl_created_ns != 0);
+        const before_sequence = blk: {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            break :blk (try @import("../source_authority.zig").load(&read)).?.sequence;
+        };
+        try std.testing.expectEqual(@as(usize, 1), try db.rewriteEntityEdges(alloc, "g", "old", "survivor"));
+        {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqual(before_sequence + 1, (try @import("../source_authority.zig").load(&read)).?.sequence);
+        }
+        try db.runUntilIdle();
+        db.close();
+        db = try DB.open(alloc, directory.path(), options);
+        try db.runUntilIdle();
+        const after_raw = try db.core.store.get(alloc, destination);
+        defer alloc.free(after_raw);
+        var after = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, after_raw);
+        defer after.deinit(alloc);
+        try std.testing.expectEqual(before.ttl_created_ns, after.ttl_created_ns);
+        try std.testing.expectEqual(@as(f64, 2), after.weight);
+        const old = try db.getEdges(alloc, "g", "old", "links", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, old);
+        try std.testing.expectEqual(@as(usize, 0), old.len);
+        const survivor = try db.getEdges(alloc, "g", "survivor", "links", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, survivor);
+        try std.testing.expectEqual(@as(usize, 1), survivor.len);
+        try std.testing.expectEqualStrings("node:a", survivor[0].source);
+        if (asset) {
+            const count_key = try internal_keys.graphEdgeContenderCountKeyAlloc(alloc, "doc:a", "g");
+            defer alloc.free(count_key);
+            const count = try db.core.store.get(alloc, count_key);
+            defer alloc.free(count);
+            try std.testing.expectEqual(@as(?usize, 1), try graph_edge_contender.decodeVisibleCount(count, db.core.index_manager.graphIndex("g").?.config.coverage_generation));
+        }
+        try db.batch(.{ .deletes = &.{"doc:a"}, .sync_level = .enrichments });
+        try db.runUntilIdle();
+        if (asset) {
+            const remaining = try db.getEdges(alloc, "g", "survivor", "links", .in);
+            defer graph_mod.GraphIndex.freeEdges(alloc, remaining);
+            try std.testing.expectEqual(@as(usize, 1), remaining.len);
+            try db.batch(.{ .deletes = &.{"doc:b"}, .sync_level = .enrichments });
+            try db.runUntilIdle();
+        }
+        const retired = try db.getEdges(alloc, "g", "survivor", "links", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, retired);
+        try std.testing.expectEqual(@as(usize, 0), retired.len);
+    }
+}
+
+test "db rewriteEntityEdges rejects unpositioned Raft curation" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("entity-rewrite-raft-fence");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .online_source_authority = .raft, .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 } });
+    defer db.close();
+    try std.testing.expectError(error.OnlineSourceScopeChanged, db.rewriteEntityEdges(alloc, "g", "old", "survivor"));
 }
 
 test "db complete-snapshot scope expands graph traversal through tagged entity nodes" {
