@@ -15,7 +15,7 @@
 //! Private server storage-provider operations, separate from public C exports.
 pub const storage_root = @import("antfly_source_root");
 pub const antfly = @import("../capi_root.zig");
-const handles = @import("handles.zig");
+const handles = @import("antfly_local_sources").capi_handles;
 pub const std = handles.std;
 pub const builtin = handles.builtin;
 pub const local_write = handles.local_write;
@@ -6225,3 +6225,7 @@ pub fn releaseServerContext(context_ptr: *anyopaque) void {
     const context: *StorageOwnerContext = @ptrCast(@alignCast(context_ptr));
     context.release();
 }
+
+pub const test_support = if (@import("builtin").is_test) struct {
+    pub const transactionRecoveryConfig = StorageOwnerTransactionRecovery.serverConfig;
+} else struct {};

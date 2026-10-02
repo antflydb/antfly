@@ -1,11 +1,11 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
 const std = @import("std");
-const ast = @import("ast.zig");
-const catalog = @import("catalog.zig");
-const compiler = @import("compiler.zig");
-const merge_mutation = @import("merge_mutation.zig");
-const runtime = @import("runtime.zig");
+const ast = @import("antfly_local_sources").sql_ast;
+const catalog = @import("antfly_local_sources").sql_catalog;
+const compiler = @import("antfly_local_sources").sql_compiler;
+const merge_mutation = @import("antfly_local_sources").sql_merge_mutation;
+const runtime = @import("antfly_local_sources").sql_runtime;
 
 test "SQL original MERGE corpus admitted plans retain exact source SQL" {
     const Probe = struct {
@@ -47,7 +47,7 @@ test "SQL original MERGE corpus admitted plans retain exact source SQL" {
             return .{ .ptr = self, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
         }
     };
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, @embedFile("fixtures/sql_parity_inventory.json"), .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, @import("antfly_local_sources").sql_parity_fixtures.inventory, .{});
     defer parsed.deinit();
     var probe: Probe = .{};
     var covered: usize = 0;
@@ -150,7 +150,7 @@ test "SQL original cross-table MERGE executes matched and source-only rows atomi
             return .{ .ptr = self, .atomic_statement_read_set = true, .coordinated_point_reads = true, .vtable = &.{ .generate_row_id = generate, .resolve = resolve, .open_statement = open, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
         }
     };
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, @embedFile("fixtures/sql_parity_inventory.json"), .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, @import("antfly_local_sources").sql_parity_fixtures.inventory, .{});
     defer parsed.deinit();
     const sql = for (parsed.value.object.get("entries").?.array.items) |entry| {
         if (std.mem.eql(u8, entry.object.get("id").?.string, "sql-0579")) break entry.object.get("sql").?.string;
@@ -391,7 +391,7 @@ test "SQL MERGE source-preserving candidates exclude target-only rows" {
     try std.testing.expectEqual(@as(i64, 4), mutations[0].row.?.object.get("n").?.integer);
     try std.testing.expectError(error.SqlProgramLimitExceeded, candidates.prepareMutations(alloc, probe.backend(), output.rows, output.sql_nulls.?, parameters, 3, 1));
     for (output.rows, output.sql_nulls.?, 0..) |row, nulls, row_index| {
-        const cells = try alloc.alloc(@import("scalar.zig").Datum, row.len);
+        const cells = try alloc.alloc(@import("antfly_local_sources").sql_scalar.Datum, row.len);
         for (row, nulls, cells) |value, is_null, *cell| cell.* = .{ .value = value, .sql_null = is_null };
         const selected = (try candidates.selectArm(alloc, cells, parameters)).?;
         try std.testing.expectEqual(if (row_index == 0) @as(usize, 2) else @as(usize, 4), selected);
@@ -487,7 +487,7 @@ test "SQL MERGE source-preserving candidates exclude target-only rows" {
         defer per_row.deinit();
         const old_start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
         const old_selections = try per_row.allocator().alloc(?usize, count);
-        const cells = try per_row.allocator().alloc(@import("scalar.zig").Datum, rows[0].len);
+        const cells = try per_row.allocator().alloc(@import("antfly_local_sources").sql_scalar.Datum, rows[0].len);
         for (rows, nulls, old_selections) |row, flags, *selected_arm| {
             for (row, flags, cells) |value, is_null, *cell| cell.* = .{ .value = value, .sql_null = is_null };
             var scratch = std.heap.ArenaAllocator.init(per_row.allocator());

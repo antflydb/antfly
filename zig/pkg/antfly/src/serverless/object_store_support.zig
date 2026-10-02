@@ -13,10 +13,10 @@
 // limitations.
 
 const std = @import("std");
-const object_storage = @import("../storage/object_storage.zig");
+const object_storage = @import("antfly_local_sources").storage_object_storage;
 const bedrock = @import("antfly_inference_bedrock");
 const google_auth = @import("antfly_google").auth;
-const remote_uri = @import("remote_uri.zig");
+const remote_uri = @import("antfly_local_sources").serverless_remote_uri;
 
 const Allocator = std.mem.Allocator;
 const AwsCredentialContext = @import("aws_credential_context.zig").AwsCredentialContext;

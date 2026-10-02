@@ -22,8 +22,8 @@ pub const Owner = struct {
     plan_digest: [32]u8,
     table: tables.TableRecord,
     range: tables.RangeRecord,
-    scope: @import("../storage/db/restore_staging_contract.zig").Scope,
-    empty_generation_handoff: ?@import("../storage/db/restore_staging_contract.zig").EmptyGenerationHandoffExpectation = null,
+    scope: @import("antfly_local_sources").storage_db_restore_staging_contract.Scope,
+    empty_generation_handoff: ?@import("antfly_local_sources").storage_db_restore_staging_contract.EmptyGenerationHandoffExpectation = null,
     cancel_recovery: bool = false,
 };
 pub const InitialOwner = struct {
@@ -57,7 +57,7 @@ pub fn validateInitial(alloc: std.mem.Allocator, public_tables: []const tables.T
         var digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(table.schema_json, &digest, .{});
         if (!std.mem.eql(u8, &digest, &descriptor.public_schema_json_digest)) return error.InvalidGenerationPublication;
-        var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, table.schema_json);
+        var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, table.schema_json);
         defer parsed.deinit(alloc);
         if (parsed.version != descriptor.schema_version or parsed.storage_mode != .relational) return error.InvalidGenerationPublication;
         var compiled = try @import("../metadata/fk_generation_publication.zig").compileCatalog(alloc, parsed, table.table_id, null);
@@ -221,7 +221,7 @@ test "initial FK private owner is exact, unpublished, and supports schema epoch 
     const schema_json = "{\"version\":0,\"storage_mode\":\"relational\"}";
     var schema_digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(schema_json, &schema_digest, .{});
-    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, schema_json);
+    var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
     var compiled = try @import("../metadata/fk_generation_publication.zig").compileCatalog(alloc, parsed, 7, null);
     defer compiled.deinit();

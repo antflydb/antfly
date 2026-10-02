@@ -21,7 +21,7 @@ const abi = @import("kernel_owner_abi");
 const error_identity = @import("kernel_error_identity");
 const contract = @import("../metadata/storage/raft_apply_contract.zig");
 const metadata = @import("../metadata/domain.zig");
-const metadata_incarnation = @import("../metadata/incarnation.zig");
+const metadata_incarnation = @import("antfly_local_sources").metadata_incarnation;
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const metadata_reconciler = @import("../metadata/reconciler.zig");
@@ -29,8 +29,8 @@ const raft_state_machine = @import("../raft/state_machine/mod.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const restore_staging = @import("../metadata/restore_staging.zig");
 const physical_metadata = @import("../metadata/storage/raft_apply_store.zig");
-const sql_settings = @import("../system_catalog/settings.zig");
-const sql_policies = @import("../system_catalog/policies.zig");
+const sql_settings = @import("antfly_local_sources").system_catalog_settings;
+const sql_policies = @import("antfly_local_sources").system_catalog_policies;
 const fk_generation_publication = @import("../metadata/fk_generation_publication.zig");
 const fk_initial_retirement_wire = @import("../metadata/fk_initial_retirement_wire.zig");
 
@@ -224,7 +224,7 @@ pub const RaftApplyStore = struct {
         return try std.json.parseFromSlice(T, alloc, response.slice(), .{ .allocate = .alloc_always });
     }
 
-    pub fn bindHA(self: *RaftApplyStore, gate: ?@import("db/replication_contract.zig").WriteGate, mirror: ?@import("db/replication_contract.zig").AsyncEffectMirror) !void {
+    pub fn bindHA(self: *RaftApplyStore, gate: ?@import("antfly_local_sources").storage_db_replication_contract.WriteGate, mirror: ?@import("antfly_local_sources").storage_db_replication_contract.AsyncEffectMirror) !void {
         const Adapter = @import("metadata_hot_standby_adapter.zig").Adapter;
         const next = try self.alloc.create(Adapter);
         errdefer self.alloc.destroy(next);
@@ -241,8 +241,8 @@ pub const RaftApplyStore = struct {
     pub fn flushHAOutbox(self: *RaftApplyStore) !void {
         _ = try self.projection(bool, .{ .kind = .flush_ha_outbox });
     }
-    pub fn applyHARecord(self: *RaftApplyStore, record: @import("db/replication_record.zig").RecordView) !void {
-        const bytes = try @import("db/replication_record.zig").encodeAlloc(self.alloc, record);
+    pub fn applyHARecord(self: *RaftApplyStore, record: @import("antfly_local_sources").storage_db_replication_record.RecordView) !void {
+        const bytes = try @import("antfly_local_sources").storage_db_replication_record.encodeAlloc(self.alloc, record);
         defer self.alloc.free(bytes);
         _ = try self.projection(bool, .{ .kind = .apply_ha_record, .key = .fromSlice(bytes) });
     }
@@ -258,7 +258,7 @@ pub const RaftApplyStore = struct {
         var encoded: std.Io.Writer.Allocating = .init(self.alloc);
         defer encoded.deinit();
         var stream: std.json.Stringify = .{ .writer = &encoded.writer, .options = .{} };
-        try @import("db/relational_integrity_json.zig").write(rows, &stream);
+        try @import("antfly_local_sources").storage_db_relational_integrity_json.write(rows, &stream);
         _ = try self.projection(bool, .{ .kind = .migrate_standalone_restore_jobs, .key = .fromSlice(encoded.written()) });
     }
 
@@ -268,8 +268,8 @@ pub const RaftApplyStore = struct {
     pub fn getBackupCohortProgress(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, job_id: u64) !?[]u8 {
         return self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .backup_cohort_progress, .group_id = group_id, .arg0 = job_id });
     }
-    pub fn listBackupCohorts(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, after: ?[]const u8, limit: usize) ![]@import("docstore.zig").OwnedKVPair {
-        return self.projectionWithAllocator([]@import("docstore.zig").OwnedKVPair, alloc, .{ .kind = .backup_cohorts, .group_id = group_id, .arg0 = limit, .arg1 = @intFromBool(after != null), .key = .fromSlice(after orelse "") });
+    pub fn listBackupCohorts(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, after: ?[]const u8, limit: usize) ![]@import("antfly_local_sources").storage_docstore.OwnedKVPair {
+        return self.projectionWithAllocator([]@import("antfly_local_sources").storage_docstore.OwnedKVPair, alloc, .{ .kind = .backup_cohorts, .group_id = group_id, .arg0 = limit, .arg1 = @intFromBool(after != null), .key = .fromSlice(after orelse "") });
     }
     pub fn loadRestoreStaging(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, id: restore_staging.Id) !?std.json.Parsed(restore_staging.Job) {
         return self.parsedProjection(restore_staging.Job, alloc, .{ .kind = .restore_staging_job, .group_id = group_id, .key = .fromSlice(&id) });
@@ -325,7 +325,7 @@ pub const RaftApplyStore = struct {
         var encoded: std.Io.Writer.Allocating = .init(self.alloc);
         defer encoded.deinit();
         var stream: std.json.Stringify = .{ .writer = &encoded.writer, .options = .{} };
-        try @import("db/relational_integrity_json.zig").write(update, &stream);
+        try @import("antfly_local_sources").storage_db_relational_integrity_json.write(update, &stream);
         _ = try self.projection(bool, .{ .kind = .replace_standalone_catalog, .group_id = group_id, .arg0 = expected_revision, .key = .fromSlice(encoded.written()) });
     }
 
@@ -979,6 +979,6 @@ fn statusToError(status: abi.Status) !void {
     return error_identity.statusToError(status);
 }
 
-const system_catalog = @import("../system_catalog/domain.zig");
+const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 const store_report_update = @import("../metadata/store_report_update.zig");
-const topology_protocol = @import("../metadata/topology_protocol.zig");
+const topology_protocol = @import("antfly_local_sources").metadata_topology_protocol;

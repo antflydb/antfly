@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Cross-checks the `extern "C"` declarations in `antfly-lite-sys` against
-//! `zig/pkg/antfly/include/antfly.h` *without* linking against libantfly.
+//! `zig/pkg/antfly-embedded/include/antfly.h` *without* linking against libantfly.
 //!
 //! This works purely on source text (via `include_str!`, resolved at compile
 //! time) so that it never references any of the crate's `extern "C"` items --
@@ -24,7 +24,7 @@
 
 const HEADER_SRC: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../../zig/pkg/antfly/include/antfly.h"
+    "/../../../zig/pkg/antfly-embedded/include/antfly.h"
 ));
 const SYS_SRC: &str = include_str!("../src/lib.rs");
 

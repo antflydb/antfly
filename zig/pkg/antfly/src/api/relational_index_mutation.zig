@@ -9,7 +9,7 @@
 const std = @import("std");
 const wire = @import("antfly_schema_openapi");
 const tables = @import("tables.zig");
-const records = @import("../common/topology_records.zig");
+const records = @import("antfly_local_sources").common_topology_records;
 const indexes = @import("indexes.zig");
 
 pub fn isRelational(alloc: std.mem.Allocator, config_json: []const u8) !bool {
@@ -243,7 +243,7 @@ test "relational mutation INCLUDE fields survive unified resource and reject dup
     defer alloc.free(config);
     const created = try create(alloc, table, "covered", config);
     defer @import("../metadata/table_manager.zig").freeTable(alloc, created);
-    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, created.schema_json);
+    var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, created.schema_json);
     defer parsed.deinit(alloc);
     const definition = parsed.relational_indexes.?.value[0];
     try std.testing.expectEqualStrings("label", definition.include_columns.?[0]);
@@ -288,7 +288,7 @@ test "relational mutation expression composite keys use the unified generated co
     defer alloc.free(config);
     const created = try create(alloc, table, "computed", config);
     defer @import("../metadata/table_manager.zig").freeTable(alloc, created);
-    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, created.schema_json);
+    var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, created.schema_json);
     defer parsed.deinit(alloc);
     const definition = parsed.relational_indexes.?.value[0];
     try std.testing.expectEqualStrings("label", definition.keys[0].column.?);
@@ -303,20 +303,20 @@ test "relational mutation expression composite keys use the unified generated co
     const roundtrip = try create(alloc, created, "computed", projected);
     defer @import("../metadata/table_manager.zig").freeTable(alloc, roundtrip);
     try std.testing.expectEqual(try tables.schemaVersion(created.schema_json), try tables.schemaVersion(roundtrip.schema_json));
-    var roundtrip_schema = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, roundtrip.schema_json);
+    var roundtrip_schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, roundtrip.schema_json);
     defer roundtrip_schema.deinit(alloc);
-    const native_schema = @import("../storage/schema.zig");
-    const runtime = try @import("../schema/mod.zig").deriveRuntimeTableSchema(alloc, parsed);
+    const native_schema = @import("antfly_local_sources").storage_schema;
+    const runtime = try @import("antfly_local_sources").schema_mod.deriveRuntimeTableSchema(alloc, parsed);
     defer native_schema.freeSchema(alloc, runtime);
-    var layout = try @import("../storage/db/algebraic/relational_row_codec.zig").PhysicalLayout.init(alloc, runtime);
+    var layout = try @import("antfly_local_sources").storage_db_algebraic_relational_row_codec.PhysicalLayout.init(alloc, runtime);
     defer layout.deinit();
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     const old_keys = (try parsed.relationalIndexDefinitions(scratch.allocator())).?[0].keys;
     const new_keys = (try roundtrip_schema.relationalIndexDefinitions(scratch.allocator())).?[0].keys;
-    var old_plan = try @import("../storage/db/relational_index_keys.zig").TuplePlan.init(alloc, runtime, &layout, old_keys);
+    var old_plan = try @import("antfly_local_sources").storage_db_relational_index_keys.TuplePlan.init(alloc, runtime, &layout, old_keys);
     defer old_plan.deinit();
-    var new_plan = try @import("../storage/db/relational_index_keys.zig").TuplePlan.init(alloc, runtime, &layout, new_keys);
+    var new_plan = try @import("antfly_local_sources").storage_db_relational_index_keys.TuplePlan.init(alloc, runtime, &layout, new_keys);
     defer new_plan.deinit();
     try std.testing.expectEqualSlices(u8, &old_plan.fingerprint, &new_plan.fingerprint);
     const public = try indexes.encodeCreatedIndexConfig(alloc, "computed",
@@ -352,7 +352,7 @@ test "relational mutation partial predicates round trip unified indexes with typ
     defer alloc.free(config);
     const created = try create(alloc, table, "partial", config);
     defer @import("../metadata/table_manager.zig").freeTable(alloc, created);
-    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, created.schema_json);
+    var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, created.schema_json);
     defer parsed.deinit(alloc);
     const definition = parsed.relational_indexes.?.value[0];
     try std.testing.expectEqual(@as(usize, 2), definition.where.?.len);

@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const api_operation = @import("../api/operation.zig");
+const api_operation = @import("antfly_local_sources").api_operation;
 const raft_reconciler = @import("../raft/reconciler.zig");
 const metadata_reconciler = @import("reconciler.zig");
 const metadata_state = @import("state.zig");
@@ -430,7 +430,7 @@ test "metadata control loop plans placement intents from desired topology and ca
             return try alloc.alloc(raft_reconciler.PlacementIntent, 0);
         }
 
-        pub fn getProjectedReallocationRequest(self: *@This()) !?@import("reallocation_request.zig").ReallocationRequestRecord {
+        pub fn getProjectedReallocationRequest(self: *@This()) !?@import("antfly_local_sources").metadata_reallocation_request.ReallocationRequestRecord {
             if (!self.catalog_locked) return error.CatalogSnapshotNotLocked;
             return null;
         }

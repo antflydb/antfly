@@ -78,7 +78,7 @@ fn collect(b: *std.Build, step: *std.Build.Step, audit: *std.Build.Step.Run, vis
                     }
                 }
             } else {
-                if (!std.mem.endsWith(u8, runner_path, "antfly/src/test_runner.zig")) @panic("unit inventory needs an adapter for this test runner");
+                if (!std.mem.endsWith(u8, runner_path, "antfly-embedded/src/local/test_runner.zig")) @panic("unit inventory needs an adapter for this test runner");
                 // Preserve actual filters on simple runners and linked executables.
                 for (run.argv.items) |value| switch (value) {
                     .bytes => |bytes| list.addArg(bytes),

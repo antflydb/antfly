@@ -17,12 +17,12 @@ const ant_json = @import("antfly-json");
 const abi = @import("kernel_abi.zig");
 const server_mod = @import("http_server.zig");
 const handler_mod = @import("httpx_handler.zig");
-const distributed_txn_contract = @import("distributed_txn_contract.zig");
-const table_reads = @import("table_read_source.zig");
-const table_writes = @import("table_write_source.zig");
+const distributed_txn_contract = @import("antfly_local_sources").api_distributed_txn_contract;
+const table_reads = @import("antfly_local_sources").api_table_read_source;
+const table_writes = @import("antfly_local_sources").api_table_write_source;
 const restore_jobs = @import("restore_jobs.zig");
-const managed_embedder = @import("../inference/managed_embedder.zig");
-const backend_erased = @import("../storage/backend_erased.zig");
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
+const backend_erased = @import("antfly_local_sources").storage_backend_erased;
 const ha_http_operation = @import("../storage/hot_standby/http_operation.zig");
 const httpx = @import("httpx");
 const platform_sync = @import("antfly_platform").sync;
@@ -951,7 +951,7 @@ test "linked API dispatch preserves kernel-owned ingress policy" {
 }
 
 test "API kernel create rejects raw owner runtime without transferred capabilities" {
-    const background = @import("../storage/background_runtime.zig");
+    const background = @import("antfly_local_sources").storage_background_runtime;
     var runtime = try background.BackendRuntimeHandle.init(std.testing.allocator, .{
         .backend = .manual,
         .borrowed_io = .{ .general = std.testing.io },
@@ -1023,7 +1023,7 @@ test "API kernel failed fallible create releases unpublished state" {
         const writes: ?table_writes.TableWriteSource = null;
         var handle: ?*anyopaque = null;
         var request_alloc: ?*const abi.memory_abi.Allocator = null;
-        @import("../test_error_logs.zig").expectErrorLogs(1);
+        @import("antfly_test_error_logs").expectErrorLogs(1);
         const result = create(&.{
             .abi_version = abi.abi_version,
             .owner_alloc = &owner_alloc,
@@ -1085,7 +1085,7 @@ test "API kernel runtime I/O receiver keeps imported unavailable views null" {
 }
 
 test "API kernel create enforces owner I/O capabilities and preserves their lifetime" {
-    const background = @import("../storage/background_runtime.zig");
+    const background = @import("antfly_local_sources").storage_background_runtime;
     var runtime = try background.BackendRuntimeHandle.init(std.testing.allocator, .{
         .backend = .manual,
         .borrowed_io = .{ .general = std.testing.io },

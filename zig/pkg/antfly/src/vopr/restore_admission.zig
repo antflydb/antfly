@@ -5,7 +5,7 @@
 //! replicas using the production generation locks and import-proof validator.
 const std = @import("std");
 const vopr = @import("vopr");
-const lifecycle = @import("../storage/db/generation_lifecycle.zig");
+const lifecycle = @import("antfly_local_sources").storage_db_generation_lifecycle;
 const admission = @import("../storage/restore_admission.zig");
 const Identity = @import("../storage/restore_identity.zig").Identity;
 

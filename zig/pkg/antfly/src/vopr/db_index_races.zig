@@ -11,11 +11,11 @@ const std = @import("std");
 const builtin = @import("builtin");
 const vopr = @import("vopr");
 const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-const db_types = @import("../storage/db/types.zig");
-const embedder_mod = @import("../storage/db/enrichment/embedder.zig");
-const background_runtime = @import("../storage/background_runtime.zig");
-const text_merge_runtime = @import("../storage/db/maintenance/text_merge_runtime.zig");
-const lsm_backend = @import("../storage/lsm_backend/mod.zig");
+const db_types = @import("antfly_local_sources").storage_db_types;
+const embedder_mod = @import("antfly_local_sources").storage_db_enrichment_embedder;
+const background_runtime = @import("antfly_local_sources").storage_background_runtime;
+const text_merge_runtime = @import("antfly_local_sources").storage_db_maintenance_text_merge_runtime;
+const lsm_backend = @import("antfly_local_sources").storage_lsm_backend_mod;
 const VoprTestAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Fixture = struct {

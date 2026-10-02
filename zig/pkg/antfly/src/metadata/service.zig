@@ -19,8 +19,8 @@ const store_report_update = @import("store_report_update.zig");
 const storage_source_options = @import("storage_source_options");
 const control_only_storage_sources = storage_source_options.control_only;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
-const common_group_ids = @import("../common/group_ids.zig");
-const common_secrets = @import("../common/secrets.zig");
+const common_group_ids = @import("antfly_local_sources").common_group_ids;
+const common_secrets = @import("antfly_local_sources").common_secrets;
 const metadata_mod = @import("domain.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const metadata_api = @import("api.zig");
@@ -30,7 +30,7 @@ const metadata_http_client = @import("http_client.zig");
 const raft_engine = @import("raft_engine");
 const metadata_control_loop = @import("control_loop.zig");
 const metadata_reconcile_lease = @import("reconcile_lease.zig");
-const metadata_reallocation_request = @import("reallocation_request.zig");
+const metadata_reallocation_request = @import("antfly_local_sources").metadata_reallocation_request;
 const metadata_runtime_status_protocol = @import("runtime_status_protocol.zig");
 const metadata_reconciler = @import("reconciler.zig");
 const fk_generation_publication = @import("fk_generation_publication.zig");
@@ -40,7 +40,7 @@ const metadata_table_provisioner = @import("table_provisioner.zig");
 const metadata_store_observer = @import("store_observer.zig");
 const metadata_table_manager = @import("table_manager.zig");
 const metadata_table_workflow = @import("table_workflow.zig");
-const metadata_topology_protocol = @import("topology_protocol.zig");
+const metadata_topology_protocol = @import("antfly_local_sources").metadata_topology_protocol;
 const metadata_storage = @import("storage/mod.zig");
 const platform_clock = @import("antfly_platform").clock;
 const process_memory_mod = @import("antfly_platform").process_memory;
@@ -55,18 +55,18 @@ const raft_transition_service = @import("../raft/transition_service.zig");
 const raft_state_machine = @import("../raft/state_machine/mod.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const api_table_catalog = @import("../api/table_catalog.zig");
-const api_operation = @import("../api/operation.zig");
+const api_operation = @import("antfly_local_sources").api_operation;
 const raft_mutation_forwarding = @import("../api/raft_mutation_forwarding.zig");
 const api_table_router = @import("../api/table_router.zig");
 const api_table_writes = @import("antfly_source_root").antfly_sources.table_writes;
-const stored_destination_authorization = @import("../api/stored_destination_authorization.zig");
+const stored_destination_authorization = @import("antfly_local_sources").api_stored_destination_authorization;
 const db_mod = if (control_only_storage_sources)
-    @import("../storage/db/control_root.zig")
+    @import("antfly_local_sources").storage_db_control_root
 else
     @import("antfly_source_root").antfly_sources.selected_db;
-const backend_runtime_mod = @import("../storage/background_runtime.zig");
-const backfill_state_mod = @import("../storage/db/backfill_state.zig");
-const internal_keys = @import("../storage/internal_keys.zig");
+const backend_runtime_mod = @import("antfly_local_sources").storage_background_runtime;
+const backfill_state_mod = @import("antfly_local_sources").storage_db_backfill_state;
+const internal_keys = @import("antfly_local_sources").storage_internal_keys;
 const foreign_mod = @import("../foreign/mod.zig");
 
 const cdc_replication_round_interval_ms: u64 = 1_000;
@@ -2454,14 +2454,14 @@ pub fn compareAndSetOnlineMerge(service: anytype, previous: @import("online_merg
 /// Called after the service has its final address and shared HTTP executor.
 /// The default capability set is false; installing an incomplete bundle fails
 /// closed and ordinary merges continue through their existing driver.
-pub fn installOnlineMergeDriver(service: anytype, executor: @import("../common/http/http_common.zig").RequestExecutor, capabilities: @import("online_merge.zig").Capabilities) !void {
+pub fn installOnlineMergeDriver(service: anytype, executor: @import("antfly_local_sources").common_http_http_common.RequestExecutor, capabilities: @import("online_merge.zig").Capabilities) !void {
     return installOnlineMergeDriverWithAdmission(service, executor, capabilities, true);
 }
 
 /// Disabling new online work must not abandon durable in-flight transitions or
 /// their source fences. Recovery retains the same complete driver; only the
 /// optional ordinary-to-online admission callback is removed.
-pub fn installOnlineMergeDriverWithAdmission(service: anytype, executor: @import("../common/http/http_common.zig").RequestExecutor, capabilities: @import("online_merge.zig").Capabilities, allow_new_admissions: bool) !void {
+pub fn installOnlineMergeDriverWithAdmission(service: anytype, executor: @import("antfly_local_sources").common_http_http_common.RequestExecutor, capabilities: @import("online_merge.zig").Capabilities, allow_new_admissions: bool) !void {
     var runtime = try @import("online_merge_driver.zig").create(service, executor, capabilities);
     errdefer runtime.deinit();
     if (!allow_new_admissions) runtime.driver.admit = null;
@@ -2476,7 +2476,7 @@ pub fn installOnlineMergeDriverWithAdmission(service: anytype, executor: @import
 }
 
 test "metadata transition driver online installs before registration and reattaches replacement" {
-    const http = @import("../common/http/http_common.zig");
+    const http = @import("antfly_local_sources").common_http_http_common;
     const shard = @import("../raft/shard_ops.zig");
     const Stub = struct {
         fn build(_: *anyopaque, _: raft_host.catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {

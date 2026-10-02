@@ -20,17 +20,17 @@ const metadata_service = @import("../metadata/service.zig");
 const metadata = @import("../metadata/api.zig");
 const tables = @import("../metadata/table_manager.zig");
 const stages = @import("../metadata/restore_staging.zig");
-const cohort = @import("../metadata/backup_cohort.zig");
-const db = @import("../storage/db/mod.zig");
-const portable_backup = @import("../storage/portable_backup.zig");
-const native = @import("../storage/db/restore_staging.zig");
+const cohort = @import("antfly_local_sources").metadata_backup_cohort;
+const db = @import("antfly_local_sources").storage_db_mod;
+const portable_backup = @import("antfly_local_sources").storage_portable_backup;
+const native = @import("antfly_local_sources").storage_db_restore_staging;
 const owner_api = @import("restore_owner.zig");
 const catalog_mod = @import("restore_catalog.zig");
-const reads = @import("table_read_source.zig");
-const writes = @import("table_write_source.zig");
+const reads = @import("antfly_local_sources").api_table_read_source;
+const writes = @import("antfly_local_sources").api_table_write_source;
 const distributed = @import("distributed_txn.zig");
-const contract = @import("distributed_txn_contract.zig");
-const operation = @import("operation.zig");
+const contract = @import("antfly_local_sources").api_distributed_txn_contract;
+const operation = @import("antfly_local_sources").api_operation;
 const backups = @import("backups.zig");
 const restore_jobs = @import("restore_jobs.zig");
 const driver = @import("restore_staging_driver.zig");
@@ -45,7 +45,7 @@ const Fixture = struct {
     source: http.StatusSource = undefined,
     non_raft: bool = false,
     owner_count: usize = 3,
-    node_config: ?*const @import("../common/config.zig").Config = null,
+    node_config: ?*const @import("antfly_local_sources").common_config.Config = null,
     dbs: [3]*db.DB = undefined,
     scopes: [3]native.Scope = undefined,
     cache_paths: [3][]const u8 = undefined,
@@ -125,7 +125,7 @@ const Fixture = struct {
         }
         var input = request;
         if (self.non_raft and input.operation == .admission) input.scope.authority = .native;
-        return @import("../storage/db/online_merge_io.zig").executeJson(original, alloc, input, context.cancellation);
+        return @import("antfly_local_sources").storage_db_online_merge_io.executeJson(original, alloc, input, context.cancellation);
     }
     fn destinationIndex(self: *@This(), name: []const u8, scope: ?[32]u8, plan_id: ?[16]u8, group: ?u64) !usize {
         const i = try index(name);
@@ -155,7 +155,7 @@ const Fixture = struct {
             try std.testing.expect(std.meta.eql(donor_marker, try self.donors[i].orderedApplyReceipt()));
             var read = try self.donors[i].core.store.beginReadTxn();
             defer read.abort();
-            try std.testing.expect((try @import("../storage/db/empty_generation_handoff.zig").loadInstallReceipt(&read)) == null);
+            try std.testing.expect((try @import("antfly_local_sources").storage_db_empty_generation_handoff.loadInstallReceipt(&read)) == null);
             self.destination_handoff_writes += 1;
             return {};
         }
@@ -419,7 +419,7 @@ const Fixture = struct {
     fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db.types.ScanOptions, _: read_gate.ReadConsistency) !?reads.ScanResponse {
         return error.UnexpectedCall;
     }
-    fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db.types.SearchRequest, _: read_gate.ReadConsistency) !?@import("query_response.zig").QueryResponse {
+    fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db.types.SearchRequest, _: read_gate.ReadConsistency) !?@import("antfly_local_sources").api_query_response.QueryResponse {
         return error.UnexpectedCall;
     }
     fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db.types.BatchRequest) !?void {
@@ -625,7 +625,7 @@ fn runRewriteWithFailure(comptime Driver: type, invalid_tail: bool, non_raft: bo
                 var read = try donor.core.store.beginReadTxn();
                 defer read.abort();
                 const source_namespace = donor.core.identity_namespace;
-                const summary = try @import("../storage/db/empty_generation_handoff.zig").summaryAlloc(a, &read, source_namespace);
+                const summary = try @import("antfly_local_sources").storage_db_empty_generation_handoff.summaryAlloc(a, &read, source_namespace);
                 if (!summary.namespace.eql(source_namespace) or summary.intent != null or summary.seal != null) return error.TableGenerationChanged;
                 handoff.* = .{
                     .source_group_id = source_range.group_id,
@@ -653,13 +653,13 @@ fn runRewriteWithFailure(comptime Driver: type, invalid_tail: bool, non_raft: bo
     if (unavailable_authority) for (fixture.donors) |original| {
         var txn = try original.core.store.beginWriteTxn();
         errdefer txn.abort();
-        try txn.delete(@import("../storage/source_authority.zig").key);
+        try txn.delete(@import("antfly_local_sources").storage_source_authority.key);
         try txn.commit();
         try std.testing.expectEqual(.unsupported, (try original.relationalTopologyIdentity()).generation_handoff_receipt_authority);
     };
     const plan_json = try std.json.Stringify.valueAlloc(a, plan, .{});
     const source_operations_before_execution = fixture.source_operations;
-    _ = try server.restore_job_store.start(a, .{ .scope = .cluster, .source_kind = if (empty_generation) .empty_generation else .schema_rewrite, .backup_id = "rewrite", .location = "metadata://rewrite", .connection = "internal", .restore_mode = "overwrite", .idempotency_namespace = "rewrite-worker", .idempotency_key = "one", .table_names = &.{ "parent", "child", "docs" }, .destination_authorization_principal = @import("stored_destination_authorization.zig").auth_disabled_principal, .rewrite_plan_json = if (empty_generation) null else plan_json, .generation_plan_json = if (empty_generation) plan_json else null });
+    _ = try server.restore_job_store.start(a, .{ .scope = .cluster, .source_kind = if (empty_generation) .empty_generation else .schema_rewrite, .backup_id = "rewrite", .location = "metadata://rewrite", .connection = "internal", .restore_mode = "overwrite", .idempotency_namespace = "rewrite-worker", .idempotency_key = "one", .table_names = &.{ "parent", "child", "docs" }, .destination_authorization_principal = @import("antfly_local_sources").api_stored_destination_authorization.auth_disabled_principal, .rewrite_plan_json = if (empty_generation) null else plan_json, .generation_plan_json = if (empty_generation) plan_json else null });
     for (0..600) |_| {
         try Driver.work(&server, job_id);
         const bytes = (try server.restore_job_store.load(a, job_id)).?;
@@ -807,10 +807,10 @@ fn generatedSchema(alloc: std.mem.Allocator, input: []const u8, default_base: []
 /// external FK child; the backup fixture must exercise the same fenced owner
 /// install that a metadata publication drives. The invalid-child variant is
 /// intentionally a malformed source backup for restore validation.
-fn publishSourceChildSchema(alloc: std.mem.Allocator, parent: *db.DB, source: *db.DB, schema_json: []const u8, namespace: @import("../storage/db/doc_identity.zig").Namespace) !void {
-    const public_schema = @import("../schema/mod.zig");
-    const topology = @import("../storage/db/relational_integrity_topology.zig");
-    const catalog = @import("../storage/db/relational_integrity_catalog.zig");
+fn publishSourceChildSchema(alloc: std.mem.Allocator, parent: *db.DB, source: *db.DB, schema_json: []const u8, namespace: @import("antfly_local_sources").storage_db_doc_identity.Namespace) !void {
+    const public_schema = @import("antfly_local_sources").schema_mod;
+    const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology;
+    const catalog = @import("antfly_local_sources").storage_db_relational_integrity_catalog;
     const before_schema = (try source.getSchemaJson(alloc)) orelse return error.MissingSourceSchema;
     defer alloc.free(before_schema);
     const before_catalog = try source.core.store.get(alloc, catalog.key);
@@ -820,7 +820,7 @@ fn publishSourceChildSchema(alloc: std.mem.Allocator, parent: *db.DB, source: *d
     var parsed = try public_schema.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
     const runtime_schema = try public_schema.deriveRuntimeTableSchema(alloc, parsed);
-    defer @import("../storage/schema.zig").freeSchema(alloc, runtime_schema);
+    defer @import("antfly_local_sources").storage_schema.freeSchema(alloc, runtime_schema);
     var prepared = try source.core.prepareSchemaMetadataPublishedChild(runtime_schema, &.{.{ .key = "\x00\x00__metadata__:schema_json", .value = schema_json }});
     defer prepared.deinit();
     const generation = (prepared.integrity_catalog.?.catalog.find(.foreign_key, "parent_fk") orelse return error.IntegrityCatalogChanged).generation;
@@ -853,7 +853,7 @@ fn publishSourceChildSchema(alloc: std.mem.Allocator, parent: *db.DB, source: *d
         .namespace = parent.core.identity_namespace,
         .catalog_digest = parent_identity.catalog_digest,
     };
-    const transition: @import("../storage/db/relational_integrity_generation_admission.zig").Transition = .{
+    const transition: @import("antfly_local_sources").storage_db_relational_integrity_generation_admission.Transition = .{
         .child_table_id = namespace.table_id,
         .child_table_name = "child",
         .constraint_name = "parent_fk",
@@ -877,7 +877,7 @@ fn publishSourceChildSchema(alloc: std.mem.Allocator, parent: *db.DB, source: *d
     {
         var read = try parent.core.store.beginReadTxn();
         defer read.abort();
-        const admission = @import("../storage/db/relational_integrity_generation_admission.zig");
+        const admission = @import("antfly_local_sources").storage_db_relational_integrity_generation_admission;
         const accepted = (try admission.load(&read, transition.child_table_name, transition.constraint_name)) orelse return error.MissingParentGeneration;
         try std.testing.expectEqual(admission.Phase.active, accepted.phase);
         try std.testing.expectEqual(namespace.table_id, accepted.child_table_id);
@@ -971,10 +971,10 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
     var originals: [3]db.DB = undefined;
     var originals_open: usize = 0;
     defer for (originals[0..originals_open]) |*original| original.close();
-    var namespaces: [3]@import("../storage/db/doc_identity.zig").Namespace = undefined;
+    var namespaces: [3]@import("antfly_local_sources").storage_db_doc_identity.Namespace = undefined;
     var schemas: [3][]const u8 = undefined;
     for ([_][]const u8{ "parent", "child", "docs" }, 0..) |_, i| {
-        const namespace: @import("../storage/db/doc_identity.zig").Namespace = .{ .table_id = 10 + i, .shard_id = 20 + i, .range_id = 20 + i };
+        const namespace: @import("antfly_local_sources").storage_db_doc_identity.Namespace = .{ .table_id = 10 + i, .shard_id = 20 + i, .range_id = 20 + i };
         const path = try std.fmt.allocPrint(a, "{s}/source-{d}", .{ root, i });
         originals[i] = try db.DB.open(alloc, path, .{ .backend_runtime = &runtime, .identity_namespace = namespace, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false });
         originals_open += 1;
@@ -1013,7 +1013,7 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
         const namespace = namespaces[i];
         const schema = schemas[i];
         const identity = try original.relationalTopologyIdentity();
-        const fence: @import("../storage/db/relational_integrity_topology.zig").Fence = .{ .transition_id = 700, .attempt = 1, .owner_group_id = namespace.shard_id, .peer_group_id = namespace.shard_id, .admission_epoch = identity.next_epoch, .role = .backup_snapshot, .namespace = namespace, .catalog_digest = identity.catalog_digest };
+        const fence: @import("antfly_local_sources").storage_db_relational_integrity_topology.Fence = .{ .transition_id = 700, .attempt = 1, .owner_group_id = namespace.shard_id, .peer_group_id = namespace.shard_id, .admission_epoch = identity.next_epoch, .role = .backup_snapshot, .namespace = namespace, .catalog_digest = identity.catalog_digest };
         try original.applyRelationalTopologyControl(.{ .fence = fence, .action = .begin }, null);
         const seal = try original.sealBackupCohort("cohort", fence, .none);
         try original.applyRelationalTopologyControl(.{ .fence = fence, .action = .release }, null);

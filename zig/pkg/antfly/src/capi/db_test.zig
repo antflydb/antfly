@@ -13,9 +13,9 @@
 // limitations.
 
 //! Integration coverage for public handles and private server owners.
-const public = @import("db.zig");
+const public = @import("antfly_local_sources").capi_db;
 const server_api = @import("server_owner.zig");
-const shared = @import("handles.zig");
+const shared = @import("antfly_local_sources").capi_handles;
 const antfly = server_api.antfly;
 const storage_root = server_api.storage_root;
 const replication_ingress = server_api.replication_ingress;
@@ -1556,7 +1556,7 @@ test "capi SQL mutations fence exact primary bytes with unchanged TTL and schema
         defer alloc.free(schema);
         try database.setSchemaJson(alloc, schema);
         try database.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":1,\"expires\":\"2090-01-01T00:00:00Z\"}" }} });
-        var adapter = @import("sql.zig").Adapter(antfly){ .db = &database, .table_name = "items" };
+        var adapter = @import("antfly_local_sources").capi_sql.Adapter(antfly){ .db = &database, .table_name = "items" };
         const backend = adapter.backend();
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
@@ -1591,8 +1591,8 @@ test "capi SQL local integrity coordinator enforces unique arbitration and self 
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"parent_fk","child_columns":["parent"],"parent_table":"rows","parent_columns":["id"],"on_delete":"cascade","on_update":"cascade"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
     ;
     try database.setSchemaJson(alloc, schema);
-    var adapter = @import("sql.zig").Adapter(antfly){ .db = &database, .table_name = "rows" };
-    const sql = @import("sql.zig");
+    var adapter = @import("antfly_local_sources").capi_sql.Adapter(antfly){ .db = &database, .table_name = "rows" };
+    const sql = @import("antfly_local_sources").capi_sql;
     for ([_]struct { statement: []const u8, count: u64 }{
         .{ .statement = "INSERT INTO rows (_id,id,parent) VALUES ('p',1,NULL),('c',2,1)", .count = 2 },
         .{ .statement = "INSERT INTO rows (_id,id,parent) VALUES ('skipped',1,NULL) ON CONFLICT (id) DO NOTHING RETURNING id", .count = 0 },
@@ -1647,8 +1647,8 @@ test "capi SQL native expression partial unique claims reject collisions and arb
     try database.setSchemaJson(alloc,
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"email_key","keys":[{"expression":{"op":"lower_ascii","args":[{"op":"column","column":"email"}]},"result_type":"string"}],"where":[{"column":"active","op":"eq","value":true}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"email":{"type":"keyword"},"active":{"type":"boolean"}},"additionalProperties":false}}}}
     );
-    var adapter = @import("sql.zig").Adapter(antfly){ .db = &database, .table_name = "rows" };
-    const sql = @import("sql.zig");
+    var adapter = @import("antfly_local_sources").capi_sql.Adapter(antfly){ .db = &database, .table_name = "rows" };
+    const sql = @import("antfly_local_sources").capi_sql;
     for ([_]struct { statement: []const u8, count: u64 }{
         .{ .statement = "INSERT INTO rows (_id,email,active) VALUES ('a','Alice',TRUE)", .count = 1 },
         .{ .statement = "INSERT INTO rows (_id,email,active) VALUES ('skip','ALICE',TRUE) ON CONFLICT DO NOTHING", .count = 0 },
@@ -1692,8 +1692,8 @@ test "capi SQL local integrity refuses partial ownership instead of inventing co
     try database.setSchemaJson(alloc,
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
     );
-    var adapter = @import("sql.zig").Adapter(antfly){ .db = &database, .table_name = "rows" };
-    const sql = @import("sql.zig");
+    var adapter = @import("antfly_local_sources").capi_sql.Adapter(antfly){ .db = &database, .table_name = "rows" };
+    const sql = @import("antfly_local_sources").capi_sql;
     var compiled = try sql.compiler.compile(alloc, "INSERT INTO rows (_id,id) VALUES ('k',1)", .{});
     defer compiled.deinit();
     try std.testing.expectError(error.UnsupportedSqlExecution, sql.runtime.execute(alloc, adapter.backend(), &compiled, &.{}, .{}));
@@ -2110,7 +2110,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"index_layout\":\"native_index_catalog_pages\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"index_layout\":\"lsm") == null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"index_namespace\":\"__antfly_lite\"") != null);
-    const expected_format_version = try std.fmt.allocPrint(alloc, "\"format_version\":{d}", .{antfly.lite.native.format_version});
+    const expected_format_version = try std.fmt.allocPrint(alloc, "\"format_version\":{d}", .{antfly.lite.native.indexed_format_version});
     defer alloc.free(expected_format_version);
     try std.testing.expect(std.mem.indexOf(u8, status_json, expected_format_version) != null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"page_size\":4096") != null);
@@ -4267,7 +4267,8 @@ test "storage owner runtime status bulk recovery bridge preserves identities cap
     bridge.owner_id = &owner_id;
     bridge.config = .{ .callback_ctx = &capture, .replicated_metadata = 1, .acknowledge_participants_fn = Capture.acknowledge };
     const config = bridge.dbConfig();
-    try std.testing.expect(config.acknowledge_participants_fn != null);
+    try std.testing.expect(config.factory != null);
+    try std.testing.expect(server_api.test_support.transactionRecoveryConfig(&bridge).acknowledge_participants_fn != null);
     try StorageOwnerTransactionRecovery.acknowledgeParticipants(&bridge, @splat(5), "owner", &.{ "first", "second" });
     for ([_]anyerror{ error.UnsupportedOperation, error.UnsupportedRaftBatchProtocolVersion, error.RaftBatchWriteOutcomeUnknown }) |err| {
         capture.result = kernel_error_identity.statusFromError(err);
@@ -4276,7 +4277,7 @@ test "storage owner runtime status bulk recovery bridge preserves identities cap
     try std.testing.expectError(error.InvalidParticipant, StorageOwnerTransactionRecovery.acknowledgeParticipants(&bridge, @splat(5), "owner", &.{}));
     try std.testing.expectEqual(@as(usize, 4), capture.calls);
     bridge.config.acknowledge_participants_fn = null;
-    try std.testing.expect(bridge.dbConfig().acknowledge_participants_fn == null);
+    try std.testing.expect(server_api.test_support.transactionRecoveryConfig(&bridge).acknowledge_participants_fn == null);
 }
 
 // These callbacks are installed only by the private server owner. Public Lite

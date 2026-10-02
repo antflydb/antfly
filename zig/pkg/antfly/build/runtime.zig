@@ -13,15 +13,9 @@
 // limitations.
 
 const std = @import("std");
-const AntflyRootImports = @import("imports.zig").AntflyRootImports;
+const AntflyRootImports = @import("../../../build_support/antfly/imports.zig").AntflyRootImports;
 
-pub const RuntimeArtifactRole = enum {
-    cli,
-    data,
-    inference,
-    metadata,
-    standalone,
-};
+pub const RuntimeArtifactRole = @import("../../../build_support/antfly/runtime_roles.zig").RuntimeArtifactRole;
 
 const runtime_memory = @import("runtime_memory.zig");
 pub const RuntimeLibraryUnit = runtime_memory.RuntimeLibraryUnit;
@@ -122,7 +116,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
     const antfly_main_tests = b.addTest(.{
         .root_module = b.createModule(main_module_options),
         .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -138,8 +132,8 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
 
     var runtime_library_artifacts: [std.meta.fields(RuntimeLibraryUnit).len]?*std.Build.Step.Compile = @splat(null);
     inline for (std.meta.tags(RuntimeLibraryUnit)) |unit| {
-        // The executable, C API, and focused artifacts reuse their owning
-        // runtime units instead of recompiling implementations in each root.
+        // The server executable and focused server artifacts reuse their owning
+        // runtime units. Public embedded products have independent owners.
         const role_mod = b.createModule(.{
             .root_source_file = b.path(b.fmt("pkg/antfly/src/runtime_{s}_root.zig", .{@tagName(unit)})),
             .target = target,
@@ -163,6 +157,15 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             .serverless => role_imports.configureServerless(b, role_mod, link_libc),
         }
         role_imports.storage_boundary.configureProfile(role_mod, unit != .storage_kernel and unit != .enrichment_compute, true, role_imports.boundary_profile);
+        if (unit == .inference) {
+            const native_exports = b.createModule(.{
+                .root_source_file = b.path("pkg/inference/src/host/native_exports.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            production_antfly_imports.configureInference(b, native_exports, link_libc);
+            role_mod.addImport("antfly_inference_native_exports", native_exports);
+        }
         if (unit == .storage_kernel) {
             const capi_options = b.addOptions();
             capi_options.addOption(bool, "linked_storage", true);
@@ -219,25 +222,14 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             role_artifact.link_data_sections = true;
         }
         // Zig's build runner uses these claims to run as many LLVM codegen
-        // steps concurrently as fit in available RAM. The storage archive
-        // is PIC and shared by the executable and C API final links.
-        if (unit == .storage_kernel) {
-            libantfly_link_mod.linkLibrary(role_artifact);
-        }
+        // steps concurrently as fit in available RAM. The server storage
+        // archive owns private operations used by the executable.
         if (strip) {
             var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
             defer visited.deinit();
             setStripRecursively(role_mod, &visited);
         }
     }
-
-    libantfly_link_mod.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.enrichment_compute)].?);
-    // libantfly embeds the standalone inference runtime in-process, the same
-    // as the `antfly` executable (2026-09-17 product decision: Lite hosts
-    // get local inference without a separate runtime). This is why
-    // `link_anchor.zig` no longer traps
-    // `antfly_standalone_inference_get_function_table`.
-    libantfly_link_mod.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.inference)].?);
 
     // Exercise the real production archive boundary for encoded-image reads.
     // The probe resolves only the exported C function table, so it cannot

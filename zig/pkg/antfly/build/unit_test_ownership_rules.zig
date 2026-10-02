@@ -195,7 +195,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         },
     },
     .{
-        .source = "pkg/antfly/src/introducer.zig",
+        .source = "pkg/antfly-embedded/src/local/introducer.zig",
         .artifact = "test",
         .selection = "all",
         .skip = &.{

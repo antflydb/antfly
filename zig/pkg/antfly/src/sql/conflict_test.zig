@@ -1,10 +1,10 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
 const std = @import("std");
-const ast = @import("ast.zig");
-const catalog = @import("catalog.zig");
-const compiler = @import("compiler.zig");
-const runtime = @import("runtime.zig");
+const ast = @import("antfly_local_sources").sql_ast;
+const catalog = @import("antfly_local_sources").sql_catalog;
+const compiler = @import("antfly_local_sources").sql_compiler;
+const runtime = @import("antfly_local_sources").sql_runtime;
 const Allocator = std.mem.Allocator;
 
 const Fixture = struct {
@@ -248,7 +248,7 @@ test "SQL conflict assignment subqueries fail closed before owner-side masked Ap
 }
 
 test "SQL original conflict scalar cases require a deferred owner-side read" {
-    const corpus = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, @embedFile("fixtures/sql_parity_inventory.json"), .{});
+    const corpus = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, @import("antfly_local_sources").sql_parity_fixtures.inventory, .{});
     defer corpus.deinit();
     for ([_][]const u8{ "sql-1411", "sql-1440" }) |id| {
         const sql = for (corpus.value.object.get("entries").?.array.items) |entry| {
@@ -466,7 +466,7 @@ test "SQL conflict binder separates partial arbiter predicates from DO UPDATE fi
     var compiled = try compiler.compile(std.testing.allocator, "INSERT INTO items (n) VALUES (3) ON CONFLICT (n) WHERE n >= 2 DO UPDATE SET n = excluded.n WHERE items.n < 9", .{});
     defer compiled.deinit();
     const table: catalog.Table = .{ .id = 1, .physical_name = "items", .schema_version = 1, .columns = &.{.{ .name = "n", .path = "n", .type = .integer, .nullable = false }} };
-    const bound = try @import("conflict.zig").bind(alloc, backend, table, compiled.statement.insert.table, compiled.statement.insert.conflict.?, &.{}, &.{});
+    const bound = try @import("antfly_local_sources").sql_conflict.bind(alloc, backend, table, compiled.statement.insert.table, compiled.statement.insert.conflict.?, &.{}, &.{});
     try std.testing.expectEqual(@as(usize, 1), bound.arbiter_conditions.len);
     try std.testing.expectEqual(catalog.Condition.Op.gte, bound.arbiter_conditions[0].op);
     try std.testing.expectEqual(@as(i64, 2), bound.arbiter_conditions[0].value.integer);

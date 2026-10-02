@@ -13,11 +13,11 @@
 // limitations.
 
 const std = @import("std");
-const addRuntimeTestFilters = @import("test_support.zig").addRuntimeTestFilters;
-const compileFiltersWithAnchors = @import("test_support.zig").compileFiltersWithAnchors;
-const addFilteredTestRunArtifact = @import("test_support.zig").addFilteredTestRunArtifact;
-const addCuratedTestRunArtifact = @import("test_support.zig").addCuratedTestRunArtifact;
-const selectTestFilters = @import("test_support.zig").selectTestFilters;
+const addRuntimeTestFilters = @import("../../../build_support/antfly/test_support.zig").addRuntimeTestFilters;
+const compileFiltersWithAnchors = @import("../../../build_support/antfly/test_support.zig").compileFiltersWithAnchors;
+const addFilteredTestRunArtifact = @import("../../../build_support/antfly/test_support.zig").addFilteredTestRunArtifact;
+const addCuratedTestRunArtifact = @import("../../../build_support/antfly/test_support.zig").addCuratedTestRunArtifact;
+const selectTestFilters = @import("../../../build_support/antfly/test_support.zig").selectTestFilters;
 
 pub const AddTestsOptions = struct {
     antfly_test_mod: *std.Build.Module,
@@ -33,21 +33,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const direct_vector_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "online direct vector", "online graph snapshot", "retained transaction vector", "api module compiles", "metadata module compiles" },
-        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-online-direct-vector-test", "Run ordered direct vector snapshot, retention, and repair regressions")
         .dependOn(&addFilteredTestRunArtifact(b, direct_vector_tests).step);
     const retirement_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "db cold initial FK retirement", "api module compiles", "metadata module compiles" },
-        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-cold-fk-retirement-test", "Run terminal local publication cancellation durability tests")
         .dependOn(&addFilteredTestRunArtifact(b, retirement_tests).step);
     const ordered_artifact_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "ordered artifact inventory", "storage.db.derived.apply_state", "artifact footprint", "artifact publication upload", "artifact publication compact transport", "db derived coverage snapshot", "db dense target reads atomic outcome and source coverage snapshot", "online admission facts are unbound", "native source admission", "api module compiles", "metadata module compiles", "db lookup includes chunk artifacts", "db search includes chunk artifacts", "db scan includes chunk artifacts", "db lookup does not load chunks", "db lookup loads chunks" },
-        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-ordered-artifact-test", "Run ordered artifact inventory, wire, and durable owner regressions")
         .dependOn(&addFilteredTestRunArtifact(b, ordered_artifact_tests).step);
@@ -59,7 +59,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "db dense shadow activation rejects surplus candidate coverage",
             "db paused dense repair resumes its durable candidate after restart",
         },
-        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-storage-repair-activation-test", "Run bounded index activation, coverage, and candidate-resume regressions")
         .dependOn(&addFilteredTestRunArtifact(b, repair_activation_tests).step);
@@ -536,7 +536,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_test_mod,
         .filters = &lib_db_query_default_filters,
         .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -555,7 +555,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const highlight_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &highlight_filters,
-        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
     });
     const run_highlight_tests = b.addRunArtifact(highlight_tests);
     addRuntimeTestFilters(b, run_highlight_tests, &highlight_filters);
@@ -568,7 +568,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "text late visibility",
         },
         .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -615,7 +615,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "hierarchy stored-value sanitizer always removes the unit fingerprint",
         },
         .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
             .mode = .simple,
         },
     });

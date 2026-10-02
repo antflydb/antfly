@@ -14,12 +14,12 @@
 
 //! Server transaction command validation, participant selection and acknowledgement policy.
 const std = @import("std");
-const db_mod = @import("db/mod.zig");
-const transactions_mod = @import("transactions.zig");
-const local_transaction_contract = @import("../api/local_transaction_contract.zig");
-const local_write = @import("local_write.zig");
+const db_mod = @import("antfly_local_sources").storage_db_mod;
+const transactions_mod = @import("antfly_local_sources").storage_transactions;
+const local_transaction_contract = @import("antfly_local_sources").api_local_transaction_contract;
+const local_write = @import("antfly_local_sources").storage_local_write;
 const validateTableBatchAgainstLocalSchema = local_write.validateTableBatchAgainstLocalSchema;
-const runTestBeforeBatchExecutionHook = @import("../api/local_write_test_hooks.zig").runTestBeforeBatchExecutionHook;
+const runTestBeforeBatchExecutionHook = @import("antfly_local_sources").api_local_write_test_hooks.runTestBeforeBatchExecutionHook;
 const batchWritesAsTransactionWrites = local_write.batchWritesAsTransactionWrites;
 
 pub fn applyStorageKernelReplicatedBatch(
@@ -68,7 +68,7 @@ pub fn applyReplicatedTransactionMutationInternal(
     raft_entry: ?db_mod.RaftAppliedEntryIdentity,
 ) !void {
     const mutation = req.transaction orelse return error.InvalidBatchRequest;
-    try @import("range_protection.zig").validateRequest(req);
+    try @import("antfly_local_sources").storage_range_protection.validateRequest(req);
     if (req.relational_index_maintenance) |command| if (command.owner_group_id != group_id) return error.PreparedGenerationChanged;
     switch (mutation) {
         .begin => |begin| {

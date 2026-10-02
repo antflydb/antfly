@@ -178,7 +178,7 @@ pub fn build(b: *std.Build) void {
         var seen = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
         inspect(artifact.root_module, unit, artifacts.inference.build_info_object, &seen);
         if (unit == .distributed) artifact.root_module.addImport("cache_lite_capabilities", b.createModule(.{
-            .root_source_file = b.path("pkg/antfly/src/storage/lite/capabilities.zig"),
+            .root_source_file = b.path("pkg/antfly-embedded/src/local/storage/lite/capabilities.zig"),
             .target = artifact.root_module.resolved_target,
             .optimize = artifact.root_module.optimize,
             .imports = &.{.{ .name = "antfly_lite_options", .module = artifact.root_module.import_table.get("antfly_lite_options").? }},
@@ -250,6 +250,14 @@ pub fn build(b: *std.Build) void {
         identities.addImports(identity_probe.root_module);
         b.step("cache-identity", "Read enabled backends' actual source identities").dependOn(&b.addRunArtifact(identity_probe).step);
     }
+    // Pointer-keyed step traversal must not change the shared generated source
+    // directory when an input is removed and restored. Stable paths are part
+    // of the cache contract for every runtime archive in this fixture.
+    std.mem.sort(std.Build.Step.WriteFile.File, sources.files.items, {}, struct {
+        fn lessThan(_: void, a: std.Build.Step.WriteFile.File, c: std.Build.Step.WriteFile.File) bool {
+            return std.mem.lessThan(u8, a.sub_path, c.sub_path);
+        }
+    }.lessThan);
 }
 
 fn findSourceModule(module: *std.Build.Module, suffix: []const u8, seen: *std.AutoHashMap(*std.Build.Module, void)) ?*std.Build.Module {

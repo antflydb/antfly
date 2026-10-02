@@ -15,7 +15,7 @@
 const std = @import("std");
 const snapshot_transfer = @import("snapshot_transfer.zig");
 const store_report_update = @import("store_report_update.zig");
-const system_catalog = @import("../system_catalog/domain.zig");
+const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 const ant_json = @import("antfly-json");
 const platform_time = @import("antfly_platform").time;
 const tables_api = @import("../api/tables.zig");
@@ -26,7 +26,7 @@ const metadata_api = @import("api.zig");
 const metadata_reconciler = @import("reconciler.zig");
 const metadata_table_manager = @import("table_manager.zig");
 const metadata_transition_state = @import("transition_state.zig");
-const topology_protocol = @import("topology_protocol.zig");
+const topology_protocol = @import("antfly_local_sources").metadata_topology_protocol;
 const raft_reconciler = @import("../raft/reconciler.zig");
 const raft_routes = @import("../raft/transport/routes.zig");
 const http_common = @import("../raft/transport/http_common.zig");
@@ -1184,7 +1184,7 @@ pub const MetadataHttpClient = struct {
         const raw_incarnation = responseHeader(response, "x-antfly-catalog-metadata-incarnation") orelse return error.MetadataIncarnationUnavailable;
         if (raw_incarnation.len != 32) return error.InvalidMetadataIncarnation;
         const incarnation: metadata_api.MetadataClusterIncarnation = raw_incarnation[0..32].*;
-        if (!@import("incarnation.zig").isValid(incarnation)) return error.InvalidMetadataIncarnation;
+        if (!@import("antfly_local_sources").metadata_incarnation.isValid(incarnation)) return error.InvalidMetadataIncarnation;
         return .{
             .metadata_group_id = std.fmt.parseInt(u64, group, 10) catch return error.MetadataGroupMismatch,
             .metadata_incarnation = incarnation,
@@ -4159,7 +4159,7 @@ fn consumerTests() type {
                     self.create_count += 1;
                 }
 
-                fn createTableWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, request: @import("../api/operation.zig").RequestContext, table_name: []const u8, req: @import("../api/tables.zig").CreateTableRequest) !void {
+                fn createTableWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, request: @import("antfly_local_sources").api_operation.RequestContext, table_name: []const u8, req: @import("../api/tables.zig").CreateTableRequest) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     if (request.deadline_ns != null) self.forwarded_create_deadline_seen = true;
                     try createTable(ptr, alloc, table_name, req);
@@ -4171,7 +4171,7 @@ fn consumerTests() type {
                     self.drop_count += 1;
                 }
 
-                fn dropTableWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, request: @import("../api/operation.zig").RequestContext, table_name: []const u8) !void {
+                fn dropTableWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, request: @import("antfly_local_sources").api_operation.RequestContext, table_name: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     if (request.deadline_ns != null) self.forwarded_drop_deadline_seen = true;
                     try dropTable(ptr, alloc, table_name);

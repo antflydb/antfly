@@ -22,7 +22,7 @@
 
 /**
  * Runs the shared libantfly conformance cases (see
- * zig/pkg/antfly/capi-conformance/README.md) through the public @antfly/lite
+ * zig/pkg/antfly-embedded/capi-conformance/README.md) through the public @antfly/lite
  * API, mirroring go/pkg/lite/conformance_cgo_test.go's semantics exactly so
  * every binding stays behaviorally identical.
  */

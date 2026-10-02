@@ -17,25 +17,25 @@ const builtin = @import("builtin");
 const platform_time = @import("antfly_platform").time;
 const httpx = @import("httpx");
 const lib = @import("antfly_reranking");
-const managed_embedder = @import("../inference/managed_embedder.zig");
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
 const inference_request_context = @import("antfly_inference_execution_context");
-const db_embedder = @import("../storage/db/enrichment/embedder.zig");
+const db_embedder = @import("antfly_local_sources").storage_db_enrichment_embedder;
 const antfly_provider = @import("antfly_inference_local");
 const remote_capabilities = @import("antfly_inference_remote_capabilities");
 const execution_context = @import("antfly_inference_execution_context");
 const runtime_error_abi = @import("antfly_runtime_abi").error_abi;
 const runtime_native_abi = @import("antfly_runtime_abi").native_abi;
 const vertex_provider = @import("antfly_inference_vertex");
-const common_secrets = @import("../common/secrets.zig");
+const common_secrets = @import("antfly_local_sources").common_secrets;
 const request_admission = @import("../common/request_admission.zig");
 const common_cancellation = @import("antfly_cancellation");
-const provider_limits = @import("../common/provider_limits.zig");
-const credential_identity = @import("../common/credential_source_identity.zig");
+const provider_limits = @import("antfly_local_sources").common_provider_limits;
+const credential_identity = @import("antfly_local_sources").common_credential_source_identity;
 const google_auth = @import("antfly_google").auth;
 const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test)
-    @import("../storage/db/template_stub.zig")
+    @import("antfly_local_sources").storage_db_template_stub
 else
-    @import("../template.zig");
+    @import("antfly_local_sources").template;
 
 pub const ContentPart = template_mod.ContentPart;
 

@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Elastic-2.0
 
 const std = @import("std");
-const ast = @import("ast.zig");
-const catalog = @import("catalog.zig");
-const compiler = @import("compiler.zig");
-const runtime = @import("runtime.zig");
+const ast = @import("antfly_local_sources").sql_ast;
+const catalog = @import("antfly_local_sources").sql_catalog;
+const compiler = @import("antfly_local_sources").sql_compiler;
+const runtime = @import("antfly_local_sources").sql_runtime;
 const Json = std.json.Value;
 const Allocator = std.mem.Allocator;
 

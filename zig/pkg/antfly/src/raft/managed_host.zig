@@ -17,7 +17,7 @@ const raft_engine = @import("raft_engine");
 const storage_source_options = @import("storage_source_options");
 const control_only_storage_sources = storage_source_options.control_only;
 const backups_api = @import("../api/backups.zig");
-const common_config = @import("../common/config.zig");
+const common_config = @import("antfly_local_sources").common_config;
 const catalog = @import("storage/catalog.zig");
 const data_storage = @import("../data/storage/mod.zig");
 const data_apply_client = @import("../storage/data_raft_apply_client.zig");
@@ -29,15 +29,15 @@ const metadata_table_provisioner = if (control_only_storage_sources)
     struct {}
 else
     @import("../metadata/table_provisioner.zig");
-const metadata_reallocation_request = @import("../metadata/reallocation_request.zig");
+const metadata_reallocation_request = @import("antfly_local_sources").metadata_reallocation_request;
 const metadata_storage = @import("../metadata/storage/mod.zig");
 const metadata_view = @import("metadata_view.zig");
 const reconciler = @import("reconciler.zig");
 const state_machine = @import("state_machine/mod.zig");
 const storage = @import("storage/mod.zig");
 const backup_restore = @import("storage/backup_restore.zig");
-const background_runtime = @import("../storage/background_runtime.zig");
-const resource_manager = @import("../storage/resource_manager.zig");
+const background_runtime = @import("antfly_local_sources").storage_background_runtime;
+const resource_manager = @import("antfly_local_sources").storage_resource_manager;
 const linked_storage = control_only_storage_sources;
 pub const DataApplyStore = if (linked_storage) data_apply_client.RaftApplyStore else data_storage.RaftApplyStore;
 

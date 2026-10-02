@@ -17,25 +17,25 @@ const ant_json = @import("antfly-json");
 const platform_time = @import("antfly_platform").time;
 const metadata_openapi = @import("antfly_metadata_openapi");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
-const group_ids = @import("../common/group_ids.zig");
+const group_ids = @import("antfly_local_sources").common_group_ids;
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
-const object_storage = @import("../storage/object_storage.zig");
-const remote_uri = @import("../serverless/remote_uri.zig");
+const object_storage = @import("antfly_local_sources").storage_object_storage;
+const remote_uri = @import("antfly_local_sources").serverless_remote_uri;
 const tables_api = @import("tables.zig");
-const common_secrets = @import("../common/secrets.zig");
-const common_config = @import("../common/config.zig");
+const common_secrets = @import("antfly_local_sources").common_secrets;
+const common_config = @import("antfly_local_sources").common_config;
 const bedrock = @import("antfly_inference_bedrock");
 const httpx = @import("httpx");
-const system_catalog = @import("../system_catalog/domain.zig");
+const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 const extension_domain = @import("../extensions/mod.zig");
 const google_auth = @import("antfly_google").auth;
-const backup_contract = @import("backup_contract.zig");
+const backup_contract = @import("antfly_local_sources").api_backup_contract;
 const backup_repository = @import("../storage/backup_repository.zig");
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
-const objectCancellationToken = @import("local_backups.zig").objectCancellationToken;
+const objectCancellationToken = @import("antfly_local_sources").api_local_backups.objectCancellationToken;
 
 pub const BackupRequest = metadata_openapi.BackupRequest;
 pub const RestoreRequest = metadata_openapi.RestoreRequest;
@@ -59,20 +59,20 @@ pub const ClusterRestoreRequest = struct {
     single_table_destination: ?[]const u8 = null,
 };
 
-pub const format_version = @import("local_backups.zig").format_version;
+pub const format_version = @import("antfly_local_sources").api_local_backups.format_version;
 pub const cluster_format_version: u32 = 2;
 pub const table_backup_id = "table";
 pub const antfly_version = "zig-dev";
 pub const max_portable_backup_file_bytes: usize = 1024 * 1024 * 1024;
-pub const max_backup_manifest_bytes = @import("local_backups.zig").max_backup_manifest_bytes;
+pub const max_backup_manifest_bytes = @import("antfly_local_sources").api_local_backups.max_backup_manifest_bytes;
 pub const max_backup_attempt_marker_bytes: usize = 2 * 1024 * 1024;
 pub const max_backup_attempt_cursor_bytes: usize = 8 * 1024;
 const max_backup_attempt_quarantine_bytes: usize = max_backup_attempt_marker_bytes + 2048;
-const max_backup_attempt_lease_bytes = @import("local_backups.zig").max_backup_attempt_lease_bytes;
+const max_backup_attempt_lease_bytes = @import("antfly_local_sources").api_local_backups.max_backup_attempt_lease_bytes;
 // `:` is intentionally outside validateBackupId's public alphabet. Cleanup
 // owners therefore cannot be confused with a caller-supplied attempt ID, while
 // the suffix can still carry the full 128-byte public identity losslessly.
-const backup_cleanup_lease_owner_prefix = @import("local_backups.zig").backup_cleanup_lease_owner_prefix;
+const backup_cleanup_lease_owner_prefix = @import("antfly_local_sources").api_local_backups.backup_cleanup_lease_owner_prefix;
 const legacy_backup_cleanup_lease_owner_prefix = "antfly-cleanup-";
 const backup_attempt_quarantine_prefix = ".antfly-quarantine";
 const cluster_backup_attempt_quarantine_suffix = ".quarantine";
@@ -109,7 +109,7 @@ pub const backup_attempt_request_reclaim_object_budget: usize = 32;
 const backup_cleanup_local_traversal_budget: usize = 512;
 pub const backup_attempt_cleanup_object_budget: usize = 1_000_000;
 pub const backup_attempt_lease_duration_ns: u64 = 5 * std.time.ns_per_min;
-pub const backup_attempt_lease_renew_interval_ns = @import("local_backups.zig").backup_attempt_lease_renew_interval_ns;
+pub const backup_attempt_lease_renew_interval_ns = @import("antfly_local_sources").api_local_backups.backup_attempt_lease_renew_interval_ns;
 /// Current storage owners renew this lease for as long as artifact production
 /// remains live. The initial 24-hour term preserves the pre-lease grace window
 /// when forwarding to a rolling-upgrade peer that does not yet renew it.
@@ -118,10 +118,10 @@ pub const table_backup_writer_lease_duration_ns: u64 = backup_attempt_reclaim_ag
 /// by a different node. Reclamation therefore waits beyond the advertised
 /// expiry by this bounded skew envelope. Deployments must keep host clocks
 /// within this two-renewal-period tolerance.
-pub const backup_attempt_lease_clock_skew_allowance_ns = @import("local_backups.zig").backup_attempt_lease_clock_skew_allowance_ns;
-pub const backup_integrity_read_chunk_bytes = @import("local_backups.zig").backup_integrity_read_chunk_bytes;
-pub const backup_integrity_max_native_files = @import("local_backups.zig").backup_integrity_max_native_files;
-pub const backup_integrity_max_native_list_pages = @import("local_backups.zig").backup_integrity_max_native_list_pages;
+pub const backup_attempt_lease_clock_skew_allowance_ns = @import("antfly_local_sources").api_local_backups.backup_attempt_lease_clock_skew_allowance_ns;
+pub const backup_integrity_read_chunk_bytes = @import("antfly_local_sources").api_local_backups.backup_integrity_read_chunk_bytes;
+pub const backup_integrity_max_native_files = @import("antfly_local_sources").api_local_backups.backup_integrity_max_native_files;
+pub const backup_integrity_max_native_list_pages = @import("antfly_local_sources").api_local_backups.backup_integrity_max_native_list_pages;
 const artifact_verification_cache_max_entries: usize = 65_536;
 const incomplete_backup_prefix = ".antfly-incomplete";
 const backup_attempt_head_name = ".antfly-backup-attempt-head.json";
@@ -234,16 +234,16 @@ pub const BackupListPage = struct {
     }
 };
 
-pub const BackupFormat = @import("local_backups.zig").BackupFormat;
-pub const ArtifactIntegrityMode = @import("local_backups.zig").ArtifactIntegrityMode;
-pub const TableBackupManifest = @import("local_backups.zig").TableBackupManifest;
-pub const ShardSnapshot = @import("local_backups.zig").ShardSnapshot;
+pub const BackupFormat = @import("antfly_local_sources").api_local_backups.BackupFormat;
+pub const ArtifactIntegrityMode = @import("antfly_local_sources").api_local_backups.ArtifactIntegrityMode;
+pub const TableBackupManifest = @import("antfly_local_sources").api_local_backups.TableBackupManifest;
+pub const ShardSnapshot = @import("antfly_local_sources").api_local_backups.ShardSnapshot;
 
-pub const ArtifactIntegrity = @import("local_backups.zig").ArtifactIntegrity;
+pub const ArtifactIntegrity = @import("antfly_local_sources").api_local_backups.ArtifactIntegrity;
 
-pub const TableBackupPlan = @import("local_backups.zig").TableBackupPlan;
+pub const TableBackupPlan = @import("antfly_local_sources").api_local_backups.TableBackupPlan;
 pub const TableBackupFence = backup_contract.TableBackupFence;
-pub const BackupOperationControl = @import("local_backups.zig").BackupOperationControl;
+pub const BackupOperationControl = @import("antfly_local_sources").api_local_backups.BackupOperationControl;
 pub const TableRestorePlan = backup_contract.TableRestorePlan;
 
 pub const backup_fence_metadata_group_id_header = backup_contract.backup_fence_metadata_group_id_header;
@@ -421,25 +421,25 @@ pub fn tableBackupFenceMatches(
     return expected.matches(tableBackupFence(snapshot, table));
 }
 
-pub const max_restore_source_identity_bytes = @import("local_backups.zig").max_restore_source_identity_bytes;
+pub const max_restore_source_identity_bytes = @import("antfly_local_sources").api_local_backups.max_restore_source_identity_bytes;
 
 /// Produces the bounded, canonical identity persisted with a restored
 /// generation. Canonicalization makes equivalent accepted spellings (such as
 /// gcs:// and gs://, redundant file path components, or trailing object-store
 /// separators) share one idempotency key.
-pub const canonicalRestoreSourceIdentityAlloc = @import("local_backups.zig").canonicalRestoreSourceIdentityAlloc;
+pub const canonicalRestoreSourceIdentityAlloc = @import("antfly_local_sources").api_local_backups.canonicalRestoreSourceIdentityAlloc;
 
-const canonicalObjectStoreLocationAlloc = @import("local_backups.zig").canonicalObjectStoreLocationAlloc;
+const canonicalObjectStoreLocationAlloc = @import("antfly_local_sources").api_local_backups.canonicalObjectStoreLocationAlloc;
 
-pub const validateCanonicalRestoreSourceIdentity = @import("local_backups.zig").validateCanonicalRestoreSourceIdentity;
+pub const validateCanonicalRestoreSourceIdentity = @import("antfly_local_sources").api_local_backups.validateCanonicalRestoreSourceIdentity;
 
 pub const RestorePublicationHook = backup_contract.RestorePublicationHook;
 
-pub const validateRestorableManifestLayout = @import("local_backups.zig").validateRestorableManifestLayout;
+pub const validateRestorableManifestLayout = @import("antfly_local_sources").api_local_backups.validateRestorableManifestLayout;
 
-pub const validateSingleRangeRestoreManifestLayout = @import("local_backups.zig").validateSingleRangeRestoreManifestLayout;
+pub const validateSingleRangeRestoreManifestLayout = @import("antfly_local_sources").api_local_backups.validateSingleRangeRestoreManifestLayout;
 
-pub const BackupLocation = @import("local_backups.zig").BackupLocation;
+pub const BackupLocation = @import("antfly_local_sources").api_local_backups.BackupLocation;
 
 /// Production adapter from the configured backup location to the canonical
 /// refs/manifests/blobs repository. The adapter borrows `location`; callers
@@ -1704,9 +1704,9 @@ test "repository remote verification accepts only full-object SHA-256 proofs" {
     try std.testing.expect(remoteFullSha256ProofMatches(metadata, expected) == null);
 }
 
-pub const OpenOptions = @import("local_backups.zig").OpenOptions;
+pub const OpenOptions = @import("antfly_local_sources").api_local_backups.OpenOptions;
 
-const createOwnedThreadedIo = @import("local_backups.zig").createOwnedThreadedIo;
+const createOwnedThreadedIo = @import("antfly_local_sources").api_local_backups.createOwnedThreadedIo;
 
 test "owned backup runtime has a finite worker ceiling" {
     const owned = try createOwnedThreadedIo(std.testing.allocator);
@@ -1719,25 +1719,25 @@ test "owned backup runtime has a finite worker ceiling" {
     );
 }
 
-const AwsCredentialContext = @import("local_backups.zig").AwsCredentialContext;
+const AwsCredentialContext = @import("antfly_local_sources").api_local_backups.AwsCredentialContext;
 
-const authorizedObjectConnection = @import("local_backups.zig").authorizedObjectConnection;
+const authorizedObjectConnection = @import("antfly_local_sources").api_local_backups.authorizedObjectConnection;
 
-const authorizedFilesystemConnection = @import("local_backups.zig").authorizedFilesystemConnection;
+const authorizedFilesystemConnection = @import("antfly_local_sources").api_local_backups.authorizedFilesystemConnection;
 
-const s3ConfigForConnection = @import("local_backups.zig").s3ConfigForConnection;
+const s3ConfigForConnection = @import("antfly_local_sources").api_local_backups.s3ConfigForConnection;
 
-const BackupLeaseFenceClaim = @import("local_backups.zig").BackupLeaseFenceClaim;
+const BackupLeaseFenceClaim = @import("antfly_local_sources").api_local_backups.BackupLeaseFenceClaim;
 
-const RemoteBackupStore = @import("local_backups.zig").RemoteBackupStore;
+const RemoteBackupStore = @import("antfly_local_sources").api_local_backups.RemoteBackupStore;
 
-pub const gcsConfigForConnection = @import("local_backups.zig").gcsConfigForConnection;
+pub const gcsConfigForConnection = @import("antfly_local_sources").api_local_backups.gcsConfigForConnection;
 
-const S3SecretOverrides = @import("local_backups.zig").S3SecretOverrides;
+const S3SecretOverrides = @import("antfly_local_sources").api_local_backups.S3SecretOverrides;
 
-const loadS3SecretOverrides = @import("local_backups.zig").loadS3SecretOverrides;
+const loadS3SecretOverrides = @import("antfly_local_sources").api_local_backups.loadS3SecretOverrides;
 
-const firstStoredSecretOwned = @import("local_backups.zig").firstStoredSecretOwned;
+const firstStoredSecretOwned = @import("antfly_local_sources").api_local_backups.firstStoredSecretOwned;
 
 pub const ClusterTableBackupEntry = struct {
     /// Immutable source storage name; table manifests must agree with it.
@@ -1827,7 +1827,7 @@ pub const ClusterBackupAttemptHead = struct {
     generation: u64,
 };
 
-const ClusterBackupReservationLease = @import("local_backups.zig").ClusterBackupReservationLease;
+const ClusterBackupReservationLease = @import("antfly_local_sources").api_local_backups.ClusterBackupReservationLease;
 
 fn backupCleanupLeaseOwner(identity: []const u8, buf: *[backup_cleanup_lease_owner_prefix.len + 64]u8) []const u8 {
     var digest: [32]u8 = undefined;
@@ -1870,13 +1870,13 @@ fn legacyClusterCleanupLeaseOwner(
     return buf[0 .. legacy_backup_cleanup_lease_owner_prefix.len + attempt_id.len];
 }
 
-const validateBackupLeaseOwner = @import("local_backups.zig").validateBackupLeaseOwner;
+const validateBackupLeaseOwner = @import("antfly_local_sources").api_local_backups.validateBackupLeaseOwner;
 
-const reservationOwner = @import("local_backups.zig").reservationOwner;
+const reservationOwner = @import("antfly_local_sources").api_local_backups.reservationOwner;
 
-const parseClusterBackupReservationLease = @import("local_backups.zig").parseClusterBackupReservationLease;
+const parseClusterBackupReservationLease = @import("antfly_local_sources").api_local_backups.parseClusterBackupReservationLease;
 
-const clusterBackupLeaseReclaimable = @import("local_backups.zig").clusterBackupLeaseReclaimable;
+const clusterBackupLeaseReclaimable = @import("antfly_local_sources").api_local_backups.clusterBackupLeaseReclaimable;
 
 fn encodeClusterBackupReservationLease(
     alloc: std.mem.Allocator,
@@ -1962,11 +1962,11 @@ pub const BackupInfo = struct {
     antfly_version: []const u8,
 };
 
-pub const openBackupLocation = @import("local_backups.zig").openBackupLocation;
+pub const openBackupLocation = @import("antfly_local_sources").api_local_backups.openBackupLocation;
 
-pub const openBackupLocationWithSecrets = @import("local_backups.zig").openBackupLocationWithSecrets;
+pub const openBackupLocationWithSecrets = @import("antfly_local_sources").api_local_backups.openBackupLocationWithSecrets;
 
-pub const openBackupLocationWithOptions = @import("local_backups.zig").openBackupLocationWithOptions;
+pub const openBackupLocationWithOptions = @import("antfly_local_sources").api_local_backups.openBackupLocationWithOptions;
 
 pub fn backupLocationErrorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
@@ -2103,17 +2103,17 @@ pub fn parseClusterRestoreRequest(alloc: std.mem.Allocator, body: []const u8) !C
     };
 }
 
-pub const parseFileLocation = @import("local_backups.zig").parseFileLocation;
+pub const parseFileLocation = @import("antfly_local_sources").api_local_backups.parseFileLocation;
 
-pub const validateBackupId = @import("local_backups.zig").validateBackupId;
+pub const validateBackupId = @import("antfly_local_sources").api_local_backups.validateBackupId;
 
-const ensureManifestSize = @import("local_backups.zig").ensureManifestSize;
+const ensureManifestSize = @import("antfly_local_sources").api_local_backups.ensureManifestSize;
 
-pub const validateArtifactRelativePath = @import("backup_contract.zig").validateArtifactRelativePath;
+pub const validateArtifactRelativePath = @import("antfly_local_sources").api_backup_contract.validateArtifactRelativePath;
 
-const resolveFilesystemLocationAlloc = @import("local_backups.zig").resolveFilesystemLocationAlloc;
+const resolveFilesystemLocationAlloc = @import("antfly_local_sources").api_local_backups.resolveFilesystemLocationAlloc;
 
-const pathIsWithin = @import("local_backups.zig").pathIsWithin;
+const pathIsWithin = @import("antfly_local_sources").api_local_backups.pathIsWithin;
 
 test "restore filesystem scope containment handles filesystem roots and component boundaries" {
     try std.testing.expect(pathIsWithin("/", "/private/tmp/backup"));
@@ -2149,16 +2149,16 @@ test "filesystem backup location returns the canonical authorized identity" {
     opened.close(io);
 }
 
-pub const cloneAcceptedGenerationSummary = @import("local_backups.zig").cloneAcceptedGenerationSummary;
+pub const cloneAcceptedGenerationSummary = @import("antfly_local_sources").api_local_backups.cloneAcceptedGenerationSummary;
 
-pub const shardAdmissionNamespace = @import("local_backups.zig").shardAdmissionNamespace;
+pub const shardAdmissionNamespace = @import("antfly_local_sources").api_local_backups.shardAdmissionNamespace;
 
-pub const createManifest = @import("local_backups.zig").createManifest;
+pub const createManifest = @import("antfly_local_sources").api_local_backups.createManifest;
 
 test "portable backup manifest rejects partial per-shard accepted generation proof" {
     const alloc = std.testing.allocator;
     const table: metadata_table_manager.TableRecord = .{ .table_id = 11, .name = "parents", .schema_json = "{}" };
-    const empty_digest = try @import("../storage/portable_backup.zig").sourceGenerationAdmissionSummaryDigest(.{ .table_id = 11, .shard_id = 101, .range_id = 101 }, &.{});
+    const empty_digest = try @import("antfly_local_sources").storage_portable_backup.sourceGenerationAdmissionSummaryDigest(.{ .table_id = 11, .shard_id = 101, .range_id = 101 }, &.{});
     const shards = [_]ShardSnapshot{
         .{ .group_id = 101, .range_id = 101, .doc_identity_shard_id = 101, .doc_identity_range_id = 101, .start_key = "", .end_key = "m", .snapshot_path = "first.afb", .accepted_generation_summary_digest = empty_digest },
         .{ .group_id = 102, .range_id = 102, .doc_identity_shard_id = 102, .doc_identity_range_id = 102, .start_key = "m", .snapshot_path = "second.afb" },
@@ -2168,19 +2168,19 @@ test "portable backup manifest rejects partial per-shard accepted generation pro
     try std.testing.expectError(error.BackupIntegrityFailure, validateTableManifest(alloc, &manifest, "daily"));
 }
 
-pub const writeManifest = @import("local_backups.zig").writeManifest;
+pub const writeManifest = @import("antfly_local_sources").api_local_backups.writeManifest;
 
-pub const readManifest = @import("local_backups.zig").readManifest;
+pub const readManifest = @import("antfly_local_sources").api_local_backups.readManifest;
 
-pub const writeManifestToLocation = @import("local_backups.zig").writeManifestToLocation;
+pub const writeManifestToLocation = @import("antfly_local_sources").api_local_backups.writeManifestToLocation;
 
-pub const writeManifestToLocationWithIo = @import("local_backups.zig").writeManifestToLocationWithIo;
+pub const writeManifestToLocationWithIo = @import("antfly_local_sources").api_local_backups.writeManifestToLocationWithIo;
 
-pub const writeManifestToLocationWithIoAndCancellation = @import("local_backups.zig").writeManifestToLocationWithIoAndCancellation;
+pub const writeManifestToLocationWithIoAndCancellation = @import("antfly_local_sources").api_local_backups.writeManifestToLocationWithIoAndCancellation;
 
-pub const readManifestFromLocation = @import("local_backups.zig").readManifestFromLocation;
+pub const readManifestFromLocation = @import("antfly_local_sources").api_local_backups.readManifestFromLocation;
 
-pub const readManifestFromLocationWithArtifactBackupId = @import("local_backups.zig").readManifestFromLocationWithArtifactBackupId;
+pub const readManifestFromLocationWithArtifactBackupId = @import("antfly_local_sources").api_local_backups.readManifestFromLocationWithArtifactBackupId;
 
 pub fn manifestExistsAtLocation(alloc: std.mem.Allocator, location: *BackupLocation, backup_id: []const u8) !bool {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -2226,41 +2226,41 @@ pub fn manifestExistsAtLocationWithIoAndCancellation(
     };
 }
 
-const parseTableBackupManifest = @import("local_backups.zig").parseTableBackupManifest;
+const parseTableBackupManifest = @import("antfly_local_sources").api_local_backups.parseTableBackupManifest;
 
-const parseTableBackupManifestWithArtifactBackupId = @import("local_backups.zig").parseTableBackupManifestWithArtifactBackupId;
+const parseTableBackupManifestWithArtifactBackupId = @import("antfly_local_sources").api_local_backups.parseTableBackupManifestWithArtifactBackupId;
 
-pub const validateTableManifest = @import("local_backups.zig").validateTableManifest;
+pub const validateTableManifest = @import("antfly_local_sources").api_local_backups.validateTableManifest;
 
-const validatePublishedTableManifest = @import("local_backups.zig").validatePublishedTableManifest;
+const validatePublishedTableManifest = @import("antfly_local_sources").api_local_backups.validatePublishedTableManifest;
 
-const validateManifestShards = @import("local_backups.zig").validateManifestShards;
+const validateManifestShards = @import("antfly_local_sources").api_local_backups.validateManifestShards;
 
-pub const validateRestoreManifest = @import("local_backups.zig").validateRestoreManifest;
+pub const validateRestoreManifest = @import("antfly_local_sources").api_local_backups.validateRestoreManifest;
 
-const isLowerSha256Hex = @import("local_backups.zig").isLowerSha256Hex;
+const isLowerSha256Hex = @import("antfly_local_sources").api_local_backups.isLowerSha256Hex;
 
-const PortableShard = @import("local_backups.zig").PortableShard;
+const PortableShard = @import("antfly_local_sources").api_local_backups.PortableShard;
 
-const GoPortableArtifactIntegrity = @import("local_backups.zig").GoPortableArtifactIntegrity;
+const GoPortableArtifactIntegrity = @import("antfly_local_sources").api_local_backups.GoPortableArtifactIntegrity;
 
-const parseGoPortableTableManifest = @import("local_backups.zig").parseGoPortableTableManifest;
+const parseGoPortableTableManifest = @import("antfly_local_sources").api_local_backups.parseGoPortableTableManifest;
 
-const stringifyOptionalGoTableField = @import("local_backups.zig").stringifyOptionalGoTableField;
+const stringifyOptionalGoTableField = @import("antfly_local_sources").api_local_backups.stringifyOptionalGoTableField;
 
-const normalizeGoPortableIndexesJson = @import("local_backups.zig").normalizeGoPortableIndexesJson;
+const normalizeGoPortableIndexesJson = @import("antfly_local_sources").api_local_backups.normalizeGoPortableIndexesJson;
 
-const appendGoPortableIndexConfigJson = @import("local_backups.zig").appendGoPortableIndexConfigJson;
+const appendGoPortableIndexConfigJson = @import("antfly_local_sources").api_local_backups.appendGoPortableIndexConfigJson;
 
-const appendGoPortableJsonValue = @import("local_backups.zig").appendGoPortableJsonValue;
+const appendGoPortableJsonValue = @import("antfly_local_sources").api_local_backups.appendGoPortableJsonValue;
 
-const appendJsonString = @import("local_backups.zig").appendJsonString;
+const appendJsonString = @import("antfly_local_sources").api_local_backups.appendJsonString;
 
-const portableShardLessThan = @import("local_backups.zig").portableShardLessThan;
+const portableShardLessThan = @import("antfly_local_sources").api_local_backups.portableShardLessThan;
 
-const decodePortableByteRangeBoundary = @import("local_backups.zig").decodePortableByteRangeBoundary;
+const decodePortableByteRangeBoundary = @import("antfly_local_sources").api_local_backups.decodePortableByteRangeBoundary;
 
-pub const metadataPath = @import("local_backups.zig").metadataPath;
+pub const metadataPath = @import("antfly_local_sources").api_local_backups.metadataPath;
 
 pub fn clusterMetadataPath(alloc: std.mem.Allocator, backup_root: []const u8, backup_id: []const u8) ![]u8 {
     try validateBackupId(backup_id);
@@ -6392,7 +6392,7 @@ fn openOrCreateBackupLockFile(
 /// efficient blocking lock; cancellable request paths poll with a short capped
 /// backoff so cancellation latency stays below one scheduler quantum without
 /// busy-spinning under contention.
-const lockFileExclusiveWithCancellation = @import("local_backups.zig").lockFileExclusiveWithCancellation;
+const lockFileExclusiveWithCancellation = @import("antfly_local_sources").api_local_backups.lockFileExclusiveWithCancellation;
 
 fn deleteFileDurablyFromBackupRoot(
     io: std.Io,
@@ -9404,9 +9404,9 @@ fn reclaimStaleClusterBackupAttemptsWithHook(
     return reclaimed;
 }
 
-pub const shardSnapshotPath = @import("local_backups.zig").shardSnapshotPath;
+pub const shardSnapshotPath = @import("antfly_local_sources").api_local_backups.shardSnapshotPath;
 
-pub const shardSnapshotRelPath = @import("local_backups.zig").shardSnapshotRelPath;
+pub const shardSnapshotRelPath = @import("antfly_local_sources").api_local_backups.shardSnapshotRelPath;
 
 pub fn encodeBackupSuccess(alloc: std.mem.Allocator) ![]u8 {
     return try alloc.dupe(u8, "{\"backup\":\"successful\"}");
@@ -10029,11 +10029,11 @@ pub fn validateClusterBackupArtifactsAtLocation(
     }
 }
 
-const hashArtifactI128 = @import("local_backups.zig").hashArtifactI128;
+const hashArtifactI128 = @import("antfly_local_sources").api_local_backups.hashArtifactI128;
 
-const hashLocalArtifactStat = @import("local_backups.zig").hashLocalArtifactStat;
+const hashLocalArtifactStat = @import("antfly_local_sources").api_local_backups.hashLocalArtifactStat;
 
-const localArtifactStatsEqual = @import("local_backups.zig").localArtifactStatsEqual;
+const localArtifactStatsEqual = @import("antfly_local_sources").api_local_backups.localArtifactStatsEqual;
 
 fn localArtifactStatIdentity(stat: std.Io.File.Stat) u64 {
     var hasher = std.hash.Wyhash.init(@intCast(stat.inode));
@@ -11284,9 +11284,9 @@ pub fn findClusterTable(
     return null;
 }
 
-pub const createTableRequestFromManifest = @import("local_backups.zig").createTableRequestFromManifest;
+pub const createTableRequestFromManifest = @import("antfly_local_sources").api_local_backups.createTableRequestFromManifest;
 
-pub const deriveRestoreTableRecord = @import("local_backups.zig").deriveRestoreTableRecord;
+pub const deriveRestoreTableRecord = @import("antfly_local_sources").api_local_backups.deriveRestoreTableRecord;
 
 pub fn deriveRestoreRanges(
     alloc: std.mem.Allocator,
@@ -11375,15 +11375,15 @@ fn deriveRestoreRange(
     };
 }
 
-pub const findShardSnapshot = @import("local_backups.zig").findShardSnapshot;
+pub const findShardSnapshot = @import("antfly_local_sources").api_local_backups.findShardSnapshot;
 
-pub const findShardSnapshotByPath = @import("local_backups.zig").findShardSnapshotByPath;
+pub const findShardSnapshotByPath = @import("antfly_local_sources").api_local_backups.findShardSnapshotByPath;
 
-pub const copyDirectoryToLocation = @import("local_backups.zig").copyDirectoryToLocation;
+pub const copyDirectoryToLocation = @import("antfly_local_sources").api_local_backups.copyDirectoryToLocation;
 
-pub const copyDirectoryToLocationWithCancellation = @import("local_backups.zig").copyDirectoryToLocationWithCancellation;
+pub const copyDirectoryToLocationWithCancellation = @import("antfly_local_sources").api_local_backups.copyDirectoryToLocationWithCancellation;
 
-pub const copyDirectoryToLocationUsingIoWithCancellation = @import("local_backups.zig").copyDirectoryToLocationUsingIoWithCancellation;
+pub const copyDirectoryToLocationUsingIoWithCancellation = @import("antfly_local_sources").api_local_backups.copyDirectoryToLocationUsingIoWithCancellation;
 
 pub fn copyDirectoryFromLocation(
     alloc: std.mem.Allocator,
@@ -11411,7 +11411,7 @@ pub fn copyDirectoryFromLocationUsingIo(
     );
 }
 
-pub const copyDirectoryFromLocationUsingIoWithCancellation = @import("local_backups.zig").copyDirectoryFromLocationUsingIoWithCancellation;
+pub const copyDirectoryFromLocationUsingIoWithCancellation = @import("antfly_local_sources").api_local_backups.copyDirectoryFromLocationUsingIoWithCancellation;
 
 pub fn copyFileFromLocation(
     alloc: std.mem.Allocator,
@@ -11422,12 +11422,12 @@ pub fn copyFileFromLocation(
     return try copyFileFromLocationUsingIo(alloc, null, location, snapshot_path, dest_path);
 }
 
-pub const copyFileFromLocationUsingIo = @import("local_backups.zig").copyFileFromLocationUsingIo;
+pub const copyFileFromLocationUsingIo = @import("antfly_local_sources").api_local_backups.copyFileFromLocationUsingIo;
 
 /// Reads one authenticated control file without enumerating or buffering the
 /// artifact generation that contains it. Restore uses this for the native
 /// generation manifest before admitting any corpus-sized bytes.
-pub const readFileFromLocationUsingIoLimited = @import("local_backups.zig").readFileFromLocationUsingIoLimited;
+pub const readFileFromLocationUsingIoLimited = @import("antfly_local_sources").api_local_backups.readFileFromLocationUsingIoLimited;
 
 /// Copies exactly one manifest-declared artifact directly into an unpublished
 /// generation. Size and digest are checked against the bytes written, and a
@@ -11475,7 +11475,7 @@ pub fn readFileRangeFromLocationUsingIo(alloc: std.mem.Allocator, io: std.Io, lo
     }
 }
 
-pub const copyFileFromLocationVerifiedUsingIo = @import("local_backups.zig").copyFileFromLocationVerifiedUsingIo;
+pub const copyFileFromLocationVerifiedUsingIo = @import("antfly_local_sources").api_local_backups.copyFileFromLocationVerifiedUsingIo;
 
 pub fn copyFileToLocation(
     alloc: std.mem.Allocator,
@@ -11547,7 +11547,7 @@ pub fn copyFileToLocationUsingIoWithCancellation(
     }
 }
 
-pub const populateShardArtifactIntegrity = @import("local_backups.zig").populateShardArtifactIntegrity;
+pub const populateShardArtifactIntegrity = @import("antfly_local_sources").api_local_backups.populateShardArtifactIntegrity;
 
 pub fn populateShardArtifactIntegrityWithCancellation(
     alloc: std.mem.Allocator,
@@ -11590,62 +11590,62 @@ pub fn deriveManifestArtifactIntegrity(
     try validateTableManifest(alloc, manifest, manifest.backup_id);
 }
 
-pub const verifyShardArtifactIntegrity = @import("local_backups.zig").verifyShardArtifactIntegrity;
+pub const verifyShardArtifactIntegrity = @import("antfly_local_sources").api_local_backups.verifyShardArtifactIntegrity;
 
-pub const verifyShardArtifactIntegrityWithCancellation = @import("local_backups.zig").verifyShardArtifactIntegrityWithCancellation;
+pub const verifyShardArtifactIntegrityWithCancellation = @import("antfly_local_sources").api_local_backups.verifyShardArtifactIntegrityWithCancellation;
 
 /// Restore-only verification for native generations. A whole-tree mismatch
 /// may represent a missing/corrupt generated projection. It is safe to defer
 /// that classification to the native validator only when the separately
 /// authenticated per-file generation manifest is still exact.
-pub const verifyRestorableShardArtifactIntegrityWithCancellation = @import("local_backups.zig").verifyRestorableShardArtifactIntegrityWithCancellation;
+pub const verifyRestorableShardArtifactIntegrityWithCancellation = @import("antfly_local_sources").api_local_backups.verifyRestorableShardArtifactIntegrityWithCancellation;
 
-pub const nativeGenerationManifestIntegrityAllocWithCancellation = @import("local_backups.zig").nativeGenerationManifestIntegrityAllocWithCancellation;
+pub const nativeGenerationManifestIntegrityAllocWithCancellation = @import("antfly_local_sources").api_local_backups.nativeGenerationManifestIntegrityAllocWithCancellation;
 
-pub const artifactIntegrityAlloc = @import("local_backups.zig").artifactIntegrityAlloc;
+pub const artifactIntegrityAlloc = @import("antfly_local_sources").api_local_backups.artifactIntegrityAlloc;
 
-pub const artifactIntegrityAllocWithCancellation = @import("local_backups.zig").artifactIntegrityAllocWithCancellation;
+pub const artifactIntegrityAllocWithCancellation = @import("antfly_local_sources").api_local_backups.artifactIntegrityAllocWithCancellation;
 
-const artifactIntegrityAllocCancellableWithIo = @import("local_backups.zig").artifactIntegrityAllocCancellableWithIo;
+const artifactIntegrityAllocCancellableWithIo = @import("antfly_local_sources").api_local_backups.artifactIntegrityAllocCancellableWithIo;
 
-pub const portableBytesIntegrityAlloc = @import("local_backups.zig").portableBytesIntegrityAlloc;
+pub const portableBytesIntegrityAlloc = @import("antfly_local_sources").api_local_backups.portableBytesIntegrityAlloc;
 
-const artifactIntegrityAllocWithIo = @import("local_backups.zig").artifactIntegrityAllocWithIo;
+const artifactIntegrityAllocWithIo = @import("antfly_local_sources").api_local_backups.artifactIntegrityAllocWithIo;
 
-const fileArtifactIntegrityAlloc = @import("local_backups.zig").fileArtifactIntegrityAlloc;
+const fileArtifactIntegrityAlloc = @import("antfly_local_sources").api_local_backups.fileArtifactIntegrityAlloc;
 
-const fileArtifactIntegrityAllocWithIdentity = @import("local_backups.zig").fileArtifactIntegrityAllocWithIdentity;
+const fileArtifactIntegrityAllocWithIdentity = @import("antfly_local_sources").api_local_backups.fileArtifactIntegrityAllocWithIdentity;
 
-const fileArtifactIntegrityAllocCancellable = @import("local_backups.zig").fileArtifactIntegrityAllocCancellable;
+const fileArtifactIntegrityAllocCancellable = @import("antfly_local_sources").api_local_backups.fileArtifactIntegrityAllocCancellable;
 
-const NativeArtifactFile = @import("local_backups.zig").NativeArtifactFile;
+const NativeArtifactFile = @import("antfly_local_sources").api_local_backups.NativeArtifactFile;
 
-const directoryArtifactIntegrityAlloc = @import("local_backups.zig").directoryArtifactIntegrityAlloc;
+const directoryArtifactIntegrityAlloc = @import("antfly_local_sources").api_local_backups.directoryArtifactIntegrityAlloc;
 
-const directoryArtifactIntegrityAllocWithIdentity = @import("local_backups.zig").directoryArtifactIntegrityAllocWithIdentity;
+const directoryArtifactIntegrityAllocWithIdentity = @import("antfly_local_sources").api_local_backups.directoryArtifactIntegrityAllocWithIdentity;
 
-const directoryArtifactIntegrityAllocCancellable = @import("local_backups.zig").directoryArtifactIntegrityAllocCancellable;
+const directoryArtifactIntegrityAllocCancellable = @import("antfly_local_sources").api_local_backups.directoryArtifactIntegrityAllocCancellable;
 
-const nativeArtifactFileLessThan = @import("local_backups.zig").nativeArtifactFileLessThan;
+const nativeArtifactFileLessThan = @import("antfly_local_sources").api_local_backups.nativeArtifactFileLessThan;
 
-const hashFileContents = @import("local_backups.zig").hashFileContents;
+const hashFileContents = @import("antfly_local_sources").api_local_backups.hashFileContents;
 
-const hashFileContentsCancellable = @import("local_backups.zig").hashFileContentsCancellable;
+const hashFileContentsCancellable = @import("antfly_local_sources").api_local_backups.hashFileContentsCancellable;
 
-const hashArtifactU64 = @import("local_backups.zig").hashArtifactU64;
+const hashArtifactU64 = @import("antfly_local_sources").api_local_backups.hashArtifactU64;
 
-const hashArtifactBytes = @import("local_backups.zig").hashArtifactBytes;
+const hashArtifactBytes = @import("antfly_local_sources").api_local_backups.hashArtifactBytes;
 
-pub const writeFileToLocation = @import("local_backups.zig").writeFileToLocation;
+pub const writeFileToLocation = @import("antfly_local_sources").api_local_backups.writeFileToLocation;
 
-const cloneTableBackupManifest = @import("local_backups.zig").cloneTableBackupManifest;
+const cloneTableBackupManifest = @import("antfly_local_sources").api_local_backups.cloneTableBackupManifest;
 
 /// Derive the mutable restore envelope for a destination table without
 /// changing the immutable source manifest that authenticated the backup.
 /// Native bundle extraction uses this after verifying the sealed AFB2 source;
 /// the resulting table manifest is the target-scoped intent consumed by the
 /// ordinary restore API.
-pub const deriveRestoreManifestForTargetTable = @import("local_backups.zig").deriveRestoreManifestForTargetTable;
+pub const deriveRestoreManifestForTargetTable = @import("antfly_local_sources").api_local_backups.deriveRestoreManifestForTargetTable;
 
 fn cloneClusterBackupManifest(alloc: std.mem.Allocator, manifest: ClusterBackupManifest) !ClusterBackupManifest {
     const tables = try alloc.alloc(ClusterTableBackupEntry, manifest.tables.len);
@@ -11805,38 +11805,38 @@ fn backupIdFromClusterMetadataKey(key: []const u8) []const u8 {
     return base[0 .. base.len - "-cluster-metadata.json".len];
 }
 
-const joinPathAlloc = @import("local_backups.zig").joinPathAlloc;
+const joinPathAlloc = @import("antfly_local_sources").api_local_backups.joinPathAlloc;
 
-const normalizeRemoteLocationAlloc = @import("local_backups.zig").normalizeRemoteLocationAlloc;
+const normalizeRemoteLocationAlloc = @import("antfly_local_sources").api_local_backups.normalizeRemoteLocationAlloc;
 
-const trimLeftSlash = @import("local_backups.zig").trimLeftSlash;
+const trimLeftSlash = @import("antfly_local_sources").api_local_backups.trimLeftSlash;
 
-const trimRightSlash = @import("local_backups.zig").trimRightSlash;
+const trimRightSlash = @import("antfly_local_sources").api_local_backups.trimRightSlash;
 
-pub const copyDirectoryRecursive = @import("local_backups.zig").copyDirectoryRecursive;
+pub const copyDirectoryRecursive = @import("antfly_local_sources").api_local_backups.copyDirectoryRecursive;
 
-pub const copyDirectoryRecursiveUsingIo = @import("local_backups.zig").copyDirectoryRecursiveUsingIo;
+pub const copyDirectoryRecursiveUsingIo = @import("antfly_local_sources").api_local_backups.copyDirectoryRecursiveUsingIo;
 
-pub const copyDirectoryRecursiveUsingIoWithCancellation = @import("local_backups.zig").copyDirectoryRecursiveUsingIoWithCancellation;
+pub const copyDirectoryRecursiveUsingIoWithCancellation = @import("antfly_local_sources").api_local_backups.copyDirectoryRecursiveUsingIoWithCancellation;
 
 /// Copies a native artifact and computes the canonical tree digest from the
 /// exact bytes written. This avoids a second corpus-sized read after local
 /// materialization and binds the advertised integrity to the destination.
-pub const copyNativeDirectoryWithIntegrityUsingIo = @import("local_backups.zig").copyNativeDirectoryWithIntegrityUsingIo;
+pub const copyNativeDirectoryWithIntegrityUsingIo = @import("antfly_local_sources").api_local_backups.copyNativeDirectoryWithIntegrityUsingIo;
 
-const copyFileAndHashCancellable = @import("local_backups.zig").copyFileAndHashCancellable;
+const copyFileAndHashCancellable = @import("antfly_local_sources").api_local_backups.copyFileAndHashCancellable;
 
-const CopyDurability = @import("local_backups.zig").CopyDurability;
+const CopyDurability = @import("antfly_local_sources").api_local_backups.CopyDurability;
 
-const copyDirectoryRecursiveWithIo = @import("local_backups.zig").copyDirectoryRecursiveWithIo;
+const copyDirectoryRecursiveWithIo = @import("antfly_local_sources").api_local_backups.copyDirectoryRecursiveWithIo;
 
-const writeFileAbsolute = @import("local_backups.zig").writeFileAbsolute;
+const writeFileAbsolute = @import("antfly_local_sources").api_local_backups.writeFileAbsolute;
 
-const writeFileAbsoluteIfAbsent = @import("local_backups.zig").writeFileAbsoluteIfAbsent;
+const writeFileAbsoluteIfAbsent = @import("antfly_local_sources").api_local_backups.writeFileAbsoluteIfAbsent;
 
-const writeFileAbsoluteIfAbsentWithIo = @import("local_backups.zig").writeFileAbsoluteIfAbsentWithIo;
+const writeFileAbsoluteIfAbsentWithIo = @import("antfly_local_sources").api_local_backups.writeFileAbsoluteIfAbsentWithIo;
 
-const writeFileAbsoluteIfAbsentWithIoAndCancellation = @import("local_backups.zig").writeFileAbsoluteIfAbsentWithIoAndCancellation;
+const writeFileAbsoluteIfAbsentWithIoAndCancellation = @import("antfly_local_sources").api_local_backups.writeFileAbsoluteIfAbsentWithIoAndCancellation;
 
 fn replaceFileAbsoluteUnderHeldLock(
     alloc: std.mem.Allocator,
@@ -11896,9 +11896,9 @@ fn writeFileAbsoluteAtomicallyWithIo(
     try replaceFileAbsoluteUnderHeldLock(alloc, io, path, data);
 }
 
-const readFileAbsoluteAlloc = @import("local_backups.zig").readFileAbsoluteAlloc;
+const readFileAbsoluteAlloc = @import("antfly_local_sources").api_local_backups.readFileAbsoluteAlloc;
 
-const readFileAbsoluteAllocWithIo = @import("local_backups.zig").readFileAbsoluteAllocWithIo;
+const readFileAbsoluteAllocWithIo = @import("antfly_local_sources").api_local_backups.readFileAbsoluteAllocWithIo;
 
 fn pathExists(path: []const u8) !bool {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -11931,17 +11931,17 @@ fn copyFileAbsoluteWithDurability(
         try syncPathAncestorsWithIo(io, std.fs.path.dirname(dest_path) orelse ".");
 }
 
-const copyFileAbsoluteWithIoOptions = @import("local_backups.zig").copyFileAbsoluteWithIoOptions;
+const copyFileAbsoluteWithIoOptions = @import("antfly_local_sources").api_local_backups.copyFileAbsoluteWithIoOptions;
 
-const copyFileAbsoluteWithIoOptionsCancellable = @import("local_backups.zig").copyFileAbsoluteWithIoOptionsCancellable;
+const copyFileAbsoluteWithIoOptionsCancellable = @import("antfly_local_sources").api_local_backups.copyFileAbsoluteWithIoOptionsCancellable;
 
-const ensureDirPath = @import("local_backups.zig").ensureDirPath;
+const ensureDirPath = @import("antfly_local_sources").api_local_backups.ensureDirPath;
 
-const ensureDirPathWithIo = @import("local_backups.zig").ensureDirPathWithIo;
+const ensureDirPathWithIo = @import("antfly_local_sources").api_local_backups.ensureDirPathWithIo;
 
-const syncPathAncestorsWithIo = @import("local_backups.zig").syncPathAncestorsWithIo;
+const syncPathAncestorsWithIo = @import("antfly_local_sources").api_local_backups.syncPathAncestorsWithIo;
 
-const stringifyJsonAlloc = @import("local_backups.zig").stringifyJsonAlloc;
+const stringifyJsonAlloc = @import("antfly_local_sources").api_local_backups.stringifyJsonAlloc;
 
 test "native artifact copy observes cancellation between io chunks" {
     const alloc = std.testing.allocator;

@@ -11,8 +11,8 @@ pub const Artifact = struct {
 
     pub fn run(self: Artifact, b: *std.Build) *std.Build.Step.Run {
         const step = b.addRunArtifact(self.executable);
-        @import("test_support.zig").configureTestRun(step);
-        @import("test_support.zig").addRuntimeTestFilters(b, step, self.object.filters);
+        @import("../../../build_support/antfly/test_support.zig").configureTestRun(step);
+        @import("../../../build_support/antfly/test_support.zig").addRuntimeTestFilters(b, step, self.object.filters);
         return step;
     }
 };
@@ -21,7 +21,7 @@ pub fn add(b: *std.Build, options: std.Build.TestOptions) Artifact {
     var object_options = options;
     object_options.emit_object = true;
     object_options.test_runner = options.test_runner orelse .{
-        .path = b.path("pkg/antfly/src/test_runner.zig"),
+        .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
         .mode = .simple,
     };
     const module = b.createModule(.{
@@ -49,7 +49,7 @@ pub const Pair = struct {
 
 pub fn addPair(b: *std.Build, options: std.Build.TestOptions, implementation: *std.Build.Step.Compile) Pair {
     var consumer_options = options;
-    consumer_options.filters = @import("test_support.zig").selectTestFilters(b, options.filters);
+    consumer_options.filters = @import("../../../build_support/antfly/test_support.zig").selectTestFilters(b, options.filters);
     return .{ .consumer = add(b, consumer_options), .implementation = implementation };
 }
 
@@ -86,7 +86,7 @@ pub fn runPair(b: *std.Build, consumer: Artifact, implementation: *std.Build.Ste
         audit.addArg("--inventory");
         audit.addFileArg(inventory.captureStdErr(.{}));
     }
-    const implementation_run = @import("test_support.zig").addFilteredTestRunArtifactWithRuntimeFilters(b, implementation, consumer.object.filters);
+    const implementation_run = @import("../../../build_support/antfly/test_support.zig").addFilteredTestRunArtifactWithRuntimeFilters(b, implementation, consumer.object.filters);
     implementation_run.addArg("--allow-empty-test-filter");
     implementation_run.step.dependOn(&audit.step);
     const consumer_run = consumer.run(b);
@@ -134,5 +134,6 @@ fn splitNativeSources(
     }
     for (original.import_table.keys(), original.import_table.values()) |key, dependency|
         copy.addImport(key, splitNativeSources(b, dependency, final, name, clones));
+    @import("../../antfly-embedded/build/source_owner.zig").adopt(copy);
     return copy;
 }

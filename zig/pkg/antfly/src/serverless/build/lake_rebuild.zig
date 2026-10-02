@@ -773,7 +773,7 @@ fn stampExternalGraphTopologyGenerations(
 fn graphMetricDeclarationAlloc(
     alloc: Allocator,
     graph_declaration: sidecar_manifest.DeclaredArtifact,
-    config: @import("../../graph/graph.zig").GraphMetricConfig,
+    config: @import("antfly_local_sources").graph_graph.GraphMetricConfig,
     artifact: manifest_artifact.ArtifactRef,
 ) !sidecar_manifest.DeclaredArtifact {
     const name = try alloc.dupe(u8, artifact.name);
@@ -1448,7 +1448,7 @@ fn graphIndexConfigJsonAlloc(
 
 fn graphMetricBindingHashAlloc(
     alloc: Allocator,
-    config: @import("../../graph/graph.zig").GraphMetricConfig,
+    config: @import("antfly_local_sources").graph_graph.GraphMetricConfig,
     graph_artifact_id: []const u8,
 ) ![]u8 {
     return try std.fmt.allocPrint(

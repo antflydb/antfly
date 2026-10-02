@@ -7,6 +7,9 @@
 test {
     _ = @import("common/http/io_http_executor.zig");
     _ = @import("common/http/std_http_executor.zig");
-    _ = @import("common/http/std_http_listener.zig");
+    _ = @import("antfly_local_sources").common_http_std_http_listener;
     _ = @import("common/runtime_lifecycle.zig");
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

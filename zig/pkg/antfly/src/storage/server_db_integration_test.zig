@@ -13,7 +13,7 @@
 // limitations.
 
 //! Server command, transaction recovery and ordered replay integration tests.
-const engine = @import("db/db.zig");
+const engine = @import("antfly_local_sources").storage_db_db;
 const server_test_adapter = @import("server_db_adapter.zig");
 const server_recovery = @import("server_transaction_recovery.zig");
 const transaction_runtime_mod = server_recovery;
@@ -630,7 +630,7 @@ test "db replicated merge keeps expired graph source suppressed until asset chan
 
 test "db repair activation restarts unjournaled source races without penalizing replayed writes" {
     const alloc = std.testing.allocator;
-    const publication = @import("db/artifact_publication.zig");
+    const publication = @import("antfly_local_sources").storage_db_artifact_publication;
     for ([_]bool{ false, true }) |unjournaled| {
         var directory = try TestDirectory.init("repair-source-gap");
         defer directory.cleanup();
@@ -693,15 +693,15 @@ test "db repair activation restarts unjournaled source races without penalizing 
         // Enroll the pre-activation row through the real ordered baseline,
         // then close both native and projection requirements without rewriting
         // the historic document or borrowing the newer global journal tip.
-        var baseline_page = (try @import("db/artifact_producer_baseline.zig").prepareRaft(alloc, db.core.store)).?;
+        var baseline_page = (try @import("antfly_local_sources").storage_db_artifact_producer_baseline.prepareRaft(alloc, db.core.store)).?;
         defer baseline_page.deinit();
         try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = baseline_page.command }, .{ .term = 1, .index = 5 });
         var plan = try db.core.index_manager.acquireWritePlanSnapshot();
         defer plan.release();
         for (0..16) |_| {
-            if (try @import("db/artifact_native_stream.zig").advance(alloc, db.core.store, db.root_incarnation, "historic", plan.plan()) == .closed) break;
+            if (try @import("antfly_local_sources").storage_db_artifact_native_stream.advance(alloc, db.core.store, db.root_incarnation, "historic", plan.plan()) == .closed) break;
         } else return error.TestExpectedHistoricNativeClosure;
-        const completion = @import("db/artifact_completion_progress.zig");
+        const completion = @import("antfly_local_sources").storage_db_artifact_completion_progress;
         try completion.refreshProjections(alloc, db.core.store, db.core.index_manager, db.core.applied_sequence_checkpoint_path, db.root_incarnation, "historic", plan.plan(), .{ .time_budget_ns = null });
         {
             var read = try db.core.store.beginReadTxn();
@@ -709,7 +709,7 @@ test "db repair activation restarts unjournaled source races without penalizing 
             const node = for (plan.plan().completion_plan.?.nodes) |*value| {
                 if (value.kind == .index_projection) break value;
             } else return error.TestExpectedProjectionNode;
-            var adopted = try @import("db/artifact_projection_certificate.zig").prepareClosure(alloc, &read, db.root_incarnation, "doc", node);
+            var adopted = try @import("antfly_local_sources").storage_db_artifact_projection_certificate.prepareClosure(alloc, &read, db.root_incarnation, "doc", node);
             defer adopted.deinit();
             try std.testing.expectEqual(unjournaled, adopted.baseline != null);
             try adopted.requireCurrent(&read, db.root_incarnation);
@@ -725,19 +725,19 @@ test "db repair activation restarts unjournaled source races without penalizing 
         {
             var txn = try db.core.store.beginWriteTxn();
             defer txn.abort();
-            try @import("db/artifact_source_gap.zig").record(&txn);
+            try @import("antfly_local_sources").storage_db_artifact_source_gap.record(&txn);
             try std.testing.expectError(error.EnrichmentSourceChanged, prepared.stageCurrent(&txn, db.root_incarnation));
         }
         try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = try prepared.command() }, .{ .term = 1, .index = 6 });
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
-        try std.testing.expect(try @import("db/artifact_producer_obligations.zig").lookupWork(alloc, &read, (try publication.authority(&read)).?, "historic") == null);
+        try std.testing.expect(try @import("antfly_local_sources").storage_db_artifact_producer_obligations.lookupWork(alloc, &read, (try publication.authority(&read)).?, "historic") == null);
     }
 }
 
 test "db repair activation automatically schedules bounded historical adoption and preserves pause across restart" {
     const alloc = std.testing.allocator;
-    const publication = @import("db/artifact_publication.zig");
+    const publication = @import("antfly_local_sources").storage_db_artifact_publication;
     var directory = try TestDirectory.init("automatic-artifact-adoption");
     defer directory.cleanup();
     const options: OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .index_backends = .{ .text_main_backend = .lsm }, .start_index_workers = false, .start_optional_runtimes = false };
@@ -767,7 +767,7 @@ test "db repair activation automatically schedules bounded historical adoption a
     var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activation.publication_digest = activation.digest();
     try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
-    var baseline = (try @import("db/artifact_producer_baseline.zig").prepareRaft(alloc, db.core.store)).?;
+    var baseline = (try @import("antfly_local_sources").storage_db_artifact_producer_baseline.prepareRaft(alloc, db.core.store)).?;
     defer baseline.deinit();
     try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = baseline.command }, .{ .term = 1, .index = 4 });
     {
@@ -826,20 +826,20 @@ test "db repair activation automatically schedules bounded historical adoption a
     var plan = try db.core.index_manager.acquireWritePlanSnapshot();
     defer plan.release();
     for (0..16) |_| {
-        if (try @import("db/artifact_native_stream.zig").advance(alloc, db.core.store, db.root_incarnation, "historic", plan.plan()) == .closed) break;
+        if (try @import("antfly_local_sources").storage_db_artifact_native_stream.advance(alloc, db.core.store, db.root_incarnation, "historic", plan.plan()) == .closed) break;
     } else return error.TestExpectedNativeClosure;
     try engine.test_support.refreshArtifactProjections(engine.test_support.dbPointer(&db), alloc, "historic", plan.plan(), .{ .time_budget_ns = null });
     var complete = blk: {
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
-        break :blk (try @import("db/artifact_completion_progress.zig").discover(alloc, &read, db.root_incarnation, "historic", plan.plan(), .{ .time_budget_ns = null })).?;
+        break :blk (try @import("antfly_local_sources").storage_db_artifact_completion_progress.discover(alloc, &read, db.root_incarnation, "historic", plan.plan(), .{ .time_budget_ns = null })).?;
     };
     defer complete.deinit();
     try std.testing.expect(complete.atEnd());
     try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = try complete.command() }, .{ .term = 1, .index = 5 });
     var read = try db.core.store.beginReadTxn();
     defer read.abort();
-    try std.testing.expectEqual(@as(u64, 0), (try @import("db/artifact_producer_obligations.zig").load(&read)).?.pending_documents);
+    try std.testing.expectEqual(@as(u64, 0), (try @import("antfly_local_sources").storage_db_artifact_producer_obligations.load(&read)).?.pending_documents);
 }
 
 test "db replicated transaction commits each raft receipt atomically" {
@@ -924,21 +924,21 @@ test "db replicated transaction commits each raft receipt atomically" {
 
 test "storage.hot_standby merge proof adoption certifies receiver-local absent output" {
     const alloc = std.testing.allocator;
-    const publication = @import("db/artifact_publication.zig");
-    const provenance = @import("db/artifact_producer_provenance.zig");
-    const proof_batch = @import("db/source_proof_batch.zig");
-    const inventory = @import("db/artifact_inventory.zig");
-    const pages = @import("db/merge_page_contract.zig");
-    const source_catalog = @import("db/merge_artifact_catalog.zig");
+    const publication = @import("antfly_local_sources").storage_db_artifact_publication;
+    const provenance = @import("antfly_local_sources").storage_db_artifact_producer_provenance;
+    const proof_batch = @import("antfly_local_sources").storage_db_source_proof_batch;
+    const inventory = @import("antfly_local_sources").storage_db_artifact_inventory;
+    const pages = @import("antfly_local_sources").storage_db_merge_page_contract;
+    const source_catalog = @import("antfly_local_sources").storage_db_merge_artifact_catalog;
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
     const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
-    const receiver_namespace: @import("db/doc_identity_namespace.zig").Namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 };
-    const donor_namespace: @import("db/doc_identity_namespace.zig").Namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 };
+    const receiver_namespace: @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 };
+    const donor_namespace: @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 };
     var db = try DB.open(alloc, std.mem.span(path), .{ .identity_namespace = receiver_namespace, .start_index_workers = false, .start_optional_runtimes = false });
     defer db.close();
-    const keys = @import("internal_keys.zig");
+    const keys = @import("antfly_local_sources").storage_internal_keys;
     const row_key = try keys.documentKeyAlloc(alloc, "doc");
     defer alloc.free(row_key);
     const ttl_key = try keys.ttlKeyAlloc(alloc, "doc");
@@ -1011,7 +1011,7 @@ test "storage.hot_standby merge proof adoption certifies receiver-local absent o
         try txn.put(&witness_key, &record_digest);
         try txn.commit();
     }
-    const command: @import("db/merge_proof_adoption.zig").Command = .{ .transition_id = progress.transition_id, .attempt = progress.attempt, .source_pin = progress.source.pin_digest, .proof_digest = donor_proof.publication_digest, .record_digest = record_digest };
+    const command: @import("antfly_local_sources").storage_db_merge_proof_adoption.Command = .{ .transition_id = progress.transition_id, .attempt = progress.attempt, .source_pin = progress.source.pin_digest, .proof_digest = donor_proof.publication_digest, .record_digest = record_digest };
     try server_test_adapter.applyOrdered(&db, .{ .merge_proof_adoption = command }, .{ .term = 4, .index = 7 });
     {
         var read = try db.core.store.beginReadTxn();
@@ -1034,7 +1034,7 @@ test "storage.hot_standby stale merge proof adoption advances only its ordered w
     defer path_tmp.cleanup();
     const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
-    const command: @import("db/merge_proof_adoption.zig").Command = .{
+    const command: @import("antfly_local_sources").storage_db_merge_proof_adoption.Command = .{
         .transition_id = 42,
         .attempt = .{ .donor_term = 3, .sequence = 1 },
         .source_pin = @splat(1),
@@ -1118,7 +1118,7 @@ test "db raced replicated transaction completion persists receipt and participan
 
 test "online direct vector uncertified source cannot authorize unknown effects or chunks" {
     const alloc = std.testing.allocator;
-    const pages = @import("db/merge_page_contract.zig");
+    const pages = @import("antfly_local_sources").storage_db_merge_page_contract;
     var directory = try TestDirectory.init("online-vector-mode-fence");
     defer directory.cleanup();
     var db = try DB.open(alloc, directory.path(), .{ .identity_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} } });
@@ -1155,7 +1155,7 @@ test "online direct vector uncertified source cannot authorize unknown effects o
 
 test "online direct vector Raft retention captures exact artifacts and rejects unmarked writes after reopen" {
     const alloc = std.testing.allocator;
-    const retention = @import("retained_effects.zig");
+    const retention = @import("antfly_local_sources").storage_retained_effects;
     var directory = try TestDirectory.init("online-vector-retention");
     defer directory.cleanup();
     const options: OpenOptions = .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} } };
@@ -1192,7 +1192,7 @@ test "online direct vector Raft retention captures exact artifacts and rejects u
         var vectors: usize = 0;
         while (try frame.next()) |effect| if (effect.isVector()) {
             vectors += 1;
-            try @import("db/online_vector_artifacts.zig").validate(effect.key, effect.value);
+            try @import("antfly_local_sources").storage_db_online_vector_artifacts.validate(effect.key, effect.value);
             try std.testing.expectEqualSlices(u8, try txn.get(effect.key), effect.value.?);
         };
         try std.testing.expectEqual(@as(usize, 2), vectors);
@@ -1766,7 +1766,7 @@ test "db merge copy attempts fence delayed leaders before finalize across reopen
         new_copy.copy_attempt = new_begin.copy_attempt;
         try Apply.command(&db, &index, .{ .merge_replication = new_copy, .writes = &.{.{ .key = "b", .value = "{\"new\":true}" }} });
         const count_before = (try range_cardinality.loadOrProveEmpty(alloc, db.core.store)).?;
-        const cardinality_key = @import("db/merge_cardinality.zig").key;
+        const cardinality_key = @import("antfly_local_sources").storage_db_merge_cardinality.key;
         const cardinality_before = (try db.core.getStoreValue(alloc, cardinality_key)).?;
         defer alloc.free(cardinality_before);
         // A delayed begin cannot take ownership back. Nor can its completion
@@ -2111,7 +2111,7 @@ test "db scoped restore rejects unverified generated vectors without a producer 
 
 fn testScopedNativeArtifactRestore(standby: bool, replace_generated: bool, unverified_generated: bool) !void {
     const alloc = std.testing.allocator;
-    const staging = @import("db/restore_staging.zig");
+    const staging = @import("antfly_local_sources").storage_db_restore_staging;
     var source_tmp = try TestDirectory.init("native-artifact-source");
     defer source_tmp.cleanup();
     var target_tmp = try TestDirectory.init("native-artifact-target");
@@ -2243,8 +2243,8 @@ fn testScopedNativeArtifactRestore(standby: bool, replace_generated: bool, unver
             const payload = try replication_effects_mod.encodeBatchMutationRequestAlloc(alloc, batch);
             defer alloc.free(payload);
             const record: replication_record_mod.RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = index_number, .previous_lsn = index_number - 1, .payload = payload };
-            try @import("db/replication_ingress.zig").applyRecord(&target, record);
-            try @import("db/replication_ingress.zig").applyRecord(&target, record);
+            try @import("antfly_local_sources").storage_db_replication_ingress.applyRecord(&target, record);
+            try @import("antfly_local_sources").storage_db_replication_ingress.applyRecord(&target, record);
         } else {
             try server_test_adapter.applyOrdered(&target, batch, .{ .term = 1, .index = index_number });
             // Lost acknowledgements replay without mutating the next page.
@@ -2339,11 +2339,11 @@ fn testScopedNativeArtifactRestore(standby: bool, replace_generated: bool, unver
 
 test "db ordered artifact inventory producer baseline resumes and includes behind-cursor writes" {
     const alloc = std.testing.allocator;
-    const publication = @import("db/artifact_publication.zig");
-    const obligations = @import("db/artifact_producer_obligations.zig");
-    const baseline = @import("db/artifact_producer_baseline.zig");
-    const codec = @import("db/artifact_publication_transport_codec.zig");
-    const transport = @import("db/artifact_publication_transport.zig");
+    const publication = @import("antfly_local_sources").storage_db_artifact_publication;
+    const obligations = @import("antfly_local_sources").storage_db_artifact_producer_obligations;
+    const baseline = @import("antfly_local_sources").storage_db_artifact_producer_baseline;
+    const codec = @import("antfly_local_sources").storage_db_artifact_publication_transport_codec;
+    const transport = @import("antfly_local_sources").storage_db_artifact_publication_transport;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/producer-baseline", .{tmp.sub_path});
@@ -2512,7 +2512,7 @@ test "db ordered artifact inventory producer baseline resumes and includes behin
         try std.testing.expectEqual(state.pending_documents, (try obligations.load(&read)).?.pending_documents);
     }
     {
-        const validation = @import("db/artifact_producer_validation.zig");
+        const validation = @import("antfly_local_sources").storage_db_artifact_producer_validation;
         var stale = (try validation.prepareRaft(alloc, reopened.core.store)).?;
         defer stale.deinit();
         try std.testing.expect(stale.command.validation.?.at_end);
@@ -2558,7 +2558,7 @@ test "db ordered artifact inventory producer baseline resumes and includes behin
 
 test "db ordered artifact inventory upload backpressure advances apply without false completion" {
     const alloc = std.testing.allocator;
-    const transport = @import("db/artifact_publication_transport.zig");
+    const transport = @import("antfly_local_sources").storage_db_artifact_publication_transport;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/publication-upload-admission", .{tmp.sub_path});
@@ -2609,10 +2609,10 @@ test "db ordered artifact inventory accepted graph receipts lose current credit 
 
 fn testGraphGenerationHeadFence(accepted_before_switch: bool) !void {
     const alloc = std.testing.allocator;
-    const publication = @import("db/artifact_publication.zig");
-    const generations = @import("db/artifact_chunk_generation.zig");
-    const chunks = @import("db/artifact_chunk_manifest.zig");
-    const planning = @import("db/artifact_graph_planning.zig");
+    const publication = @import("antfly_local_sources").storage_db_artifact_publication;
+    const generations = @import("antfly_local_sources").storage_db_artifact_chunk_generation;
+    const chunks = @import("antfly_local_sources").storage_db_artifact_chunk_manifest;
+    const planning = @import("antfly_local_sources").storage_db_artifact_graph_planning;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-head-fence", .{tmp.sub_path});
@@ -2637,7 +2637,7 @@ fn testGraphGenerationHeadFence(accepted_before_switch: bool) !void {
     defer plan.deinit();
     const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "relations");
     defer alloc.free(asset_key);
-    var token: @import("db/artifact_producer_context.zig").Token = .{ .arena = std.heap.ArenaAllocator.init(alloc), .namespace = authority.namespace, .epoch = authority.epoch, .catalog_digest = authority.catalog_digest, .producer_kind = .enrichment, .producer_name = "relations", .producer_generation = authority.epoch, .artifact_name = "relations", .source = undefined };
+    var token: @import("antfly_local_sources").storage_db_artifact_producer_context.Token = .{ .arena = std.heap.ArenaAllocator.init(alloc), .namespace = authority.namespace, .epoch = authority.epoch, .catalog_digest = authority.catalog_digest, .producer_kind = .enrichment, .producer_name = "relations", .producer_generation = authority.epoch, .artifact_name = "relations", .source = undefined };
     defer token.deinit();
     {
         var read = try db.core.store.beginReadTxn();
@@ -2651,7 +2651,7 @@ fn testGraphGenerationHeadFence(accepted_before_switch: bool) !void {
     var pinned = try db.core.store.beginReadTxn();
     defer pinned.abort();
     const Check = struct {
-        fn run(a: Allocator, read: *@import("backend_erased.zig").ReadTxn, key: []const u8) !void {
+        fn run(a: Allocator, read: *@import("antfly_local_sources").storage_backend_erased.ReadTxn, key: []const u8) !void {
             const context = try planning.Context.create(a, read, "doc", "relations", key, "{}");
             defer context.destroy();
         }
@@ -2665,7 +2665,7 @@ fn testGraphGenerationHeadFence(accepted_before_switch: bool) !void {
     try std.testing.expect(inherited);
     const count_key = try internal_keys.graphEdgeContenderCountKeyAlloc(alloc, "doc", "g");
     defer alloc.free(count_key);
-    const count = try @import("db/graph_edge_contender.zig").encodeVisibleCount(db.core.index_manager.coverageGenerationForIndex("g").?, 0);
+    const count = try @import("antfly_local_sources").storage_db_graph_edge_contender.encodeVisibleCount(db.core.index_manager.coverageGenerationForIndex("g").?, 0);
     try context.publishGraphEffects(&[_]docstore_mod.KVPair{.{ .key = count_key, .value = &count }}, &.{});
     try std.testing.expectEqual(@as(usize, 1), context.commands.items.len);
     const graph_command = context.commands.items[0];
@@ -2694,7 +2694,7 @@ fn testGraphGenerationHeadFence(accepted_before_switch: bool) !void {
     try std.testing.expectEqual(accepted_before_switch, (try publication.readReceipt(&current, graph_command, graph_command.sources[0])) != null);
     if (accepted_before_switch) {
         try std.testing.expectEqualSlices(u8, &count, try current.get(count_key));
-        try std.testing.expectError(error.EnrichmentSourceChanged, @import("db/artifact_producer_provenance.zig").readCurrentForSource(alloc, &current, graph_command, graph_command.sources[0]));
+        try std.testing.expectError(error.EnrichmentSourceChanged, @import("antfly_local_sources").storage_db_artifact_producer_provenance.readCurrentForSource(alloc, &current, graph_command, graph_command.sources[0]));
     } else try std.testing.expectError(error.NotFound, current.get(count_key));
     try std.testing.expectEqualStrings("{}", try current.get(asset_key));
     try std.testing.expectError(error.EnrichmentSourceChanged, planning.Context.create(alloc, &current.read.?, "doc", "relations", asset_key, "{}"));
@@ -2702,12 +2702,12 @@ fn testGraphGenerationHeadFence(accepted_before_switch: bool) !void {
 
 test "db ordered artifact inventory graph planning inherits selected extraction head instead of stale root" {
     const alloc = std.testing.allocator;
-    const publication = @import("db/artifact_publication.zig");
-    const provenance = @import("db/artifact_producer_provenance.zig");
-    const extraction = @import("db/artifact_extraction_generation.zig");
-    const generations = @import("db/artifact_chunk_generation.zig");
-    const chunks = @import("db/artifact_chunk_manifest.zig");
-    const planning = @import("db/artifact_graph_planning.zig");
+    const publication = @import("antfly_local_sources").storage_db_artifact_publication;
+    const provenance = @import("antfly_local_sources").storage_db_artifact_producer_provenance;
+    const extraction = @import("antfly_local_sources").storage_db_artifact_extraction_generation;
+    const generations = @import("antfly_local_sources").storage_db_artifact_chunk_generation;
+    const chunks = @import("antfly_local_sources").storage_db_artifact_chunk_manifest;
+    const planning = @import("antfly_local_sources").storage_db_artifact_graph_planning;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-extraction-head", .{tmp.sub_path});
@@ -2727,7 +2727,7 @@ test "db ordered artifact inventory graph planning inherits selected extraction 
     activation.publication_digest = activation.digest();
     try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
     const authority: publication.Authority = .{ .namespace = catalog.namespace, .epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest };
-    const scope = try @import("db/artifact_generation_scope.zig").extractionKeyAlloc(alloc, "doc", "relations");
+    const scope = try @import("antfly_local_sources").storage_db_artifact_generation_scope.extractionKeyAlloc(alloc, "doc", "relations");
     defer alloc.free(scope);
     const root_entry: extraction.Entry = .{ .name = "root", .value = "{}" };
     const encoded_entry = try extraction.encodeEntry(alloc, root_entry);
@@ -2780,12 +2780,12 @@ test "db ordered artifact inventory graph planning inherits selected extraction 
     }
     var pinned = try db.core.store.beginReadTxn();
     defer pinned.abort();
-    var view = (try extraction.View(@import("docstore.zig").DocStore.Txn).open(alloc, &pinned, scope)).?;
+    var view = (try extraction.View(@import("antfly_local_sources").storage_docstore.DocStore.Txn).open(alloc, &pinned, scope)).?;
     defer view.deinit();
     try std.testing.expectEqualStrings("{}", (try view.get(alloc, "root")).?);
     try std.testing.expectEqualStrings("{\"stale\":true}", try pinned.get(stale_root));
     const AllocationCheck = struct {
-        fn run(a: Allocator, read: *@import("backend_erased.zig").ReadTxn, head: []const u8, value: []const u8) !void {
+        fn run(a: Allocator, read: *@import("antfly_local_sources").storage_backend_erased.ReadTxn, head: []const u8, value: []const u8) !void {
             const selected_context = try planning.Context.createWithProof(a, read, "doc", "relations", head, value);
             defer selected_context.destroy();
             try std.testing.expectEqualStrings(head, selected_context.base.artifact_sources[0].key);
@@ -2815,7 +2815,7 @@ test "db ordered artifact inventory graph planning inherits selected extraction 
     }
     const count_key = try internal_keys.graphEdgeContenderCountKeyAlloc(alloc, "doc", "g");
     defer alloc.free(count_key);
-    const count = try @import("db/graph_edge_contender.zig").encodeVisibleCount(db.core.index_manager.coverageGenerationForIndex("g").?, 0);
+    const count = try @import("antfly_local_sources").storage_db_graph_edge_contender.encodeVisibleCount(db.core.index_manager.coverageGenerationForIndex("g").?, 0);
     try context.publishGraphEffects(&[_]docstore_mod.KVPair{.{ .key = count_key, .value = &count }}, &.{});
     try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = context.commands.items[0] }, .{ .term = 1, .index = 6 });
     var current = try db.core.store.beginReadTxn();
@@ -2847,7 +2847,7 @@ test "db ordered artifact inventory graph planning inherits selected extraction 
     empty_copy_command.artifact_sources = &empty_guard;
     empty_copy_command.publication_digest = empty_copy_command.digest();
     try std.testing.expectError(error.EnrichmentSourceChanged, publication.validateArtifactSources(alloc, &replaced, copy_command.namespace, copy_command.sources, copy_command.artifact_sources));
-    var empty_fence: @import("db/artifact_asset_publication.zig").UpstreamFence = .{ .key = stale_root, .requires_value = true };
+    var empty_fence: @import("antfly_local_sources").storage_db_artifact_asset_publication.UpstreamFence = .{ .key = stale_root, .requires_value = true };
     try std.testing.expectError(error.EnrichmentSourceChanged, empty_fence.bind(alloc, &replaced, empty_copy_command));
     try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = context.commands.items[0] }, .{ .term = 1, .index = 8 });
     var post = try db.core.store.beginReadTxn();
@@ -2865,9 +2865,9 @@ test "db ordered artifact inventory pending coverage upload survives reopen and 
 
 fn testAcceptedArtifactUpload(inject_missing_counter: bool) !void {
     const alloc = std.testing.allocator;
-    const publication = @import("db/artifact_publication.zig");
-    const transport = @import("db/artifact_publication_transport.zig");
-    const codec = @import("db/artifact_publication_transport_codec.zig");
+    const publication = @import("antfly_local_sources").storage_db_artifact_publication;
+    const transport = @import("antfly_local_sources").storage_db_artifact_publication_transport;
+    const codec = @import("antfly_local_sources").storage_db_artifact_publication_transport_codec;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/accepted-publication-upload", .{tmp.sub_path});
@@ -2931,8 +2931,8 @@ fn testAcceptedArtifactUpload(inject_missing_counter: bool) !void {
             preconditions[0] = .{ .key = key, .content_digest = digest, .input_position = try publication.artifactRevision(&read, catalog.namespace, key), .source_index = 0 };
         }
         const generation = db.core.index_manager.coverageGenerationForIndex("g").?;
-        counter_key = try @import("db/artifact_coverage_epoch.zig").counter(owned, @import("db/artifact_coverage_epoch.zig").forCommand(activation), "g", generation, "terminal_failed");
-        count = try @import("db/graph_edge_contender.zig").encodeVisibleCount(generation, 0);
+        counter_key = try @import("antfly_local_sources").storage_db_artifact_coverage_epoch.counter(owned, @import("antfly_local_sources").storage_db_artifact_coverage_epoch.forCommand(activation), "g", generation, "terminal_failed");
+        count = try @import("antfly_local_sources").storage_db_graph_edge_contender.encodeVisibleCount(generation, 0);
         const mutations = try owned.alloc(publication.Mutation, 1);
         mutations[0] = .{ .family = .graph, .key = key, .value = &count, .source_index = 0 };
         command = .{ .producer_kind = .graph, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "g", .producer_generation = generation, .producer_artifact_name = "relations", .sources = sources, .mutation_preconditions = preconditions, .mutations = mutations, .publication_digest = @splat(0) };
@@ -3025,10 +3025,10 @@ fn testAcceptedArtifactUpload(inject_missing_counter: bool) !void {
     try std.testing.expect((try publication.rejected(&read, command)) == null);
     try std.testing.expectEqual(@as(u64, if (inject_missing_counter) 8 else 6), (try transport.terminal(&read, command.namespace, command.publication_digest)).?.decided_index);
     try std.testing.expect((try transport.nextRecovery(&read, command.namespace, 0)) == null);
-    var proof = (try @import("db/artifact_producer_provenance.zig").readCurrentForArtifact(alloc, &read, key, &count)).?;
+    var proof = (try @import("antfly_local_sources").storage_db_artifact_producer_provenance.readCurrentForArtifact(alloc, &read, key, &count)).?;
     defer proof.deinit();
     try std.testing.expectEqualDeep(command.publication_digest, proof.proof.publication_digest);
-    const provenance = @import("db/artifact_producer_provenance.zig");
+    const provenance = @import("antfly_local_sources").storage_db_artifact_producer_provenance;
     try std.testing.expect((try provenance.readCurrentForSource(alloc, &read, command, command.sources[1])) == null);
     var accepted = (try provenance.readCurrentForSource(alloc, &read, command, command.sources[0])).?;
     defer accepted.deinit();
@@ -3062,7 +3062,7 @@ fn testAcceptedArtifactUpload(inject_missing_counter: bool) !void {
         };
         try std.testing.checkAllAllocationFailures(alloc, Verify.run, .{ &latest, command });
     }
-    const validation = @import("db/artifact_producer_validation.zig");
+    const validation = @import("antfly_local_sources").storage_db_artifact_producer_validation;
     var clean_page = (try validation.prepareRaft(alloc, db.core.store)).?;
     defer clean_page.deinit();
     try std.testing.expectEqual(@as(usize, 0), clean_page.command.validation.?.repair_documents.len);
@@ -3091,7 +3091,7 @@ fn testAcceptedArtifactUpload(inject_missing_counter: bool) !void {
     {
         var latest = try db.core.store.beginReadTxn();
         defer latest.abort();
-        const obligations = @import("db/artifact_producer_obligations.zig");
+        const obligations = @import("antfly_local_sources").storage_db_artifact_producer_obligations;
         try std.testing.expectEqual(@as(u64, 1), (try obligations.load(&latest)).?.pending_documents);
     }
     var current = try db.core.store.beginReadTxn();
@@ -3106,9 +3106,9 @@ fn testAcceptedArtifactUpload(inject_missing_counter: bool) !void {
 
 test "db ordered artifact inventory upload resumes across restart and atomically rejects then retires chunks" {
     const alloc = std.testing.allocator;
-    const publication = @import("db/artifact_publication.zig");
-    const transport = @import("db/artifact_publication_transport.zig");
-    const codec = @import("db/artifact_publication_transport_codec.zig");
+    const publication = @import("antfly_local_sources").storage_db_artifact_publication;
+    const transport = @import("antfly_local_sources").storage_db_artifact_publication_transport;
+    const codec = @import("antfly_local_sources").storage_db_artifact_publication_transport_codec;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/publication-upload", .{tmp.sub_path});
@@ -3177,10 +3177,10 @@ test "db ordered artifact inventory upload resumes across restart and atomically
 
 test "db ordered artifact inventory idle upload retirement replays across owners restart and racing chunks" {
     const alloc = std.testing.allocator;
-    const transport = @import("db/artifact_publication_transport.zig");
-    const publication = @import("db/artifact_publication.zig");
-    const codec = @import("db/artifact_publication_transport_codec.zig");
-    const obligations = @import("db/artifact_producer_obligations.zig");
+    const transport = @import("antfly_local_sources").storage_db_artifact_publication_transport;
+    const publication = @import("antfly_local_sources").storage_db_artifact_publication;
+    const codec = @import("antfly_local_sources").storage_db_artifact_publication_transport_codec;
+    const obligations = @import("antfly_local_sources").storage_db_artifact_producer_obligations;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const options: OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
@@ -3261,11 +3261,11 @@ test "db ordered artifact inventory idle upload retirement replays across owners
 
 test "db ordered artifact inventory chunk publication authenticates complete sets and rejects omitted tail retirement" {
     const alloc = std.testing.allocator;
-    const publication = @import("db/artifact_publication.zig");
-    const chunks = @import("db/artifact_chunk_manifest.zig");
-    const Context = @import("db/artifact_producer_context.zig").Token;
+    const publication = @import("antfly_local_sources").storage_db_artifact_publication;
+    const chunks = @import("antfly_local_sources").storage_db_artifact_chunk_manifest;
+    const Context = @import("antfly_local_sources").storage_db_artifact_producer_context.Token;
     const Harness = struct {
-        fn captureVector(a: Allocator, db: *DB, scope: []const u8) !@import("db/artifact_chunk_vector_publication.zig").Input {
+        fn captureVector(a: Allocator, db: *DB, scope: []const u8) !@import("antfly_local_sources").storage_db_artifact_chunk_vector_publication.Input {
             var plan = try db.core.index_manager.acquireWritePlanSnapshot();
             defer plan.release();
             var request = for (plan.plan().generated_templates) |template| {
@@ -3274,7 +3274,7 @@ test "db ordered artifact inventory chunk publication authenticates complete set
             request.doc_key = "doc";
             var read = try db.core.store.beginReadTxn();
             defer read.abort();
-            return (try @import("db/artifact_chunk_vector_publication.zig").capture(a, &read, request, plan.plan(), scope)) orelse error.TestUnexpectedResult;
+            return (try @import("antfly_local_sources").storage_db_artifact_chunk_vector_publication.capture(a, &read, request, plan.plan(), scope)) orelse error.TestUnexpectedResult;
         }
         fn checkCapture(a: Allocator, db: *DB, scope: []const u8) !void {
             var input = try captureVector(a, db, scope);
@@ -3287,11 +3287,11 @@ test "db ordered artifact inventory chunk publication authenticates complete set
             var token: Context = .{ .arena = std.heap.ArenaAllocator.init(db.alloc), .namespace = authority.namespace, .epoch = authority.epoch, .catalog_digest = authority.catalog_digest, .producer_kind = .index, .producer_name = "sparse", .producer_generation = db.core.index_manager.coverageGenerationForIndex("sparse").?, .artifact_name = "model", .producer_scope_key = scope, .source = undefined };
             errdefer token.deinit();
             token.source = try publication.capturePrimarySource(token.arena.allocator(), &read, authority.namespace, "doc");
-            var input = try @import("db/artifact_chunk_generation.zig").captureInput(db.alloc, &read, scope);
+            var input = try @import("antfly_local_sources").storage_db_artifact_chunk_generation.captureInput(db.alloc, &read, scope);
             defer input.deinit();
             // Deliberately permit uncertified legacy input in this fixture:
             // the final writer must reject it even if a sender does not.
-            if (try @import("db/artifact_producer_provenance.zig").readCurrentForArtifact(db.alloc, &read, input.proofKey(scope), input.proofValue())) |accepted| {
+            if (try @import("antfly_local_sources").storage_db_artifact_producer_provenance.readCurrentForArtifact(db.alloc, &read, input.proofKey(scope), input.proofValue())) |accepted| {
                 var proof = accepted;
                 defer proof.deinit();
                 try token.inheritProof(proof.proof);
@@ -3315,9 +3315,9 @@ test "db ordered artifact inventory chunk publication authenticates complete set
             var read = try db.core.store.beginReadTxn();
             defer read.abort();
             const raw = read.get(key) catch |err| if (err == error.NotFound) null else return err;
-            return (try @import("db/artifact_asset_publication.zig").capture(db.alloc, &read, request, plan.plan(), key, raw, .{ .ptr = db, .materialize = materialize })) orelse error.TestUnexpectedResult;
+            return (try @import("antfly_local_sources").storage_db_artifact_asset_publication.capture(db.alloc, &read, request, plan.plan(), key, raw, .{ .ptr = db, .materialize = materialize })) orelse error.TestUnexpectedResult;
         }
-        fn prepare(a: Allocator, command: publication.Command, catalogs: @import("db/artifact_inventory.zig").Catalogs) !void {
+        fn prepare(a: Allocator, command: publication.Command, catalogs: @import("antfly_local_sources").storage_db_artifact_inventory.Catalogs) !void {
             var result = try publication.prepareEffects(a, command, catalogs);
             defer result.deinit();
         }
@@ -3384,7 +3384,7 @@ test "db ordered artifact inventory chunk publication authenticates complete set
         const command = try token.command(&effects);
         const vector_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, zero, "model");
         defer alloc.free(vector_key);
-        const vector = try @import("db/enrichment/artifact_codec.zig").encodeSparseEmbeddingAlloc(alloc, 123, &.{1}, &.{2});
+        const vector = try @import("antfly_local_sources").storage_db_enrichment_artifact_codec.encodeSparseEmbeddingAlloc(alloc, 123, &.{1}, &.{2});
         defer alloc.free(vector);
         try std.testing.expectError(error.ArtifactPublicationPending, Harness.captureVector(alloc, &db, zero));
         var uncertified = try Harness.vectorToken(&db, zero, vector_key);
@@ -3451,9 +3451,9 @@ test "db ordered artifact inventory chunk publication authenticates complete set
 
 test "db ordered artifact inventory asset publication authenticates output and preserves shared text coverage" {
     const alloc = std.testing.allocator;
-    const publication = @import("db/artifact_publication.zig");
-    const asset = @import("db/artifact_asset_publication.zig");
-    const Context = @import("db/artifact_producer_context.zig").Token;
+    const publication = @import("antfly_local_sources").storage_db_artifact_publication;
+    const asset = @import("antfly_local_sources").storage_db_artifact_asset_publication;
+    const Context = @import("antfly_local_sources").storage_db_artifact_producer_context.Token;
     const Harness = struct {
         fn materialize(_: *anyopaque, a: Allocator, _: []const u8, raw: []const u8) ![]u8 {
             return a.dupe(u8, raw);
@@ -3478,7 +3478,7 @@ test "db ordered artifact inventory asset publication authenticates output and p
             var token = try captureAlloc(a, db, "first");
             defer token.deinit();
         }
-        fn checkPrepare(a: Allocator, command: publication.Command, catalogs: @import("db/artifact_inventory.zig").Catalogs) !void {
+        fn checkPrepare(a: Allocator, command: publication.Command, catalogs: @import("antfly_local_sources").storage_db_artifact_inventory.Catalogs) !void {
             var prepared = try asset.prepare(a, command, catalogs);
             defer prepared.deinit();
         }
@@ -3531,7 +3531,7 @@ test "db ordered artifact inventory asset publication authenticates output and p
             defer read.abort();
             // Bytes from the old primary remain physically present, but do
             // not establish current authoritative projection availability.
-            try std.testing.expect(!try @import("db/artifact_producer_provenance.zig").currentArtifactProduced(alloc, &read, second_key));
+            try std.testing.expect(!try @import("antfly_local_sources").storage_db_artifact_producer_provenance.currentArtifactProduced(alloc, &read, second_key));
         }
         {
             var token = try Harness.capture(&db, "second");
@@ -3545,7 +3545,7 @@ test "db ordered artifact inventory asset publication authenticates output and p
             defer token.deinit();
             const command = try token.command(&.{.{ .family = .document_artifact, .key = key, .value = null, .source_index = 0 }});
             try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = command }, .{ .term = 1, .index = ordinal * 2 + 8 });
-            const marker = try @import("db/artifact_coverage_epoch.zig").marker(alloc, @import("db/artifact_coverage_epoch.zig").forCommand(command), "text", db.core.index_manager.coverageGenerationForIndex("text").?, "doc");
+            const marker = try @import("antfly_local_sources").storage_db_artifact_coverage_epoch.marker(alloc, @import("antfly_local_sources").storage_db_artifact_coverage_epoch.forCommand(command), "text", db.core.index_manager.coverageGenerationForIndex("text").?, "doc");
             defer alloc.free(marker);
             var read = try db.core.store.beginReadTxn();
             defer read.abort();
@@ -3565,14 +3565,14 @@ test "db ordered artifact inventory asset publication authenticates output and p
 
 test "db ordered artifact inventory full text replay publishes physical coverage before sidecar" {
     const alloc = std.testing.allocator;
-    const publication = @import("db/artifact_publication.zig");
-    const certificates = @import("db/artifact_projection_certificate.zig");
+    const publication = @import("antfly_local_sources").storage_db_artifact_publication;
+    const certificates = @import("antfly_local_sources").storage_db_artifact_projection_certificate;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/physical-projection-seal", .{tmp.sub_path});
     defer alloc.free(path);
     const options: OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .index_backends = .{ .text_main_backend = .lsm }, .start_index_workers = false, .start_optional_runtimes = false };
-    var saved: @import("projection_seal.zig").Seal = undefined;
+    var saved: @import("antfly_local_sources").storage_projection_seal.Seal = undefined;
     var requirement: publication.Digest = undefined;
     {
         var db = try DB.open(alloc, path, options);
@@ -3657,9 +3657,9 @@ test "db ordered artifact inventory full text replay publishes physical coverage
             var plan = try db.core.index_manager.acquireWritePlanSnapshot();
             defer plan.release();
             for (0..16) |_| {
-                if (try @import("db/artifact_native_stream.zig").advance(alloc, db.core.store, db.root_incarnation, "doc", plan.plan()) == .closed) break;
+                if (try @import("antfly_local_sources").storage_db_artifact_native_stream.advance(alloc, db.core.store, db.root_incarnation, "doc", plan.plan()) == .closed) break;
             } else return error.TestExpectedNativeProjectionClosure;
-            const completion = @import("db/artifact_completion_progress.zig");
+            const completion = @import("antfly_local_sources").storage_db_artifact_completion_progress;
             {
                 var txn = try db.core.store.beginWriteTxn();
                 errdefer txn.abort();
@@ -3680,9 +3680,9 @@ test "db ordered artifact inventory full text replay publishes physical coverage
             var complete = blk: {
                 var read = try db.core.store.beginReadTxn();
                 defer read.abort();
-                var result = (try @import("db/artifact_completion_progress.zig").discover(alloc, &read, db.root_incarnation, "doc", plan.plan(), .{ .time_budget_ns = null })).?;
+                var result = (try @import("antfly_local_sources").storage_db_artifact_completion_progress.discover(alloc, &read, db.root_incarnation, "doc", plan.plan(), .{ .time_budget_ns = null })).?;
                 errdefer result.deinit();
-                var scheduled = (try @import("db/artifact_completion_progress.zig").discoverNextControl(alloc, &read, db.root_incarnation, "doc", plan.plan(), .{ .time_budget_ns = null })).?;
+                var scheduled = (try @import("antfly_local_sources").storage_db_artifact_completion_progress.discoverNextControl(alloc, &read, db.root_incarnation, "doc", plan.plan(), .{ .time_budget_ns = null })).?;
                 defer scheduled.deinit();
                 try std.testing.expect(scheduled == .completion);
                 try std.testing.expectEqualDeep(try result.command(), try scheduled.command());
@@ -3701,7 +3701,7 @@ test "db ordered artifact inventory full text replay publishes physical coverage
             try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = try complete.command() }, .{ .term = 1, .index = 4 });
             var read = try db.core.store.beginReadTxn();
             defer read.abort();
-            try std.testing.expectEqual(@as(u64, 0), (try @import("db/artifact_producer_obligations.zig").load(&read)).?.pending_documents);
+            try std.testing.expectEqual(@as(u64, 0), (try @import("antfly_local_sources").storage_db_artifact_producer_obligations.load(&read)).?.pending_documents);
         }
         {
             var snapshot = (try apply_state.tryAcquireProjectionSnapshot(alloc, db.core.index_manager.checkpointIo(), db.core.store, db.core.applied_sequence_checkpoint_path)).?;
@@ -3733,14 +3733,14 @@ test "db ordered artifact inventory full text replay publishes physical coverage
         defer read.abort();
         const certificate = (try certificates.load(&read, &certificates.key("text"))).?;
         try std.testing.expectError(error.EnrichmentSourceChanged, certificate.requireCurrent(&read, db.root_incarnation, requirement, saved.applied_sequence));
-        break :blk try @import("db/artifact_projection_epoch.zig").load(&read);
+        break :blk try @import("antfly_local_sources").storage_db_artifact_projection_epoch.load(&read);
     };
     try db.core.index_manager.pruneTextSplitRange("a");
     try std.testing.expect(try db.core.index_manager.textIndexEntry("text").?.persistent.loadProjectionSeal(alloc) == null);
     {
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
-        try std.testing.expect(try @import("db/artifact_projection_epoch.zig").load(&read) > before_prune);
+        try std.testing.expect(try @import("antfly_local_sources").storage_db_artifact_projection_epoch.load(&read) > before_prune);
     }
     try std.testing.expect(try db.core.index_manager.remove(db.core.store, "text"));
     var read = try db.core.store.beginReadTxn();
@@ -3750,8 +3750,8 @@ test "db ordered artifact inventory full text replay publishes physical coverage
 
 test "db ordered artifact inventory materialization replay cut is owner local atomic and durable" {
     const alloc = std.testing.allocator;
-    const publication = @import("db/artifact_publication.zig");
-    const source_gap = @import("db/artifact_source_gap.zig");
+    const publication = @import("antfly_local_sources").storage_db_artifact_publication;
+    const source_gap = @import("antfly_local_sources").storage_db_artifact_source_gap;
     var source_guard: source_gap.Guard = undefined;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3839,7 +3839,7 @@ test "db ordered artifact inventory materialization replay cut is owner local at
 
 test "db ordered artifact inventory stale publications commit rejection without artifact or replay progress" {
     const alloc = std.testing.allocator;
-    const publication = @import("db/artifact_publication.zig");
+    const publication = @import("antfly_local_sources").storage_db_artifact_publication;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/publication-rejection", .{tmp.sub_path});
@@ -3874,7 +3874,7 @@ test "db ordered artifact inventory stale publications commit rejection without 
             std.crypto.hash.sha2.Sha256.hash(try read.get(primary_key), &source.content_digest, .{});
         }
         try std.testing.expectEqual(@as(u16, 14), catalog.binding.effect_protocol);
-        try std.testing.expect((try @import("db/artifact_producer_baseline.zig").prepareRaft(alloc, db.core.store)) == null);
+        try std.testing.expect((try @import("antfly_local_sources").storage_db_artifact_producer_baseline.prepareRaft(alloc, db.core.store)) == null);
         try std.testing.expect(try db.advanceArtifactProducerBaselinePage());
         stale_source = .{ .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "model", .producer_generation = 1, .producer_artifact_name = "model", .sources = (&source)[0..1], .mutations = &effects, .publication_digest = @splat(0) };
         stale_source.publication_digest = stale_source.digest();
@@ -3912,9 +3912,9 @@ test "db ordered artifact inventory commits receipt and detects catalog drift ac
     // Logical restore copies definitions but cannot inherit another owner's
     // ordered epoch or local materialization receipt. Native Raft snapshots
     // instead preserve the complete primary store for this same namespace.
-    try std.testing.expect(!portable_backup.isPortableMetadataKey(@import("db/artifact_inventory.zig").ordered_key));
-    try std.testing.expect(!portable_backup.isPortableMetadataKey(@import("db/artifact_inventory.zig").local_key));
-    try std.testing.expect(!portable_backup.isPortableMetadataKey(@import("db/artifact_reconcile_intent.zig").key));
+    try std.testing.expect(!portable_backup.isPortableMetadataKey(@import("antfly_local_sources").storage_db_artifact_inventory.ordered_key));
+    try std.testing.expect(!portable_backup.isPortableMetadataKey(@import("antfly_local_sources").storage_db_artifact_inventory.local_key));
+    try std.testing.expect(!portable_backup.isPortableMetadataKey(@import("antfly_local_sources").storage_db_artifact_reconcile_intent.key));
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/ordered-artifacts", .{tmp.sub_path});
@@ -3968,9 +3968,9 @@ test "relational index system online admission defers during index structural mu
     defer db.close();
     try db.setSchemaJson(alloc, "{}");
     try db.updateRange(.{ .start = "m", .end = "z" });
-    try db.core.store.delete(@import("db/relational_integrity_catalog.zig").key);
+    try db.core.store.delete(@import("antfly_local_sources").storage_db_relational_integrity_catalog.key);
     const identity = try db.relationalTopologyIdentity();
-    const scope: @import("db/online_source_contract.zig").Scope = .{
+    const scope: @import("antfly_local_sources").storage_db_online_source_contract.Scope = .{
         .fence = .{ .admission_epoch = 1, .attempt = 1, .transition_id = 7, .owner_group_id = 2, .peer_group_id = 3, .role = .merge_source, .namespace = db.core.identity_namespace, .catalog_digest = identity.catalog_digest },
         .receiver_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 },
         .consumer_epoch = 1,
@@ -3987,15 +3987,15 @@ test "relational index system online admission defers during index structural mu
     {
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
-        try std.testing.expect((try @import("retained_effects.zig").load(&read)) == null);
-        try std.testing.expect((try @import("source_pin_state.zig").load(&read)) == null);
+        try std.testing.expect((try @import("antfly_local_sources").storage_retained_effects.load(&read)) == null);
+        try std.testing.expect((try @import("antfly_local_sources").storage_source_pin_state.load(&read)) == null);
     }
     try server_test_adapter.applyOrdered(&db, command, .{ .term = 2, .index = 1 });
     try std.testing.expectEqual(@as(u64, 1), (try db.orderedApplyReceipt()).?.index);
     {
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
-        try std.testing.expect((try @import("retained_effects.zig").load(&read)).?.active());
+        try std.testing.expect((try @import("antfly_local_sources").storage_retained_effects.load(&read)).?.active());
     }
 }
 

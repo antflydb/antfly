@@ -21,17 +21,17 @@
 const std = @import("std");
 const ant_json = @import("antfly-json");
 const sql_execution = @import("sql_execution.zig");
-const sql_compiler = @import("../sql/compiler.zig");
-const sql_runtime = @import("../sql/runtime.zig");
+const sql_compiler = @import("antfly_local_sources").sql_compiler;
+const sql_runtime = @import("antfly_local_sources").sql_runtime;
 const sql_plan_cache = @import("../sql/plan_cache.zig");
-const SQLMemoryBudget = @import("../sql/memory_budget.zig");
+const SQLMemoryBudget = @import("antfly_local_sources").sql_memory_budget;
 const sql_wire = @import("antfly_metadata_openapi").types;
 const httpx = @import("httpx");
-const system_catalog = @import("../system_catalog/domain.zig");
+const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 const system_catalog_routes = @import("../system_catalog/routes.zig");
 const system_catalog_http = @import("system_catalog_http.zig");
 const runtime_http_bridge = @import("antfly_runtime_abi").http_bridge;
-const inference_connection_abi = @import("../inference_connection_abi.zig");
+const inference_connection_abi = @import("antfly_local_sources").inference_connection_abi;
 const http_common = @import("../raft/transport/http_common.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
 var relational_read_diagnostic_gate: http_route_helpers.RelationalReadDiagnosticGate = .{};
@@ -40,7 +40,7 @@ var restore_owner_diagnostic_gate: http_route_helpers.RelationalReadDiagnosticGa
 var online_merge_diagnostic_gate: http_route_helpers.RelationalReadDiagnosticGate = .{};
 var txn_prepare_diagnostic_gate: http_route_helpers.RelationalReadDiagnosticGate = .{};
 const http_server_mod = @import("http_server.zig");
-const operation_contract = @import("operation.zig");
+const operation_contract = @import("antfly_local_sources").api_operation;
 const probe_operations = @import("probe_operations.zig");
 const storage_maintenance_operations = @import("storage_maintenance_operations.zig");
 const internal_group_operations = @import("internal_group_operations.zig");
@@ -58,27 +58,27 @@ const repair_jobs = @import("repair_jobs.zig");
 const ApiHttpServer = http_server_mod.ApiHttpServer;
 const AuthenticatedIdentity = http_server_mod.AuthenticatedIdentity;
 
-const common_secrets = @import("../common/secrets.zig");
-const common_config = @import("../common/config.zig");
+const common_secrets = @import("antfly_local_sources").common_secrets;
+const common_config = @import("antfly_local_sources").common_config;
 const ha_mutation_inventory = @import("../storage/hot_standby/mutation_inventory.zig");
 const cluster = @import("cluster.zig");
 const cluster_api_http = @import("cluster_api_http.zig");
 const connections_api = @import("connections.zig");
 const backups_api = @import("backups.zig");
-const batch_api = @import("batch.zig");
+const batch_api = @import("antfly_local_sources").api_batch;
 const restore_jobs = @import("restore_jobs.zig");
 const public_table_http = @import("public_table_http.zig");
 const query_request_diagnostics = @import("query_request_diagnostics.zig");
-const stored_destination_authorization = @import("stored_destination_authorization.zig");
+const stored_destination_authorization = @import("antfly_local_sources").api_stored_destination_authorization;
 const tables_api = @import("tables.zig");
 const table_contract = @import("table_contract.zig");
-const table_index_config = @import("table_index_config.zig");
-const table_reads = if (builtin.is_test) @import("antfly_source_root").antfly_sources.table_reads else @import("table_read_source.zig");
-const table_writes = @import("table_write_source.zig");
+const table_index_config = @import("antfly_local_sources").api_table_index_config;
+const table_reads = if (builtin.is_test) @import("antfly_source_root").antfly_sources.table_reads else @import("antfly_local_sources").api_table_read_source;
+const table_writes = @import("antfly_local_sources").api_table_write_source;
 const linear_merge_api = @import("linear_merge.zig");
 const transactions_api = @import("transactions.zig");
 const distributed_txn = @import("distributed_txn.zig");
-const distributed_txn_contract = @import("distributed_txn_contract.zig");
+const distributed_txn_contract = @import("antfly_local_sources").api_distributed_txn_contract;
 const distributed_graph = @import("distributed_graph.zig");
 const retrieval_agent = @import("retrieval_agent.zig");
 const research_agent = @import("research_agent.zig");
@@ -86,11 +86,11 @@ const research_jobs = @import("research_jobs.zig");
 const web_search = @import("web_search.zig");
 const web_fetch = @import("web_fetch.zig");
 const scraping = @import("antfly_scraping");
-const generating_runtime = @import("../generating/mod.zig");
-const query_api = @import("query.zig");
-const query_contract = @import("query_contract.zig");
+const generating_runtime = @import("antfly_local_sources").generating_mod;
+const query_api = @import("antfly_local_sources").api_query;
+const query_contract = @import("antfly_local_sources").api_query_contract;
 const query_builder_agent = @import("query_builder_agent.zig");
-const managed_embedder = @import("../inference/managed_embedder.zig");
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_authority = @import("../metadata/authority.zig");
@@ -106,7 +106,7 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const casbin = @import("antfly_casbin");
 const builtin = @import("builtin");
 
-const db_mod = @import("../storage/db/selected_root.zig").db;
+const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
 const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
 const metadata_server_openapi = @import("antfly_metadata_server_openapi");
@@ -2005,7 +2005,7 @@ pub const AntflyApiHandler = struct {
     fn storageMaintenanceJobResponse(
         ctx: *httpx.Context,
         status: u16,
-        snapshot: @import("../storage/maintenance.zig").Coordinator.Snapshot,
+        snapshot: @import("antfly_local_sources").storage_maintenance.Coordinator.Snapshot,
     ) !httpx.Response {
         _ = ctx.status(status);
         return ctx.json(.{
@@ -2023,7 +2023,7 @@ pub const AntflyApiHandler = struct {
     fn startStorageMaintenance(
         self: *AntflyApiHandler,
         ctx: *httpx.Context,
-        maintenance_operation: @import("../storage/maintenance.zig").Operation,
+        maintenance_operation: @import("antfly_local_sources").storage_maintenance.Operation,
     ) !httpx.Response {
         var identity: ?AuthenticatedIdentity = null;
         defer if (identity) |*authenticated| authenticated.deinit(self.api_server.alloc);
@@ -2517,9 +2517,9 @@ pub const AntflyApiHandler = struct {
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse
             return textResponse(ctx, 400, "invalid backup shard request");
-        if (ctx.header(@import("backup_contract.zig").backup_pin_control_header)) |version| {
+        if (ctx.header(@import("antfly_local_sources").api_backup_contract.backup_pin_control_header)) |version| {
             if (!std.mem.eql(u8, version, "v1") or body.len > 4096) return textResponse(ctx, 400, "invalid backup pin control");
-            var parsed = std.json.parseFromSlice(@import("../storage/db/native_backup_seal.zig").Request, ctx.allocator, body, .{}) catch
+            var parsed = std.json.parseFromSlice(@import("antfly_local_sources").storage_db_native_backup_seal.Request, ctx.allocator, body, .{}) catch
                 return textResponse(ctx, 400, "invalid backup pin control");
             defer parsed.deinit();
             const source = self.api_server.table_writes orelse return textResponse(ctx, 503, "backup owner unavailable");
@@ -2563,12 +2563,12 @@ pub const AntflyApiHandler = struct {
         }) catch return textResponse(ctx, 400, "invalid backup location");
         defer location.deinit(ctx.allocator);
 
-        const cohort = @import("backup_contract.zig").parseBackupCohortFenceHeader(ctx.header(@import("backup_contract.zig").backup_cohort_fence_header)) catch
+        const cohort = @import("antfly_local_sources").api_backup_contract.parseBackupCohortFenceHeader(ctx.header(@import("antfly_local_sources").api_backup_contract.backup_cohort_fence_header)) catch
             return textResponse(ctx, 400, "invalid backup cohort fence");
-        const sealed_raw = ctx.header(@import("backup_contract.zig").backup_sealed_handle_header);
+        const sealed_raw = ctx.header(@import("antfly_local_sources").api_backup_contract.backup_sealed_handle_header);
         if (sealed_raw != null and (cohort != null or sealed_raw.?.len > 4096)) return textResponse(ctx, 400, "invalid sealed backup authority");
-        var sealed: ?std.json.Parsed(@import("backup_contract.zig").SealedHandle) = if (sealed_raw) |value|
-            std.json.parseFromSlice(@import("backup_contract.zig").SealedHandle, ctx.allocator, value, .{}) catch return textResponse(ctx, 400, "invalid sealed backup authority")
+        var sealed: ?std.json.Parsed(@import("antfly_local_sources").api_backup_contract.SealedHandle) = if (sealed_raw) |value|
+            std.json.parseFromSlice(@import("antfly_local_sources").api_backup_contract.SealedHandle, ctx.allocator, value, .{}) catch return textResponse(ctx, 400, "invalid sealed backup authority")
         else
             null;
         defer if (sealed) |*value| value.deinit();
@@ -5600,7 +5600,7 @@ pub const AntflyApiHandler = struct {
                 var binding_budget: SQLMemoryBudget = .{ .backing = std.heap.page_allocator, .limit = 32 << 20 };
                 var describe_backend = self.adapter.backend();
                 if (compiled.uses_current_setting) describe_backend.setting_capture = self.adapter.settingCapture();
-                var description = @import("../sql/describe.zig").describe(binding_budget.allocator(), describe_backend, compiled, &.{}) catch |err| return if (binding_budget.exhausted) error.SqlProgramLimitExceeded else err;
+                var description = @import("antfly_local_sources").sql_describe.describe(binding_budget.allocator(), describe_backend, compiled, &.{}) catch |err| return if (binding_budget.exhausted) error.SqlProgramLimitExceeded else err;
                 defer description.deinit();
                 var bytes: [16]u8 = undefined;
                 try self.cache_io.randomSecure(&bytes);
@@ -6420,7 +6420,7 @@ pub const AntflyApiHandler = struct {
         if (!http_server_mod.permissionsAllow(admitted.permissions, .@"*", "*", .admin)) return jsonErrorResponse(ctx, 403, "forbidden");
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing setting mutation");
         if (body.len > system_catalog.max_command_bytes) return textResponse(ctx, 413, "setting request too large");
-        const settings = @import("../system_catalog/settings.zig");
+        const settings = @import("antfly_local_sources").system_catalog_settings;
         var parsed = std.json.parseFromSlice(settings.Request, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid setting mutation");
         defer parsed.deinit();
         var context = operationContext(ctx, identity);
@@ -6881,7 +6881,7 @@ pub const AntflyApiHandler = struct {
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         if (params.pattern != null) return textResponse(ctx, 400, "unsupported table pattern");
         const route = try system_catalog_routes.parseAlloc(ctx.allocator, http_server_mod.stripApiPrefix(ctx.request.uri.path));
-        var request: @import("../system_catalog/domain.zig").TableList = .{
+        var request: @import("antfly_local_sources").system_catalog_domain.TableList = .{
             .database = if (route) |value| value.database else "default",
             .namespace = if (route) |value| value.namespace else "public",
             .prefix = params.prefix,
@@ -7480,7 +7480,7 @@ pub const AntflyApiHandler = struct {
         return self.relationalMutationImpl(ctx, table_name, .retire);
     }
 
-    fn relationalMutationImpl(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, comptime recovery: @FieldType(@import("operation.zig").RequestContext, "relational_recovery")) !httpx.Response {
+    fn relationalMutationImpl(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, comptime recovery: @FieldType(@import("antfly_local_sources").api_operation.RequestContext, "relational_recovery")) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
@@ -7711,7 +7711,7 @@ pub const AntflyApiHandler = struct {
             error.ForeignKeyPartialSupportIndexRequired, error.ForeignKeyPartialSupportIndexConflict => return witnessDDLError(ctx, err),
             error.GeneratedColumnRewriteRequired => {
                 _ = ctx.status(409);
-                return ctx.text(@import("../schema/relational_expression_errors.zig").rewrite_required_message);
+                return ctx.text(@import("antfly_local_sources").schema_relational_expression_errors.rewrite_required_message);
             },
             error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest, error.SchemaVersionManagedByBackend => {
                 invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(err, body_data);
@@ -7789,7 +7789,7 @@ pub const AntflyApiHandler = struct {
                 _ = table_writes_source.updateSchema(alloc, decoded_table_name, schema_json) catch |write_err| switch (write_err) {
                     error.GeneratedColumnRewriteRequired => {
                         _ = ctx.status(409);
-                        return ctx.text(@import("../schema/relational_expression_errors.zig").rewrite_required_message);
+                        return ctx.text(@import("antfly_local_sources").schema_relational_expression_errors.rewrite_required_message);
                     },
                     error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => {
                         _ = ctx.status(400);
@@ -8593,7 +8593,7 @@ pub const AntflyApiHandler = struct {
         return self.maintainIndex(ctx, table_name, index_name, .repair);
     }
 
-    fn maintainIndex(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8, action: @import("../storage/db/relational_index_maintenance_contract.zig").Action) !httpx.Response {
+    fn maintainIndex(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8, action: @import("antfly_local_sources").storage_db_relational_index_maintenance_contract.Action) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
@@ -11186,7 +11186,7 @@ test "httpx ARD routes call typed contextual operations directly" {
 
 test "httpx storage maintenance routes call typed operations directly" {
     const alloc = std.testing.allocator;
-    const maintenance_mod = @import("../storage/maintenance.zig");
+    const maintenance_mod = @import("antfly_local_sources").storage_maintenance;
     const FakeMaintenance = struct {
         fn source(self: *@This()) maintenance_mod.Source {
             return .{ .ptr = self, .vtable = &.{ .status = status, .run = run } };
@@ -12401,7 +12401,7 @@ test "httpx SQL durable session settings enforce scoped typed authority" {
         prepare_registry: ?*transactions_api.SessionRegistry = null,
         prepare_session_id: ?db_mod.types.TxnId = null,
         observed_prepare_lease: bool = false,
-        const setting_definitions = [_]@import("../sql/setting_catalog.zig").Definition{
+        const setting_definitions = [_]@import("antfly_local_sources").sql_setting_catalog.Definition{
             .{ .identity = .{ .id = 1, .generation = 1 }, .name = "app.limit", .kind = .integer, .session_writable = true, .default = .{ .integer = 3 } },
             .{ .identity = .{ .id = 2, .generation = 1 }, .name = "app.secret", .kind = .string, .policy_sensitive = true, .default = .{ .string = "hidden" } },
             .{ .identity = .{ .id = 3, .generation = 1 }, .name = "app.mode", .kind = .string, .session_writable = true, .default = .{ .string = "base" } },
@@ -12425,13 +12425,13 @@ test "httpx SQL durable session settings enforce scoped typed authority" {
                 self.observed_prepare_lease = true;
             }
             self.setting_reads += 1;
-            return std.json.Stringify.valueAlloc(arena, @import("../sql/setting_catalog.zig").RawSnapshot{ .scope = call.setting_snapshot, .epoch = self.setting_epoch, .definitions = &setting_definitions }, .{});
+            return std.json.Stringify.valueAlloc(arena, @import("antfly_local_sources").sql_setting_catalog.RawSnapshot{ .scope = call.setting_snapshot, .epoch = self.setting_epoch, .definitions = &setting_definitions }, .{});
         }
     };
     var source: Source = .{};
     var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
     defer backend_runtime.deinit();
-    var storage = @import("../storage/mem_backend.zig").Backend.init(alloc, .{});
+    var storage = @import("antfly_local_sources").storage_mem_backend.Backend.init(alloc, .{});
     defer storage.close();
     var session_store = try storage.runtimeStore(alloc, .{ .name = "http-sql-settings-test" });
     defer session_store.deinit();
@@ -12686,7 +12686,7 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     const bob_auth = try encodeBasicAuthorization(alloc, "connection_bob", "secret");
     defer alloc.free(bob_auth);
     const Source = struct {
-        const definitions = [_]@import("../sql/setting_catalog.zig").Definition{
+        const definitions = [_]@import("antfly_local_sources").sql_setting_catalog.Definition{
             .{ .identity = .{ .id = 1, .generation = 1 }, .name = "app.limit", .kind = .integer, .session_writable = true, .default = .{ .integer = 3 } },
         };
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
@@ -12695,13 +12695,13 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
         fn catalog(_: *anyopaque, arena: std.mem.Allocator, context: operation_contract.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             if (call != .setting_snapshot) return error.TestUnexpectedCatalogCall;
             if (!std.mem.eql(u8, context.setting_read_principal orelse "", call.setting_snapshot.principal)) return error.Forbidden;
-            return std.json.Stringify.valueAlloc(arena, @import("../sql/setting_catalog.zig").RawSnapshot{ .scope = call.setting_snapshot, .epoch = 1, .definitions = &definitions }, .{});
+            return std.json.Stringify.valueAlloc(arena, @import("antfly_local_sources").sql_setting_catalog.RawSnapshot{ .scope = call.setting_snapshot, .epoch = 1, .definitions = &definitions }, .{});
         }
     };
     var source: Source = .{};
     var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
     defer backend_runtime.deinit();
-    var storage = @import("../storage/mem_backend.zig").Backend.init(alloc, .{});
+    var storage = @import("antfly_local_sources").storage_mem_backend.Backend.init(alloc, .{});
     defer storage.close();
     var native = try storage.runtimeStore(alloc, .{ .name = "http-sql-connection-routes-test" });
     defer native.deinit();
@@ -12837,7 +12837,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
     ;
     const Source = struct {
         schema: []const u8 = schema_json,
-        records: [1]@import("../common/topology_records.zig").TableRecord = .{.{ .table_id = 7, .name = "usage_records", .schema_json = schema_json }},
+        records: [1]@import("antfly_local_sources").common_topology_records.TableRecord = .{.{ .table_id = 7, .name = "usage_records", .schema_json = schema_json }},
         calls: usize = 0,
         replace_after_open: bool = false,
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
@@ -12871,7 +12871,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         }
         fn freeSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
-    var directory = try @import("../common/test_directory.zig").TestDirectory.init("antfly-httpx-sql");
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("antfly-httpx-sql");
     defer directory.cleanup();
     var db = try db_mod.DB.open(alloc, directory.path(), .{});
     defer db.close();
@@ -12890,7 +12890,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
     var reads = table_reads.BoundTableReadSource.init("usage_records", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
     defer backend_runtime.deinit();
-    var prepared_backend = @import("../storage/mem_backend.zig").Backend.init(alloc, .{});
+    var prepared_backend = @import("antfly_local_sources").storage_mem_backend.Backend.init(alloc, .{});
     defer prepared_backend.close();
     var prepared_store = try prepared_backend.runtimeStore(alloc, .{ .name = "http-prepared-test" });
     defer prepared_store.deinit();
@@ -12922,7 +12922,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         // sql-0438 through sql-0449 execute pinned source text over native
         // rows, checking both projection aliases and complete set-operation
         // output. Mixed-case and absent status cells distinguish each filter.
-        const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @embedFile("../sql/fixtures/sql_parity_inventory.json"), .{});
+        const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @import("antfly_local_sources").sql_parity_fixtures.inventory, .{});
         defer corpus.deinit();
         const cases = [_]struct { id: []const u8, ids: []const []const u8, alias: bool = false }{
             .{ .id = "sql-0438", .ids = &.{ "9007199254740993", "2", "3", "4", "5", "6", "7", "8", "9" }, .alias = true },
@@ -12973,7 +12973,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         }
     }
     {
-        const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @embedFile("../sql/fixtures/sql_parity_inventory.json"), .{});
+        const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @import("antfly_local_sources").sql_parity_fixtures.inventory, .{});
         defer corpus.deinit();
         const exact_sql = for (corpus.value.object.get("entries").?.array.items) |entry| {
             if (std.mem.eql(u8, entry.object.get("id").?.string, "sql-0019")) break entry.object.get("sql").?.string;
@@ -12996,7 +12996,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         }
     }
     {
-        const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @embedFile("../sql/fixtures/sql_parity_inventory.json"), .{});
+        const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @import("antfly_local_sources").sql_parity_fixtures.inventory, .{});
         defer corpus.deinit();
         for ([_][]const u8{ "sql-0020", "sql-1254", "sql-1255" }) |case_id| {
             const exact_sql = for (corpus.value.object.get("entries").?.array.items) |entry| {
@@ -13023,7 +13023,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         }
     }
     {
-        const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @embedFile("../sql/fixtures/sql_parity_inventory.json"), .{});
+        const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @import("antfly_local_sources").sql_parity_fixtures.inventory, .{});
         defer corpus.deinit();
         const cases = [_]struct { id: []const u8, rows: []const []const []const u8 }{
             .{ .id = "sql-1221", .rows = &.{ &.{"8"}, &.{"7"}, &.{"6"}, &.{"4"}, &.{"9007199254740993"} } },
@@ -13067,7 +13067,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         // the latter reaches cardinality through correlated customer groups.
         // The neighboring text-key cases use a separate text-id fixture below;
         // this table's integer id correctly rejects their 'u1' literal.
-        const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @embedFile("../sql/fixtures/sql_parity_inventory.json"), .{});
+        const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @import("antfly_local_sources").sql_parity_fixtures.inventory, .{});
         defer corpus.deinit();
         for ([_][]const u8{ "sql-1270", "sql-1307" }) |case_id| {
             const exact_sql = for (corpus.value.object.get("entries").?.array.items) |entry| {
@@ -13093,7 +13093,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         // sql-1283 through sql-1297 and selected correlated cases exercise
         // existence, membership, quantified extrema, bounded pattern sets,
         // and OR-correlated witness summaries.
-        const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @embedFile("../sql/fixtures/sql_parity_inventory.json"), .{});
+        const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @import("antfly_local_sources").sql_parity_fixtures.inventory, .{});
         defer corpus.deinit();
         const cases = [_]struct { id: []const u8, ids: []const []const u8 }{
             .{ .id = "sql-1273", .ids = &.{ "9007199254740993", "2", "3", "4", "5", "6", "7", "8", "9" } },
@@ -13261,7 +13261,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         // sql-0064/sql-0065: exact original EXPLAIN reads through mounted
         // HTTP. Binding resolves catalog identity; the component test proves
         // plan rendering opens no native row page or mutation.
-        const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @embedFile("../sql/fixtures/sql_parity_inventory.json"), .{});
+        const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @import("antfly_local_sources").sql_parity_fixtures.inventory, .{});
         defer corpus.deinit();
         source.calls = 0;
         for ([_][]const u8{ "sql-0064", "sql-0065" }) |case_id| {
@@ -13338,7 +13338,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             .{ .key = "only-15", .value = "{\"id\":15,\"status\":\"ready\",\"created_at\":\"2026-02-15\"}" },
             .{ .key = "only-16", .value = "{\"id\":16,\"status\":\"closed\",\"created_at\":\"2026-02-16\"}" },
         }, .timestamp_ns = 43 });
-        const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @embedFile("../sql/fixtures/sql_parity_inventory.json"), .{});
+        const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @import("antfly_local_sources").sql_parity_fixtures.inventory, .{});
         defer corpus.deinit();
         const exact_sql = for (corpus.value.object.get("entries").?.array.items) |entry| {
             if (std.mem.eql(u8, entry.object.get("id").?.string, "sql-0170")) break entry.object.get("sql").?.string;
@@ -13368,7 +13368,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         const text_schema_json =
             \\{"version":1,"storage_mode":"relational","default_type":"row","column_defaults":[{"column":"id","expression":{"op":"literal","type":"string","value":"u_schema_default"}},{"column":"status","expression":{"op":"literal","type":"string","value":"reset"}},{"column":"amount","expression":{"op":"literal","type":"integer","value":9}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"quantity":{"type":"integer"},"amount":{"type":"integer"},"created_at_ns":{"type":"datetime"}},"additionalProperties":false}}}}
         ;
-        var text_directory = try @import("../common/test_directory.zig").TestDirectory.init("antfly-httpx-sql-text-id");
+        var text_directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("antfly-httpx-sql-text-id");
         defer text_directory.cleanup();
         var text_db = try db_mod.DB.open(alloc, text_directory.path(), .{});
         defer text_db.close();
@@ -13383,7 +13383,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         var text_server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable }, .{ .ptr = &text_source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, text_reads.source(), text_writes.source());
         defer text_server.deinit();
         var text_handler = AntflyApiHandler{ .api_server = &text_server };
-        const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @embedFile("../sql/fixtures/sql_parity_inventory.json"), .{});
+        const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @import("antfly_local_sources").sql_parity_fixtures.inventory, .{});
         defer corpus.deinit();
         {
             // sql-0066: the original INSERT explanation binds against the
@@ -13702,7 +13702,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             const timestamp_schema_json =
                 \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"created_at_ns":{"type":"datetime"}},"additionalProperties":false}}}}
             ;
-            var timestamp_directory = try @import("../common/test_directory.zig").TestDirectory.init("antfly-httpx-sql-timestamp-literal");
+            var timestamp_directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("antfly-httpx-sql-timestamp-literal");
             defer timestamp_directory.cleanup();
             var timestamp_db = try db_mod.DB.open(alloc, timestamp_directory.path(), .{});
             defer timestamp_db.close();
@@ -13853,7 +13853,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         const text_schema =
             \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"additionalProperties":false}}}}
         ;
-        var text_directory = try @import("../common/test_directory.zig").TestDirectory.init("antfly-pgwire-prepared-insert");
+        var text_directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("antfly-pgwire-prepared-insert");
         defer text_directory.cleanup();
         var text_db = try db_mod.DB.open(alloc, text_directory.path(), .{});
         defer text_db.close();
@@ -13890,7 +13890,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         try input.writer.writeInt(u32, 196608, .big);
         try input.writer.writeAll(startup_body);
         try Wire.frame(&input.writer, 'p', "secret\x00");
-        const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @embedFile("../sql/fixtures/sql_parity_inventory.json"), .{});
+        const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @import("antfly_local_sources").sql_parity_fixtures.inventory, .{});
         defer corpus.deinit();
         const prepare_sql = for (corpus.value.object.get("entries").?.array.items) |entry| {
             if (std.mem.eql(u8, entry.object.get("id").?.string, "sql-0002")) break entry.object.get("sql").?.string;
@@ -13961,10 +13961,10 @@ test "httpx SQL executes one relational page with exact integer parameters" {
 
 test "httpx SQL coordinated UNIQUE owner rejects duplicate batch and updates default collision" {
     const alloc = std.testing.allocator;
-    const integrity = @import("relational_integrity_commit.zig");
-    const owner = @import("../storage/db/relational_integrity.zig");
-    const activation = @import("../storage/db/relational_integrity_activation_contract.zig");
-    const native_catalog = @import("../storage/db/relational_integrity_catalog.zig");
+    const integrity = @import("antfly_local_sources").api_relational_integrity_commit;
+    const owner = @import("antfly_local_sources").storage_db_relational_integrity;
+    const activation = @import("antfly_local_sources").storage_db_relational_integrity_activation_contract;
+    const native_catalog = @import("antfly_local_sources").storage_db_relational_integrity_catalog;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"id_unique","columns":["id"]}],"column_defaults":[{"column":"id","expression":{"op":"literal","type":"string","value":"u_default"}},{"column":"status","expression":{"op":"literal","type":"string","value":"reset"}},{"column":"amount","expression":{"op":"literal","type":"integer","value":9}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"integer"}},"additionalProperties":false}}}}
     ;
@@ -13993,14 +13993,14 @@ test "httpx SQL coordinated UNIQUE owner rejects duplicate batch and updates def
         envelope: []const u8,
         digest: [32]u8,
         generation_set: [32]u8,
-        records: [1]@import("../common/topology_records.zig").TableRecord = .{.{ .table_id = 7, .name = "usage_records", .schema_json = schema_json }},
-        ranges: [1]@import("../common/topology_records.zig").RangeRecord = .{.{ .group_id = 8, .table_id = 7, .start_key = "" }},
+        records: [1]@import("antfly_local_sources").common_topology_records.TableRecord = .{.{ .table_id = 7, .name = "usage_records", .schema_json = schema_json }},
+        ranges: [1]@import("antfly_local_sources").common_topology_records.RangeRecord = .{.{ .group_id = 8, .table_id = 7, .start_key = "" }},
         owner_attempts: usize = 0,
         primary_apply_attempts: usize = 0,
-        seeded_claim: ?@import("../storage/db/relational_integrity_contract.zig").Claim = null,
-        seeded_address: ?@import("../storage/db/relational_integrity_contract.zig").Address = null,
+        seeded_claim: ?@import("antfly_local_sources").storage_db_relational_integrity_contract.Claim = null,
+        seeded_address: ?@import("antfly_local_sources").storage_db_relational_integrity_contract.Address = null,
         default_conflict: bool = false,
-        native_reads: ?@import("table_read_source.zig").TableReadSource = null,
+        native_reads: ?@import("antfly_local_sources").api_table_read_source.TableReadSource = null,
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
@@ -14036,7 +14036,7 @@ test "httpx SQL coordinated UNIQUE owner rejects duplicate batch and updates def
             if (self.native_reads) |source| return source.lookup(a, table, key, opts, consistency);
             return null;
         }
-        fn openRead(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.read_gate.ReadConsistency) !?@import("table_read_source.zig").RelationalReadView {
+        fn openRead(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.read_gate.ReadConsistency) !?@import("antfly_local_sources").api_table_read_source.RelationalReadView {
             const self: *Self = @ptrCast(@alignCast(ptr));
             return (self.native_reads orelse return null).openRelationalRead(a, table, from, to, opts, consistency);
         }
@@ -14076,7 +14076,7 @@ test "httpx SQL coordinated UNIQUE owner rejects duplicate batch and updates def
             return .{ .committed = .{ .participant_count = 1 } };
         }
     };
-    var directory = try @import("../common/test_directory.zig").TestDirectory.init("antfly-httpx-sql-unique-batch");
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("antfly-httpx-sql-unique-batch");
     defer directory.cleanup();
     var db = try db_mod.DB.open(alloc, directory.path(), .{ .identity_namespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 }, .start_optional_runtimes = false, .start_index_workers = false });
     defer db.close();
@@ -14097,7 +14097,7 @@ test "httpx SQL coordinated UNIQUE owner rejects duplicate batch and updates def
     var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status, .system_catalog = Fixture.catalog, .admin_snapshot = Fixture.snapshot, .free_admin_snapshot = Fixture.freeSnapshot, .supports_query_definitions = true } }, .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .open_relational_read = Fixture.openRead, .scan = undefined, .query = undefined } }, .{ .ptr = &fixture, .vtable = &.{ .batch = Fixture.batch, .commit_batch = Fixture.commit } });
     defer server.deinit();
     var handler = AntflyApiHandler{ .api_server = &server };
-    const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @embedFile("../sql/fixtures/sql_parity_inventory.json"), .{});
+    const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @import("antfly_local_sources").sql_parity_fixtures.inventory, .{});
     defer corpus.deinit();
     const exact_sql = for (corpus.value.object.get("entries").?.array.items) |entry| {
         if (std.mem.eql(u8, entry.object.get("id").?.string, "sql-1484")) break entry.object.get("sql").?.string;
@@ -14128,7 +14128,7 @@ test "httpx SQL coordinated UNIQUE owner rejects duplicate batch and updates def
     try db.commitTransaction(seed_txn, 46);
     var seed = (try db.lookup(alloc, "seed-primary", .{ .include_primary_digest = true })).?;
     defer seed.deinit(alloc);
-    const records = [_]@import("../common/topology_records.zig").TableRecord{fixture.records[0]};
+    const records = [_]@import("antfly_local_sources").common_topology_records.TableRecord{fixture.records[0]};
     var backfill = try integrity.prepareBackfill(alloc, .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .open_relational_read = Fixture.openRead, .scan = undefined, .query = undefined } }, &records, "usage_records", &.{.{ .key = "seed-primary", .json = seed.json, .version = seed.version.?, .expected_content_digest = seed.expected_content_digest }}, .unique);
     defer backfill.deinit();
     try std.testing.expectEqual(@as(usize, 1), backfill.tables[0].integrity_commands.len);
@@ -14173,7 +14173,7 @@ test "httpx SQL coordinated UNIQUE owner rejects duplicate batch and updates def
 
 test "httpx relational row query mutation endpoints enforce exact versions and schema epochs" {
     const alloc = std.testing.allocator;
-    var directory = try @import("../common/test_directory.zig").TestDirectory.init("antfly-httpx-relational-rows");
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("antfly-httpx-relational-rows");
     defer directory.cleanup();
     var db = try db_mod.DB.open(alloc, directory.path(), .{});
     defer db.close();
@@ -14718,9 +14718,9 @@ test "httpx antfly schema update owns self partial support and requires coordina
     // a new FK generation through this fixture's ordinary schema CAS alone.
     const supported = try api_server.preparePartialWitnessSchema(alloc, "docs", body, initial, .{});
     defer alloc.free(supported);
-    var prepared = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, supported);
+    var prepared = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, supported);
     defer prepared.deinit(alloc);
-    try @import("../schema/relational_witness_indexes.zig").requireCoverage(prepared, &.{"id"});
+    try @import("antfly_local_sources").schema_relational_witness_indexes.requireCoverage(prepared, &.{"id"});
     for (0..2) |_| {
         var response = try requestWithRetry(&client, client_io.io(), .PUT, url, body, &headers, 20);
         defer response.deinit();
@@ -14736,7 +14736,7 @@ test "httpx antfly schema update owns self partial support and requires coordina
     defer rejected.deinit();
     try std.testing.expectEqual(@as(u16, 400), rejected.status.code);
     try std.testing.expect(std.mem.indexOf(u8, rejected.body.?, "server-owned") != null);
-    const index_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/indexes/{s}", .{ base_url, @import("../schema/relational_witness_indexes.zig").supportName("id") });
+    const index_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/indexes/{s}", .{ base_url, @import("antfly_local_sources").schema_relational_witness_indexes.supportName("id") });
     defer alloc.free(index_url);
     var dropped = try requestWithRetry(&client, client_io.io(), .DELETE, index_url, null, &headers, 20);
     defer dropped.deinit();
@@ -14831,15 +14831,15 @@ test "httpx FK source control rejects missing service token in legacy internal m
 test "httpx restore owner accepts bounded rewrite source chunks above legacy control limit" {
     const alloc = std.testing.allocator;
     const contract = @import("restore_owner_contract.zig");
-    const rewrite = @import("../storage/db/relational_rewrite_contract.zig");
-    const transfer = @import("../storage/db/source_artifact_transfer.zig");
-    const source_scope: @import("../storage/db/online_source_contract.zig").Scope = .{
+    const rewrite = @import("antfly_local_sources").storage_db_relational_rewrite_contract;
+    const transfer = @import("antfly_local_sources").storage_db_source_artifact_transfer;
+    const source_scope: @import("antfly_local_sources").storage_db_online_source_contract.Scope = .{
         .fence = .{ .role = .rewrite_source, .transition_id = 1, .attempt = 1, .owner_group_id = 11, .peer_group_id = 22, .namespace = .{ .table_id = 1, .shard_id = 11, .range_id = 11 }, .admission_epoch = 1, .catalog_digest = @splat(1) },
         .receiver_namespace = .{ .table_id = 2, .shard_id = 22, .range_id = 22 },
         .consumer_epoch = 1,
         .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
     };
-    const certificate: @import("../storage/source_snapshot.zig").Certificate = .{
+    const certificate: @import("antfly_local_sources").storage_source_snapshot.Certificate = .{
         .cut = .{ .namespace = source_scope.fence.namespace, .applied_index = 1, .retained_start = 0 },
         .objects = 1,
         .content_bytes = 1,
@@ -14862,7 +14862,7 @@ test "httpx restore owner accepts bounded rewrite source chunks above legacy con
     const Fixture = struct {
         calls: std.atomic.Value(u32) = .init(0),
         failure: ?anyerror = null,
-        fn execute(ptr: *anyopaque, _: std.mem.Allocator, table: []const u8, group: u64, input: contract.Request, context: @import("operation.zig").RequestContext) !contract.Response {
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, table: []const u8, group: u64, input: contract.Request, context: @import("antfly_local_sources").api_operation.RequestContext) !contract.Response {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try context.ensureActive();
             try input.validate(group);
@@ -14950,14 +14950,14 @@ test "httpx schema rewrite accepted job atomically stores draft and preserves id
             if (self.row) |value| self.alloc.free(value);
             if (self.plan) |value| self.alloc.free(value);
         }
-        fn readFacts(ptr: *anyopaque, a: std.mem.Allocator, group: u64, table: []const u8, request: @import("online_merge_io.zig").contract.Request, context: @import("operation.zig").RequestContext) ![]u8 {
+        fn readFacts(ptr: *anyopaque, a: std.mem.Allocator, group: u64, table: []const u8, request: @import("online_merge_io.zig").contract.Request, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try context.ensureActive();
             try request.validate();
             try std.testing.expectEqualStrings("docs", table);
             try std.testing.expectEqual(@as(u64, 7001), group);
             try std.testing.expect(request.operation == .admission and request.operation.admission == .donor);
-            try std.testing.expectEqual(@import("../storage/db/relational_integrity_topology_contract.zig").Role.rewrite_source, request.scope.fence.role);
+            try std.testing.expectEqual(@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Role.rewrite_source, request.scope.fence.role);
             _ = self.admissions.fetchAdd(1, .monotonic);
             return std.json.Stringify.valueAlloc(a, @import("online_merge_io.zig").contract.AdmissionFacts{
                 .namespace = request.scope.fence.namespace,
@@ -14971,7 +14971,7 @@ test "httpx schema rewrite accepted job atomically stores draft and preserves id
                 .generation_handoff = .{
                     .namespace = request.scope.fence.namespace,
                     .admissions = &.{},
-                    .admissions_digest = try @import("../storage/portable_backup.zig").sourceGenerationAdmissionSummaryDigest(request.scope.fence.namespace, &.{}),
+                    .admissions_digest = try @import("antfly_local_sources").storage_portable_backup.sourceGenerationAdmissionSummaryDigest(request.scope.fence.namespace, &.{}),
                     // Owner-authenticated empty retirement set; zero is the
                     // missing-proof sentinel and must never be admitted.
                     .retired_digest = @splat(7),

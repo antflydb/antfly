@@ -15,7 +15,7 @@
 const std = @import("std");
 const casbin = @import("antfly_casbin");
 const storage = @import("usermgr_storage");
-const user_manager = @import("user_manager.zig");
+const user_manager = @import("antfly_local_sources").usermgr_user_manager;
 
 const Allocator = std.mem.Allocator;
 const backend_erased = storage.backend_erased;

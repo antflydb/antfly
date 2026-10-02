@@ -6,11 +6,11 @@
 //! one memory budget and are reclaimed before the next pull. Blocking plans
 //! explicitly decline this path, never pretend that LIMIT is a continuation.
 const std = @import("std");
-const catalog = @import("catalog.zig");
-const compiler = @import("compiler.zig");
-const runtime = @import("runtime.zig");
-const describe = @import("describe.zig");
-const Budget = @import("memory_budget.zig");
+const catalog = @import("antfly_local_sources").sql_catalog;
+const compiler = @import("antfly_local_sources").sql_compiler;
+const runtime = @import("antfly_local_sources").sql_runtime;
+const describe = @import("antfly_local_sources").sql_describe;
+const Budget = @import("antfly_local_sources").sql_memory_budget;
 const Json = std.json.Value;
 
 pub const Page = struct {
@@ -36,7 +36,7 @@ const Fixture = struct {
     fn backend(self: *Fixture) catalog.Backend {
         return .{ .ptr = self, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = openScan, .mutate = mutate, .checkpoint = checkpoint } };
     }
-    fn resolve(_: *anyopaque, _: std.mem.Allocator, _: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
+    fn resolve(_: *anyopaque, _: std.mem.Allocator, _: @import("antfly_local_sources").sql_ast.Name, _: catalog.Action) !catalog.Table {
         return .{ .id = 1, .physical_name = "docs", .schema_version = 1, .columns = &.{.{ .name = "n", .path = "n", .type = .integer }} };
     }
     fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
@@ -103,7 +103,7 @@ test "SQL pull stream releases pages and streams beyond materialized result limi
 }
 
 test "SQL pull stream keeps one pinned policy setting across pages" {
-    const settings = @import("setting_catalog.zig");
+    const settings = @import("antfly_local_sources").sql_setting_catalog;
     const Owner = struct {
         value: []const u8 = "tenant-a",
         definition: settings.Definition = .{ .identity = .{ .id = 10, .generation = 1 }, .name = "app.tenant", .kind = .string, .policy_sensitive = true, .default = .{ .string = "tenant-a" } },
@@ -199,7 +199,7 @@ test "SQL pull stream unwinds every allocation failure" {
 pub const Stream = struct {
     budget: Budget,
     arena: std.heap.ArenaAllocator,
-    settings: ?*@import("setting_catalog.zig").View = null,
+    settings: ?*@import("antfly_local_sources").sql_setting_catalog.View = null,
     context: runtime.Context,
     cursor: ?catalog.Cursor = null,
     fields: []const []const u8,
@@ -230,8 +230,8 @@ pub const Stream = struct {
         const arena = self.arena.allocator();
         var statement_backend = backend;
         if (backend.setting_capture) |capture| {
-            const view = try arena.create(@import("setting_catalog.zig").View);
-            view.* = try @import("setting_catalog.zig").View.capture(self.budget.allocator(), capture.owner, capture.scope, capture.overlay);
+            const view = try arena.create(@import("antfly_local_sources").sql_setting_catalog.View);
+            view.* = try @import("antfly_local_sources").sql_setting_catalog.View.capture(self.budget.allocator(), capture.owner, capture.scope, capture.overlay);
             self.settings = view;
             statement_backend.settings_view = view;
         }
@@ -283,7 +283,7 @@ pub const Stream = struct {
         self.cursor = null;
         if (!self.exhausted) {
             if (binding.relation != null) {
-                self.cursor = try @import("relation_runtime.zig").openCursor(self.context);
+                self.cursor = try @import("antfly_local_sources").sql_relation_runtime.openCursor(self.context);
             } else {
                 const open_scan = backend.vtable.open_scan orelse return error.SqlStatementSnapshotRequired;
                 self.cursor = (try open_scan(backend.ptr, self.budget.allocator(), table, .{

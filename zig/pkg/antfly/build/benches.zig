@@ -17,15 +17,15 @@ pub const wal_bench_root = "pkg/antfly/src/wal_bench_root.zig";
 pub const derived_log_bench_root = "pkg/antfly/src/derived_log_bench_root.zig";
 pub const storage_bench_root = "pkg/antfly/src/storage_bench_root.zig";
 const addFilteredTestRunArtifact = @import("tests.zig").addFilteredTestRunArtifact;
-const addSnowballModule = @import("snowball.zig").addSnowballModule;
-const makeLmdbBuildOptions = @import("storage.zig").makeLmdbBuildOptions;
-const makeLmdbEngineModule = @import("storage.zig").makeLmdbEngineModule;
-const makeLmdbModule = @import("storage.zig").makeLmdbModule;
-const makeRootBuildOptions = @import("storage.zig").makeRootBuildOptions;
+const addSnowballModule = @import("../../antfly-embedded/build/snowball.zig").addSnowballModule;
+const makeLmdbBuildOptions = @import("../../antfly-embedded/build/storage.zig").makeLmdbBuildOptions;
+const makeLmdbEngineModule = @import("../../antfly-embedded/build/storage.zig").makeLmdbEngineModule;
+const makeLmdbModule = @import("../../antfly-embedded/build/storage.zig").makeLmdbModule;
+const makeRootBuildOptions = @import("../../antfly-embedded/build/storage.zig").makeRootBuildOptions;
 
 const std = @import("std");
-const AntflyRootImports = @import("imports.zig").AntflyRootImports;
-const LmdbBackend = @import("storage.zig").LmdbBackend;
+const AntflyRootImports = @import("../../../build_support/antfly/imports.zig").AntflyRootImports;
+const LmdbBackend = @import("../../antfly-embedded/build/storage.zig").LmdbBackend;
 
 pub const AddBenchmarksOptions = struct {
     vopr: *std.Build.Module,
@@ -76,7 +76,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         }),
     });
     system_catalog_bench.root_module.addImport("system_catalog", b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/system_catalog/domain.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/local/system_catalog/domain.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     }));
@@ -91,7 +91,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
             .optimize = optimize,
         }),
     });
-    const catalog_bench_imports = @import("test_support.zig").Imports{ .runtime = antfly_imports, .vopr = options.vopr, .lmdb_engine = options.lmdb_engine };
+    const catalog_bench_imports = @import("../../../build_support/antfly/test_support.zig").Imports{ .runtime = antfly_imports, .vopr = options.vopr, .lmdb_engine = options.lmdb_engine };
     catalog_bench_imports.configure(b, system_catalog_routing_bench.root_module, true, true);
     b.step("antfly-system-catalog-routing-bench", "Benchmark rebuilt and retained indexed routing generations").dependOn(&b.addRunArtifact(system_catalog_routing_bench).step);
     const lmdb_bench_engine_options_c = makeLmdbBuildOptions(b, .c, false, false);
@@ -526,7 +526,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
             "text score query exposes score top k sort profile",
         },
         .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -734,7 +734,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .optimize = optimize,
     });
     antfly_imports.configureStorageBenchmark(b, storage_bench_root_mod);
-    @import("storage.zig").configureLmdb(b, storage_bench_root_mod, lmdb_engine_mod, false);
+    @import("../../antfly-embedded/build/storage.zig").configureLmdb(b, storage_bench_root_mod, lmdb_engine_mod, false);
     storage_bench_mod.addImport("antfly-zig", storage_bench_root_mod);
     storage_bench_mod.addImport("antfly_platform", platform_mod);
 

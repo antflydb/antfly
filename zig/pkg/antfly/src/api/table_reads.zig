@@ -12,11 +12,11 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const local_query_contract = @import("local_query_contract.zig");
+const local_query_contract = @import("antfly_local_sources").api_local_query_contract;
 const aggregation_plan = @import("aggregation_plan.zig");
 const physical_local_query = if (@import("storage_source_options").control_only) struct {} else @import("antfly_source_root").antfly_sources.local_query;
 const std = @import("std");
-const TestDirectory = @import("../common/test_directory.zig").TestDirectory;
+const TestDirectory = @import("antfly_local_sources").common_test_directory.TestDirectory;
 const builtin = @import("builtin");
 const storage_source_options = @import("storage_source_options");
 const control_only_storage_sources = storage_source_options.control_only;
@@ -28,69 +28,69 @@ const metadata_admin = @import("../metadata/admin.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_mod = @import("../metadata/domain.zig");
 const metadata_reconciler = @import("../metadata/reconciler.zig");
-const common_secrets = @import("../common/secrets.zig");
+const common_secrets = @import("antfly_local_sources").common_secrets;
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_table_provisioner = @import("../metadata/table_provisioner.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
-const managed_embedder = @import("../inference/managed_embedder.zig");
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
 const remote_capabilities = @import("antfly_inference_remote_capabilities");
 const execution_context = @import("antfly_inference_execution_context");
 const inference_request_context = @import("antfly_inference_execution_context");
 const raft_mod = @import("../raft/mod.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = if (control_only_storage_sources)
-    @import("../storage/db/control_root.zig")
+    @import("antfly_local_sources").storage_db_control_root
 else
     @import("antfly_source_root").antfly_sources.selected_db;
-const doc_set = @import("../storage/db/doc_set.zig");
-const doc_identity = if (control_only_storage_sources) struct {} else @import("../storage/db/doc_identity.zig");
-const db_embedder = if (control_only_storage_sources) struct {} else @import("../storage/db/enrichment/embedder.zig");
+const doc_set = @import("antfly_local_sources").storage_db_doc_set;
+const doc_identity = if (control_only_storage_sources) struct {} else @import("antfly_local_sources").storage_db_doc_identity;
+const db_embedder = if (control_only_storage_sources) struct {} else @import("antfly_local_sources").storage_db_enrichment_embedder;
 const ha_public_gate_state = @import("../storage/hot_standby/public_gate_state.zig");
 const ha_read_gate_mod = @import("../storage/hot_standby/read_gate.zig");
 const hot_standby_standby_mod = @import("../storage/hot_standby/standby.zig");
-const storage_schema = @import("../storage/schema.zig");
-const dynamic_field_capability = @import("../storage/db/dynamic_field_capability.zig");
-const internal_keys = @import("../storage/internal_keys.zig");
-const hierarchy_navigation = @import("../storage/hierarchy_navigation.zig");
-const hbc_mod = @import("../storage/hbc_adapter.zig");
-const lsm_backend = @import("../storage/lsm_backend/mod.zig");
-const resource_manager_mod = @import("../storage/resource_manager.zig");
+const storage_schema = @import("antfly_local_sources").storage_schema;
+const dynamic_field_capability = @import("antfly_local_sources").storage_db_dynamic_field_capability;
+const internal_keys = @import("antfly_local_sources").storage_internal_keys;
+const hierarchy_navigation = @import("antfly_local_sources").storage_hierarchy_navigation;
+const hbc_mod = @import("antfly_local_sources").storage_hbc_adapter;
+const lsm_backend = @import("antfly_local_sources").storage_lsm_backend_mod;
+const resource_manager_mod = @import("antfly_local_sources").storage_resource_manager;
 const db_query_search = if (control_only_storage_sources)
-    @import("../storage/db/query/control_contract.zig")
+    @import("antfly_local_sources").storage_db_query_control_contract
 else
-    @import("../storage/db/query/search_exec.zig");
-const index_manager_mod = if (control_only_storage_sources) struct {} else @import("../storage/db/catalog/index_manager.zig");
-const text_analysis_config = @import("../storage/db/text_analysis_config.zig");
-const introducer_mod = @import("../introducer.zig");
-const graph_mod = @import("../graph/graph.zig");
-const graph_edge_type = @import("../graph/edge_type.zig");
-const graph_edge_weight = @import("../graph/edge_weight.zig");
-const graph_node_identity = @import("../graph/node_identity.zig");
-const graph_pattern_mod = @import("../graph/pattern.zig");
-const graph_paths = @import("../graph/paths.zig");
-const graph_query_mod = @import("../graph/query.zig");
+    @import("antfly_local_sources").storage_db_query_search_exec;
+const index_manager_mod = if (control_only_storage_sources) struct {} else @import("antfly_local_sources").storage_db_catalog_index_manager;
+const text_analysis_config = @import("antfly_local_sources").storage_db_text_analysis_config;
+const introducer_mod = @import("antfly_local_sources").introducer;
+const graph_mod = @import("antfly_local_sources").graph_graph;
+const graph_edge_type = @import("antfly_local_sources").graph_edge_type;
+const graph_edge_weight = @import("antfly_local_sources").graph_edge_weight;
+const graph_node_identity = @import("antfly_local_sources").graph_node_identity;
+const graph_pattern_mod = @import("antfly_local_sources").graph_pattern;
+const graph_paths = @import("antfly_local_sources").graph_paths;
+const graph_query_mod = @import("antfly_local_sources").graph_query;
 const reranking_runtime = @import("../reranking/mod.zig");
-const template_mod = @import("../template.zig");
+const template_mod = @import("antfly_local_sources").template;
 const template_remote = if (builtin.os.tag == .freestanding)
-    @import("../storage/db/template_remote_stub.zig")
+    @import("antfly_local_sources").storage_db_template_remote_stub
 else
-    @import("../template_remote.zig");
+    @import("antfly_local_sources").template_remote;
 const table_catalog = @import("table_catalog.zig");
 const table_router = @import("table_router.zig");
 const tables_api = @import("tables.zig");
-const query_api = @import("query.zig");
-const query_contract = @import("query_contract.zig");
+const query_api = @import("antfly_local_sources").api_query;
+const query_contract = @import("antfly_local_sources").api_query_contract;
 const public_limits = @import("antfly_public_limits");
 const distributed_graph = @import("distributed_graph.zig");
-const runtime_status = @import("runtime_status.zig");
-const table_read_source = @import("table_read_source.zig");
+const runtime_status = @import("antfly_local_sources").api_runtime_status;
+const table_read_source = @import("antfly_local_sources").api_table_read_source;
 const linked_storage = control_only_storage_sources;
 const kernel_owner_client = if (control_only_storage_sources)
     @import("../storage/kernel_owner_client.zig")
 else
     struct {};
-const aggregation_contract = @import("../storage/db/aggregations_contract.zig");
+const aggregation_contract = @import("antfly_local_sources").storage_db_aggregations_contract;
 const table_read_graph = @import("table_reads/graph.zig");
 
 fn earliestDeadline(a: ?u64, b: ?u64) ?u64 {
@@ -129,11 +129,11 @@ fn catalogRouteFenceForGroup(
 /// Each adapter borrows its runtime/resident owners but owns its routing lease.
 fn JoinReadBinding(comptime Source: type) type {
     return struct {
-        view: @import("table_read_source.zig").JoinReadView,
+        view: @import("antfly_local_sources").api_table_read_source.JoinReadView,
         alloc: std.mem.Allocator,
         routed: Source,
         session: table_catalog.RoutingSession,
-        fn acquire(ptr: *anyopaque, alloc: std.mem.Allocator, budget: table_router.RouteBudget) !*@import("table_read_source.zig").JoinReadView {
+        fn acquire(ptr: *anyopaque, alloc: std.mem.Allocator, budget: table_router.RouteBudget) !*@import("antfly_local_sources").api_table_read_source.JoinReadView {
             try budget.check();
             const source: *Source = @ptrCast(@alignCast(ptr));
             const self = try alloc.create(@This());
@@ -152,7 +152,7 @@ fn JoinReadBinding(comptime Source: type) type {
             self.view.source = self.routed.source();
             return &self.view;
         }
-        fn destroy(view: *@import("table_read_source.zig").JoinReadView) void {
+        fn destroy(view: *@import("antfly_local_sources").api_table_read_source.JoinReadView) void {
             const self: *@This() = @fieldParentPtr("view", view);
             self.session.deinit();
             self.alloc.destroy(self);
@@ -218,8 +218,8 @@ const algebraic_partials_wire = @import("algebraic_partials_wire.zig");
 const http_routes = @import("http_routes.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const platform_time = @import("antfly_platform").time;
-const distributed_stats_mod = @import("../search/distributed_stats.zig");
-const fusion_mod = @import("../search/fusion.zig");
+const distributed_stats_mod = @import("antfly_local_sources").search_distributed_stats;
+const fusion_mod = @import("antfly_local_sources").search_fusion;
 
 /// Normalize known read-transport failures before they cross a compiled
 /// boundary. Reads have no ambiguous mutation outcome; unavailable peers must
@@ -272,10 +272,10 @@ pub fn normalizeDistributedQueryOperationalError(err: anyerror) anyerror {
     };
 }
 
-const regex_mod = @import("../search/regex.zig");
+const regex_mod = @import("antfly_local_sources").search_regex;
 const httpx = @import("httpx");
 const Io = std.Io;
-const json_helpers = @import("json_helpers.zig");
+const json_helpers = @import("antfly_local_sources").api_json_helpers;
 const ParsedJsonPathValue = json_helpers.ParsedJsonPathValue;
 const parseJsonValueAlloc = json_helpers.parseJsonValueAlloc;
 const parseJsonPathValueAlloc = json_helpers.parseJsonPathValueAlloc;
@@ -2581,14 +2581,14 @@ pub const BoundTableReadSource = struct {
         return try controlledLookupResponseAlloc(alloc, result.json, if (integrityLookupMode(opts)) 0 else result.version orelse try self.db.getTimestamp(alloc, key), opts, result.expected_content_digest);
     }
 
-    fn openRelationalRead(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, from_key: []const u8, to_key: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?@import("table_read_source.zig").RelationalReadView {
+    fn openRelationalRead(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, from_key: []const u8, to_key: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?@import("antfly_local_sources").api_table_read_source.RelationalReadView {
         const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         try self.reads.reads.prepareScanWithConsistency(self.reads.group_id, from_key, to_key, opts, consistency);
         return try self.openPreparedRelationalRead(alloc, from_key, to_key, opts);
     }
 
-    fn openPreparedRelationalRead(self: *BoundTableReadSource, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: db_mod.types.ScanOptions) !@import("table_read_source.zig").RelationalReadView {
+    fn openPreparedRelationalRead(self: *BoundTableReadSource, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: db_mod.types.ScanOptions) !@import("antfly_local_sources").api_table_read_source.RelationalReadView {
         var epoch = self.db.core.acquireSchemaView();
         defer if (epoch) |*view| view.release();
         if (epoch == null or epoch.?.storageMode() == .document) {
@@ -2601,7 +2601,7 @@ pub const BoundTableReadSource = struct {
 
     const RetainedStatementRead = struct {
         alloc: std.mem.Allocator,
-        views: []@import("table_read_source.zig").RelationalReadView,
+        views: []@import("antfly_local_sources").api_table_read_source.RelationalReadView,
         opened: usize = 0,
 
         fn close(ptr: *anyopaque) void {
@@ -2618,7 +2618,7 @@ pub const BoundTableReadSource = struct {
     const CoordinatedStatementSnapshot = struct {
         alloc: std.mem.Allocator,
         prepared: ProvisionedTableReadSource.PreparedSpanRead,
-        snapshots: []@import("../storage/statement_read_fence.zig").Snapshot,
+        snapshots: []@import("antfly_local_sources").storage_statement_read_fence.Snapshot,
         table: []u8,
         schema_version: u32,
         cancellation: ?@import("antfly_cancellation").CancellationToken,
@@ -2630,18 +2630,18 @@ pub const BoundTableReadSource = struct {
             if (self.deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
         }
 
-        fn open(_: *anyopaque, _: std.mem.Allocator, _: @import("table_read_source.zig").RelationalStatementScan) !@import("table_read_source.zig").RelationalReadView {
+        fn open(_: *anyopaque, _: std.mem.Allocator, _: @import("antfly_local_sources").api_table_read_source.RelationalStatementScan) !@import("antfly_local_sources").api_table_read_source.RelationalReadView {
             return error.SqlRangeTrackingRequired;
         }
 
-        fn openGuarded(ptr: *anyopaque, alloc: std.mem.Allocator, input: @import("table_read_source.zig").RelationalStatementScan) !@import("table_read_source.zig").RelationalStatementSnapshot.GuardedRead {
+        fn openGuarded(ptr: *anyopaque, alloc: std.mem.Allocator, input: @import("antfly_local_sources").api_table_read_source.RelationalStatementScan) !@import("antfly_local_sources").api_table_read_source.RelationalStatementSnapshot.GuardedRead {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.check();
             if (!std.mem.eql(u8, input.table, self.table) or self.opened >= 64 or !input.opts.include_range_proofs) return error.SqlStatementSnapshotRequired;
             const row_query = input.opts.relational_query orelse return error.SqlStatementSnapshotRequired;
             if (row_query.schema_version != self.schema_version or row_query.index != null or row_query.auto_index) return error.SqlStatementSnapshotRequired;
-            const View = @import("table_read_source.zig").RelationalReadView;
-            const OwnerProof = @import("range_read_guards.zig").OwnerRangeProof;
+            const View = @import("antfly_local_sources").api_table_read_source.RelationalReadView;
+            const OwnerProof = @import("antfly_local_sources").api_range_read_guards.OwnerRangeProof;
             const views = try alloc.alloc(View, self.snapshots.len);
             defer alloc.free(views);
             var opened: usize = 0;
@@ -2697,7 +2697,7 @@ pub const BoundTableReadSource = struct {
             if (self.deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
         }
 
-        fn open(raw: *anyopaque, alloc: std.mem.Allocator, input: @import("table_read_source.zig").RelationalStatementScan) !@import("table_read_source.zig").RelationalReadView {
+        fn open(raw: *anyopaque, alloc: std.mem.Allocator, input: @import("antfly_local_sources").api_table_read_source.RelationalStatementScan) !@import("antfly_local_sources").api_table_read_source.RelationalReadView {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try self.check();
             if (!std.mem.eql(u8, input.table, self.table_name)) return error.TableNotFound;
@@ -2725,7 +2725,7 @@ pub const BoundTableReadSource = struct {
         }
     };
 
-    fn openRelationalStatementSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, schema_version: u32, consistency: raft_mod.ReadConsistency, cancellation: ?@import("antfly_cancellation").CancellationToken, deadline_ns: ?u64) !@import("table_read_source.zig").RelationalStatementSnapshot {
+    fn openRelationalStatementSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, schema_version: u32, consistency: raft_mod.ReadConsistency, cancellation: ?@import("antfly_cancellation").CancellationToken, deadline_ns: ?u64) !@import("antfly_local_sources").api_table_read_source.RelationalStatementSnapshot {
         const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table)) return error.TableNotFound;
         if (consistency != .read_index) return error.SqlStatementSnapshotRequired;
@@ -2752,7 +2752,7 @@ pub const BoundTableReadSource = struct {
         return .{ .ptr = retained, .vtable = &.{ .open = DynamicStatementSnapshot.open, .close = DynamicStatementSnapshot.close } };
     }
 
-    fn openRelationalStatement(ptr: *anyopaque, alloc: std.mem.Allocator, scans: []const @import("table_read_source.zig").RelationalStatementScan, consistency: raft_mod.ReadConsistency) !@import("table_read_source.zig").RelationalStatementRead {
+    fn openRelationalStatement(ptr: *anyopaque, alloc: std.mem.Allocator, scans: []const @import("antfly_local_sources").api_table_read_source.RelationalStatementScan, consistency: raft_mod.ReadConsistency) !@import("antfly_local_sources").api_table_read_source.RelationalStatementRead {
         const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
         if (scans.len == 0 or scans.len > 64) return error.SqlProgramLimitExceeded;
         // Complete read-index admission before taking the short write fence;
@@ -2765,7 +2765,7 @@ pub const BoundTableReadSource = struct {
         }
         const owner = try alloc.create(RetainedStatementRead);
         errdefer alloc.destroy(owner);
-        const views = try alloc.alloc(@import("table_read_source.zig").RelationalReadView, scans.len);
+        const views = try alloc.alloc(@import("antfly_local_sources").api_table_read_source.RelationalReadView, scans.len);
         errdefer alloc.free(views);
         owner.* = .{ .alloc = alloc, .views = views };
         errdefer for (owner.views[0..owner.opened]) |view| view.deinit();
@@ -2787,7 +2787,7 @@ pub const BoundTableReadSource = struct {
         return .{ .ptr = owner, .views = views, .vtable = &.{ .close = RetainedStatementRead.close } };
     }
 
-    fn nextDocumentPage(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !@import("table_read_source.zig").RelationalReadView.Page {
+    fn nextDocumentPage(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !@import("antfly_local_sources").api_table_read_source.RelationalReadView.Page {
         const session: *db_mod.DB.DocumentReadSession = @ptrCast(@alignCast(ptr));
         return session.next(alloc, limit);
     }
@@ -2802,8 +2802,8 @@ pub const BoundTableReadSource = struct {
         return session.normalizeRows(alloc, writes);
     }
 
-    fn nextRelationalPage(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !@import("table_read_source.zig").RelationalReadView.Page {
-        const View = @import("table_read_source.zig").RelationalReadView;
+    fn nextRelationalPage(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !@import("antfly_local_sources").api_table_read_source.RelationalReadView.Page {
+        const View = @import("antfly_local_sources").api_table_read_source.RelationalReadView;
         const session: *db_mod.DB.RelationalReadSession = @ptrCast(@alignCast(ptr));
         var page = try session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024 });
         errdefer page.deinit();
@@ -2821,7 +2821,7 @@ pub const BoundTableReadSource = struct {
         session.deinit();
     }
 
-    fn relationalRangeProofs(ptr: *anyopaque, alloc: std.mem.Allocator) ![]@import("../storage/range_protection.zig").Proof {
+    fn relationalRangeProofs(ptr: *anyopaque, alloc: std.mem.Allocator) ![]@import("antfly_local_sources").storage_range_protection.Proof {
         const session: *db_mod.DB.RelationalReadSession = @ptrCast(@alignCast(ptr));
         return session.rangeProofs(alloc);
     }
@@ -3655,9 +3655,9 @@ pub const ProvisionedTableReadSource = struct {
     const RetainedSingleOwnerRead = struct {
         alloc: std.mem.Allocator,
         prepared: PreparedSpanRead,
-        view: @import("table_read_source.zig").RelationalReadView,
+        view: @import("antfly_local_sources").api_table_read_source.RelationalReadView,
 
-        fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !@import("table_read_source.zig").RelationalReadView.Page {
+        fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !@import("antfly_local_sources").api_table_read_source.RelationalReadView.Page {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.view.next(alloc, limit);
         }
@@ -3673,7 +3673,7 @@ pub const ProvisionedTableReadSource = struct {
         }
     };
 
-    fn openRelationalRead(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?@import("table_read_source.zig").RelationalReadView {
+    fn openRelationalRead(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?@import("antfly_local_sources").api_table_read_source.RelationalReadView {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
         if (self.distributed_router != null) {
@@ -3722,9 +3722,9 @@ pub const ProvisionedTableReadSource = struct {
         return .{ .ptr = retained, .vtable = &.{ .next = RetainedSingleOwnerRead.next, .close = RetainedSingleOwnerRead.close, .normalize = RetainedSingleOwnerRead.normalize } };
     }
 
-    fn openCoordinatedRelationalRead(self: *ProvisionedTableReadSource, alloc: std.mem.Allocator, prepared: *PreparedSpanRead, table: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions) !@import("table_read_source.zig").RelationalReadView {
-        const ReadView = @import("table_read_source.zig").RelationalReadView;
-        const Fence = @import("table_read_source.zig").StatementReadFence;
+    fn openCoordinatedRelationalRead(self: *ProvisionedTableReadSource, alloc: std.mem.Allocator, prepared: *PreparedSpanRead, table: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions) !@import("antfly_local_sources").api_table_read_source.RelationalReadView {
+        const ReadView = @import("antfly_local_sources").api_table_read_source.RelationalReadView;
+        const Fence = @import("antfly_local_sources").api_table_read_source.StatementReadFence;
         if (prepared.group_ids.len > 256) return error.SqlProgramLimitExceeded;
         // Native automatic indexes need not emit primary-key order. Merge
         // only explicit primary-order streams; unordered SQL scans concatenate
@@ -3787,7 +3787,7 @@ pub const ProvisionedTableReadSource = struct {
         proofs: []const []const table_read_source.RelationalStatementRead.OwnerRangeProof = &.{},
         alloc: std.mem.Allocator,
         prepared: []PreparedSpanRead,
-        views: []@import("table_read_source.zig").RelationalReadView,
+        views: []@import("antfly_local_sources").api_table_read_source.RelationalReadView,
         prepared_count: usize = 0,
         view_count: usize = 0,
 
@@ -3810,19 +3810,19 @@ pub const ProvisionedTableReadSource = struct {
                 alloc.free(result);
             }
             for (self.proofs[scan_index], result) |owner, *out| {
-                out.* = .{ .fence = owner.fence, .proofs = try alloc.dupe(@import("range_read_guards.zig").Proof, owner.proofs) };
+                out.* = .{ .fence = owner.fence, .proofs = try alloc.dupe(@import("antfly_local_sources").api_range_read_guards.Proof, owner.proofs) };
                 initialized += 1;
             }
             return result;
         }
     };
 
-    fn openRelationalStatement(ptr: *anyopaque, alloc: std.mem.Allocator, scans: []const @import("table_read_source.zig").RelationalStatementScan, consistency: raft_mod.ReadConsistency) !@import("table_read_source.zig").RelationalStatementRead {
+    fn openRelationalStatement(ptr: *anyopaque, alloc: std.mem.Allocator, scans: []const @import("antfly_local_sources").api_table_read_source.RelationalStatementScan, consistency: raft_mod.ReadConsistency) !@import("antfly_local_sources").api_table_read_source.RelationalStatementRead {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
         if (self.local_read_source == null and self.distributed_router == null) return error.SqlStatementSnapshotRequired;
         if (scans.len == 0 or scans.len > 64) return error.SqlProgramLimitExceeded;
-        const View = @import("table_read_source.zig").RelationalReadView;
+        const View = @import("antfly_local_sources").api_table_read_source.RelationalReadView;
         const retained = try alloc.create(RetainedStatementRead);
         errdefer alloc.destroy(retained);
         const prepared_reads = try alloc.alloc(PreparedSpanRead, scans.len);
@@ -3840,7 +3840,7 @@ pub const ProvisionedTableReadSource = struct {
         };
     }
 
-    fn openRelationalStatementSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, schema_version: u32, consistency: raft_mod.ReadConsistency, cancellation: ?@import("antfly_cancellation").CancellationToken, deadline_ns: ?u64) !@import("table_read_source.zig").RelationalStatementSnapshot {
+    fn openRelationalStatementSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, schema_version: u32, consistency: raft_mod.ReadConsistency, cancellation: ?@import("antfly_cancellation").CancellationToken, deadline_ns: ?u64) !@import("antfly_local_sources").api_table_read_source.RelationalStatementSnapshot {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
         if (self.local_read_source == null) return error.SqlStatementSnapshotRequired;
@@ -3875,7 +3875,7 @@ pub const ProvisionedTableReadSource = struct {
                 .remote => |remote| try @import("retained_read_client.zig").Client.admit(alloc, self.distributedInternalExecutor(), remote.base_uri, table, prepared.fenceAt(index, deadline_ns, cancellation), schema_version, deadline_ns),
             };
         }
-        const Fence = @import("table_read_source.zig").StatementReadFence;
+        const Fence = @import("antfly_local_sources").api_table_read_source.StatementReadFence;
         const fences = try temp.alloc(Fence, routes.len);
         var held: usize = 0;
         defer for (fences[0..held]) |fence| fence.deinit();
@@ -3897,7 +3897,7 @@ pub const ProvisionedTableReadSource = struct {
             held = 0;
             try wait_budget.sleepNs(std.time.ns_per_ms);
         }
-        const snapshots = try alloc.alloc(@import("../storage/statement_read_fence.zig").Snapshot, fences.len);
+        const snapshots = try alloc.alloc(@import("antfly_local_sources").storage_statement_read_fence.Snapshot, fences.len);
         var captured: usize = 0;
         errdefer {
             for (snapshots[0..captured]) |snapshot| snapshot.deinit();
@@ -3915,9 +3915,9 @@ pub const ProvisionedTableReadSource = struct {
         return .{ .ptr = owned, .vtable = &.{ .open = BoundTableReadSource.CoordinatedStatementSnapshot.open, .open_guarded = BoundTableReadSource.CoordinatedStatementSnapshot.openGuarded, .close = BoundTableReadSource.CoordinatedStatementSnapshot.close } };
     }
 
-    fn finishRelationalStatement(self: *ProvisionedTableReadSource, alloc: std.mem.Allocator, scans: []const @import("table_read_source.zig").RelationalStatementScan, consistency: raft_mod.ReadConsistency, retained: *RetainedStatementRead) !@import("table_read_source.zig").RelationalStatementRead {
-        const View = @import("table_read_source.zig").RelationalReadView;
-        const Fence = @import("table_read_source.zig").StatementReadFence;
+    fn finishRelationalStatement(self: *ProvisionedTableReadSource, alloc: std.mem.Allocator, scans: []const @import("antfly_local_sources").api_table_read_source.RelationalStatementScan, consistency: raft_mod.ReadConsistency, retained: *RetainedStatementRead) !@import("antfly_local_sources").api_table_read_source.RelationalStatementRead {
+        const View = @import("antfly_local_sources").api_table_read_source.RelationalReadView;
+        const Fence = @import("antfly_local_sources").api_table_read_source.StatementReadFence;
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
         const temporary = scratch.allocator();
@@ -4032,7 +4032,7 @@ pub const ProvisionedTableReadSource = struct {
                 opened += 1;
                 if (proof_groups) |groups| {
                     const native_proofs = try view.rangeProofs(temporary);
-                    const proofs = try retained.proof_arena.allocator().alloc(@import("range_read_guards.zig").Proof, native_proofs.len);
+                    const proofs = try retained.proof_arena.allocator().alloc(@import("antfly_local_sources").api_range_read_guards.Proof, native_proofs.len);
                     for (native_proofs, proofs) |native_proof, *proof| proof.* = native_proof;
                     groups[owner_index] = .{ .fence = retained.prepared[scan_index].fenceAt(owner_index, null, null), .proofs = proofs };
                 }
@@ -4049,7 +4049,7 @@ pub const ProvisionedTableReadSource = struct {
                 const upper = row_query.upper orelse return error.UnsupportedSqlExecution;
                 if (!input.opts.include_range_proofs or row_query.after != null or !lower.inclusive or !upper.inclusive or
                     lower.values.len == 0 or lower.values.len != upper.values.len) return error.UnsupportedSqlExecution;
-                const tracking = @import("../storage/range_protection.zig");
+                const tracking = @import("antfly_local_sources").storage_range_protection;
                 var span: ?tracking.IndexSpan = null;
                 for (proof_groups orelse return error.UnsupportedSqlExecution) |owner| {
                     if (owner.proofs.len != 1) return error.UnsupportedSqlExecution;
@@ -4069,14 +4069,14 @@ pub const ProvisionedTableReadSource = struct {
         return .{ .ptr = retained, .views = retained.views, .vtable = &.{ .close = RetainedStatementRead.close, .range_proofs = RetainedStatementRead.rangeProofs } };
     }
 
-    fn openRelationalReadGroupRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, from_key: []const u8, to_key: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?@import("table_read_source.zig").RelationalReadView {
+    fn openRelationalReadGroupRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, from_key: []const u8, to_key: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?@import("antfly_local_sources").api_table_read_source.RelationalReadView {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
         if (self.local_read_source == null) return null;
         return self.groupLocalSourceWithFence(fence).openRelationalReadGroupLocal(alloc, group_id, table_name, from_key, to_key, opts, consistency);
     }
 
-    fn tryStatementReadFenceGroupRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?@import("table_read_source.zig").StatementReadFence {
+    fn tryStatementReadFenceGroupRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?@import("antfly_local_sources").api_table_read_source.StatementReadFence {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
         if (self.local_read_source == null) return error.SqlStatementSnapshotRequired;
@@ -4151,7 +4151,7 @@ pub const ProvisionedTableReadSource = struct {
         };
     }
 
-    fn bindIncomingGraphRoutes(ptr: *anyopaque, cache: *@import("table_read_source.zig").IncomingGraphRouteCache) void {
+    fn bindIncomingGraphRoutes(ptr: *anyopaque, cache: *@import("antfly_local_sources").api_table_read_source.IncomingGraphRouteCache) void {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         _ = self.withIncomingGraphRoutes(@ptrCast(@alignCast(cache)));
     }
@@ -6904,7 +6904,7 @@ pub const HostedProvisionedTableReadSource = struct {
         };
     }
 
-    fn bindIncomingGraphRoutes(ptr: *anyopaque, cache: *@import("table_read_source.zig").IncomingGraphRouteCache) void {
+    fn bindIncomingGraphRoutes(ptr: *anyopaque, cache: *@import("antfly_local_sources").api_table_read_source.IncomingGraphRouteCache) void {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         _ = self.withIncomingGraphRoutes(@ptrCast(@alignCast(cache)));
     }
@@ -7188,7 +7188,7 @@ pub const HostedProvisionedTableReadSource = struct {
         return .{ .ptr = owner, .vtable = &.{ .next = Owner.next, .close = Owner.close, .normalize = Owner.normalize } };
     }
 
-    fn openRelationalRead(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?@import("table_read_source.zig").RelationalReadView {
+    fn openRelationalRead(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?@import("antfly_local_sources").api_table_read_source.RelationalReadView {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         if (self.local_read_source == null) return try self.openRemoteRelationalRead(alloc, table, from, to, opts, consistency);
         var snapshot = try table_catalog.routedSpanSnapshotUntil(alloc, self.catalog, table, from, to, opts.execution_deadline_ns);
@@ -14701,7 +14701,7 @@ fn collectSignificantTermsFromHits(
     alloc: std.mem.Allocator,
     hits: []const db_mod.types.SearchHit,
     field: []const u8,
-    analyzer: *const @import("../search/analysis.zig").Analyzer,
+    analyzer: *const @import("antfly_local_sources").search_analysis.Analyzer,
     candidate_limit: usize,
     seen_terms: *std.StringHashMapUnmanaged(void),
 ) !void {
@@ -14712,7 +14712,7 @@ fn collectSignificantTermsFromStoredAlloc(
     alloc: std.mem.Allocator,
     stored: []const u8,
     field: []const u8,
-    analyzer: *const @import("../search/analysis.zig").Analyzer,
+    analyzer: *const @import("antfly_local_sources").search_analysis.Analyzer,
     candidate_limit: usize,
     seen_terms: *std.StringHashMapUnmanaged(void),
 ) !void {
@@ -14724,7 +14724,7 @@ fn collectSignificantTermsFromStoredAlloc(
 fn collectSignificantTermsFromValue(
     alloc: std.mem.Allocator,
     value: std.json.Value,
-    analyzer: *const @import("../search/analysis.zig").Analyzer,
+    analyzer: *const @import("antfly_local_sources").search_analysis.Analyzer,
     candidate_limit: usize,
     seen_terms: *std.StringHashMapUnmanaged(void),
 ) !void {
@@ -14732,7 +14732,7 @@ fn collectSignificantTermsFromValue(
         .array => |arr| for (arr.items) |item| try collectSignificantTermsFromValue(alloc, item, analyzer, candidate_limit, seen_terms),
         .string => {
             const tokens = try analyzer.analyze(alloc, value.string);
-            defer @import("../search/analysis.zig").Analyzer.freeTokens(alloc, tokens);
+            defer @import("antfly_local_sources").search_analysis.Analyzer.freeTokens(alloc, tokens);
             for (tokens) |tok| {
                 if (!seen_terms.contains(tok.term) and seen_terms.count() >= candidate_limit)
                     return error.QueryCandidateBudgetExceeded;
@@ -14748,7 +14748,7 @@ fn collectSignificantTermsFromValue(
 fn tableAggregationAnalyzerForField(
     cfg: *const introducer_mod.TextAnalysisConfig,
     field: []const u8,
-) !*const @import("../search/analysis.zig").Analyzer {
+) !*const @import("antfly_local_sources").search_analysis.Analyzer {
     var analyzer_name: ?[]const u8 = null;
     for (cfg.field_analyzers) |item| {
         if (!std.mem.eql(u8, item.field_name, field)) continue;
@@ -16794,8 +16794,8 @@ fn consumerTests() type {
     if (!(builtin.is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
         test "relational statement retries unavailable capture and releases fences before pages or deadline" {
-            const View = @import("table_read_source.zig").RelationalReadView;
-            const Fence = @import("table_read_source.zig").StatementReadFence;
+            const View = @import("antfly_local_sources").api_table_read_source.RelationalReadView;
+            const Fence = @import("antfly_local_sources").api_table_read_source.StatementReadFence;
             const Fixture = struct {
                 admission: *TopologyReadAdmissionTracker,
                 held: bool = false,
@@ -16837,10 +16837,10 @@ fn consumerTests() type {
                     self.opens_since_capture += 1;
                     return .{ .ptr = self, .vtable = &.{ .next = next, .close = close, .range_proofs = proofs } };
                 }
-                fn proofs(ptr: *anyopaque, alloc: std.mem.Allocator) ![]@import("../storage/range_protection.zig").Proof {
+                fn proofs(ptr: *anyopaque, alloc: std.mem.Allocator) ![]@import("antfly_local_sources").storage_range_protection.Proof {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expect(self.held);
-                    return alloc.dupe(@import("../storage/range_protection.zig").Proof, &.{.{ .bucket = 101, .generation = 7 }});
+                    return alloc.dupe(@import("antfly_local_sources").storage_range_protection.Proof, &.{.{ .bucket = 101, .generation = 7 }});
                 }
                 fn release(ptr: *anyopaque) void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -16870,7 +16870,7 @@ fn consumerTests() type {
                 .prepare_for_read = admission.iface(),
                 .local_read_source = .{ .ptr = &fixture, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .try_statement_read_fence_group_local_routed = Fixture.capture } },
             };
-            const input: @import("table_read_source.zig").RelationalStatementScan = .{ .table = "docs", .opts = .{ .relational_query = .{ .fields = &.{} }, .include_range_proofs = true } };
+            const input: @import("antfly_local_sources").api_table_read_source.RelationalStatementScan = .{ .table = "docs", .opts = .{ .relational_query = .{ .fields = &.{} }, .include_range_proofs = true } };
             const statement = try routed.source().openRelationalStatement(std.testing.allocator, &.{ input, input }, .stale);
             try std.testing.expectEqual(@as(usize, 2), fixture.captures);
             try std.testing.expectEqual(@as(usize, 2), fixture.opens);
@@ -16899,16 +16899,16 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 0), admission.active);
             try std.testing.expect(!fixture.held);
             fixture.persistently_unavailable = true;
-            const deadline_input: @import("table_read_source.zig").RelationalStatementScan = .{ .table = "docs", .opts = .{ .relational_query = .{ .fields = &.{} }, .include_range_proofs = true, .execution_deadline_ns = platform_time.monotonicNs() +| 250 * std.time.ns_per_ms } };
+            const deadline_input: @import("antfly_local_sources").api_table_read_source.RelationalStatementScan = .{ .table = "docs", .opts = .{ .relational_query = .{ .fields = &.{} }, .include_range_proofs = true, .execution_deadline_ns = platform_time.monotonicNs() +| 250 * std.time.ns_per_ms } };
             try std.testing.expectError(error.SqlStatementReadUnavailable, routed.source().openRelationalStatement(std.testing.allocator, &.{ deadline_input, deadline_input }, .stale));
             try std.testing.expectEqual(@as(usize, 0), admission.active);
             try std.testing.expect(!fixture.held);
         }
 
         test "relational row query full-key index proof requires every routed owner" {
-            const View = @import("table_read_source.zig").RelationalReadView;
-            const Fence = @import("table_read_source.zig").StatementReadFence;
-            const tracking = @import("../storage/range_protection.zig");
+            const View = @import("antfly_local_sources").api_table_read_source.RelationalReadView;
+            const Fence = @import("antfly_local_sources").api_table_read_source.StatementReadFence;
+            const tracking = @import("antfly_local_sources").storage_range_protection;
             const Catalog = struct {
                 tables: [1]metadata_table_manager.TableRecord = .{.{ .table_id = 7, .name = "docs", .placement_role = "data", .indexes_json = "{}" }},
                 ranges: [2]metadata_table_manager.RangeRecord = .{
@@ -16965,7 +16965,7 @@ fn consumerTests() type {
                         self.fixture.opens += 1;
                         return .{ .ptr = self, .vtable = &.{ .next = next, .close = close, .range_proofs = proofs } };
                     }
-                    fn captureSnapshot(ptr: *anyopaque, _: std.mem.Allocator) !@import("../storage/statement_read_fence.zig").Snapshot {
+                    fn captureSnapshot(ptr: *anyopaque, _: std.mem.Allocator) !@import("antfly_local_sources").storage_statement_read_fence.Snapshot {
                         const self: *@This() = @ptrCast(@alignCast(ptr));
                         try validate(ptr);
                         try std.testing.expect(self.fixture.owners[0].held and self.fixture.owners[1].held);
@@ -17032,7 +17032,7 @@ fn consumerTests() type {
                 .local_read_source = .{ .ptr = &fixture, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .try_statement_read_fence_group_local_routed = Fixture.capture } },
             };
             const values = [_]std.json.Value{ .{ .string = "joint" }, .{ .integer = 7 } };
-            const input: @import("table_read_source.zig").RelationalStatementScan = .{ .table = "docs", .opts = .{
+            const input: @import("antfly_local_sources").api_table_read_source.RelationalStatementScan = .{ .table = "docs", .opts = .{
                 .include_range_proofs = true,
                 .relational_query = .{ .fields = &.{}, .index = "label_tenant_idx", .lower = .{ .values = &values }, .upper = .{ .values = &values }, .schema_version = 1 },
             } };
@@ -17097,7 +17097,7 @@ fn consumerTests() type {
         }
 
         test "relational row query retained owner holds admission and releases failed opens" {
-            const View = @import("table_read_source.zig").RelationalReadView;
+            const View = @import("antfly_local_sources").api_table_read_source.RelationalReadView;
             const Fixture = struct {
                 admission: *TopologyReadAdmissionTracker,
                 fail_open: bool = false,
@@ -17407,7 +17407,7 @@ fn consumerTests() type {
             const fence: metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 1, .topology_epoch = 1, .route = .{ .group_id = 7, .range_id = 7, .identity_namespace = .{ .table_id = 1, .shard_id = 7, .range_id = 7 } } };
             const fence_json = try std.json.Stringify.valueAlloc(std.testing.allocator, fence, .{});
             defer std.testing.allocator.free(fence_json);
-            const context: @import("operation.zig").RequestContext = .{ .catalog_route_fence_json = fence_json };
+            const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .catalog_route_fence_json = fence_json };
             const input: operations_module.LookupInput = .{ .group_id = 7, .table_name = "rows", .key = "absent" };
             try std.testing.expectError(error.AuthoritativeLookupMissing, operations.lookup(std.testing.allocator, context, input));
             operations.reads.?.strict_read_index_absence = false;
@@ -26323,7 +26323,7 @@ fn consumerTests() type {
             }
             try std.testing.expectError(
                 error.QueryCandidateBudgetExceeded,
-                collectSignificantTermsFromValue(alloc, .{ .string = "alpha beta" }, &@import("../search/analysis.zig").default_analyzer, 1, &seen),
+                collectSignificantTermsFromValue(alloc, .{ .string = "alpha beta" }, &@import("antfly_local_sources").search_analysis.default_analyzer, 1, &seen),
             );
         }
 
@@ -27037,7 +27037,7 @@ fn implementationTests() type {
             ;
             try left.setSchemaJson(alloc, schema_json);
             try right.setSchemaJson(alloc, schema_json);
-            const txn_id: @import("../storage/transactions.zig").TxnId = @splat(33);
+            const txn_id: @import("antfly_local_sources").storage_transactions.TxnId = @splat(33);
             _ = try left.beginTransactionWithId(txn_id, 10);
             _ = try right.beginTransactionWithId(txn_id, 10);
             try left.writeIntents(txn_id, &.{.{ .key = "a", .value = "{\"id\":1}" }}, &.{});
@@ -33738,7 +33738,7 @@ fn implementationTests() type {
         }
 
         test "hosted cross-range graph metric fan-in merges compatible hits pair" {
-            var allocator_state: @import("../storage/test_allocator.zig").TestAllocator = .{};
+            var allocator_state: @import("antfly_local_sources").storage_test_allocator.TestAllocator = .{};
             defer allocator_state.deinit();
             const alloc = allocator_state.allocator();
             var path_tmp = try TestDirectory.initFast("hosted-cross-range-graph-metric-hits-pair");

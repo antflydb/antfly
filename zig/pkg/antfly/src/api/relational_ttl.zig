@@ -17,16 +17,16 @@
 //! RESTRICT leaves expired rows visible; each root is independent so a blocked
 //! parent does not starve unrelated expiration in the same scan page.
 const std = @import("std");
-const expiry = @import("../storage/coordinated_ttl.zig");
+const expiry = @import("antfly_local_sources").storage_coordinated_ttl;
 const catalog = @import("table_catalog.zig");
-const reads = @import("table_read_source.zig");
-const writes = @import("table_write_source.zig");
-const integrity = @import("relational_integrity_commit.zig");
-const operation = @import("operation.zig");
-const schema = @import("../schema/mod.zig");
-const topology = @import("../common/topology_records.zig");
-const contract = @import("distributed_txn_contract.zig");
-const types = @import("../storage/db/types.zig");
+const reads = @import("antfly_local_sources").api_table_read_source;
+const writes = @import("antfly_local_sources").api_table_write_source;
+const integrity = @import("antfly_local_sources").api_relational_integrity_commit;
+const operation = @import("antfly_local_sources").api_operation;
+const schema = @import("antfly_local_sources").schema_mod;
+const topology = @import("antfly_local_sources").common_topology_records;
+const contract = @import("antfly_local_sources").api_distributed_txn_contract;
+const types = @import("antfly_local_sources").storage_db_types;
 
 const CommitCancellation = struct {
     request: operation.RequestContext,
@@ -270,7 +270,7 @@ test "distributed txn ttl shares cascade restrict and set null semantics" {
                 return .{ .committed = .{ .participant_count = 1 } };
             }
             fn candidate(self: *@This(), key: []const u8) !expiry.Candidate {
-                const physical = try @import("../storage/db/relational_store.zig").keyAlloc(std.testing.allocator, key);
+                const physical = try @import("antfly_local_sources").storage_db_relational_store.keyAlloc(std.testing.allocator, key);
                 defer std.testing.allocator.free(physical);
                 var read = try self.db.core.store.beginReadTxn();
                 defer read.abort();

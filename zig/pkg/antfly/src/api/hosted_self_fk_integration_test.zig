@@ -850,7 +850,7 @@ fn printDropParentFailureState(alloc: std.mem.Allocator, metadata: *metadata_run
         if (publication_status) |value| {
             var response = value;
             defer response.deinit(alloc);
-            var parsed = std.json.parseFromSlice(@import("../storage/db/relational_integrity_generation_admission.zig").OwnerStatus, alloc, response.json, .{}) catch |err| {
+            var parsed = std.json.parseFromSlice(@import("antfly_local_sources").storage_db_relational_integrity_generation_admission.OwnerStatus, alloc, response.json, .{}) catch |err| {
                 std.debug.print("self-FK DROP owner node={d} publication_decode_err={s}\n", .{ node_id, @errorName(err) });
                 continue;
             };
@@ -910,7 +910,7 @@ const RecoveredOwnerStatus = struct {
     digest_matches: bool,
     schema_matches: bool,
     installed: bool,
-    activation_state: @import("../storage/db/relational_integrity_activation_contract.zig").State,
+    activation_state: @import("antfly_local_sources").storage_db_relational_integrity_activation_contract.State,
     activation_schema_version: u32,
 };
 
@@ -930,7 +930,7 @@ fn inspectRecoveredOwner(alloc: std.mem.Allocator, metadata: *metadata_runtime.S
     const reader = data.read_source.source();
     var owner_identity = (try reader.lookupGroupLocal(alloc, group_id, owner_table_name, "", .{ .relational_topology_json = "{\"mode\":\"identity\"}" }, .read_index)) orelse return error.OwnerStatusUnavailable;
     defer owner_identity.deinit(alloc);
-    var parsed_identity = try std.json.parseFromSlice(@import("../storage/db/relational_integrity_topology_contract.zig").Identity, alloc, owner_identity.json, .{ .ignore_unknown_fields = true });
+    var parsed_identity = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Identity, alloc, owner_identity.json, .{ .ignore_unknown_fields = true });
     defer parsed_identity.deinit();
     var owner_schema = (try reader.lookupGroupLocal(alloc, group_id, owner_table_name, "", .{ .relational_topology_json = "{\"mode\":\"public_schema\"}" }, .read_index)) orelse return error.OwnerStatusUnavailable;
     defer owner_schema.deinit(alloc);
@@ -938,12 +938,12 @@ fn inspectRecoveredOwner(alloc: std.mem.Allocator, metadata: *metadata_runtime.S
     defer parsed_schema.deinit();
     var owner_publication = (try reader.lookupGroupLocal(alloc, group_id, owner_table_name, "", .{ .relational_topology_json = "{\"mode\":\"generation_publication\"}" }, .read_index)) orelse return error.OwnerStatusUnavailable;
     defer owner_publication.deinit(alloc);
-    var parsed_owner_publication = try std.json.parseFromSlice(@import("../storage/db/relational_integrity_generation_admission.zig").OwnerStatus, alloc, owner_publication.json, .{ .ignore_unknown_fields = true });
+    var parsed_owner_publication = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_relational_integrity_generation_admission.OwnerStatus, alloc, owner_publication.json, .{ .ignore_unknown_fields = true });
     defer parsed_owner_publication.deinit();
     var activation_response = (try reader.integrityActivation(alloc, owner_table_name, record.plan.child_ranges[0].start_key, "{\"mode\":\"status\"}")) orelse return error.OwnerStatusUnavailable;
     defer activation_response.deinit(alloc);
     var activation = try std.json.parseFromSlice(struct {
-        state: @import("../storage/db/relational_integrity_activation_contract.zig").State,
+        state: @import("antfly_local_sources").storage_db_relational_integrity_activation_contract.State,
         schema_version: u32,
     }, alloc, activation_response.json, .{ .ignore_unknown_fields = true });
     defer activation.deinit();
@@ -955,7 +955,7 @@ fn inspectRecoveredOwner(alloc: std.mem.Allocator, metadata: *metadata_runtime.S
 
 fn awaitRecoveredOwnerReady(alloc: std.mem.Allocator, io: std.Io, metadata: *metadata_runtime.Server, data: *data_runtime.DataServer, table_id: u64, drivers: []const *const raft.ManagedProgressDriver) !void {
     const deadline = platform.time.monotonicNs() +| 10 * std.time.ns_per_s;
-    var prior_state: ?@import("../storage/db/relational_integrity_activation_contract.zig").State = null;
+    var prior_state: ?@import("antfly_local_sources").storage_db_relational_integrity_activation_contract.State = null;
     while (true) {
         for (drivers) |driver| try driver.checkFailure();
         const observed = inspectRecoveredOwner(alloc, metadata, data, table_id) catch |err| switch (err) {
@@ -1283,7 +1283,7 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
         defer inserted.deinit(alloc);
         if (inserted.status != 200) std.debug.print("hosted MERGE seed status={d} body={s}\n", .{ inserted.status, inserted.body });
         try std.testing.expectEqual(@as(u16, 200), inserted.status);
-        const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @embedFile("../sql/fixtures/sql_parity_inventory.json"), .{});
+        const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @import("antfly_local_sources").sql_parity_fixtures.inventory, .{});
         defer corpus.deinit();
         const original = for (corpus.value.object.get("entries").?.array.items) |entry| {
             if (std.mem.eql(u8, entry.object.get("id").?.string, "sql-0008")) break entry.object.get("sql").?.string;

@@ -1018,3 +1018,6 @@ test "serverless main derives GCS lanes and configured credentials" {
     try std.testing.expectEqualStrings("antfly-prod", configured.gcs_options[0].?.project_id.?);
     try std.testing.expectEqualStrings("https://storage.example/v1", configured.gcs_options[0].?.endpoint.?);
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

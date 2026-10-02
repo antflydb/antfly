@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Elastic-2.0
 
 //! Compatibility facade for the local inference provider adapter.
-const local = @import("../storage/inference_provider.zig");
+const local = @import("antfly_local_sources").storage_inference_provider;
 pub const inference_bridge = local.inference_bridge;
 pub const runtime_http_abi = local.runtime_http_abi;
 pub const LocalInferenceConnectionContext = local.LocalInferenceConnectionContext;

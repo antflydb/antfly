@@ -107,7 +107,7 @@ pub const MetadataServer = struct {
     owned_kernel_owner_source: ?*MetadataKernelOwnerSource = null,
     owned_public_http_server: ?*public_api_kernel.ApiHttpServer = null,
     owned_admin_mux: ?*MetadataAdminMux = null,
-    http_observer_lease: ?@import("../storage/background_runtime.zig").BackendRuntime.WorkerLease = null,
+    http_observer_lease: ?@import("antfly_local_sources").storage_background_runtime.BackendRuntime.WorkerLease = null,
     owned_http_runtime: ?*httpx.HttpRuntime = null,
     owned_admin_listener: ?*MetadataAdminHttpRuntime = null,
     restore_supervisor_owner_id: u64 = 0,
@@ -133,7 +133,7 @@ pub const MetadataServer = struct {
         };
         var http_config = cfg.http;
         if (online_capabilities != null) {
-            http_config.http.executor.max_response_bytes = @max(http_config.http.executor.max_response_bytes, @import("../storage/db/online_merge_io_contract.zig").max_response_bytes);
+            http_config.http.executor.max_response_bytes = @max(http_config.http.executor.max_response_bytes, @import("antfly_local_sources").storage_db_online_merge_io_contract.max_response_bytes);
         }
         svc.* = try service.MetadataHttpService.init(alloc, http_config, deps.http, service_cfg);
         errdefer svc.deinit();
@@ -215,7 +215,7 @@ pub const MetadataServer = struct {
         };
         var owned_admin_mux: ?*MetadataAdminMux = null;
         errdefer if (owned_admin_mux) |mux| alloc.destroy(mux);
-        var http_observer_lease: ?@import("../storage/background_runtime.zig").BackendRuntime.WorkerLease = null;
+        var http_observer_lease: ?@import("antfly_local_sources").storage_background_runtime.BackendRuntime.WorkerLease = null;
         errdefer if (http_observer_lease) |*lease| lease.release();
         var owned_http_runtime: ?*httpx.HttpRuntime = null;
         errdefer if (owned_http_runtime) |http_runtime| {
@@ -707,11 +707,11 @@ const MetadataAdminHttpRuntime = struct {
     handler: public_api_kernel.HttpxHandler,
     server: httpx.Server,
     listener_task: httpx.ListenerTask,
-    api_lane_lease: @import("../storage/background_runtime.zig").BackendRuntime.ApiLaneLease,
+    api_lane_lease: @import("antfly_local_sources").storage_background_runtime.BackendRuntime.ApiLaneLease,
 
     fn init(
         alloc: std.mem.Allocator,
-        backend_runtime: *@import("../storage/background_runtime.zig").BackendRuntime,
+        backend_runtime: *@import("antfly_local_sources").storage_background_runtime.BackendRuntime,
         http_runtime: *httpx.HttpRuntime,
         cfg: raft_transport.StdHttpListenerConfig,
         mux: *MetadataAdminMux,
@@ -896,7 +896,7 @@ fn metadataRestoreJobPut(ptr: *anyopaque, key: []const u8, value: []const u8, le
 
 fn metadataRestoreJobCreate(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8, value: []const u8, leadership_term: u64) ![]u8 {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, @import("topology_protocol.zig").restore_job_admission_version);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, @import("antfly_local_sources").metadata_topology_protocol.restore_job_admission_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.validateTableTopologyProtocolReadinessWithContext(.{}, readiness);
@@ -912,7 +912,7 @@ fn metadataRestoreJobCreate(ptr: *anyopaque, alloc: std.mem.Allocator, key: []co
 
 fn metadataRestoreJobCreateWithStaging(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8, value: []const u8, plan_json: []const u8, leadership_term: u64) ![]u8 {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, @import("topology_protocol.zig").coordinated_lifecycle_version);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, @import("antfly_local_sources").metadata_topology_protocol.coordinated_lifecycle_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.validateTableTopologyProtocolReadinessWithContext(.{}, readiness);
@@ -923,7 +923,7 @@ fn metadataRestoreJobCreateWithStaging(ptr: *anyopaque, alloc: std.mem.Allocator
 
 fn metadataRestoreJobDeleteMatching(ptr: *anyopaque, key: []const u8, value_hash: []const u8, leadership_term: u64) !bool {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, @import("topology_protocol.zig").restore_job_expiry_version);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, @import("antfly_local_sources").metadata_topology_protocol.restore_job_expiry_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.validateTableTopologyProtocolReadinessWithContext(.{}, readiness);
@@ -1603,7 +1603,7 @@ test "metadata server online merge defaults on only for authenticated native dep
     cfg.api_server_cfg.deployment_mode = .serverless;
     try std.testing.expect((try onlineMergeCapabilities(cfg)) == null);
     cfg.api_server_cfg.deployment_mode = .distributed;
-    var node = try @import("../common/config.zig").Config.parseFromSlice(std.testing.allocator, "{}");
+    var node = try @import("antfly_local_sources").common_config.Config.parseFromSlice(std.testing.allocator, "{}");
     defer node.deinit();
     node.deployment_mode = .serverless;
     cfg.api_server_cfg.node_config = &node;
@@ -1614,7 +1614,7 @@ test "metadata server online merge defaults on only for authenticated native dep
     if (control_only_storage_sources) {
         try (try onlineMergeCapabilities(cfg)).?.require();
     } else try std.testing.expect((try onlineMergeCapabilities(cfg)) == null);
-    try std.testing.expect(@import("../storage/db/online_merge_io_contract.zig").max_response_bytes >= 32 * 1024 * 1024);
+    try std.testing.expect(@import("antfly_local_sources").storage_db_online_merge_io_contract.max_response_bytes >= 32 * 1024 * 1024);
 }
 
 test "metadata server can expose admin listener endpoints" {

@@ -18,9 +18,9 @@ const metadata_openapi = @import("antfly_metadata_openapi");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const generating = @import("antfly_generating");
 const platform_time = @import("antfly_platform").time;
-const db_mod = @import("../storage/db/selected_root.zig").db;
-const storage_schema = @import("../storage/schema.zig");
-const query_contract = @import("query_contract.zig");
+const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
+const storage_schema = @import("antfly_local_sources").storage_schema;
+const query_contract = @import("antfly_local_sources").api_query_contract;
 const agent_tools = @import("agent_tools.zig");
 
 const AgentQuestion = metadata_openapi.AgentQuestion;

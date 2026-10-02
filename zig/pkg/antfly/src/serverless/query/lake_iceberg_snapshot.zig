@@ -28,7 +28,7 @@ const lake_iceberg_deletes = @import("lake_iceberg_deletes.zig");
 const lake_object_reader = @import("lake_object_reader.zig");
 const lake_parquet_rowgroup = @import("lake_parquet_rowgroup.zig");
 const lake_range_io = @import("lake_range_io.zig");
-const object_storage = @import("../../storage/object_storage.zig");
+const object_storage = @import("antfly_local_sources").storage_object_storage;
 const rowsource = @import("../../storage/rowsource/types.zig");
 
 pub const SnapshotReadRequest = struct {

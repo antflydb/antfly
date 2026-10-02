@@ -16,8 +16,8 @@ const std = @import("std");
 const store_mod = @import("raft_apply_store.zig");
 const shard = @import("shard_state_store.zig");
 const batch = @import("../raft_batch.zig");
-const types = @import("../../storage/db/types.zig");
-const pages = @import("../../storage/db/merge_page_contract.zig");
+const types = @import("antfly_local_sources").storage_db_types;
+const pages = @import("antfly_local_sources").storage_db_merge_page_contract;
 const raft = @import("../../raft/state_machine/mod.zig");
 const alloc = std.testing.allocator;
 const group: u64 = 502;
@@ -41,9 +41,9 @@ fn seal(input: types.BatchRequest) types.BatchRequest {
 }
 
 test "data raft merge pages chunk spool survives snapshot without exposing incomplete rows" {
-    var first_dir = try @import("../../common/test_directory.zig").TestDirectory.init("merge-chunk-projection");
+    var first_dir = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("merge-chunk-projection");
     defer first_dir.cleanup();
-    var next_dir = try @import("../../common/test_directory.zig").TestDirectory.init("merge-chunk-projection-restored");
+    var next_dir = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("merge-chunk-projection-restored");
     defer next_dir.cleanup();
     var source = try store_mod.RaftApplyStore.init(alloc, .{ .root_dir = first_dir.path() });
     defer source.deinit();
@@ -53,7 +53,7 @@ test "data raft merge pages chunk spool survives snapshot without exposing incom
     try payload(&source, 1, barrier);
     var checkpoint: types.MergeReplicationCheckpoint = .{ .kind = .accept, .transition_id = 500, .donor_group_id = 501, .receiver_group_id = group, .receiver_base_start = "m", .receiver_base_end = "z", .merged_start = "a", .merged_end = "z" };
     try command(&source, 2, .{ .merge_checkpoint = checkpoint });
-    const namespace: @import("../../storage/db/doc_identity_namespace.zig").Namespace = .{ .table_id = 11, .shard_id = group, .range_id = group };
+    const namespace: @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace = .{ .table_id = 11, .shard_id = group, .range_id = group };
     const pin: pages.Source = .{ .namespace = .{ .table_id = 11, .shard_id = 501, .range_id = 501 }, .pin_digest = @splat(7), .applied_index = 100 };
     checkpoint.kind = .begin_copy;
     checkpoint.copy_attempt = .{ .donor_term = 1, .sequence = 1 };
@@ -94,9 +94,9 @@ test "data raft merge pages chunk spool survives snapshot without exposing incom
 }
 
 test "data raft merge pages persist atomic cursor through snapshot retry and protocol fences" {
-    var first_dir = try @import("../../common/test_directory.zig").TestDirectory.init("merge-pages-projection");
+    var first_dir = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("merge-pages-projection");
     defer first_dir.cleanup();
-    var second_dir = try @import("../../common/test_directory.zig").TestDirectory.init("merge-pages-projection-reopened");
+    var second_dir = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("merge-pages-projection-reopened");
     defer second_dir.cleanup();
     var source = try store_mod.RaftApplyStore.init(alloc, .{ .root_dir = first_dir.path() });
     defer source.deinit();
@@ -106,7 +106,7 @@ test "data raft merge pages persist atomic cursor through snapshot retry and pro
     try payload(&source, 1, barrier);
     var checkpoint: types.MergeReplicationCheckpoint = .{ .kind = .accept, .transition_id = 500, .donor_group_id = 501, .receiver_group_id = group, .receiver_base_start = "m", .receiver_base_end = "z", .merged_start = "a", .merged_end = "z" };
     try command(&source, 2, .{ .merge_checkpoint = checkpoint });
-    const namespace: @import("../../storage/db/doc_identity_namespace.zig").Namespace = .{ .table_id = 11, .shard_id = group, .range_id = group };
+    const namespace: @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace = .{ .table_id = 11, .shard_id = group, .range_id = group };
     const pin: pages.Source = .{ .namespace = .{ .table_id = 11, .shard_id = 501, .range_id = 501 }, .pin_digest = @splat(7), .applied_index = 100 };
     checkpoint.kind = .begin_copy;
     checkpoint.copy_attempt = .{ .donor_term = 1, .sequence = 1 };
@@ -169,7 +169,7 @@ test "data raft merge pages persist atomic cursor through snapshot retry and pro
 }
 
 test "data raft merge pages snapshot locator requires protocol12 and fences cursor replay" {
-    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("merge-locator-projection");
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("merge-locator-projection");
     defer directory.cleanup();
     var store = try store_mod.RaftApplyStore.init(alloc, .{ .root_dir = directory.path() });
     defer store.deinit();
@@ -179,7 +179,7 @@ test "data raft merge pages snapshot locator requires protocol12 and fences curs
     try payload(&store, 1, old_barrier);
     var checkpoint: types.MergeReplicationCheckpoint = .{ .kind = .accept, .transition_id = 500, .donor_group_id = 501, .receiver_group_id = group, .receiver_base_start = "m", .receiver_base_end = "z", .merged_start = "a", .merged_end = "z" };
     try command(&store, 2, .{ .merge_checkpoint = checkpoint });
-    const namespace: @import("../../storage/db/doc_identity_namespace.zig").Namespace = .{ .table_id = 11, .shard_id = group, .range_id = group };
+    const namespace: @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace = .{ .table_id = 11, .shard_id = group, .range_id = group };
     const pin: pages.Source = .{ .namespace = .{ .table_id = 11, .shard_id = 501, .range_id = 501 }, .pin_digest = @splat(7), .applied_index = 100, .retention = .{ .epoch = 3, .after_sequence = 10 } };
     checkpoint.kind = .begin_copy;
     checkpoint.copy_attempt = .{ .donor_term = 1, .sequence = 1 };
@@ -219,9 +219,9 @@ test "data raft merge pages snapshot locator requires protocol12 and fences curs
 }
 
 test "data raft merge pages tail requires v12 and resumes fragments through snapshots" {
-    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("merge-tail-projection");
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("merge-tail-projection");
     defer directory.cleanup();
-    var recovered_directory = try @import("../../common/test_directory.zig").TestDirectory.init("merge-tail-projection-recovered");
+    var recovered_directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("merge-tail-projection-recovered");
     defer recovered_directory.cleanup();
     var store = try store_mod.RaftApplyStore.init(alloc, .{ .root_dir = directory.path() });
     defer store.deinit();
@@ -231,7 +231,7 @@ test "data raft merge pages tail requires v12 and resumes fragments through snap
     try payload(&store, 1, old_barrier);
     var checkpoint: types.MergeReplicationCheckpoint = .{ .kind = .accept, .transition_id = 500, .donor_group_id = 501, .receiver_group_id = group, .receiver_base_start = "m", .receiver_base_end = "z", .merged_start = "a", .merged_end = "z" };
     try command(&store, 2, .{ .merge_checkpoint = checkpoint });
-    const namespace: @import("../../storage/db/doc_identity_namespace.zig").Namespace = .{ .table_id = 11, .shard_id = group, .range_id = group };
+    const namespace: @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace = .{ .table_id = 11, .shard_id = group, .range_id = group };
     const pin: pages.Source = .{ .namespace = .{ .table_id = 11, .shard_id = 501, .range_id = 501 }, .pin_digest = @splat(7), .applied_index = 100, .retention = .{ .epoch = 3, .after_sequence = 10 } };
     checkpoint.kind = .begin_copy;
     checkpoint.copy_attempt = .{ .donor_term = 1, .sequence = 1 };
@@ -269,9 +269,9 @@ test "data raft merge pages tail requires v12 and resumes fragments through snap
     try snapshot.writer.writeByte(0);
     const primary_path = try std.fmt.allocPrintSentinel(alloc, "{s}/native", .{recovered_directory.path()}, 0);
     defer alloc.free(primary_path);
-    var primary = try @import("../../storage/docstore.zig").DocStore.open(alloc, primary_path.ptr, .{});
+    var primary = try @import("antfly_local_sources").storage_docstore.DocStore.open(alloc, primary_path.ptr, .{});
     defer primary.close();
-    const primary_key = try @import("../../storage/internal_keys.zig").documentKeyAlloc(alloc, first.writes[0].key);
+    const primary_key = try @import("antfly_local_sources").storage_internal_keys.documentKeyAlloc(alloc, first.writes[0].key);
     defer alloc.free(primary_key);
     try primary.put(primary_key, first.writes[0].value);
     var resumed = try store_mod.RaftApplyStore.init(alloc, .{ .root_dir = recovered_directory.path() });
@@ -310,14 +310,14 @@ test "data raft merge pages tail requires v12 and resumes fragments through snap
 }
 
 test "data raft merge pages projection cannot acknowledge native source retention controls" {
-    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("merge-source-projection-reject");
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("merge-source-projection-reject");
     defer directory.cleanup();
     var store = try store_mod.RaftApplyStore.init(alloc, .{ .root_dir = directory.path() });
     defer store.deinit();
     const barrier = try batch.encodeProtocolBarrier(alloc, "docs", batch.online_source_protocol_version);
     defer alloc.free(barrier);
     try payload(&store, 1, barrier);
-    const source: @import("../../storage/db/online_source_contract.zig").Scope = .{
+    const source: @import("antfly_local_sources").storage_db_online_source_contract.Scope = .{
         .consumer_epoch = 1,
         .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
         .receiver_namespace = .{ .table_id = 11, .shard_id = 503, .range_id = 503 },
@@ -356,11 +356,11 @@ test "data raft merge pages native source projection requires trusted delegate a
         }
     };
     for ([_]bool{ false, true }) |trusted| {
-        var directory = try @import("../../common/test_directory.zig").TestDirectory.init("merge-source-native-projection");
+        var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("merge-source-native-projection");
         defer directory.cleanup();
         var store = try store_mod.RaftApplyStore.init(alloc, .{ .root_dir = directory.path(), .native_source_delegate = trusted });
         defer store.deinit();
-        const source: @import("../../storage/db/online_source_contract.zig").Scope = .{
+        const source: @import("antfly_local_sources").storage_db_online_source_contract.Scope = .{
             .consumer_epoch = 1,
             .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
             .receiver_namespace = .{ .table_id = 11, .shard_id = 503, .range_id = 503 },
@@ -397,12 +397,12 @@ test "data raft merge pages native source projection requires trusted delegate a
 }
 
 test "data raft merge pages cleanup verifies pending put delete overlay and exact EOF" {
-    const docstore = @import("../../storage/docstore.zig");
-    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("merge-page-overlay-proof");
+    const docstore = @import("antfly_local_sources").storage_docstore;
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("merge-page-overlay-proof");
     defer directory.cleanup();
     var store = try docstore.DocStore.open(alloc, directory.path().ptr, .{});
     defer store.close();
-    const namespace: @import("../../storage/db/doc_identity_namespace.zig").Namespace = .{ .table_id = 11, .shard_id = group, .range_id = group };
+    const namespace: @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace = .{ .table_id = 11, .shard_id = group, .range_id = group };
     const pin: pages.Source = .{ .namespace = .{ .table_id = 11, .shard_id = 501, .range_id = 501 }, .pin_digest = @splat(7), .applied_index = 100 };
     const accept: types.MergeReplicationCheckpoint = .{ .kind = .accept, .transition_id = 500, .donor_group_id = 501, .receiver_group_id = group, .receiver_base_start = "m", .receiver_base_end = "z", .merged_start = "a", .merged_end = "z" };
     var begin = accept;

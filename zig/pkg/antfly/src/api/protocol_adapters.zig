@@ -735,7 +735,7 @@ fn mcpToolVisibleForIdentity(spec: McpToolSpec, authenticated_identity: anytype)
 /// effective table permission again immediately before dispatch so denied MCP
 /// calls cannot reach an extension, router, or metadata mutation path.
 fn mcpTableNameAlloc(alloc: std.mem.Allocator, args: std.json.Value, argument: []const u8) ![]u8 {
-    const catalog = @import("../system_catalog/domain.zig");
+    const catalog = @import("antfly_local_sources").system_catalog_domain;
     const table = jsonStringArg(args, argument) orelse return error.InvalidCatalogName;
     var target = try catalog.Target.literal(table);
     if (jsonValueArg(args, "database") != null) target.database = jsonStringArg(args, "database") orelse return error.InvalidCatalogName;

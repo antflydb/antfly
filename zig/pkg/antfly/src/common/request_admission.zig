@@ -5,7 +5,7 @@
 // the License at https://www.antfly.io/licensing/ELv2-license.
 
 const std = @import("std");
-const prometheus = @import("prometheus.zig");
+const prometheus = @import("antfly_local_sources").common_prometheus;
 
 pub const Class = enum { none, query, write, inference };
 

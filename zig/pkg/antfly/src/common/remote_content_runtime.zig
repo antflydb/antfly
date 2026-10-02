@@ -5,8 +5,8 @@
 
 const std = @import("std");
 const scraping = @import("antfly_scraping");
-const config_mod = @import("config.zig");
-const secrets = @import("secrets.zig");
+const config_mod = @import("antfly_local_sources").common_config;
+const secrets = @import("antfly_local_sources").common_secrets;
 const platform_sync = @import("antfly_platform").sync;
 
 const request_refresh_interval_ns: u64 = std.time.ns_per_s;

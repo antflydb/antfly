@@ -17,7 +17,7 @@ const platform_sync = @import("antfly_platform").sync;
 const objectstore = @import("objectstore");
 const wal_types = @import("types.zig");
 const wal_store = @import("store.zig");
-const remote_uri = @import("../remote_uri.zig");
+const remote_uri = @import("antfly_local_sources").serverless_remote_uri;
 const object_store_support = @import("../object_store_support.zig");
 
 pub const ObjectStore = struct {

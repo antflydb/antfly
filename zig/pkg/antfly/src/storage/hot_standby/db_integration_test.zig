@@ -13,7 +13,7 @@
 // limitations.
 
 //! DB integration with hot standby coordination. Engine-only tests stay with DB.
-const engine = @import("../db/db.zig");
+const engine = @import("antfly_local_sources").storage_db_db;
 const default_test_wait_attempts = engine.test_support.default_test_wait_attempts;
 const ConcurrentWriteProbe = engine.test_support.ConcurrentWriteProbe;
 const DB = engine.DB;
@@ -28,7 +28,7 @@ const MutationBarrier = engine.MutationBarrier;
 const OpenOptions = engine.OpenOptions;
 const ReplicationAsyncEffectMirror = engine.ReplicationAsyncEffectMirror;
 const ResolutionHandoffPublishHook = engine.test_support.ResolutionHandoffPublishHook;
-const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
+const TestDirectory = @import("antfly_local_sources").common_test_directory.TestDirectory;
 const TtlCleanupContext = engine.test_support.TtlCleanupContext;
 const appendDerivedBatchRecord = engine.test_support.appendDerivedBatchRecord;
 const appendDerivedBatchRecordContext = engine.test_support.appendDerivedBatchRecordContext;
@@ -36,47 +36,47 @@ const appendResolutionRecord = engine.test_support.appendResolutionRecord;
 const appendResolutionRecordWithHook = engine.test_support.appendResolutionRecordWithHook;
 const applyDerivedBatchToIndexAsync = engine.test_support.applyDerivedBatchToIndexAsync;
 const builtin = @import("builtin");
-const change_journal_mod = @import("../db/derived/change_journal.zig");
+const change_journal_mod = @import("antfly_local_sources").storage_db_derived_change_journal;
 const cleanupTempDir = engine.test_support.cleanupTempDir;
-const doc_identity = @import("../db/doc_identity.zig");
-const docstore_mod = @import("../docstore.zig");
+const doc_identity = @import("antfly_local_sources").storage_db_doc_identity;
+const docstore_mod = @import("antfly_local_sources").storage_docstore;
 const durableReplicationOutboxKeyAlloc = durable_outbox.durableReplicationOutboxKeyAlloc;
 const durableReplicationOutboxKindFromKey = durable_outbox.durableReplicationOutboxKindFromKey;
 const encodeDurableReplicationOutboxAlloc = durable_outbox.encodeDurableReplicationOutboxAlloc;
-const enrichment_artifact_codec = @import("../db/enrichment/artifact_codec.zig");
+const enrichment_artifact_codec = @import("antfly_local_sources").storage_db_enrichment_artifact_codec;
 const executeDeleteBatchContext = engine.test_support.executeDeleteBatchContext;
 const expireDirectGraphTtlCandidateContext = engine.test_support.expireDirectGraphTtlCandidateContext;
 const expireGraphTtlCandidateContext = engine.test_support.expireGraphTtlCandidateContext;
-const graph_edge_contender = @import("../db/graph_edge_contender.zig");
-const graph_edge_ttl_expiration = @import("../db/graph_edge_ttl_expiration.zig");
-const graph_edge_ttl_tombstone = @import("../db/graph_edge_ttl_tombstone.zig");
-const graph_metric_rerank = @import("../../graph/metric_rerank.zig");
-const graph_mod = @import("../../graph/graph.zig");
-const internal_keys = @import("../internal_keys.zig");
+const graph_edge_contender = @import("antfly_local_sources").storage_db_graph_edge_contender;
+const graph_edge_ttl_expiration = @import("antfly_local_sources").storage_db_graph_edge_ttl_expiration;
+const graph_edge_ttl_tombstone = @import("antfly_local_sources").storage_db_graph_edge_ttl_tombstone;
+const graph_metric_rerank = @import("antfly_local_sources").graph_metric_rerank;
+const graph_mod = @import("antfly_local_sources").graph_graph;
+const internal_keys = @import("antfly_local_sources").storage_internal_keys;
 const lockAtomic = engine.test_support.lockAtomic;
 const monotonicTimeNs = engine.test_support.monotonicTimeNs;
 const platform_clock = @import("antfly_platform").clock;
-const portable_backup = @import("../portable_backup.zig");
+const portable_backup = @import("antfly_local_sources").storage_portable_backup;
 const publishResolutionHandoffContext = engine.test_support.publishResolutionHandoffContext;
-const relational_columns = @import("../db/relational_columns.zig");
-const replay_stream_mod = @import("../db/derived/replay_stream.zig");
+const relational_columns = @import("antfly_local_sources").storage_db_relational_columns;
+const replay_stream_mod = @import("antfly_local_sources").storage_db_derived_replay_stream;
 const replication_batch_outbox_key = durable_outbox.replication_batch_outbox_key;
-const replication_effects_mod = @import("../db/replication_effects.zig");
-const replication_ingress = @import("../db/replication_ingress.zig");
+const replication_effects_mod = @import("antfly_local_sources").storage_db_replication_effects;
+const replication_ingress = @import("antfly_local_sources").storage_db_replication_ingress;
 const replication_outbox_v2_prefix = durable_outbox.replication_outbox_v2_prefix;
-const replication_record_mod = @import("../db/replication_record.zig");
-const resolution_handoff = @import("../db/resolution_handoff.zig");
-const resolution_runtime_mod = @import("../db/resolution_runtime.zig");
-const row_policy_authority_mod = @import("../../usermgr/row_policy_authority.zig");
-const row_policy_bundle_mod = @import("../db/row_policy_bundle.zig");
-const schema_mod = @import("../schema.zig");
+const replication_record_mod = @import("antfly_local_sources").storage_db_replication_record;
+const resolution_handoff = @import("antfly_local_sources").storage_db_resolution_handoff;
+const resolution_runtime_mod = @import("antfly_local_sources").storage_db_resolution_runtime;
+const row_policy_authority_mod = @import("antfly_local_sources").usermgr_row_policy_authority;
+const row_policy_bundle_mod = @import("antfly_local_sources").storage_db_row_policy_bundle;
+const schema_mod = @import("antfly_local_sources").storage_schema;
 const sleepNs = engine.test_support.sleepNs;
 const std = @import("std");
-const table_catalog_mod = @import("../db/table_catalog.zig");
-const transactions_mod = @import("../transactions.zig");
-const types = @import("../db/types.zig");
+const table_catalog_mod = @import("antfly_local_sources").storage_db_table_catalog;
+const transactions_mod = @import("antfly_local_sources").storage_transactions;
+const types = @import("antfly_local_sources").storage_db_types;
 const waitForAtomicFlag = engine.test_support.waitForAtomicFlag;
-const durable_outbox = @import("../db/durable_outbox.zig");
+const durable_outbox = @import("antfly_local_sources").storage_db_durable_outbox;
 
 const hot_standby_write_gate_adapter = @import("write_gate.zig");
 
@@ -241,7 +241,7 @@ test "row-policy Raft apply persists fail-closed intent and finalizes after rest
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
     ;
     var bundle_bytes: []u8 = undefined;
-    var request: @import("../../system_catalog/policies.zig").InstallRequest = undefined;
+    var request: @import("antfly_local_sources").system_catalog_policies.InstallRequest = undefined;
     {
         var db = try DB.open(alloc, path, options);
         defer db.close();
@@ -251,7 +251,7 @@ test "row-policy Raft apply persists fail-closed intent and finalizes after rest
         defer alloc.free(schema_bytes);
         var schema_digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(schema_bytes, &schema_digest, .{});
-        const policy: @import("../../system_catalog/policies.zig").Record = .{
+        const policy: @import("antfly_local_sources").system_catalog_policies.Record = .{
             .id = 1,
             .generation = 1,
             .table_id = namespace.table_id,
@@ -264,7 +264,7 @@ test "row-policy Raft apply persists fail-closed intent and finalizes after rest
                 .{ .type = .{ .kind = .boolean }, .operation = .{ .literal = .{ .bool = true } } },
             }, .root = 0 },
         };
-        bundle_bytes = try std.json.Stringify.valueAlloc(alloc, @import("../../system_catalog/policies.zig").InstallSnapshot{
+        bundle_bytes = try std.json.Stringify.valueAlloc(alloc, @import("antfly_local_sources").system_catalog_policies.InstallSnapshot{
             .table_id = namespace.table_id,
             .schema_version = schema.version,
             .schema_digest = schema_digest,
@@ -281,7 +281,7 @@ test "row-policy Raft apply persists fail-closed intent and finalizes after rest
             .expected_catalog_epoch = 2,
             .expected_phase = .pending_install,
             .owner_group_id = 17,
-            .expected_descriptor_digest = try (@import("../../system_catalog/policies.zig").OwnerDescriptor{
+            .expected_descriptor_digest = try (@import("antfly_local_sources").system_catalog_policies.OwnerDescriptor{
                 .table_id = namespace.table_id,
                 .group_id = 17,
                 .shard_id = namespace.shard_id,
@@ -314,7 +314,7 @@ test "row-policy Raft apply persists fail-closed intent and finalizes after rest
         try std.testing.expectEqual(@as(u64, 3), receipt.applied_term);
         try std.testing.expectEqual(@as(u64, 11), receipt.applied_index);
         try std.testing.expectEqualDeep(receipt, (try db.applyReplicatedRowPolicyPublication(bundle_bytes, request, .{ .term = 3, .index = 11 })).?);
-        var parsed = try std.json.parseFromSlice(@import("../../system_catalog/policies.zig").InstallSnapshot, alloc, bundle_bytes, .{});
+        var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").system_catalog_policies.InstallSnapshot, alloc, bundle_bytes, .{});
         defer parsed.deinit();
         parsed.value.phase = .serving_install;
         const serving_bytes = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
@@ -367,7 +367,7 @@ test "row-policy Raft apply persists fail-closed intent and finalizes after rest
     var follower_reader = try follower.local_execution.row_policy_gate.enterRaw();
     try std.testing.expect((try follower.applyReplicatedRowPolicyPublication(bundle_bytes, pending_request, .{ .term = 3, .index = 11 })) == null);
     try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.preparing, follower.local_execution.row_policy_gate.currentPhase());
-    var follower_bundle = try std.json.parseFromSlice(@import("../../system_catalog/policies.zig").InstallSnapshot, alloc, bundle_bytes, .{});
+    var follower_bundle = try std.json.parseFromSlice(@import("antfly_local_sources").system_catalog_policies.InstallSnapshot, alloc, bundle_bytes, .{});
     defer follower_bundle.deinit();
     follower_bundle.value.phase = .serving_install;
     const follower_serving_bytes = try std.json.Stringify.valueAlloc(alloc, follower_bundle.value, .{});
@@ -384,7 +384,7 @@ test "row-policy Raft apply persists fail-closed intent and finalizes after rest
     try std.testing.expectEqual(@as(u64, 12), follower_receipt.applied_index);
     try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.active, follower.local_execution.row_policy_gate.currentPhase());
 
-    var next_bundle = try std.json.parseFromSlice(@import("../../system_catalog/policies.zig").InstallSnapshot, alloc, bundle_bytes, .{});
+    var next_bundle = try std.json.parseFromSlice(@import("antfly_local_sources").system_catalog_policies.InstallSnapshot, alloc, bundle_bytes, .{});
     defer next_bundle.deinit();
     next_bundle.value.policy_generation = 2;
     next_bundle.value.catalog_epoch = 3;
@@ -449,7 +449,7 @@ test "row-policy Raft apply persists fail-closed intent and finalizes after rest
 test "storage.hot_standby graph retirement seal replays exact Raft receipt and rejects missing marker" {
     const alloc = std.testing.allocator;
     const replication_effects = @import("effects.zig");
-    const seal = @import("../db/graph_retirement_seal.zig");
+    const seal = @import("antfly_local_sources").storage_db_graph_retirement_seal;
     var path_tmp = try TestDirectory.init("graph-retirement-ha-replay");
     defer path_tmp.cleanup();
     const path = path_tmp.path().ptr;
@@ -463,7 +463,7 @@ test "storage.hot_standby graph retirement seal replays exact Raft receipt and r
     );
     try db.addIndex(.{ .name = "links", .kind = .graph, .config_json = "{}", .coverage_generation = 1 });
     const graph_digest = (try db.core.index_manager.graphRetirementConfigDigest(alloc)) orelse return error.TestUnexpectedResult;
-    const catalog = try db.core.store.get(alloc, @import("../db/relational_integrity_catalog.zig").key);
+    const catalog = try db.core.store.get(alloc, @import("antfly_local_sources").storage_db_relational_integrity_catalog.key);
     defer alloc.free(catalog);
     var catalog_digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(catalog, &catalog_digest, .{});
@@ -2636,7 +2636,7 @@ test "storage.hot_standby row policy metadata publication replays with its exact
     defer alloc.free(schema_bytes);
     var schema_digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(schema_bytes, &schema_digest, .{});
-    const policy: @import("../../system_catalog/policies.zig").Record = .{
+    const policy: @import("antfly_local_sources").system_catalog_policies.Record = .{
         .id = 1,
         .generation = 1,
         .table_id = 7,
@@ -2647,7 +2647,7 @@ test "storage.hot_standby row policy metadata publication replays with its exact
         .roles = &.{"PUBLIC"},
         .using = .{ .instructions = &.{.{ .type = .{ .kind = .boolean }, .operation = .{ .literal = .{ .bool = true } } }}, .root = 0 },
     };
-    const bundle = try std.json.Stringify.valueAlloc(alloc, @import("../../system_catalog/policies.zig").InstallSnapshot{
+    const bundle = try std.json.Stringify.valueAlloc(alloc, @import("antfly_local_sources").system_catalog_policies.InstallSnapshot{
         .table_id = 7,
         .schema_version = 1,
         .schema_digest = schema_digest,
@@ -2659,13 +2659,13 @@ test "storage.hot_standby row policy metadata publication replays with its exact
     }, .{});
     defer alloc.free(bundle);
     const range = owner.core.byteRange();
-    var request: @import("../../system_catalog/policies.zig").InstallRequest = .{
+    var request: @import("antfly_local_sources").system_catalog_policies.InstallRequest = .{
         .table_id = 7,
         .expected_generation = 1,
         .expected_catalog_epoch = 2,
         .expected_phase = .pending_install,
         .owner_group_id = 17,
-        .expected_descriptor_digest = try (@import("../../system_catalog/policies.zig").OwnerDescriptor{
+        .expected_descriptor_digest = try (@import("antfly_local_sources").system_catalog_policies.OwnerDescriptor{
             .table_id = 7,
             .group_id = 17,
             .shard_id = 8,
@@ -2690,7 +2690,7 @@ test "storage.hot_standby row policy metadata publication replays with its exact
     try std.testing.expectEqual(@as(u64, 11), receipt.applied_index);
     try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.preparing, replica.local_execution.row_policy_gate.currentPhase());
 
-    var serving = try std.json.parseFromSlice(@import("../../system_catalog/policies.zig").InstallSnapshot, alloc, bundle, .{});
+    var serving = try std.json.parseFromSlice(@import("antfly_local_sources").system_catalog_policies.InstallSnapshot, alloc, bundle, .{});
     defer serving.deinit();
     serving.value.phase = .serving_install;
     const serving_bundle = try std.json.Stringify.valueAlloc(alloc, serving.value, .{});
@@ -3312,10 +3312,10 @@ test "db ordered artifact inventory reconciles committed receiver catalog before
     var obsolete = obsolete: {
         var read = try follower.core.store.beginReadTxn();
         defer read.abort();
-        break :obsolete .{ .catalogs = try @import("../db/artifact_inventory.zig").copyCatalogs(alloc, &read) };
+        break :obsolete .{ .catalogs = try @import("antfly_local_sources").storage_db_artifact_inventory.copyCatalogs(alloc, &read) };
     };
     defer obsolete.catalogs.deinit(alloc);
-    const invalid_scope: @import("../db/online_source_contract.zig").Scope = .{
+    const invalid_scope: @import("antfly_local_sources").storage_db_online_source_contract.Scope = .{
         .fence = .{ .admission_epoch = 1, .attempt = 1, .transition_id = 9, .owner_group_id = 2, .peer_group_id = 3, .role = .merge_source, .namespace = options.identity_namespace.?, .catalog_digest = @splat(99) },
         .receiver_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 },
         .consumer_epoch = 1,
@@ -3326,7 +3326,7 @@ test "db ordered artifact inventory reconciles committed receiver catalog before
     {
         var read = try follower.core.store.beginReadTxn();
         defer read.abort();
-        try std.testing.expect((try @import("../db/artifact_reconcile_intent.zig").load(alloc, &read)) == null);
+        try std.testing.expect((try @import("antfly_local_sources").storage_db_artifact_reconcile_intent.load(alloc, &read)) == null);
     }
     // An independently built donor has a distinct physical generation but the
     // same definition. The receiver repairs to its own ordered generation.
@@ -3343,7 +3343,7 @@ test "db ordered artifact inventory reconciles committed receiver catalog before
     try std.testing.expect(donor_binding.compatible(command.binding));
     const request: types.BatchRequest = .{ .artifact_catalog = command, .merge_replication = .{ .transition_id = 10, .donor_group_id = 3, .receiver_group_id = 2, .identity_namespace = options.identity_namespace.?, .copy_attempt = .{} }, .merge_checkpoint = .{ .kind = .accept, .transition_id = 10, .donor_group_id = 3, .receiver_group_id = 2, .receiver_base_start = "m", .receiver_base_end = "z", .merged_start = "a", .merged_end = "z", .page_receiver_namespace = options.identity_namespace, .page_source = .{ .namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .pin_digest = @splat(5), .applied_index = 4, .retention = .{ .epoch = 1, .after_sequence = 0 }, .artifact_catalog = donor_binding } } };
     var retries: usize = 0;
-    var saved_context: ?@import("../db/artifact_reconcile_intent.zig").Context = null;
+    var saved_context: ?@import("antfly_local_sources").storage_db_artifact_reconcile_intent.Context = null;
     var restarted_cleanup = false;
     var saw_pending_repair = false;
     var standby_gate: @import("public_gate_state.zig").State = .{};
@@ -3363,13 +3363,13 @@ test "db ordered artifact inventory reconciles committed receiver catalog before
             {
                 var read = try follower.core.store.beginReadTxn();
                 defer read.abort();
-                const intent = (try @import("../db/artifact_reconcile_intent.zig").load(alloc, &read)).?;
+                const intent = (try @import("antfly_local_sources").storage_db_artifact_reconcile_intent.load(alloc, &read)).?;
                 defer intent.deinit();
                 saved_context = .{ .token = intent.value.token };
-                try std.testing.expectError(error.ArtifactCatalogEpochChanged, @import("../db/artifact_reconcile_intent.zig").requireContext(alloc, &read, .{ .token = @splat(0) }));
+                try std.testing.expectError(error.ArtifactCatalogEpochChanged, @import("antfly_local_sources").storage_db_artifact_reconcile_intent.requireContext(alloc, &read, .{ .token = @splat(0) }));
                 if (follower.hasIndex("expected")) {
-                    try std.testing.expectError(error.IntegrityTopologyBusy, @import("../db/artifact_reconcile_intent.zig").permitCatalog(alloc, &read, @import("../db/artifact_inventory.zig").index_key, ""));
-                    try std.testing.expectError(error.IntegrityTopologyBusy, @import("../db/artifact_reconcile_intent.zig").permitCatalog(alloc, &read, @import("../db/artifact_inventory.zig").index_key, obsolete.catalogs.indexes));
+                    try std.testing.expectError(error.IntegrityTopologyBusy, @import("antfly_local_sources").storage_db_artifact_reconcile_intent.permitCatalog(alloc, &read, @import("antfly_local_sources").storage_db_artifact_inventory.index_key, ""));
+                    try std.testing.expectError(error.IntegrityTopologyBusy, @import("antfly_local_sources").storage_db_artifact_reconcile_intent.permitCatalog(alloc, &read, @import("antfly_local_sources").storage_db_artifact_inventory.index_key, obsolete.catalogs.indexes));
                 }
             }
             try std.testing.expectError(error.IntegrityTopologyBusy, follower.setSchemaJson(alloc, "{\"version\":2}"));
@@ -3382,8 +3382,8 @@ test "db ordered artifact inventory reconciles committed receiver catalog before
             {
                 var rejected = try follower.core.store.beginWriteTxn();
                 defer rejected.abort();
-                try std.testing.expectError(error.IntegrityTopologyBusy, @import("../db/relational_integrity_topology.zig").stageCancel(&rejected, invalid_scope.fence));
-                try std.testing.expectError(error.IntegrityTopologyBusy, @import("../db/relational_integrity_topology.zig").stageAbortTransition(&rejected, invalid_scope.fence));
+                try std.testing.expectError(error.IntegrityTopologyBusy, @import("antfly_local_sources").storage_db_relational_integrity_topology.stageCancel(&rejected, invalid_scope.fence));
+                try std.testing.expectError(error.IntegrityTopologyBusy, @import("antfly_local_sources").storage_db_relational_integrity_topology.stageAbortTransition(&rejected, invalid_scope.fence));
             }
             const producer_base = engine.test_support.batchContext(&follower);
             var producer: EnrichmentAppendContext = .{
@@ -3405,11 +3405,11 @@ test "db ordered artifact inventory reconciles committed receiver catalog before
             try std.testing.expectError(error.IntegrityTopologyBusy, appendResolutionRecord(&producer, late_write));
             try std.testing.expectError(error.IntegrityTopologyBusy, publishResolutionHandoffContext(&producer_base, late_write));
             try std.testing.expectError(error.NotFound, follower.core.store.get(alloc, late_key));
-            if (!restarted_cleanup) if (try follower.core.getStoreValue(alloc, @import("../db/artifact_reconcile_intent.zig").resolver_cursor_key)) |cursor_before| {
+            if (!restarted_cleanup) if (try follower.core.getStoreValue(alloc, @import("antfly_local_sources").storage_db_artifact_reconcile_intent.resolver_cursor_key)) |cursor_before| {
                 defer alloc.free(cursor_before);
                 follower.close();
                 follower = try DB.open(alloc, follower_path, options);
-                const cursor_after = try follower.core.store.get(alloc, @import("../db/artifact_reconcile_intent.zig").resolver_cursor_key);
+                const cursor_after = try follower.core.store.get(alloc, @import("antfly_local_sources").storage_db_artifact_reconcile_intent.resolver_cursor_key);
                 defer alloc.free(cursor_after);
                 try std.testing.expectEqualSlices(u8, cursor_before, cursor_after);
                 var resumed = try follower.artifactInventoryCommand(alloc);
@@ -3457,9 +3457,9 @@ test "db ordered artifact inventory reconciles committed receiver catalog before
     {
         var read = try follower.core.store.beginReadTxn();
         defer read.abort();
-        try std.testing.expect((try @import("../db/artifact_reconcile_intent.zig").load(alloc, &read)) == null);
-        try std.testing.expectError(error.ArtifactCatalogEpochChanged, @import("../db/artifact_reconcile_intent.zig").requireContext(alloc, &read, saved_context.?));
-        try std.testing.expectError(error.NotFound, read.get(@import("../db/artifact_reconcile_intent.zig").resolver_cursor_key));
+        try std.testing.expect((try @import("antfly_local_sources").storage_db_artifact_reconcile_intent.load(alloc, &read)) == null);
+        try std.testing.expectError(error.ArtifactCatalogEpochChanged, @import("antfly_local_sources").storage_db_artifact_reconcile_intent.requireContext(alloc, &read, saved_context.?));
+        try std.testing.expectError(error.NotFound, read.get(@import("antfly_local_sources").storage_db_artifact_reconcile_intent.resolver_cursor_key));
     }
     try std.testing.expectError(error.IntegrityTopologyBusy, follower.addIndex(.{ .name = "late", .kind = .full_text, .config_json = "{}" }));
 }

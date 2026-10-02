@@ -22,44 +22,44 @@ const distributed_join = @import("../../api/distributed_join.zig");
 const indexes_api = @import("../../api/indexes.zig");
 const foreign_sources_api = @import("../../api/foreign_sources.zig");
 const join_model = @import("../../api/join_model.zig");
-const query_api = @import("../../api/query.zig");
-const query_contract = @import("../../api/query_contract.zig");
-const graph_wire_envelope = @import("../../api/graph_wire_envelope.zig");
+const query_api = @import("antfly_local_sources").api_query;
+const query_contract = @import("antfly_local_sources").api_query_contract;
+const graph_wire_envelope = @import("antfly_local_sources").api_graph_wire_envelope;
 const public_graph_query = @import("../../api/public_graph_query.zig");
 const graph_query_diagnostic = @import("../../api/graph_query_diagnostic.zig");
-const graph_distinct_budget_diagnostic = @import("../../graph/distinct_budget_diagnostic.zig");
-const graph_path_weight_diagnostic = @import("../../graph/path_weight_diagnostic.zig");
-const graph_work_budget_diagnostic = @import("../../graph/work_budget_diagnostic.zig");
-const public_search_request = @import("../../api/public_search_request.zig");
-const public_text_query = @import("../../api/public_text_query.zig");
+const graph_distinct_budget_diagnostic = @import("antfly_local_sources").graph_distinct_budget_diagnostic;
+const graph_path_weight_diagnostic = @import("antfly_local_sources").graph_path_weight_diagnostic;
+const graph_work_budget_diagnostic = @import("antfly_local_sources").graph_work_budget_diagnostic;
+const public_search_request = @import("antfly_local_sources").api_public_search_request;
+const public_text_query = @import("antfly_local_sources").api_public_text_query;
 const public_table_http = @import("../../api/public_table_http.zig");
 const table_contract = @import("../../api/table_contract.zig");
 const tables_api = @import("../../api/tables.zig");
-const table_writes = @import("../../api/table_index_config.zig");
-const analysis_mod = @import("../../search/analysis.zig");
+const table_writes = @import("antfly_local_sources").api_table_index_config;
+const analysis_mod = @import("antfly_local_sources").search_analysis;
 const shared_vector = @import("antfly_vector").vector;
 const storage_source_options = @import("storage_source_options");
 const control_only_storage_sources = storage_source_options.control_only;
-const db_mod = @import("../../storage/db/selected_root.zig").db;
-const aggregation_contract = @import("../../storage/db/aggregations_contract.zig");
+const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
+const aggregation_contract = @import("antfly_local_sources").storage_db_aggregations_contract;
 const kernel_owner_client = if (control_only_storage_sources)
     @import("../../storage/kernel_owner_client.zig")
 else
     struct {};
-const db_transform = @import("../../storage/db/transform.zig");
-const db_types = @import("../../storage/db/types.zig");
-const db_query_graph = @import("../../storage/db/query/graph_exec.zig");
-const db_embedder = @import("../../storage/db/enrichment/embedder.zig");
-const distributed_stats_mod = @import("../../search/distributed_stats.zig");
-const graph_mod = @import("../../graph/graph.zig");
-const graph_metric_rerank = @import("../../graph/metric_rerank.zig");
-const graph_pattern_mod = @import("../../graph/pattern.zig");
-const graph_work_budget_mod = @import("../../graph/work_budget.zig");
-const graph_node_admission = @import("../../graph/node_admission.zig");
-const graph_node_identity = @import("../../graph/node_identity.zig");
-const graph_paths = @import("../../graph/paths.zig");
-const graph_query_mod = @import("../../graph/query.zig");
-const graph_traversal = @import("../../graph/traversal.zig");
+const db_transform = @import("antfly_local_sources").storage_db_transform;
+const db_types = @import("antfly_local_sources").storage_db_types;
+const db_query_graph = @import("antfly_local_sources").storage_db_query_graph_exec;
+const db_embedder = @import("antfly_local_sources").storage_db_enrichment_embedder;
+const distributed_stats_mod = @import("antfly_local_sources").search_distributed_stats;
+const graph_mod = @import("antfly_local_sources").graph_graph;
+const graph_metric_rerank = @import("antfly_local_sources").graph_metric_rerank;
+const graph_pattern_mod = @import("antfly_local_sources").graph_pattern;
+const graph_work_budget_mod = @import("antfly_local_sources").graph_work_budget;
+const graph_node_admission = @import("antfly_local_sources").graph_node_admission;
+const graph_node_identity = @import("antfly_local_sources").graph_node_identity;
+const graph_paths = @import("antfly_local_sources").graph_paths;
+const graph_query_mod = @import("antfly_local_sources").graph_query;
+const graph_traversal = @import("antfly_local_sources").graph_traversal;
 const http_routes = @import("http_routes.zig");
 const http_types = @import("http_types.zig");
 const api_service = @import("service.zig");
@@ -79,7 +79,7 @@ const document_segment_mod = @import("../document_segment/mod.zig");
 const segment_mod = @import("../segment/mod.zig");
 const wal_mod = @import("../wal/mod.zig");
 const search_sources = @import("../search_sources.zig");
-const managed_embedder = @import("../../inference/managed_embedder.zig");
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
 const scraping = @import("antfly_scraping");
 const platform_time = @import("antfly_platform").time;
 const graph_segment_mod = @import("../graph_segment/mod.zig");
@@ -100,15 +100,15 @@ const SyncWaitCancellation = struct {
         return state.upstream.isCancelled() or platform_time.monotonicNs() >= state.deadline_ns;
     }
 };
-const json_helpers = @import("../../api/json_helpers.zig");
+const json_helpers = @import("antfly_local_sources").api_json_helpers;
 const ParsedJsonPathValue = json_helpers.ParsedJsonPathValue;
 const parseJsonValueAlloc = json_helpers.parseJsonValueAlloc;
 const parseJsonObjectAlloc = json_helpers.parseJsonObjectAlloc;
 const parseJsonPathValueAlloc = json_helpers.parseJsonPathValueAlloc;
 const parseOwnedJsonValueAlloc = json_helpers.parseOwnedJsonValueAlloc;
-const common_config = @import("../../common/config.zig");
+const common_config = @import("antfly_local_sources").common_config;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
-const api_operation = @import("../../api/operation.zig");
+const api_operation = @import("antfly_local_sources").api_operation;
 const request_admission = @import("../../common/request_admission.zig");
 const RequestAdmission = request_admission.RequestAdmission;
 
@@ -239,7 +239,7 @@ pub const HttpHandler = struct {
     published_search_sources: search_sources.PublishedSearchSources = .{},
     runtime_status: *const api_types.RuntimeStatusResult,
     runtime_metrics: ?*runtime_manager.ManagedRuntime = null,
-    graph_execution_limits: @import("../../graph/work_budget.zig").Limits = .{},
+    graph_execution_limits: @import("antfly_local_sources").graph_work_budget.Limits = .{},
     query_admission: RequestAdmission = RequestAdmission.init(common_config.default_query_max_concurrent_requests),
     write_admission: RequestAdmission = RequestAdmission.init(common_config.default_write_max_concurrent_requests),
 
@@ -269,7 +269,7 @@ pub const HttpHandler = struct {
 
     /// Install operator-owned graph ceilings. Public query bodies cannot
     /// override these values.
-    pub fn setGraphExecutionLimits(self: *HttpHandler, limits: @import("../../graph/work_budget.zig").Limits) !void {
+    pub fn setGraphExecutionLimits(self: *HttpHandler, limits: @import("antfly_local_sources").graph_work_budget.Limits) !void {
         try limits.validate();
         self.graph_execution_limits = limits;
     }
@@ -7357,8 +7357,8 @@ const ServerlessGraphReadBudget = struct {
     }
 };
 
-fn openPublicEdgeStream(a: Allocator, cached: *const CachedPublicGraphSegment, budget: *ServerlessGraphReadBudget, key: []const u8, kinds: []const []const u8, direction: graph_mod.EdgeDirection, include_qualified: bool) !@import("../../graph/edge_stream.zig").Stream {
-    const Stream = @import("../../graph/edge_stream.zig").Stream;
+fn openPublicEdgeStream(a: Allocator, cached: *const CachedPublicGraphSegment, budget: *ServerlessGraphReadBudget, key: []const u8, kinds: []const []const u8, direction: graph_mod.EdgeDirection, include_qualified: bool) !@import("antfly_local_sources").graph_edge_stream.Stream {
+    const Stream = @import("antfly_local_sources").graph_edge_stream.Stream;
     if (cached.paged == null) {
         const edges = try allocPublicSegmentEdgesBounded(a, cached, budget, null, key, kinds, direction, include_qualified, if (budget.work_budget) |b| b.edgeLimit() else public_graph_max_edges_scanned, if (budget.work_budget) |b| b.edgeByteLimit() else 64 * 1024 * 1024);
         errdefer {
@@ -7439,7 +7439,7 @@ const PublicEdgeCursor = struct {
             for ([_]usize{ self.key.len, edge.neighbor_id.len, edge.edge_type.len, if (metadata) |bytes| bytes.len else 0 }) |len| {
                 size = std.math.add(usize, size, len) catch return error.GraphExploredEdgeBytesBudgetExceeded;
             }
-            if (size > max_bytes -| owned_bytes or (out.items.len > 0 and size +| owned_bytes > @import("../../graph/edge_stream.zig").batch_bytes)) {
+            if (size > max_bytes -| owned_bytes or (out.items.len > 0 and size +| owned_bytes > @import("antfly_local_sources").graph_edge_stream.batch_bytes)) {
                 if (out.items.len == 0) return error.GraphExploredEdgeBytesBudgetExceeded;
                 self.pending = wire_edge;
                 break;
@@ -7460,7 +7460,7 @@ const ServerlessTraversalEdgeReader = struct {
     cached: *const CachedPublicGraphSegment,
     budget: *ServerlessGraphReadBudget,
 
-    pub fn openEdgeStream(self: @This(), a: Allocator, key: []const u8, kinds: []const []const u8, direction: graph_mod.EdgeDirection) !@import("../../graph/edge_stream.zig").Stream {
+    pub fn openEdgeStream(self: @This(), a: Allocator, key: []const u8, kinds: []const []const u8, direction: graph_mod.EdgeDirection) !@import("antfly_local_sources").graph_edge_stream.Stream {
         return openPublicEdgeStream(a, self.cached, self.budget, key, kinds, direction, true);
     }
 
@@ -7498,7 +7498,7 @@ const ServerlessPathEdgeReader = struct {
     cached: *const CachedPublicGraphSegment,
     budget: *ServerlessGraphReadBudget,
 
-    pub fn openEdgeStream(self: @This(), a: Allocator, key: []const u8, kinds: []const []const u8, direction: graph_mod.EdgeDirection) !@import("../../graph/edge_stream.zig").Stream {
+    pub fn openEdgeStream(self: @This(), a: Allocator, key: []const u8, kinds: []const []const u8, direction: graph_mod.EdgeDirection) !@import("antfly_local_sources").graph_edge_stream.Stream {
         return openPublicEdgeStream(a, self.cached, self.budget, key, kinds, direction, false);
     }
 
@@ -7534,7 +7534,7 @@ const ServerlessPatternEdgeReader = struct {
     budget: *ServerlessGraphReadBudget,
     source_table: []const u8,
 
-    pub fn openPatternEdgeStream(self: @This(), a: Allocator, table: ?[]const u8, key: []const u8, kinds: []const []const u8, direction: graph_mod.EdgeDirection, declared: bool) !@import("../../graph/edge_stream.zig").Stream {
+    pub fn openPatternEdgeStream(self: @This(), a: Allocator, table: ?[]const u8, key: []const u8, kinds: []const []const u8, direction: graph_mod.EdgeDirection, declared: bool) !@import("antfly_local_sources").graph_edge_stream.Stream {
         try self.validatePatternSourceTable(table, declared);
         return openPublicEdgeStream(a, self.cached, self.budget, key, kinds, direction, true);
     }

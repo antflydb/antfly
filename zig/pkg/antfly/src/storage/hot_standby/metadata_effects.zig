@@ -14,7 +14,7 @@
 
 //! Incremental metadata KV effects and bounded full-authority checkpoints.
 const std = @import("std");
-const capture_mod = @import("../txn_mutation_capture.zig");
+const capture_mod = @import("antfly_local_sources").storage_txn_mutation_capture;
 pub const prefix = "\x00\x00__metadata__:standalone_ha:";
 pub const source_key = prefix ++ "source";
 pub const sequence_key = prefix ++ "sequence";

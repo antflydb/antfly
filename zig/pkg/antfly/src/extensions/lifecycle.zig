@@ -13,16 +13,16 @@
 // limitations.
 
 const std = @import("std");
-const system_catalog = @import("../system_catalog/domain.zig");
+const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 const extension_domain = @import("mod.zig");
 const indexes_api = @import("../api/indexes.zig");
-const managed_embedder = @import("../inference/managed_embedder.zig");
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
 const tables_api = @import("../api/tables.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_storage = @import("../metadata/storage/mod.zig");
 const metadata_service = @import("../metadata/service.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
-const metadata_topology_protocol = @import("../metadata/topology_protocol.zig");
+const metadata_topology_protocol = @import("antfly_local_sources").metadata_topology_protocol;
 
 fn lockCatalogMutation(service: anytype) bool {
     const ServiceType = @TypeOf(service);

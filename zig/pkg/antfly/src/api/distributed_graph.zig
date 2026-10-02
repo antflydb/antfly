@@ -17,29 +17,29 @@ const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const raft_mod = struct {
     pub const ReadConsistency = @import("../raft/read_gate.zig").ReadConsistency;
 };
-const db_mod = @import("local_graph.zig").db_mod;
+const db_mod = @import("antfly_local_sources").api_local_graph.db_mod;
 
-const graph_query_mod = @import("../graph/query.zig");
-const graph_mod = @import("../graph/graph.zig");
-const graph_node_admission = @import("../graph/node_admission.zig");
-const graph_node_identity = @import("../graph/node_identity.zig");
-const graph_pattern_mod = @import("../graph/pattern.zig");
-const graph_paths_mod = @import("../graph/paths.zig");
-const graph_traversal_mod = @import("../graph/traversal.zig");
-const graph_work_budget = @import("../graph/work_budget.zig");
-const graph_distinct_budget_diagnostic = @import("../graph/distinct_budget_diagnostic.zig");
-const graph_work_budget_diagnostic = @import("../graph/work_budget_diagnostic.zig");
-const graph_path_weight_diagnostic = @import("../graph/path_weight_diagnostic.zig");
-const backend_erased = @import("../storage/backend_erased.zig");
-const background_runtime = @import("../storage/background_runtime.zig");
-const mem_backend = @import("../storage/mem_backend.zig");
-const doc_set = @import("../storage/db/doc_set.zig");
-const graph_exec = @import("../storage/db/query/graph_exec.zig");
-const algebraic_ir = @import("local_graph.zig").algebraic_ir;
+const graph_query_mod = @import("antfly_local_sources").graph_query;
+const graph_mod = @import("antfly_local_sources").graph_graph;
+const graph_node_admission = @import("antfly_local_sources").graph_node_admission;
+const graph_node_identity = @import("antfly_local_sources").graph_node_identity;
+const graph_pattern_mod = @import("antfly_local_sources").graph_pattern;
+const graph_paths_mod = @import("antfly_local_sources").graph_paths;
+const graph_traversal_mod = @import("antfly_local_sources").graph_traversal;
+const graph_work_budget = @import("antfly_local_sources").graph_work_budget;
+const graph_distinct_budget_diagnostic = @import("antfly_local_sources").graph_distinct_budget_diagnostic;
+const graph_work_budget_diagnostic = @import("antfly_local_sources").graph_work_budget_diagnostic;
+const graph_path_weight_diagnostic = @import("antfly_local_sources").graph_path_weight_diagnostic;
+const backend_erased = @import("antfly_local_sources").storage_backend_erased;
+const background_runtime = @import("antfly_local_sources").storage_background_runtime;
+const mem_backend = @import("antfly_local_sources").storage_mem_backend;
+const doc_set = @import("antfly_local_sources").storage_db_doc_set;
+const graph_exec = @import("antfly_local_sources").storage_db_query_graph_exec;
+const algebraic_ir = @import("antfly_local_sources").api_local_graph.algebraic_ir;
 
-const algebraic_law = @import("local_graph.zig").algebraic_law;
+const algebraic_law = @import("antfly_local_sources").api_local_graph.algebraic_law;
 
-const algebraic_planner = @import("local_graph.zig").algebraic_planner;
+const algebraic_planner = @import("antfly_local_sources").api_local_graph.algebraic_planner;
 
 const table_catalog = @import("table_catalog.zig");
 const metadata_api = @import("../metadata/api.zig");
@@ -50,7 +50,7 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const platform_time = @import("antfly_platform").time;
 const platform_sync = @import("antfly_platform").sync;
 const indexes_api = @import("indexes.zig");
-const query_contract = @import("query_contract.zig");
+const query_contract = @import("antfly_local_sources").api_query_contract;
 const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
 const tables_api = @import("tables.zig");
 
@@ -348,7 +348,7 @@ pub const IncomingSourceGroupsRequest = struct {
     identity_read_generations: []const db_mod.types.ShardIdentityReadGeneration = &.{},
 };
 
-pub const GraphIndexIdentity = @import("local_graph.zig").GraphIndexIdentity;
+pub const GraphIndexIdentity = @import("antfly_local_sources").api_local_graph.GraphIndexIdentity;
 
 pub const IncomingSourceGroupEntry = struct {
     source_group_ids: []u64 = &.{},
@@ -1294,7 +1294,7 @@ fn hashIncomingRouteU64(hasher: *std.crypto.hash.sha2.Sha256, value: u64) void {
 /// Reconstitutes a node-local absolute deadline from the coordinator's
 /// remaining transport budget. Saturating addition keeps maliciously large
 /// values from wrapping into an already-expired deadline.
-pub const executionDeadlineFromTimeoutMs = @import("local_graph.zig").executionDeadlineFromTimeoutMs;
+pub const executionDeadlineFromTimeoutMs = @import("antfly_local_sources").api_local_graph.executionDeadlineFromTimeoutMs;
 
 const GraphFanoutPlan = struct {
     parallel: bool,
@@ -1429,25 +1429,25 @@ fn planGraphFanout(has_io: bool, width_cap: ?usize, batch_count: usize) GraphFan
     };
 }
 
-pub const GraphExpandRequest = @import("local_graph.zig").GraphExpandRequest;
+pub const GraphExpandRequest = @import("antfly_local_sources").api_local_graph.GraphExpandRequest;
 
-pub const OwnedGraphTensorAccessPath = @import("local_graph.zig").OwnedGraphTensorAccessPath;
+pub const OwnedGraphTensorAccessPath = @import("antfly_local_sources").api_local_graph.OwnedGraphTensorAccessPath;
 
-pub const GraphNodeIdentity = @import("local_graph.zig").GraphNodeIdentity;
+pub const GraphNodeIdentity = @import("antfly_local_sources").api_local_graph.GraphNodeIdentity;
 
-pub const GraphFrontierItem = @import("local_graph.zig").GraphFrontierItem;
+pub const GraphFrontierItem = @import("antfly_local_sources").api_local_graph.GraphFrontierItem;
 
-pub const GraphExpandResponse = @import("local_graph.zig").GraphExpandResponse;
+pub const GraphExpandResponse = @import("antfly_local_sources").api_local_graph.GraphExpandResponse;
 
-pub const GraphHydrateRequest = @import("local_graph.zig").GraphHydrateRequest;
+pub const GraphHydrateRequest = @import("antfly_local_sources").api_local_graph.GraphHydrateRequest;
 
-pub const GraphHydrateResponse = @import("local_graph.zig").GraphHydrateResponse;
+pub const GraphHydrateResponse = @import("antfly_local_sources").api_local_graph.GraphHydrateResponse;
 
-pub const GraphEdgesRequest = @import("local_graph.zig").GraphEdgesRequest;
+pub const GraphEdgesRequest = @import("antfly_local_sources").api_local_graph.GraphEdgesRequest;
 
-pub const GraphEdgesResponse = @import("local_graph.zig").GraphEdgesResponse;
+pub const GraphEdgesResponse = @import("antfly_local_sources").api_local_graph.GraphEdgesResponse;
 
-pub const GraphExpansion = @import("local_graph.zig").GraphExpansion;
+pub const GraphExpansion = @import("antfly_local_sources").api_local_graph.GraphExpansion;
 
 const GraphExpandBatchEntry = struct {
     table_name: []const u8,
@@ -1542,33 +1542,33 @@ const GraphEdgesFanoutSlot = struct {
     }
 };
 
-const GraphExpandRequestJson = @import("local_graph.zig").GraphExpandRequestJson;
+const GraphExpandRequestJson = @import("antfly_local_sources").api_local_graph.GraphExpandRequestJson;
 
-const GraphFrontierItemJson = @import("local_graph.zig").GraphFrontierItemJson;
+const GraphFrontierItemJson = @import("antfly_local_sources").api_local_graph.GraphFrontierItemJson;
 
-const GraphNodeIdentityJson = @import("local_graph.zig").GraphNodeIdentityJson;
+const GraphNodeIdentityJson = @import("antfly_local_sources").api_local_graph.GraphNodeIdentityJson;
 
-const GraphExpandParamsJson = @import("local_graph.zig").GraphExpandParamsJson;
+const GraphExpandParamsJson = @import("antfly_local_sources").api_local_graph.GraphExpandParamsJson;
 
-const GraphMetricReadJson = @import("local_graph.zig").GraphMetricReadJson;
+const GraphMetricReadJson = @import("antfly_local_sources").api_local_graph.GraphMetricReadJson;
 
-const GraphTensorAccessPathJson = @import("local_graph.zig").GraphTensorAccessPathJson;
+const GraphTensorAccessPathJson = @import("antfly_local_sources").api_local_graph.GraphTensorAccessPathJson;
 
-const GraphExpandResponseJson = @import("local_graph.zig").GraphExpandResponseJson;
+const GraphExpandResponseJson = @import("antfly_local_sources").api_local_graph.GraphExpandResponseJson;
 
-const GraphExpansionJson = @import("local_graph.zig").GraphExpansionJson;
+const GraphExpansionJson = @import("antfly_local_sources").api_local_graph.GraphExpansionJson;
 
-const GraphHydrateRequestJson = @import("local_graph.zig").GraphHydrateRequestJson;
+const GraphHydrateRequestJson = @import("antfly_local_sources").api_local_graph.GraphHydrateRequestJson;
 
-const GraphHydrateResponseJson = @import("local_graph.zig").GraphHydrateResponseJson;
+const GraphHydrateResponseJson = @import("antfly_local_sources").api_local_graph.GraphHydrateResponseJson;
 
-const GraphEdgesRequestJson = @import("local_graph.zig").GraphEdgesRequestJson;
+const GraphEdgesRequestJson = @import("antfly_local_sources").api_local_graph.GraphEdgesRequestJson;
 
-const GraphEdgeJson = @import("local_graph.zig").GraphEdgeJson;
+const GraphEdgeJson = @import("antfly_local_sources").api_local_graph.GraphEdgeJson;
 
-const GraphEdgesResponseJson = @import("local_graph.zig").GraphEdgesResponseJson;
+const GraphEdgesResponseJson = @import("antfly_local_sources").api_local_graph.GraphEdgesResponseJson;
 
-const jsonStringifyAlloc = @import("local_graph.zig").jsonStringifyAlloc;
+const jsonStringifyAlloc = @import("antfly_local_sources").api_local_graph.jsonStringifyAlloc;
 
 pub fn supportsCrossRange(req: db_mod.types.SearchRequest) bool {
     if (req.graph_queries.len == 0) return false;
@@ -8043,9 +8043,9 @@ fn encodeGraphHydrateRequestWithWireMode(alloc: std.mem.Allocator, req: GraphHyd
     return try appendResolvedDocFilterToObjectAlloc(alloc, encoded, req.resolved_doc_filter.?, req.resolved_doc_filter_wire_context orelse return error.UnsupportedQueryRequest);
 }
 
-pub const parseGraphHydrateRequest = @import("local_graph.zig").parseGraphHydrateRequest;
+pub const parseGraphHydrateRequest = @import("antfly_local_sources").api_local_graph.parseGraphHydrateRequest;
 
-pub const encodeGraphHydrateResponse = @import("local_graph.zig").encodeGraphHydrateResponse;
+pub const encodeGraphHydrateResponse = @import("antfly_local_sources").api_local_graph.encodeGraphHydrateResponse;
 
 pub fn parseGraphHydrateResponse(alloc: std.mem.Allocator, body: []const u8) !GraphHydrateResponse {
     var parsed = try std.json.parseFromSlice(GraphHydrateResponseJson, alloc, body, .{});
@@ -8106,7 +8106,7 @@ test "graph hydrate response wire flattens index identity" {
     try std.testing.expect(decoded.incoming_index_identity.eql(response.incoming_index_identity));
 }
 
-const identityGenerationFromResolvedFilterEnvelope = @import("local_graph.zig").identityGenerationFromResolvedFilterEnvelope;
+const identityGenerationFromResolvedFilterEnvelope = @import("antfly_local_sources").api_local_graph.identityGenerationFromResolvedFilterEnvelope;
 
 pub fn encodeGraphEdgesRequest(alloc: std.mem.Allocator, req: GraphEdgesRequest) ![]u8 {
     return encodeGraphEdgesRequestWithWireMode(alloc, req, false);
@@ -8151,9 +8151,9 @@ fn encodeGraphEdgesRequestWithWireMode(alloc: std.mem.Allocator, req: GraphEdges
     });
 }
 
-pub const parseGraphEdgesRequest = @import("local_graph.zig").parseGraphEdgesRequest;
+pub const parseGraphEdgesRequest = @import("antfly_local_sources").api_local_graph.parseGraphEdgesRequest;
 
-const validateGraphEdgesReadLimits = @import("local_graph.zig").validateGraphEdgesReadLimits;
+const validateGraphEdgesReadLimits = @import("antfly_local_sources").api_local_graph.validateGraphEdgesReadLimits;
 
 fn cloneGraphEdge(alloc: std.mem.Allocator, edge: GraphEdgeJson) !graph_mod.Edge {
     const source = try alloc.dupe(u8, edge.source);
@@ -8178,7 +8178,7 @@ fn cloneGraphEdge(alloc: std.mem.Allocator, edge: GraphEdgeJson) !graph_mod.Edge
     };
 }
 
-pub const encodeGraphEdgesResponse = @import("local_graph.zig").encodeGraphEdgesResponse;
+pub const encodeGraphEdgesResponse = @import("antfly_local_sources").api_local_graph.encodeGraphEdgesResponse;
 
 pub fn parseGraphEdgesResponse(alloc: std.mem.Allocator, body: []const u8) !GraphEdgesResponse {
     var parsed = try std.json.parseFromSlice(GraphEdgesResponseJson, alloc, body, .{});
@@ -8428,7 +8428,7 @@ fn reconstructGraphPathEdges(
     return out;
 }
 
-const cloneGraphPath = @import("local_graph.zig").cloneGraphPath;
+const cloneGraphPath = @import("antfly_local_sources").api_local_graph.cloneGraphPath;
 
 fn graphPathRetainedBytes(path: db_mod.types.GraphPath) !usize {
     var total: usize = @sizeOf(BudgetedGraphPath);
@@ -8462,9 +8462,9 @@ fn graphPathRetainedBytes(path: db_mod.types.GraphPath) !usize {
     return total;
 }
 
-const dupeGraphPathEdge = @import("local_graph.zig").dupeGraphPathEdge;
+const dupeGraphPathEdge = @import("antfly_local_sources").api_local_graph.dupeGraphPathEdge;
 
-const freeOwnedGraphPathEdge = @import("local_graph.zig").freeOwnedGraphPathEdge;
+const freeOwnedGraphPathEdge = @import("antfly_local_sources").api_local_graph.freeOwnedGraphPathEdge;
 
 fn dupPathEdgesFromGraphPath(
     alloc: std.mem.Allocator,
@@ -8544,7 +8544,7 @@ fn graphPathToKey(alloc: std.mem.Allocator, path: db_mod.types.GraphPath) ![]u8 
     return out;
 }
 
-const graphPathTraversalDirectionTag = @import("local_graph.zig").graphPathTraversalDirectionTag;
+const graphPathTraversalDirectionTag = @import("antfly_local_sources").api_local_graph.graphPathTraversalDirectionTag;
 
 fn rootPathMatches(a: db_mod.types.GraphPath, b: db_mod.types.GraphPath, spur_idx: usize) bool {
     if (a.nodes.len <= spur_idx or b.nodes.len <= spur_idx) return false;
@@ -8879,7 +8879,7 @@ test "distributed canonical path weight is the checked raw edge sum" {
     try std.testing.expectError(error.GraphPathWeightOverflow, computeGraphPathWeightSum(&overflow, &overflow));
 }
 
-const allocEdgeExclusionKey = @import("local_graph.zig").allocEdgeExclusionKey;
+const allocEdgeExclusionKey = @import("antfly_local_sources").api_local_graph.allocEdgeExclusionKey;
 
 fn edgeExclusionIdentityEncodedLen(
     from: graph_node_identity.Ref,
@@ -8901,9 +8901,9 @@ fn edgeExclusionIdentityEncodedLen(
     });
 }
 
-const compositeIdentityAlloc = @import("local_graph.zig").compositeIdentityAlloc;
+const compositeIdentityAlloc = @import("antfly_local_sources").api_local_graph.compositeIdentityAlloc;
 
-const compositeIdentityEncodedLen = @import("local_graph.zig").compositeIdentityEncodedLen;
+const compositeIdentityEncodedLen = @import("antfly_local_sources").api_local_graph.compositeIdentityEncodedLen;
 
 test "distributed graph identities are length framed" {
     const alloc = std.testing.allocator;
@@ -10049,9 +10049,9 @@ fn cloneGraphTensorAccessPathAlloc(alloc: std.mem.Allocator, path: algebraic_ir.
     };
 }
 
-const enumSliceEql = @import("local_graph.zig").enumSliceEql;
+const enumSliceEql = @import("antfly_local_sources").api_local_graph.enumSliceEql;
 
-const graphTensorAccessPathEql = @import("local_graph.zig").graphTensorAccessPathEql;
+const graphTensorAccessPathEql = @import("antfly_local_sources").api_local_graph.graphTensorAccessPathEql;
 
 fn graphTensorProgramJsonValueAlloc(
     alloc: std.mem.Allocator,
@@ -10064,7 +10064,7 @@ fn graphTensorProgramJsonValueAlloc(
     return std.json.parseFromSlice(std.json.Value, alloc, encoded, .{}) catch return error.InvalidQueryRequest;
 }
 
-const parseGraphTensorProgramJsonValueAlloc = @import("local_graph.zig").parseGraphTensorProgramJsonValueAlloc;
+const parseGraphTensorProgramJsonValueAlloc = @import("antfly_local_sources").api_local_graph.parseGraphTensorProgramJsonValueAlloc;
 
 pub fn graphTraversalTensorProgramEnvelopeAlloc(
     alloc: std.mem.Allocator,
@@ -10076,17 +10076,17 @@ pub fn graphTraversalTensorProgramEnvelopeAlloc(
     return try cloneGraphTensorProgramEnvelopeAlloc(alloc, plan.asProgram());
 }
 
-pub const graphEdgesTensorProgramEnvelopeAlloc = @import("local_graph.zig").graphEdgesTensorProgramEnvelopeAlloc;
+pub const graphEdgesTensorProgramEnvelopeAlloc = @import("antfly_local_sources").api_local_graph.graphEdgesTensorProgramEnvelopeAlloc;
 
-const cloneGraphTensorProgramEnvelopeAlloc = @import("local_graph.zig").cloneGraphTensorProgramEnvelopeAlloc;
+const cloneGraphTensorProgramEnvelopeAlloc = @import("antfly_local_sources").api_local_graph.cloneGraphTensorProgramEnvelopeAlloc;
 
-pub const validateGraphExpandTensorAccessPath = @import("local_graph.zig").validateGraphExpandTensorAccessPath;
+pub const validateGraphExpandTensorAccessPath = @import("antfly_local_sources").api_local_graph.validateGraphExpandTensorAccessPath;
 
-const validateGraphExpandTensorAccessPathParts = @import("local_graph.zig").validateGraphExpandTensorAccessPathParts;
+const validateGraphExpandTensorAccessPathParts = @import("antfly_local_sources").api_local_graph.validateGraphExpandTensorAccessPathParts;
 
-pub const validateGraphEdgesTensorAccessPath = @import("local_graph.zig").validateGraphEdgesTensorAccessPath;
+pub const validateGraphEdgesTensorAccessPath = @import("antfly_local_sources").api_local_graph.validateGraphEdgesTensorAccessPath;
 
-const validateGraphEdgesTensorAccessPathParts = @import("local_graph.zig").validateGraphEdgesTensorAccessPathParts;
+const validateGraphEdgesTensorAccessPathParts = @import("antfly_local_sources").api_local_graph.validateGraphEdgesTensorAccessPathParts;
 
 pub fn makeGraphExpandRequest(
     alloc: std.mem.Allocator,
@@ -10427,7 +10427,7 @@ fn graphConfigEnablesAlgebraicSemiring(config: std.json.Value) bool {
     return true;
 }
 
-pub const frontierItemToSearchRequest = @import("local_graph.zig").frontierItemToSearchRequest;
+pub const frontierItemToSearchRequest = @import("antfly_local_sources").api_local_graph.frontierItemToSearchRequest;
 
 fn enumNameArrayAlloc(comptime T: type, alloc: std.mem.Allocator, values: []const T) ![][]const u8 {
     const out = try alloc.alloc([]const u8, values.len);
@@ -10454,9 +10454,9 @@ fn graphTensorAccessPathJsonAlloc(
     };
 }
 
-const parseGraphTensorAccessPathAlloc = @import("local_graph.zig").parseGraphTensorAccessPathAlloc;
+const parseGraphTensorAccessPathAlloc = @import("antfly_local_sources").api_local_graph.parseGraphTensorAccessPathAlloc;
 
-pub const freeExpandSearchRequest = @import("local_graph.zig").freeExpandSearchRequest;
+pub const freeExpandSearchRequest = @import("antfly_local_sources").api_local_graph.freeExpandSearchRequest;
 
 fn graphMetricReadJsonAlloc(
     alloc: std.mem.Allocator,
@@ -10477,9 +10477,9 @@ fn graphMetricReadJsonAlloc(
     return out;
 }
 
-const parseGraphMetricReads = @import("local_graph.zig").parseGraphMetricReads;
+const parseGraphMetricReads = @import("antfly_local_sources").api_local_graph.parseGraphMetricReads;
 
-const dupGraphMetricReads = @import("local_graph.zig").dupGraphMetricReads;
+const dupGraphMetricReads = @import("antfly_local_sources").api_local_graph.dupGraphMetricReads;
 
 fn graphMetricExecutionReadsAlloc(
     alloc: std.mem.Allocator,
@@ -10521,12 +10521,12 @@ fn stricterGraphMetricFreshness(
     return if (left == .fresh or right == .fresh) .fresh else .published;
 }
 
-const freeGraphMetricReads = @import("local_graph.zig").freeGraphMetricReads;
+const freeGraphMetricReads = @import("antfly_local_sources").api_local_graph.freeGraphMetricReads;
 
 /// Published columns are shard-local. A seeded metric needs a query-time
 /// computation over the complete graph, so it cannot use distributed column
 /// hydration or expansion until that computation has a distributed owner.
-pub const validateGraphMetricReadsForDistributedTransport = @import("local_graph.zig").validateGraphMetricReadsForDistributedTransport;
+pub const validateGraphMetricReadsForDistributedTransport = @import("antfly_local_sources").api_local_graph.validateGraphMetricReadsForDistributedTransport;
 
 fn validateDistributedGraphMetricCandidateCount(count: usize, needs_full_candidates: bool) !void {
     if (needs_full_candidates and count > graph_query_mod.graph_metric_candidate_limit)
@@ -10645,9 +10645,9 @@ fn appendResolvedDocFilterToObjectAlloc(
     return try out.toOwnedSlice(alloc);
 }
 
-pub const parseGraphExpandRequest = @import("local_graph.zig").parseGraphExpandRequest;
+pub const parseGraphExpandRequest = @import("antfly_local_sources").api_local_graph.parseGraphExpandRequest;
 
-pub const encodeGraphExpandResponse = @import("local_graph.zig").encodeGraphExpandResponse;
+pub const encodeGraphExpandResponse = @import("antfly_local_sources").api_local_graph.encodeGraphExpandResponse;
 
 pub fn parseGraphExpandResponse(alloc: std.mem.Allocator, body: []const u8) !GraphExpandResponse {
     var parsed = try std.json.parseFromSlice(GraphExpandResponseJson, alloc, body, .{});
@@ -10702,11 +10702,11 @@ pub fn parseGraphExpandResponse(alloc: std.mem.Allocator, body: []const u8) !Gra
     return .{ .expansions = expansions, .scanned_rows = parsed.value.scanned_rows orelse @intCast(graph_pattern_mod.default_max_explored_edges) };
 }
 
-pub const cloneGraphSearchResult = @import("local_graph.zig").cloneGraphSearchResult;
+pub const cloneGraphSearchResult = @import("antfly_local_sources").api_local_graph.cloneGraphSearchResult;
 
-pub const filterGraphSearchResult = @import("local_graph.zig").filterGraphSearchResult;
+pub const filterGraphSearchResult = @import("antfly_local_sources").api_local_graph.filterGraphSearchResult;
 
-const canonicalGraphNodeTable = @import("local_graph.zig").canonicalGraphNodeTable;
+const canonicalGraphNodeTable = @import("antfly_local_sources").api_local_graph.canonicalGraphNodeTable;
 
 fn canonicalExpandedNodeTable(
     source_table: []const u8,
@@ -10719,7 +10719,7 @@ fn canonicalExpandedNodeTable(
     );
 }
 
-pub const emptyGraphSearchResult = @import("local_graph.zig").emptyGraphSearchResult;
+pub const emptyGraphSearchResult = @import("antfly_local_sources").api_local_graph.emptyGraphSearchResult;
 
 fn appendRootPathState(
     alloc: std.mem.Allocator,
@@ -11094,11 +11094,11 @@ test "distributed frontier reservations precede allocation and release on deinit
     try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
 }
 
-const cloneGraphFrontierItemParts = @import("local_graph.zig").cloneGraphFrontierItemParts;
+const cloneGraphFrontierItemParts = @import("antfly_local_sources").api_local_graph.cloneGraphFrontierItemParts;
 
-const cloneGraphNodeIdentityParts = @import("local_graph.zig").cloneGraphNodeIdentityParts;
+const cloneGraphNodeIdentityParts = @import("antfly_local_sources").api_local_graph.cloneGraphNodeIdentityParts;
 
-const dupKeys = @import("local_graph.zig").dupKeys;
+const dupKeys = @import("antfly_local_sources").api_local_graph.dupKeys;
 
 fn dupNodeIdentities(
     alloc: std.mem.Allocator,
@@ -11125,11 +11125,11 @@ fn freeNodeIdentities(
     if (identities.len > 0) alloc.free(identities);
 }
 
-const dupSortedUniqueKeys = @import("local_graph.zig").dupSortedUniqueKeys;
+const dupSortedUniqueKeys = @import("antfly_local_sources").api_local_graph.dupSortedUniqueKeys;
 
-const stringSliceLessThan = @import("local_graph.zig").stringSliceLessThan;
+const stringSliceLessThan = @import("antfly_local_sources").api_local_graph.stringSliceLessThan;
 
-const freeKeys = @import("local_graph.zig").freeKeys;
+const freeKeys = @import("antfly_local_sources").api_local_graph.freeKeys;
 
 pub fn testResultRefFailClosedGuards(alloc: std.mem.Allocator) !void {
     {
@@ -11684,11 +11684,11 @@ fn freeFrontier(alloc: std.mem.Allocator, items: []FrontierState) void {
     if (items.len > 0) alloc.free(items);
 }
 
-const dupConstStrings = @import("local_graph.zig").dupConstStrings;
+const dupConstStrings = @import("antfly_local_sources").api_local_graph.dupConstStrings;
 
-const freeConstStrings = @import("local_graph.zig").freeConstStrings;
+const freeConstStrings = @import("antfly_local_sources").api_local_graph.freeConstStrings;
 
-const freePathArray = @import("local_graph.zig").freePathArray;
+const freePathArray = @import("antfly_local_sources").api_local_graph.freePathArray;
 
 fn reconstructPath(
     alloc: std.mem.Allocator,
@@ -11765,7 +11765,7 @@ fn reconstructPathEdges(
     return out;
 }
 
-const freePathEdges = @import("local_graph.zig").freePathEdges;
+const freePathEdges = @import("antfly_local_sources").api_local_graph.freePathEdges;
 
 fn pathLength(path_states: []const PathState, id: u32) usize {
     var len: usize = 0;
@@ -11787,33 +11787,33 @@ fn pathEdgeLength(path_states: []const PathState, id: u32) usize {
     return len;
 }
 
-const cloneGraphNodes = @import("local_graph.zig").cloneGraphNodes;
+const cloneGraphNodes = @import("antfly_local_sources").api_local_graph.cloneGraphNodes;
 
-const graphPathIsExcluded = @import("local_graph.zig").graphPathIsExcluded;
+const graphPathIsExcluded = @import("antfly_local_sources").api_local_graph.graphPathIsExcluded;
 
-const graphResultNodePathTable = @import("local_graph.zig").graphResultNodePathTable;
+const graphResultNodePathTable = @import("antfly_local_sources").api_local_graph.graphResultNodePathTable;
 
-const graphResultNodeTouchesExcludedNode = @import("local_graph.zig").graphResultNodeTouchesExcludedNode;
+const graphResultNodeTouchesExcludedNode = @import("antfly_local_sources").api_local_graph.graphResultNodeTouchesExcludedNode;
 
-const graphResultNodeHasExcludedEdge = @import("local_graph.zig").graphResultNodeHasExcludedEdge;
+const graphResultNodeHasExcludedEdge = @import("antfly_local_sources").api_local_graph.graphResultNodeHasExcludedEdge;
 
-const graphPatternMatchIsExcluded = @import("local_graph.zig").graphPatternMatchIsExcluded;
+const graphPatternMatchIsExcluded = @import("antfly_local_sources").api_local_graph.graphPatternMatchIsExcluded;
 
-const cloneGraphPaths = @import("local_graph.zig").cloneGraphPaths;
+const cloneGraphPaths = @import("antfly_local_sources").api_local_graph.cloneGraphPaths;
 
-const cloneGraphPatternMatches = @import("local_graph.zig").cloneGraphPatternMatches;
+const cloneGraphPatternMatches = @import("antfly_local_sources").api_local_graph.cloneGraphPatternMatches;
 
-const cloneGraphAggregates = @import("local_graph.zig").cloneGraphAggregates;
+const cloneGraphAggregates = @import("antfly_local_sources").api_local_graph.cloneGraphAggregates;
 
-const cloneGraphPatternMatch = @import("local_graph.zig").cloneGraphPatternMatch;
+const cloneGraphPatternMatch = @import("antfly_local_sources").api_local_graph.cloneGraphPatternMatch;
 
-const cloneGraphPatternBinding = @import("local_graph.zig").cloneGraphPatternBinding;
+const cloneGraphPatternBinding = @import("antfly_local_sources").api_local_graph.cloneGraphPatternBinding;
 
-const cloneSearchHits = @import("local_graph.zig").cloneSearchHits;
+const cloneSearchHits = @import("antfly_local_sources").api_local_graph.cloneSearchHits;
 
-const cloneGraphMetricValues = @import("local_graph.zig").cloneGraphMetricValues;
+const cloneGraphMetricValues = @import("antfly_local_sources").api_local_graph.cloneGraphMetricValues;
 
-const cloneGraphMetricStatuses = @import("local_graph.zig").cloneGraphMetricStatuses;
+const cloneGraphMetricStatuses = @import("antfly_local_sources").api_local_graph.cloneGraphMetricStatuses;
 
 fn cloneGraphMetricStatus(
     alloc: std.mem.Allocator,
@@ -12156,17 +12156,17 @@ fn retainDistributedGraphProjectedMetrics(
     }
 }
 
-const cloneGraphNode = @import("local_graph.zig").cloneGraphNode;
+const cloneGraphNode = @import("antfly_local_sources").api_local_graph.cloneGraphNode;
 
-const dupPath = @import("local_graph.zig").dupPath;
+const dupPath = @import("antfly_local_sources").api_local_graph.dupPath;
 
-const cloneOwnedStrings = @import("local_graph.zig").cloneOwnedStrings;
+const cloneOwnedStrings = @import("antfly_local_sources").api_local_graph.cloneOwnedStrings;
 
-const dupOptionalStrings = @import("local_graph.zig").dupOptionalStrings;
+const dupOptionalStrings = @import("antfly_local_sources").api_local_graph.dupOptionalStrings;
 
-const freeOptionalStrings = @import("local_graph.zig").freeOptionalStrings;
+const freeOptionalStrings = @import("antfly_local_sources").api_local_graph.freeOptionalStrings;
 
-const graphPathNodeTable = @import("local_graph.zig").graphPathNodeTable;
+const graphPathNodeTable = @import("antfly_local_sources").api_local_graph.graphPathNodeTable;
 
 fn optionalGraphTableEql(
     left: ?[]const u8,
@@ -12182,11 +12182,11 @@ fn optionalStringsContainValue(items: []const ?[]const u8) bool {
     return false;
 }
 
-const dupPathEdges = @import("local_graph.zig").dupPathEdges;
+const dupPathEdges = @import("antfly_local_sources").api_local_graph.dupPathEdges;
 
-const clonePathEdge = @import("local_graph.zig").clonePathEdge;
+const clonePathEdge = @import("antfly_local_sources").api_local_graph.clonePathEdge;
 
-const freeOwnedPathEdge = @import("local_graph.zig").freeOwnedPathEdge;
+const freeOwnedPathEdge = @import("antfly_local_sources").api_local_graph.freeOwnedPathEdge;
 
 test "distributed graph expansion charges physical rows with no visible nodes" {
     const alloc = std.testing.allocator;
@@ -15447,11 +15447,11 @@ test "graph hydrate incoming probe wire carries pinned clock and physical allowa
     try std.testing.expect(legacy.incoming_scanned_rows == null);
 }
 
-pub const encodeGraphHydrateResponseForWire = @import("local_graph.zig").encodeGraphHydrateResponseForWire;
+pub const encodeGraphHydrateResponseForWire = @import("antfly_local_sources").api_local_graph.encodeGraphHydrateResponseForWire;
 
-pub const encodeGraphEdgesResponseForWire = @import("local_graph.zig").encodeGraphEdgesResponseForWire;
+pub const encodeGraphEdgesResponseForWire = @import("antfly_local_sources").api_local_graph.encodeGraphEdgesResponseForWire;
 
-pub const encodeGraphExpandResponseForWire = @import("local_graph.zig").encodeGraphExpandResponseForWire;
+pub const encodeGraphExpandResponseForWire = @import("antfly_local_sources").api_local_graph.encodeGraphExpandResponseForWire;
 
 test "legacy graph hydrate wire omits metric fields in both directions" {
     const alloc = std.testing.allocator;

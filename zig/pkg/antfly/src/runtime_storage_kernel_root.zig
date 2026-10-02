@@ -25,7 +25,7 @@ const restore_staging_exports = @import("standalone/restore_staging_exports.zig"
 
 const storage_kernel_exports = @import("capi/server_owner.zig");
 comptime {
-    _ = @import("capi/db.zig");
+    _ = @import("antfly_local_sources").capi_db;
 }
 
 const local_query_exports = @import("storage/local_query_provider.zig");
@@ -63,7 +63,7 @@ comptime {
     exportInternal(&storageEntry, "antfly_runtime_storage");
     exportInternal(&restore_staging_exports.create, "antfly_restore_staging_create");
     exportInternal(&restore_staging_exports.destroy, "antfly_restore_staging_destroy");
-    exportInternal(&@import("storage/db/enrichment/enrichment_types.zig").interactiveActivity, "antfly_storage_interactive_activity");
+    exportInternal(&@import("antfly_local_sources").storage_db_enrichment_enrichment_types.interactiveActivity, "antfly_storage_interactive_activity");
     exportInternal(&storage_kernel_exports.storageOwnerContextCreate, "antfly_storage_context_create");
     exportInternal(&storage_kernel_exports.storageOwnerContextCreateWithRuntime, "antfly_storage_context_create_with_runtime");
     exportInternal(&storage_kernel_exports.storageOwnerContextDestroy, "antfly_storage_context_destroy");
@@ -208,3 +208,6 @@ comptime {
     exportInternal(&local_query_exports.execute, "antfly_local_query_execute");
     exportInternal(&local_query_exports.bufferDestroy, "antfly_local_query_buffer_destroy");
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

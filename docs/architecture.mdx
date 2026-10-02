@@ -100,7 +100,7 @@ Tables are divided into shards by key range, and each shard is replicated by its
 
 ### Full-Text Search
 
-Implemented natively in Zig (`zig/pkg/antfly/src/search`) as a Lucene-style segment index with FST-based term dictionaries and roaring-bitmap postings, our full-text indexing provides:
+Implemented natively in Zig (`zig/pkg/antfly-embedded/src/local/search`) as a Lucene-style segment index with FST-based term dictionaries and roaring-bitmap postings, our full-text indexing provides:
 - Language-aware tokenization
 - Fuzzy matching and phrase search
 - Faceted search capabilities

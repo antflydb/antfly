@@ -17,8 +17,8 @@
 
 test "relational backup cohort pin cancellation survives absent live catalog and late seal" {
     const std = @import("std");
-    const db = @import("../storage/db/mod.zig");
-    const seal = @import("../storage/db/native_backup_seal.zig");
+    const db = @import("antfly_local_sources").storage_db_mod;
+    const seal = @import("antfly_local_sources").storage_db_native_backup_seal;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -29,12 +29,12 @@ test "relational backup cohort pin cancellation survives absent live catalog and
     const path = try std.fmt.allocPrint(a, "{s}/retired-source", .{root});
     var runtime = try db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer runtime.deinit();
-    const namespace: @import("../storage/db/doc_identity.zig").Namespace = .{ .table_id = 2, .shard_id = 3, .range_id = 4 };
+    const namespace: @import("antfly_local_sources").storage_db_doc_identity.Namespace = .{ .table_id = 2, .shard_id = 3, .range_id = 4 };
     var source = try db.DB.open(alloc, path, .{ .backend_runtime = runtime.ptr(), .identity_namespace = namespace, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false });
     var source_open = true;
     defer if (source_open) source.close();
     const identity = try source.relationalTopologyIdentity();
-    const fence: @import("../storage/db/relational_integrity_topology_contract.zig").Fence = .{ .transition_id = 92, .attempt = 1, .admission_epoch = identity.next_epoch, .owner_group_id = 31, .peer_group_id = 31, .role = .backup_snapshot, .namespace = namespace, .catalog_digest = identity.catalog_digest };
+    const fence: @import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Fence = .{ .transition_id = 92, .attempt = 1, .admission_epoch = identity.next_epoch, .owner_group_id = 31, .peer_group_id = 31, .role = .backup_snapshot, .namespace = namespace, .catalog_digest = identity.catalog_digest };
     try source.batch(.{ .relational_topology = .{ .fence = fence, .action = .begin } });
     source.close();
     source_open = false;
@@ -59,11 +59,11 @@ test "relational backup cohort topology HA split cutover preserves binary range 
 }
 
 fn testTopologyHAControls(comptime replicated: bool, comptime split: bool) !void {
-    const replication_ingress = @import("../storage/db/replication_ingress.zig");
+    const replication_ingress = @import("antfly_local_sources").storage_db_replication_ingress;
     const std = @import("std");
-    const db = @import("../storage/db/mod.zig");
+    const db = @import("antfly_local_sources").storage_db_mod;
     const ha = @import("../storage/hot_standby/primary.zig");
-    const topology = @import("../storage/db/relational_integrity_topology_contract.zig");
+    const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -75,7 +75,7 @@ fn testTopologyHAControls(comptime replicated: bool, comptime split: bool) !void
     defer primary.close();
     var runtime = try db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer runtime.deinit();
-    const namespace: @import("../storage/db/doc_identity.zig").Namespace = .{ .table_id = 2, .shard_id = 3, .range_id = 4 };
+    const namespace: @import("antfly_local_sources").storage_db_doc_identity.Namespace = .{ .table_id = 2, .shard_id = 3, .range_id = 4 };
     var source = try db.DB.open(alloc, try std.fmt.allocPrint(a, "{s}/source", .{root}), .{ .backend_runtime = runtime.ptr(), .identity_namespace = namespace, .replication_async_batch_mirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary) }, .replication_write_gate = .{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .start_optional_runtimes = false, .start_index_workers = false });
     defer source.close();
     var target = try db.DB.open(alloc, try std.fmt.allocPrint(a, "{s}/target", .{root}), .{ .backend_runtime = runtime.ptr(), .identity_namespace = namespace, .start_optional_runtimes = false, .start_index_workers = false });
@@ -89,7 +89,7 @@ fn testTopologyHAControls(comptime replicated: bool, comptime split: bool) !void
     }
     const identity = try source.relationalTopologyIdentity();
     const fence: topology.Fence = .{ .transition_id = 81, .attempt = 1, .admission_epoch = identity.next_epoch, .owner_group_id = 31, .peer_group_id = if (replicated) 32 else 31, .role = if (split) .split_source else if (replicated) .merge_source else .backup_snapshot, .namespace = namespace, .catalog_digest = identity.catalog_digest };
-    const begin_request: @import("../storage/db/types.zig").BatchRequest = .{ .relational_topology = .{ .fence = fence, .action = .begin } };
+    const begin_request: @import("antfly_local_sources").storage_db_types.BatchRequest = .{ .relational_topology = .{ .fence = fence, .action = .begin } };
     if (replicated) {
         try @import("../storage/server_db_adapter.zig").applyOrdered(&source, begin_request, .{ .index = 1, .term = 1 });
         const first_lsn = primary.lastLsn();
@@ -105,7 +105,7 @@ fn testTopologyHAControls(comptime replicated: bool, comptime split: bool) !void
         try std.testing.expectError(error.IntegrityTopologyBusy, target.writeTransaction(fresh, .{ .predicates = &.{.{ .key = "blocked", .expected_version = 0 }} }));
         try target.abortTransaction(fresh, 2);
     } else try std.testing.expectError(error.IntegrityTopologyBusy, target.batch(.{ .writes = &.{.{ .key = "blocked", .value = "{}" }} }));
-    const release_request: @import("../storage/db/types.zig").BatchRequest = if (split)
+    const release_request: @import("antfly_local_sources").storage_db_types.BatchRequest = if (split)
         .{ .split_transition = .{ .kind = .finalize, .transition_id = fence.transition_id, .attempt_epoch = fence.attempt, .destination_group_id = fence.peer_group_id, .split_key = "\x80" } }
     else
         .{ .relational_topology = .{ .fence = fence, .action = if (replicated) .abort_transition else .release } };
@@ -123,7 +123,7 @@ fn testTopologyHAControls(comptime replicated: bool, comptime split: bool) !void
     if (split) {
         try std.testing.expectEqualSlices(u8, "\x80", source.getRange().end);
         try std.testing.expectEqualSlices(u8, "\x80", target.getRange().end);
-        const activation = @import("../storage/db/relational_integrity_activation_contract.zig");
+        const activation = @import("antfly_local_sources").storage_db_relational_integrity_activation_contract;
         const source_coverage = (try source.core.getStoreValue(a, activation.key)).?;
         const target_coverage = (try target.core.getStoreValue(a, activation.key)).?;
         try std.testing.expectEqualSlices(u8, source_coverage, target_coverage);

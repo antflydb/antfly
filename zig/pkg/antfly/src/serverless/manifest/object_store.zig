@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const object_storage = @import("../../storage/object_storage.zig");
+const object_storage = @import("antfly_local_sources").storage_object_storage;
 const manifest_types = @import("types.zig");
 const manifest_codec = @import("codec.zig");
 const manifest_store = @import("store.zig");

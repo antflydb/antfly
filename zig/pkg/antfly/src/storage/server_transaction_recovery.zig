@@ -13,16 +13,16 @@
 // limitations.
 
 const std = @import("std");
-const driver = @import("db/maintenance/transaction_recovery_driver.zig");
+const driver = @import("antfly_local_sources").storage_db_maintenance_transaction_recovery_driver;
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
-const backend_erased = @import("backend_erased.zig");
-const lsm_backend = @import("lsm_backend.zig");
-const mem_backend = @import("mem_backend.zig");
-const transactions_mod = @import("transactions.zig");
-const types = @import("db/types.zig");
+const backend_erased = @import("antfly_local_sources").storage_backend_erased;
+const lsm_backend = @import("antfly_local_sources").storage_lsm_backend;
+const mem_backend = @import("antfly_local_sources").storage_mem_backend;
+const transactions_mod = @import("antfly_local_sources").storage_transactions;
+const types = @import("antfly_local_sources").storage_db_types;
 const platform_clock = @import("antfly_platform").clock;
-const background_runtime_mod = @import("background_runtime.zig");
+const background_runtime_mod = @import("antfly_local_sources").storage_background_runtime;
 
 pub const Config = @import("server_transaction_recovery_contract.zig").Config;
 
@@ -865,7 +865,7 @@ test "replicated recovery batches proven followers preserves uncertain debt and 
     }
 }
 
-pub fn runDbRecoveryOnce(self: *@import("db/db.zig").DB, config: Config) !types.TransactionRecoveryStats {
+pub fn runDbRecoveryOnce(self: *@import("antfly_local_sources").storage_db_db.DB, config: Config) !types.TransactionRecoveryStats {
     var replication_mutation = try self.admitTransactionRecovery();
     defer if (replication_mutation) |*lease| lease.release();
     if (!config.enabled) return .{};
@@ -942,7 +942,7 @@ pub fn runDbRecoveryOnce(self: *@import("db/db.zig").DB, config: Config) !types.
     return recovery_stats;
 }
 
-const local_contract = @import("db/transaction_recovery_contract.zig");
+const local_contract = @import("antfly_local_sources").storage_db_transaction_recovery_contract;
 
 /// Config and its callback contexts must outlive DB initialization. The
 /// constructed runtime snapshots Config and retains only its borrowed contexts.
@@ -1032,7 +1032,7 @@ const OwnedServerRuntime = struct {
 
 /// Inspect the owned server configuration only in server integration fixtures.
 pub const test_support = if (builtin.is_test) struct {
-    pub fn runtimeConfig(runtime: *@import("db/maintenance/transaction_runtime.zig").Runtime) Config {
+    pub fn runtimeConfig(runtime: *@import("antfly_local_sources").storage_db_maintenance_transaction_runtime.Runtime) Config {
         return OwnedServerRuntime.owner(runtime.external.?.ptr).runtime.config;
     }
 } else struct {};

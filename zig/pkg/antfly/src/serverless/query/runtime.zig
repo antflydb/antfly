@@ -24,7 +24,7 @@ const cache_mod = @import("cache.zig");
 const bounded_decode = @import("../bounded_decode.zig");
 const graph_reader = @import("graph_reader.zig");
 const request_mod = @import("request.zig");
-const operation = @import("../../api/operation.zig");
+const operation = @import("antfly_local_sources").api_operation;
 const CancellationToken = operation.CancellationToken;
 const read_lease = @import("../manifest/read_lease.zig");
 

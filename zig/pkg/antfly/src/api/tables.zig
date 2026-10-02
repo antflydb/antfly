@@ -13,31 +13,31 @@
 // limitations.
 
 const std = @import("std");
-const group_ids = @import("../common/group_ids.zig");
+const group_ids = @import("antfly_local_sources").common_group_ids;
 const metadata_api = @import("../metadata/api.zig");
 const metadata_admin = @import("../metadata/admin.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
-const metadata_topology_protocol = @import("../metadata/topology_protocol.zig");
+const metadata_topology_protocol = @import("antfly_local_sources").metadata_topology_protocol;
 const raft_reconciler = @import("../raft/reconciler.zig");
-const db_mod = @import("../storage/db/selected_root.zig").db;
+const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
 const indexes_openapi = @import("antfly_indexes_openapi");
 const indexes_api = @import("indexes.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const schema_openapi = @import("antfly_schema_openapi");
-const schema_mod = @import("../schema/mod.zig");
-const runtime_schema_mod = @import("../storage/schema.zig");
-const algebraic_mod = @import("../storage/db/algebraic/mod.zig");
-const lsm_backend = @import("../storage/lsm_backend/mod.zig");
-const full_text_indexes = @import("full_text_indexes.zig");
-const json_helpers = @import("json_helpers.zig");
-const table_reads = @import("table_read_source.zig");
-const coverage_policy_mod = @import("coverage_policy.zig");
-const table_create_contract = @import("table_create_contract.zig");
+const schema_mod = @import("antfly_local_sources").schema_mod;
+const runtime_schema_mod = @import("antfly_local_sources").storage_schema;
+const algebraic_mod = @import("antfly_local_sources").storage_db_algebraic_mod;
+const lsm_backend = @import("antfly_local_sources").storage_lsm_backend_mod;
+const full_text_indexes = @import("antfly_local_sources").api_full_text_indexes;
+const json_helpers = @import("antfly_local_sources").api_json_helpers;
+const table_reads = @import("antfly_local_sources").api_table_read_source;
+const coverage_policy_mod = @import("antfly_local_sources").api_coverage_policy;
+const table_create_contract = @import("antfly_local_sources").api_table_create_contract;
 
-pub const default_full_text_index_name = @import("local_tables.zig").default_full_text_index_name;
+pub const default_full_text_index_name = @import("antfly_local_sources").api_local_tables.default_full_text_index_name;
 
-pub const default_indexes_json = @import("local_tables.zig").default_indexes_json;
+pub const default_indexes_json = @import("antfly_local_sources").api_local_tables.default_indexes_json;
 
 pub const max_table_name_bytes: usize = 255;
 pub const max_table_initial_ranges: u32 = metadata_topology_protocol.max_initial_ranges;
@@ -77,12 +77,12 @@ pub fn validateTableMutationName(table_name: []const u8) !void {
 /// publication. Public names keep their existing 255-byte validation contract.
 pub fn validateInternalTableMutationName(table_name: []const u8) !void {
     if (table_name.len <= max_table_name_bytes) return validateTableMutationName(table_name);
-    const catalog = @import("../system_catalog/domain.zig");
+    const catalog = @import("antfly_local_sources").system_catalog_domain;
     try catalog.validateStorageName(table_name);
 }
 
 test "system catalog maximum restore identity can be dropped internally" {
-    const catalog = @import("../system_catalog/domain.zig");
+    const catalog = @import("antfly_local_sources").system_catalog_domain;
     const component: [catalog.max_name_bytes]u8 = @splat('a');
     const name = try catalog.restoreStorageNameAlloc(std.testing.allocator, "table:00000000000000000000000000000000", .{ .database = &component, .namespace = &component, .table = &component });
     defer std.testing.allocator.free(name);
@@ -110,7 +110,7 @@ test "table mutation names preserve the public contract" {
 }
 
 test "create table rejects unbounded initial shard fanout" {
-    const topology_protocol = @import("../metadata/topology_protocol.zig");
+    const topology_protocol = @import("antfly_local_sources").metadata_topology_protocol;
     const body = try std.fmt.allocPrint(
         std.testing.allocator,
         "{{\"num_shards\":{d}}}",
@@ -133,7 +133,7 @@ test "create table rejects unbounded initial shard fanout" {
     );
 }
 
-const validateIndexesValue = @import("local_tables.zig").validateIndexesValue;
+const validateIndexesValue = @import("antfly_local_sources").api_local_tables.validateIndexesValue;
 
 pub fn validateIndexesJson(alloc: std.mem.Allocator, indexes_json: []const u8) !void {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{}) catch return error.InvalidCreateTableRequest;
@@ -143,7 +143,7 @@ pub fn validateIndexesJson(alloc: std.mem.Allocator, indexes_json: []const u8) !
 
 /// Validates metadata read from Antfly-owned durable catalogs or backup
 /// manifests. Public request paths must use validateIndexesJson instead.
-pub const validateStoredIndexesJson = @import("local_tables.zig").validateStoredIndexesJson;
+pub const validateStoredIndexesJson = @import("antfly_local_sources").api_local_tables.validateStoredIndexesJson;
 
 fn normalizeRawCreateTableIndexesAlloc(
     alloc: std.mem.Allocator,
@@ -220,11 +220,11 @@ fn normalizeRawCreateTableIndexesAlloc(
     }
     return try out.toOwnedSlice(alloc);
 }
-pub const default_schema_json = @import("local_tables.zig").default_schema_json;
+pub const default_schema_json = @import("antfly_local_sources").api_local_tables.default_schema_json;
 
-pub const effectiveSchemaJson = @import("local_tables.zig").effectiveSchemaJson;
+pub const effectiveSchemaJson = @import("antfly_local_sources").api_local_tables.effectiveSchemaJson;
 
-pub const ParsedTableSchema = @import("local_tables.zig").ParsedTableSchema;
+pub const ParsedTableSchema = @import("antfly_local_sources").api_local_tables.ParsedTableSchema;
 
 pub const LsmStorageStatus = struct {
     // Table status intentionally exposes a compact operational snapshot. Full
@@ -326,7 +326,7 @@ pub const LsmStorageStatus = struct {
 };
 
 pub const TableStorageStatus = struct {
-    source_vectors: ?@import("../storage/artifact_payload.zig").Stats = null,
+    source_vectors: ?@import("antfly_local_sources").storage_artifact_payload.Stats = null,
     table_name: []const u8,
     empty: bool,
     disk_usage: ?u64 = null,
@@ -1077,7 +1077,7 @@ pub fn buildSingleTableIndexWithRuntimeSchemaDebugValue(
     return value;
 }
 
-pub const CreateTableRequest = @import("local_tables.zig").CreateTableRequest;
+pub const CreateTableRequest = @import("antfly_local_sources").api_local_tables.CreateTableRequest;
 
 pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !CreateTableRequest {
     return parseCreateTableRequestWithOptions(alloc, body, false);
@@ -1152,11 +1152,11 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
     if (root.get("tablespace_name")) |value| {
         if (value != .null) {
             if (value != .string) return error.InvalidCreateTableRequest;
-            try @import("../system_catalog/domain.zig").validateName(value.string);
+            try @import("antfly_local_sources").system_catalog_domain.validateName(value.string);
             req.tablespace_name = try alloc.dupe(u8, value.string);
         }
     }
-    if (root.get("storage")) |value| req.storage = try @import("../common/table_storage.zig").Settings.parse(value);
+    if (root.get("storage")) |value| req.storage = try @import("antfly_local_sources").common_table_storage.Settings.parse(value);
 
     if (root.get("num_shards")) |value| {
         if (value != .null) req.num_shards = try parseU32Field(value);
@@ -1222,9 +1222,9 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
     return req;
 }
 
-pub const expandSchemaDerivedAlgebraicIndexesAlloc = @import("local_tables.zig").expandSchemaDerivedAlgebraicIndexesAlloc;
+pub const expandSchemaDerivedAlgebraicIndexesAlloc = @import("antfly_local_sources").api_local_tables.expandSchemaDerivedAlgebraicIndexesAlloc;
 
-pub const expandSchemaDerivedAlgebraicIndexAlloc = @import("local_tables.zig").expandSchemaDerivedAlgebraicIndexAlloc;
+pub const expandSchemaDerivedAlgebraicIndexAlloc = @import("antfly_local_sources").api_local_tables.expandSchemaDerivedAlgebraicIndexAlloc;
 
 pub fn validatePublicAlgebraicIndexesJson(alloc: std.mem.Allocator, indexes_json: []const u8) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
@@ -1243,7 +1243,7 @@ pub fn validatePublicAlgebraicIndexJson(alloc: std.mem.Allocator, index_json: []
     try validatePublicAlgebraicIndexValue(parsed.value);
 }
 
-const isSchemaDerivedAlgebraicIndex = @import("local_tables.zig").isSchemaDerivedAlgebraicIndex;
+const isSchemaDerivedAlgebraicIndex = @import("antfly_local_sources").api_local_tables.isSchemaDerivedAlgebraicIndex;
 
 fn validatePublicAlgebraicIndexValue(value: std.json.Value) !void {
     if (value != .object) return;
@@ -1260,7 +1260,7 @@ fn validatePublicAlgebraicIndexValue(value: std.json.Value) !void {
     }
 }
 
-const schemaDerivedAlgebraicIndexValueAlloc = @import("local_tables.zig").schemaDerivedAlgebraicIndexValueAlloc;
+const schemaDerivedAlgebraicIndexValueAlloc = @import("antfly_local_sources").api_local_tables.schemaDerivedAlgebraicIndexValueAlloc;
 
 pub fn regenerateAlgebraicIndexesFromSchemaAlloc(
     alloc: std.mem.Allocator,
@@ -1388,9 +1388,9 @@ fn regenerateAlgebraicIndexValueAlloc(
     return derived;
 }
 
-const isAlgebraicInternalConfigField = @import("local_tables.zig").isAlgebraicInternalConfigField;
+const isAlgebraicInternalConfigField = @import("antfly_local_sources").api_local_tables.isAlgebraicInternalConfigField;
 
-pub const deriveTableRecord = @import("local_tables.zig").deriveTableRecord;
+pub const deriveTableRecord = @import("antfly_local_sources").api_local_tables.deriveTableRecord;
 
 pub fn deriveInitialRange(table: metadata_table_manager.TableRecord) metadata_table_manager.RangeRecord {
     return deriveInitialRangeForGeneration(table, 0);
@@ -1590,7 +1590,7 @@ pub fn applySchemaMutationRecord(
     return try applySchemaUpdateRecord(alloc, table, schema_json);
 }
 
-pub const parseValidatedTableSchema = @import("local_tables.zig").parseValidatedTableSchema;
+pub const parseValidatedTableSchema = @import("antfly_local_sources").api_local_tables.parseValidatedTableSchema;
 
 pub fn validateBatchWritesAgainstTableSchema(
     alloc: std.mem.Allocator,
@@ -1600,9 +1600,9 @@ pub fn validateBatchWritesAgainstTableSchema(
     try schema_mod.validateBatchWritesAgainstTableSchema(alloc, schema, writes);
 }
 
-pub const validateWritesAgainstTableSchema = @import("local_tables.zig").validateWritesAgainstTableSchema;
+pub const validateWritesAgainstTableSchema = @import("antfly_local_sources").api_local_tables.validateWritesAgainstTableSchema;
 
-pub const deriveRuntimeTableSchema = @import("local_tables.zig").deriveRuntimeTableSchema;
+pub const deriveRuntimeTableSchema = @import("antfly_local_sources").api_local_tables.deriveRuntimeTableSchema;
 
 pub fn applySchemaUpdateRecord(
     alloc: std.mem.Allocator,
@@ -1621,7 +1621,7 @@ pub fn applySchemaUpdateRecordWithIncarnation(
     schema_json: []const u8,
     incarnation: u64,
 ) !metadata_table_manager.TableRecord {
-    if (!@import("../storage/coverage_identity.zig").isValid(incarnation)) return error.InvalidIndexConfig;
+    if (!@import("antfly_local_sources").storage_coverage_identity.isValid(incarnation)) return error.InvalidIndexConfig;
     return applySchemaRecord(alloc, table, schema_json, false, false, incarnation);
 }
 
@@ -1671,11 +1671,11 @@ pub fn foreignKeyPublicationIndexesValid(alloc: std.mem.Allocator, table_name: [
 }
 
 fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, schema_json: []const u8, rewrite: bool, fk_publication: bool, pinned_incarnation: ?u64) !metadata_table_manager.TableRecord {
-    try @import("../schema/relational_index_namespace.zig").validate(alloc, schema_json, table.indexes_json);
+    try @import("antfly_local_sources").schema_relational_index_namespace.validate(alloc, schema_json, table.indexes_json);
     const current_version = try schemaVersion(table.schema_json);
     const schema_changed = !try schemasSemanticallyEqual(alloc, table.schema_json, schema_json);
     if (schema_changed and !rewrite) {
-        try @import("../schema/relational_expression.zig").validateSchemaUpdate(alloc, table.schema_json, schema_json);
+        try @import("antfly_local_sources").schema_relational_expression.validateSchemaUpdate(alloc, table.schema_json, schema_json);
         if (!fk_publication and !try foreignKeyDefinitionsUnchanged(alloc, table.schema_json, schema_json))
             return error.ForeignKeyGenerationPublicationRequired;
     }
@@ -1728,9 +1728,9 @@ fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_mana
 /// canonical fingerprints as the owner catalog, so JSON spelling/order and
 /// unrelated layout changes do not turn a safe update into a false conflict.
 pub fn foreignKeyDefinitionsUnchanged(alloc: std.mem.Allocator, previous_json: []const u8, next_json: []const u8) !bool {
-    const schema_api = @import("../schema/mod.zig");
-    const native = @import("../storage/schema.zig");
-    const declarations = @import("../schema/relational_declarations.zig");
+    const schema_api = @import("antfly_local_sources").schema_mod;
+    const native = @import("antfly_local_sources").storage_schema;
+    const declarations = @import("antfly_local_sources").schema_relational_declarations;
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     const a = scratch.allocator();
@@ -1836,7 +1836,7 @@ fn validateNamedFullTextQueryIndexes(
     }
 }
 
-fn generatedSourceVectorStats(stats: @import("../storage/artifact_payload.zig").Stats) metadata_openapi.VectorSourceStorageStatus {
+fn generatedSourceVectorStats(stats: @import("antfly_local_sources").storage_artifact_payload.Stats) metadata_openapi.VectorSourceStorageStatus {
     var out: metadata_openapi.VectorSourceStorageStatus = .{};
     inline for (@typeInfo(@TypeOf(stats)).@"struct".fields) |field| {
         @field(out, field.name) = @intCast(@min(@field(stats, field.name), std.math.maxInt(i64)));
@@ -2738,9 +2738,9 @@ fn inferIndexType(index_name: []const u8, config: std.json.Value) ?ApiIndexType 
     return null;
 }
 
-const parseJsonValueAlloc = @import("local_tables.zig").parseJsonValueAlloc;
+const parseJsonValueAlloc = @import("antfly_local_sources").api_local_tables.parseJsonValueAlloc;
 
-const cloneJsonValueAlloc = @import("local_tables.zig").cloneJsonValueAlloc;
+const cloneJsonValueAlloc = @import("antfly_local_sources").api_local_tables.cloneJsonValueAlloc;
 
 fn buildTableRuntimeSchemaDebug(
     alloc: std.mem.Allocator,
@@ -3923,7 +3923,7 @@ pub fn findTableByName(snapshot: *const metadata_api.AdminSnapshot, table_name: 
     return null;
 }
 
-const deriveId = @import("local_tables.zig").deriveId;
+const deriveId = @import("antfly_local_sources").api_local_tables.deriveId;
 
 fn deriveDataGroupId(name: []const u8, seed: u64) u64 {
     return group_ids.dataGroupIdFromHash(std.hash.Wyhash.hash(seed, name));
@@ -4093,7 +4093,7 @@ test "relational declarations public schema preserves unsafe typed literals and 
     }
     const roundtrip = try std.json.Stringify.valueAlloc(alloc, active, .{});
     defer alloc.free(roundtrip);
-    try @import("../schema/relational_expression.zig").validateSchemaUpdate(alloc, source, roundtrip);
+    try @import("antfly_local_sources").schema_relational_expression.validateSchemaUpdate(alloc, source, roundtrip);
     var old = try schema_mod.CompiledTableValidator.init(alloc, source);
     defer old.deinit(alloc);
     var next = try schema_mod.CompiledTableValidator.init(alloc, roundtrip);
@@ -6274,7 +6274,7 @@ test "system catalog stored create preserves tablespace and storage ownership to
     defer decoded.deinit(alloc);
     try std.testing.expectEqualStrings("serving", decoded.tablespace_name.?);
     try std.testing.expectEqual(@as(?u32, 1), decoded.num_shards);
-    try std.testing.expectEqual(@import("../common/table_storage.zig").DenseEmbeddings.vector_store, decoded.storage.?.dense_embeddings);
+    try std.testing.expectEqual(@import("antfly_local_sources").common_table_storage.DenseEmbeddings.vector_store, decoded.storage.?.dense_embeddings);
 }
 
 test "system catalog definition cache shares immutable content and protects hot entries from scans" {
@@ -6469,7 +6469,7 @@ test "relational declarations metadata generated update admission precedes catal
     const json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","column_defaults":[{"column":"x","expression":{"op":"literal","type":"integer","value":"2"}}],"generated_columns":[{"column":"y","expression":{"op":"column","column":"x"}},{"column":"z","expression":{"op":"column","column":"y"}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"z":{"type":"integer"}},"additionalProperties":false}}}}
     ;
-    const manager = @import("../metadata/local_catalog.zig");
+    const manager = @import("antfly_local_sources").metadata_local_catalog;
     const tables = @This();
     const table: manager.TableRecord = .{ .table_id = 7, .name = "rows", .schema_json = json, .indexes_json = "{}" };
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{ .parse_numbers = false });
