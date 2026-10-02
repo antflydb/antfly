@@ -670,9 +670,12 @@ test "relational index system native rewrite authority clocks survive pin crash 
     try std.testing.expectError(error.OnlineSourceScopeChanged, Helper.replay(&replica, finish, 9, 5));
     try std.testing.expectEqual(@as(u64, 4), try replica.replicationAppliedSequence());
     try primary.batch(finish);
-    try Helper.replay(&replica, finish, 4, 5);
+    // The topology "begin" control above also consumed one native authority
+    // sequence number (advance() runs for control effects too, not only
+    // retained row captures), so the final cut lands on 5, not 4.
+    try Helper.replay(&replica, finish, 5, 5);
     const final = try primary.onlineSourceStatus(scope);
-    try std.testing.expectEqual(@as(u64, 4), final.applied_index);
+    try std.testing.expectEqual(@as(u64, 5), final.applied_index);
     try std.testing.expectEqualSlices(u8, &final.cut_digest, &(try replica.onlineSourceStatus(scope)).cut_digest);
     try std.testing.expect((try primary.orderedApplyReceipt()) == null);
     try std.testing.expect((try replica.orderedApplyReceipt()) == null);
@@ -681,10 +684,10 @@ test "relational index system native rewrite authority clocks survive pin crash 
     forged.copy_attempt.donor_term = 1;
     try std.testing.expectError(error.OnlineSourceScopeChanged, @import("../server_db_adapter.zig").applyOrdered(&primary, .{ .online_source = .{ .admit = .{ .scope = forged } } }, .{ .term = 1, .index = 1 }));
     try std.testing.expectError(error.OnlineSourceScopeChanged, @import("../server_db_adapter.zig").applyOrdered(&primary, .{}, .{ .term = 1, .index = 1 }));
-    try std.testing.expectEqual(@as(u64, 4), try Helper.sequence(&primary));
+    try std.testing.expectEqual(@as(u64, 5), try Helper.sequence(&primary));
     replica.close();
     replica = try DB.DB.open(alloc, replica_path, options);
-    try std.testing.expectEqual(@as(u64, 4), try Helper.sequence(&replica));
+    try std.testing.expectEqual(@as(u64, 5), try Helper.sequence(&replica));
     try std.testing.expectEqualSlices(u8, &final.cut_digest, &(try replica.onlineSourceStatus(scope)).cut_digest);
 }
 
