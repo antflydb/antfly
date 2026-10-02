@@ -53328,6 +53328,16 @@ fn computeAssetRequestDerived(
     const key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", artifact_name);
     defer alloc.free(key);
 
+    // Resolved once, under IndexManager.catalog_mutex.lockShared(), before
+    // any chunking/inference work below; both the "no source text" delete
+    // path and computeDocumentExtractionAssetRequestDerived need it, and
+    // neither may read the live catalog arrays themselves afterward.
+    var document_extraction_view: DocumentExtractionCatalogView = .{};
+    defer document_extraction_view.deinit(alloc);
+    if (producer_cfg.type == .document_extraction) {
+        document_extraction_view = try buildDocumentExtractionCatalogView(alloc, db, artifact_name);
+    }
+
     const text_indexes: []const []const u8 = request.consumer_indexes;
 
     // Asset-consumes-asset: the source is another asset's produced bytes.
@@ -53358,7 +53368,7 @@ fn computeAssetRequestDerived(
         if (source_text) |s| alloc.free(s);
         try appendFullTextDeleteDocument(alloc, documents, key, text_indexes);
         if (producer_cfg.type == .document_extraction) {
-            try appendDocumentExtractionDeleteKeys(alloc, db, request.doc_key, artifact_name, key, artifact_delete_keys);
+            try appendDocumentExtractionDeleteKeys(alloc, db, &document_extraction_view, request.doc_key, artifact_name, key, artifact_delete_keys);
             return;
         }
         try artifact_delete_keys.append(alloc, try alloc.dupe(u8, key));
@@ -53373,6 +53383,7 @@ fn computeAssetRequestDerived(
         return try computeDocumentExtractionAssetRequestDerived(
             alloc,
             db,
+            &document_extraction_view,
             doc_value,
             source_text.?,
             request,
@@ -53697,9 +53708,186 @@ fn flushPrecomputeAssetProducerBatch(
     }
 }
 
+/// One embedding enrichment consuming a document-extraction chunk artifact,
+/// fully resolved (owned strings, owned resolved consumer index names) while
+/// `DocumentExtractionCatalogView` was built. No field here is a pointer into
+/// `IndexManager`'s live `enrichments`/`dense_indexes`/`sparse_indexes`
+/// arrays, so it stays valid across a concurrent catalog publish.
+const DocumentExtractionEmbeddingView = struct {
+    name: []const u8 = &.{},
+    source_field: []const u8 = &.{},
+    expected_dims: u32 = 0,
+    producer_json: []const u8 = &.{},
+    consumer_indexes: [][]u8 = &.{},
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        if (self.name.len > 0) alloc.free(@constCast(self.name));
+        if (self.source_field.len > 0) alloc.free(@constCast(self.source_field));
+        if (self.producer_json.len > 0) alloc.free(@constCast(self.producer_json));
+        for (self.consumer_indexes) |name| alloc.free(name);
+        if (self.consumer_indexes.len > 0) alloc.free(self.consumer_indexes);
+        self.* = undefined;
+    }
+
+    fn cloneFromEnrichment(alloc: Allocator, entry: anytype, consumer_indexes: [][]u8) !DocumentExtractionEmbeddingView {
+        const name = try alloc.dupe(u8, entry.name);
+        errdefer alloc.free(name);
+        const source_field = try alloc.dupe(u8, entry.source_field);
+        errdefer alloc.free(source_field);
+        const producer_json = if (entry.producer_json.len > 0) try alloc.dupe(u8, entry.producer_json) else "";
+        errdefer if (producer_json.len > 0) alloc.free(@constCast(producer_json));
+        return .{
+            .name = name,
+            .source_field = source_field,
+            .expected_dims = entry.expected_dims,
+            .producer_json = producer_json,
+            .consumer_indexes = consumer_indexes,
+        };
+    }
+};
+
+/// One chunk enrichment whose `source_artifact_name` names a document
+/// extraction asset, plus every embedding enrichment that in turn consumes
+/// that chunk artifact -- resolved once per `computeDocumentExtractionAssetRequestDerived`
+/// call, under `IndexManager.catalog_mutex.lockShared()`, instead of each
+/// helper below walking the live catalog arrays itself while chunking,
+/// rendering, or model inference runs with no catalog lock held at all (the
+/// case for the pre-lock document-mode hoist in `batchInternalPrepared`).
+const DocumentExtractionChunkView = struct {
+    name: []const u8 = &.{},
+    source_field: []const u8 = &.{},
+    chunker_json: []const u8 = &.{},
+    chunk_size: u32 = 0,
+    chunk_overlap: u32 = 0,
+    text_indexes: [][]u8 = &.{},
+    dense_embeddings: []DocumentExtractionEmbeddingView = &.{},
+    sparse_embeddings: []DocumentExtractionEmbeddingView = &.{},
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        if (self.name.len > 0) alloc.free(@constCast(self.name));
+        if (self.source_field.len > 0) alloc.free(@constCast(self.source_field));
+        if (self.chunker_json.len > 0) alloc.free(@constCast(self.chunker_json));
+        for (self.text_indexes) |name| alloc.free(name);
+        if (self.text_indexes.len > 0) alloc.free(self.text_indexes);
+        for (self.dense_embeddings) |*embedding| embedding.deinit(alloc);
+        if (self.dense_embeddings.len > 0) alloc.free(self.dense_embeddings);
+        for (self.sparse_embeddings) |*embedding| embedding.deinit(alloc);
+        if (self.sparse_embeddings.len > 0) alloc.free(self.sparse_embeddings);
+        self.* = undefined;
+    }
+};
+
+/// Owned, request-local snapshot of every catalog entry document extraction's
+/// synchronous chunk/embedding derivation for one asset artifact needs.
+/// `buildDocumentExtractionCatalogView` is the only place this reads
+/// `IndexManager`'s live arrays; every helper downstream of
+/// `computeDocumentExtractionAssetRequestDerived` reads this view instead of
+/// `db.core.index_manager`, so a catalog publish racing a pre-lock precompute
+/// can replace or free those live arrays without this view observing it.
+const DocumentExtractionCatalogView = struct {
+    chunks: []DocumentExtractionChunkView = &.{},
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.chunks) |*chunk| chunk.deinit(alloc);
+        if (self.chunks.len > 0) alloc.free(self.chunks);
+        self.* = undefined;
+    }
+};
+
+fn buildDocumentExtractionEmbeddingViews(
+    alloc: Allocator,
+    db: anytype,
+    chunk_artifact_name: []const u8,
+    dense: *std.ArrayListUnmanaged(DocumentExtractionEmbeddingView),
+    sparse: *std.ArrayListUnmanaged(DocumentExtractionEmbeddingView),
+) !void {
+    for (db.core.index_manager.enrichments.items) |entry| {
+        if (entry.kind != .embedding) continue;
+        if (!std.mem.eql(u8, entry.source_artifact_name, chunk_artifact_name)) continue;
+        if (entry.expected_dims > 0) {
+            const consumer_indexes = try db.core.index_manager.denseIndexesForEmbedding(alloc, entry.name, entry.expected_dims);
+            errdefer {
+                for (consumer_indexes) |name| alloc.free(name);
+                alloc.free(consumer_indexes);
+            }
+            var view = try DocumentExtractionEmbeddingView.cloneFromEnrichment(alloc, entry, consumer_indexes);
+            errdefer view.deinit(alloc);
+            try dense.append(alloc, view);
+        } else {
+            const consumer_indexes = try db.core.index_manager.sparseIndexesForEmbedding(alloc, entry.name);
+            errdefer {
+                for (consumer_indexes) |name| alloc.free(name);
+                alloc.free(consumer_indexes);
+            }
+            var view = try DocumentExtractionEmbeddingView.cloneFromEnrichment(alloc, entry, consumer_indexes);
+            errdefer view.deinit(alloc);
+            try sparse.append(alloc, view);
+        }
+    }
+}
+
+fn buildDocumentExtractionCatalogView(
+    alloc: Allocator,
+    db: anytype,
+    artifact_name: []const u8,
+) !DocumentExtractionCatalogView {
+    db.core.index_manager.catalog_mutex.lockShared();
+    defer db.core.index_manager.catalog_mutex.unlockShared();
+
+    var chunks = std.ArrayListUnmanaged(DocumentExtractionChunkView).empty;
+    errdefer {
+        for (chunks.items) |*chunk| chunk.deinit(alloc);
+        chunks.deinit(alloc);
+    }
+    for (db.core.index_manager.enrichments.items) |entry| {
+        if (entry.kind != .chunk) continue;
+        if (!std.mem.eql(u8, entry.source_artifact_name, artifact_name)) continue;
+
+        const name = try alloc.dupe(u8, entry.name);
+        errdefer alloc.free(name);
+        const source_field = try alloc.dupe(u8, entry.source_field);
+        errdefer alloc.free(source_field);
+        const chunker_json = if (entry.chunker_json.len > 0) try alloc.dupe(u8, entry.chunker_json) else "";
+        errdefer if (chunker_json.len > 0) alloc.free(@constCast(chunker_json));
+
+        const include_default_full_text = entry.full_text_index or
+            try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, entry.chunker_json);
+        const text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, entry.name, include_default_full_text);
+        errdefer {
+            for (text_indexes) |index_name| alloc.free(index_name);
+            alloc.free(text_indexes);
+        }
+
+        var dense = std.ArrayListUnmanaged(DocumentExtractionEmbeddingView).empty;
+        errdefer {
+            for (dense.items) |*embedding| embedding.deinit(alloc);
+            dense.deinit(alloc);
+        }
+        var sparse = std.ArrayListUnmanaged(DocumentExtractionEmbeddingView).empty;
+        errdefer {
+            for (sparse.items) |*embedding| embedding.deinit(alloc);
+            sparse.deinit(alloc);
+        }
+        try buildDocumentExtractionEmbeddingViews(alloc, db, entry.name, &dense, &sparse);
+
+        try chunks.append(alloc, .{
+            .name = name,
+            .source_field = source_field,
+            .chunker_json = chunker_json,
+            .chunk_size = entry.chunk_size,
+            .chunk_overlap = entry.chunk_overlap,
+            .text_indexes = text_indexes,
+            .dense_embeddings = try dense.toOwnedSlice(alloc),
+            .sparse_embeddings = try sparse.toOwnedSlice(alloc),
+        });
+    }
+    return .{ .chunks = try chunks.toOwnedSlice(alloc) };
+}
+
 fn computeDocumentExtractionAssetRequestDerived(
     alloc: Allocator,
     db: anytype,
+    view: *const DocumentExtractionCatalogView,
     doc_value: []const u8,
     source_url: []const u8,
     request: enrichment_types.GeneratedEnrichmentRequest,
@@ -53803,7 +53991,7 @@ fn computeDocumentExtractionAssetRequestDerived(
         error.OutOfMemory => if (extraction_budgeted != null and extraction_budgeted.?.denied()) return enrichment_runtime_mod.documentExtractionBudgetDenialError(&extraction_budgeted.?) else return err,
         else => {
             if (!document_extraction_mod.remoteContentErrorIsPermanent(err)) return err;
-            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(err), "remote content download failed", "remote_content_download", artifact_writes);
+            try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(err), "remote content download failed", "remote_content_download", artifact_writes);
             return;
         },
     };
@@ -53814,7 +54002,7 @@ fn computeDocumentExtractionAssetRequestDerived(
                 return error.RemoteDocumentFetchFailed;
             const message = try std.fmt.allocPrint(alloc, "{s}: HTTP {d}", .{ http_error.message, http_error.status });
             defer alloc.free(message);
-            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, "RemoteDocumentFetchFailed", message, "remote_content_http", artifact_writes);
+            try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, "RemoteDocumentFetchFailed", message, "remote_content_http", artifact_writes);
             return;
         },
     };
@@ -53848,7 +54036,7 @@ fn computeDocumentExtractionAssetRequestDerived(
             return err,
         else => {
             const exact_error_name = boundaryFailureErrorName(&extraction_failure, err);
-            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, exact_error_name, "document extraction failed", document_extraction_mod.failureStageFromErrorName(exact_error_name, "document_extraction"), artifact_writes);
+            try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, exact_error_name, "document extraction failed", document_extraction_mod.failureStageFromErrorName(exact_error_name, "document_extraction"), artifact_writes);
             return;
         },
     };
@@ -53895,7 +54083,7 @@ fn computeDocumentExtractionAssetRequestDerived(
         desired_chunk_keys.deinit(alloc);
     }
 
-    try collectDocumentExtractionDesiredKeys(alloc, db, request.doc_key, artifact_name, extraction.units, &desired_unit_keys, &desired_unit_fingerprints, &desired_chunk_keys);
+    try collectDocumentExtractionDesiredKeys(alloc, view, request.doc_key, artifact_name, extraction.units, &desired_unit_keys, &desired_unit_fingerprints, &desired_chunk_keys);
 
     const desired_unit_descriptors = try documentExtractionUnitDescriptorsFromKeysAlloc(alloc, desired_unit_keys.items, desired_unit_fingerprints.items);
     defer alloc.free(desired_unit_descriptors);
@@ -53941,7 +54129,7 @@ fn computeDocumentExtractionAssetRequestDerived(
             }
         }
 
-        previous_state = try loadDocumentExtractionPreviousState(alloc, db, request.doc_key, artifact_name, state);
+        previous_state = try loadDocumentExtractionPreviousState(alloc, db, view, request.doc_key, artifact_name, state);
         for (previous_state.unit_keys) |previous_key| {
             if (containsDeleteKey(desired_unit_keys.items, previous_key)) continue;
             try artifact_delete_keys.append(alloc, try alloc.dupe(u8, previous_key));
@@ -54018,7 +54206,7 @@ fn computeDocumentExtractionAssetRequestDerived(
         const unit_unchanged = std.mem.eql(u8, unit_descriptor.key, unit_key) and
             unitDescriptorFingerprintMatches(previous_state.unit_descriptors, unit_key, unit_descriptor.fingerprint);
         if (unit_unchanged and
-            try documentUnitCanSkipLocalWrites(alloc, db, request.doc_key, artifact_name, unit_key, unit_descriptor.fingerprint, unit, desired_chunk_keys.items, chunk_range_base_index, previous_child_ranges))
+            try documentUnitCanSkipLocalWrites(alloc, db, view, request.doc_key, artifact_name, unit_key, unit_descriptor.fingerprint, unit, desired_chunk_keys.items, chunk_range_base_index, previous_child_ranges))
         {
             if (force_reprocess) {
                 const payload = try documentUnitPayloadAlloc(alloc, request.doc_key, artifact_name, unit, unit_descriptor.fingerprint, source_url, extraction.content_type, unit_route);
@@ -54046,9 +54234,9 @@ fn computeDocumentExtractionAssetRequestDerived(
                         .targets = targets,
                     });
                 }
-                try appendDocumentUnitStoredChunkFullTextDocuments(alloc, db, request.doc_key, artifact_name, unit, documents);
+                try appendDocumentUnitStoredChunkFullTextDocuments(alloc, view, request.doc_key, unit, documents);
             } else {
-                try appendDocumentUnitStoredFullTextDocuments(alloc, db, request.doc_key, artifact_name, unit_key, unit, text_indexes, documents);
+                try appendDocumentUnitStoredFullTextDocuments(alloc, view, request.doc_key, unit_key, unit, text_indexes, documents);
             }
             continue;
         }
@@ -54078,7 +54266,7 @@ fn computeDocumentExtractionAssetRequestDerived(
             });
         }
 
-        try appendDocumentUnitChunkWrites(alloc, db, request.doc_key, artifact_name, unit_key, unit_descriptor.fingerprint, unit, desired_chunk_keys.items, chunk_range_base_index, previous_child_ranges, artifact_writes, documents, dense_embeddings, sparse_embeddings);
+        try appendDocumentUnitChunkWrites(alloc, db, view, request.doc_key, artifact_name, unit_key, unit_descriptor.fingerprint, unit, desired_chunk_keys.items, chunk_range_base_index, previous_child_ranges, artifact_writes, documents, dense_embeddings, sparse_embeddings);
     }
 
     const manifest = try documentExtractionManifestPayloadAlloc(
@@ -54643,6 +54831,7 @@ fn documentGeneratedTextPartsJsonAlloc(
 fn appendDocumentExtractionDeleteKeys(
     alloc: Allocator,
     db: anytype,
+    view: *const DocumentExtractionCatalogView,
     doc_key: []const u8,
     artifact_name: []const u8,
     manifest_key: []const u8,
@@ -54657,7 +54846,7 @@ fn appendDocumentExtractionDeleteKeys(
     };
     defer if (existing_state) |value| alloc.free(value);
     if (existing_state != null) {
-        var previous_state = try loadDocumentExtractionPreviousState(alloc, db, doc_key, artifact_name, existing_state);
+        var previous_state = try loadDocumentExtractionPreviousState(alloc, db, view, doc_key, artifact_name, existing_state);
         defer previous_state.deinit(alloc);
         for (previous_state.unit_keys) |previous_key| {
             try artifact_delete_keys.append(alloc, try alloc.dupe(u8, previous_key));
@@ -54682,7 +54871,7 @@ fn appendDocumentExtractionDeleteKeys(
 
 fn collectDocumentExtractionDesiredKeys(
     alloc: Allocator,
-    db: anytype,
+    view: *const DocumentExtractionCatalogView,
     doc_key: []const u8,
     artifact_name: []const u8,
     units: []const document_extraction_mod.Unit,
@@ -54693,9 +54882,7 @@ fn collectDocumentExtractionDesiredKeys(
     for (units) |unit| {
         try desired_unit_keys.append(alloc, try internal_keys.documentUnitArtifactKeyAlloc(alloc, doc_key, artifact_name, unit.unit_id));
         try desired_unit_fingerprints.append(alloc, try documentExtractionUnitFingerprintAlloc(alloc, unit));
-        for (db.core.index_manager.enrichments.items) |entry| {
-            if (entry.kind != .chunk) continue;
-            if (!std.mem.eql(u8, entry.source_artifact_name, artifact_name)) continue;
+        for (view.chunks) |entry| {
             const chunks = if (entry.chunker_json.len > 0)
                 try chunker_mod.chunkTextWithConfigJson(alloc, unit.text, entry.chunker_json)
             else
@@ -54737,6 +54924,7 @@ const DocumentExtractionRangeRoute = struct {
 fn loadDocumentExtractionPreviousState(
     alloc: Allocator,
     db: anytype,
+    view: *const DocumentExtractionCatalogView,
     doc_key: []const u8,
     artifact_name: []const u8,
     existing_state: ?[]const u8,
@@ -54749,7 +54937,7 @@ fn loadDocumentExtractionPreviousState(
             else => {},
         }
     }
-    var recovered = try scanDocumentExtractionPreviousStateFromStore(alloc, db, doc_key, artifact_name);
+    var recovered = try scanDocumentExtractionPreviousStateFromStore(alloc, db, view, doc_key, artifact_name);
     recovered.recovered_from_store_scan = existing_state != null;
     return recovered;
 }
@@ -54767,6 +54955,7 @@ fn loadDocumentExtractionPreviousStateFromJson(alloc: Allocator, state: []const 
 fn scanDocumentExtractionPreviousStateFromStore(
     alloc: Allocator,
     db: anytype,
+    view: *const DocumentExtractionCatalogView,
     doc_key: []const u8,
     artifact_name: []const u8,
 ) !DocumentExtractionPreviousState {
@@ -54793,9 +54982,7 @@ fn scanDocumentExtractionPreviousStateFromStore(
         for (chunk_keys.items) |key| alloc.free(@constCast(key));
         chunk_keys.deinit(alloc);
     }
-    for (db.core.index_manager.enrichments.items) |entry| {
-        if (entry.kind != .chunk) continue;
-        if (!std.mem.eql(u8, entry.source_artifact_name, artifact_name)) continue;
+    for (view.chunks) |entry| {
         const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "chunk", entry.name);
         defer alloc.free(chunk_prefix);
         const chunk_rows = try db.core.store.scanPrefix(alloc, chunk_prefix);
@@ -54924,38 +55111,26 @@ fn fullTextTargetRefsAlloc(
 
 fn appendDocumentUnitStoredFullTextDocuments(
     alloc: Allocator,
-    db: anytype,
+    view: *const DocumentExtractionCatalogView,
     doc_key: []const u8,
-    source_artifact_name: []const u8,
     unit_key: []const u8,
     unit: document_extraction_mod.Unit,
     unit_text_indexes: []const []const u8,
     documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
 ) !void {
     try appendStoredFullTextDocument(alloc, documents, unit_key, unit_text_indexes);
-    try appendDocumentUnitStoredChunkFullTextDocuments(alloc, db, doc_key, source_artifact_name, unit, documents);
+    try appendDocumentUnitStoredChunkFullTextDocuments(alloc, view, doc_key, unit, documents);
 }
 
 fn appendDocumentUnitStoredChunkFullTextDocuments(
     alloc: Allocator,
-    db: anytype,
+    view: *const DocumentExtractionCatalogView,
     doc_key: []const u8,
-    source_artifact_name: []const u8,
     unit: document_extraction_mod.Unit,
     documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
 ) !void {
-    for (db.core.index_manager.enrichments.items) |entry| {
-        if (entry.kind != .chunk) continue;
-        if (!std.mem.eql(u8, entry.source_artifact_name, source_artifact_name)) continue;
-
-        const include_default_full_text = entry.full_text_index or
-            try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, entry.chunker_json);
-        const chunk_text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, entry.name, include_default_full_text);
-        defer {
-            for (chunk_text_indexes) |name| alloc.free(name);
-            alloc.free(chunk_text_indexes);
-        }
-        if (chunk_text_indexes.len == 0) continue;
+    for (view.chunks) |entry| {
+        if (entry.text_indexes.len == 0) continue;
 
         const chunks = if (entry.chunker_json.len > 0)
             try chunker_mod.chunkTextWithConfigJson(alloc, unit.text, entry.chunker_json)
@@ -54968,7 +55143,7 @@ fn appendDocumentUnitStoredChunkFullTextDocuments(
             if (!chunk.isText()) continue;
             const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id));
             defer alloc.free(chunk_key);
-            try appendStoredFullTextDocument(alloc, documents, chunk_key, chunk_text_indexes);
+            try appendStoredFullTextDocument(alloc, documents, chunk_key, entry.text_indexes);
         }
     }
 }
@@ -54990,6 +55165,7 @@ fn storeKeyExists(alloc: Allocator, db: anytype, key: []const u8) !bool {
 fn documentUnitCanSkipLocalWrites(
     alloc: Allocator,
     db: anytype,
+    view: *const DocumentExtractionCatalogView,
     doc_key: []const u8,
     source_artifact_name: []const u8,
     unit_key: []const u8,
@@ -55001,10 +55177,7 @@ fn documentUnitCanSkipLocalWrites(
 ) !bool {
     if (!(try storeKeyExists(alloc, db, unit_key))) return false;
 
-    for (db.core.index_manager.enrichments.items) |entry| {
-        if (entry.kind != .chunk) continue;
-        if (!std.mem.eql(u8, entry.source_artifact_name, source_artifact_name)) continue;
-
+    for (view.chunks) |entry| {
         const chunks = if (entry.chunker_json.len > 0)
             try chunker_mod.chunkTextWithConfigJson(alloc, unit.text, entry.chunker_json)
         else
@@ -55029,7 +55202,7 @@ fn documentUnitCanSkipLocalWrites(
             const chunk_route = documentExtractionRangeRoute(previous_child_ranges, chunk_range_id, "chunk", "derived_chunks");
             const expected = try buildDocumentUnitChunkPayloadAlloc(scratch, doc_key, unit_key, unit_fingerprint, entry.name, source_artifact_name, entry.source_field, unit, chunk, true, chunk_route);
             if (!std.mem.eql(u8, stored, expected)) return false;
-            if (!(try documentUnitChunkEmbeddingArtifactsPresent(alloc, db, chunk_key, entry.name))) return false;
+            if (!(try documentUnitChunkEmbeddingArtifactsPresent(alloc, db, &entry, chunk_key))) return false;
         }
     }
     return true;
@@ -55038,30 +55211,18 @@ fn documentUnitCanSkipLocalWrites(
 fn documentUnitChunkEmbeddingArtifactsPresent(
     alloc: Allocator,
     db: anytype,
+    chunk_view: *const DocumentExtractionChunkView,
     chunk_key: []const u8,
-    chunk_artifact_name: []const u8,
 ) !bool {
     const runtime = db.enrichment_runtime;
-    for (db.core.index_manager.enrichments.items) |entry| {
-        if (entry.kind != .embedding) continue;
-        if (!std.mem.eql(u8, entry.source_artifact_name, chunk_artifact_name)) continue;
-
-        if (entry.expected_dims > 0) {
-            const consumer_indexes = try db.core.index_manager.denseIndexesForEmbedding(alloc, entry.name, entry.expected_dims);
-            defer {
-                for (consumer_indexes) |name| alloc.free(name);
-                alloc.free(consumer_indexes);
-            }
-            if (consumer_indexes.len == 0 or runtime == null or runtime.?.config.dense_embedder == null) continue;
-        } else {
-            const consumer_indexes = try db.core.index_manager.sparseIndexesForEmbedding(alloc, entry.name);
-            defer {
-                for (consumer_indexes) |name| alloc.free(name);
-                alloc.free(consumer_indexes);
-            }
-            if (consumer_indexes.len == 0 or runtime == null or runtime.?.config.sparse_embedder == null) continue;
-        }
-
+    for (chunk_view.dense_embeddings) |entry| {
+        if (entry.consumer_indexes.len == 0 or runtime == null or runtime.?.config.dense_embedder == null) continue;
+        const artifact_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, entry.name);
+        defer alloc.free(artifact_key);
+        if (!(try storeKeyExists(alloc, db, artifact_key))) return false;
+    }
+    for (chunk_view.sparse_embeddings) |entry| {
+        if (entry.consumer_indexes.len == 0 or runtime == null or runtime.?.config.sparse_embedder == null) continue;
         const artifact_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, entry.name);
         defer alloc.free(artifact_key);
         if (!(try storeKeyExists(alloc, db, artifact_key))) return false;
@@ -55115,25 +55276,37 @@ const PendingDocumentUnitSparseChunkEmbedding = struct {
     }
 };
 
+fn dupeConsumerIndexNames(alloc: Allocator, names: []const []const u8) ![][]u8 {
+    const out = try alloc.alloc([]u8, names.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |name| alloc.free(name);
+        alloc.free(out);
+    }
+    for (names, 0..) |name, i| {
+        out[i] = try alloc.dupe(u8, name);
+        initialized += 1;
+    }
+    return out;
+}
+
 fn collectPendingDocumentUnitDenseChunkEmbeddings(
     alloc: Allocator,
     db: anytype,
-    chunk_artifact_name: []const u8,
+    chunk_view: *const DocumentExtractionChunkView,
     out: *std.ArrayListUnmanaged(PendingDocumentUnitDenseChunkEmbedding),
 ) !void {
     const runtime = db.enrichment_runtime orelse return;
-    const dense_embedder = runtime.config.dense_embedder;
-    if (dense_embedder == null) return;
-    for (db.core.index_manager.enrichments.items) |embed_entry| {
-        if (embed_entry.kind != .embedding) continue;
-        if (!std.mem.eql(u8, embed_entry.source_artifact_name, chunk_artifact_name)) continue;
-        if (embed_entry.expected_dims == 0) continue;
-
-        const consumer_indexes = try db.core.index_manager.denseIndexesForEmbedding(alloc, embed_entry.name, embed_entry.expected_dims);
-        if (consumer_indexes.len == 0) {
-            alloc.free(consumer_indexes);
-            continue;
-        }
+    if (runtime.config.dense_embedder == null) return;
+    for (chunk_view.dense_embeddings) |embed_entry| {
+        if (embed_entry.consumer_indexes.len == 0) continue;
+        // `embedding_name`/`source_field`/`producer_json` borrow from
+        // `chunk_view`, which outlives this pending struct (both live only
+        // within one computeDocumentExtractionAssetRequestDerived call);
+        // `consumer_indexes` is duplicated because PendingDocumentUnit*
+        // ChunkEmbedding.deinit frees it, and it must not free memory the
+        // view's own deinit also owns.
+        const consumer_indexes = try dupeConsumerIndexNames(alloc, embed_entry.consumer_indexes);
         try out.append(alloc, .{
             .embedding_name = embed_entry.name,
             .source_field = embed_entry.source_field,
@@ -55147,22 +55320,14 @@ fn collectPendingDocumentUnitDenseChunkEmbeddings(
 fn collectPendingDocumentUnitSparseChunkEmbeddings(
     alloc: Allocator,
     db: anytype,
-    chunk_artifact_name: []const u8,
+    chunk_view: *const DocumentExtractionChunkView,
     out: *std.ArrayListUnmanaged(PendingDocumentUnitSparseChunkEmbedding),
 ) !void {
     const runtime = db.enrichment_runtime orelse return;
-    const sparse_embedder = runtime.config.sparse_embedder;
-    if (sparse_embedder == null) return;
-    for (db.core.index_manager.enrichments.items) |embed_entry| {
-        if (embed_entry.kind != .embedding) continue;
-        if (!std.mem.eql(u8, embed_entry.source_artifact_name, chunk_artifact_name)) continue;
-        if (embed_entry.expected_dims != 0) continue;
-
-        const consumer_indexes = try db.core.index_manager.sparseIndexesForEmbedding(alloc, embed_entry.name);
-        if (consumer_indexes.len == 0) {
-            alloc.free(consumer_indexes);
-            continue;
-        }
+    if (runtime.config.sparse_embedder == null) return;
+    for (chunk_view.sparse_embeddings) |embed_entry| {
+        if (embed_entry.consumer_indexes.len == 0) continue;
+        const consumer_indexes = try dupeConsumerIndexNames(alloc, embed_entry.consumer_indexes);
         try out.append(alloc, .{
             .embedding_name = embed_entry.name,
             .producer_json = embed_entry.producer_json,
@@ -55295,6 +55460,7 @@ fn flushPendingSparseChunkEmbedding(
 fn appendDocumentUnitChunkWrites(
     alloc: Allocator,
     db: anytype,
+    view: *const DocumentExtractionCatalogView,
     doc_key: []const u8,
     source_artifact_name: []const u8,
     unit_key: []const u8,
@@ -55308,9 +55474,7 @@ fn appendDocumentUnitChunkWrites(
     dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
     sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
 ) !void {
-    for (db.core.index_manager.enrichments.items) |entry| {
-        if (entry.kind != .chunk) continue;
-        if (!std.mem.eql(u8, entry.source_artifact_name, source_artifact_name)) continue;
+    for (view.chunks) |entry| {
         const chunks = if (entry.chunker_json.len > 0)
             try chunker_mod.chunkTextWithConfigJson(alloc, unit.text, entry.chunker_json)
         else
@@ -55319,13 +55483,7 @@ fn appendDocumentUnitChunkWrites(
         if (chunks.len == 0) continue;
         document_extraction_mod.applyTranscriptTiming(unit, chunks);
 
-        const include_default_full_text = entry.full_text_index or
-            try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, entry.chunker_json);
-        const text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, entry.name, include_default_full_text);
-        defer {
-            for (text_indexes) |name| alloc.free(name);
-            alloc.free(text_indexes);
-        }
+        const text_indexes = entry.text_indexes;
 
         // Resolve, once per chunk-producing entry rather than once per chunk,
         // which embedding enrichments consume these chunks. The per-chunk
@@ -55337,13 +55495,13 @@ fn appendDocumentUnitChunkWrites(
             for (dense_pending.items) |*pending| pending.deinit(alloc);
             dense_pending.deinit(alloc);
         }
-        try collectPendingDocumentUnitDenseChunkEmbeddings(alloc, db, entry.name, &dense_pending);
+        try collectPendingDocumentUnitDenseChunkEmbeddings(alloc, db, &entry, &dense_pending);
         var sparse_pending = std.ArrayListUnmanaged(PendingDocumentUnitSparseChunkEmbedding).empty;
         defer {
             for (sparse_pending.items) |*pending| pending.deinit(alloc);
             sparse_pending.deinit(alloc);
         }
-        try collectPendingDocumentUnitSparseChunkEmbeddings(alloc, db, entry.name, &sparse_pending);
+        try collectPendingDocumentUnitSparseChunkEmbeddings(alloc, db, &entry, &sparse_pending);
         const runtime = db.enrichment_runtime;
         const dense_embedder = if (runtime) |rt| rt.config.dense_embedder else null;
         const sparse_embedder = if (runtime) |rt| rt.config.sparse_embedder else null;
@@ -56665,6 +56823,7 @@ fn documentExtractionFailureManifestPayloadAlloc(
 fn appendDocumentExtractionFailureManifest(
     alloc: Allocator,
     db: anytype,
+    view: *const DocumentExtractionCatalogView,
     doc_key: []const u8,
     artifact_name: []const u8,
     source_url: []const u8,
@@ -56681,7 +56840,7 @@ fn appendDocumentExtractionFailureManifest(
     var previous_state = DocumentExtractionPreviousState{};
     defer previous_state.deinit(alloc);
     if (existing_state != null) {
-        previous_state = try loadDocumentExtractionPreviousState(alloc, db, doc_key, artifact_name, existing_state);
+        previous_state = try loadDocumentExtractionPreviousState(alloc, db, view, doc_key, artifact_name, existing_state);
     }
 
     const manifest = try documentExtractionFailureManifestPayloadAlloc(
@@ -105947,19 +106106,6 @@ test "db document extraction pre-lock precompute survives a concurrent catalog m
         .kind = .dense_vector,
         .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}",
     });
-    // An enrichment doc:a's own write never touches. Deleting it still
-    // replaces the whole catalog generation -- including the dense/sparse
-    // field-write-plan and generated-enrichment template arrays thread_a's
-    // pre-lock precompute already read -- so this exercises a catalog
-    // publish racing precompute that has moved on past its catalog reads,
-    // not whether the delete is itself relevant to doc:a.
-    try db.addEnrichment(.{
-        .name = "unrelated_summary_v1",
-        .kind = .asset,
-        .field = "summary",
-        .content_type = "text/plain",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
-    });
 
     var hook = PortableRuntimeBatchPrelockTestHook{};
     test_portable_runtime_batch_prelock_hook = &hook;
@@ -105998,28 +106144,48 @@ test "db document extraction pre-lock precompute survives a concurrent catalog m
     }
     try std.testing.expect(hook.entered.load(.acquire));
 
-    // Delete an unrelated enrichment while thread_a is parked. This is the
-    // exact window #957's review blocker identified: a catalog publish can
-    // replace or free IndexManager's live dense/sparse/graph/enrichment
-    // arrays while pre-lock preparation holds data derived from them.
-    // thread_a's PrecomputedGeneratedBatch and the write-plan snapshot it
-    // was built from must be fully owned (or re-validated by generation),
-    // never a borrowed pointer into what this delete can free -- whether
-    // thread_a goes on to retry against the new catalog or commit, this
-    // must not read or free memory `deleteEnrichment` already freed, which
-    // the testing allocator below would catch as corruption or a double
-    // free.
+    // Replace the CHUNK enrichment doc:a's own pre-lock extraction actually
+    // used -- with a different chunk_size -- while thread_a is parked just
+    // before the apply lock. By this point thread_a's
+    // DocumentExtractionCatalogView (built once, under
+    // catalog_mutex.lockShared(), in computeAssetRequestDerived) has
+    // already been fully read -- its chunk/embedding derivation runs
+    // entirely pre-lock, before this hook -- so this exercises the same
+    // class of bug the review blocker identified: upsertEnrichment frees
+    // the live "document_chunks_v1" entry's strings (chunker_json,
+    // source_field, ...) and replaces them in place; thread_a's view, and
+    // everything it derived from "document_chunks_v1" and
+    // "document_chunk_dense_v1" (which consumes it), must be fully owned,
+    // not a borrowed pointer into what this upsert frees. Deleting the
+    // chunk enrichment outright is rejected with error.EnrichmentInUse
+    // while the embedding still names it as source_artifact_name, so this
+    // uses the allowed in-place replace instead. A catalog publish bumps
+    // the write-plan generation thread_a pinned, so this also forces the
+    // existing PreparedGenerationChanged retry path to run against the
+    // replaced catalog entry.
     test_portable_runtime_batch_prelock_hook = null;
-    try std.testing.expect(try db.deleteEnrichment(.asset, "unrelated_summary_v1"));
+    _ = try db.upsertEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 4,
+    });
 
     hook.release.store(true, .release);
     thread_a.join();
     joined_a = true;
     try std.testing.expectEqual(@as(?anyerror, null), writer_a.err);
 
-    // doc:a's own enrichment chain is untouched by the deletion above: its
-    // chunk and embedding artifacts must exist, whether thread_a's result
-    // came from its pre-lock precompute or a generation-changed retry.
+    // Whether this landed from thread_a's own pre-lock result (if its
+    // pinned generation happened to still match) or a generation-changed
+    // retry against the replaced chunk_size, the testing allocator above
+    // would already have caught any read of, or double free of, memory the
+    // upsert's replace freed. Every surviving chunk still gets its
+    // "document_chunk_dense_v1" embedding artifact -- the replace never
+    // touched that enrichment, so this is the same convergence check as
+    // the "concurrent same-key writes" test above, just with a catalog
+    // replace as the interference instead of another write.
     const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "document_chunks_v1");
     defer alloc.free(chunk_prefix);
     const chunk_entries = try db.core.store.scanPrefix(alloc, chunk_prefix);
@@ -106031,10 +106197,7 @@ test "db document extraction pre-lock precompute survives a concurrent catalog m
         chunk_count += 1;
         const dense_artifact_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, entry.key, "document_chunk_dense_v1");
         defer alloc.free(dense_artifact_key);
-        const dense_artifact_payload = db.core.store.get(alloc, dense_artifact_key) catch |err| switch (err) {
-            error.NotFound => continue,
-            else => return err,
-        };
+        const dense_artifact_payload = try db.core.store.get(alloc, dense_artifact_key);
         alloc.free(dense_artifact_payload);
         dense_artifact_count += 1;
     }
