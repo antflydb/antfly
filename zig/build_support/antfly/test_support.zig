@@ -64,6 +64,9 @@ pub const Imports = struct {
         var imports = self.runtime;
         imports.boundary_profile = .owner;
         imports.configureApi(module, true);
+        // Callback option contracts include vector backend types even when
+        // the test consumer delegates physical execution to provider archives.
+        module.addImport("antfly_vectorindex", imports.vectorindex);
         module.addImport("vopr", self.vopr);
         imports.storage_boundary.configureProfile(module, true, true, .owner);
         @import("../../pkg/antfly-embedded/build/snowball.zig").addSnowballModule(b, module);

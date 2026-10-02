@@ -43,6 +43,7 @@ pub fn build(b: *std.Build) void {
     });
     shared.antfly_imports.configureEmbedded(b, lite_module, shared.link_libc);
     lite_module.addImport("antfly-client", embedded.antfly_client_pkg_mod);
+    lite_module.addImport("antfly_inference_host", shared.antfly_imports.inference_host);
     lite_module.linkLibrary(embedded.native_inference);
     lite_module.linkLibrary(embedded.native_enrichment);
     shared.build_info.link(lite_module);

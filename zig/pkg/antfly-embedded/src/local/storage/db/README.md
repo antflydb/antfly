@@ -58,10 +58,10 @@ surface where that is meaningfully different.
   Background maintenance workers that are not index-specific.
   - `ttl_runtime.zig`: TTL cleanup that reclaims expired documents through normal DB delete semantics, optionally under shared lease ownership.
   - `transaction_runtime.zig`: coordinator-side transaction recovery that retries unresolved participants through a notifier callback and only allows finalized metadata cleanup once participants are resolved.
-- [BATCH.md](../../../../../BATCH.md)
+- [BATCH.md](../../../../../../BATCH.md)
   Batch coalescing semantics, bulk ingest scope, and dense HBC replay-window
   policy.
-- [FULL_TEXT.md](../../../../../FULL_TEXT.md)
+- [FULL_TEXT.md](../../../../../../FULL_TEXT.md)
   Full-text visibility and merge-maintenance policy. Scheduled merges are
   background maintenance; force-compaction is a separate explicit path.
 

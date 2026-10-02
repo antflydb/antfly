@@ -45,7 +45,8 @@ under its storage profile and keeps its own private adapters.
 
 The independent CLI supports file-oriented Lite commands. The server command
 wrapper supplies the `lite serve` callback; its behavior remains available through
-the server product. Public executable names and release packaging are unchanged
+the server product. The independent executable retains the hidden inference worker
+entry point for process isolation. Public executable names and release packaging are unchanged
 by this refactor.
 
 The staged-build check removes the entire server package before compiling the

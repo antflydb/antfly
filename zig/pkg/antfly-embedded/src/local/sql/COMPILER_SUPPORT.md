@@ -217,7 +217,7 @@ create a linear-depth binding/evaluation stack.
 Run compiler tests from `zig/`:
 
 ```sh
-zig test --dep sql_parser -Mroot=pkg/antfly/src/sql/compiler.zig -Msql_parser=lib/sql/root.zig
+zig build root-test -Dmetal=false -- --test-filter 'sql.compiler.' --allow-empty-test-filter
 zig test lib/sql/root.zig
 ```
 
@@ -245,5 +245,8 @@ memory, bounded token admission and nested shape binding with inferred versus
 explicit parameter types, not SQL execution or storage throughput:
 
 ```sh
-zig run -O ReleaseSafe --dep sql_parser -Mroot=pkg/antfly/src/sql_bench.zig -Msql_parser=lib/sql/root.zig
+zig run -O ReleaseSafe --dep sql_parser --dep antfly_local_sources \
+  -Mroot=pkg/antfly/src/sql_bench.zig --dep sql_parser \
+  -Mantfly_local_sources=pkg/antfly-embedded/src/local/source_catalog.zig \
+  -Msql_parser=lib/sql/root.zig
 ```

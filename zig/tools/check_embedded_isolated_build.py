@@ -87,7 +87,22 @@ def smoke_lite(stage: Path) -> None:
     if document.get("_source") != {"title": "embedded"}:
         raise RuntimeError(f"Lite backup/restore lost the document: {document}")
     run("check", restored)
-    print("Server-free Lite init/batch/backup/restore/lookup/check passed", flush=True)
+    worker = subprocess.run(
+        [str(executable), "inference", "_worker"],
+        cwd=stage,
+        input="",
+        text=True,
+        capture_output=True,
+        timeout=15,
+    )
+    if worker.returncode:
+        raise RuntimeError(
+            f"Lite inference worker failed to shut down on EOF: {worker.stderr}"
+        )
+    print(
+        "Server-free Lite init/batch/backup/restore/lookup/check and worker shutdown passed",
+        flush=True,
+    )
 
 
 def main() -> None:
