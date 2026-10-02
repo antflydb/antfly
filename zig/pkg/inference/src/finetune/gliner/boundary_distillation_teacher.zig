@@ -3,8 +3,9 @@
 
 //! A frozen GLiNER2.5 checkpoint as a feature-distillation teacher: the
 //! student's items are prepared with the teacher's own tokenizer and encoded
-//! with the serving DeBERTa kernels on the CPU, and the routed final states
-//! are handed to the trainer. Word splitting and schema markers do not depend
+//! with the serving DeBERTa kernels on the CPU (GEMMs on the job's `Io` thread
+//! pool when one is given), and the routed final states are handed to the
+//! trainer. Word splitting and schema markers do not depend
 //! on the tokenizer, so the teacher's routes align row for row with the
 //! student's; any difference is rejected rather than silently misaligned.
 const std = @import("std");
@@ -25,9 +26,12 @@ pub const SourceTeacher = struct {
 
     /// Borrows the verified source for the teacher's lifetime. The processor
     /// options must match the student's, so both split words identically.
-    pub fn init(self: *SourceTeacher, a: Allocator, source: *source_mod.Source, options: processor.Options, limits: engine.Limits) !void {
+    /// With an `io`, the encoder's GEMMs run on its thread pool; without one
+    /// they run on the calling thread (the sync pool is sequential on macOS).
+    pub fn init(self: *SourceTeacher, a: Allocator, source: *source_mod.Source, options: processor.Options, limits: engine.Limits, io: ?std.Io) !void {
         if (source.config.encoder.family != .deberta or source.config.neck != .none) return error.UnsupportedBoundaryDistillationTeacher;
-        self.* = .{ .source = source, .compute = native.NativeCompute.init(a, &source.store, null), .options = options, .limits = limits, .identity = undefined };
+        const compute = if (io) |value| native.NativeCompute.initWithIo(a, &source.store, null, value) else native.NativeCompute.init(a, &source.store, null);
+        self.* = .{ .source = source, .compute = compute, .options = options, .limits = limits, .identity = undefined };
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update("antfly.antenna.distillation-teacher.v1\x00");
         hash.update(std.mem.asBytes(&source.identity.weight));
