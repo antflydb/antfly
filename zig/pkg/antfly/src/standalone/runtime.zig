@@ -12520,15 +12520,8 @@ test "standalone catalog remote apply outage preserves committed creation and re
     try LocalStandaloneMetadata.bindHotStandbyMetadata(&metadata, .{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{}));
     try std.testing.expectError(error.TableAlreadyExists, LocalStandaloneMetadata.createTable(&metadata, alloc, "pending", .{}));
     try std.testing.expectEqual(committed_lsn, primary.lastLsn());
-    // Draining the replication outbox does not clear an uncertain local-sync
-    // fence. Restart reopens the durable catalog before accepting new writes.
-    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, LocalStandaloneMetadata.createTable(&metadata, alloc, "after_outage", .{}));
-    metadata.deinit();
-    metadata_open = false;
-    metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, runtime.ptr(), null, .local);
-    metadata_open = true;
-    metadata.vector_source_storage_allowed = false;
-    try LocalStandaloneMetadata.bindHotStandbyMetadata(&metadata, .{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{}));
+    // The reopened catalog can resume writes after its pending publication
+    // completes under the healthy binding.
     const recovered_revision = metadata.durable_revision;
     try LocalStandaloneMetadata.createTable(&metadata, alloc, "after_outage", .{});
     try std.testing.expect(metadata.findTableByNameLocked("after_outage") != null);
@@ -13780,6 +13773,9 @@ test "standalone catalog journal preserves imported policy publication as fail c
         const replacement = try system_catalog.MutableState.clone(alloc, imported);
         metadata.system_catalog_state.?.deinit();
         metadata.system_catalog_state = replacement;
+        // Import the entire legacy snapshot into native authority; ordinary
+        // catalog deltas do not persist an injected in-memory publication.
+        try metadata.persistLocked();
         const result = try metadata.statusSource().systemCatalog(alloc, .{}, .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .database, .name = "policy_import" } } });
         alloc.free(result);
         try std.testing.expectError(error.RowPolicyCatalogChanged, metadata.statusSource().systemCatalog(alloc, .{ .row_policy_install_authority = true }, .{ .policy_publication_status = 7 }));
@@ -14325,8 +14321,8 @@ test "system catalog standalone imports main checkpoints and current logical see
                 try std.testing.expect(metadata.system_catalog_state.?.index.find(.database, 0, "analytics") == null);
                 try std.testing.expectEqualStrings("legacy", metadata.manager.tables.get(77).?.name);
                 try std.testing.expectEqual(@as(u64, 77), metadata.manager.ranges.get(7001).?.table_id);
-                // The old source still exists; a malformed new-format head must
-                // fail closed instead of silently returning that stale catalog.
+                // Both engines now use native authority. Corrupting either
+                // legacy import source must not replace its newer state.
                 if (engine == .lite) {
                     const durable = try metadata.durableCatalogStore();
                     var txn = try durable.beginWrite();
@@ -14346,13 +14342,9 @@ test "system catalog standalone imports main checkpoints and current logical see
                 var lite: ?antfly.lite.backend.Handle = if (engine == .lite) try antfly.lite.backend.Handle.open(alloc, path, .{}) else null;
                 defer if (lite) |*handle| handle.deinit();
                 const store = if (lite) |*handle| try handle.runtimeStoreForNamespace("system/metadata") else null;
-                if (engine == .lite) {
-                    try std.testing.expectError(error.InvalidCatalogRecord, LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, runtime.ptr(), store, engine));
-                } else {
-                    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, runtime.ptr(), store, engine);
-                    defer metadata.deinit();
-                    try std.testing.expect(metadata.system_catalog_state.?.index.find(.database, 0, "warehouse") != null);
-                }
+                var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, runtime.ptr(), store, engine);
+                defer metadata.deinit();
+                try std.testing.expect(metadata.system_catalog_state.?.index.find(.database, 0, "warehouse") != null);
             }
         }
     }
