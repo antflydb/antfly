@@ -50,6 +50,7 @@ const CgroupVersion = enum { v1, v2 };
 const CgroupPaths = struct {
     v2: ?[]const u8 = null,
     v1_memory: ?[]const u8 = null,
+    v1_cpu: ?[]const u8 = null,
 };
 
 const CgroupMount = struct {
@@ -74,7 +75,112 @@ const CgroupMount = struct {
 const CgroupMounts = struct {
     v2: CgroupMount = .{},
     v1_memory: CgroupMount = .{},
+    v1_cpu: CgroupMount = .{},
 };
+
+pub const CpuCapacity = struct {
+    /// Preserve fractional CFS capacity independently of integer fan-out.
+    millicpus: u64 = 1000,
+    source: EnvelopeSource = .unavailable,
+
+    pub fn parallelism(self: CpuCapacity) usize {
+        return @intCast(@max(1, @min(self.millicpus / 1000, std.math.maxInt(usize))));
+    }
+};
+
+/// Affinity constrains CPU placement; cgroup quota constrains CPU time. Both
+/// apply, including ancestor limits visible inside the controller mount.
+pub fn cpuCapacity() CpuCapacity {
+    const affinity = std.Thread.getCpuCount() catch 1;
+    var capacity: CpuCapacity = .{ .millicpus = @as(u64, @intCast(affinity)) *| 1000, .source = .host };
+    if (builtin.os.tag != .linux) return capacity;
+    var buffer: [4096]u8 = undefined;
+    const bytes = readSmallLinuxFile("/proc/self/cgroup", &buffer) orelse return capacity;
+    const paths = parseCgroupPaths(bytes);
+    var quota = probeCgroupMounts(CpuCapacity, probeCpuMountInfoLine, paths);
+    // Retain a canonical fallback for environments without readable mountinfo.
+    if (quota == null) {
+        if (paths.v2) |path| quota = readCpuHierarchy("/sys/fs/cgroup", "/", path, .v2);
+        if (paths.v1_cpu) |path| {
+            if (readCpuHierarchy("/sys/fs/cgroup/cpu", "/", path, .v1)) |v1|
+                if (quota == null or v1.millicpus < quota.?.millicpus) {
+                    quota = v1;
+                };
+        }
+    }
+    if (quota) |limit| if (limit.millicpus < capacity.millicpus) {
+        capacity = limit;
+    };
+    return capacity;
+}
+
+fn quotaMillicpus(quota: []const u8, period: []const u8) ?u64 {
+    const numerator = std.fmt.parseUnsigned(u64, quota, 10) catch return null;
+    const denominator = std.fmt.parseUnsigned(u64, period, 10) catch return null;
+    if (numerator == 0 or denominator == 0) return null;
+    const value = @as(u128, numerator) * 1000 / denominator;
+    return @intCast(@max(1, @min(value, std.math.maxInt(u64))));
+}
+
+fn parseCpuMax(bytes: []const u8) ?u64 {
+    var fields = std.mem.tokenizeAny(u8, bytes, " \t\r\n");
+    const quota = fields.next() orelse return null;
+    const period = fields.next() orelse return null;
+    if (fields.next() != null) return null;
+    return quotaMillicpus(quota, period);
+}
+
+fn readCpuHierarchy(mount_point: []const u8, mount_root: []const u8, process_path: []const u8, version: CgroupVersion) ?CpuCapacity {
+    return readCpuHierarchyWithReader(mount_point, mount_root, process_path, version, readSmallLinuxFile);
+}
+
+fn readCpuHierarchyWithReader(mount_point: []const u8, mount_root: []const u8, process_path: []const u8, version: CgroupVersion, comptime readFile: fn ([]const u8, []u8) ?[]const u8) ?CpuCapacity {
+    const relative = cgroupPathRelativeToMount(process_path, mount_root) orelse return null;
+    var directory_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var directory = cgroupDirectoryPath(&directory_buffer, mount_point, relative) orelse return null;
+    const root_len = @max(@as(usize, 1), std.mem.trimEnd(u8, mount_point, "/").len);
+    var best: ?CpuCapacity = null;
+    var at_leaf = true;
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var quota_buffer: [128]u8 = undefined;
+    var period_buffer: [128]u8 = undefined;
+    while (directory.len >= root_len) {
+        const filename = if (version == .v2) "cpu.max" else "cpu.cfs_quota_us";
+        const path = std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ directory, filename }) catch break;
+        const raw = readFile(path, &quota_buffer);
+        // Namespace-relative paths may match several controller mounts.
+        // Only ancestors of a leaf present on this mount constrain us.
+        if (at_leaf and raw == null) return null;
+        at_leaf = false;
+        const limit = if (version == .v2)
+            if (raw) |value| parseCpuMax(value) else null
+        else v1: {
+            const period_path = std.fmt.bufPrint(&path_buffer, "{s}/cpu.cfs_period_us", .{directory}) catch break;
+            const period = readFile(period_path, &period_buffer) orelse break :v1 null;
+            break :v1 if (raw) |value| quotaMillicpus(std.mem.trim(u8, value, " \t\r\n"), std.mem.trim(u8, period, " \t\r\n")) else null;
+        };
+        if (limit) |value| if (best == null or value < best.?.millicpus) {
+            best = .{ .millicpus = value, .source = if (version == .v2) .cgroup_v2 else .cgroup_v1 };
+        };
+        if (directory.len == root_len) break;
+        const parent = std.fs.path.dirname(directory) orelse break;
+        directory = directory_buffer[0..parent.len];
+    }
+    return best;
+}
+
+fn probeCpuMountInfoLine(line: []const u8, paths: CgroupPaths, best: *?CpuCapacity) void {
+    var mounts = CgroupMounts{};
+    parseCgroupMountInfoLine(line, &mounts);
+    inline for (.{ .{ paths.v2, &mounts.v2, CgroupVersion.v2 }, .{ paths.v1_cpu, &mounts.v1_cpu, CgroupVersion.v1 } }) |controller| {
+        if (controller[0]) |path| if (controller[1].valid()) {
+            if (readCpuHierarchy(controller[1].mountPoint(), controller[1].root(), path, controller[2])) |limit|
+                if (best.* == null or limit.millicpus < best.*.?.millicpus) {
+                    best.* = limit;
+                };
+        };
+    }
+}
 
 /// Resolve the finite physical envelope visible to this process. Linux walks
 /// the process's actual cgroup leaf and every ancestor, including noncanonical
@@ -157,8 +263,9 @@ fn parseCgroupPaths(bytes: []const u8) CgroupPaths {
         if (!isSafeAbsoluteCgroupPath(path)) continue;
         if (std.mem.eql(u8, hierarchy, "0") and controllers.len == 0) {
             result.v2 = path;
-        } else if (controllerListContains(controllers, "memory")) {
-            result.v1_memory = path;
+        } else {
+            if (controllerListContains(controllers, "memory")) result.v1_memory = path;
+            if (controllerListContains(controllers, "cpu")) result.v1_cpu = path;
         }
     }
     return result;
@@ -231,14 +338,17 @@ fn parseCgroupMountInfoLine(line: []const u8, mounts: *CgroupMounts) void {
     const is_v2 = std.mem.eql(u8, filesystem_type, "cgroup2");
     const is_v1_memory = std.mem.eql(u8, filesystem_type, "cgroup") and
         controllerListContains(super_options, "memory");
-    if (!is_v2 and !is_v1_memory) return;
+    const is_v1_cpu = std.mem.eql(u8, filesystem_type, "cgroup") and
+        controllerListContains(super_options, "cpu");
+    if (!is_v2 and !is_v1_memory and !is_v1_cpu) return;
 
-    const mount = if (is_v2) &mounts.v2 else &mounts.v1_memory;
+    const mount = if (is_v2) &mounts.v2 else if (is_v1_memory) &mounts.v1_memory else &mounts.v1_cpu;
     mount.root_len = decodeMountInfoPath(&mount.root_storage, encoded_root) orelse return;
     mount.mount_point_len = decodeMountInfoPath(
         &mount.mount_point_storage,
         encoded_mount_point,
     ) orelse return;
+    if (is_v1_cpu and is_v1_memory) mounts.v1_cpu = mount.*;
 }
 
 fn cgroupPathRelativeToMount(process_path: []const u8, mount_root: []const u8) ?[]const u8 {
@@ -334,6 +444,10 @@ fn probeCgroupMountInfoLine(line: []const u8, paths: CgroupPaths, best: *?Envelo
 }
 
 fn probeCgroupMountLimits(paths: CgroupPaths) ?Envelope {
+    return probeCgroupMounts(Envelope, probeCgroupMountInfoLine, paths);
+}
+
+fn probeCgroupMounts(comptime T: type, comptime visit: fn ([]const u8, CgroupPaths, *?T) void, paths: CgroupPaths) ?T {
     if (builtin.os.tag != .linux) return null;
     const fd = std.posix.openat(
         std.posix.AT.FDCWD,
@@ -343,7 +457,7 @@ fn probeCgroupMountLimits(paths: CgroupPaths) ?Envelope {
     ) catch return null;
     defer _ = std.posix.system.close(fd);
 
-    var best: ?Envelope = null;
+    var best: ?T = null;
     var read_buffer: [4096]u8 = undefined;
     var line_buffer: [8192]u8 = undefined;
     var line_len: usize = 0;
@@ -354,7 +468,7 @@ fn probeCgroupMountLimits(paths: CgroupPaths) ?Envelope {
         for (read_buffer[0..count]) |byte| {
             if (byte == '\n') {
                 if (!discard_line and line_len != 0)
-                    probeCgroupMountInfoLine(line_buffer[0..line_len], paths, &best);
+                    visit(line_buffer[0..line_len], paths, &best);
                 line_len = 0;
                 discard_line = false;
             } else if (!discard_line) {
@@ -369,7 +483,7 @@ fn probeCgroupMountLimits(paths: CgroupPaths) ?Envelope {
         }
     }
     if (!discard_line and line_len != 0)
-        probeCgroupMountInfoLine(line_buffer[0..line_len], paths, &best);
+        visit(line_buffer[0..line_len], paths, &best);
     return best;
 }
 
@@ -684,4 +798,47 @@ test "cgroup mountinfo resolves roots and escaped paths" {
         "/",
         cgroupPathRelativeToMount("/", mounts.v2.root()).?,
     );
+}
+
+test "CPU capacity preserves fractional quotas and checks visible ancestors" {
+    const paths = parseCgroupPaths("7:cpu,cpuacct:/tenant/worker\n");
+    try std.testing.expectEqualStrings("/tenant/worker", paths.v1_cpu.?);
+    var mounts = CgroupMounts{};
+    parseCgroupMountInfoLine("42 25 0:30 /tenant /cpu rw - cgroup cgroup rw,memory,cpu,cpuacct", &mounts);
+    try std.testing.expect(mounts.v1_cpu.valid());
+    try std.testing.expectEqualStrings("/tenant", mounts.v1_cpu.root());
+    try std.testing.expectEqualStrings("/cpu", mounts.v1_cpu.mountPoint());
+    try std.testing.expectEqual(@as(?u64, 500), parseCpuMax("50000 100000\n"));
+    try std.testing.expectEqual(@as(?u64, null), parseCpuMax("max 100000"));
+    try std.testing.expectEqual(@as(?u64, null), parseCpuMax("50000 0"));
+    try std.testing.expectEqual(@as(?u64, null), parseCpuMax("50000 100000 extra"));
+    try std.testing.expectEqual(@as(?u64, null), quotaMillicpus("-1", "100000"));
+    try std.testing.expectEqual(@as(usize, 1), (CpuCapacity{ .millicpus = 500 }).parallelism());
+    try std.testing.expectEqual(@as(usize, 2), (CpuCapacity{ .millicpus = 2500 }).parallelism());
+    const Fixture = struct {
+        fn read(path: []const u8, _: []u8) ?[]const u8 {
+            const files = .{
+                .{ "/cpu/tenant/child/cpu.max", "max 100000" },
+                .{ "/cpu/tenant/cpu.max", "50000 100000" },
+                .{ "/cpu/cpu.max", "200000 100000" },
+                .{ "/cpu/tenant/child/cpu.cfs_quota_us", "150000\n" },
+                .{ "/cpu/tenant/child/cpu.cfs_period_us", "100000\n" },
+                .{ "/cpu/tenant/cpu.cfs_quota_us", "25000\n" },
+                .{ "/cpu/tenant/cpu.cfs_period_us", "100000\n" },
+                .{ "/cpu/cpu.cfs_quota_us", "-1\n" },
+                .{ "/cpu/cpu.cfs_period_us", "100000\n" },
+            };
+            inline for (files) |file| if (std.mem.eql(u8, path, file[0])) return file[1];
+            return null;
+        }
+    };
+    const v2 = readCpuHierarchyWithReader("/cpu", "/subtree", "/subtree/tenant/child", .v2, Fixture.read).?;
+    try std.testing.expectEqual(@as(u64, 500), v2.millicpus);
+    try std.testing.expectEqual(EnvelopeSource.cgroup_v2, v2.source);
+    const v1 = readCpuHierarchyWithReader("/cpu", "/subtree", "/subtree/tenant/child", .v1, Fixture.read).?;
+    try std.testing.expectEqual(@as(u64, 250), v1.millicpus);
+    try std.testing.expectEqual(EnvelopeSource.cgroup_v1, v1.source);
+    try std.testing.expectEqual(@as(?CpuCapacity, null), readCpuHierarchyWithReader("/cpu", "/subtree", "/outside", .v2, Fixture.read));
+    // Exercise the host path too, so its platform-specific code is analyzed.
+    try std.testing.expect(cpuCapacity().parallelism() >= 1);
 }
