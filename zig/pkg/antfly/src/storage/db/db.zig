@@ -2300,6 +2300,7 @@ const LocalMutationExecution = struct {
     const batchInternalPrepared = DB.batchInternalPrepared;
     const batchInternalWithPreparationAllocator = DB.batchInternalWithPreparationAllocator;
     const captureTransformReadSnapshot = DB.captureTransformReadSnapshot;
+    const captureWriteKeyVersionSnapshot = DB.captureWriteKeyVersionSnapshot;
     const clearActiveIndexRepairsLocked = DB.clearActiveIndexRepairsLocked;
     const clearBulkIngestIdentityAllNewLocked = DB.clearBulkIngestIdentityAllNewLocked;
     const clearBulkIngestSeenDocKeysLocked = DB.clearBulkIngestSeenDocKeysLocked;
@@ -2358,7 +2359,7 @@ const LocalMutationExecution = struct {
         try self.executor.failIfUnhealthy();
     }
 
-    fn waitForSyncLevelWithCancellation(self: *@This(), sync_level: types.SyncLevel, _: u64, _: ManagedSyncTargets, _: types.CancellationToken) !void {
+    fn waitForSyncLevelWithCancellation(self: *@This(), sync_level: types.SyncLevel, _: u64, _: ManagedSyncTargets, _: types.CancellationToken, _: bool) !void {
         std.debug.assert(sync_level == .propose);
         try self.executor.failIfUnhealthy();
     }
@@ -15152,7 +15153,7 @@ pub const DB = struct {
     /// uses, so a real race forces the existing bounded retry rather than a
     /// silent stale reuse.
     fn captureWriteKeyVersionSnapshot(
-        self: *DB,
+        self: anytype,
         alloc: Allocator,
         writes: []const types.BatchWrite,
     ) !TransformReadSnapshot {
@@ -55069,7 +55070,7 @@ const PendingDocumentUnitSparseChunkEmbedding = struct {
 
 fn collectPendingDocumentUnitDenseChunkEmbeddings(
     alloc: Allocator,
-    db: *DB,
+    db: anytype,
     chunk_artifact_name: []const u8,
     out: *std.ArrayListUnmanaged(PendingDocumentUnitDenseChunkEmbedding),
 ) !void {
@@ -55098,7 +55099,7 @@ fn collectPendingDocumentUnitDenseChunkEmbeddings(
 
 fn collectPendingDocumentUnitSparseChunkEmbeddings(
     alloc: Allocator,
-    db: *DB,
+    db: anytype,
     chunk_artifact_name: []const u8,
     out: *std.ArrayListUnmanaged(PendingDocumentUnitSparseChunkEmbedding),
 ) !void {
