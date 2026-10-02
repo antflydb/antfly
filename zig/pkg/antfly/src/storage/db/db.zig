@@ -139943,6 +139943,13 @@ test "db bulk ingest primary lsm writes use direct sorted ingest batch mode" {
     });
     defer db.close();
 
+    // DB.open's own bootstrap write (catalog/manifest bookkeeping) is subject
+    // to the same flush_threshold=1 as every other write, so it can already
+    // flush once before the bulk session even begins. write_stats is a
+    // lifetime counter with no reset, so baseline it here and assert on the
+    // delta the bulk batch itself produced, not an absolute count.
+    const baseline = db.snapshotPrimaryLsmWriteStatsForTest() orelse return error.TestExpectedEqual;
+
     try db.beginBulkIngestSession();
     errdefer db.abortBulkIngestSession();
 
@@ -139957,8 +139964,8 @@ test "db bulk ingest primary lsm writes use direct sorted ingest batch mode" {
     });
 
     const stats = db.snapshotPrimaryLsmWriteStatsForTest() orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(u64, 0), stats.flushes);
-    try std.testing.expect(stats.sorted_ingest_runs > 0);
+    try std.testing.expectEqual(baseline.flushes, stats.flushes);
+    try std.testing.expect(stats.sorted_ingest_runs > baseline.sorted_ingest_runs);
 
     const visible_before_finish = (try db.get(alloc, "doc:bulk_lsm_d")) orelse return error.TestExpectedEqual;
     alloc.free(visible_before_finish);
