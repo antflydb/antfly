@@ -1203,6 +1203,25 @@ pub const OrdinalRowView = struct {
 
     /// Shared logical interpretation for projection and predicate execution.
     /// Composite values belong to the caller's arena, never to a scan cursor.
+    /// JSON reconstruction alone cannot distinguish SQL NULL from JSON null.
+    /// Carry only the names of present JSON-null cells across logical row copies.
+    pub fn jsonNullFieldsAlloc(self: OrdinalRowView, alloc: Allocator) ![]const []const u8 {
+        var names: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (names.items) |name| alloc.free(name);
+            names.deinit(alloc);
+        }
+        var cells = try self.cellIterator();
+        while (try cells.next()) |cell| {
+            if (cell.is_null or !cell.is_json or cell.value_type != .bytes_val or
+                !std.mem.eql(u8, std.mem.trim(u8, cell.value.bytes_val, " \t\r\n"), "null")) continue;
+            const name = try alloc.dupe(u8, self.table_schema.relational_columns[cell.ordinal].name);
+            errdefer alloc.free(name);
+            try names.append(alloc, name);
+        }
+        return names.toOwnedSlice(alloc);
+    }
+
     pub fn materializeCellAlloc(self: OrdinalRowView, alloc: Allocator, cell: Cell) !std.json.Value {
         return try ownedJsonValueFromCellAlloc(alloc, self.table_schema.relational_columns[cell.ordinal], cell);
     }
@@ -2568,6 +2587,19 @@ test "ordinal typed projection preserves SQL types null absence and exact JSON" 
     var plan = try OrdinalProjectionPlan.init(alloc, schema, &layout, &.{ "s", "i", "f", "b", "d", "j", "n", "absent", "json_null" });
     defer plan.deinit();
     const row = try ordinalRowViewSelective(encoded, schema, &layout);
+    const NullNames = struct {
+        fn check(allocator: Allocator, view: OrdinalRowView) !void {
+            const names = try view.jsonNullFieldsAlloc(allocator);
+            defer {
+                for (names) |name| allocator.free(name);
+                allocator.free(names);
+            }
+            try std.testing.expectEqual(@as(usize, 1), names.len);
+            try std.testing.expectEqualStrings("json_null", names[0]);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, NullNames.check, .{row});
+
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const projection = try row.projectSqlTypedAlloc(arena.allocator(), plan);

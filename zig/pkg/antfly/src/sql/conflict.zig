@@ -276,6 +276,7 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
         const proposed_key = mutation.key;
         mutation.key = try context.arena.dupe(u8, previous.id);
         mutation.expected_version = previous.version;
+        mutation.unique_absence = false;
         mutation.expected_content_digest = previous.expected_content_digest;
         if (clause.assignments.len == 0) {
             mutation.predicate_only = true;
@@ -287,7 +288,7 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
         const cells = try page_alloc.alloc(scalar.Datum, binding.columns.len);
         for (0..width) |i| {
             const cell = try previous.cell(binding.columns[i].name);
-            cells[i] = .{ .value = try @import("describe.zig").coerce(cell.value, binding.columns[i].type), .sql_null = cell.sql_null };
+            cells[i] = .{ .value = try @import("describe.zig").coerceAlloc(page_alloc, cell.value, binding.columns[i].type), .sql_null = cell.sql_null };
             cells[width + i] = cells[i];
             const value = if (std.mem.eql(u8, binding.columns[i].name, "_id")) std.json.Value{ .string = proposed_key } else mutation.row.?.object.get(binding.columns[i].name) orelse .null;
             var sql_null = value == .null;
@@ -295,7 +296,7 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
                 sql_null = false;
                 break;
             };
-            cells[width * 2 + i] = .{ .value = try @import("describe.zig").coerce(value, binding.columns[i].type), .sql_null = sql_null };
+            cells[width * 2 + i] = .{ .value = try @import("describe.zig").coerceAlloc(page_alloc, value, binding.columns[i].type), .sql_null = sql_null };
         }
         for (captured_row, cells[width * 3 ..]) |capture, *cell| cell.* = capture;
         const matches = if (binding.predicate) |program| blk: {
@@ -330,7 +331,7 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
             };
             if (datum.sql_null and !column.nullable) return error.SqlNotNullViolation;
             if (datum.value == .null and !datum.sql_null) try nulls.append(context.arena, column.name);
-            try row.put(context.arena, column.name, try @import("runtime.zig").clone(context.arena, try @import("describe.zig").coerce(datum.value, column.type)));
+            try row.put(context.arena, column.name, try @import("runtime.zig").clone(context.arena, try @import("describe.zig").coerceAlloc(context.arena, datum.value, column.type)));
         }
         mutation.row = .{ .object = row };
         mutation.json_null_fields = nulls.items;

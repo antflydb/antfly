@@ -5396,6 +5396,8 @@ test "metadata raft apply store snapshot replaces one complete projection and pr
 }
 
 pub const RaftApplyStoreConfig = struct {
+    /// Borrowed durable system keyspace; must outlive this authority.
+    borrowed_store: ?*@import("../../storage/backend_erased.zig").Store = null,
     root_dir: []const u8,
     map_size: usize = 16 * 1024 * 1024,
     no_sync: bool = false,
@@ -6055,7 +6057,7 @@ pub const RaftApplyStore = struct {
     io_impl: std.Io.Threaded,
     root_dir: []u8,
     path: []u8,
-    backend: lsm_backend.BackendHandle,
+    backend: ?lsm_backend.BackendHandle,
     block_cache: ?*lsm_backend.Cache = null,
     store: docstore.DocStore,
     checkpoints: std.AutoHashMapUnmanaged(u64, AppliedMetadataCheckpoint) = .empty,
@@ -6083,13 +6085,13 @@ pub const RaftApplyStore = struct {
 
         const root_dir = try alloc.dupe(u8, cfg.root_dir);
         errdefer alloc.free(root_dir);
-        if (!cfg.read_only) try fs_paths.createDirPathPortable(io_impl.io(), root_dir);
+        if (!cfg.read_only and cfg.borrowed_store == null) try fs_paths.createDirPathPortable(io_impl.io(), root_dir);
 
         const path = try std.fmt.allocPrint(alloc, "{s}/metadata-apply-store", .{root_dir});
         errdefer alloc.free(path);
-        if (!cfg.read_only) try fs_paths.createDirPathPortable(io_impl.io(), path);
+        if (!cfg.read_only and cfg.borrowed_store == null) try fs_paths.createDirPathPortable(io_impl.io(), path);
 
-        const block_cache = if (cfg.block_cache_bytes == 0) null else blk: {
+        const block_cache = if (cfg.block_cache_bytes == 0 or cfg.borrowed_store != null) null else blk: {
             const cache = try alloc.create(lsm_backend.Cache);
             cache.* = lsm_backend.Cache.init(alloc, cfg.block_cache_bytes);
             break :blk cache;
@@ -6098,7 +6100,7 @@ pub const RaftApplyStore = struct {
             cache.deinit();
             alloc.destroy(cache);
         };
-        var backend = try lsm_backend.BackendHandle.open(alloc, path, .{
+        var backend: ?lsm_backend.BackendHandle = if (cfg.borrowed_store == null) try lsm_backend.BackendHandle.open(alloc, path, .{
             .backend = .{
                 .durability = if (cfg.no_sync) .none else .full,
                 .read_only = cfg.read_only,
@@ -6106,11 +6108,16 @@ pub const RaftApplyStore = struct {
             },
             .flush_threshold = cfg.flush_threshold,
             .cache = block_cache,
-        });
-        errdefer backend.close();
-
-        var runtime_store = try backend.backend.runtimeStore(alloc, .{ .name = "metadata-apply" });
-        errdefer runtime_store.deinit();
+        }) else null;
+        errdefer if (backend) |*owned| owned.close();
+        var store = if (cfg.borrowed_store) |borrowed|
+            try docstore.DocStore.openRuntime(alloc, borrowed)
+        else blk: {
+            var runtime_store = try backend.?.backend.runtimeStore(alloc, .{ .name = "metadata-apply" });
+            errdefer runtime_store.deinit();
+            break :blk try docstore.DocStore.openRuntime(alloc, runtime_store);
+        };
+        errdefer store.close();
 
         return .{
             .alloc = alloc,
@@ -6120,7 +6127,7 @@ pub const RaftApplyStore = struct {
             .path = path,
             .backend = backend,
             .block_cache = block_cache,
-            .store = try docstore.DocStore.openRuntime(alloc, runtime_store),
+            .store = store,
         };
     }
 
@@ -6133,7 +6140,7 @@ pub const RaftApplyStore = struct {
         self.projection_listeners.deinit(self.alloc);
         self.committed_key_listeners.deinit(self.alloc);
         self.store.close();
-        self.backend.close();
+        if (self.backend) |*backend| backend.close();
         if (self.block_cache) |cache| {
             cache.deinit();
             self.alloc.destroy(cache);
@@ -7016,11 +7023,11 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn snapshotWriteStats(self: *const RaftApplyStore) lsm_backend.Backend.WriteStats {
-        return self.backend.backend.snapshotWriteStats();
+        return if (self.backend) |backend| backend.backend.snapshotWriteStats() else .{};
     }
 
     pub fn snapshotMaintenanceStats(self: *const RaftApplyStore) lsm_backend.Backend.MaintenanceStats {
-        return self.backend.snapshotMaintenanceStats();
+        return if (self.backend) |backend| backend.snapshotMaintenanceStats() else .{};
     }
 
     pub fn latestCheckpoint(self: *RaftApplyStore, group_id: u64) !?AppliedMetadataCheckpoint {
@@ -9439,6 +9446,15 @@ pub const RaftApplyStore = struct {
         self.alloc.free(result);
     }
 
+    fn validateCatalogTopology(command: SystemCatalogCommand) !void {
+        const physical = command.mutation.kind == .table and (command.mutation.action == .create or command.mutation.action == .drop);
+        if (physical != (command.topology != null)) return error.InvalidCatalogMutation;
+        if (command.topology) |topology| switch (topology) {
+            .create => |create| if (command.mutation.action != .create or create.table.table_id != command.mutation.table_id or !std.mem.eql(u8, create.table.name, command.mutation.storage_name)) return error.InvalidCatalogMutation,
+            .drop => |drop| if (command.mutation.action != .drop or drop.table_id != command.mutation.table_id or !std.mem.eql(u8, drop.expected_name, command.mutation.storage_name)) return error.InvalidCatalogMutation,
+        };
+    }
+
     /// Validate and serialize the exact admitted projection before proposing.
     pub fn prepareSystemCatalogResult(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, command: SystemCatalogCommand) ![]u8 {
         var txn = try self.beginQueryCatalogReadTxn(group_id);
@@ -9449,19 +9465,15 @@ pub const RaftApplyStore = struct {
         const meta = try system_catalog_storage.readMeta(a, &txn, group_id);
         if (meta.revision != command.expected_revision) return error.CatalogGenerationChanged;
         const reader: CatalogReader = .{ .store = self, .view = .{ .alloc = a, .txn = &txn, .group_id = group_id, .meta = meta } };
-        var delta = try system_catalog.planWithReader(a, reader, meta.next_id, command.mutation);
+        try validateCatalogTopology(command);
+        var delta = try system_catalog.planWithTopology(a, reader, meta.next_id, command.mutation, command.mutation.kind == .table and command.mutation.action == .drop);
         defer delta.deinit(a);
-        if ((command.mutation.kind == .table and command.mutation.action == .create) != (command.topology != null)) return error.InvalidCatalogMutation;
         if (command.placement_update) |update| {
             if (command.mutation.kind != .table or command.mutation.action != .set_tablespace or update.expected.table_id != update.replacement.table_id or !std.mem.eql(u8, update.expected.name, update.replacement.name)) return error.InvalidCatalogMutation;
             if ((try self.loadTableTransitionFenceTxn(&txn, group_id, update.expected.table_id)).active()) return error.TableTransitionActive;
             const current = (try self.getTableByNameTxn(self.alloc, &txn, group_id, update.expected.name)) orelse return error.TableNotFound;
             defer metadata_table_manager.freeTable(self.alloc, current);
             if (!metadata_table_manager.tableDefinitionsEqual(current, update.expected)) return error.TableGenerationChanged;
-        }
-        if (command.topology) |topology| {
-            if (topology != .create or topology.create.table.table_id != command.mutation.table_id or
-                !std.mem.eql(u8, topology.create.table.name, command.mutation.storage_name)) return error.InvalidCatalogMutation;
         }
         return std.json.Stringify.valueAlloc(alloc, try system_catalog.mutationResult(reader, meta.revision + 1, delta), .{});
     }
@@ -9626,12 +9638,12 @@ pub const RaftApplyStore = struct {
                 return;
         }
         const reader: CatalogReader = .{ .store = self, .view = .{ .alloc = a, .txn = txn, .group_id = group_id, .meta = meta } };
-        var delta = system_catalog.planWithReader(a, reader, meta.next_id, command.mutation) catch |err| switch (err) {
+        validateCatalogTopology(command) catch return;
+        var delta = system_catalog.planWithTopology(a, reader, meta.next_id, command.mutation, command.mutation.kind == .table and command.mutation.action == .drop) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return, // A concurrent catalog/topology operation defeated admission.
         };
         defer delta.deinit(a);
-        if ((command.mutation.kind == .table and command.mutation.action == .create) != (command.topology != null)) return;
         if (command.placement_update) |update| {
             if (command.mutation.kind != .table or command.mutation.action != .set_tablespace or update.expected.table_id != update.replacement.table_id or !std.mem.eql(u8, update.expected.name, update.replacement.name)) return;
             if ((try self.loadTableTransitionFenceTxn(txn, group_id, update.expected.table_id)).active()) return;
@@ -9641,17 +9653,20 @@ pub const RaftApplyStore = struct {
             try self.applyTableCompareAndReplaceTxn(txn, group_id, update.expected, update.replacement);
         }
         if (command.topology) |topology| {
-            if (topology != .create or topology.create.table.table_id != command.mutation.table_id or
-                !std.mem.eql(u8, topology.create.table.name, command.mutation.storage_name)) return;
             try self.applyTableTopologyMutationTxn(txn, group_id, topology);
             var key_buf: [160]u8 = undefined;
             const encoded = txn.get(try tableKeyForGroup(&key_buf, group_id, command.mutation.table_id)) catch |err| switch (err) {
-                error.NotFound => return,
+                error.NotFound => null,
                 else => return err,
             };
-            const table = try decodeTableRecord(self.alloc, encoded);
-            defer metadata_table_manager.freeTable(self.alloc, table);
-            if (!metadata_table_manager.tableDefinitionsEqual(table, topology.create.table)) return;
+            switch (topology) {
+                .create => |create| {
+                    const table = try decodeTableRecord(self.alloc, encoded orelse return);
+                    defer metadata_table_manager.freeTable(self.alloc, table);
+                    if (!metadata_table_manager.tableDefinitionsEqual(table, create.table)) return;
+                },
+                .drop => if (encoded != null) return,
+            }
         }
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
@@ -28918,6 +28933,40 @@ fn applySystemCatalogTestCommand(store: *RaftApplyStore, index: u64, command: Sy
     try store.snapshotBuilder().applyBatch(.{ .group_id = 21, .commit_index = index, .entries_bytes = entries });
 }
 
+test "system catalog qualified DROP removes topology atomically and rejects stale identity" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog-drop", .{tmp.sub_path});
+    defer alloc.free(root);
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    const table: metadata.TableRecord = .{ .table_id = 42, .name = "table:42", .min_ranges = 1 };
+    const ranges = [_]metadata.RangeRecord{.{ .table_id = 42, .group_id = 301, .range_id = 301, .start_key = "" }};
+    try applySystemCatalogTestCommand(&store, 1, .{ .expected_revision = 0, .mutation = .{ .action = .create, .kind = .table, .name = "events", .table_id = 42, .storage_name = "table:42" }, .topology = .{ .create = .{ .expected_transition_generation = 0, .table = table, .ranges = &ranges } } });
+    var membership: topology_protocol.RangeMembershipAccumulator = .{};
+    try membership.add(301);
+    var drop: SystemCatalogCommand = .{ .expected_revision = 1, .mutation = .{ .action = .drop, .kind = .table, .name = "events", .table_id = 42, .storage_name = "table:42" }, .topology = .{ .drop = .{ .table_id = 42, .expected_name = "table:42", .expected_transition_generation = 1, .range_contract = .{ .membership = membership.finish(42) } } } };
+    const admitted = try store.prepareSystemCatalogResult(alloc, 21, drop);
+    defer alloc.free(admitted);
+    drop.topology.?.drop.table_id = 43;
+    try std.testing.expectError(error.InvalidCatalogMutation, store.prepareSystemCatalogResult(alloc, 21, drop));
+    drop.topology.?.drop.table_id = 42;
+    drop.topology.?.drop.expected_transition_generation = 0;
+    try applySystemCatalogTestCommand(&store, 2, drop);
+    try std.testing.expectEqual(@as(u64, 1), (try store.systemCatalogMeta(alloc, 21)).revision);
+    drop.topology.?.drop.expected_transition_generation = 1;
+    try applySystemCatalogTestCommand(&store, 3, drop);
+    try std.testing.expectEqual(@as(?metadata.TableRecord, null), try store.resolveSystemCatalogTable(alloc, 21, .{ .table = "events" }));
+    const remaining = try store.listTables(alloc, 21);
+    defer {
+        for (remaining) |entry| metadata_table_manager.freeTable(alloc, entry);
+        alloc.free(remaining);
+    }
+    try std.testing.expectEqual(@as(usize, 0), remaining.len);
+    try std.testing.expectEqual(@as(u64, 2), (try store.systemCatalogMeta(alloc, 21)).revision);
+}
+
 test "system catalog publishes names and table topology atomically and fences stale mutations" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -30729,4 +30778,38 @@ test "metadata replay advances new noops without changing catalog authority or o
     const value = (try store.getRestoreJobValue(T.alloc, T.group_id, key)).?;
     defer T.alloc.free(value);
     try std.testing.expectEqualStrings("retained", value);
+}
+
+test "system catalog borrowed authority retains ownership and recovers a failed sync" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/borrowed", .{tmp.sub_path});
+    defer alloc.free(root);
+    var backend = try lsm_backend.BackendHandle.open(alloc, root, .{});
+    defer backend.close();
+    var runtime_store = try backend.backend.runtimeStore(alloc, .{ .name = "system/metadata" });
+    defer runtime_store.deinit();
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root, .borrowed_store = &runtime_store });
+    defer store.deinit();
+    try std.testing.expect(store.backend == null);
+    const group = group_ids.main_metadata_group_id;
+    try store.replaceStandaloneCatalog(group, 0, &.{}, &.{}, "{}");
+    try std.testing.expectEqual(@as(u64, 1), try store.standaloneRevision());
+    const Fail = struct {
+        fn sync(_: *anyopaque, _: bool) anyerror!void {
+            return error.InjectedSyncFailure;
+        }
+    };
+    const original = store.store.runtime_store.vtable;
+    var failing = original.*;
+    failing.sync = Fail.sync;
+    store.store.runtime_store.vtable = &failing;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, store.updateStandaloneCatalog(group, 1, .{ .auxiliary_json = "{\"recovered\":true}" }));
+    store.deinit();
+    store = try RaftApplyStore.init(alloc, .{ .root_dir = root, .borrowed_store = &runtime_store });
+    try std.testing.expectEqual(@as(u64, 2), try store.standaloneRevision());
+    const recovered = (try store.loadStandaloneCatalog(alloc)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(recovered);
+    try std.testing.expectEqualStrings("{\"recovered\":true}", recovered);
 }

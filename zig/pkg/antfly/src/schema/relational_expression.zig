@@ -528,11 +528,15 @@ pub const Set = struct {
     /// Rewrite programs bind this policy durably. Ordinary restore must never
     /// call this function: it verifies historical results without computing.
     pub fn applyValuesWithPolicy(self: *const Set, alloc: Allocator, values: []Value, present: []bool, defaults: DefaultsPolicy) !void {
-        if (values.len != self.table.relational_columns.len or present.len != values.len) return error.InvalidRelationalExpressionInput;
+        return self.applyValuesWithDefaultMask(alloc, values, present, defaults, null);
+    }
+
+    pub fn applyValuesWithDefaultMask(self: *const Set, alloc: Allocator, values: []Value, present: []bool, defaults: DefaultsPolicy, default_mask: ?[]const bool) !void {
+        if (values.len != self.table.relational_columns.len or present.len != values.len or (default_mask != null and default_mask.?.len != values.len)) return error.InvalidRelationalExpressionInput;
         var budget: usize = max_allocated_bytes;
         for (self.order) |index| {
             const binding = &self.bindings[index];
-            if (!binding.generated and (present[binding.ordinal] or defaults == .preserve_absence)) continue;
+            if (!binding.generated and (present[binding.ordinal] or defaults == .preserve_absence or (default_mask != null and !default_mask.?[binding.ordinal]))) continue;
             values[binding.ordinal] = try binding.plan.evaluateNode(alloc, .{ .values = values }, @intCast(binding.plan.nodes.len - 1), &budget);
             present[binding.ordinal] = true;
         }

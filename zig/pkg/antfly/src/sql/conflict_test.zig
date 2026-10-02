@@ -131,6 +131,7 @@ const Fixture = struct {
             }
             const expected: u64 = if (std.mem.startsWith(u8, mutation.key, "existing")) 9 else 0;
             try std.testing.expectEqual(expected, mutation.expected_version);
+            try std.testing.expectEqual(expected == 0, mutation.unique_absence);
             if (mutation.predicate_only) {
                 self.fences += 1;
                 try std.testing.expect(mutation.row == null);

@@ -56,6 +56,15 @@ pub fn deriveColumns(alloc: std.mem.Allocator, schema: anytype) ![]const catalog
     return columns;
 }
 
+/// Recover logical UUID semantics without changing the physical keyword layout.
+pub fn relationalType(schema: anytype, name: []const u8, physical: ast.ColumnType) ast.ColumnType {
+    if (physical != .string) return physical;
+    for (schema.document_schemas) |document_| for (document_.properties) |property| {
+        if (std.mem.eql(u8, property.name, name) and propertyType(property) == .uuid) return .uuid;
+    };
+    return physical;
+}
+
 fn propertyType(property: anytype) ast.ColumnType {
     const name = property.field_type orelse return .json;
     if (std.mem.eql(u8, name, "integer") or property.integer_only) return .integer;

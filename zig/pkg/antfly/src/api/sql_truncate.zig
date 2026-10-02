@@ -177,13 +177,17 @@ fn selectInternal(alloc: std.mem.Allocator, tables: []const records.TableRecord,
             try queue.append(alloc, index);
         }
     }
+    var schema_scratch = std.heap.ArenaAllocator.init(alloc);
+    defer schema_scratch.deinit();
     const incoming = try alloc.alloc(std.ArrayList(usize), tables.len);
     @memset(incoming, .empty);
     for (tables, 0..) |table, child| {
         for ([_][]const u8{ table.schema_json, table.read_schema_json }) |definition| {
             if (definition.len == 0) continue;
-            var schema = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, definition);
-            defer schema.deinit(alloc);
+            _ = schema_scratch.reset(.retain_capacity);
+            const temporary = schema_scratch.allocator();
+            var schema = try @import("../schema/mod.zig").parseValidatedTableSchema(temporary, definition);
+            defer schema.deinit(temporary);
             if (schema.foreign_keys) |foreign_keys| for (foreign_keys.value) |fk| {
                 const parent = names.get(fk.parent_table) orelse return error.ForeignKeyParentTableNotFound;
                 try incoming[parent].append(alloc, child);
