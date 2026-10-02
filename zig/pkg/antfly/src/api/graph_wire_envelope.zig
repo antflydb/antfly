@@ -23,7 +23,9 @@ pub fn captureRequestTransportAlloc(
     body: []const u8,
     expected_operations: anytype,
 ) !db_mod.types.GraphQueryTransport {
-    var parsed = ant_json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| switch (err) {
+    // This sidecar is forwarded verbatim to storage. Preserve predicate number
+    // tokens so transport cannot change the canonical execution plan's values.
+    var parsed = ant_json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidGraphWireEnvelope,
     };

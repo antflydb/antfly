@@ -32,6 +32,7 @@ const rfc3339 = @import("../common/rfc3339.zig");
 const fusion_mod = @import("../search/fusion.zig");
 const aggregations_mod = @import("../storage/db/aggregations_contract.zig");
 const public_search_request_mod = @import("public_search_request.zig");
+const public_embedding_query_mod = @import("public_embedding_query.zig");
 const public_text_query_mod = @import("public_text_query.zig");
 const public_query_string_mod = @import("public_query_string.zig");
 const public_limits = @import("antfly_public_limits");
@@ -3461,8 +3462,11 @@ fn cloneFastDenseQueryAlloc(
     const owned_index_name = try alloc.dupe(u8, index_name);
     errdefer alloc.free(owned_index_name);
     const vector = switch (embedding) {
-        .@"packed" => |encoded| vector_codec.decodePackedF32Base64Alloc(alloc, encoded) catch return error.InvalidQueryRequest,
-        .dense => |dense| try alloc.dupe(f32, dense),
+        .@"packed" => |encoded| try public_embedding_query_mod.decodePackedF32Alloc(alloc, encoded),
+        .dense => |dense| blk: {
+            try public_embedding_query_mod.validateF32Values(dense);
+            break :blk try alloc.dupe(f32, dense);
+        },
     };
     return .{
         .name = name,
