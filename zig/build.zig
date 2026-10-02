@@ -146,6 +146,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     const inference_steps = shared.inference_steps;
     const antfly_imports = shared.antfly_imports;
     const production_antfly_imports = shared.production_antfly_imports;
+    production_antfly_imports.configureRuntimeContracts(usermgr_mod);
+    production_antfly_imports.storage_boundary.configureSources(usermgr_mod, false, false);
     const onnx_build = @import("onnx_graph").support;
 
     // The public package has the same storage boundary as the linked server:
@@ -778,6 +780,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = optimize,
     }) });
     production_antfly_imports.configureRuntimeContracts(graph_transfer_tests.root_module);
+    graph_transfer_tests.root_module.addImport("antfly_hash", hash_mod);
     production_antfly_imports.storage_boundary.configureSources(graph_transfer_tests.root_module, false, false);
     const run_graph_transfer_tests = b.addRunArtifact(graph_transfer_tests);
     b.step("antfly-graph-transfer-test", "Validate certified graph artifact generation transfer").dependOn(&run_graph_transfer_tests.step);
