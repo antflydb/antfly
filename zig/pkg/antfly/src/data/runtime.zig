@@ -31990,7 +31990,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             // to stand in for the catalog authority.
             if (std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog")) {
                 const catalog = @import("../system_catalog/domain.zig");
-                const parsed = try std.json.parseFromSlice(catalog.Call, response_alloc, request.body, .{});
+                const parsed = try std.json.parseFromSlice(@import("../system_catalog/server_call.zig").Call, response_alloc, request.body, .{});
                 defer parsed.deinit();
                 const body = switch (parsed.value) {
                     .read, .list_tables, .export_snapshot, .table_status => return error.UnexpectedCatalogRead,
@@ -44919,7 +44919,7 @@ fn consumerTests() type {
         }
 
         test "remote policy publication calls use mutation transport rather than read retry" {
-            const catalog = @import("../system_catalog/domain.zig");
+            const catalog = @import("../system_catalog/server_call.zig");
             try std.testing.expect(RemoteMetadataSource.isSystemCatalogMutation(catalog.Call{ .policy_publication_begin = .{
                 .table_id = 7,
                 .enable = true,
