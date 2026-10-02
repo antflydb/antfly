@@ -57410,22 +57410,24 @@ fn reconcileGlobalGraphEdgeWinner(
             try considerGraphEdgeWinner(alloc, &result.winners, edge_key, change.state_key, change.source_priority, source_payload);
         } else {
             try result.deletes.append(alloc, contender_key);
-            // This source's own contender row is gone, but the scan above
-            // may already have selected an unrelated, lower-priority (e.g.
-            // asset-derived) contender as the edge's winner because that
-            // contender's own state was untouched by this batch. A caller
-            // that explicitly deletes a top-level graph edge (no owner --
-            // appendMixedDirectGraphContenderMutations is the only caller
-            // of this path) is asking to retire the edge outright, the same
-            // way an explicit write at this priority outranks every asset
-            // contender. Retiring one contributor must not let a surviving
-            // independent one resurrect the edge out from under an explicit
-            // delete; drop any winner so the edge's primary key is deleted
-            // instead of rewritten from that leftover contender.
-            if (result.winners.map.fetchRemove(edge_key)) |removed| {
-                alloc.free(@constCast(removed.key));
-                alloc.free(removed.value.owner_state_key);
-                alloc.free(removed.value.payload);
+            // Ordinary source removal (e.g. an asset re-render dropping a
+            // stale contender when its producing field disappears) must
+            // still fall back to the next-best surviving contender the scan
+            // above already selected -- that is the whole point of
+            // precedence. Only an explicit top-level graph_deletes entry
+            // (always posted at the reserved direct state key; see
+            // appendMixedDirectGraphContenderMutations, the only caller that
+            // ever touches it) is asking to retire the edge outright, the
+            // same way an explicit write at that priority outranks every
+            // asset contender. Scope the override to that one state key so
+            // retiring an asset contributor can never resurrect-then-drop an
+            // edge out from under an unrelated fallback (PR #957 review).
+            if (std.mem.eql(u8, change.state_key, direct_state_key)) {
+                if (result.winners.map.fetchRemove(edge_key)) |removed| {
+                    alloc.free(@constCast(removed.key));
+                    alloc.free(removed.value.owner_state_key);
+                    alloc.free(removed.value.payload);
+                }
             }
         }
     }
@@ -97460,6 +97462,109 @@ test "db multi-source graph precedence falls back after winner deletion and reop
     try std.testing.expectEqual(@as(usize, 1), reopened_edges.len);
     try std.testing.expectEqual(@as(f64, 1), reopened_edges[0].weight);
     try std.testing.expect(std.mem.indexOf(u8, reopened_edges[0].metadata, "\"winner\":\"fallback\"") != null);
+}
+
+// Regression for PR #957's review of "fix(storage): stop a surviving asset
+// contender from resurrecting an explicitly deleted graph edge": removing an
+// ordinary (non-winning, non-direct) contender must still leave the winning
+// contender's edge in place. The sibling precedence test above exercises the
+// opposite edge of this same reconcileGlobalGraphEdgeWinner path (removing
+// the winner reveals the fallback); this one removes the fallback while the
+// winner survives untouched, which the unconditional winner-removal this
+// fixes used to wipe out alongside it.
+test "db multi-source graph precedence keeps the primary edge after removing the fallback" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addEnrichment(.{
+            .name = "primary_relations_v1",
+            .kind = .asset,
+            .field = "primary_relations",
+            .content_type = "application/json",
+        });
+        try db.addEnrichment(.{
+            .name = "fallback_relations_v1",
+            .kind = .asset,
+            .field = "fallback_relations",
+            .content_type = "application/json",
+        });
+        try db.addIndex(.{
+            .name = "relations_graph",
+            .kind = .graph,
+            .config_json =
+            \\{"sources":[{"artifact":"primary_relations_v1"},{"artifact":"fallback_relations_v1"}]}
+            ,
+        });
+
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:a",
+                .value =
+                \\{"primary_relations":{"type":"mentions","target":{"document_id":"doc:b"},"weight":2,"winner":"primary"},"fallback_relations":{"type":"mentions","target":{"document_id":"doc:b"},"weight":1,"winner":"fallback"}}
+                ,
+            }},
+            .sync_level = .enrichments,
+        });
+        try db.runUntilIdle();
+
+        {
+            const edges = try db.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+            defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+            try std.testing.expectEqual(@as(usize, 1), edges.len);
+            try std.testing.expectEqual(@as(f64, 2), edges[0].weight);
+            try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"winner\":\"primary\"") != null);
+        }
+        const logical_edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:b");
+        defer alloc.free(logical_edge_key);
+        const contender_prefix = try internal_keys.graphEdgeContenderEdgePrefixAlloc(alloc, "doc:a", "relations_graph", logical_edge_key);
+        defer alloc.free(contender_prefix);
+        {
+            const contenders = try db.core.store.scanPrefix(alloc, contender_prefix);
+            defer docstore_mod.DocStore.freeResults(alloc, contenders);
+            try std.testing.expectEqual(@as(usize, 2), contenders.len);
+        }
+
+        // Removing the lower-precedence (non-winning) artifact must leave
+        // the still-winning primary edge exactly as it was, not delete it.
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:a",
+                .value =
+                \\{"primary_relations":{"type":"mentions","target":{"document_id":"doc:b"},"weight":2,"winner":"primary"}}
+                ,
+            }},
+            .sync_level = .enrichments,
+        });
+        try db.runUntilIdle();
+
+        const edges = try db.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+        try std.testing.expectEqual(@as(f64, 2), edges[0].weight);
+        try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"winner\":\"primary\"") != null);
+        {
+            const contenders = try db.core.store.scanPrefix(alloc, contender_prefix);
+            defer docstore_mod.DocStore.freeResults(alloc, contenders);
+            try std.testing.expectEqual(@as(usize, 1), contenders.len);
+        }
+        try db.sync(true);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+    const reopened_edges = try reopened.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, reopened_edges);
+    try std.testing.expectEqual(@as(usize, 1), reopened_edges.len);
+    try std.testing.expectEqual(@as(f64, 2), reopened_edges[0].weight);
+    try std.testing.expect(std.mem.indexOf(u8, reopened_edges[0].metadata, "\"winner\":\"primary\"") != null);
 }
 
 test "db portable restore rebuilds multi-source graph contender provenance" {
