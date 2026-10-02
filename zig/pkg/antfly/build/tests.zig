@@ -102,7 +102,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const httpx_mod = options.antfly_imports.httpx;
     const structlog_mod = options.antfly_imports.structlog;
     const openapi_root_check = options.openapi_root_check;
-    const handlebars_mod = options.antfly_imports.handlebars;
     const platform_mod = options.antfly_imports.platform;
     const bloom_mod = options.antfly_imports.bloom;
     const vector_mod = options.antfly_imports.vector;
@@ -119,9 +118,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const reranking_mod = options.antfly_imports.reranking;
     const image_mod = options.antfly_imports.image;
     const pdf_mod = options.antfly_imports.pdf;
-    const font_mod = options.antfly_imports.font;
-    const inference_api_mod = options.antfly_imports.inference_api;
-    const inference_chunker_mod = options.antfly_imports.inference_chunker;
     const reader_config_mod = options.antfly_imports.reader_config;
     const antfly_imports = options.antfly_imports;
     const test_imports = @import("test_support.zig").Imports{ .runtime = antfly_imports, .vopr = options.vopr, .lmdb_engine = options.lmdb_engine };
@@ -1401,6 +1397,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "graph query engine shares traversal work across start nodes",
         "stored graph weights are finite and non-negative",
         "relationship predicates",
+        "JSON decimal comparison",
+        "traversal decimal weight filters",
         "fact temporal predicates",
         "derived worker pause",
         "exact two-edge pattern preserves same type parallel relationship matches",
@@ -5139,39 +5137,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     index_manager_vopr_step.dependOn(&run_index_manager_vopr_tests.step);
 
     const db_test_mod = makeLmdbModule(b, "pkg/antfly/src/db_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
-    db_test_mod.addImport("antfly_schema_openapi", antfly_imports.schema_openapi);
-    antfly_imports.storage_boundary.configureSources(db_test_mod, false, false);
-    db_test_mod.addImport("runtime_failure_abi", antfly_imports.storage_boundary.failure);
+    // Use the owner constructor so this standalone graph/DB root receives the
+    // same runtime contracts as production storage when dependencies change.
+    antfly_imports.configureStorage(b, db_test_mod, true);
     const transcribing_db_test_stub_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/testing/transcribing_stub.zig"),
         .target = target,
         .optimize = optimize,
     });
     transcribing_db_test_stub_mod.addImport("httpx", httpx_mod);
-    addSnowballModule(b, db_test_mod);
-    db_test_mod.addImport("bloom", bloom_mod);
-    db_test_mod.addImport("handlebars", handlebars_mod);
-    db_test_mod.addImport("antfly_fst", fst_mod);
-    db_test_mod.addImport("antfly_vector", vector_mod);
-    db_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
-    db_test_mod.addImport("antfly_matcher", matcher_mod);
-    db_test_mod.addImport("antfly_resolver", resolver_mod);
-    db_test_mod.addImport("antfly_chunking", chunking_mod);
-    db_test_mod.addImport("antfly_regex", regex_mod);
-    db_test_mod.addImport("antfly-json", json_mod);
-    db_test_mod.addImport("raft_engine", raft_engine_mod);
-    db_test_mod.addImport("inference_chunker", inference_chunker_mod);
-    db_test_mod.addImport("inference_api", inference_api_mod);
-    db_test_mod.addImport("antfly_reranking", reranking_mod);
-    db_test_mod.addImport("antfly_scraping", scraping_mod);
-    db_test_mod.addImport("antfly_reader_config", reader_config_mod);
     db_test_mod.addImport("antfly_transcribing", transcribing_db_test_stub_mod);
-    db_test_mod.addImport("httpx", httpx_mod);
-    db_test_mod.addImport("antfly_pdf", pdf_mod);
-    db_test_mod.addImport("objectstore", antfly_imports.objectstore);
-    db_test_mod.addImport("antfly_image", image_mod);
-    db_test_mod.addImport("antfly_font", font_mod);
-    db_test_mod.addImport("structlog", structlog_mod);
     db_test_mod.addImport("vopr", vopr_mod);
 
     const db_split_workload_default_filters = [_][]const u8{

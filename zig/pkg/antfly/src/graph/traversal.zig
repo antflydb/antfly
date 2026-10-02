@@ -1126,3 +1126,22 @@ fn cloneEdge(alloc: Allocator, edge: PathEdge) !PathEdge {
 fn freeEdge(alloc: Allocator, edge: PathEdge) void {
     paths_mod.freePathEdgeAlloc(alloc, edge);
 }
+
+test "traversal decimal weight filters match public stored values" {
+    const alloc = std.testing.allocator;
+    var graph = try graph_mod.GraphIndex.openWithPrivateStores(alloc, "unused-out", "unused-in", "weights", .{ .reverse_backend = .mem });
+    defer graph.close();
+    try graph.addEdge("a", "b", "R", 0.1, 0, 0, "");
+    try graph.addEdge("a", "c", "R", 0.2, 0, 0, "");
+    for ([_]relationship_filter.Operator{ .eq, .lte }) |op| {
+        const results = try traverse(alloc, &graph, "a", .{
+            .max_depth = 1,
+            .include_paths = true,
+            .edge_filter = .{ .properties = &.{.{ .field = "/weight", .op = op, .value_json = "0.1" }} },
+        });
+        defer freeOwnedResults(alloc, results);
+        try std.testing.expectEqual(@as(usize, 1), results.len);
+        try std.testing.expectEqualStrings("b", results[0].key);
+        try std.testing.expectEqual(@as(f64, 0.1), results[0].path_edges.?[0].weight);
+    }
+}

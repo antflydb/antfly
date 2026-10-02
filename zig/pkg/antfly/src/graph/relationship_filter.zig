@@ -16,6 +16,7 @@
 //! Metadata is a projection of the authoritative fact, not a late document join.
 const std = @import("std");
 const schema = @import("../storage/schema.zig");
+const json_number = @import("../common/json_number.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Operator = enum { eq, ne, lt, lte, gt, gte, is_null, is_not_null };
@@ -125,7 +126,7 @@ fn scalar(value: std.json.Value) bool {
     return switch (value) {
         .string, .integer, .bool => true,
         .float => |n| std.math.isFinite(n),
-        .number_string => |n| if (std.fmt.parseFloat(f128, n) catch null) |number| std.math.isFinite(number) else false,
+        .number_string => |n| json_number.Number.parse(n) != null,
         else => false,
     };
 }
@@ -183,18 +184,6 @@ fn edgeValue(alloc: Allocator, edge: anytype, metadata: std.json.Value, field: [
     return current;
 }
 
-fn numeric(value: std.json.Value) ?f128 {
-    return switch (value) {
-        .integer => |n| @floatFromInt(n),
-        .float => |n| if (std.math.isFinite(n)) @floatCast(n) else null,
-        .number_string => |n| blk: {
-            const number = std.fmt.parseFloat(f128, n) catch break :blk null;
-            break :blk if (std.math.isFinite(number)) number else null;
-        },
-        else => null,
-    };
-}
-
 fn compare(actual: std.json.Value, expected: std.json.Value, value_type: ValueType) ?std.math.Order {
     if (value_type == .datetime) {
         if (actual != .string or expected != .string) return null;
@@ -202,9 +191,11 @@ fn compare(actual: std.json.Value, expected: std.json.Value, value_type: ValueTy
         const b = schema.parseRfc3339ToSignedNs(expected.string) orelse return null;
         return std.math.order(a, b);
     }
-    if (numeric(actual)) |a| {
-        const b = numeric(expected) orelse return null;
-        return std.math.order(a, b);
+    var actual_buffer: [64]u8 = undefined;
+    var expected_buffer: [64]u8 = undefined;
+    if (json_number.fromValue(actual, &actual_buffer)) |a| {
+        const b = json_number.fromValue(expected, &expected_buffer) orelse return null;
+        return a.order(b);
     }
     if (actual == .string and expected == .string) return std.mem.order(u8, actual.string, expected.string);
     if (actual == .bool and expected == .bool) return std.math.order(@intFromBool(actual.bool), @intFromBool(expected.bool));
@@ -342,4 +333,29 @@ test "relationship predicates preserve exact decimal literals" {
         const lower_passes = std.mem.eql(u8, op, "ne") or std.mem.eql(u8, op, "lt") or std.mem.eql(u8, op, "lte");
         try std.testing.expectEqual(lower_passes, try filter.matches(alloc, Edge{ .metadata = "{\"value\":1}" }));
     }
+}
+
+test "relationship predicates normalize stored floating weights" {
+    const alloc = std.testing.allocator;
+    const Edge = struct { source: []const u8 = "a", target: []const u8 = "b", edge_type: []const u8 = "R", edge_id: []const u8 = "", owner_document: []const u8 = "", weight: f64 = 0.1, created_at: u64 = 0, updated_at: u64 = 0, metadata: []const u8 = "{}" };
+    for ([_]Operator{ .eq, .ne, .lt, .lte, .gt, .gte }) |op| {
+        const filter = Filter{ .properties = &.{.{ .field = "/weight", .op = op, .value_json = "0.1" }} };
+        try filter.validate(alloc);
+        try std.testing.expectEqual(op == .eq or op == .lte or op == .gte, try filter.matches(alloc, Edge{}));
+    }
+    const precise = Filter{ .properties = &.{.{ .field = "/weight", .op = .eq, .value_json = "1.5000000000000001" }} };
+    try std.testing.expect(!try precise.matches(alloc, Edge{ .weight = 1.5 }));
+}
+
+test "relationship predicates distinguish arbitrary precision metadata" {
+    const alloc = std.testing.allocator;
+    const Edge = struct { source: []const u8 = "a", target: []const u8 = "b", edge_type: []const u8 = "R", edge_id: []const u8 = "", owner_document: []const u8 = "", weight: f64 = 1, created_at: u64 = 0, updated_at: u64 = 0, metadata: []const u8 = "{\"value\":1}" };
+    for ([_]Operator{ .eq, .ne, .lt, .lte, .gt, .gte }) |op| {
+        const filter = Filter{ .properties = &.{.{ .field = "/metadata/value", .op = op, .value_json = "1.00000000000000000000000000000000001" }} };
+        try filter.validate(alloc);
+        try std.testing.expectEqual(op == .ne or op == .lt or op == .lte, try filter.matches(alloc, Edge{}));
+    }
+    const enormous = Filter{ .properties = &.{.{ .field = "/metadata/value", .op = .eq, .value_json = "10e999999999999999999999999999999999999" }} };
+    try enormous.validate(alloc);
+    try std.testing.expect(try enormous.matches(alloc, Edge{ .metadata = "{\"value\":1e1000000000000000000000000000000000000}" }));
 }

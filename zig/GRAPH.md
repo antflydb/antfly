@@ -210,7 +210,14 @@ introduce a global cross-shard endpoint-deletion protocol.
 JSON number literals remain intact in source artifacts, document context, and
 metadata templates through live materialization, repair, and restore. Only
 numeric fields used by the graph engine, such as edge weights and entity array
-indices, are converted to their declared numeric types.
+indices, are converted to their declared numeric types. Relationship predicates
+compare these preserved decimal literals exactly, including arbitrary precision
+coefficients and exponents. Stored floating-point weights compare using their
+shortest round-trip decimal representation, so `/weight = 0.1` matches a stored
+`f64` weight of `0.1` without exposing binary rounding through a wider float.
+A distinct literal such as `1.5000000000000001` still differs from `1.5`.
+Comparison borrows digit views and never allocates big integers or expands
+exponent zeros; its work is linear in the input number lengths.
 
 Artifact materialization and restore pages retain at most 2048 relation items
 or 4 MiB of materialized writes. Byte accounting includes the mutation struct,
