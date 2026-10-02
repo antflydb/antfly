@@ -2110,7 +2110,16 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"index_layout\":\"native_index_catalog_pages\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"index_layout\":\"lsm") == null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"index_namespace\":\"__antfly_lite\"") != null);
-    const expected_format_version = try std.fmt.allocPrint(alloc, "\"format_version\":{d}", .{(try antfly.lite.native.inspect(alloc, std.testing.io, src_path)).format_version});
+    const format_version = blk: {
+        // Simulate the allocator's exclusive file lock. Handle status must
+        // remain available without opening a competing external reader.
+        var held = try std.Io.Dir.cwd().openFile(std.testing.io, src_path, .{ .mode = .read_write, .lock = .exclusive });
+        defer held.close(std.testing.io);
+        const guard = public.enterHandle(src_handle, .read) orelse return error.InvalidHandle;
+        defer guard.leave();
+        break :blk guard.handle.owned_lite_backend.?.storageStatus().format_version.?;
+    };
+    const expected_format_version = try std.fmt.allocPrint(alloc, "\"format_version\":{d}", .{format_version});
     defer alloc.free(expected_format_version);
     try std.testing.expect(std.mem.indexOf(u8, status_json, expected_format_version) != null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"page_size\":4096") != null);

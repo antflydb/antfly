@@ -94,6 +94,36 @@ seam and published through durable graph replay; unit and chunk variants both
 retain the survivor after replay and reopen. HA fixtures check both successful
 acknowledgement cleanup/reopen and retained outboxes after failed acknowledgement.
 
+The next fresh review identified two independent entity-rewrite deadlocks.
+Rewrite now acquires DB apply before graph publication, both initially and after
+catch-up, following the primary publisher lock hierarchy. Its regression probes
+that hierarchy at both admission points. After the local commit and HA append,
+the shared replication mutation lease is released before remote durability waits;
+the acknowledgement fixture must acquire exclusive seed-capture admission before
+it can complete, and still verifies acknowledged/failed outbox retirement.
+
+Multi-owner preparation retains one incrementally extended contender overlay.
+Bucket identities are owned independently of replaceable payloads. Each owner's
+reconciliation and parsed JSON use reclaimable scratch storage, while only final
+commit effects survive. TTL due-record membership uses indexed sets instead of
+repeated mutation scans. A 64-owner regression bounds overlay examinations by a
+linear function of owner count and verifies both rewritten adjacency and producer
+deletion. This establishes work growth, not a measured latency speedup.
+
+The C ABI Lite fixture also reads its format version through the open handle.
+It holds an exclusive data-file lock during that read, deterministically proving
+that status does not reopen the file as a competing external reader. The focused
+C ABI test, all 37 resolver runtime tests, and all 16 graph TTL tests pass in Debug
+with no leaks.
+
+The lock-order and HA acknowledgement regressions passed 200/200 fresh Debug
+processes (400 test executions), split across two local lanes using
+`scripts/ci/zig_vopr_soak.py`'s bounded process runner. There were no skips,
+failures, leaks, or retries. The deterministic 64-owner work-bound fixture is
+qualified separately; it is not included in that admission soak. The soak
+preceded the final resolver-only scratch-allocation cleanup, which does not
+change either admission fixture's exercised path.
+
 Aggregate test ownership is audited against the original selected union. The
 shared module gates own their contract tests; implementation gates receive
 explicit runtime dependencies and exclude only tests executed by another gate.
