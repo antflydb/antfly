@@ -203,6 +203,7 @@ echo "logs: ${build_log}" >&2
 echo "rss:  ${timeline}" >&2
 
 while kill -0 "${build_pid}" 2>/dev/null; do
+    sample_id="$((sample_id + 1))"
     now="$(date +%s)"
     elapsed="$((now - start_epoch))"
 
@@ -213,8 +214,8 @@ while kill -0 "${build_pid}" 2>/dev/null; do
         cmd="$(ps -o command= -p "${pid}" 2>/dev/null | tr '\t' ' ' || true)"
         rss_mb="$(rss_mb_from_kb "${rss_kb}")"
 
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${elapsed}" "${pid}" "${rss_kb}" "${rss_mb}" "${cmd}" \
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${elapsed}" "${pid}" "${rss_kb}" "${rss_mb}" "${cmd}" "${sample_id}" \
             >> "${timeline}"
 
         if [ "${rss_kb}" -gt "${max_rss_kb}" ]; then

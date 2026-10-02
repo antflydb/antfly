@@ -1663,6 +1663,13 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    runtime_build.addX86Kernels(
+        b,
+        linalg_tests.root_module,
+        b.path(b.pathJoin(&.{ shared_lib_root, "lib/linalg" })),
+        target,
+        optimize,
+    );
     const run_linalg_tests = b.addRunArtifact(linalg_tests);
     const linalg_test_step = b.step("test-linalg", "Run linalg tests");
     linalg_test_step.dependOn(&run_linalg_tests.step);

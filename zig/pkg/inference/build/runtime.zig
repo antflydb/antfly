@@ -303,6 +303,14 @@ pub fn create(config: Config) Graph {
         .optimize = optimize,
     });
 
+    addX86Kernels(
+        b,
+        inference_linalg_mod,
+        b.path(pathJoin(b, paths.shared_lib_root, "lib/linalg")),
+        target,
+        optimize,
+    );
+
     const inference_audio_mod = addOrCreateModule(b, config.register_public_modules, "inference_audio", .{
         .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/audio/src/mod.zig")),
         .target = target,
@@ -777,4 +785,24 @@ fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.
 fn pathJoin(b: *std.Build, root: []const u8, relative_path: []const u8) []const u8 {
     if (root.len == 0) return relative_path;
     return b.fmt("{s}/{s}", .{ root, relative_path });
+}
+
+/// Keep optional ISA instructions in a distinct object. Importers remain
+/// baseline compatible, including GNU/musl, static binaries, and PIC users.
+pub fn addX86Kernels(b: *std.Build, module: *std.Build.Module, root: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    if (target.result.os.tag != .linux or target.result.cpu.arch != .x86_64) return;
+    var query = target.query;
+    query.cpu_model = .baseline;
+    query.cpu_features_add = std.Target.x86.featureSet(&.{ .avx, .avx2, .fma, .f16c });
+    query.cpu_features_sub = .empty;
+    const object = b.addObject(.{
+        .name = "antfly-linalg-avx2",
+        .root_module = b.createModule(.{
+            .root_source_file = root.path(b, "src/x86_avx2.zig"),
+            .target = b.resolveTargetQuery(query),
+            .optimize = optimize,
+            .pic = true,
+        }),
+    });
+    module.addObject(object);
 }

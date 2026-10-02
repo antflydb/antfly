@@ -5,6 +5,7 @@
 //! owns pairing, independent output/token validation, resource supervision,
 //! and the evidence report. This binary never claims serving qualification.
 const std = @import("std");
+const linalg = @import("inference_linalg");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const inference = @import("inference_internal");
@@ -142,9 +143,16 @@ fn parseArgs(init: std.process.Init) !Options {
         const next = args.next() orelse return error.MissingBenchmarkArgument;
         if (std.mem.eql(u8, arg, "--model-dir")) options.model_dir = next else if (std.mem.eql(u8, arg, "--cases")) options.cases_path = next else if (std.mem.eql(u8, arg, "--threads")) options.threads = try std.fmt.parseInt(usize, next, 10) else if (std.mem.eql(u8, arg, "--batch-size")) options.batch_size = try std.fmt.parseInt(usize, next, 10) else if (std.mem.eql(u8, arg, "--timeout-ms")) options.timeout_ms = try std.fmt.parseInt(u64, next, 10) else if (std.mem.eql(u8, arg, "--max-commands")) options.max_commands = try std.fmt.parseInt(usize, next, 10) else return error.UnknownBenchmarkArgument;
     }
-    if (options.model_dir.len == 0 or options.cases_path.len == 0 or options.threads == 0 or options.threads > 32 or options.timeout_ms == 0 or options.timeout_ms > 60000 or options.max_commands == 0 or options.max_commands > 4096) return error.InvalidBenchmarkOptions;
+    if (options.model_dir.len == 0 or options.cases_path.len == 0 or options.threads == 0 or options.threads > 32 or options.timeout_ms == 0 or options.timeout_ms > 300000 or options.max_commands == 0 or options.max_commands > 4096) return error.InvalidBenchmarkOptions;
     if (options.batch_size == 0 or options.batch_size > 64 or (!on_cuda and options.batch_size != 1)) return error.InvalidBenchmarkOptions;
-    if (!build_options.enable_system_blas and options.threads != 1) return error.BenchmarkThreadControlUnavailable;
+    if (!build_options.enable_system_blas) {
+        if (comptime on_cuda or !linalg.x86.enabled) {
+            if (options.threads != 1) return error.BenchmarkThreadControlUnavailable;
+            return options;
+        }
+        if (options.threads > 8) return error.BenchmarkThreadControlUnavailable;
+        if (linalg.pool.cachedCpuCount() != options.threads) return error.InvalidBenchmarkThreadControl;
+    }
     return options;
 }
 fn verifyThreadEnvironment(a: Allocator, threads: usize) !void {
@@ -195,10 +203,14 @@ pub fn main(init: std.process.Init) !void {
     try verifyBytes(fixture.model_files.@"model.safetensors", reader.file_bytes);
     var store = try loadWeights(a, &reader, config.backbone);
     defer store.deinitOwned();
-    // Avoid a second native worker pool: BLAS alone owns the requested dense
-    // math thread budget. Without BLAS only the explicit one-thread profile is
-    // admitted. Default Io otherwise creates platform-dependent parallelism.
-    var backend = if (on_cuda) try inference.native_compute.cuda.CudaCompute.init(a) else native.NativeCompute.initWithIo(a, &store, null, std.Io.Threaded.global_single_threaded.io());
+    // BLAS owns its math pool. Pure native math uses one bounded caller-owned
+    // Io pool, shared by every projection and attention operation.
+    var math_io = std.Io.Threaded.init(a, .{
+        .async_limit = .limited(options.threads - 1),
+        .concurrent_limit = .limited(options.threads - 1),
+    });
+    defer math_io.deinit();
+    var backend = if (on_cuda) try inference.native_compute.cuda.CudaCompute.init(a) else native.NativeCompute.initWithIo(a, &store, null, if (build_options.enable_system_blas or options.threads == 1) std.Io.Threaded.global_single_threaded.io() else math_io.io());
     defer backend.deinit();
     if (comptime on_cuda) {
         if (backend.kernels.gliner25_boundary_f32 == null) return error.CudaKernelUnavailable;
@@ -215,7 +227,7 @@ pub fn main(init: std.process.Init) !void {
     var stdout_buffer: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(init.io, &stdout_buffer);
     const cases_digest = hash(bytes);
-    try emit(a, &stdout.interface, .{ .event = "ready", .batch_size = options.batch_size, .arm = "native", .scope = scope, .cuda_runtime = if (on_cuda) .{ .device_name = backend.ctx.info.nameSlice(), .driver_version = backend.ctx.info.driver_version, .compute_major = backend.ctx.info.compute_major, .compute_minor = backend.ctx.info.compute_minor } else null, .backend = if (on_cuda) "cuda" else "native", .synchronization_policy = if (on_cuda) "cuda_stream_before_start_and_after_extract_v1" else "synchronous_cpu_v1", .timing_boundary = timing_boundary, .model = fixture.model, .model_id = fixture.model_id, .revision = fixture.revision, .model_files = fixture.model_files, .cases_sha256 = cases_digest[0..], .build_mode = @tagName(builtin.mode), .zig_version = builtin.zig_version_string, .threads = options.threads, .scheduler = "serial_io", .system_blas = build_options.enable_system_blas, .dtype = "float32", .qualification = false });
+    try emit(a, &stdout.interface, .{ .event = "ready", .batch_size = options.batch_size, .arm = "native", .scope = scope, .cuda_runtime = if (on_cuda) .{ .device_name = backend.ctx.info.nameSlice(), .driver_version = backend.ctx.info.driver_version, .compute_major = backend.ctx.info.compute_major, .compute_minor = backend.ctx.info.compute_minor } else null, .backend = if (on_cuda) "cuda" else "native", .synchronization_policy = if (on_cuda) "cuda_stream_before_start_and_after_extract_v1" else "synchronous_cpu_v1", .timing_boundary = timing_boundary, .model = fixture.model, .model_id = fixture.model_id, .revision = fixture.revision, .model_files = fixture.model_files, .cases_sha256 = cases_digest[0..], .build_mode = @tagName(builtin.mode), .zig_version = builtin.zig_version_string, .threads = options.threads, .scheduler = if (on_cuda or build_options.enable_system_blas or options.threads == 1) "serial_io" else "bounded_io", .x86_kernel = if (linalg.x86.enabled) @tagName(linalg.x86.selected()) else null, .effective_cpu_threads = linalg.pool.cachedCpuCount(), .system_blas = build_options.enable_system_blas, .dtype = "float32", .qualification = false });
     var stdin_buffer: [4096]u8 = undefined;
     var stdin = std.Io.File.stdin().readerStreaming(init.io, &stdin_buffer);
     var count: usize = 0;

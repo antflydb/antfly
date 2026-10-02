@@ -239,6 +239,34 @@ previous claims.
 | CLI | 1.25 GiB | 2 GiB |
 | Enrichment | 0.80 GiB | 2 GiB |
 
+### October macOS compile-memory follow-up
+
+The baseline Linux GNU reservations above remain scoped to their measured
+profile. macOS reservations now provision 28 GiB for storage, 14 GiB for API,
+20 GiB for inference, and 4 GiB for CLI. The storage claim covers the reported
+22–23 GB peak with at least 25% headroom. The other increases are provisional
+headroom over claims reported as exceeded, **not new measured peaks**. No CPU
+kernel or Accelerate behavior changes with these scheduling reservations.
+
+Re-measure each affected unit with empty caches and `-j1` on the affected host
+and product profile. Then validate concurrent admission on a 48 GiB host with
+at least 8 GiB left outside the build budget. Do not extrapolate the historical
+Linux measurements to a different target, optimization mode, or backend set.
+
+`diagnose-zig-build-memory.sh` now assigns each polling pass a sample ID.
+Summarize its trace with:
+
+```sh
+python3 scripts/summarize_zig_compile_memory.py /tmp/build.rss.tsv \
+  --output /tmp/build.units.json
+```
+
+The report retains per-unit peak commands, recommends whole-GiB reservations
+with 25% headroom, and reports the sampled aggregate compiler RSS. Legacy
+six-column traces produce an explicitly approximate aggregate upper envelope.
+Sampling can miss short-lived peaks; retain raw traces and build provenance.
+Final reservation qualification still requires fresh cold-build evidence.
+
 ### C API composition
 
 `libantfly` links the sectioned PIC storage and enrichment artifacts, plus the
