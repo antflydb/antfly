@@ -87,10 +87,10 @@ pub fn runPair(b: *std.Build, consumer: Artifact, implementation: *std.Build.Ste
         audit.addFileArg(inventory.captureStdErr(.{}));
     }
     const implementation_run = @import("../../../build_support/antfly/test_support.zig").addFilteredTestRunArtifactWithRuntimeFilters(b, implementation, consumer.object.filters);
-    implementation_run.addArg("--allow-empty-test-filter");
+    implementation_run.addArgs(&.{ "--allow-empty-test-filter", "--allow-empty-owner" });
     implementation_run.step.dependOn(&audit.step);
     const consumer_run = consumer.run(b);
-    consumer_run.addArg("--allow-empty-test-filter");
+    consumer_run.addArgs(&.{ "--allow-empty-test-filter", "--allow-empty-owner" });
     consumer_run.step.dependOn(&implementation_run.step);
     return consumer_run;
 }

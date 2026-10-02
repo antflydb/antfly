@@ -39,6 +39,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     var suite_include_filters: std.ArrayList([]const u8) = .empty;
     var exclude_filters: std.ArrayList([]const u8) = .empty;
     var allow_empty_test_filter = false;
+    var allow_empty_owner = false;
     var list_tests = false;
     var require_no_skips = false;
     var timeout_ms: ?u64 = null;
@@ -67,6 +68,9 @@ pub fn main(init: std.process.Init.Minimal) void {
             appendFilter(arena, "--skip-test-filter", &exclude_filters, args[i]);
         } else if (std.mem.eql(u8, arg, "--allow-empty-test-filter")) {
             allow_empty_test_filter = true;
+        } else if (std.mem.eql(u8, arg, "--allow-empty-owner")) {
+            // Only source-owner orchestration supplies this after union validation.
+            allow_empty_owner = true;
         } else if (std.mem.eql(u8, arg, "--list-tests")) {
             list_tests = true;
         } else if (std.mem.eql(u8, arg, "--require-no-skips")) {
@@ -116,7 +120,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         std.process.exit(1);
     }
     if (total_count == 0) {
-        if (allow_empty_test_filter and !require_no_skips) {
+        if (allow_empty_test_filter and (allow_empty_owner or list_tests or !require_no_skips)) {
             return;
         }
         std.debug.print("test selection matched no runnable tests\n", .{});

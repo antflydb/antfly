@@ -69,10 +69,16 @@ class TestRunnerSelection(unittest.TestCase):
         )
 
     def test_required_execution_rejects_skips_but_inventory_still_lists(self):
-        for required, expected in ((False, 0), (True, 1)):
+        for required, owner, expected in (
+            (False, False, 0),
+            (True, False, 1),
+            (True, True, 1),
+        ):
             args = [str(self.binary), "--test-filter", "environment unavailable"]
             if required:
                 args.append("--require-no-skips")
+            if owner:
+                args.extend(("--allow-empty-test-filter", "--allow-empty-owner"))
             result = subprocess.run(args, text=True, capture_output=True, timeout=5)
             self.assertEqual(result.returncode, expected, result.stderr)
             self.assertIn("1 skipped", result.stderr)

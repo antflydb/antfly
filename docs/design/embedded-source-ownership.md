@@ -69,12 +69,17 @@ local test partition alongside each server consumer that owns local tests.
 `test_partitions.zig` discovers the local roots referenced by the server test
 surface, clones its configured module graph, and makes the local catalog the
 main compilation module. Late-bound options and fixture type identity are shared
-within that graph. Compiler filters are retained.
+within that graph. Compiler filters are retained. Control-only profiles omit inactive
+physical DB imports; generation-publication tests belong to the physical owner,
+including the portable lifecycle helpers borrowed by control facades.
 
 Runtime selection and ownership audits see the union of both inventories before
 execution. A filter can match either owner, while missing filters, empty runnable
 selections and duplicate ownership still fail. Explicitly allowed empty selections
-retain their existing behavior. Calling finalization twice does not duplicate
+retain their existing behavior. Once the union is validated, an individual owner
+may be empty even under `--require-no-skips`; selected tests still cannot skip.
+Inventory listing includes both owners and never treats listing as execution.
+Calling finalization twice does not duplicate
 partitions or inventories. Small real-build fixtures cover these contracts in
 `tools/test_local_test_partitions.py`; the normal product suites exercise the
 actual local/server fixture graph.

@@ -141,6 +141,9 @@ pub fn build(b: *std.Build) void {
         self.assertIn("server owned...", self.build("--test-filter", "server owned"))
         output = self.build("--test-filter", "missing", succeeds=False)
         self.assertIn("test filter matched no declared tests", output)
+        self.assertIn("local owned...", self.build("--test-filter=local owned"))
+        output = self.build("--test-filter=missing", succeeds=False)
+        self.assertIn("test filter matched no declared tests", output)
 
     def test_script_wrapper_runs_both_owners_and_audits_selection(self):
         options = ("-Dwrapper=true",)
@@ -157,8 +160,63 @@ pub fn build(b: *std.Build) void {
         self.assertIn("server owned...", output)
         self.assertNotIn("local owned...", output)
 
+    def test_control_profile_ignores_inactive_physical_imports(self):
+        catalog = self.root / "pkg/antfly-embedded/src/local/source_catalog.zig"
+        catalog.write_text(
+            catalog.read_text()
+            + '\n pub const physical = @import("physical.zig");\n'
+            + 'pub const storage_db_generation_lifecycle = @import("lifecycle.zig");\n'
+        )
+        self.write(
+            "pkg/antfly-embedded/src/local/physical.zig",
+            """const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
+test "physical owned" { _ = DB; }
+""",
+        )
+        self.write(
+            "pkg/antfly-embedded/src/local/lifecycle.zig",
+            'test "physical lifecycle owned" {}\n',
+        )
+        fixture = self.root / "pkg/antfly/src/fixture.zig"
+        fixture.write_text(
+            fixture.read_text()
+            + """
+pub const antfly_sources = struct { pub const physical_db = struct {}; };
+test {
+    if (!@import("storage_source_options").control_only)
+        _ = @import("antfly_local_sources").physical;
+    _ = @import("antfly_local_sources").storage_db_generation_lifecycle;
+}
+"""
+        )
+        build = self.root / "build.zig"
+        build.write_text(
+            build.read_text().replace(
+                "    owner.attach(root);",
+                """    const storage = b.addOptions();
+    storage.addOption(bool, "control_only", true);
+    root.addOptions("storage_source_options", storage);
+    owner.attach(root);""",
+            )
+        )
+        output = self.build()
+        self.assertIn("server owned...", output)
+        self.assertIn("local owned...", output)
+        self.assertNotIn("physical owned...", output)
+        self.assertNotIn("physical lifecycle owned...", output)
+
+    def test_strict_execution_accepts_empty_owner_and_listing_keeps_both(self):
+        for name in ("server owned", "local owned"):
+            output = self.build("--test-filter", name, "--require-no-skips")
+            self.assertIn(name + "...", output)
+        output = self.build("--list-tests", "--require-no-skips")
+        self.assertEqual(output.count("TEST\tlocal.test.local owned"), 1, output)
+        self.assertEqual(output.count("TEST\tfixture.test.server owned"), 1, output)
+
     def test_union_rejects_all_skipped_and_honors_explicit_empty(self):
         output = self.build("--skip-test-filter", "owned", succeeds=False)
+        self.assertIn("test selection matched no runnable tests", output)
+        output = self.build("--skip-test-filter=owned", succeeds=False)
         self.assertIn("test selection matched no runnable tests", output)
         self.build("--test-filter", "missing", "--allow-empty-test-filter")
 

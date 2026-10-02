@@ -55,6 +55,72 @@ fn cloneModule(b: *std.Build, original: *std.Build.Module, copies: *std.AutoHash
 var source_texts: std.StringHashMapUnmanaged([]const u8) = .empty;
 var selected_names: std.AutoHashMapUnmanaged(*std.Build.Module, []const []const u8) = .empty;
 
+var physical_sources: std.StringHashMapUnmanaged(bool) = .empty;
+
+fn controlOnly(consumer: *std.Build.Module) bool {
+    const module = consumer.import_table.get("storage_source_options") orelse return false;
+    const path = module.root_source_file orelse return false;
+    if (path != .generated) return false;
+    const options = path.generated.file.step.cast(std.Build.Step.Options) orelse return false;
+    return std.mem.indexOf(u8, options.contents.items, "control_only: bool = true;") != null;
+}
+
+fn sourceText(b: *std.Build, path: []const u8) ?[]const u8 {
+    if (source_texts.get(path)) |text| return text;
+    const text = std.Io.Dir.cwd().readFileAlloc(b.graph.io, path, b.allocator, .limited(64 * 1024 * 1024)) catch return null;
+    source_texts.put(b.allocator, path, text) catch @panic("OOM");
+    return text;
+}
+
+/// An inactive server branch is not a physical test owner. Do not turn its
+/// lexical imports into DB tests in a control-only compilation. The selected
+/// facade remains a control contract; it deliberately does not resolve DB.
+fn requiresPhysical(b: *std.Build, path: []const u8) bool {
+    if (physical_sources.get(path)) |value| return value;
+    const local = b.path("pkg/antfly-embedded/src/local").getPath(b);
+    var pending: std.ArrayList([]const u8) = .empty;
+    pending.append(b.allocator, path) catch @panic("OOM");
+    var seen = std.StringHashMap(void).init(b.allocator);
+    var index: usize = 0;
+    const result = search: while (index < pending.items.len) : (index += 1) {
+        const current = pending.items[index];
+        if (!std.mem.startsWith(u8, current, local)) continue;
+        if (std.mem.endsWith(u8, current, "/storage/db/selected_root.zig")) continue;
+        if ((seen.getOrPut(current) catch @panic("OOM")).found_existing) continue;
+        if (physical_sources.get(current)) |value| {
+            if (value) break :search true;
+            continue;
+        }
+        const text = sourceText(b, current) orelse continue;
+        if (std.mem.indexOf(u8, text, ".antfly_sources.physical_db") != null) break :search true;
+        var cursor: usize = 0;
+        const marker = "@import(\"";
+        while (std.mem.indexOfPos(u8, text, cursor, marker)) |offset| {
+            const start = offset + marker.len;
+            const end = std.mem.indexOfScalarPos(u8, text, start, '\"') orelse break;
+            const relative = text[start..end];
+            if (std.mem.endsWith(u8, relative, ".zig")) {
+                const dependency = std.fs.path.resolve(b.allocator, &.{ std.fs.path.dirname(current).?, relative }) catch @panic("OOM");
+                pending.append(b.allocator, dependency) catch @panic("OOM");
+            }
+            cursor = end + 1;
+        }
+    } else false;
+    physical_sources.put(b.allocator, path, result) catch @panic("OOM");
+    return result;
+}
+
+fn physicalName(b: *std.Build, name: []const u8) bool {
+    const catalog = b.path("pkg/antfly-embedded/src/local/source_catalog.zig").getPath(b);
+    const text = sourceText(b, catalog) orelse return false;
+    const marker = b.fmt("pub const {s} = @import(\"", .{name});
+    const offset = std.mem.indexOf(u8, text, marker) orelse return false;
+    const start = offset + marker.len;
+    const end = std.mem.indexOfScalarPos(u8, text, start, '\"') orelse return false;
+    const path = std.fs.path.resolve(b.allocator, &.{ std.fs.path.dirname(catalog).?, text[start..end] }) catch @panic("OOM");
+    return requiresPhysical(b, path);
+}
+
 fn localNames(b: *std.Build, consumer: *std.Build.Module) []const []const u8 {
     if (selected_names.get(consumer)) |names| return names;
     const source = consumer.root_source_file orelse return &.{};
@@ -70,11 +136,7 @@ fn localNames(b: *std.Build, consumer: *std.Build.Module) []const []const u8 {
         if ((seen.getOrPut(path) catch @panic("OOM")).found_existing) continue;
         const base = std.fs.path.basename(path);
         if (std.mem.eql(u8, base, "local_test_sources.zig") or std.mem.startsWith(u8, base, "source_owner_")) continue;
-        const text = source_texts.get(path) orelse blk: {
-            const contents = std.Io.Dir.cwd().readFileAlloc(b.graph.io, path, b.allocator, .limited(64 * 1024 * 1024)) catch continue;
-            source_texts.put(b.allocator, path, contents) catch @panic("OOM");
-            break :blk contents;
-        };
+        const text = sourceText(b, path) orelse continue;
         const marker = "@import(\"antfly_local_sources\").";
         var cursor: usize = 0;
         while (std.mem.indexOfPos(u8, text, cursor, marker)) |offset| {
@@ -97,7 +159,15 @@ fn localNames(b: *std.Build, consumer: *std.Build.Module) []const []const u8 {
             cursor = end + 1;
         }
     }
-    const result = b.allocator.dupe([]const u8, names.keys()) catch @panic("OOM");
+    var selected: std.ArrayList([]const u8) = .empty;
+    for (names.keys()) |name| {
+        // Generation publication is exercised by the physical DB owner, including
+        // its portable helpers. A control facade borrows it without owning tests.
+        if (controlOnly(consumer) and (physicalName(b, name) or
+            std.mem.eql(u8, name, "storage_db_generation_lifecycle"))) continue;
+        selected.append(b.allocator, name) catch @panic("OOM");
+    }
+    const result = selected.toOwnedSlice(b.allocator) catch @panic("OOM");
     selected_names.put(b.allocator, consumer, result) catch @panic("OOM");
     return result;
 }
@@ -223,7 +293,7 @@ pub fn add(b: *std.Build) void {
     for (b.top_level_steps.values()) |top| collect(&top.step, &runs, &visited, b.allocator);
     for (runs.items) |run| {
         if ((processed.getOrPut(b.allocator, run) catch @panic("OOM")).found_existing) continue;
-        if (hasArg(run, "--list-tests")) continue;
+        if (hasArg(run, "--list-tests") and run.captured_stderr != null) continue;
         // Artifact references in inventory/audit commands are not test runs.
         if (run.producer == null and !hasArg(run, "--executable")) continue;
         const executable = producer(run) orelse continue;
@@ -239,6 +309,7 @@ pub fn add(b: *std.Build) void {
             for (run.argv.items) |arg| if (arg == .bytes) child.addArg(arg.bytes);
         }
         allowEmpty(child);
+        child.addArg("--allow-empty-owner");
         const tests = testObject(executable).?;
         if (tests.test_runner != null and tests.test_runner.?.mode == .simple) {
             const audit = b.addSystemCommand(&.{"python3"});
@@ -246,12 +317,19 @@ pub fn add(b: *std.Build) void {
             audit.addFileArg(b.path("tools/audit_test_selection.py"));
             if (allow_empty) audit.addArg("--allow-empty");
             var i: usize = 0;
-            while (i + 1 < run.argv.items.len) : (i += 1) {
+            while (i < run.argv.items.len) : (i += 1) {
                 const arg = run.argv.items[i];
                 if (arg != .bytes) continue;
-                const flag = if (std.mem.eql(u8, arg.bytes, "--test-filter")) "--filter" else if (std.mem.eql(u8, arg.bytes, "--skip-test-filter")) "--skip-filter" else continue;
-                const value = run.argv.items[i + 1];
-                if (value == .bytes) audit.addArgs(&.{ flag, value.bytes });
+                if (std.mem.startsWith(u8, arg.bytes, "--test-filter=")) {
+                    audit.addArgs(&.{ "--filter", arg.bytes["--test-filter=".len..] });
+                } else if (std.mem.startsWith(u8, arg.bytes, "--skip-test-filter=")) {
+                    audit.addArgs(&.{ "--skip-filter", arg.bytes["--skip-test-filter=".len..] });
+                } else {
+                    const flag = if (std.mem.eql(u8, arg.bytes, "--test-filter")) "--filter" else if (std.mem.eql(u8, arg.bytes, "--skip-test-filter")) "--skip-filter" else continue;
+                    i += 1;
+                    if (i >= run.argv.items.len or run.argv.items[i] != .bytes) @panic("missing test filter value");
+                    audit.addArgs(&.{ flag, run.argv.items[i].bytes });
+                }
             }
             for ([_]*std.Build.Step.Compile{ executable, local }) |artifact| {
                 const inv = inventory(b, artifact, run);
@@ -259,6 +337,7 @@ pub fn add(b: *std.Build) void {
                 audit.addFileArg(inv.captureStdErr(.{}));
             }
             allowEmpty(run);
+            run.addArg("--allow-empty-owner");
             child.step.dependOn(&audit.step);
         }
         run.step.dependOn(&child.step);
