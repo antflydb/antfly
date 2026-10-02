@@ -227,6 +227,8 @@ pub const VersionPredicate = struct {
     key: []const u8,
     expected_version: u64 = 0, // 0 = key must not exist
     expected_content_digest: ?[32]u8 = null,
+    /// A server-authored INSERT identity constraint, rather than an observed read.
+    unique_absence: bool = false,
     /// Internal integrity records are raw metadata, not timestamped primary
     /// rows. Their CAS compares complete bytes and retains the same shared
     /// dependency guard as a document predicate. NULL means absent, not empty.
@@ -1909,11 +1911,12 @@ pub const TxnManager = struct {
     ) !void {
         var relational_primary: ?bool = null;
         for (predicates) |pred| {
+            if (pred.unique_absence and (pred.comparison != .document_version or pred.expected_version != 0)) return error.InvalidArgument;
             switch (pred.comparison) {
                 .document_version => {
                     const current_ts = try self.readTimestamp(pred.key);
                     if (pred.expected_version == 0) {
-                        if (current_ts != null) return TxnError.VersionConflict;
+                        if (current_ts != null) return if (pred.unique_absence) error.UniqueConstraintViolation else TxnError.VersionConflict;
                     } else {
                         const ts = current_ts orelse return TxnError.VersionConflict;
                         if (ts != pred.expected_version) return TxnError.VersionConflict;
@@ -3931,6 +3934,14 @@ test "version predicate conflict" {
         .{ .key = "existing_key", .expected_version = 0 },
     });
     try std.testing.expectError(TxnError.VersionConflict, result1);
+
+    try std.testing.expectError(error.UniqueConstraintViolation, mgr.writeIntents(txn_id, &.{
+        .{ .key = "existing_key", .value = "new_value" },
+    }, &.{.{ .key = "existing_key", .expected_version = 0, .unique_absence = true }}));
+    try std.testing.expectError(error.InvalidArgument, mgr.checkVersionPredicates(
+        &.{.{ .key = "existing_key", .expected_version = 5000, .unique_absence = true }},
+        null,
+    ));
 
     // Predicate: wrong version — should conflict
     const result2 = mgr.writeIntents(txn_id, &.{

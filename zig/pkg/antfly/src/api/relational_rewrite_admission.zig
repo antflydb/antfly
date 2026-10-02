@@ -131,6 +131,10 @@ const SourceSchemas = struct {
 /// leader-fenced read only. No source pins, parent schema writes, or hidden
 /// roots may be created until the returned plan is atomically admitted.
 pub fn build(alloc: std.mem.Allocator, id: stages.Id, selected: []const records.TableRecord, all_ranges: []const records.RangeRecord, table_name: []const u8, proposed: []const u8, observer: anytype) !stages.Plan {
+    return buildWithPolicies(alloc, id, selected, all_ranges, table_name, proposed, observer, .{});
+}
+
+pub fn buildWithPolicies(alloc: std.mem.Allocator, id: stages.Id, selected: []const records.TableRecord, all_ranges: []const records.RangeRecord, table_name: []const u8, proposed: []const u8, observer: anytype, policies: @import("../storage/db/relational_row_transform.zig").Policies) !stages.Plan {
     // Source ownership must stay fixed throughout the rewrite cohort. Check
     // every member before issuing any source reads or admitting a durable job.
     for (selected) |table| if (table.storage_migration != null) return error.TableTransitionActive;
@@ -215,14 +219,15 @@ pub fn build(alloc: std.mem.Allocator, id: stages.Id, selected: []const records.
         const source_schemas = source_manifest.definitions.items;
         schema_bytes +|= source_manifest.bytes +| table.schema_json.len +| table.read_schema_json.len +| table.indexes_json.len;
         if (schema_bytes > @import("../storage/db/relational_rewrite_contract.zig").max_schema_bytes) return error.RelationalRewriteBudgetExceeded;
+        const target_policies: @import("../storage/db/relational_row_transform.zig").Policies = if (std.mem.eql(u8, before.name, table_name)) policies else .{};
         var programs = if (document)
             try @import("../storage/db/relational_rewrite_program.zig").ProgramSet.initDocumentPreservationWithRead(alloc, active, read)
         else
-            try @import("../storage/db/relational_rewrite_program.zig").ProgramSet.init(alloc, source_schemas, table.schema_json, .{});
+            try @import("../storage/db/relational_rewrite_program.zig").ProgramSet.init(alloc, source_schemas, table.schema_json, target_policies);
         defer programs.deinit();
         table.table_id = table_id;
         table.min_ranges = @intCast(ranges.len);
-        target.* = .{ .source_table_id = before.table_id, .table = table, .ranges = ranges, .generation_handoffs = handoffs, .rewrite = .{ .preserve_document = document, .source_schemas = source_schemas, .target_schema = table.schema_json, .target_read_schema = if (document) table.read_schema_json else "", .program_digest = programs.identity }, .rewrite_sources = scopes, .replace = .{ .table = try metadata.cloneTable(alloc, before), .ranges = original_ranges.items, .fences = fences } };
+        target.* = .{ .source_table_id = before.table_id, .table = table, .ranges = ranges, .generation_handoffs = handoffs, .rewrite = .{ .preserve_document = document, .default_columns = target_policies.default_columns, .allow_column_drops = !document and target_policies.dropped_columns == .allow, .source_schemas = source_schemas, .target_schema = table.schema_json, .target_read_schema = if (document) table.read_schema_json else "", .program_digest = programs.identity }, .rewrite_sources = scopes, .replace = .{ .table = try metadata.cloneTable(alloc, before), .ranges = original_ranges.items, .fences = fences } };
     }
     try stages.prepareEmptyGenerationHandoffMappingsAlloc(alloc, targets);
     var result: stages.Plan = .{ .id = id, .cohort_digest = @splat(0), .targets = targets, .preparing_sources = true };
@@ -289,8 +294,16 @@ test "distributed txn rewrite admission closes current and historical dependenci
     var observer = Observer{ .tables = &tables, .alloc = alloc };
     const plan = try build(alloc, try stages.idForAttempt(19, 1), cohort, &ranges, "parents", proposed, &observer);
     try std.testing.expect(plan.preparing_sources);
+
     try std.testing.expectEqual(@as(usize, 3), observer.calls);
     try std.testing.expectEqual(observer.calls, observer.released);
+    const proposed_with_defaults = try std.mem.replaceOwned(u8, alloc, proposed, "\"generated_columns\":", "\"column_defaults\":[{\"column\":\"x\",\"expression\":{\"op\":\"literal\",\"type\":\"integer\",\"value\":9}}],\"generated_columns\":");
+    const with_defaults = try buildWithPolicies(alloc, plan.id, cohort, &ranges, "parents", proposed_with_defaults, &observer, .{ .default_columns = &.{"x"} });
+    for (with_defaults.targets) |target| {
+        try std.testing.expectEqual(target.source_table_id == 10, target.rewrite.?.default_columns.len != 0);
+        var bound = try @import("../storage/db/relational_rewrite_program.zig").ProgramSet.initIntent(alloc, target.rewrite.?);
+        defer bound.deinit();
+    }
     const migrating = try alloc.dupe(records.TableRecord, cohort);
     migrating[migrating.len - 1].storage_migration = .{ .request = .{ .job_id = "vectors", .mode = .online } };
     const calls_before_migration = observer.calls;

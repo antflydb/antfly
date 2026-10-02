@@ -35,6 +35,7 @@ const fk_generation_publication = @import("../metadata/fk_generation_publication
 const fk_initial_retirement_wire = @import("../metadata/fk_initial_retirement_wire.zig");
 
 pub const RaftApplyStoreConfig = struct {
+    borrowed_store: ?*@import("backend_erased.zig").Store = null,
     root_dir: []const u8,
     map_size: usize = 16 * 1024 * 1024,
     no_sync: bool = false,
@@ -98,6 +99,7 @@ pub const RaftApplyStore = struct {
             .read_only = @intFromBool(cfg.read_only),
             .context = cfg.context,
             .root_dir = .fromSlice(cfg.root_dir),
+            .system_store = if (cfg.borrowed_store) |store| try @import("kernel_system_store_client.zig").nativeHandle(store) else null,
         }, &handle));
         return .{
             .alloc = alloc,

@@ -769,6 +769,23 @@ fn bindOrder(alloc: std.mem.Allocator, table: catalog.Table, statement: ast.Sele
 
 /// Shared literal/parameter coercion. Exact integer columns never pass through
 /// f64. Native number columns intentionally have IEEE-754 semantics.
+/// Native relational storage encodes timestamps as unsigned epoch nanos.
+/// Convert at the SQL boundary so projection, ordering and scalar evaluation
+/// share the same canonical datetime representation.
+pub fn coerceAlloc(alloc: std.mem.Allocator, raw: Json, kind: ast.ColumnType) !Json {
+    if (kind == .datetime and raw != .null) {
+        const datetime = @import("../datetime.zig");
+        const ns: u64 = switch (raw) {
+            .integer => |value| std.math.cast(u64, value) orelse return error.InvalidSqlDateTime,
+            .number_string => |text| std.fmt.parseInt(u64, text, 10) catch return error.InvalidSqlDateTime,
+            .string => |text| datetime.parseDateTimeToNs(text) orelse return error.InvalidSqlDateTime,
+            else => return error.SqlTypeMismatch,
+        };
+        return .{ .string = try datetime.formatDateTimeNsAlloc(alloc, ns) };
+    }
+    return coerce(raw, kind);
+}
+
 pub fn coerce(raw: Json, kind: ast.ColumnType) !Json {
     if (raw == .null) return .null;
     return switch (kind) {
@@ -1137,4 +1154,17 @@ test "SQL binding rejects generated column writes even when a predicate is prova
     var result = try describe(std.testing.allocator, fake.backend(), &read, &.{});
     defer result.deinit();
     try std.testing.expectEqualStrings("derived", result.binding.columns[result.binding.columns.len - 1].name);
+}
+
+test "SQL native timestamp coercion preserves epoch precision and canonical offsets" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const expected = "2026-01-01T00:00:00.123456789Z";
+    const ns = @import("../datetime.zig").parseDateTimeToNs(expected).?;
+    for ([_]Json{ .{ .integer = @intCast(ns) }, .{ .number_string = try std.fmt.allocPrint(a, "{d}", .{ns}) }, .{ .string = "2026-01-01T01:00:00.123456789+01:00" } }) |raw| {
+        try std.testing.expectEqualStrings(expected, (try coerceAlloc(a, raw, .datetime)).string);
+    }
+    try std.testing.expect((try coerceAlloc(a, .null, .datetime)) == .null);
+    try std.testing.expectError(error.InvalidSqlDateTime, coerceAlloc(a, .{ .integer = -1 }, .datetime));
 }

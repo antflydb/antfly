@@ -485,7 +485,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-retained-transfer-test", "Run bounded retained-frame transfer, cold resume and corruption regressions").dependOn(&addFilteredTestRunArtifact(b, retained_transfer_tests).step);
     const sql_pk_transform_tests = b.addTest(.{
         .root_module = relational_index_system_mod,
-        .filters = &.{"SQL primary-key rewrite retains a present key across nullable-to-required row mapping"},
+        .filters = &.{ "SQL primary-key rewrite retains a present key across nullable-to-required row mapping", "SQL scoped defaults" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-sql-primary-key-transform-test", "Run focused SQL primary-key native row-transform regression")
@@ -4592,8 +4592,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const standalone_policy_ha_tests = b.addTest(.{
         .root_module = standalone_policy_ha_test_mod,
         .filters = &.{
+            "standalone schema finalizer defers fenced tables",
             "native standalone policy publication installs exact owner phases and resumes after restart",
             "native HA policy publication replays metadata and owner phases and resumes after restart",
+            // These fixtures borrow the native system keyspace. Run them in
+            // the linked owner lane, where storage handle cleanup is available.
+            "system catalog imports released row journal once into native authority",
+            "system catalog borrowed journal writes bounded deltas and recovers an ambiguous sync",
+            "system catalog native authority writes bounded deltas and recovers logical bindings",
         },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 18 else 7) * 1024 * 1024 * 1024,

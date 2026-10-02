@@ -5630,7 +5630,7 @@ pub const AntflyApiHandler = struct {
             defer execution.release();
             self.preparation.release();
             self.execution_entered = true;
-            self.result = self.adapter.execute(std.heap.page_allocator, compiled, self.parameters, .{ .result_rows = self.limit, .page_rows = 4096 }, null) catch |err| {
+            self.result = self.adapter.execute(std.heap.page_allocator, compiled, self.parameters, .{ .result_rows = self.limit }, null) catch |err| {
                 self.failure = err;
                 return;
             };
@@ -5825,6 +5825,7 @@ pub const AntflyApiHandler = struct {
         _ = future.await(runtime_io);
         if (job.failure) |err| {
             const diagnostic = sql_execution.diagnostic(err);
+            if (std.mem.eql(u8, diagnostic.code, "XX000")) std.log.warn("SQL execution internal failure err={s}", .{@errorName(err)});
             if (std.mem.eql(u8, diagnostic.code, "53300")) try ctx.setHeader("Retry-After", "1");
             return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{
                 .code = sql_execution.sqlState(err),
