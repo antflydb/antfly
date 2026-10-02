@@ -29977,7 +29977,13 @@ pub const DB = struct {
         const index_spans = try self.collectIndexSpanReservations(preparation_alloc, prepared_intents, view);
         defer if (index_spans.len != 0) preparation_alloc.free(index_spans);
         try self.prepareOnlineVectorIntentBoundsLocked(preparation_alloc, prepared_intents, view);
-        try self.core.writeIntentsExtraBatch(txn_id, prepared_intents, predicates, .{
+        var guarded_predicates = std.ArrayListUnmanaged(transactions_mod.VersionPredicate).empty;
+        defer guarded_predicates.deinit(preparation_alloc);
+        try guarded_predicates.appendSlice(preparation_alloc, predicates);
+        var endpoint_dependencies = std.heap.ArenaAllocator.init(preparation_alloc);
+        defer endpoint_dependencies.deinit();
+        try self.prepareGraphEndpointDependenciesLocked(preparation_alloc, endpoint_dependencies.allocator(), txn_id, prepared_intents, view, &guarded_predicates);
+        try self.core.writeIntentsExtraBatch(txn_id, prepared_intents, guarded_predicates.items, .{
             .preparation_allocator = preparation_alloc,
             .schema_binding = .{ .version = if (view) |pinned| pinned.version() else null },
             .index_span_digests = index_spans,
@@ -30376,6 +30382,9 @@ pub const DB = struct {
         const index_spans = try self.collectIndexSpanReservations(preparation_alloc, intents.items, prepared_schema_view);
         defer if (index_spans.len != 0) preparation_alloc.free(index_spans);
         try self.prepareOnlineVectorIntentBoundsLocked(preparation_alloc, intents.items, prepared_schema_view);
+        var endpoint_dependencies = std.heap.ArenaAllocator.init(preparation_alloc);
+        defer endpoint_dependencies.deinit();
+        try self.prepareGraphEndpointDependenciesLocked(preparation_alloc, endpoint_dependencies.allocator(), txn_id, intents.items, prepared_schema_view, &predicates);
         if (row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         if (raft_entry) |identity| {
             switch (try orderedApplyDisposition(try readOrderedApplyReceipt(preparation_alloc, self.core.store), identity)) {
@@ -30471,6 +30480,80 @@ pub const DB = struct {
             alloc.free(@constCast(row));
             alloc.free(@constCast(intent.value.?));
         };
+    }
+
+    /// Endpoint deletion is a document mutation, including TTL and deletes
+    /// prepared by another transaction. Reuse the durable shared read guards
+    /// so it cannot enqueue cleanup after an inline relationship votes prepared.
+    /// The guards survive restart and are released atomically with resolution.
+    /// Fact-owned projections deliberately have an independent lifecycle.
+    fn prepareGraphEndpointDependenciesLocked(
+        self: *DB,
+        alloc: Allocator,
+        scratch: Allocator,
+        txn_id: types.TxnId,
+        intents: []const transactions_mod.WriteIntent,
+        schema_view: ?schema_registry_mod.SchemaView,
+        predicates: *std.ArrayListUnmanaged(transactions_mod.VersionPredicate),
+    ) !void {
+        if (!self.core.hasGraphIndexes()) return;
+        var manager = try self.core.initTxnManager();
+        defer manager.deinit();
+        var targets = std.StringHashMapUnmanaged(void).empty;
+        defer targets.deinit(scratch);
+        var read = try self.core.store.beginProbeTxn();
+        defer read.abort();
+        var rows = std.heap.ArenaAllocator.init(alloc);
+        defer rows.deinit();
+        const row_alloc = rows.allocator();
+        for (intents) |intent| {
+            if (isMetadataKey(intent.key)) continue;
+            const value = intent.value orelse continue;
+            defer _ = rows.reset(.retain_capacity);
+            var prepared: ?mapper.PreparedRelationalWrite = if (intent.prepared_row != null) prepared_row: {
+                const view = schema_view orelse return error.PreparedGenerationChanged;
+                break :prepared_row try mapper.PreparedRelationalWrite.initFromIntent(row_alloc, intent.key, value, view.validator(), view.tableSchema().*, view.physicalLayout(), intent.prepared_row);
+            } else null;
+            defer if (prepared) |*row| row.deinit(row_alloc);
+            var parsed: ?std.json.Parsed(std.json.Value) = if (prepared == null)
+                try std.json.parseFromSlice(std.json.Value, row_alloc, value, .{ .parse_numbers = false })
+            else
+                null;
+            defer if (parsed) |*root| root.deinit();
+            if (prepared) |*row| {
+                // AROW columns are lazy; materialize only fields consumed by
+                // graph mappings before planning durable endpoint guards.
+                for (self.core.graphIndexes()) |entry| {
+                    for (entry.edge_type_configs) |edge_cfg| {
+                        if (edge_cfg.field_name) |name| try row.requireLogicalField(name);
+                    }
+                }
+            }
+            const root = if (prepared) |*row| row.parsedValue() else parsed.?.value;
+            var extracted = if (prepared) |*row| row.takeExtracted() else try mapper.extractWriteFromParsed(row_alloc, intent.key, value, root);
+            defer extracted.deinit(row_alloc);
+            try augmentExtractedWriteWithGraphFieldEdgesParsed(self, row_alloc, intent.key, root, &extracted);
+            for (extracted.graph_writes) |edge| {
+                if (edge.owner_document.len != 0 and !std.mem.eql(u8, edge.owner_document, edge.source)) continue;
+                if (targets.contains(edge.target)) continue;
+                const target = try scratch.dupe(u8, edge.target);
+                // Request preparation owns all predicate bytes until prepare.
+                const job = try internal_keys.graphEndpointCleanupKeyAlloc(scratch, target);
+                _ = read.get(job) catch |err| switch (err) {
+                    error.NotFound => {
+                        if (!try manager.hasSharedReadDependency(txn_id, target)) {
+                            if (predicates.items.len >= transactions_mod.max_read_guards_per_transaction) return error.TransactionTooLarge;
+                            const version = (try ttl_mod.readTimestamp(self.core.store, alloc, target)) orelse 0;
+                            try predicates.append(alloc, .{ .key = target, .expected_version = version });
+                        }
+                        try targets.put(scratch, target, {});
+                        continue;
+                    },
+                    else => return err,
+                };
+                return error.IntegrityTopologyBusy;
+            }
+        }
     }
 
     /// Called under apply after row preparation. Prior reverse companions are
@@ -33914,6 +33997,15 @@ pub const DB = struct {
         return self.installIndexForReconciliation(cfg, admission_mode, null);
     }
 
+    /// Field-derived edges are part of prepared document effects. Preserve
+    /// their catalog until durable prepares resolve, including prepares made
+    /// while no graph index existed. Schema leases already survive recovery.
+    fn requireGraphCatalogMutableForTransactions(self: *DB) !void {
+        var manager = try self.core.initTxnManager();
+        defer manager.deinit();
+        if (try manager.hasSchemaLeases()) return error.SchemaInUse;
+    }
+
     fn installIndexForReconciliation(self: *DB, cfg: types.IndexConfig, admission_mode: IndexAdmissionMode, context: ?@import("artifact_reconcile_intent.zig").Context) !InstalledIndex {
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
@@ -33923,6 +34015,8 @@ pub const DB = struct {
             try self.requireArtifactReconcileUnfenced(&read, context);
             try self.requireOnlineArtifactCatalogMutableWithContextLocked(&read, context);
         }
+        if (cfg.kind == .graph or self.core.index_manager.graphIndex(cfg.name) != null)
+            try self.requireGraphCatalogMutableForTransactions();
         if (admission_mode == .managed and !indexKindSupportsManagedGenerationRepair(cfg.kind))
             return error.UnsupportedOperation;
         try self.removeOrphanedIndexRepairIntentForFreshAdmission(self.alloc, cfg.name);
@@ -35713,6 +35807,7 @@ pub const DB = struct {
             defer read.abort();
             try self.requireArtifactReconcileUnfenced(&read, context);
             try self.requireOnlineArtifactCatalogMutableWithContextLocked(&read, context);
+            if (self.core.index_manager.graphIndex(name) != null) try self.requireGraphCatalogMutableForTransactions();
         }
         self.executor.removeWorker(name);
         try self.lockApplyForPortableRuntime();
@@ -35722,6 +35817,7 @@ pub const DB = struct {
             defer read.abort();
             try self.requireArtifactReconcileUnfenced(&read, context);
             try self.requireOnlineArtifactCatalogMutableWithContextLocked(&read, context);
+            if (self.core.index_manager.graphIndex(name) != null) try self.requireGraphCatalogMutableForTransactions();
         }
         const repair_id = try self.prepareIndexRepairForDeletion(self.alloc, name);
         defer if (repair_id != null) self.endIndexRepairLease(name);
@@ -138418,6 +138514,8 @@ test "db bulk ingest primary lsm writes use direct sorted ingest batch mode" {
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtimes = false,
+        .start_index_workers = false,
         .primary_backend = .{ .lsm = .{
             .flush_threshold = 1,
             .bulk_ingest_flush_threshold_multiplier = 4,
@@ -138425,6 +138523,9 @@ test "db bulk ingest primary lsm writes use direct sorted ingest batch mode" {
     });
     defer db.close();
 
+    // Opening the owner may flush its initial durable metadata. Measure the
+    // bulk interval itself, with background maintenance suppressed.
+    const before = db.snapshotPrimaryLsmWriteStatsForTest() orelse return error.TestExpectedEqual;
     try db.beginBulkIngestSession();
     errdefer db.abortBulkIngestSession();
 
@@ -138439,8 +138540,8 @@ test "db bulk ingest primary lsm writes use direct sorted ingest batch mode" {
     });
 
     const stats = db.snapshotPrimaryLsmWriteStatsForTest() orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(u64, 0), stats.flushes);
-    try std.testing.expect(stats.sorted_ingest_runs > 0);
+    try std.testing.expectEqual(before.flushes, stats.flushes);
+    try std.testing.expect(stats.sorted_ingest_runs > before.sorted_ingest_runs);
 
     const visible_before_finish = (try db.get(alloc, "doc:bulk_lsm_d")) orelse return error.TestExpectedEqual;
     alloc.free(visible_before_finish);
@@ -151264,4 +151365,107 @@ test "db graph endpoint cleanup pages filter stale and live jobs independently" 
     defer graph_mod.GraphIndex.freeEdges(alloc, retired);
     try std.testing.expectEqual(@as(usize, 1), revived.len);
     try std.testing.expectEqual(@as(usize, 0), retired.len);
+}
+
+test "db graph endpoint cleanup pages transaction dependencies survive reopen" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("graph-prepared-endpoint");
+    defer directory.cleanup();
+    var txn_id: types.TxnId = undefined;
+    {
+        var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}" });
+        txn_id = try db.beginTransaction(21_000);
+        try db.writeTransaction(txn_id, .{ .writes = &.{.{ .key = "b", .value = "{\"links\":[\"field-target\"],\"_edges\":{\"g\":{\"R\":[{\"target\":\"hub\"}]}}}" }} });
+        try std.testing.expectError(error.IntentConflict, graphTestApplyOrdered(&db, .{ .deletes = &.{ "hub", "field-target" } }, .{ .term = 1, .index = 1 }));
+        try std.testing.expect(!try db.core.store.hasGraphEndpointCleanup());
+        try std.testing.expectError(error.SchemaInUse, db.deleteIndex("g"));
+        try std.testing.expectError(error.SchemaInUse, db.addIndex(.{ .name = "another", .kind = .graph, .config_json = "{}" }));
+    }
+    {
+        var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        try std.testing.expectError(error.IntentConflict, graphTestApplyOrdered(&db, .{ .deletes = &.{ "hub", "field-target" } }, .{ .term = 1, .index = 1 }));
+        const deleting = try db.beginTransaction(22_000);
+        try std.testing.expectError(error.IntentConflict, db.writeTransaction(deleting, .{ .deletes = &.{ "hub", "field-target" } }));
+        try db.abortTransaction(deleting, 22_001);
+        try db.commitTransaction(txn_id, 21_001);
+        try graphTestApplyOrdered(&db, .{ .deletes = &.{ "hub", "field-target" } }, .{ .term = 1, .index = 1 });
+        while (try db.prepareGraphEndpointCleanupBatch(alloc)) |selected| {
+            var plan = selected;
+            defer plan.deinit();
+            try db.batch(plan.request());
+        }
+        try db.runUntilIdle();
+        const edges = try db.getEdges(alloc, "g", "b", "", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 0), edges.len);
+    }
+}
+
+test "db graph endpoint cleanup pages transaction admission rejects active cleanup and abort releases guards" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("graph-prepare-cleanup-admission");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+    const value = "{\"_edges\":{\"g\":{\"R\":[{\"target\":\"hub\"}]}}}";
+    const aborted = try db.beginTransaction(1);
+    try db.writeIntents(aborted, &.{.{ .key = "a", .value = value }}, &.{});
+    try std.testing.expectError(error.IntentConflict, graphTestApplyOrdered(&db, .{ .deletes = &.{"hub"} }, .{ .term = 1, .index = 1 }));
+    try db.abortTransaction(aborted, 2);
+    try graphTestApplyOrdered(&db, .{ .deletes = &.{"hub"} }, .{ .term = 1, .index = 1 });
+    const rejected = try db.beginTransaction(3);
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.writeIntents(rejected, &.{.{ .key = "b", .value = value }}, &.{}));
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.writeTransaction(rejected, .{ .writes = &.{.{ .key = "b", .value = value }} }));
+    try db.abortTransaction(rejected, 4);
+    var plan = (try db.prepareGraphEndpointCleanupBatch(alloc)).?;
+    defer plan.deinit();
+    try graphTestApplyOrdered(&db, plan.request(), .{ .term = 1, .index = 2 });
+    const accepted = try db.beginTransaction(5);
+    try db.writeIntents(accepted, &.{.{ .key = "c", .value = value }}, &.{});
+    try db.commitTransaction(accepted, 6);
+}
+
+test "db graph endpoint cleanup pages transaction dependencies cover relational fields" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("graph-relational-prepared-endpoint");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &.{.{ .name = "links", .path = "links", .column_type = .json, .is_json = true, .json_kind = .any, .allows_null = true }} });
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}" });
+    const txn_id = try db.beginTransaction(1);
+    try db.writeTransaction(txn_id, .{ .writes = &.{.{ .key = "a", .value = "{\"links\":[\"hub\"]}" }} });
+    try std.testing.expectError(error.IntentConflict, graphTestApplyOrdered(&db, .{ .deletes = &.{"hub"} }, .{ .term = 1, .index = 1 }));
+    try db.commitTransaction(txn_id, 2);
+    try db.runUntilIdle();
+    const edges = try db.getEdges(alloc, "g", "a", "", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("hub", edges[0].target);
+    try graphTestApplyOrdered(&db, .{ .deletes = &.{"hub"} }, .{ .term = 1, .index = 1 });
+}
+
+test "db graph endpoint cleanup pages transaction dependencies retain stronger caller read guards" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("graph-caller-read-dependency");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+    try db.batch(.{ .writes = &.{.{ .key = "hub", .value = "{\"title\":\"hub\"}" }}, .timestamp_ns = 99 });
+    const key = try internal_keys.documentKeyAlloc(alloc, "hub");
+    defer alloc.free(key);
+    const value = try db.core.store.get(alloc, key);
+    defer alloc.free(value);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(value, &digest, .{});
+    const txn_id = try db.beginTransaction(1);
+    try db.writeIntents(txn_id, &.{}, &.{.{ .key = "hub", .expected_version = 99, .expected_content_digest = digest }});
+    try db.writeTransaction(txn_id, .{ .writes = &.{.{ .key = "a", .value = "{\"_edges\":{\"g\":{\"R\":[{\"target\":\"hub\"}]}}}" }} });
+    try std.testing.expectError(error.IntentConflict, graphTestApplyOrdered(&db, .{ .deletes = &.{"hub"} }, .{ .term = 1, .index = 1 }));
+    try db.commitTransaction(txn_id, 2);
 }

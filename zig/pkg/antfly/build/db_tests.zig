@@ -33,6 +33,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const relationship_identity_filters = [_][]const u8{
         "db graph endpoint cleanup pages",
         "graph endpoint cleanup byte admission",
+        "bulk append index",
         "graph relationship integration",
         "graph relationship artifact identity",
         "derived log record",

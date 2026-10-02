@@ -122,6 +122,44 @@ fn hashBulkEntryKey(namespace: backend_types.Namespace, key: []const u8) u64 {
     return hasher.final();
 }
 
+/// Point reads must not walk the growing unordered bulk arena. Borrow keys
+/// from its stable entry arena, retain the latest duplicate, and compare full
+/// namespace/key bytes so hash collisions never affect read-your-writes.
+const BulkAppendIndex = struct {
+    const Key = struct { namespace: backend_types.Namespace, key: []const u8 };
+    const Context = struct {
+        pub fn hash(_: @This(), key: Key) u64 {
+            return hashBulkEntryKey(key.namespace, key.key);
+        }
+        pub fn eql(_: @This(), left: Key, right: Key) bool {
+            return compareNamespace(left.namespace, right.namespace) == .eq and std.mem.eql(u8, left.key, right.key);
+        }
+    };
+    entries: std.HashMapUnmanaged(Key, usize, Context, 80) = .{},
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        self.entries.deinit(alloc);
+        self.* = .{};
+    }
+    fn clear(self: *@This()) void {
+        self.entries.clearRetainingCapacity();
+    }
+    fn append(self: *@This(), alloc: Allocator, state: *State, namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
+        // Reserve both containers before publishing either change. Failed
+        // allocation leaves the prior overlay and its index consistent.
+        try self.entries.ensureUnusedCapacity(alloc, 1);
+        try state.entries.ensureUnusedCapacity(alloc, 1);
+        const entry_allocator = try state.ensureArenaAllocator(alloc);
+        const entry = try state_mod.initArenaEntry(entry_allocator, namespace, key, value, false);
+        const index = state.entryCount();
+        state.entries.appendAssumeCapacity(entry);
+        self.entries.putAssumeCapacity(.{ .namespace = namespaceOf(entry), .key = entry.key }, index);
+    }
+    fn get(self: *const @This(), state: *const State, namespace: backend_types.Namespace, key: []const u8) ?state_mod.OwnedEntry {
+        const index = self.entries.get(.{ .namespace = namespace, .key = key }) orelse return null;
+        return state.entryAt(index);
+    }
+};
+
 fn bulkStateHasDuplicateKeys(allocator: Allocator, state: *const State) !bool {
     var index: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(usize)) = .{};
     defer {
@@ -4339,6 +4377,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         namespace: backend_types.Namespace,
         mutable: ActiveMemTable,
         bulk_appends: State = .{},
+        bulk_index: BulkAppendIndex = .{},
         cursor_overlay: ?State = null,
         cursor_base_mutable: ?State = null,
         cursor_immutable_memtables: []const *const State = &.{},
@@ -4375,6 +4414,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         pub fn abort(self: *@This()) void {
             if (self.closed) return;
             const backend = self.backend;
+            self.bulk_index.deinit(self.allocator);
             self.mutable.deinit(self.allocator);
             self.bulk_appends.deinit(self.allocator);
             self.invalidateCursorSnapshot();
@@ -4389,6 +4429,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
 
         pub fn commit(self: *@This()) !void {
             if (self.closed) return error.TransactionClosed;
+            defer if (self.closed) self.bulk_index.deinit(self.allocator);
             const wire_credit = if (comptime @hasDecl(BackendType, "prepareManifestCredit")) try self.backend.prepareManifestCredit(&self.mutable, &self.bulk_appends) else 0;
             const locked = lockBackend(BackendType, self.backend);
             defer unlockBackend(BackendType, self.backend, locked);
@@ -4466,6 +4507,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         fn drainBulkAppendsToMutable(self: *@This()) !void {
             if (self.bulk_appends.entryCount() == 0) return;
             try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+            self.bulk_index.clear();
         }
 
         fn tryCommitDirectBulkAppends(self: *@This()) !bool {
@@ -4511,7 +4553,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
 
             const duplicate_check_start_ns = platform_time.monotonicNs();
-            if (try bulkStateHasDuplicateKeys(self.allocator, &self.bulk_appends)) {
+            if (self.bulk_index.entries.count() != entries) {
                 if (@hasDecl(BackendType, "recordBulkAppendFallbackDuplicateKeys")) self.backend.recordBulkAppendFallbackDuplicateKeys(entries, elapsedNs(duplicate_check_start_ns));
                 try self.drainBulkAppendsToMutable();
                 return false;
@@ -4643,14 +4685,9 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
 
         pub fn get(self: *@This(), key: []const u8) ![]const u8 {
             if (self.closed) return error.TransactionClosed;
-            var bulk_idx = self.bulk_appends.entryCount();
-            while (bulk_idx > 0) {
-                bulk_idx -= 1;
-                const entry = self.bulk_appends.entryAt(bulk_idx);
-                if (compareEntryTo(entry, self.namespace, key) == .eq) {
-                    if (entry.tombstone) return error.NotFound;
-                    return entry.value;
-                }
+            if (self.bulk_index.get(&self.bulk_appends, self.namespace, key)) |entry| {
+                if (entry.tombstone) return error.NotFound;
+                return entry.value;
             }
             if (self.mutable.findIndex(self.namespace, key)) |idx| {
                 const entry = self.mutable.entryAt(idx);
@@ -4734,19 +4771,13 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             var miss_count: usize = 0;
             var overlay_point_gets: usize = 0;
             for (keys, 0..) |key, i| {
-                var bulk_idx = self.bulk_appends.entryCount();
-                while (bulk_idx > 0) {
-                    bulk_idx -= 1;
-                    const entry = self.bulk_appends.entryAt(bulk_idx);
-                    if (compareEntryTo(entry, self.namespace, key) == .eq) {
-                        overlay_point_gets += 1;
-                        if (entry.tombstone) {
-                            misses += 1;
-                        } else {
-                            values[i] = entry.value;
-                            hits += 1;
-                        }
-                        break;
+                if (self.bulk_index.get(&self.bulk_appends, self.namespace, key)) |entry| {
+                    overlay_point_gets += 1;
+                    if (entry.tombstone) {
+                        misses += 1;
+                    } else {
+                        values[i] = entry.value;
+                        hits += 1;
                     }
                 } else {
                     if (self.mutable.findIndex(self.namespace, key)) |idx| {
@@ -4813,8 +4844,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         pub fn appendPut(self: *@This(), key: []const u8, value: []const u8) !void {
             if (self.closed) return error.TransactionClosed;
             if (self.batch_options.mode == .bulk_ingest and self.mutable.entryCount() == 0) {
-                const entry_allocator = try self.bulk_appends.ensureArenaAllocator(self.allocator);
-                try self.bulk_appends.entries.append(self.allocator, try state_mod.initArenaEntry(entry_allocator, self.namespace, key, value, false));
+                try self.bulk_index.append(self.allocator, &self.bulk_appends, self.namespace, key, value);
                 self.invalidateCursorSnapshot();
                 return;
             }
@@ -7644,6 +7674,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         backend: *BackendType,
         mutable: ActiveMemTable,
         bulk_appends: State = .{},
+        bulk_index: BulkAppendIndex = .{},
         cursor_overlay: ?State = null,
         cursor_base_mutable: ?State = null,
         cursor_read_view: ?RunReadView = null,
@@ -7679,6 +7710,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         pub fn abort(self: *@This()) void {
             if (self.closed) return;
             const backend = self.backend;
+            self.bulk_index.deinit(self.allocator);
             self.mutable.deinit(self.allocator);
             self.bulk_appends.deinit(self.allocator);
             self.invalidateCursorSnapshot();
@@ -7693,6 +7725,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
 
         pub fn commit(self: *@This()) !void {
             if (self.closed) return error.TransactionClosed;
+            defer if (self.closed) self.bulk_index.deinit(self.allocator);
             const wire_credit = if (comptime @hasDecl(BackendType, "prepareManifestCredit")) try self.backend.prepareManifestCredit(&self.mutable, &self.bulk_appends) else 0;
             const locked = lockBackend(BackendType, self.backend);
             defer unlockBackend(BackendType, self.backend, locked);
@@ -7770,6 +7803,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         fn drainBulkAppendsToMutable(self: *@This()) !void {
             if (self.bulk_appends.entryCount() == 0) return;
             try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+            self.bulk_index.clear();
         }
 
         fn tryCommitDirectBulkAppends(self: *@This()) !bool {
@@ -7815,7 +7849,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
 
             const duplicate_check_start_ns = platform_time.monotonicNs();
-            if (try bulkStateHasDuplicateKeys(self.allocator, &self.bulk_appends)) {
+            if (self.bulk_index.entries.count() != entries) {
                 if (@hasDecl(BackendType, "recordBulkAppendFallbackDuplicateKeys")) self.backend.recordBulkAppendFallbackDuplicateKeys(entries, elapsedNs(duplicate_check_start_ns));
                 try self.drainBulkAppendsToMutable();
                 return false;
@@ -7947,14 +7981,9 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
 
         pub fn get(self: *@This(), namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
             if (self.closed) return error.TransactionClosed;
-            var bulk_idx = self.bulk_appends.entryCount();
-            while (bulk_idx > 0) {
-                bulk_idx -= 1;
-                const entry = self.bulk_appends.entryAt(bulk_idx);
-                if (compareEntryTo(entry, namespace, key) == .eq) {
-                    if (entry.tombstone) return error.NotFound;
-                    return entry.value;
-                }
+            if (self.bulk_index.get(&self.bulk_appends, namespace, key)) |entry| {
+                if (entry.tombstone) return error.NotFound;
+                return entry.value;
             }
             if (self.mutable.findIndex(namespace, key)) |idx| {
                 const entry = self.mutable.entryAt(idx);
@@ -7994,15 +8023,9 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             var miss_count: usize = 0;
             var overlay_point_gets: usize = 0;
             for (keys, 0..) |key, i| {
-                var bulk_idx = self.bulk_appends.entryCount();
-                while (bulk_idx > 0) {
-                    bulk_idx -= 1;
-                    const entry = self.bulk_appends.entryAt(bulk_idx);
-                    if (compareEntryTo(entry, namespace, key) == .eq) {
-                        overlay_point_gets += 1;
-                        if (!entry.tombstone) values[i] = entry.value;
-                        break;
-                    }
+                if (self.bulk_index.get(&self.bulk_appends, namespace, key)) |entry| {
+                    overlay_point_gets += 1;
+                    if (!entry.tombstone) values[i] = entry.value;
                 } else if (self.mutable.findIndex(namespace, key)) |idx| {
                     overlay_point_gets += 1;
                     const entry = self.mutable.entryAt(idx);
@@ -8040,8 +8063,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         pub fn appendPut(self: *@This(), namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
             if (self.closed) return error.TransactionClosed;
             if (self.batch_options.mode == .bulk_ingest and self.mutable.entryCount() == 0) {
-                const entry_allocator = try self.bulk_appends.ensureArenaAllocator(self.allocator);
-                try self.bulk_appends.entries.append(self.allocator, try state_mod.initArenaEntry(entry_allocator, namespace, key, value, false));
+                try self.bulk_index.append(self.allocator, &self.bulk_appends, namespace, key, value);
                 self.invalidateCursorSnapshot();
                 return;
             }
@@ -8618,4 +8640,28 @@ test "lsm merge cursor caps retained mutable source scratch" {
 
     _ = try cursor.mutableSourceEntryScratch(Cursor.min_retained_mutable_source_entry_scratch + 1);
     try std.testing.expectEqual(Cursor.min_retained_mutable_source_entry_scratch * 2, cursor.mutable_source_entry_bytes.?.len);
+}
+
+test "bulk append index preserves namespaces duplicates and allocation failure atomicity" {
+    const Fixture = struct {
+        fn run(alloc: Allocator) !void {
+            var state: State = .{};
+            defer state.deinit(alloc);
+            var index: BulkAppendIndex = .{};
+            defer index.deinit(alloc);
+            try index.append(alloc, &state, .{}, "key", "first");
+            try index.append(alloc, &state, .{ .name = "other" }, "key", "other");
+            index.append(alloc, &state, .{}, "key", "last") catch |err| {
+                try std.testing.expectEqualStrings("first", index.get(&state, .{}, "key").?.value);
+                try std.testing.expectEqualStrings("other", index.get(&state, .{ .name = "other" }, "key").?.value);
+                return err;
+            };
+            try std.testing.expectEqualStrings("last", index.get(&state, .{}, "key").?.value);
+            try std.testing.expectEqualStrings("other", index.get(&state, .{ .name = "other" }, "key").?.value);
+            try std.testing.expect(index.get(&state, .{}, "missing") == null);
+            index.clear();
+            try std.testing.expect(index.get(&state, .{}, "key") == null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }

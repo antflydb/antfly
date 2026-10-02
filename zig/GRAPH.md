@@ -138,8 +138,8 @@ Merge artifact pages include primary retirement records. Receiver replay applies
 exact relationship deletions to existing projections as well as suppressing
 future materialization. Commands that can generate retirements during apply
 require data-Raft protocol version 19, including ordinary document deletion,
-legacy relationship deletion, cleanup, transforms, committed transaction
-decisions, and merge pages. Classification occurs before proposal even when retirement records
+legacy relationship deletion, cleanup, transforms, document transaction
+prepares, committed transaction decisions, and merge pages. Classification occurs before proposal even when retirement records
 are absent from the input. Ordinary artifact-only batches retain their existing
 protocol requirements.
 Physical splits rebuild the incoming directory and retirement accounting on both
@@ -165,6 +165,25 @@ or finish a newer deletion. Legacy jobs with raw endpoint values use generation
 zero; newly enqueued jobs always have a positive generation. Guard identities
 count toward the page byte budget. HA cleanup payloads require schema version 18,
 or version 19 when carrying an ordinary Raft receipt; older envelopes are rejected.
+
+Preparing a transaction with inline relationships retains shared dependencies
+on each distinct target document after checking that its cleanup job is absent.
+Active cleanup rejects prepare before the transaction votes ready. Ordinary target
+writes and deletes, TTL expiry, and another transaction's target deletion respect
+the durable read guards until commit or abort; restart retains those guards.
+Fact-owned projections retain their independent lifecycle and do not reserve
+endpoint documents. Target dependencies are deduplicated across the prepare.
+Configured field-derived edges use the same guards, including relational rows.
+Graph catalog additions, replacements, and deletion return `SchemaInUse` until
+durable prepares resolve, so commit uses the same relationship mapping admitted at prepare.
+
+Native unordered bulk writers maintain a namespace/key index over their append
+arena. Scalar and sorted-batch point reads use that index, including missing-job
+admission probes, instead of repeatedly scanning earlier appends. The latest
+write wins within the overlay; a mutable-write fallback clears the index after
+draining, and commit or abort releases it. Duplicate detection reuses the index.
+This keeps endpoint admission linear in batch size while preserving direct
+sorted ingestion and the same transactional cleanup fence.
 
 The distributed cleanup worker retains one immutable indexed routing generation
 per sweep and visits each range once, checking current local leadership before

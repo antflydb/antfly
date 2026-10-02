@@ -5041,7 +5041,12 @@ pub fn requiresGraphRelationshipProtocol(req: BatchRequest) bool {
     // contains only legacy tuples or document keys. Classify those effects
     // before proposal; inspecting only already-materialized rows is too late.
     if (req.graph_endpoint_cleanup or req.deletes.len != 0 or req.graph_deletes.len != 0 or req.transforms.len != 0 or req.merge_page != null) return true;
-    if (req.transaction) |control| if (control == .resolve and control.resolve.status == .committed) return true;
+    if (req.transaction) |control| {
+        if (control == .resolve and control.resolve.status == .committed) return true;
+        // Field-derived inline edges depend on the local graph catalog, so
+        // even ordinary document values can acquire durable endpoint guards.
+        if (control == .prepare and req.writes.len != 0) return true;
+    }
     for (req.graph_writes) |write| if (write.edge_id.len != 0 or write.owner_document.len != 0) return true;
     for (req.graph_deletes) |delete| if (delete.edge_id.len != 0 or delete.owner_document.len != 0) return true;
     for (req.merge_artifacts) |row| if (keys.isGraphRetirementKey(row.key) or keys.graphArtifactHasRelationshipId(row.key)) return true;

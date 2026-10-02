@@ -5612,3 +5612,33 @@ test "graph relationship bulk ingestion preserves direct append and retirement d
     try std.testing.expect(!try store.backfillGraphIncomingDirectoryPage());
     try std.testing.expect(!try store.graphIncomingDirectoryReady());
 }
+
+test "graph relationship bulk ingestion preserves direct append and retirement with initialized directory" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 1, .bulk_ingest_flush_threshold_multiplier = 2 });
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    // Populate the directory before the bulk transaction: initialization must
+    // not accidentally hide unordered-overlay reads behind a mutable write.
+    const initial = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, "seed", "g", "R", "target", "seed", "seed");
+    defer alloc.free(initial);
+    try store.put(initial, "seed");
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const writes = try scratch.alloc(KVPair, 4096);
+    for (writes, 0..) |*write, i| {
+        const owner = try std.fmt.allocPrint(scratch, "{d:0>8}", .{i});
+        write.* = .{ .key = try internal_keys.graphRelationshipArtifactKeyAlloc(scratch, owner, "g", "R", "target", owner, "id"), .value = "payload" };
+    }
+    const before = backend.snapshotWriteStats().sorted_ingest_runs;
+    try store.putBatchWithReplayWithOptions(null, writes, &.{}, null, .{ .mode = .bulk_ingest });
+    try std.testing.expectEqual(before + 1, backend.snapshotWriteStats().sorted_ingest_runs);
+    const refs = try store.scanPrefix(alloc, internal_keys.graph_incoming_prefix);
+    defer DocStore.freeResults(alloc, refs);
+    try std.testing.expectEqual(writes.len + 1, refs.len);
+    const job = try internal_keys.graphEndpointCleanupKeyAlloc(scratch, "target");
+    try store.put(job, "target");
+    try std.testing.expectError(error.IntegrityTopologyBusy, store.putBatchWithReplayWithOptions(null, writes, &.{}, null, .{ .mode = .bulk_ingest }));
+}
