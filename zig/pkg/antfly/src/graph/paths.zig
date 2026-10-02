@@ -214,6 +214,7 @@ fn createPathNode(
     hops: u32,
     parent: ?*PathNode,
     edge: ?Edge,
+    direction: ?EdgeDirection,
 ) !*PathNode {
     const node = try alloc.create(PathNode);
     errdefer alloc.destroy(node);
@@ -242,10 +243,7 @@ fn createPathNode(
             .owner_document = owner_document,
             .weight = value.weight,
             .metadata = metadata,
-            .traversal_direction = if (parent) |previous|
-                if (std.mem.eql(u8, value.source, value.target)) null else if (std.mem.eql(u8, previous.key, value.source)) .out else .in
-            else
-                null,
+            .traversal_direction = direction,
         };
     } else null;
     node.* = .{
@@ -262,13 +260,10 @@ fn createPathNode(
 /// Table identity of the node an edge leads to, canonicalized against the
 /// index-owning table. Forward arrivals read the target tag; reverse arrivals
 /// read the source tag, matching the BFS traversal engine.
-fn canonicalNextNodeTable(scratch: *traversal_mod.MetadataScratch, opts: *const PathFindOptions, next_key: []const u8, edge: *const Edge) !?[]const u8 {
-    const table = if (std.mem.eql(u8, next_key, edge.target))
-        (try traversal_mod.metadataTargetTable(scratch, edge.metadata)) orelse return null
-    else
-        (try traversal_mod.metadataSourceTable(scratch, edge.metadata)) orelse return null;
-    if (opts.owning_table.len > 0 and std.mem.eql(u8, table, opts.owning_table)) return null;
-    return table;
+fn canonicalNextNodeTable(opts: *const PathFindOptions, table: ?[]const u8) ?[]const u8 {
+    const name = table orelse return null;
+    if (std.mem.eql(u8, name, opts.owning_table)) return null;
+    return name;
 }
 
 fn retainPathNodeState(
@@ -578,7 +573,7 @@ fn bfsShortestPath(
     try work_budget.checkIntermediateStates(1, opts.max_intermediate_states);
     try work_budget.consumeNode();
     try retainPathNodeState(source, null, null, work_budget, &retained_node_bytes);
-    const start = try createPathNode(alloc, source, null, 0, 0, null, null);
+    const start = try createPathNode(alloc, source, null, 0, 0, null, null, null);
     var start_owned = true;
     errdefer if (start_owned) destroyPathNode(alloc, start);
     try node_pool.append(alloc, start);
@@ -617,7 +612,8 @@ fn bfsShortestPath(
                 try candidate_nodes.ensureTotalCapacity(alloc, edges.len);
                 for (edges, 0..) |edge, edge_index| {
                     if (!try shouldTraverseEdge(alloc, opts, &edge)) continue;
-                    const next_key = if (std.mem.eql(u8, current.key, edge.source)) edge.target else edge.source;
+                    const endpoint = try traversal_mod.resolveAdjacent(&table_scratch, edge, current.key, current.table, if (opts.owning_table.len > 0) opts.owning_table else null, opts.direction);
+                    const next_key = endpoint.key;
                     if (excluded_nodes) |en| if (en.contains(next_key)) continue;
                     if (excluded_edges) |ee| {
                         if (ee.contains(.{
@@ -628,15 +624,13 @@ fn bfsShortestPath(
                             .owner_document = edge.owner_document,
                         })) continue;
                     }
-                    const target_table = try canonicalNextNodeTable(&table_scratch, &opts, next_key, &edge);
+                    const target_table = canonicalNextNodeTable(&opts, endpoint.table);
                     if (visited.contains(.{ .table = target_table, .key = next_key })) continue;
                     candidate_indexes.appendAssumeCapacity(edge_index);
                     candidate_nodes.appendAssumeCapacity(.{
                         .key = next_key,
                         .table = target_table,
-                        .external = std.mem.eql(u8, next_key, edge.target) and
-                            (admission.external_targets or
-                                target_table != null),
+                        .external = target_table != null or (endpoint.direction != .in and admission.external_targets),
                     });
                 }
                 const candidate_mask = try admission.filterAlloc(alloc, candidate_nodes.items);
@@ -649,7 +643,8 @@ fn bfsShortestPath(
             defer if (admitted_edges) |mask| alloc.free(mask);
 
             for (edges, 0..) |edge, edge_index| {
-                const next_key = if (std.mem.eql(u8, current.key, edge.source)) edge.target else edge.source;
+                const endpoint = try traversal_mod.resolveAdjacent(&table_scratch, edge, current.key, current.table, if (opts.owning_table.len > 0) opts.owning_table else null, opts.direction);
+                const next_key = endpoint.key;
                 if (admitted_edges) |mask| {
                     if (!mask[edge_index]) continue;
                 } else {
@@ -665,7 +660,7 @@ fn bfsShortestPath(
                         })) continue;
                     }
                 }
-                const next_table = try canonicalNextNodeTable(&table_scratch, &opts, next_key, &edge);
+                const next_table = canonicalNextNodeTable(&opts, endpoint.table);
                 if (visited.contains(.{ .table = next_table, .key = next_key })) continue;
                 const is_target = std.mem.eql(u8, next_key, target);
                 if (!is_target) {
@@ -684,6 +679,7 @@ fn bfsShortestPath(
                     current.hops + 1,
                     current,
                     edge,
+                    endpoint.direction,
                 );
                 var node_owned = true;
                 errdefer if (node_owned) destroyPathNode(alloc, node);
@@ -739,7 +735,7 @@ fn dijkstraPath(
     try work_budget.checkIntermediateStates(1, opts.max_intermediate_states);
     try work_budget.consumeNode();
     try retainPathNodeState(source, null, null, work_budget, &retained_node_bytes);
-    const start = try createPathNode(alloc, source, null, 0.0, 0, null, null);
+    const start = try createPathNode(alloc, source, null, 0.0, 0, null, null, null);
     var start_owned = true;
     errdefer if (start_owned) destroyPathNode(alloc, start);
     try node_pool.append(alloc, start);
@@ -780,7 +776,8 @@ fn dijkstraPath(
                 try candidate_nodes.ensureTotalCapacity(alloc, edges.len);
                 for (edges, 0..) |edge, edge_index| {
                     if (!try shouldTraverseEdge(alloc, opts, &edge)) continue;
-                    const next_key = if (std.mem.eql(u8, current.key, edge.source)) edge.target else edge.source;
+                    const endpoint = try traversal_mod.resolveAdjacent(&table_scratch, edge, current.key, current.table, if (opts.owning_table.len > 0) opts.owning_table else null, opts.direction);
+                    const next_key = endpoint.key;
                     if (excluded_nodes) |en| if (en.contains(next_key)) continue;
                     if (excluded_edges) |ee| {
                         if (ee.contains(.{
@@ -791,14 +788,12 @@ fn dijkstraPath(
                             .owner_document = edge.owner_document,
                         })) continue;
                     }
-                    const target_table = try canonicalNextNodeTable(&table_scratch, &opts, next_key, &edge);
+                    const target_table = canonicalNextNodeTable(&opts, endpoint.table);
                     candidate_indexes.appendAssumeCapacity(edge_index);
                     candidate_nodes.appendAssumeCapacity(.{
                         .key = next_key,
                         .table = target_table,
-                        .external = std.mem.eql(u8, next_key, edge.target) and
-                            (admission.external_targets or
-                                target_table != null),
+                        .external = target_table != null or (endpoint.direction != .in and admission.external_targets),
                     });
                 }
                 const candidate_mask = try admission.filterAlloc(alloc, candidate_nodes.items);
@@ -811,7 +806,8 @@ fn dijkstraPath(
             defer if (admitted_edges) |mask| alloc.free(mask);
 
             for (edges, 0..) |edge, edge_index| {
-                const next_key = if (std.mem.eql(u8, current.key, edge.source)) edge.target else edge.source;
+                const endpoint = try traversal_mod.resolveAdjacent(&table_scratch, edge, current.key, current.table, if (opts.owning_table.len > 0) opts.owning_table else null, opts.direction);
+                const next_key = endpoint.key;
                 if (admitted_edges) |mask| {
                     if (!mask[edge_index]) continue;
                 } else {
@@ -828,14 +824,14 @@ fn dijkstraPath(
                     }
                 }
 
-                const next_table = try canonicalNextNodeTable(&table_scratch, &opts, next_key, &edge);
+                const next_table = canonicalNextNodeTable(&opts, endpoint.table);
                 const new_dist = current.distance + try pathEdgeCost(opts.weight_mode, edge.weight);
                 const next_hops = current.hops + 1;
                 if (!pathStateDominated(&best_dist, next_key, next_table, next_hops, new_dist, false)) {
                     try work_budget.checkIntermediateStates(heap.items.len + 1, opts.max_intermediate_states);
                     try work_budget.consumeNode();
                     try retainPathNodeState(next_key, next_table, edge, work_budget, &retained_node_bytes);
-                    const node = try createPathNode(alloc, next_key, next_table, new_dist, next_hops, current, edge);
+                    const node = try createPathNode(alloc, next_key, next_table, new_dist, next_hops, current, edge, endpoint.direction);
                     var node_owned = true;
                     errdefer if (node_owned) destroyPathNode(alloc, node);
                     try node_pool.append(alloc, node);
@@ -2388,4 +2384,21 @@ pub fn freePathEdgesAlloc(alloc: Allocator, edges: []const PathEdge) void {
 
 pub fn pathEdgeOwnedBytes(edge: PathEdge) usize {
     return @sizeOf(PathEdge) +| edge.source.len +| edge.target.len +| edge.edge_type.len +| edge.edge_id.len +| edge.owner_document.len +| edge.metadata.len;
+}
+
+test "path nodes retain qualified equal-key reverse edge provenance" {
+    const alloc = std.testing.allocator;
+    const parent = try createPathNode(alloc, "same", null, 0, 0, null, null, null);
+    defer destroyPathNode(alloc, parent);
+    var scratch = traversal_mod.MetadataScratch.init(alloc, null);
+    defer scratch.deinit();
+    const edge = Edge{ .source = "same", .target = "same", .edge_type = "R", .edge_id = "one", .weight = 0.5, .created_at = 0, .updated_at = 0, .metadata = "{\"source_table\":\"people\",\"target_table\":\"companies\"}" };
+    for ([_]EdgeDirection{ .in, .both }) |direction| {
+        const endpoint = try traversal_mod.resolveAdjacent(&scratch, edge, parent.key, parent.table, "companies", direction);
+        const node = try createPathNode(alloc, endpoint.key, endpoint.table, 0.5, 1, parent, edge, endpoint.direction);
+        defer destroyPathNode(alloc, node);
+        try std.testing.expectEqualStrings("people", node.table.?);
+        try std.testing.expectEqual(EdgeDirection.in, node.parent_edge.?.traversal_direction.?);
+        try std.testing.expectEqualStrings("one", node.parent_edge.?.edge_id);
+    }
 }

@@ -155,6 +155,17 @@ strings. Nested evidence fields cannot redirect traversal. Whitespace and JSON
 escapes are supported in names and keys; malformed or ambiguous tags have no
 routing authority. Plain names borrow metadata, while decoded names use scoped,
 budgeted scratch shared by traversal, paths, patterns, and distributed expansion.
+Traversal selects direction before reading the adjacent endpoint's tag. Equal
+document keys in different tables are distinct nodes: reverse traversal reads
+the source tag, and bidirectional traversal compares qualified endpoint
+identities. A genuine self-loop remains unoriented for bidirectional traversal.
+
+Artifact metadata writers use the same structural root-field rules in primary
+and background indexing. Custom templates can override a resolved table with
+one valid explicit root tag; duplicate or invalid explicit tags reject the
+projection. Default item metadata replaces root routing tags with the resolved
+endpoint table. Nested evidence is retained and never suppresses a root tag.
+Unrelated JSON member spans, including exact number literals, are copied intact.
 
 Physical splits rebuild the incoming directory and retirement accounting on both
 the child and retained parent before graph work resumes. Clearing and rebuilding
@@ -247,7 +258,11 @@ Relationship filters prepare constants, numeric views, and decoded JSON pointers
 once, then reuse immutable prepared state across expansions and Yen spur searches.
 Intrinsic-only filters do not inspect metadata and allocate no per-edge state.
 Metadata predicates scan and skip unrelated containers instead of building a JSON
-tree; selected strings and scanner nesting consume the graph retained-memory
+tree. Presence/null-only predicates validate and skip scalar content without
+decoding strings. When a comparison or temporal predicate shares that pointer,
+the prepared projection decodes its value once. Scalar values and escaped keys
+are bounded by the metadata input length rather than an implicit decoder size
+limit; decoded strings and scanner nesting consume the graph retained-memory
 budget, and denial produces the normal graph budget diagnostic. JSON pointers
 have at most 256 components; array indices use canonical unsigned decimal spelling.
 Duplicate selected object keys fail the predicate as ambiguous.

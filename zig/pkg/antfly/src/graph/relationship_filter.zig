@@ -74,15 +74,15 @@ pub const Filter = struct {
             out.* = .{ .syntax = p, .path = path, .expected = if (p.value_json.len > 0) try std.json.parseFromSliceLeaky(std.json.Value, a, p.value_json, .{ .parse_numbers = false, .allocate = .alloc_always }) else .null };
             out.expected_number = if (out.expected == .number_string) json_number.Number.parse(out.expected.number_string) else null;
             out.expected_time = if (p.value_type == .datetime) schema.parseRfc3339ToSignedNs(out.expected.string) else null;
-            if (path.len > 0) out.metadata_slot = try internPath(a, &nodes, &prepared.slot_count, path);
+            if (path.len > 0) out.metadata_slot = try internPath(a, &nodes, &prepared.slot_count, path, p.op != .is_null and p.op != .is_not_null);
         }
         if (self.valid_at_ns != null) prepared.valid_interval = .{
-            .lower = try internPath(a, &nodes, &prepared.slot_count, &.{"valid_at"}),
-            .upper = try internPath(a, &nodes, &prepared.slot_count, &.{"invalid_at"}),
+            .lower = try internPath(a, &nodes, &prepared.slot_count, &.{"valid_at"}, true),
+            .upper = try internPath(a, &nodes, &prepared.slot_count, &.{"invalid_at"}, true),
         };
         if (self.known_at_ns != null) prepared.known_interval = .{
-            .lower = try internPath(a, &nodes, &prepared.slot_count, &.{"created_at"}),
-            .upper = try internPath(a, &nodes, &prepared.slot_count, &.{"expired_at"}),
+            .lower = try internPath(a, &nodes, &prepared.slot_count, &.{"created_at"}, true),
+            .upper = try internPath(a, &nodes, &prepared.slot_count, &.{"expired_at"}, true),
         };
         prepared.nodes = try nodes.toOwnedSlice(a);
         var result = self;
@@ -303,9 +303,10 @@ const IntervalSlots = struct { lower: usize, upper: usize };
 const ProjectionNode = struct {
     children: std.StringHashMapUnmanaged(usize) = .empty,
     slot: ?usize = null,
+    needs_value: bool = false,
 };
 
-fn internPath(alloc: Allocator, nodes: *std.ArrayListUnmanaged(ProjectionNode), slots: *usize, path: []const []const u8) !usize {
+fn internPath(alloc: Allocator, nodes: *std.ArrayListUnmanaged(ProjectionNode), slots: *usize, path: []const []const u8, needs_value: bool) !usize {
     var current: usize = 0;
     for (path) |key| {
         const entry = try nodes.items[current].children.getOrPut(alloc, key);
@@ -319,6 +320,7 @@ fn internPath(alloc: Allocator, nodes: *std.ArrayListUnmanaged(ProjectionNode), 
         nodes.items[current].slot = slots.*;
         slots.* += 1;
     }
+    nodes.items[current].needs_value = nodes.items[current].needs_value or needs_value;
     return nodes.items[current].slot.?;
 }
 
@@ -331,17 +333,22 @@ fn projectMetadata(alloc: Allocator, raw: []const u8, prepared: *const Prepared,
     if ((prepared.valid_interval != null or prepared.known_interval != null) and try scanner.peekNextTokenType() != .object_begin) return error.InvalidRelationshipFilter;
     const seen = try alloc.alloc(bool, prepared.nodes.len);
     @memset(seen, false);
-    try projectNode(alloc, &scanner, prepared.nodes, 0, values, seen);
+    try projectNode(alloc, &scanner, prepared.nodes, 0, values, seen, raw.len);
     if (try scanner.next() != .end_of_document) return error.InvalidRelationshipFilter;
 }
 
-fn projectNode(alloc: Allocator, scanner: *std.json.Scanner, nodes: []const ProjectionNode, index: usize, values: *[68]?std.json.Value, seen: []bool) anyerror!void {
+fn projectNode(alloc: Allocator, scanner: *std.json.Scanner, nodes: []const ProjectionNode, index: usize, values: *[68]?std.json.Value, seen: []bool, max_value_len: usize) anyerror!void {
     if (seen[index]) return error.DuplicateField;
     seen[index] = true;
     const node = nodes[index];
     const kind = try scanner.peekNextTokenType();
     if (kind != .object_begin and kind != .array_begin) {
-        if (node.slot) |slot| values[slot] = switch (try scanner.nextAlloc(alloc, .alloc_if_needed)) {
+        if (node.slot != null and !node.needs_value) {
+            values[node.slot.?] = if (kind == .null) .null else .{ .bool = true };
+            try scanner.skipValue();
+            return;
+        }
+        if (node.slot) |slot| values[slot] = switch (try scanner.nextAllocMax(alloc, .alloc_if_needed, max_value_len)) {
             .string, .allocated_string => |v| .{ .string = v },
             .number, .allocated_number => |v| .{ .number_string = v },
             .true => .{ .bool = true },
@@ -356,20 +363,20 @@ fn projectNode(alloc: Allocator, scanner: *std.json.Scanner, nodes: []const Proj
     _ = try scanner.next();
     if (kind == .object_begin) {
         while (try scanner.peekNextTokenType() != .object_end) {
-            const token = try scanner.nextAlloc(alloc, .alloc_if_needed);
+            const token = try scanner.nextAllocMax(alloc, .alloc_if_needed, max_value_len);
             const key = switch (token) {
                 .string, .allocated_string => |v| v,
                 else => return error.InvalidRelationshipFilter,
             };
             defer if (token == .allocated_string) alloc.free(token.allocated_string);
-            if (node.children.get(key)) |child| try projectNode(alloc, scanner, nodes, child, values, seen) else try scanner.skipValue();
+            if (node.children.get(key)) |child| try projectNode(alloc, scanner, nodes, child, values, seen, max_value_len) else try scanner.skipValue();
         }
     } else {
         var ordinal: usize = 0;
         while (try scanner.peekNextTokenType() != .array_end) : (ordinal += 1) {
             var buffer: [32]u8 = undefined;
             const key = try std.fmt.bufPrint(&buffer, "{d}", .{ordinal});
-            if (node.children.get(key)) |child| try projectNode(alloc, scanner, nodes, child, values, seen) else try scanner.skipValue();
+            if (node.children.get(key)) |child| try projectNode(alloc, scanner, nodes, child, values, seen, max_value_len) else try scanner.skipValue();
         }
     }
     _ = try scanner.next();
@@ -620,4 +627,57 @@ test "relationship predicates project overlapping paths and shared array leaves 
     try std.testing.expect(try filter.matches(alloc, RegressionEdge{ .metadata = "{\"a\":{\"items\":[7,null],\"\":true}}" }));
     try std.testing.expect(!try filter.matches(alloc, RegressionEdge{ .metadata = "{\"a\":{\"items\":[7,null],\"items\":[7,null],\"\":true}}" }));
     try std.testing.expect(!try filter.matches(alloc, RegressionEdge{ .metadata = "{\"a\":{\"items\":[7,null],\"\":true}} trailing" }));
+}
+
+test "relationship predicates large escaped scalars use explicit budgets and presence projection" {
+    const alloc = std.testing.allocator;
+    const text = try alloc.alloc(u8, 4 * 1024 * 1024 + 1);
+    defer alloc.free(text);
+    @memset(text, 'x');
+    const escaped = try std.fmt.allocPrint(alloc, "{{\"payload\":\"\\u0078{s}\"}}", .{text});
+    defer alloc.free(escaped);
+    const plain = try std.fmt.allocPrint(alloc, "{{\"payload\":\"x{s}\"}}", .{text});
+    defer alloc.free(plain);
+    const presence = try (Filter{ .properties = &.{.{ .field = "/metadata/payload", .op = .is_not_null }} }).prepare(alloc);
+    defer presence.releasePrepared(alloc);
+    for ([_][]const u8{ plain, escaped }) |raw| {
+        var budget = work_budget.WorkBudget.initWithLimits(.{ .max_retained_state_bytes = 16384 });
+        try std.testing.expect(try presence.matchesWithBudget(alloc, RegressionEdge{ .metadata = raw }, &budget));
+        try std.testing.expect(budget.exhaustion() == null);
+        try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+    }
+    const comparison = try (Filter{ .properties = &.{
+        .{ .field = "/metadata/payload", .op = .is_not_null },
+        .{ .field = "/metadata/payload", .op = .gt, .value_json = "\"w\"" },
+    } }).prepare(alloc);
+    defer comparison.releasePrepared(alloc);
+    for ([_][]const u8{ plain, escaped }) |raw| {
+        var budget = work_budget.WorkBudget.initWithLimits(.{ .max_retained_state_bytes = 32 * 1024 * 1024 });
+        try std.testing.expect(try comparison.matchesWithBudget(alloc, RegressionEdge{ .metadata = raw }, &budget));
+        try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+    }
+    var small = work_budget.WorkBudget.initWithLimits(.{ .max_retained_state_bytes = 16384 });
+    try std.testing.expectError(error.GraphWorkBudgetExceeded, comparison.matchesWithBudget(alloc, RegressionEdge{ .metadata = escaped }, &small));
+    try std.testing.expect(small.exhaustion() != null);
+    try std.testing.expectEqual(@as(usize, 0), small.retained_state_bytes);
+    try std.testing.expect(!try presence.matches(alloc, RegressionEdge{ .metadata = "{\"payload\":null}" }));
+    try std.testing.expect(!try presence.matches(alloc, RegressionEdge{ .metadata = "{\"payload\":\"a\",\"payload\":\"b\"}" }));
+}
+
+test "relationship predicates escaped oversized keys are controlled by graph budgets" {
+    const alloc = std.testing.allocator;
+    const text = try alloc.alloc(u8, 4 * 1024 * 1024 + 1);
+    defer alloc.free(text);
+    @memset(text, 'x');
+    const raw = try std.fmt.allocPrint(alloc, "{{\"\\u0078{s}\":null,\"payload\":true}}", .{text});
+    defer alloc.free(raw);
+    const filter = try (Filter{ .properties = &.{.{ .field = "/metadata/payload", .op = .is_not_null }} }).prepare(alloc);
+    defer filter.releasePrepared(alloc);
+    var ample = work_budget.WorkBudget.initWithLimits(.{ .max_retained_state_bytes = 32 * 1024 * 1024 });
+    try std.testing.expect(try filter.matchesWithBudget(alloc, RegressionEdge{ .metadata = raw }, &ample));
+    try std.testing.expectEqual(@as(usize, 0), ample.retained_state_bytes);
+    var small = work_budget.WorkBudget.initWithLimits(.{ .max_retained_state_bytes = 16384 });
+    try std.testing.expectError(error.GraphWorkBudgetExceeded, filter.matchesWithBudget(alloc, RegressionEdge{ .metadata = raw }, &small));
+    try std.testing.expect(small.exhaustion() != null);
+    try std.testing.expectEqual(@as(usize, 0), small.retained_state_bytes);
 }

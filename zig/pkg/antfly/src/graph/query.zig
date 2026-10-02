@@ -2842,17 +2842,16 @@ fn collectAlgebraicReachabilityEdges(
         for (graph_edges) |edge| {
             if (!graphEdgeTypeAllowed(params.edge_types, edge.edge_type)) continue;
             if (!graphEdgeWeightAllowed(params, edge.weight)) continue;
-            const next_key = if (std.mem.eql(u8, current.key, edge.source)) edge.target else edge.source;
-            const target_table = if (std.mem.eql(u8, next_key, edge.target))
-                try traversal_mod.metadataTargetTable(&table_scratch, edge.metadata)
-            else
-                try traversal_mod.metadataSourceTable(&table_scratch, edge.metadata);
-            // Stop the algebraic probe immediately. Its tensor vertices are
-            // key-only, while this edge names a table-qualified identity.
-            if (target_table != null) {
+            // Tensor vertices cannot represent either endpoint's namespace,
+            // even when only the departure endpoint has an explicit tag.
+            if ((try traversal_mod.metadataSourceTable(&table_scratch, edge.metadata)) != null or
+                (try traversal_mod.metadataTargetTable(&table_scratch, edge.metadata)) != null)
+            {
                 has_cross_table_edges = true;
                 break :scan;
             }
+            const endpoint = try traversal_mod.resolveAdjacent(&table_scratch, edge, current.key, null, null, params.direction);
+            const next_key = endpoint.key;
             if (std.mem.eql(u8, next_key, start_key)) continue;
             const already_visited = visited.contains(next_key);
             if (!already_visited) {

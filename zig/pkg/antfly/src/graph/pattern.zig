@@ -684,6 +684,10 @@ const LocalGraphIndexEdgeReader = struct {
         return self.canonicalizeTable(table) == null or self.expand_cross_table_local;
     }
 
+    pub fn routingIndexTable(self: @This(), _: ?[]const u8) ?[]const u8 {
+        return if (self.owning_table.len > 0) self.owning_table else null;
+    }
+
     pub fn canonicalizeTable(self: @This(), table: ?[]const u8) ?[]const u8 {
         const name = table orelse return null;
         if (self.owning_table.len > 0 and std.mem.eql(u8, name, self.owning_table)) return null;
@@ -1130,9 +1134,9 @@ fn matchExactTwoEdgePattern(
     defer candidates.deinit(alloc);
     for (forward_edges, 0..) |graph_edge, edge_index| {
         if (!try edgeMatchesBudgeted(alloc, graph_edge, prepared_steps[1].edge, work_budget)) continue;
-        if ((try traversal_mod.metadataTargetTable(&table_scratch, graph_edge.metadata)) != null) return null;
+        if ((try traversal_mod.metadataTargetTable(&table_scratch, graph_edge.metadata)) != null or
+            (try traversal_mod.metadataSourceTable(&table_scratch, graph_edge.metadata)) != null) return null;
         const middle_key = edgeTarget(graph_edge, start_key, pattern[1].edge.direction) orelse continue;
-        if (try edgeTargetTable(&table_scratch, null, graph_edge, middle_key) != null) return null;
         if (!(try passesNodeFilter(.{ .table = null, .key = middle_key }, pattern[1].node_filter, opts.evaluator))) continue;
         try candidates.append(alloc, .{
             .middle_key = middle_key,
@@ -1204,7 +1208,7 @@ fn matchExactTwoEdgePattern(
             // use this table-local plan. Release already-built results before
             // the successful null return hands control to generic expansion.
             if ((try traversal_mod.metadataTargetTable(&table_scratch, backward_edge.metadata)) != null or
-                (try edgeTargetTable(&table_scratch, null, backward_edge, target_key)) != null)
+                (try traversal_mod.metadataSourceTable(&table_scratch, backward_edge.metadata)) != null)
             {
                 for (matches.items) |*match| match.deinit(alloc);
                 matches.deinit(alloc);
@@ -1424,15 +1428,10 @@ fn streamReachableNodes(
                     try candidate_nodes.ensureTotalCapacity(alloc, edges.len);
                     for (edges, 0..) |graph_edge, edge_index| {
                         if (!try edgeMatchesBudgeted(alloc, graph_edge, edge, work_budget)) continue;
-                        const target_key = edgeTarget(graph_edge, frontier.key, edge.direction) orelse continue;
-                        const target_table = try resolvedEdgeTargetTable(
-                            &table_scratch,
-                            edge_reader,
-                            frontier.table,
-                            graph_edge,
-                            target_key,
-                            traversal,
-                        );
+                        if (edgeTarget(graph_edge, frontier.key, edge.direction) == null) continue;
+                        const endpoint = try resolvedEdgeEndpoint(&table_scratch, edge_reader, frontier.table, frontier.key, graph_edge, traversal);
+                        const target_key = endpoint.key;
+                        const target_table = endpoint.table;
                         if (shouldRejectPathRevisit(
                             frontierContainsNode(frontier.*, .{ .table = target_table, .key = target_key }),
                             .{ .table = target_table, .key = target_key },
@@ -1444,9 +1443,7 @@ fn streamReachableNodes(
                         candidate_nodes.appendAssumeCapacity(.{
                             .key = target_key,
                             .table = target_table,
-                            .external = std.mem.eql(u8, target_key, graph_edge.target) and
-                                (admission.external_targets or
-                                    target_table != null),
+                            .external = target_table != null or (endpoint.direction != .in and admission.external_targets),
                         });
                     }
                     const candidate_mask = try admission.filterAlloc(alloc, candidate_nodes.items);
@@ -1470,15 +1467,10 @@ fn streamReachableNodes(
                         if (admitted_edges) |mask| {
                             if (!mask[edge_index]) continue;
                         } else if (!try edgeMatchesBudgeted(alloc, graph_edge, edge, work_budget)) continue;
-                        const target_key = edgeTarget(graph_edge, frontier.key, edge.direction) orelse continue;
-                        const target_table = try resolvedEdgeTargetTable(
-                            &table_scratch,
-                            edge_reader,
-                            frontier.table,
-                            graph_edge,
-                            target_key,
-                            traversal,
-                        );
+                        if (edgeTarget(graph_edge, frontier.key, edge.direction) == null) continue;
+                        const endpoint = try resolvedEdgeEndpoint(&table_scratch, edge_reader, frontier.table, frontier.key, graph_edge, traversal);
+                        const target_key = endpoint.key;
+                        const target_table = endpoint.table;
                         if (shouldRejectPathRevisit(
                             frontierContainsNode(frontier.*, .{ .table = target_table, .key = target_key }),
                             .{ .table = target_table, .key = target_key },
@@ -1500,15 +1492,10 @@ fn streamReachableNodes(
                 defer if (filtered_edges) |mask| alloc.free(mask);
 
                 for (edges, 0..) |graph_edge, edge_index| {
-                    const target_key = edgeTarget(graph_edge, frontier.key, edge.direction) orelse continue;
-                    const target_table = try resolvedEdgeTargetTable(
-                        &table_scratch,
-                        edge_reader,
-                        frontier.table,
-                        graph_edge,
-                        target_key,
-                        traversal,
-                    );
+                    if (edgeTarget(graph_edge, frontier.key, edge.direction) == null) continue;
+                    const endpoint = try resolvedEdgeEndpoint(&table_scratch, edge_reader, frontier.table, frontier.key, graph_edge, traversal);
+                    const target_key = endpoint.key;
+                    const target_table = endpoint.table;
                     const revisits_path = frontierContainsNode(
                         frontier.*,
                         .{ .table = target_table, .key = target_key },
@@ -1527,7 +1514,7 @@ fn streamReachableNodes(
                     }
                     const new_hops = frontier.hops + 1;
                     const new_path = if (include_paths)
-                        try appendPathEdge(alloc, frontier.path, graph_edge, frontier.key, target_key, edge.direction)
+                        try appendPathEdge(alloc, frontier.path, graph_edge, frontier.key, target_key, endpoint.direction orelse .both)
                     else
                         @constCast((&[_]paths_mod.PathEdge{})[0..]);
                     var new_path_owned = true;
@@ -1661,38 +1648,6 @@ fn edgeTarget(edge: graph_mod.Edge, current_key: []const u8, direction: graph_mo
     };
 }
 
-fn edgeTargetTable(
-    scratch: *traversal_mod.MetadataScratch,
-    current_table: ?[]const u8,
-    edge: graph_mod.Edge,
-    target_key: []const u8,
-) !?[]const u8 {
-    if (std.mem.eql(u8, target_key, edge.target)) {
-        return (try traversal_mod.metadataTargetTable(scratch, edge.metadata)) orelse current_table;
-    }
-    return (try traversal_mod.metadataSourceTable(scratch, edge.metadata)) orelse current_table;
-}
-
-/// Edge metadata names tables in the storage namespace, while match bindings
-/// may use a canonical query-relative namespace (for example, null for the
-/// source table). Readers that cross table boundaries can normalize the
-/// derived table before it enters path-cycle checks, alias predicates, or
-/// distinct-identity sets. The compile-time capability check keeps local and
-/// serverless readers allocation- and dispatch-free.
-fn canonicalEdgeTargetTable(
-    scratch: *traversal_mod.MetadataScratch,
-    edge_reader: anytype,
-    current_table: ?[]const u8,
-    edge: graph_mod.Edge,
-    target_key: []const u8,
-) !?[]const u8 {
-    const table = try edgeTargetTable(scratch, current_table, edge, target_key);
-    if (comptime @hasDecl(@TypeOf(edge_reader), "canonicalizeTable")) {
-        return edge_reader.canonicalizeTable(table);
-    }
-    return table;
-}
-
 fn canonicalizeNodeTable(edge_reader: anytype, table: ?[]const u8) ?[]const u8 {
     if (comptime @hasDecl(@TypeOf(edge_reader), "canonicalizeTable")) {
         return edge_reader.canonicalizeTable(table);
@@ -1700,21 +1655,24 @@ fn canonicalizeNodeTable(edge_reader: anytype, table: ?[]const u8) ?[]const u8 {
     return table;
 }
 
-fn resolvedEdgeTargetTable(
+fn resolvedEdgeEndpoint(
     scratch: *traversal_mod.MetadataScratch,
     edge_reader: anytype,
     current_table: ?[]const u8,
+    current_key: []const u8,
     graph_edge: graph_mod.Edge,
-    target_key: []const u8,
     traversal: PhysicalEdgeTraversal,
-) !?[]const u8 {
-    if (traversal.incoming_source != null and
-        traversal.step.direction == .in and
-        std.mem.eql(u8, target_key, graph_edge.source))
-    {
-        return canonicalizeNodeTable(edge_reader, traversal.incoming_source.?.table);
+) !@import("metadata_tables.zig").Endpoint {
+    const physical_table = if (comptime @hasDecl(@TypeOf(edge_reader), "routingIndexTable"))
+        edge_reader.routingIndexTable(current_table)
+    else
+        current_table;
+    var endpoint = try traversal_mod.resolveAdjacent(scratch, graph_edge, current_key, current_table, physical_table, traversal.step.direction);
+    if (traversal.incoming_source) |route| {
+        if (traversal.step.direction == .in) endpoint.table = route.table;
     }
-    return canonicalEdgeTargetTable(scratch, edge_reader, current_table, graph_edge, target_key);
+    endpoint.table = canonicalizeNodeTable(edge_reader, endpoint.table);
+    return endpoint;
 }
 
 fn declaredNodeTableMatches(edge_reader: anytype, actual: ?[]const u8, declared: ?[]const u8) bool {
@@ -5642,4 +5600,30 @@ test "exact two-edge probe shares request physical budget" {
     try std.testing.expectEqual(MatchPlan.exact_two_edge_probe, stats.plan);
     try std.testing.expectEqual(@as(usize, 1), matches.len);
     try std.testing.expectEqual(@as(usize, 0), budget.remaining_physical_edges);
+}
+
+test "pattern equal-key cross-table reverse endpoint and orientation" {
+    const alloc = std.testing.allocator;
+    var graph = try graph_mod.GraphIndex.openWithPrivateStores(alloc, "unused-out", "unused-in", "facts", .{ .reverse_backend = .mem });
+    defer graph.close();
+    try graph.batchApply(&.{.{ .source = "same", .target = "same", .edge_type = "R", .edge_id = "one", .metadata_json = "{\"source_table\":\"people\",\"target_table\":\"companies\"}" }}, &.{});
+    const Admission = struct {
+        fn filter(_: ?*anyopaque, a: Allocator, nodes: []const NodeRef) ![]bool {
+            const mask = try a.alloc(bool, nodes.len);
+            errdefer a.free(mask);
+            for (nodes) |node| if (node.table != null) try std.testing.expect(node.external);
+            @memset(mask, true);
+            return mask;
+        }
+    };
+    for ([_]graph_mod.EdgeDirection{ .in, .both }) |direction| {
+        const matches = try matchPattern(alloc, &graph, &.{"same"}, &.{
+            .{ .alias = "company" },
+            .{ .alias = "person", .edge = .{ .direction = direction } },
+        }, .{ .owning_table = "companies", .include_paths = true, .node_admission = .{ .ctx = null, .filter_many = Admission.filter } });
+        defer freeMatches(alloc, matches);
+        try std.testing.expectEqual(@as(usize, 1), matches.len);
+        try std.testing.expectEqualStrings("people", matches[0].bindings[1].table.?);
+        try std.testing.expectEqual(graph_mod.EdgeDirection.in, matches[0].path[0].traversal_direction.?);
+    }
 }

@@ -34,6 +34,7 @@ const hierarchy_navigation = @import("../../hierarchy_navigation.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
 const change_journal_mod = @import("../derived/change_journal.zig");
 const graph_asset_state = @import("../graph_asset_state.zig");
+const graph_metadata_tables = @import("../../../graph/metadata_tables.zig");
 const graph_mod = @import("../../../graph/graph.zig");
 const graph_work_budget = @import("../../../graph/work_budget.zig");
 const graph_edge_contender = @import("../graph_edge_contender.zig");
@@ -22117,7 +22118,7 @@ fn runtimeAppendRelationItem(
     var owned_metadata = metadata_json;
     errdefer alloc.free(owned_metadata);
     if (source_table) |table| {
-        const tagged = try runtimePrependTableTagToMetadataJsonAlloc(alloc, "source_table", table, owned_metadata);
+        const tagged = try graph_metadata_tables.withTableAlloc(alloc, "source_table", table, owned_metadata, mapping.metadata_template_json.len > 0);
         alloc.free(owned_metadata);
         owned_metadata = tagged;
     }
@@ -22386,22 +22387,7 @@ fn runtimeCanonicalEntityTable(entity: std.json.Value) ?[]const u8 {
 /// renderer: tag an already-rendered metadata object with a resolved
 /// endpoint's home table unless the template rendered its own tag.
 fn runtimePrependTableTagToMetadataJsonAlloc(alloc: Allocator, comptime tag: []const u8, table: []const u8, metadata_json: []const u8) ![]u8 {
-    if (metadata_json.len < 2 or metadata_json[0] != '{' or
-        std.mem.indexOf(u8, metadata_json, "\"" ++ tag ++ "\":") != null)
-        return try alloc.dupe(u8, metadata_json);
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-    try out.appendSlice(alloc, "{\"" ++ tag ++ "\":");
-    const quoted = try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = table }, .{});
-    defer alloc.free(quoted);
-    try out.appendSlice(alloc, quoted);
-    if (!std.mem.eql(u8, metadata_json, "{}")) {
-        try out.append(alloc, ',');
-        try out.appendSlice(alloc, metadata_json[1..]);
-    } else {
-        try out.append(alloc, '}');
-    }
-    return try out.toOwnedSlice(alloc);
+    return graph_metadata_tables.withTableAlloc(alloc, tag, table, metadata_json, true);
 }
 
 fn runtimePrependTargetTableToMetadataJsonAlloc(alloc: Allocator, target_table: []const u8, metadata_json: []const u8) ![]u8 {
@@ -22411,20 +22397,7 @@ fn runtimePrependTargetTableToMetadataJsonAlloc(alloc: Allocator, target_table: 
 fn runtimePrependTargetTableToItemMetadataAlloc(alloc: Allocator, target_table: []const u8, item: std.json.Value) ![]u8 {
     const item_json = try std.json.Stringify.valueAlloc(alloc, item, .{});
     defer alloc.free(item_json);
-    std.debug.assert(item_json.len >= 2 and item_json[0] == '{');
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-    try out.appendSlice(alloc, "{\"target_table\":");
-    const quoted = try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = target_table }, .{});
-    defer alloc.free(quoted);
-    try out.appendSlice(alloc, quoted);
-    if (!std.mem.eql(u8, item_json, "{}")) {
-        try out.append(alloc, ',');
-        try out.appendSlice(alloc, item_json[1..]);
-    } else {
-        try out.append(alloc, '}');
-    }
-    return try out.toOwnedSlice(alloc);
+    return graph_metadata_tables.withTableAlloc(alloc, "target_table", target_table, item_json, false);
 }
 
 fn runtimeResolveGraphEndpointEntity(value: std.json.Value, artifact_value: std.json.Value) ?std.json.Value {
@@ -34135,4 +34108,24 @@ test "enrichment terminal failure envelope is preserved by unbounded drains" {
     runtime.terminal_failure_min_sequence = 0;
     runtime.terminal_failure_max_sequence = 0;
     try runtime.catchUpUntilForDrain(10);
+}
+
+test "graph projection routing writer honors root tags without nested suppression or duplicates" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "", "{\"evidence\":{\"source_table\":\"wrong\",\"target_table\":\"wrong\"},\"score\":1.00000000000000000000001}", "{\"source_table\":\"custom_people\",\"target_table\":\"custom_companies\"}" }) |metadata_template| {
+        const writes = try runtimeGraphWritesFromArtifactValueAlloc(alloc, "facts", "fact",
+            \\{"entities":[{"id":"person","document_id":"same","table":"people"},{"id":"company","document_id":"same","table":"companies"}],"relations":[{"uuid":"one","type":"R","source":"person","target":"company","source_table":"stale_people","target_table":"stale_companies","evidence":{"source_table":"wrong","target_table":"wrong"},"score":1.00000000000000000000001}]}
+        , .{ .artifact_name = @constCast("facts"), .format = .extraction_graph, .mapping = .{
+            .edge_id_template = @constCast("{{ _item.uuid }}"),
+            .metadata_template_json = @constCast(metadata_template),
+        } }, "application/json", null, 10);
+        defer runtimeFreeGraphWrites(alloc, writes);
+        try std.testing.expectEqual(@as(usize, 1), writes.len);
+        var scratch = graph_metadata_tables.Scratch.init(alloc, null);
+        defer scratch.deinit();
+        const custom = std.mem.indexOf(u8, metadata_template, "custom_people") != null;
+        try std.testing.expectEqualStrings(if (custom) "custom_people" else "people", (try scratch.table(writes[0].metadata_json, "source_table")).?);
+        try std.testing.expectEqualStrings(if (custom) "custom_companies" else "companies", (try scratch.table(writes[0].metadata_json, "target_table")).?);
+        if (!custom) try std.testing.expect(std.mem.indexOf(u8, writes[0].metadata_json, "1.00000000000000000000001") != null);
+    }
 }

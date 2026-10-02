@@ -106,6 +106,7 @@ pub const TraversalResult = struct {
     retained_state_bytes: usize = 0,
 };
 
+pub const resolveAdjacent = @import("metadata_tables.zig").adjacent;
 pub const MetadataScratch = @import("metadata_tables.zig").Scratch;
 
 pub fn metadataTargetTable(scratch: *MetadataScratch, metadata: []const u8) !?[]const u8 {
@@ -348,11 +349,9 @@ pub fn traverseWithEdgeReader(
                 try candidate_nodes.ensureTotalCapacity(alloc, edges.len);
                 for (edges, 0..) |edge, edge_index| {
                     if (!try shouldTraverseEdge(alloc, &effective_rules, &edge)) continue;
-                    const next_key = if (std.mem.eql(u8, current.ancestry.key, edge.source)) edge.target else edge.source;
-                    const target_table = if (std.mem.eql(u8, next_key, edge.target))
-                        try canonicalMetadataTargetTable(&table_scratch, &effective_rules, edge.metadata)
-                    else
-                        try canonicalMetadataSourceTable(&table_scratch, &effective_rules, edge.metadata);
+                    const endpoint = try resolveAdjacent(&table_scratch, edge, current.ancestry.key, current.ancestry.target_table, if (effective_rules.owning_table.len > 0) effective_rules.owning_table else null, effective_rules.direction);
+                    const next_key = endpoint.key;
+                    const target_table = if (endpoint.table) |table| if (std.mem.eql(u8, table, effective_rules.owning_table)) null else table else null;
                     if (effective_rules.deduplicate and visited.contains(.{
                         .table = target_table,
                         .key = next_key,
@@ -361,9 +360,7 @@ pub fn traverseWithEdgeReader(
                     candidate_nodes.appendAssumeCapacity(.{
                         .key = next_key,
                         .table = target_table,
-                        .external = std.mem.eql(u8, next_key, edge.target) and
-                            (admission.external_targets or
-                                target_table != null),
+                        .external = target_table != null or (endpoint.direction != .in and admission.external_targets),
                     });
                 }
                 const candidate_mask = try admission.filterAlloc(alloc, candidate_nodes.items);
@@ -376,17 +373,15 @@ pub fn traverseWithEdgeReader(
             defer if (admitted_edges) |mask| alloc.free(mask);
 
             for (edges, 0..) |edge, edge_index| {
-                const next_key = if (std.mem.eql(u8, current.ancestry.key, edge.source)) edge.target else edge.source;
+                const endpoint = try resolveAdjacent(&table_scratch, edge, current.ancestry.key, current.ancestry.target_table, if (effective_rules.owning_table.len > 0) effective_rules.owning_table else null, effective_rules.direction);
+                const next_key = endpoint.key;
 
                 if (admitted_edges) |mask| {
                     if (!mask[edge_index]) continue;
                 } else {
                     if (!try shouldTraverseEdge(alloc, &effective_rules, &edge)) continue;
                 }
-                const target_table = if (std.mem.eql(u8, next_key, edge.target))
-                    try canonicalMetadataTargetTable(&table_scratch, &effective_rules, edge.metadata)
-                else
-                    try canonicalMetadataSourceTable(&table_scratch, &effective_rules, edge.metadata);
+                const target_table = if (endpoint.table) |table| if (std.mem.eql(u8, table, effective_rules.owning_table)) null else table else null;
                 if (effective_rules.deduplicate and !try putVisitedRetained(
                     alloc,
                     &visited,
@@ -406,11 +401,7 @@ pub fn traverseWithEdgeReader(
                     .owner_document = edge.owner_document,
                     .weight = edge.weight,
                     .metadata = edge.metadata,
-                    .traversal_direction = switch (effective_rules.direction) {
-                        .out => .out,
-                        .in => .in,
-                        .both => if (std.mem.eql(u8, edge.source, edge.target)) null else if (std.mem.eql(u8, edge.source, current.ancestry.key)) .out else .in,
-                    },
+                    .traversal_direction = endpoint.direction,
                 } else null;
                 const next_ancestry = try ancestry.append(next_key, target_table, current.ancestry, selected_edge);
                 const total_weight = current.total_weight + edge.weight;
@@ -1164,5 +1155,35 @@ test "graph endpoint routing ignores nested tags and decodes forward and reverse
                 try std.testing.expect(path.node_tables.len == 0 or path.node_tables[1] == null);
             }
         }
+    }
+}
+
+test "graph equal-key cross-table reverse traversal preserves qualified paths" {
+    const alloc = std.testing.allocator;
+    var graph = try GraphIndex.openWithPrivateStores(alloc, "unused-out", "unused-in", "facts", .{ .reverse_backend = .mem });
+    defer graph.close();
+    try graph.batchApply(&.{
+        .{ .source = "same", .target = "same", .edge_type = "R", .edge_id = "one", .owner_document = "fact", .weight = 0.5, .metadata_json = "{\"source_table\":\"people\",\"target_table\":\"companies\"}" },
+    }, &.{});
+    const Admission = struct {
+        fn filter(_: ?*anyopaque, a: Allocator, nodes: []const NodeRef) ![]bool {
+            const mask = try a.alloc(bool, nodes.len);
+            errdefer a.free(mask);
+            for (nodes) |node| if (node.table != null) try std.testing.expect(node.external);
+            @memset(mask, true);
+            return mask;
+        }
+    };
+    for ([_]EdgeDirection{ .in, .both }) |direction| {
+        const results = try traverse(alloc, &graph, "same", .{ .direction = direction, .max_depth = 1, .owning_table = "companies", .include_paths = true, .node_admission = .{ .ctx = null, .filter_many = Admission.filter } });
+        defer freeOwnedResults(alloc, results);
+        var found = false;
+        for (results) |result| {
+            if (!std.mem.eql(u8, result.key, "same")) continue;
+            found = true;
+            try std.testing.expectEqualStrings("people", result.target_table.?);
+            try std.testing.expectEqual(EdgeDirection.in, result.path_edges.?[0].traversal_direction.?);
+        }
+        try std.testing.expect(found);
     }
 }

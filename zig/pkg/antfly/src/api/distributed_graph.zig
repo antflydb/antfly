@@ -2749,10 +2749,11 @@ const DistributedEdgeReader = struct {
     admission: *GraphNodeAdmissionContext,
     physical_work_budget: ?*graph_pattern_mod.WorkBudget = null,
 
-    /// MATCH uses null as the canonical source-table qualifier. Graph edge
-    /// metadata necessarily uses absolute table names when an external hop
-    /// returns to that table, so normalize before the graph matcher performs
-    /// identity-sensitive cycle, predicate, and aggregate work.
+    pub fn routingIndexTable(self: @This(), table: ?[]const u8) ?[]const u8 {
+        return table orelse self.source_table;
+    }
+
+    /// Normalize absolute endpoint tags before identity-sensitive MATCH work.
     pub fn canonicalizeTable(self: @This(), table: ?[]const u8) ?[]const u8 {
         return canonicalGraphNodeTable(self.source_table, table);
     }
@@ -3238,6 +3239,7 @@ fn canonicalGraphStepAlloc(
     alloc: std.mem.Allocator,
     reader: DistributedEdgeReader,
     expansion_table: []const u8,
+    current_table: []const u8,
     key: []const u8,
     params: graph_query_mod.QueryParams,
     work_budget: *graph_pattern_mod.WorkBudget,
@@ -3287,12 +3289,9 @@ fn canonicalGraphStepAlloc(
                 return work_budget.exhaust(.explored_nodes, work_budget.max_nodes);
             return work_budget.exhaust(.explored_edges, work_budget.max_edges);
         }
-        const forward = std.mem.eql(u8, key, edge.source);
-        const adjacent = if (forward) edge.target else edge.source;
-        const declared_table = if (forward)
-            try graph_traversal_mod.metadataTargetTable(&table_scratch, edge.metadata)
-        else
-            try graph_traversal_mod.metadataSourceTable(&table_scratch, edge.metadata);
+        const endpoint = try graph_traversal_mod.resolveAdjacent(&table_scratch, edge, key, current_table, expansion_table, params.direction);
+        const adjacent = endpoint.key;
+        const declared_table = endpoint.table;
         path_edges[node_count] = .{
             .source = edge.source,
             .target = edge.target,
@@ -3301,7 +3300,7 @@ fn canonicalGraphStepAlloc(
             .owner_document = edge.owner_document,
             .weight = edge.weight,
             .metadata = edge.metadata,
-            .traversal_direction = if (forward) .out else .in,
+            .traversal_direction = endpoint.direction,
         };
         nodes[node_count] = .{
             .key = adjacent,
@@ -4307,6 +4306,7 @@ fn executeDistributedTraverse(
                         alloc,
                         reader,
                         expansion_table,
+                        item.table orelse table_name,
                         item.key,
                         graph_query.query.params,
                         request_work_budget,
@@ -5667,6 +5667,7 @@ fn findDistributedShortestPath(
                     alloc,
                     reader,
                     expansion_table,
+                    item.table orelse table_name,
                     item.key,
                     graph_query.query.params,
                     request_work_budget,
@@ -12973,6 +12974,7 @@ test "distributed graph edge reader routes outgoing and fans out incoming adjace
         tie_priorities: bool = false,
         conflicting_copy: bool = false,
         legacy_projection: bool = false,
+        equal_key_endpoints: bool = false,
     };
 
     const FakeWorker = struct {
@@ -13055,13 +13057,13 @@ test "distributed graph edge reader routes outgoing and fans out incoming adjace
                     try std.testing.expectEqual(if (outgoing) @as(u32, 7) else @as(u32, 4), req.max_scanned_rows);
                 const duplicate = try inner_alloc.alloc(graph_mod.Edge, 1);
                 duplicate[0] = .{
-                    .source = try inner_alloc.dupe(u8, if (outgoing) "doc:a" else "doc:z"),
-                    .target = try inner_alloc.dupe(u8, if (outgoing) "doc:t" else "doc:a"),
+                    .source = try inner_alloc.dupe(u8, if (state.equal_key_endpoints) "doc:a" else if (outgoing) "doc:a" else "doc:z"),
+                    .target = try inner_alloc.dupe(u8, if (state.equal_key_endpoints) "doc:a" else if (outgoing) "doc:t" else "doc:a"),
                     .edge_type = try inner_alloc.dupe(u8, "links"),
                     .weight = 2,
                     .created_at = 0,
                     .updated_at = 0,
-                    .metadata = "",
+                    .metadata = if (state.equal_key_endpoints) try inner_alloc.dupe(u8, "{\"source_table\":\"people\",\"target_table\":\"docs\"}") else "",
                     .winner_rank = if (state.legacy_projection) std.math.maxInt(u64) else if (state.tie_priorities or state.conflicting_copy) 1 else 2,
                     .winner_key_hex = if (state.legacy_projection) "" else try inner_alloc.dupe(u8, if (state.conflicting_copy) "62" else "63"),
                 };
@@ -13072,13 +13074,13 @@ test "distributed graph edge reader routes outgoing and fans out incoming adjace
                 try std.testing.expectEqual(if (req.direction == .out) @as(u32, 5) else @as(u32, 3), req.max_scanned_rows);
             const result_edges = try inner_alloc.alloc(graph_mod.Edge, 1);
             result_edges[0] = .{
-                .source = try inner_alloc.dupe(u8, if (req.direction == .out) "doc:a" else "doc:z"),
-                .target = try inner_alloc.dupe(u8, if (req.direction == .out) "doc:t" else "doc:a"),
+                .source = try inner_alloc.dupe(u8, if (state.equal_key_endpoints) "doc:a" else if (req.direction == .out) "doc:a" else "doc:z"),
+                .target = try inner_alloc.dupe(u8, if (state.equal_key_endpoints) "doc:a" else if (req.direction == .out) "doc:t" else "doc:a"),
                 .edge_type = try inner_alloc.dupe(u8, "links"),
                 .weight = 1,
                 .created_at = 0,
                 .updated_at = 0,
-                .metadata = "",
+                .metadata = if (state.equal_key_endpoints) try inner_alloc.dupe(u8, "{\"source_table\":\"people\",\"target_table\":\"docs\"}") else "",
                 .winner_rank = if (state.legacy_projection) std.math.maxInt(u64) else 1,
                 .winner_key_hex = try inner_alloc.dupe(u8, "62"),
             };
@@ -13159,7 +13161,7 @@ test "distributed graph edge reader routes outgoing and fans out incoming adjace
     state.tie_priorities = false;
     var filtered_budget = graph_pattern_mod.WorkBudget.init(10, 7);
     tie_reader.physical_work_budget = &filtered_budget;
-    var filtered_step = try canonicalGraphStepAlloc(alloc, tie_reader, "docs", "doc:a", .{
+    var filtered_step = try canonicalGraphStepAlloc(alloc, tie_reader, "docs", "docs", "doc:a", .{
         .direction = .out,
         .edge_types = &.{"links"},
         .min_weight = 1.5,
@@ -13171,7 +13173,7 @@ test "distributed graph edge reader routes outgoing and fans out incoming adjace
 
     var selected_budget = graph_pattern_mod.WorkBudget.init(10, 7);
     tie_reader.physical_work_budget = &selected_budget;
-    var selected_step = try canonicalGraphStepAlloc(alloc, tie_reader, "docs", "doc:a", .{
+    var selected_step = try canonicalGraphStepAlloc(alloc, tie_reader, "docs", "docs", "doc:a", .{
         .direction = .out,
         .edge_types = &.{"links"},
         .max_weight = 1.5,
@@ -13185,6 +13187,7 @@ test "distributed graph edge reader routes outgoing and fans out incoming adjace
         alloc,
         tie_reader,
         "docs",
+        "docs",
         "doc:a",
         .{ .direction = .out, .edge_types = &.{"links"} },
         &exhausted_budget,
@@ -13193,6 +13196,21 @@ test "distributed graph edge reader routes outgoing and fans out incoming adjace
     try std.testing.expectEqual(graph_work_budget.Dimension.explored_nodes, exhausted_budget.exhaustion().?.dimension);
 
     state.strict_scan_ceiling = false;
+    state.equal_key_endpoints = true;
+    for ([_]struct { current: []const u8, direction: graph_mod.EdgeDirection, adjacent_table: []const u8, orientation: graph_mod.EdgeDirection }{
+        .{ .current = "docs", .direction = .in, .adjacent_table = "people", .orientation = .in },
+        .{ .current = "docs", .direction = .both, .adjacent_table = "people", .orientation = .in },
+        .{ .current = "people", .direction = .both, .adjacent_table = "docs", .orientation = .out },
+    }) |case| {
+        var qualified_budget = graph_pattern_mod.WorkBudget.init(100, 100);
+        tie_reader.physical_work_budget = &qualified_budget;
+        var step = try canonicalGraphStepAlloc(alloc, tie_reader, "docs", case.current, "doc:a", .{ .direction = case.direction, .edge_types = &.{"links"} }, &qualified_budget);
+        defer step.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), step.visibleNodes().len);
+        try std.testing.expectEqualStrings(case.adjacent_table, step.visibleNodes()[0].table.?);
+        try std.testing.expectEqual(case.orientation, step.visibleNodes()[0].path_edges.?[0].traversal_direction.?);
+    }
+    state.equal_key_endpoints = false;
     const base_result = db_mod.types.SearchResult{
         .alloc = alloc,
         .hits = @constCast((&[_]db_mod.types.SearchHit{})[0..]),
