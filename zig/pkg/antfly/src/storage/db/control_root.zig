@@ -25,7 +25,6 @@ const document_artifact_child_range = @import("document_artifact_child_range.zig
 pub const types = @import("types.zig");
 pub const coordinated_ttl = @import("../coordinated_ttl.zig");
 pub const OrderedApplyReceipt = types.OrderedApplyReceipt;
-pub const RaftAppliedEntryIdentity = OrderedApplyReceipt;
 pub const aggregations = @import("aggregations_contract.zig");
 pub const algebraic = @import("algebraic/control_root.zig");
 pub const doc_filter_wire = @import("doc_filter_wire.zig");
@@ -50,7 +49,6 @@ pub const ReplicationAsyncEffectMirror = replication_contract.AsyncEffectMirror;
 pub const ReplicationAsyncBatchMirror = replication_contract.AsyncBatchMirror;
 pub const ReplicationAsyncMetadataMirror = replication_contract.AsyncMetadataMirror;
 pub const MutationBarrier = @import("antfly_runtime_abi").mutation_barrier.MutationBarrier;
-pub const ReplicationSyncWaitFn = replication_contract.SyncWaitFn;
 pub const ReplicationWriteGate = replication_contract.WriteGate;
 
 pub const DocumentArtifactChildRangeApplyBatch = document_artifact_child_range.ApplyBatch;

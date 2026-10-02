@@ -5814,7 +5814,7 @@ test "standalone metadata HA preserves incremental jobs outbox recovery and full
     {
         var source = try RaftApplyStore.init(alloc, .{ .root_dir = source_root });
         defer source.deinit();
-        try source.bindHotStandby(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary) });
+        try source.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{}));
         try source.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = logical_key, .value = queued } });
         var first = (try primary.log.entryAt(alloc, 1)).?;
         defer first.deinit(alloc);
@@ -5830,7 +5830,7 @@ test "standalone metadata HA preserves incremental jobs outbox recovery and full
             }
         };
         var context: u8 = 0;
-        try source.bindHotStandby(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &context, .sync_wait_fn = Failure.wait });
+        try source.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &context, .sync_wait_fn = Failure.wait }));
         try std.testing.expectError(error.InjectedAfterMetadataHAAppend, source.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = logical_key, .value = importing } }));
         try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
         try std.testing.expectError(error.MetadataHAOutboxPending, source.exportHotStandbyCheckpoint(io, checkpoint));
@@ -5838,7 +5838,7 @@ test "standalone metadata HA preserves incremental jobs outbox recovery and full
     {
         var source = try RaftApplyStore.init(alloc, .{ .root_dir = source_root });
         defer source.deinit();
-        try source.bindHotStandby(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary) });
+        try source.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{}));
         try source.flushHotStandbyOutbox();
         try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
         try source.store.put("\x00\x00__metadata__:private_fixture", "private-reservation-proof");
@@ -5913,7 +5913,7 @@ test "standalone metadata chunked HA resumes large effects through checkpoint wi
             }
         };
         var context: u8 = 0;
-        try source.bindHotStandby(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &context, .sync_wait_fn = Failure.wait });
+        try source.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &context, .sync_wait_fn = Failure.wait }));
         try std.testing.expectError(error.MetadataMutationOutcomeUnknown, source.replaceStandaloneCatalog(group, 0, &.{}, &.{}, value));
     }
     const final_lsn = primary.lastLsn();
@@ -5921,7 +5921,7 @@ test "standalone metadata chunked HA resumes large effects through checkpoint wi
     {
         var source = try RaftApplyStore.init(alloc, .{ .root_dir = source_root });
         defer source.deinit();
-        try source.bindHotStandby(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary) });
+        try source.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{}));
         try source.flushHotStandbyOutbox();
         try std.testing.expectEqual(final_lsn, primary.lastLsn());
     }
@@ -6014,9 +6014,9 @@ test "standalone metadata chunked HA resumes large effects through checkpoint wi
     var promoted = try RaftApplyStore.init(alloc, .{ .root_dir = promoted_root });
     defer promoted.deinit();
     try promoted.importHotStandbyCheckpoint(io, checkpoint, checkpoint_size);
-    try promoted.bindHotStandby(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary) });
+    try promoted.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{}));
     try std.testing.expectError(error.MetadataHAIncompleteEffect, promoted.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = key, .value = "promoted" } }));
-    try promoted.bindHotStandby(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&new_primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&new_primary) });
+    try promoted.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&new_primary) }, hot_standby_publisher_adapter.bindMirror(&new_primary, .{}));
     try promoted.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = key, .value = "promoted" } });
     var follower = try RaftApplyStore.init(alloc, .{ .root_dir = follower_root });
     defer follower.deinit();
@@ -6337,12 +6337,12 @@ pub const RaftApplyStore = struct {
             lsn = prior orelse try (try hot_standby_publisher_adapter.runtimePrimary(mirror)).append(.{ .kind = .metadata_mutation, .payload_codec = .binary, .shard_id = 0, .table_id = 0, .payload = frame });
             search_from = lsn +| 1;
         }
-        if (mirror.last_lsn) |last| last.store(lsn, .release);
+        if (hot_standby_publisher_adapter.options(mirror).last_lsn) |last| last.store(lsn, .release);
         self.unlockHotStandbyTransition();
         transition_locked = false;
-        if (mirror.sync_policy.mode != .async) {
-            if (mirror.sync_wait_fn) |wait| try wait(mirror.sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.publisher.ptr, lsn, mirror.sync_policy);
-            const decision = try @import("../../storage/hot_standby/commit_gate.zig").evaluate(try hot_standby_publisher_adapter.runtimePrimary(mirror), lsn, mirror.sync_policy);
+        if (hot_standby_publisher_adapter.options(mirror).sync_policy.mode != .async) {
+            if (hot_standby_publisher_adapter.options(mirror).sync_wait_fn) |wait| try wait(hot_standby_publisher_adapter.options(mirror).sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.publisher.ptr, lsn, hot_standby_publisher_adapter.options(mirror).sync_policy);
+            const decision = try @import("../../storage/hot_standby/commit_gate.zig").evaluate(try hot_standby_publisher_adapter.runtimePrimary(mirror), lsn, hot_standby_publisher_adapter.options(mirror).sync_policy);
             if (!decision.shouldAcknowledge()) return error.HASyncCommitWouldBlock;
         }
         // A remote acknowledgment can outlive the role generation that

@@ -188,7 +188,7 @@ test "online merge private port preserves source recovery errors through foreign
         error.RetainedEffectsIdentityRequired,
         error.RetainedEffectsNamespaceMismatch,
         error.BackendRuntimeIoUnavailable,
-        error.CorruptRaftAppliedEntry,
+        error.CorruptOrderedApplyReceipt,
         error.UnknownSchemaVersion,
         error.InvalidRetainedEffectsAdmission,
         error.RetainedEffectsFenceMismatch,

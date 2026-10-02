@@ -18,7 +18,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from audit_embedded_source_boundary import audit, audit_modules, production_imports
+from audit_embedded_source_boundary import (
+    audit,
+    audit_modules,
+    production_imports,
+    check_replication_contract,
+)
 from check_embedded_isolated_build import stage_sources
 
 
@@ -61,6 +66,32 @@ class EmbeddedBoundaryTest(unittest.TestCase):
                 (stage / "zig/pkg/antfly/src/capi/server_owner.zig").read_text(),
             )
             self.assertFalse((stage / "docs/plan.md").exists())
+
+    def test_local_ports_reject_policy_even_without_server_imports(self):
+        for token in (
+            "sync_policy",
+            "standby_names",
+            "fenced_primary",
+            "raft_applied_entry_marker",
+        ):
+            with (
+                self.subTest(token=token),
+                self.assertRaisesRegex(ValueError, "server replication policy"),
+            ):
+                check_replication_contract(
+                    "storage/db/replication_contract.zig", f"pub const {token} = 0;"
+                )
+        check_replication_contract(
+            "storage/hot_standby/db_commit.zig", "pub const sync_policy = 0;"
+        )
+        check_replication_contract(
+            "storage/db/replication_contract.zig",
+            'test "fixture" { const sync_policy = 0; }',
+        )
+        check_replication_contract(
+            "storage/db/replication_contract.zig",
+            '// standby_names\nconst note = "sync_policy";',
+        )
 
     def test_dynamic_imports_fail_closed(self):
         with self.assertRaisesRegex(ValueError, "literal source owner"):

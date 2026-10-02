@@ -1928,7 +1928,7 @@ const RaftTableApplyStateMachine = struct {
                 }
             }
         }
-        const entry: antfly.db.types.RaftAppliedEntryIdentity = .{ .term = entry_term, .index = entry_index };
+        const entry: antfly.db.types.OrderedApplyReceipt = .{ .term = entry_term, .index = entry_index };
         if (comptime linked_storage) {
             const owner_source = self.kernel_owner_source orelse
                 return error.StorageKernelOwnerUnavailable;
@@ -7186,13 +7186,13 @@ pub const DataServer = struct {
     pub fn acknowledgeHotStandbyCatalogCreate(self: *DataServer, commit: HACatalogCommit) !void {
         const mirror = commit.mirror;
         // Do not hold the transition mutex while waiting for receiver acks.
-        if (mirror.sync_wait_fn) |wait| {
-            try wait(mirror.sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.publisher.ptr, commit.lsn, mirror.sync_policy);
+        if (hot_standby_publisher_adapter.options(mirror).sync_wait_fn) |wait| {
+            try wait(hot_standby_publisher_adapter.options(mirror).sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.publisher.ptr, commit.lsn, hot_standby_publisher_adapter.options(mirror).sync_policy);
         }
         platform_sync.lockYielding(&self.hot_standby_state_mutex);
         defer self.hot_standby_state_mutex.unlock();
         try self.hot_standby_public_gate_state.checkWrite(commit.generation);
-        const gate = try antfly.hot_standby.commit_gate.evaluate(try hot_standby_publisher_adapter.runtimePrimary(mirror), commit.lsn, mirror.sync_policy);
+        const gate = try antfly.hot_standby.commit_gate.evaluate(try hot_standby_publisher_adapter.runtimePrimary(mirror), commit.lsn, hot_standby_publisher_adapter.options(mirror).sync_policy);
         if (!gate.shouldAcknowledge()) return error.SyncPolicyUnsatisfied;
     }
 
@@ -7891,8 +7891,7 @@ pub const DataServer = struct {
     }
 
     fn hotStandbyPrimaryMirrorFor(self: *DataServer, primary: *antfly.hot_standby.primary.Primary) antfly.db.ReplicationAsyncEffectMirror {
-        var mirror = antfly.db.ReplicationAsyncEffectMirror{
-            .publisher = hot_standby_publisher_adapter.bind(primary),
+        var configuration: hot_standby_publisher_adapter.Options = .{
             .mutation_barrier = &self.hot_standby_mutation_barrier,
             .transition_mutex = &self.hot_standby_state_mutex,
             .last_lsn = &self.hot_standby_primary_mirror_last_lsn,
@@ -7904,11 +7903,11 @@ pub const DataServer = struct {
             .sync_wait_count = &self.hot_standby_primary_mirror_sync_wait_count,
             .sync_degraded_count = &self.hot_standby_primary_mirror_sync_degraded_count,
         };
-        if (mirror.sync_policy.mode != .async and mirror.sync_policy.failure_policy == .block) {
-            mirror.sync_wait_ctx = &self.hot_standby_primary_sync_wait;
-            mirror.sync_wait_fn = antfly.hot_standby.sync_wait.HotStandbyPrimaryProgressSyncWait.wait;
+        if (configuration.sync_policy.mode != .async and configuration.sync_policy.failure_policy == .block) {
+            configuration.sync_wait_ctx = &self.hot_standby_primary_sync_wait;
+            configuration.sync_wait_fn = antfly.hot_standby.sync_wait.HotStandbyPrimaryProgressSyncWait.wait;
         }
-        return mirror;
+        return hot_standby_publisher_adapter.bindMirror(primary, configuration);
     }
 
     fn hotStandbyReadGate(self: *DataServer) ?antfly.public_api.HotStandbyReadGate {
@@ -41872,7 +41871,7 @@ fn consumerTests() type {
                     try std.testing.expect(gate.state.ptr == @as(*const anyopaque, @ptrCast(&server.hot_standby_public_gate_state)));
                     try std.testing.expect(gate.generation == null);
                 },
-                .primary, .fenced_primary, .standby => return error.TestExpectedEqual,
+                .borrowed, .captured => return error.TestExpectedEqual,
             }
             try source_gate.check();
 
@@ -48779,8 +48778,8 @@ fn implementationTests() type {
                 .destination_group_id = 2,
                 .split_key = "doc:k",
             } };
-            const split_entry: antfly.db.RaftAppliedEntryIdentity = .{ .term = 1, .index = 10 };
-            const merge_entry: antfly.db.RaftAppliedEntryIdentity = .{ .term = 1, .index = 11 };
+            const split_entry: antfly.db.OrderedApplyReceipt = .{ .term = 1, .index = 10 };
+            const merge_entry: antfly.db.OrderedApplyReceipt = .{ .term = 1, .index = 11 };
             {
                 var db = try antfly.db.DB.open(alloc, path, .{ .start_index_workers = false });
                 defer db.close();
@@ -48840,7 +48839,7 @@ fn implementationTests() type {
                     .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
                 }},
             };
-            const first_entry: antfly.db.types.RaftAppliedEntryIdentity = .{ .term = 4, .index = 11 };
+            const first_entry: antfly.db.types.OrderedApplyReceipt = .{ .term = 4, .index = 11 };
 
             {
                 var db = try antfly.db.DB.open(alloc, path, .{ .start_index_workers = false });
@@ -48858,7 +48857,7 @@ fn implementationTests() type {
                 // no-op; a different term at the same index is never accepted as it.
                 try @import("../storage/server_db_adapter.zig").applyOrdered(&db, increment, first_entry);
                 try std.testing.expectError(
-                    error.ConflictingRaftAppliedEntry,
+                    error.ConflictingOrderedApplyReceipt,
                     @import("../storage/server_db_adapter.zig").applyOrdered(&db, increment, .{ .term = 5, .index = 11 }),
                 );
 
@@ -48868,7 +48867,7 @@ fn implementationTests() type {
                 defer parsed.deinit();
                 try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("count").?.integer);
 
-                const second_entry: antfly.db.types.RaftAppliedEntryIdentity = .{ .term = 5, .index = 12 };
+                const second_entry: antfly.db.types.OrderedApplyReceipt = .{ .term = 5, .index = 12 };
                 try @import("../storage/server_db_adapter.zig").applyOrdered(&db, increment, second_entry);
                 try std.testing.expectEqual(second_entry, (try db.orderedApplyReceipt()).?);
 
@@ -48876,7 +48875,7 @@ fn implementationTests() type {
                 // group-local fence, allowing that history to begin at a lower index.
                 try db.clearOrderedApplyReceipt();
                 try std.testing.expectEqual(null, try db.orderedApplyReceipt());
-                const imported_history_entry: antfly.db.types.RaftAppliedEntryIdentity = .{ .term = 1, .index = 1 };
+                const imported_history_entry: antfly.db.types.OrderedApplyReceipt = .{ .term = 1, .index = 1 };
                 try @import("../storage/server_db_adapter.zig").applyOrdered(&db, increment, imported_history_entry);
                 try std.testing.expectEqual(imported_history_entry, (try db.orderedApplyReceipt()).?);
                 const reset_raw = (try db.get(alloc, "doc:counter")) orelse return error.TestExpectedDocument;
@@ -55398,7 +55397,7 @@ fn implementationTests() type {
                     try std.testing.expect(gate.state.ptr == @as(*const anyopaque, @ptrCast(&server.hot_standby_public_gate_state)));
                     try std.testing.expect(gate.generation == null);
                 },
-                .standby, .fenced_primary, .primary => return error.TestExpectedEqual,
+                .borrowed, .captured => return error.TestExpectedEqual,
             }
 
             const cache_gate = server.provisioned_storage.write_cache.replication_write_gate orelse return error.TestExpectedEqual;
@@ -55407,7 +55406,7 @@ fn implementationTests() type {
                     try std.testing.expect(gate.state.ptr == @as(*const anyopaque, @ptrCast(&server.hot_standby_public_gate_state)));
                     try std.testing.expect(gate.generation == null);
                 },
-                .standby, .fenced_primary, .primary => return error.TestExpectedEqual,
+                .borrowed, .captured => return error.TestExpectedEqual,
             }
 
             const read_gate = server.read_source.hot_standby_read_gate orelse return error.TestExpectedEqual;

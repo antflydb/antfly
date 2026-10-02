@@ -3200,7 +3200,7 @@ test "opaque metadata HA callback preserves lost ack replay and full checkpoint 
         // An opaque owner cannot retain a pointer to this stack-local Port;
         // only its heap-owned creator adapter survives each completed bind.
         try std.testing.expect(transition.tryLock());
-        try source.bindHotStandby(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .transition_mutex = &transition });
+        try source.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .transition_mutex = &transition }));
         transition.unlock();
         try std.testing.expectError(error.MetadataHAMigrationAfterBinding, source.migrateStandaloneRestoreJobs(&.{}));
         try source.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = key, .value = initial } });
@@ -3211,7 +3211,7 @@ test "opaque metadata HA callback preserves lost ack replay and full checkpoint 
         const actual = (try target.getRestoreJobValue(alloc, group, key)).?;
         defer alloc.free(actual);
         try std.testing.expectEqualStrings(initial, actual);
-        try source.bindHotStandby(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .transition_mutex = &transition, .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &wait_ctx, .sync_wait_fn = Failure.wait });
+        try source.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .transition_mutex = &transition, .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &wait_ctx, .sync_wait_fn = Failure.wait }));
         try std.testing.expectError(error.HASyncCommitWouldBlock, source.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = key, .value = updated } }));
         try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
         try std.testing.expectError(error.MetadataHAOutboxPending, source.exportHotStandbyCheckpoint(io, root ++ "/checkpoint"));
@@ -3221,7 +3221,7 @@ test "opaque metadata HA callback preserves lost ack replay and full checkpoint 
     {
         var source = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = root ++ "/source" });
         defer source.deinit();
-        try source.bindHotStandby(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .transition_mutex = &transition });
+        try source.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .transition_mutex = &transition }));
         try source.flushHotStandbyOutbox();
         try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
         const checkpoint = try source.exportHotStandbyCheckpoint(io, root ++ "/checkpoint");
@@ -3242,7 +3242,7 @@ test "opaque metadata HA callback preserves lost ack replay and full checkpoint 
         try std.testing.expect(revision > 0);
         try std.testing.expectError(error.TableLifecycleConflict, source.replaceStandaloneCatalog(group, revision - 1, &.{}, &.{}, "{}"));
         try std.testing.expectEqual(revision, try source.standaloneRevision());
-        try source.bindHotStandby(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .transition_mutex = &transition, .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &wait_ctx, .sync_wait_fn = Failure.wait });
+        try source.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .transition_mutex = &transition, .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &wait_ctx, .sync_wait_fn = Failure.wait }));
         try std.testing.expectError(error.MetadataMutationOutcomeUnknown, source.replaceStandaloneCatalog(group, revision, &.{}, &.{}, "{}"));
         try std.testing.expectEqual(revision + 1, try source.standaloneRevision());
         const catalog = (try source.loadStandaloneCatalog(alloc)).?;
@@ -3283,13 +3283,12 @@ test "opaque metadata standby acknowledgement cannot retire an outbox across pro
     var promote: Promote = .{ .gate = &gate, .transition = &transition };
     var source = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = root ++ "/source" });
     defer source.deinit();
-    try source.bindHotStandby(.{ .shared = .{ .state = gate.storageWriteState() } }, .{
-        .publisher = hot_standby_publisher_adapter.bind(&primary),
+    try source.bindHotStandby(.{ .shared = .{ .state = gate.storageWriteState() } }, hot_standby_publisher_adapter.bindMirror(&primary, .{
         .transition_mutex = &transition,
         .sync_policy = .{ .mode = .remote_apply, .standby_names = &.{"standby-a"} },
         .sync_wait_ctx = &promote,
         .sync_wait_fn = Promote.wait,
-    });
+    }));
     const group = @import("../common/group_ids.zig").main_metadata_group_id;
     try std.testing.expectError(error.HAPromotedStandbyRequiresPrimaryOpen, source.applyStandaloneCommand(group, .{ .upsert_restore_job = .{
         .key = "\x00\x00__api_restore_jobs__:000000000000002a",
@@ -3299,7 +3298,7 @@ test "opaque metadata standby acknowledgement cannot retire an outbox across pro
     try std.testing.expect(transition.tryLock());
     transition.unlock();
     const prior_lsn = primary.lastLsn();
-    try source.bindHotStandby(.{ .shared = .{ .state = gate.storageWriteState() } }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .transition_mutex = &transition });
+    try source.bindHotStandby(.{ .shared = .{ .state = gate.storageWriteState() } }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .transition_mutex = &transition }));
     try source.flushHotStandbyOutbox();
     try std.testing.expectEqual(prior_lsn, primary.lastLsn());
     _ = try source.exportHotStandbyCheckpoint(std.testing.io, root ++ "/checkpoint");

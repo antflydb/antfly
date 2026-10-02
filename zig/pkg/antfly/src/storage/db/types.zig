@@ -4003,9 +4003,6 @@ pub const OrderedApplyReceipt = struct {
     index: u64,
 };
 
-/// Server source compatibility; the durable term/index encoding is unchanged.
-pub const RaftAppliedEntryIdentity = OrderedApplyReceipt;
-
 pub const ArtifactRepairResult = struct {
     scanned: u64 = 0,
     groups_scanned: u64 = 0,

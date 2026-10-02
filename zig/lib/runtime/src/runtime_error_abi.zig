@@ -866,7 +866,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.RetainedEffectsIdentityRequired => status(.conflict, .retained_effects_identity_required),
         error.RetainedEffectsNamespaceMismatch => status(.conflict, .retained_effects_namespace_mismatch),
         error.BackendRuntimeIoUnavailable => status(.unavailable, .backend_runtime_io_unavailable),
-        error.CorruptRaftAppliedEntry => status(.corrupt, .corrupt_raft_applied_entry),
+        error.CorruptRaftAppliedEntry, error.CorruptOrderedApplyReceipt => status(.corrupt, .corrupt_raft_applied_entry),
         error.UnknownSchemaVersion => status(.conflict, .unknown_schema_version),
         error.MetadataHABindingBusy => status(.retryable, .metadata_ha_binding_busy),
         error.MetadataHAOutboxPending => status(.retryable, .metadata_ha_outbox_pending),
@@ -2252,4 +2252,11 @@ test "online merge admission barrier preserves exact identity across runtime arc
     const err = error.OnlineMergeArtifactCatalogUncoordinated;
     try std.testing.expect(errorHasStableDetail(err));
     try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+}
+
+test "ordered receipt corruption preserves the released runtime status" {
+    const old = statusFromError(error.CorruptRaftAppliedEntry);
+    const renamed = statusFromError(error.CorruptOrderedApplyReceipt);
+    try std.testing.expectEqual(old, renamed);
+    try std.testing.expectEqual(error.CorruptRaftAppliedEntry, errorFromStatus(renamed));
 }

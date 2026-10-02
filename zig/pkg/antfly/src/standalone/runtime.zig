@@ -12490,12 +12490,12 @@ test "standalone catalog remote apply outage preserves committed creation and re
         }
     };
     var failure_context: u8 = 0;
-    const mirror: antfly.db.ReplicationAsyncEffectMirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &failure_context, .sync_wait_fn = Failure.wait };
+    const mirror: antfly.db.ReplicationAsyncEffectMirror = hot_standby_publisher_adapter.bindMirror(&primary, .{ .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &failure_context, .sync_wait_fn = Failure.wait });
     var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, runtime.ptr(), null, .local);
     var metadata_open = true;
     defer if (metadata_open) metadata.deinit();
     metadata.vector_source_storage_allowed = false;
-    try LocalStandaloneMetadata.bindHotStandbyMetadata(&metadata, .{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, mirror);
+    try LocalStandaloneMetadata.bindHotStandbyMetadata(&metadata, .{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, mirror);
     const before_revision = metadata.durable_revision;
     try std.testing.expectError(error.MetadataMutationOutcomeUnknown, LocalStandaloneMetadata.createTable(&metadata, alloc, "pending", .{}));
     try std.testing.expect(metadata.findTableByNameLocked("pending") != null);
@@ -12504,7 +12504,7 @@ test "standalone catalog remote apply outage preserves committed creation and re
     const committed_lsn = primary.lastLsn();
     try std.testing.expect(committed_lsn != 0);
     try std.testing.expectError(error.MetadataMutationOutcomeUnknown, LocalStandaloneMetadata.createTable(&metadata, alloc, "pending", .{}));
-    try std.testing.expectError(error.ProposalDropped, LocalStandaloneMetadata.createTable(&metadata, alloc, "not_committed", .{}));
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, LocalStandaloneMetadata.createTable(&metadata, alloc, "not_committed", .{}));
     try std.testing.expect(metadata.findTableByNameLocked("not_committed") == null);
     try std.testing.expectEqual(committed_lsn, primary.lastLsn());
     metadata.deinit();
@@ -12512,14 +12512,23 @@ test "standalone catalog remote apply outage preserves committed creation and re
     metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, runtime.ptr(), null, .local);
     metadata_open = true;
     metadata.vector_source_storage_allowed = false;
-    try LocalStandaloneMetadata.bindHotStandbyMetadata(&metadata, .{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, mirror);
+    try LocalStandaloneMetadata.bindHotStandbyMetadata(&metadata, .{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, mirror);
     try std.testing.expectError(error.MetadataMutationOutcomeUnknown, LocalStandaloneMetadata.createTable(&metadata, alloc, "pending", .{}));
     // Restart can expose the listener while remote acknowledgement is down,
     // but checkpoint preflight must still fail with the durable outbox intact.
     try std.testing.expectError(error.HASyncCommitWouldBlock, LocalStandaloneMetadata.prepareHotStandbyMetadataCheckpoint(&metadata));
-    try LocalStandaloneMetadata.bindHotStandbyMetadata(&metadata, .{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary) });
+    try LocalStandaloneMetadata.bindHotStandbyMetadata(&metadata, .{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{}));
     try std.testing.expectError(error.TableAlreadyExists, LocalStandaloneMetadata.createTable(&metadata, alloc, "pending", .{}));
     try std.testing.expectEqual(committed_lsn, primary.lastLsn());
+    // Draining the replication outbox does not clear an uncertain local-sync
+    // fence. Restart reopens the durable catalog before accepting new writes.
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, LocalStandaloneMetadata.createTable(&metadata, alloc, "after_outage", .{}));
+    metadata.deinit();
+    metadata_open = false;
+    metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, runtime.ptr(), null, .local);
+    metadata_open = true;
+    metadata.vector_source_storage_allowed = false;
+    try LocalStandaloneMetadata.bindHotStandbyMetadata(&metadata, .{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{}));
     const recovered_revision = metadata.durable_revision;
     try LocalStandaloneMetadata.createTable(&metadata, alloc, "after_outage", .{});
     try std.testing.expect(metadata.findTableByNameLocked("after_outage") != null);
@@ -12569,7 +12578,7 @@ test "standalone metadata replay refreshes colliding revisions and only publishe
     var source = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", source_root, source_path, runtime.ptr(), null, .local);
     defer source.deinit();
     source.vector_source_storage_allowed = false;
-    try LocalStandaloneMetadata.bindHotStandbyMetadata(&source, .{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary) });
+    try LocalStandaloneMetadata.bindHotStandbyMetadata(&source, .{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{}));
     try LocalStandaloneMetadata.createTable(&source, alloc, "replicated", .{});
     const first_revision = source.durable_revision;
     const first_lsn = primary.lastLsn();
@@ -12695,12 +12704,12 @@ test "standalone shared restore HA policy mirrors mixed publication and durable 
     var barrier: antfly.db.MutationBarrier = .{};
     // Metadata and all restored DB owners publish into this one WAL.
     var transition_mutex: std.atomic.Mutex = .unlocked;
-    const mirror: antfly.db.ReplicationAsyncEffectMirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .mutation_barrier = &barrier, .transition_mutex = &transition_mutex };
-    try LocalStandaloneMetadata.bindHotStandbyMetadata(&metadata, .{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, mirror);
+    const mirror: antfly.db.ReplicationAsyncEffectMirror = hot_standby_publisher_adapter.bindMirror(&primary, .{ .mutation_barrier = &barrier, .transition_mutex = &transition_mutex });
+    try LocalStandaloneMetadata.bindHotStandbyMetadata(&metadata, .{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, mirror);
     try @import("../api/restore_worker_fixture.zig").runWithPolicy(antfly.public_api.http_server.RestoreWorkerTestDriver, false, metadata.statusSource(), metadata.restorePersistence(), .{
         .failover_safe = true,
         .guard = .{ .ptr = &metadata, .is_current = LocalStandaloneMetadata.restoreTermCurrent },
-        .gate = .{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) },
+        .gate = .{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) },
         .mirror = mirror,
     });
     const standby_root = try std.fmt.allocPrint(alloc, "{s}/standby-metadata", .{root});
@@ -13773,13 +13782,13 @@ test "standalone catalog journal preserves imported policy publication as fail c
         metadata.system_catalog_state = replacement;
         const result = try metadata.statusSource().systemCatalog(alloc, .{}, .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .database, .name = "policy_import" } } });
         alloc.free(result);
-        try std.testing.expectError(error.RowPolicyUnsupported, metadata.statusSource().systemCatalog(alloc, .{ .row_policy_install_authority = true }, .{ .policy_publication_status = 7 }));
+        try std.testing.expectError(error.RowPolicyCatalogChanged, metadata.statusSource().systemCatalog(alloc, .{ .row_policy_install_authority = true }, .{ .policy_publication_status = 7 }));
     }
     var reopened = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), &store, .local);
     defer reopened.deinit();
     try std.testing.expectEqual(@as(usize, 1), reopened.systemCatalogState().policy_publications.len);
     try std.testing.expectEqual(@as(u64, 11), reopened.systemCatalogState().policy_publications[0].required_owners[0].group_id);
-    try std.testing.expectError(error.RowPolicyUnsupported, reopened.statusSource().systemCatalog(alloc, .{ .row_policy_install_authority = true }, .{ .policy_publication_status = 7 }));
+    try std.testing.expectError(error.RowPolicyCatalogChanged, reopened.statusSource().systemCatalog(alloc, .{ .row_policy_install_authority = true }, .{ .policy_publication_status = 7 }));
     try std.testing.expectError(error.RowPolicyUnsupported, reopened.statusSource().systemCatalog(alloc, .{}, .export_snapshot));
 }
 
@@ -14299,7 +14308,7 @@ test "system catalog standalone imports main checkpoints and current logical see
                 } else try writeFileAtomically(alloc, runtime.ptr().io().?, path, input);
                 var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, runtime.ptr(), store, engine);
                 defer metadata.deinit();
-                try std.testing.expectEqual(engine == .local, metadata.catalog_rows_initialized);
+                try std.testing.expect(metadata.catalog_rows_initialized);
                 const renamed = try metadata.statusSource().systemCatalog(alloc, .{}, .{ .mutate = .{ .mutation = if (from_main) .{ .action = .create, .kind = .database, .name = "warehouse" } else .{ .action = .rename, .kind = .database, .name = "analytics", .new_name = "warehouse" } } });
                 alloc.free(renamed);
                 try std.testing.expect(metadata.catalog_rows_initialized);

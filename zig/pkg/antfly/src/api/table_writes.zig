@@ -2628,74 +2628,16 @@ pub const ProvisionedTableWriteCache = struct {
 
     fn hotStandbyWriteGatesEqual(a: ?db_mod.ReplicationWriteGate, b: ?db_mod.ReplicationWriteGate) bool {
         if (a == null or b == null) return a == null and b == null;
-        return switch (a.?) {
-            .primary => |left| switch (b.?) {
-                .primary => |right| left.ptr == right.ptr and left.check_fn == right.check_fn,
-                .fenced_primary => false,
-                .standby => false,
-                .shared => false,
-            },
-            .fenced_primary => |left| switch (b.?) {
-                .primary => false,
-                .fenced_primary => |right| left.check_fn == right.check_fn and left.primary == right.primary and
-                    left.fence_store == right.fence_store and
-                    std.mem.eql(u8, left.node_id, right.node_id),
-                .standby => false,
-                .shared => false,
-            },
-            .standby => |left| switch (b.?) {
-                .primary => false,
-                .fenced_primary => false,
-                .standby => |right| left.ptr == right.ptr and left.check_fn == right.check_fn,
-                .shared => false,
-            },
-            .shared => |left| switch (b.?) {
-                .primary, .fenced_primary, .standby => false,
-                .shared => |right| left.state.ptr == right.state.ptr and left.state.vtable == right.state.vtable and left.generation == right.generation,
-            },
-        };
+        return a.?.eql(b.?);
     }
 
     fn hotStandbyWriteGateCurrentGeneration(gate: ?db_mod.ReplicationWriteGate) ?u64 {
-        const configured = gate orelse return null;
-        return switch (configured) {
-            .shared => |shared| shared.state.currentGeneration(),
-            .primary, .fenced_primary, .standby => null,
-        };
-    }
-
-    fn syncPoliciesEqual(a: hot_standby_primary_mod.SyncPolicy, b: hot_standby_primary_mod.SyncPolicy) bool {
-        if (a.mode != b.mode or
-            a.selection != b.selection or
-            a.required != b.required or
-            a.failure_policy != b.failure_policy or
-            a.standby_names.len != b.standby_names.len)
-        {
-            return false;
-        }
-        for (a.standby_names, b.standby_names) |left, right| {
-            if (!std.mem.eql(u8, left, right)) return false;
-        }
-        return true;
+        return if (gate) |configured| configured.currentGeneration() else null;
     }
 
     fn hotStandbyAsyncMirrorsEqual(a: ?db_mod.ReplicationAsyncEffectMirror, b: ?db_mod.ReplicationAsyncEffectMirror) bool {
         if (a == null or b == null) return a == null and b == null;
-        const left = a.?;
-        const right = b.?;
-        return left.publisher.ptr == right.publisher.ptr and left.publisher.vtable == right.publisher.vtable and
-            left.mutation_barrier == right.mutation_barrier and
-            left.transition_mutex == right.transition_mutex and
-            left.last_lsn == right.last_lsn and
-            left.failure_count == right.failure_count and
-            syncPoliciesEqual(left.sync_policy, right.sync_policy) and
-            left.sync_wait_ctx == right.sync_wait_ctx and
-            left.sync_wait_fn == right.sync_wait_fn and
-            left.last_gate_lsn == right.last_gate_lsn and
-            left.last_gate_action == right.last_gate_action and
-            left.sync_reject_count == right.sync_reject_count and
-            left.sync_wait_count == right.sync_wait_count and
-            left.sync_degraded_count == right.sync_degraded_count;
+        return a.?.eql(b.?);
     }
 
     fn runtimeHooksEqual(
@@ -22505,7 +22447,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         req: db_mod.types.BatchRequest,
         metadata_prepared: bool,
-        entry: ?db_mod.types.RaftAppliedEntryIdentity,
+        entry: ?db_mod.types.OrderedApplyReceipt,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (comptime control_only_storage_sources) {
@@ -22602,7 +22544,7 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         table_name: []const u8,
         req: db_mod.types.BatchRequest,
-        entry: db_mod.RaftAppliedEntryIdentity,
+        entry: db_mod.OrderedApplyReceipt,
     ) !?void {
         return try self.applyReplicatedBatchGroupLocalWithMetadata(
             alloc,
@@ -22640,7 +22582,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         req: db_mod.types.BatchRequest,
         metadata_source: ReplicatedApplyMetadataSource,
-        raft_entry: ?db_mod.RaftAppliedEntryIdentity,
+        raft_entry: ?db_mod.OrderedApplyReceipt,
     ) !?void {
         const apply_req = req;
         const split_identity_namespace = try validateSplitReplicationForApply(apply_req, group_id);
@@ -40105,8 +40047,8 @@ fn implementationTests() type {
             var alternate_vtable = Stub.vtable;
             mirror.publisher.vtable = &alternate_vtable;
             try std.testing.expect(!ProvisionedTableWriteCache.hotStandbyAsyncMirrorsEqual(original, mirror));
-            const allowed: db_mod.ReplicationWriteGate = .{ .primary = .{ .ptr = &context, .check_fn = Stub.allow } };
-            const rejected: db_mod.ReplicationWriteGate = .{ .primary = .{ .ptr = &context, .check_fn = Stub.reject } };
+            const allowed: db_mod.ReplicationWriteGate = .{ .borrowed = .{ .ptr = &context, .check_fn = Stub.allow } };
+            const rejected: db_mod.ReplicationWriteGate = .{ .borrowed = .{ .ptr = &context, .check_fn = Stub.reject } };
             try std.testing.expect(!ProvisionedTableWriteCache.hotStandbyWriteGatesEqual(allowed, rejected));
             try std.testing.expect(ProvisionedTableWriteCache.hotStandbyWriteGatesEqual(allowed, allowed));
         }
@@ -60161,7 +60103,7 @@ fn implementationTests() type {
             }, .{});
             defer primary.close();
 
-            try write_cache.setHotStandbyWriteGate(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) });
+            try write_cache.setHotStandbyWriteGate(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) });
             try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
             try std.testing.expectEqual(@as(usize, 0), write_cache.closing_entries.items.len);
         }
@@ -61366,10 +61308,9 @@ fn implementationTests() type {
             }, .{});
             defer primary.close();
             var mutation_barrier: replication_mutation_barrier_mod.MutationBarrier = .{};
-            source.hot_standby_async_mirror = .{
-                .publisher = hot_standby_publisher_adapter.bind(&primary),
+            source.hot_standby_async_mirror = hot_standby_publisher_adapter.bindMirror(&primary, .{
                 .mutation_barrier = &mutation_barrier,
-            };
+            });
             write_cache.hot_standby_async_mirror = source.hot_standby_async_mirror;
             startup_write_cache.hot_standby_async_mirror = source.hot_standby_async_mirror;
 

@@ -4753,7 +4753,7 @@ pub fn replicatedBatchStorageKernelJson(
 pub fn replicatedBatchStorageKernelJsonAtRaftEntry(
     handle: *Handle,
     request_json: capi.Slice,
-    raft_entry: db_mod.RaftAppliedEntryIdentity,
+    raft_entry: db_mod.OrderedApplyReceipt,
     out_buf: *capi.Buffer,
 ) kernel_owner_abi.Status {
     var owned = batch_api.parseInternalBatchRequest(handle.alloc, request_json.bytes()) catch |err|

@@ -2437,8 +2437,8 @@ test "relational index system standby replays schema churn and rebuilds ready ge
     var last_lsn = std.atomic.Value(u64).init(0);
     var failures = std.atomic.Value(u64).init(0);
     var mirrored = options;
-    mirrored.replication_async_metadata_mirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .last_lsn = &last_lsn, .failure_count = &failures };
-    mirrored.replication_async_batch_mirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .async } };
+    mirrored.replication_async_metadata_mirror = hot_standby_publisher_adapter.bindMirror(&primary, .{ .last_lsn = &last_lsn, .failure_count = &failures });
+    mirrored.replication_async_batch_mirror = hot_standby_publisher_adapter.bindMirror(&primary, .{ .sync_policy = .{ .mode = .async } });
     var source = try db_mod.DB.open(alloc, source_path, mirrored);
     defer source.close();
     var replica = try db_mod.DB.open(alloc, replica_path, options);

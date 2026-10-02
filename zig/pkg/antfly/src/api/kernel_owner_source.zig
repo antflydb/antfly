@@ -4993,7 +4993,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
         req: db_types.BatchRequest,
         metadata_prepared: bool,
-        entry: ?db_types.RaftAppliedEntryIdentity,
+        entry: ?db_types.OrderedApplyReceipt,
     ) !?void {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         var lease = if (metadata_prepared)
@@ -5130,7 +5130,7 @@ pub const ProvisionedKernelOwnerSource = struct {
 
         const payload = replication_effects.encodeBatchMutationRequestAlloc(self.alloc, req) catch |err| {
             noteReplicationMirrorFailure(mirror, err);
-            if (mirror.sync_policy.mode != .async) return err;
+            if (mirror.requirements.synchronous) return err;
             return;
         };
         defer self.alloc.free(payload);
@@ -5139,10 +5139,10 @@ pub const ProvisionedKernelOwnerSource = struct {
             .table_id = identity.table_id,
         }) catch |err| {
             noteReplicationMirrorFailure(mirror, err);
-            if (mirror.sync_policy.mode != .async) return err;
+            if (mirror.requirements.synchronous) return err;
             return;
         };
-        if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+        mirror.notePublished(lsn);
 
         if (transition_mutex) |mutex| {
             mutex.unlock();
@@ -5172,10 +5172,10 @@ pub const ProvisionedKernelOwnerSource = struct {
             .table_id = identity.table_id,
         }) catch |err| {
             noteReplicationMirrorFailure(mirror, err);
-            if (mirror.sync_policy.mode != .async) return err;
+            if (mirror.requirements.synchronous) return err;
             return;
         };
-        if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+        mirror.notePublished(lsn);
 
         if (transition_mutex) |mutex| {
             mutex.unlock();
@@ -5194,7 +5194,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     fn noteReplicationMirrorFailure(mirror: replication_contract.AsyncEffectMirror, err: anyerror) void {
-        if (mirror.failure_count) |counter| _ = counter.fetchAdd(1, .monotonic);
+        mirror.noteFailure();
         std.log.warn("failed to mirror compiled-owner commit into HA stream: {s}", .{@errorName(err)});
     }
 

@@ -76,7 +76,7 @@ fn testTopologyHotStandbyControls(comptime replicated: bool, comptime split: boo
     var runtime = try db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer runtime.deinit();
     const namespace: @import("../storage/db/doc_identity.zig").Namespace = .{ .table_id = 2, .shard_id = 3, .range_id = 4 };
-    var source = try db.DB.open(alloc, try std.fmt.allocPrint(a, "{s}/source", .{root}), .{ .backend_runtime = runtime.ptr(), .identity_namespace = namespace, .replication_async_batch_mirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary) }, .replication_write_gate = .{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .start_optional_runtimes = false, .start_index_workers = false });
+    var source = try db.DB.open(alloc, try std.fmt.allocPrint(a, "{s}/source", .{root}), .{ .backend_runtime = runtime.ptr(), .identity_namespace = namespace, .replication_async_batch_mirror = hot_standby_publisher_adapter.bindMirror(&primary, .{}), .replication_write_gate = .{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .start_optional_runtimes = false, .start_index_workers = false });
     defer source.close();
     var target = try db.DB.open(alloc, try std.fmt.allocPrint(a, "{s}/target", .{root}), .{ .backend_runtime = runtime.ptr(), .identity_namespace = namespace, .start_optional_runtimes = false, .start_index_workers = false });
     defer target.close();
