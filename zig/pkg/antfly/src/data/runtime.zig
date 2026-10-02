@@ -20226,15 +20226,7 @@ pub const DataServer = struct {
         const range: antfly.db.types.ByteRange = .{ .start = owner.range.start_key, .end = owner.range.end_key orelse "" };
         if (comptime linked_storage) {
             const compiled = try self.ensureKernelOwnerSource();
-            const bootstrap: @import("../storage/db/restore_staging_contract.zig").OwnerBootstrap = .{
-                .scope = owner.scope,
-                .table_name = owner.table.name,
-                .schema_json = owner.table.schema_json,
-                .read_schema_json = owner.table.read_schema_json,
-                .indexes_json = owner.table.indexes_json,
-                .byte_range = range,
-                .empty_generation_handoff = owner.empty_generation_handoff,
-            };
+            const bootstrap = owner.bootstrap;
             const encoded = try std.json.Stringify.valueAlloc(self.alloc, bootstrap, .{});
             defer self.alloc.free(encoded);
             return compiled.primeRestoreOwner(owner.range.group_id, owner.table.name, .{
@@ -31977,7 +31969,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             // to stand in for the catalog authority.
             if (std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog")) {
                 const catalog = @import("../system_catalog/domain.zig");
-                const parsed = try std.json.parseFromSlice(catalog.Call, response_alloc, request.body, .{});
+                const parsed = try std.json.parseFromSlice(@import("../system_catalog/server_call.zig").Call, response_alloc, request.body, .{});
                 defer parsed.deinit();
                 const body = switch (parsed.value) {
                     .read, .list_tables, .export_snapshot, .table_status => return error.UnexpectedCatalogRead,
@@ -35256,6 +35248,9 @@ fn consumerTests() type {
         }
 
         test "data server keeps upstream replication availability failures nonfatal" {
+            try std.testing.expect(isHAStandbyUpstreamTransportError(error.UnexpectedEof));
+            try std.testing.expect(isNonFatalHAStandbyReplicationError(error.UnexpectedEof));
+            try std.testing.expectEqual(HAStandbyReplicationErrorCode.InvalidResponse, haStandbyReplicationErrorCode(error.UnexpectedEof));
             inline for (.{
                 error.HttpConnectionClosing,
                 error.ConnectionResetByPeer,
@@ -42020,7 +42015,7 @@ fn consumerTests() type {
             });
             defer alloc.free(payload);
 
-            try replication_ingress.applyRecord(&server, .{
+            try server.applyHotStandbyReplicationRecord(.{
                 .kind = .batch_mutation,
                 .payload_codec = .json,
                 .cluster_id = 100,
@@ -42051,7 +42046,7 @@ fn consumerTests() type {
                 try standby.applyAvailable(&server, DataServer.applyHotStandbyReplicationRecordCallback),
             );
             try std.testing.expectEqual(@as(u64, 2), standby.currentProgress().applied_lsn);
-            try std.testing.expectError(error.HAReplicationRecordMissingTableId, replication_ingress.applyRecord(&server, .{
+            try std.testing.expectError(error.HAReplicationRecordMissingTableId, server.applyHotStandbyReplicationRecord(.{
                 .kind = .batch_mutation,
                 .payload_codec = .json,
                 .cluster_id = 100,
@@ -47322,14 +47317,14 @@ fn implementationTests() type {
             var server = DataServer.initFromLocalMetadataSources(std.testing.allocator, .{ .replica_root_dir = "unused-metadata-port", .replica_catalog_path = "unused-metadata-port-catalog" }, .{ .ptr = &probe, .vtable = &.{ .admin_snapshot = Probe.admin, .free_admin_snapshot = Probe.freeAdmin } }, .{ .ptr = &probe, .vtable = &.{ .status = Probe.status }, .standalone_hot_standby = port });
             defer server.deinit();
             const record: antfly.hot_standby.replication_record.RecordView = .{ .kind = .metadata_mutation, .payload_codec = .json, .cluster_id = 1, .table_id = 0, .shard_id = 0, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = "metadata-effects" };
-            try replication_ingress.applyRecord(&server, record);
+            try server.applyHotStandbyReplicationRecord(record);
             try std.testing.expectEqual(@as(usize, 1), probe.applied);
             var binary_record = record;
             binary_record.payload_codec = .binary;
-            try replication_ingress.applyRecord(&server, binary_record);
+            try server.applyHotStandbyReplicationRecord(binary_record);
             try std.testing.expectEqual(@as(usize, 2), probe.applied);
             server.status_source.standalone_hot_standby = null;
-            try std.testing.expectError(error.HAMetadataAuthorityUnavailable, replication_ingress.applyRecord(&server, record));
+            try std.testing.expectError(error.HAMetadataAuthorityUnavailable, server.applyHotStandbyReplicationRecord(record));
             server.status_source.standalone_hot_standby = port;
             probe.preparation_error = error.HASyncCommitWouldBlock;
             try DataServer.prepareStandaloneMetadataStartup(port);

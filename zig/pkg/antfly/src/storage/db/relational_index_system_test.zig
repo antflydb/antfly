@@ -2417,8 +2417,8 @@ fn replay(primary: *primary_mod.Primary, replica: *db_mod.DB, next: *u64) !void 
     while (next.* <= primary.lastLsn()) : (next.* += 1) {
         var entry = (try primary.log.entryAt(alloc, next.*)) orelse return error.MissingReplicationRecord;
         defer entry.deinit(alloc);
-        try replication_ingress.applyRecord(&replica, entry.record);
-        try replication_ingress.applyRecord(&replica, entry.record);
+        try replication_ingress.applyRecord(replica, entry.record);
+        try replication_ingress.applyRecord(replica, entry.record);
     }
 }
 

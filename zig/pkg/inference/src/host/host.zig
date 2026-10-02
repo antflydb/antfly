@@ -694,7 +694,7 @@ fn convertWarmModels(
                 out[i] = .{
                     .kind = parseWarmModelKind(model.kind.slice()) orelse return error.InvalidArguments,
                     .name = model.name.slice(),
-                    .backend = runtime_paths.parseOptionalBackendType(model.backend.slice()) catch
+                    .backend = inference.backends.BackendType.parseOptional(model.backend.slice()) catch
                         return error.InvalidArguments,
                     .format = model.format.slice(),
                     .quantization = model.quantization.slice(),

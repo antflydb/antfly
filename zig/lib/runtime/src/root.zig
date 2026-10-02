@@ -20,3 +20,7 @@ pub const io_abi = @import("runtime_io_abi.zig");
 pub const http_bridge = @import("runtime_http_bridge.zig");
 
 pub const mutation_barrier = @import("mutation_barrier.zig");
+
+test {
+    @import("std").testing.refAllDecls(@This());
+}

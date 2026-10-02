@@ -167,7 +167,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api http server prefers metadata-owned restore over inline write-source restore",
         "api http server does not retry authoritative metadata table-exists conflict",
         "api http server retries interrupted metadata restore publication",
-        "public API request body limit matches Go linear merge contract",
         "api query contract parses direct JSON-pointer path aliases",
         "api query contract serializes derived hierarchy ancestry",
         "api query contract serializes mention evidence hierarchy",
@@ -306,10 +305,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_test_mod,
         .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, public_api_parity_runtime_filters),
         // The macOS debug root includes the complete public transport,
-        // generated-contract, and native-index surface. ReleaseSafe test
-        // compilation currently peaks above 13 GiB; reserve the measured
+        // generated-contract, and native-index surface. Debug test
+        // compilation currently peaks at 15.09 GB; reserve the measured
         // envelope so the scheduler does not reject a successful compile.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 15 else 7) * 1024 * 1024 * 1024,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -396,6 +395,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         &lib_api_auth_default_filters,
     );
     const lib_api_auth_tests = b.addTest(.{
+        // macOS Debug measured 11.43 GB for the linked auth surface.
+        .max_rss = if (target.result.os.tag == .macos) 12 * 1024 * 1024 * 1024 else 0,
         .root_module = antfly_test_mod,
         .filters = lib_api_auth_runtime_filters,
         .test_runner = .{
