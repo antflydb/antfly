@@ -124,6 +124,12 @@ only after CPUID and OS XMM/YMM-state checks. Sequential attention uses the same
 selection. The baseline kernels use separate multiply/add rather than scalar
 software FMA. macOS, Accelerate, and ARM arithmetic are unchanged.
 
+Linux x86 GNU builds now prefer optional runtime OpenBLAS for FP32 GEMM when a
+compatible LP64 pthread library is installed. The amd64 runtime image includes
+it; other installations retain native fallback when it is absent. See
+[`NATIVE.md`](../../NATIVE.md) for installation, thread limits, and opt-outs.
+Set `ANTFLY_INFERENCE_BLAS=off` when comparing the native kernel routes below.
+
 `ANTFLY_INFERENCE_X86_KERNEL=auto|portable|avx2` selects a diagnostic route on
 Linux x86. The default is `auto`; unsupported forced AVX2 rejects before entering
 an optional-instruction kernel. `ANTFLY_INFERENCE_CPU_THREADS=1..8` caps native
@@ -137,7 +143,10 @@ The CPU comparison worker now accepts bounded native math pools without BLAS.
 The driver sets the native thread cap along with BLAS/Torch thread variables,
 keeping the native fallback at at most eight workers while preserving the
 requested BLAS/Torch budget of up to 32 threads. It records selected kernels
-and effective thread counts. Request timeouts can
+and effective thread counts. Runtime-loaded OpenBLAS additionally clamps its
+thread count to the native CPU budget; the worker reports `openblas_threads`
+and rejects a requested count that does not match the actual limit. Explicitly
+linked BLAS retains its existing thread controls. Request timeouts can
 be increased to 300000 ms to capture the old Linux baseline. Kernel benchmark
 `*_ms` fields now report time per measured iteration, rather than the sum of
 all iterations (primitive fields still include `primitive_repeats`).

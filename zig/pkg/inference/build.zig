@@ -269,6 +269,7 @@ pub fn build(b: *std.Build) void {
             .enable_pjrt = enable_pjrt,
             .enable_native = enable_native,
             .enable_system_blas = enable_system_blas,
+            .enable_runtime_openblas = b.option(bool, "runtime-openblas", "Prefer runtime-loaded OpenBLAS on Linux x86 GNU, with native fallback") orelse true,
             .blas_root = blas_root,
             .enable_wasm = enable_wasm,
             .enable_webgpu = enable_webgpu,
@@ -1335,6 +1336,7 @@ pub fn build(b: *std.Build) void {
     runtime_graph.identities.addImports(gliner2_e2e_bench_exe.root_module);
     gliner2_e2e_bench_exe.root_module.link_libc = true;
     configureOnnxRuntime(b, gliner2_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
+    b.step("bench-gliner2-e2e-build", "Build the GLiNER2 end-to-end benchmark").dependOn(&b.addInstallArtifact(gliner2_e2e_bench_exe, .{}).step);
     const run_gliner2_e2e_bench = b.addRunArtifact(gliner2_e2e_bench_exe);
     if (b.args) |args| {
         run_gliner2_e2e_bench.addArgs(args);

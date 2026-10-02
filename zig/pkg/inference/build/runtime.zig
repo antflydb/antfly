@@ -27,6 +27,7 @@ pub const BackendOptions = struct {
     enable_pjrt: bool = false,
     enable_native: bool = true,
     enable_system_blas: bool = false,
+    enable_runtime_openblas: bool = true,
     blas_root: ?[]const u8 = null,
     enable_wasm: bool = false,
     enable_webgpu: bool = false,
@@ -552,6 +553,7 @@ fn addCommonOptions(options: *std.Build.Step.Options, backend: BackendOptions) v
     options.addOption(bool, "enable_pjrt", backend.enable_pjrt);
     options.addOption(bool, "enable_native", backend.enable_native);
     options.addOption(bool, "enable_system_blas", backend.enable_system_blas);
+    options.addOption(bool, "enable_runtime_openblas", backend.enable_runtime_openblas);
     options.addOption(bool, "enable_wasm", backend.enable_wasm);
     options.addOption(bool, "enable_webgpu", backend.enable_webgpu);
     options.addOption(bool, "link_libc", backend.link_libc);

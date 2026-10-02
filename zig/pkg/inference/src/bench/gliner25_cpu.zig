@@ -135,6 +135,9 @@ fn emit(a: Allocator, writer: *std.Io.Writer, value: anytype) !void {
     try writer.writeByte('\n');
     try writer.flush();
 }
+fn useCpuBlas() bool {
+    return !on_cuda and native.useBlas();
+}
 fn parseArgs(init: std.process.Init) !Options {
     var options = Options{};
     var args = std.process.Args.Iterator.init(init.minimal.args);
@@ -145,7 +148,12 @@ fn parseArgs(init: std.process.Init) !Options {
     }
     if (options.model_dir.len == 0 or options.cases_path.len == 0 or options.threads == 0 or options.threads > 32 or options.timeout_ms == 0 or options.timeout_ms > 300000 or options.max_commands == 0 or options.max_commands > 4096) return error.InvalidBenchmarkOptions;
     if (options.batch_size == 0 or options.batch_size > 64 or (!on_cuda and options.batch_size != 1)) return error.InvalidBenchmarkOptions;
-    if (!build_options.enable_system_blas) {
+    if (!on_cuda) {
+        if (native.blasThreads()) |threads| {
+            if (threads != options.threads) return error.InvalidBenchmarkThreadControl;
+        }
+    }
+    if (!useCpuBlas()) {
         if (comptime on_cuda or !linalg.x86.enabled) {
             if (options.threads != 1) return error.BenchmarkThreadControlUnavailable;
             return options;
@@ -210,7 +218,7 @@ pub fn main(init: std.process.Init) !void {
         .concurrent_limit = .limited(options.threads - 1),
     });
     defer math_io.deinit();
-    var backend = if (on_cuda) try inference.native_compute.cuda.CudaCompute.init(a) else native.NativeCompute.initWithIo(a, &store, null, if (build_options.enable_system_blas or options.threads == 1) std.Io.Threaded.global_single_threaded.io() else math_io.io());
+    var backend = if (on_cuda) try inference.native_compute.cuda.CudaCompute.init(a) else native.NativeCompute.initWithIo(a, &store, null, if (useCpuBlas() or options.threads == 1) std.Io.Threaded.global_single_threaded.io() else math_io.io());
     defer backend.deinit();
     if (comptime on_cuda) {
         if (backend.kernels.gliner25_boundary_f32 == null) return error.CudaKernelUnavailable;
@@ -227,7 +235,7 @@ pub fn main(init: std.process.Init) !void {
     var stdout_buffer: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(init.io, &stdout_buffer);
     const cases_digest = hash(bytes);
-    try emit(a, &stdout.interface, .{ .event = "ready", .batch_size = options.batch_size, .arm = "native", .scope = scope, .cuda_runtime = if (on_cuda) .{ .device_name = backend.ctx.info.nameSlice(), .driver_version = backend.ctx.info.driver_version, .compute_major = backend.ctx.info.compute_major, .compute_minor = backend.ctx.info.compute_minor } else null, .backend = if (on_cuda) "cuda" else "native", .synchronization_policy = if (on_cuda) "cuda_stream_before_start_and_after_extract_v1" else "synchronous_cpu_v1", .timing_boundary = timing_boundary, .model = fixture.model, .model_id = fixture.model_id, .revision = fixture.revision, .model_files = fixture.model_files, .cases_sha256 = cases_digest[0..], .build_mode = @tagName(builtin.mode), .zig_version = builtin.zig_version_string, .threads = options.threads, .scheduler = if (on_cuda or build_options.enable_system_blas or options.threads == 1) "serial_io" else "bounded_io", .x86_kernel = if (linalg.x86.enabled) @tagName(linalg.x86.selected()) else null, .effective_cpu_threads = linalg.pool.cachedCpuCount(), .system_blas = build_options.enable_system_blas, .dtype = "float32", .qualification = false });
+    try emit(a, &stdout.interface, .{ .event = "ready", .batch_size = options.batch_size, .arm = "native", .scope = scope, .cuda_runtime = if (on_cuda) .{ .device_name = backend.ctx.info.nameSlice(), .driver_version = backend.ctx.info.driver_version, .compute_major = backend.ctx.info.compute_major, .compute_minor = backend.ctx.info.compute_minor } else null, .backend = if (on_cuda) "cuda" else "native", .synchronization_policy = if (on_cuda) "cuda_stream_before_start_and_after_extract_v1" else "synchronous_cpu_v1", .timing_boundary = timing_boundary, .model = fixture.model, .model_id = fixture.model_id, .revision = fixture.revision, .model_files = fixture.model_files, .cases_sha256 = cases_digest[0..], .build_mode = @tagName(builtin.mode), .zig_version = builtin.zig_version_string, .threads = options.threads, .scheduler = if (on_cuda or useCpuBlas() or options.threads == 1) "serial_io" else "bounded_io", .x86_kernel = if (linalg.x86.enabled) @tagName(linalg.x86.selected()) else null, .effective_cpu_threads = linalg.pool.cachedCpuCount(), .system_blas = useCpuBlas(), .openblas_threads = if (on_cuda) null else native.blasThreads(), .dtype = "float32", .qualification = false });
     var stdin_buffer: [4096]u8 = undefined;
     var stdin = std.Io.File.stdin().readerStreaming(init.io, &stdin_buffer);
     var count: usize = 0;

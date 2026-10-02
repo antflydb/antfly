@@ -670,6 +670,7 @@ pub fn create(b: *std.Build) ?Artifacts {
             .wasm_memory_model = b.option([]const u8, "wasm-memory-model", "Inference WASM memory model: wasm32 or wasm64") orelse "wasm32",
             .enable_webgpu = b.option(bool, "webgpu", "Enable WebGPU for inference WASM") orelse false,
             .enable_system_blas = inference_enable_system_blas,
+            .enable_runtime_openblas = b.option(bool, "runtime-openblas", "Prefer runtime-loaded OpenBLAS on Linux x86 GNU, with native fallback") orelse true,
             .blas_root = inference_blas_root,
             .link_libc = link_libc,
             .skip_openapi = false,
