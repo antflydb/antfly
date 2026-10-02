@@ -95154,6 +95154,7 @@ test "db member-mode chunk hits filter through the parent row on the full-text a
     var unfiltered = try db.search(alloc, .{
         .index_name = "selected_text",
         .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .return_mode = .member,
     });
     defer unfiltered.deinit();
     try std.testing.expectEqual(@as(u32, 2), unfiltered.total_hits);
@@ -95162,6 +95163,7 @@ test "db member-mode chunk hits filter through the parent row on the full-text a
         .index_name = "selected_text",
         .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
         .filter_query_json = "{\"term\":{\"category\":\"keep\"}}",
+        .return_mode = .member,
     });
     defer included.deinit();
     try std.testing.expectEqual(@as(u32, 1), included.total_hits);
@@ -95172,6 +95174,7 @@ test "db member-mode chunk hits filter through the parent row on the full-text a
         .index_name = "selected_text",
         .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
         .exclusion_query_json = "{\"term\":{\"category\":\"keep\"}}",
+        .return_mode = .member,
     });
     defer excluded.deinit();
     try std.testing.expectEqual(@as(u32, 1), excluded.total_hits);
@@ -95224,6 +95227,7 @@ test "db member-mode chunk hits apply query.bool.filter/must_not against the par
         .index_name = "selected_text",
         .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
         .filter_text = .{ .term = .{ .field = "category", .term = "keep" } },
+        .return_mode = .member,
     });
     defer included.deinit();
     try std.testing.expectEqual(@as(u32, 1), included.total_hits);
@@ -95234,6 +95238,7 @@ test "db member-mode chunk hits apply query.bool.filter/must_not against the par
         .index_name = "selected_text",
         .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
         .exclusion_text = .{ .term = .{ .field = "category", .term = "keep" } },
+        .return_mode = .member,
     });
     defer excluded.deinit();
     try std.testing.expectEqual(@as(u32, 1), excluded.total_hits);
@@ -95247,6 +95252,7 @@ test "db member-mode chunk hits apply query.bool.filter/must_not against the par
         .index_name = "selected_text",
         .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
         .filter_text = .{ .match = .{ .field = "category", .text = "keep" } },
+        .return_mode = .member,
     }));
 }
 
@@ -95293,6 +95299,7 @@ test "db member-mode chunk hits apply query.bool.filter/must_not against the par
     var unfiltered = try db.search(alloc, .{
         .index_name = "dv_v1",
         .dense = .{ .vector = query_vec, .k = 10 },
+        .return_mode = .member,
     });
     defer unfiltered.deinit();
     try std.testing.expectEqual(@as(u32, 6), unfiltered.total_hits);
@@ -95301,6 +95308,7 @@ test "db member-mode chunk hits apply query.bool.filter/must_not against the par
         .index_name = "dv_v1",
         .dense = .{ .vector = query_vec, .k = 10 },
         .filter_text = .{ .term = .{ .field = "category", .term = "keep" } },
+        .return_mode = .member,
     });
     defer included.deinit();
     try std.testing.expectEqual(@as(u32, 3), included.total_hits);
@@ -95310,6 +95318,7 @@ test "db member-mode chunk hits apply query.bool.filter/must_not against the par
         .index_name = "dv_v1",
         .dense = .{ .vector = query_vec, .k = 10 },
         .exclusion_text = .{ .term = .{ .field = "category", .term = "keep" } },
+        .return_mode = .member,
     });
     defer excluded.deinit();
     try std.testing.expectEqual(@as(u32, 3), excluded.total_hits);
