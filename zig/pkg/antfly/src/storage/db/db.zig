@@ -48308,7 +48308,13 @@ pub const DB = struct {
         // searchTextQuery's `suppress_text_doc_num_filter` gate) so the JSON
         // filters survive unresolved into the lift step below, which folds
         // them into applyStoredSearchPatternFilters' parent-aware matcher
-        // instead (issue #931).
+        // instead (issue #931). resolved_doc_filter - the generic
+        // doc-identity form filter_prefix resolves into
+        // (searchRequestWithIdentityPrefixFilterAlloc, run before this
+        // wrapper is even reached) - is left intact: db_query_search.searchDense
+        // itself skips applying it natively for a chunk-backed member/chunk-mode
+        // query and instead carries it through to applyStoredSearchPatternFilters'
+        // parent-aware matcher, same as the full-text arm (issue #931/#957).
         const chunk_backed_for_filter = if (self.core.denseIndex(req.index_name)) |entry|
             entry.chunk_name != null
         else
@@ -48329,7 +48335,6 @@ pub const DB = struct {
         defer lifted_dense_bool_filter.deinit(alloc);
         {
             if (suppress_dense_doc_num_filter) {
-                algebraic_filter.req.resolved_doc_filter = null;
                 lifted_dense_bool_filter = try liftChunkBoolFilterClausesAlloc(
                     alloc,
                     algebraic_filter.req.filter_text,
@@ -48431,7 +48436,12 @@ pub const DB = struct {
         // See searchDense: the algebraic resolver would resolve filter_query_json/
         // exclusion_query_json/filter_text/exclusion_text against the parent
         // doc-number space, which never matches a chunk-backed member/chunk-mode
-        // dense index's own doc set (issue #931).
+        // dense index's own doc set (issue #931). resolved_doc_filter - the
+        // generic doc-identity form filter_prefix resolved into just above via
+        // searchRequestWithIdentityPrefixFilterAlloc - is left intact for the
+        // same reason as searchDense: db_query_search.searchDense carries it
+        // through to applyStoredSearchPatternFilters' parent-aware matcher
+        // instead of applying it natively (issue #931/#957).
         const chunk_backed_for_filter = if (self.core.denseIndex(identity_prefix_filter.req.index_name)) |entry|
             entry.chunk_name != null
         else
@@ -48446,7 +48456,6 @@ pub const DB = struct {
         var lifted_dense_bool_filter = ChunkBoolFilterLowering{};
         defer lifted_dense_bool_filter.deinit(alloc);
         if (suppress_dense_doc_num_filter) {
-            algebraic_filter.req.resolved_doc_filter = null;
             lifted_dense_bool_filter = try liftChunkBoolFilterClausesAlloc(
                 alloc,
                 algebraic_filter.req.filter_text,
@@ -95720,6 +95729,88 @@ test "db member-mode chunk hits apply filter_query/exclusion_query against the p
     defer excluded.deinit();
     try std.testing.expectEqual(@as(u32, 3), excluded.total_hits);
     for (excluded.hits) |hit| try std.testing.expectEqualStrings("doc:drop", hit.artifact_ref.?.document_id);
+
+    // PR #957 review blocker 1: filter_prefix resolves into
+    // resolved_doc_filter once, before composed search fans out
+    // (searchRequestWithIdentityPrefixFilterAlloc), against the parent-row
+    // identity space. searchDense's chunk-backed member-mode gate used to
+    // clear resolved_doc_filter outright instead of deferring it like
+    // filter_query_json/exclusion_query_json above - silently dropping the
+    // restriction and returning every chunk of every document regardless of
+    // filter_prefix.
+    var prefixed = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 10 },
+        .return_mode = .member,
+        .filter_prefix = "doc:keep",
+    });
+    defer prefixed.deinit();
+    try std.testing.expectEqual(@as(u32, 3), prefixed.total_hits);
+    for (prefixed.hits) |hit| try std.testing.expectEqualStrings("doc:keep", hit.artifact_ref.?.document_id);
+}
+
+// PR #957 review blocker 1: the same resolved_doc_filter gap as the dense
+// arm above, on the chunk-backed member-mode sparse arm (searchSparse never
+// even had a suppression gate for the algebraic resolver, and
+// deriveNativeDocIdConstraintsAlloc applied resolved_doc_filter natively
+// against this chunk-backed index's own doc-number space before
+// requestAfterNativeFilters dropped it ahead of postprocessing).
+test "db member-mode chunk hits apply filter_prefix against the parent row on the sparse arm (issue #931/#957)" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var embedder = embedder_mod.DeterministicSparseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .sparse_embedder = embedder.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "sp_v1",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"sparse\",\"generator\":{\"kind\":\"sparse_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_sparse_v1\"}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:keep", .value = "{\"body\":\"abcdefghijklmno\",\"category\":\"keep\"}" },
+            .{ .key = "doc:drop", .value = "{\"body\":\"pqrstuvwxyzabcd\",\"category\":\"drop\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(u64, 6), db.core.index_manager.sparseIndex("sp_v1").?.index.stats().doc_count);
+
+    // DeterministicSparseEmbedder hashes each chunk's own text into two
+    // random indices within [0, 1024), so a query built from any single
+    // chunk's text has no guaranteed dimension overlap with the other
+    // chunks (sparse top-k only surfaces candidates that share a nonzero
+    // dimension with the query, unlike dense similarity, which always scores
+    // every vector). Query every dimension explicitly so every live member
+    // scores nonzero and is reachable at k=10, independent of chunk content.
+    var full_coverage_indices: [1024]u32 = undefined;
+    var full_coverage_values: [1024]f32 = undefined;
+    for (0..1024) |i| {
+        full_coverage_indices[i] = @intCast(i);
+        full_coverage_values[i] = 1.0;
+    }
+
+    var prefixed = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .sparse = .{ .indices = &full_coverage_indices, .values = &full_coverage_values, .k = 10 },
+        .return_mode = .member,
+        .filter_prefix = "doc:keep",
+    });
+    defer prefixed.deinit();
+    try std.testing.expectEqual(@as(u32, 3), prefixed.total_hits);
+    for (prefixed.hits) |hit| try std.testing.expectEqualStrings("doc:keep", hit.artifact_ref.?.document_id);
 }
 
 test "db composed full_text+dense (rrf) member-mode fusion scopes filter_query/exclusion_query to the parent row without collapsing distinct chunks (issue #931)" {

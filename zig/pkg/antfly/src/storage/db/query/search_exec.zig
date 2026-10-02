@@ -12917,12 +12917,31 @@ fn searchDenseInternal(
         return error.UnsupportedHierarchyGrouping;
 
     const chunk_backed = entry.chunk_name != null;
+    // Multi-source members need visibility filtering and identity translation,
+    // but raw member modes do not collapse unrelated `(artifact, key)` values.
+    // Start at the requested score-order window and grow from observed losses
+    // instead of imposing document-grouping overfetch on the common raw path.
+    const raw_member_mode = req.return_mode == .member or req.return_mode == .chunk;
+    // resolved_doc_filter carries filter_prefix/filter_doc_ids' resolved
+    // document identity (ordinals/doc keys in the parent-row identity
+    // space). A chunk-backed member/chunk-mode dense index's own doc-number
+    // space is per-chunk, not per-parent-row, so applying it natively here
+    // (deriveNativeDenseConstraintsAlloc below) would resolve against the
+    // wrong space and either match nothing or everything depending on the
+    // filter shape. Skip the native application and carry the filter through
+    // to postprocess unresolved instead; applyStoredSearchPatternFilters
+    // already matches a chunk hit's shared parent ordinal against it
+    // (issue #931/#957), mirroring searchTextQuery's resolved_doc_filter
+    // handling for the same gap.
+    const suppress_native_resolved_doc_filter = chunk_backed and raw_member_mode;
     const group_chunk_parents = shouldGroupChunkParents(req, chunk_backed);
     const multi_source_members = entry.embedding_names.len > 0;
     const paging = componentPaging(req);
     const index_stats = entry.index.stats();
     const constraint_start = platform_time.monotonicNs();
-    var native_constraints = try deriveNativeDenseConstraintsAlloc(alloc, req, executor, req.index_name orelse entry.config.name, true);
+    var constraint_req = req;
+    if (suppress_native_resolved_doc_filter) constraint_req.resolved_doc_filter = null;
+    var native_constraints = try deriveNativeDenseConstraintsAlloc(alloc, constraint_req, executor, req.index_name orelse entry.config.name, true);
     profile.constraint_ns = platform_time.monotonicNs() - constraint_start;
     defer native_constraints.deinit(alloc);
     const unresolved_stored_filters =
@@ -12933,17 +12952,20 @@ fn searchDenseInternal(
         native_constraints.filter_query_json_resolved,
         native_constraints.exclusion_query_json_resolved,
     );
-    const postprocess_req = requestAfterNativeFilters(
+    var postprocess_req = requestAfterNativeFilters(
         req,
         native_constraints.filter_query_json_resolved,
         native_constraints.exclusion_query_json_resolved,
     );
+    if (suppress_native_resolved_doc_filter) {
+        // requestAfterNativeFilters assumes a resolved_doc_filter was already
+        // enforced against this candidate window and always clears it.
+        // Never applied natively here, so restore the borrowed reference: it
+        // is still owed to applyStoredSearchPatternFilters.
+        postprocess_req.resolved_doc_filter = req.resolved_doc_filter;
+        postprocess_req.resolved_doc_filter_owned = req.resolved_doc_filter_owned;
+    }
     const expansive_postprocessing = group_chunk_parents or unresolved_stored_filters;
-    // Multi-source members need visibility filtering and identity translation,
-    // but raw member modes do not collapse unrelated `(artifact, key)` values.
-    // Start at the requested score-order window and grow from observed losses
-    // instead of imposing document-grouping overfetch on the common raw path.
-    const raw_member_mode = req.return_mode == .member or req.return_mode == .chunk;
     const full_candidate_window = expansive_postprocessing or multi_source_members;
     const page_candidate_window = pagingCandidateWindow(paging);
     const score_order_k = scoreOrderCandidateWindowK(dense.k, paging);
@@ -15023,11 +15045,21 @@ pub fn searchSparse(
     if (returnModeRequiresUnitGrouping(req.return_mode) and !entry.supports_unit_grouping)
         return error.UnsupportedHierarchyGrouping;
     const chunk_backed = entry.chunk_name != null;
+    const raw_member_mode = req.return_mode == .member or req.return_mode == .chunk;
+    // Same issue #931/#957 gap as searchDenseInternal: resolved_doc_filter
+    // (filter_prefix/filter_doc_ids resolved against the parent-row identity
+    // space) never covers a chunk-backed member/chunk-mode sparse index's own
+    // doc-number space. Skip the native application and carry the filter
+    // through to postprocess unresolved; applyStoredSearchPatternFilters
+    // matches it against each hit's shared parent ordinal instead.
+    const suppress_native_resolved_doc_filter = chunk_backed and raw_member_mode;
     const group_chunk_parents = shouldGroupChunkParents(req, chunk_backed);
     const multi_source_members = entry.embedding_names.len > 0;
     const paging = componentPaging(req);
     const constraint_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-    var native_constraints = try deriveNativeDocIdConstraintsAlloc(alloc, req, .{
+    var constraint_req = req;
+    if (suppress_native_resolved_doc_filter) constraint_req.resolved_doc_filter = null;
+    var native_constraints = try deriveNativeDocIdConstraintsAlloc(alloc, constraint_req, .{
         .ctx = executor.ctx,
         .text_index_entry = executor.text_index_entry,
         .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
@@ -15045,13 +15077,16 @@ pub fn searchSparse(
     const unresolved_stored_filters =
         (req.filter_query_json.len > 0 and !native_constraints.filter_query_json_resolved) or
         (req.exclusion_query_json.len > 0 and !native_constraints.exclusion_query_json_resolved);
-    const postprocess_req = requestAfterNativeFilters(
+    var postprocess_req = requestAfterNativeFilters(
         req,
         native_constraints.filter_query_json_resolved,
         native_constraints.exclusion_query_json_resolved,
     );
+    if (suppress_native_resolved_doc_filter) {
+        postprocess_req.resolved_doc_filter = req.resolved_doc_filter;
+        postprocess_req.resolved_doc_filter_owned = req.resolved_doc_filter_owned;
+    }
     const expansive_postprocessing = group_chunk_parents or unresolved_stored_filters;
-    const raw_member_mode = req.return_mode == .member or req.return_mode == .chunk;
     const full_candidate_window = expansive_postprocessing or multi_source_members;
     const bounded_sparse_candidate_count: u64 = if (native_constraints.positive_filter)
         @as(u64, native_constraints.filter_doc_ids.len) +| @as(u64, native_constraints.filter_doc_nums.len)
