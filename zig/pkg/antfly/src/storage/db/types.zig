@@ -5042,10 +5042,12 @@ pub const IndexTargetVisibility = struct {
 /// understand their complete identities before any primary rows are applied.
 pub fn requiresGraphRelationshipProtocol(req: BatchRequest) bool {
     const keys = @import("../internal_keys.zig");
+    // Document writes can embed relationship IDs or derive graph effects from
+    // the local catalog. Gate their complete apply contract before extraction.
     // Deletes generate exact retirements during apply even when the input
     // contains only legacy tuples or document keys. Classify those effects
     // before proposal; inspecting only already-materialized rows is too late.
-    if (req.graph_endpoint_cleanup or req.deletes.len != 0 or req.graph_deletes.len != 0 or req.transforms.len != 0 or req.merge_page != null) return true;
+    if (req.writes.len != 0 or req.graph_endpoint_cleanup or req.deletes.len != 0 or req.graph_deletes.len != 0 or req.transforms.len != 0 or req.merge_page != null) return true;
     if (req.transaction) |control| {
         if (control == .resolve and control.resolve.status == .committed) return true;
         // Field-derived inline edges depend on the local graph catalog, so
@@ -5110,4 +5112,13 @@ fn validatePlannedGraphEndpointCleanup(req: BatchRequest) !void {
         };
         if (!covered) return error.InvalidBatchRequest;
     }
+}
+
+test "graph relationship protocol gates document effects before extraction" {
+    for ([_][]const u8{
+        "{\"_edges\":{\"g\":{\"R\":[{\"target\":\"b\",\"edge_id\":\"one\"},{\"target\":\"b\",\"edge_id\":\"two\"}]}}}",
+        "{\"links\":[\"b\"]}",
+        "{}",
+    }) |document| try std.testing.expect(requiresGraphRelationshipProtocol(.{ .writes = &.{.{ .key = "a", .value = document }} }));
+    try std.testing.expect(!requiresGraphRelationshipProtocol(.{}));
 }

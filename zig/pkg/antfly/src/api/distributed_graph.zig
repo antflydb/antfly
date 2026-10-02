@@ -3251,6 +3251,10 @@ fn canonicalGraphStepAlloc(
         true,
     );
     errdefer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    const edge_filter = try params.edge_filter.prepare(alloc);
+    defer if (params.edge_filter.prepared == null) edge_filter.releasePrepared(alloc);
+    var filter_lease = try graph_work_budget.RetainedLease.init(work_budget, edge_filter.retainedBytes());
+    defer filter_lease.deinit();
     const capacity = @min(edges.len, @min(work_budget.remaining_nodes, work_budget.remaining_edges));
     const array_bytes = std.math.mul(
         usize,
@@ -3270,7 +3274,7 @@ fn canonicalGraphStepAlloc(
     for (edges) |edge| {
         edge_bytes = std.math.add(usize, edge_bytes, graphEdgeOwnedBytes(edge)) catch
             return work_budget.exhaust(.explored_edge_bytes, graph_pattern_mod.default_max_explored_edge_bytes);
-        if (!(try params.edge_filter.matches(alloc, edge))) continue;
+        if (!(try edge_filter.matchesWithBudget(alloc, edge, work_budget))) continue;
         if (params.min_weight) |minimum| if (edge.weight < minimum) continue;
         if (params.max_weight) |maximum| if (edge.weight > maximum) continue;
         if (!std.math.isFinite(edge.weight)) return error.InvalidGraphEdgeValue;

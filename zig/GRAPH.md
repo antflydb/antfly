@@ -137,7 +137,7 @@ that write retirement records themselves use ordinary transactional writes.
 Merge artifact pages include primary retirement records. Receiver replay applies
 exact relationship deletions to existing projections as well as suppressing
 future materialization. Commands that can generate retirements during apply
-require data-Raft protocol version 19, including ordinary document deletion,
+require data-Raft protocol version 21, including ordinary document writes and deletion,
 legacy relationship deletion, cleanup, transforms, document transaction
 prepares, committed transaction decisions, and merge pages. Classification occurs before proposal even when retirement records
 are absent from the input. Ordinary artifact-only batches retain their existing
@@ -217,7 +217,17 @@ shortest round-trip decimal representation, so `/weight = 0.1` matches a stored
 `f64` weight of `0.1` without exposing binary rounding through a wider float.
 A distinct literal such as `1.5000000000000001` still differs from `1.5`.
 Comparison borrows digit views and never allocates big integers or expands
-exponent zeros; its work is linear in the input number lengths.
+exponent zeros; its work is linear in the input number lengths. Canonical and
+legacy graph responses preserve these numeric tokens in metadata and evidence.
+
+Relationship filters prepare constants, numeric views, and decoded JSON pointers
+once, then reuse immutable prepared state across expansions and Yen spur searches.
+Intrinsic-only filters do not inspect metadata and allocate no per-edge state.
+Metadata predicates scan and skip unrelated containers instead of building a JSON
+tree; selected strings and scanner nesting consume the graph retained-memory
+budget, and denial produces the normal graph budget diagnostic. JSON pointers
+have at most 256 components; array indices use canonical unsigned decimal spelling.
+Duplicate selected object keys fail the predicate as ambiguous.
 
 Artifact materialization and restore pages retain at most 2048 relation items
 or 4 MiB of materialized writes. Byte accounting includes the mutation struct,

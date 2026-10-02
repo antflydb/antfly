@@ -1397,6 +1397,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "graph query engine shares traversal work across start nodes",
         "stored graph weights are finite and non-negative",
         "relationship predicates",
+        "graph relationship protocol gates",
+        "canonical and legacy graph metadata responses",
         "JSON decimal comparison",
         "traversal decimal weight filters",
         "fact temporal predicates",

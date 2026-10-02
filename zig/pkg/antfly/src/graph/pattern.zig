@@ -1079,6 +1079,20 @@ fn matchExactTwoEdgePattern(
         std.mem.eql(u8, aliases[0], aliases[2]) or
         std.mem.eql(u8, aliases[1], aliases[2])) return null;
 
+    const prepared_steps = try alloc.dupe(PatternStep, pattern);
+    defer alloc.free(prepared_steps);
+    var prepared_count: usize = 0;
+    defer for (prepared_steps[0..prepared_count], pattern[0..prepared_count]) |step, original| {
+        if (original.edge.edge_filter.prepared == null) step.edge.edge_filter.releasePrepared(alloc);
+    };
+    for (prepared_steps) |*step| {
+        step.edge.edge_filter = try step.edge.edge_filter.prepare(alloc);
+        prepared_count += 1;
+    }
+    var filter_bytes: usize = 0;
+    for (prepared_steps) |step| filter_bytes += step.edge.edge_filter.retainedBytes();
+    var filter_lease = try @import("work_budget.zig").RetainedLease.init(work_budget, filter_bytes);
+    defer filter_lease.deinit();
     const start_key = start_nodes[0].key;
     const target_key = opts.target_nodes[0].key;
     if (!(try passesNodeFilter(start_nodes[0], pattern[0].node_filter, opts.evaluator)) or
@@ -1113,7 +1127,7 @@ fn matchExactTwoEdgePattern(
     var candidates = std.ArrayListUnmanaged(Candidate).empty;
     defer candidates.deinit(alloc);
     for (forward_edges, 0..) |graph_edge, edge_index| {
-        if (!try edgeMatches(alloc, graph_edge, pattern[1].edge)) continue;
+        if (!try edgeMatchesBudgeted(alloc, graph_edge, prepared_steps[1].edge, work_budget)) continue;
         if (traversal_mod.metadataTargetTable(graph_edge.metadata) != null) return null;
         const middle_key = edgeTarget(graph_edge, start_key, pattern[1].edge.direction) orelse continue;
         if (edgeTargetTable(null, graph_edge, middle_key) != null) return null;
@@ -1193,7 +1207,7 @@ fn matchExactTwoEdgePattern(
                 matches = .empty;
                 return null;
             }
-            if (!try edgeMatches(alloc, backward_edge, pattern[2].edge)) continue;
+            if (!try edgeMatchesBudgeted(alloc, backward_edge, prepared_steps[2].edge, work_budget)) continue;
             exact_edge_matches += 1;
             if (matches.items.len >= result_limit) continue;
             const forward_edge = forward_edges[candidate.forward_edge_index];
@@ -1326,7 +1340,11 @@ fn streamReachableNodes(
     work_budget: *WorkBudget,
     observer: ReachableObserver,
 ) !void {
-    const edge = traversal.step;
+    var edge = traversal.step;
+    edge.edge_filter = try traversal.step.edge_filter.prepare(alloc);
+    defer if (traversal.step.edge_filter.prepared == null) edge.edge_filter.releasePrepared(alloc);
+    var filter_lease = try @import("work_budget.zig").RetainedLease.init(work_budget, edge.edge_filter.retainedBytes());
+    defer filter_lease.deinit();
     const min_hops = if (edge.min_hops == 0) @as(u32, 1) else edge.min_hops;
     const max_hops = if (edge.max_hops == 0) @as(u32, 1) else edge.max_hops;
     // A fixed relationship is not a variable-length path: a physical
@@ -1399,7 +1417,7 @@ fn streamReachableNodes(
                     try candidate_indexes.ensureTotalCapacity(alloc, edges.len);
                     try candidate_nodes.ensureTotalCapacity(alloc, edges.len);
                     for (edges, 0..) |graph_edge, edge_index| {
-                        if (!try edgeMatches(alloc, graph_edge, edge)) continue;
+                        if (!try edgeMatchesBudgeted(alloc, graph_edge, edge, work_budget)) continue;
                         const target_key = edgeTarget(graph_edge, frontier.key, edge.direction) orelse continue;
                         const target_table = resolvedEdgeTargetTable(
                             edge_reader,
@@ -1444,7 +1462,7 @@ fn streamReachableNodes(
                     for (edges, 0..) |graph_edge, edge_index| {
                         if (admitted_edges) |mask| {
                             if (!mask[edge_index]) continue;
-                        } else if (!try edgeMatches(alloc, graph_edge, edge)) continue;
+                        } else if (!try edgeMatchesBudgeted(alloc, graph_edge, edge, work_budget)) continue;
                         const target_key = edgeTarget(graph_edge, frontier.key, edge.direction) orelse continue;
                         const target_table = resolvedEdgeTargetTable(
                             edge_reader,
@@ -1489,7 +1507,7 @@ fn streamReachableNodes(
                     if (admitted_edges) |mask| {
                         if (!mask[edge_index]) continue;
                     } else {
-                        if (!try edgeMatches(alloc, graph_edge, edge)) continue;
+                        if (!try edgeMatchesBudgeted(alloc, graph_edge, edge, work_budget)) continue;
                         if (shouldRejectPathRevisit(
                             revisits_path,
                             .{ .table = target_table, .key = target_key },
@@ -1590,6 +1608,10 @@ fn targetNodeMatches(node: node_identity.Ref, targets: []const node_identity.Ref
 }
 
 fn edgeMatches(alloc: Allocator, edge: graph_mod.Edge, step: PatternEdgeStep) !bool {
+    return edgeMatchesBudgeted(alloc, edge, step, null);
+}
+
+fn edgeMatchesBudgeted(alloc: Allocator, edge: graph_mod.Edge, step: PatternEdgeStep, budget: ?*WorkBudget) !bool {
     if (step.types.len > 0) {
         var matched = false;
         for (step.types) |edge_type| {
@@ -1602,7 +1624,7 @@ fn edgeMatches(alloc: Allocator, edge: graph_mod.Edge, step: PatternEdgeStep) !b
     }
     if (step.min_weight) |min_weight| if (edge.weight < min_weight) return false;
     if (step.max_weight) |max_weight| if (edge.weight > max_weight) return false;
-    return step.edge_filter.matches(alloc, edge);
+    return step.edge_filter.matchesWithBudget(alloc, edge, budget);
 }
 
 test "pattern edge filters preserve explicit zero bounds" {

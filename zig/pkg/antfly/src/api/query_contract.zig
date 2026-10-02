@@ -5631,7 +5631,7 @@ fn optionalStringEqualsValue(optional: ?[]const u8, value: []const u8) bool {
 
 fn pathEdgeMetadataJsonValue(alloc: std.mem.Allocator, metadata: []const u8) !?std.json.Value {
     if (metadata.len == 0) return null;
-    return std.json.parseFromSliceLeaky(std.json.Value, alloc, metadata, .{}) catch .{ .string = try alloc.dupe(u8, metadata) };
+    return std.json.parseFromSliceLeaky(std.json.Value, alloc, metadata, .{ .parse_numbers = false }) catch .{ .string = try alloc.dupe(u8, metadata) };
 }
 
 /// Canonical GraphPathEdge metadata is object-shaped. New writes enforce this
@@ -5643,7 +5643,7 @@ fn pathEdgeMetadataObjectMap(
     metadata: []const u8,
 ) !?std.json.ArrayHashMap(std.json.Value) {
     if (metadata.len == 0) return null;
-    const value = ant_json.parseFromSliceLeaky(std.json.Value, alloc, metadata, .{}) catch return null;
+    const value = ant_json.parseFromSliceLeaky(std.json.Value, alloc, metadata, .{ .parse_numbers = false }) catch return null;
     return if (value == .object) .{ .map = value.object } else null;
 }
 
@@ -5697,8 +5697,13 @@ fn graphNodeEvidenceObjectMap(
 
             if (metadata_value == .object) {
                 if (metadata_value.object.get("mention_count")) |value| {
-                    if (value == .integer) {
-                        mention_count += value.integer;
+                    const count: ?i64 = switch (value) {
+                        .integer => |number| number,
+                        .number_string => |raw| std.fmt.parseInt(i64, raw, 10) catch null,
+                        else => null,
+                    };
+                    if (count) |number| {
+                        mention_count = std.math.add(i64, mention_count, number) catch return error.InvalidRemoteResponse;
                         saw_rollup = true;
                     }
                 }
@@ -13946,6 +13951,18 @@ fn consumerTests() type {
             try std.testing.expectEqual(indexes_openapi.GraphPathEdgeDirection.in, encoded_reverse[0].direction);
         }
 
+        test "canonical and legacy graph metadata responses preserve exact numbers" {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            const metadata = "{\"value\":1.00000000000000000000000000000000001,\"tiny\":1e-9999}";
+            const object = (try pathEdgeMetadataObjectMap(alloc, metadata)).?;
+            const canonical = try std.json.Stringify.valueAlloc(alloc, object, .{});
+            try std.testing.expectEqualStrings(metadata, canonical);
+            const legacy = (try pathEdgeMetadataJsonValue(alloc, metadata)).?;
+            try std.testing.expectEqualStrings(metadata, try std.json.Stringify.valueAlloc(alloc, legacy, .{}));
+        }
+
         test "canonical graph path metadata safely reads legacy non-object records" {
             var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
             defer arena_state.deinit();
@@ -14015,7 +14032,7 @@ fn consumerTests() type {
             try std.testing.expectEqualStrings("entities", encoded[0].path_edges.?[0].to.table.?);
             try std.testing.expectEqualStrings("e", encoded[0].path_edges.?[0].type);
             try std.testing.expectEqual(@as(f64, 3.0), encoded[0].path_edges.?[1].weight);
-            try std.testing.expectEqual(@as(i64, 2), encoded[0].path_edges.?[0].metadata.?.map.get("mention_count").?.integer);
+            try std.testing.expectEqualStrings("2", encoded[0].path_edges.?[0].metadata.?.map.get("mention_count").?.number_string);
             try std.testing.expectEqual(@as(usize, 2), encoded[0].provenance.?.len);
             try std.testing.expectEqualStrings("A\x1fe\x1fB", encoded[0].provenance.?[0]);
             try std.testing.expectEqualStrings("B\x1fe\x1fC", encoded[0].provenance.?[1]);
@@ -14024,7 +14041,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 1), evidence.get("path_edges").?.array.items.len);
             const edge_evidence = evidence.get("path_edges").?.array.items[0].object;
             try std.testing.expectEqualStrings("A", edge_evidence.get("source").?.string);
-            try std.testing.expectEqual(@as(i64, 2), edge_evidence.get("metadata").?.object.get("mention_count").?.integer);
+            try std.testing.expectEqualStrings("2", edge_evidence.get("metadata").?.object.get("mention_count").?.number_string);
             const mention_rollup = evidence.get("mention_rollup").?.object;
             try std.testing.expectEqual(@as(i64, 2), mention_rollup.get("mention_count").?.integer);
             try std.testing.expectEqual(@as(usize, 2), mention_rollup.get("mention_artifact_keys").?.array.items.len);

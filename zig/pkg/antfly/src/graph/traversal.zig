@@ -255,8 +255,12 @@ pub fn traverseWithEdgeReader(
         work_budget_mod.default_max_explored_edges,
     );
     var effective_rules = rules;
+    effective_rules.edge_filter = try rules.edge_filter.prepare(alloc);
+    defer if (rules.edge_filter.prepared == null) effective_rules.edge_filter.releasePrepared(alloc);
     if (effective_rules.work_budget == null) effective_rules.work_budget = &local_work_budget;
     const work_budget = effective_rules.work_budget.?;
+    var filter_lease = try work_budget_mod.RetainedLease.init(work_budget, effective_rules.edge_filter.retainedBytes());
+    defer filter_lease.deinit();
     const returned_state_budget = rules.work_budget;
 
     var results = std.ArrayListUnmanaged(TraversalResult).empty;
@@ -656,7 +660,7 @@ fn shouldTraverseEdge(alloc: Allocator, rules: *const TraversalRules, edge: *con
         }
         if (!matched) return false;
     }
-    return rules.edge_filter.matches(alloc, edge.*);
+    return rules.edge_filter.matchesWithBudget(alloc, edge.*, rules.work_budget);
 }
 
 test "traversal weight filters preserve explicit zero bounds" {

@@ -18,6 +18,7 @@ const std = @import("std");
 const schema = @import("../storage/schema.zig");
 const json_number = @import("../common/json_number.zig");
 const Allocator = std.mem.Allocator;
+const work_budget = @import("work_budget.zig");
 
 pub const Operator = enum { eq, ne, lt, lte, gt, gte, is_null, is_not_null };
 pub const ValueType = enum { scalar, datetime };
@@ -32,12 +33,80 @@ pub const Filter = struct {
     properties: []const Predicate = &.{},
     valid_at_ns: ?i128 = null,
     known_at_ns: ?i128 = null,
+    /// Execution-only cache. Wire hooks expose only the durable filter syntax.
+    prepared: ?*Prepared = null,
+
+    const Wire = struct {
+        properties: []const Predicate = &.{},
+        valid_at_ns: ?i128 = null,
+        known_at_ns: ?i128 = null,
+    };
+
+    pub fn jsonStringify(self: Filter, writer: anytype) !void {
+        try writer.write(Wire{ .properties = self.properties, .valid_at_ns = self.valid_at_ns, .known_at_ns = self.known_at_ns });
+    }
+
+    pub fn jsonParse(alloc: Allocator, source: anytype, options: std.json.ParseOptions) !Filter {
+        const wire = try std.json.innerParse(Wire, alloc, source, options);
+        return .{ .properties = wire.properties, .valid_at_ns = wire.valid_at_ns, .known_at_ns = wire.known_at_ns };
+    }
+
+    pub fn jsonParseFromValue(alloc: Allocator, source: std.json.Value, options: std.json.ParseOptions) !Filter {
+        const wire = try std.json.innerParseFromValue(Wire, alloc, source, options);
+        return .{ .properties = wire.properties, .valid_at_ns = wire.valid_at_ns, .known_at_ns = wire.known_at_ns };
+    }
+
+    /// Borrow an existing immutable cache or own a newly prepared one. Syntax
+    /// stays borrowed; callers release only a cache they created themselves.
+    pub fn prepare(self: Filter, alloc: Allocator) !Filter {
+        if (!self.active() or self.prepared != null) return self;
+        try self.validate(alloc);
+        const prepared = try alloc.create(Prepared);
+        errdefer alloc.destroy(prepared);
+        prepared.* = .{ .arena = std.heap.ArenaAllocator.init(alloc) };
+        errdefer prepared.arena.deinit();
+        const a = prepared.arena.allocator();
+        var nodes = std.ArrayListUnmanaged(ProjectionNode).empty;
+        try nodes.append(a, .{});
+        prepared.properties = try a.alloc(PreparedPredicate, self.properties.len);
+        for (self.properties, prepared.properties) |p, *out| {
+            const path = if (std.mem.startsWith(u8, p.field, "/metadata/")) try decodePointer(a, p.field[10..]) else &.{};
+            out.* = .{ .syntax = p, .path = path, .expected = if (p.value_json.len > 0) try std.json.parseFromSliceLeaky(std.json.Value, a, p.value_json, .{ .parse_numbers = false, .allocate = .alloc_always }) else .null };
+            out.expected_number = if (out.expected == .number_string) json_number.Number.parse(out.expected.number_string) else null;
+            out.expected_time = if (p.value_type == .datetime) schema.parseRfc3339ToSignedNs(out.expected.string) else null;
+            if (path.len > 0) out.metadata_slot = try internPath(a, &nodes, &prepared.slot_count, path);
+        }
+        if (self.valid_at_ns != null) prepared.valid_interval = .{
+            .lower = try internPath(a, &nodes, &prepared.slot_count, &.{"valid_at"}),
+            .upper = try internPath(a, &nodes, &prepared.slot_count, &.{"invalid_at"}),
+        };
+        if (self.known_at_ns != null) prepared.known_interval = .{
+            .lower = try internPath(a, &nodes, &prepared.slot_count, &.{"created_at"}),
+            .upper = try internPath(a, &nodes, &prepared.slot_count, &.{"expired_at"}),
+        };
+        prepared.nodes = try nodes.toOwnedSlice(a);
+        var result = self;
+        result.prepared = prepared;
+        return result;
+    }
+
+    pub fn retainedBytes(self: Filter) usize {
+        return if (self.prepared) |prepared| @sizeOf(Prepared) + prepared.arena.queryCapacity() else 0;
+    }
+
+    pub fn releasePrepared(self: Filter, alloc: Allocator) void {
+        if (self.prepared) |prepared| {
+            prepared.arena.deinit();
+            alloc.destroy(prepared);
+        }
+    }
 
     pub fn active(self: Filter) bool {
         return self.properties.len > 0 or self.valid_at_ns != null or self.known_at_ns != null;
     }
 
     pub fn deinit(self: Filter, alloc: Allocator) void {
+        self.releasePrepared(alloc);
         for (self.properties) |predicate| {
             alloc.free(predicate.field);
             if (predicate.value_json.len > 0) alloc.free(predicate.value_json);
@@ -61,7 +130,7 @@ pub const Filter = struct {
             properties[i] = .{ .field = field, .op = p.op, .value_json = if (p.value_json.len > 0) try alloc.dupe(u8, p.value_json) else "", .value_type = p.value_type };
             count += 1;
         }
-        return .{ .properties = properties, .valid_at_ns = self.valid_at_ns, .known_at_ns = self.known_at_ns };
+        return try (Filter{ .properties = properties, .valid_at_ns = self.valid_at_ns, .known_at_ns = self.known_at_ns }).prepare(alloc);
     }
 
     pub fn validate(self: Filter, alloc: Allocator) !void {
@@ -84,30 +153,47 @@ pub const Filter = struct {
     }
 
     pub fn matches(self: Filter, alloc: Allocator, edge: anytype) !bool {
+        return self.matchesWithBudget(alloc, edge, null);
+    }
+
+    pub fn matchesWithBudget(self: Filter, alloc: Allocator, edge: anytype, budget: ?*work_budget.WorkBudget) !bool {
+        var retained = work_budget.RetainedAllocator{ .backing = alloc, .budget = budget };
+        return self.matchesImpl(retained.allocator(), edge) catch |err| {
+            if (retained.denied) return error.GraphWorkBudgetExceeded;
+            return err;
+        };
+    }
+
+    fn matchesImpl(self: Filter, alloc: Allocator, edge: anytype) !bool {
         if (!self.active()) return true;
-        var metadata = std.json.parseFromSlice(std.json.Value, alloc, if (edge.metadata.len > 0) edge.metadata else "{}", .{ .parse_numbers = false }) catch |err| return if (err == error.OutOfMemory) err else false;
-        defer metadata.deinit();
-        if (self.valid_at_ns) |at| if (!intervalContains(metadata.value, "valid_at", "invalid_at", at, false)) return false;
-        if (self.known_at_ns) |at| if (!intervalContains(metadata.value, "created_at", "expired_at", at, true)) return false;
-        for (self.properties) |p| {
+        const filter = try self.prepare(alloc);
+        defer if (self.prepared == null) filter.releasePrepared(alloc);
+        const prepared = filter.prepared.?;
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        var values: [68]?std.json.Value = @splat(null);
+        if (prepared.slot_count > 0) {
+            const metadata = if (edge.metadata.len > 0) edge.metadata else "{}";
+            projectMetadata(scratch.allocator(), metadata, prepared, &values) catch |err|
+                return if (err == error.OutOfMemory) err else false;
+        }
+        if (prepared.valid_interval) |interval| if (!intervalContainsValues(values[interval.lower], values[interval.upper], self.valid_at_ns.?, false)) return false;
+        if (prepared.known_interval) |interval| if (!intervalContainsValues(values[interval.lower], values[interval.upper], self.known_at_ns.?, true)) return false;
+        for (prepared.properties) |p| {
             var timestamp_buffer: [32]u8 = undefined;
-            const actual = try edgeValue(alloc, edge, metadata.value, p.field, &timestamp_buffer);
+            const actual = if (p.metadata_slot) |slot| values[slot] else try edgeValue(edge, p.syntax.field, &timestamp_buffer);
             const nullish = actual == null or actual.? == .null;
-            if (p.op == .is_null) {
+            if (p.syntax.op == .is_null) {
                 if (!nullish) return false;
                 continue;
             }
-            if (p.op == .is_not_null) {
+            if (p.syntax.op == .is_not_null) {
                 if (nullish) return false;
                 continue;
             }
-            // Cypher comparisons with absent/null properties do not pass WHERE,
-            // including !=. Null tests must be requested explicitly.
             if (nullish) return false;
-            var expected = try std.json.parseFromSlice(std.json.Value, alloc, p.value_json, .{ .parse_numbers = false });
-            defer expected.deinit();
-            const order = compare(actual.?, expected.value, p.value_type) orelse return false;
-            const passes = switch (p.op) {
+            const order = comparePrepared(actual.?, p) orelse return false;
+            const passes = switch (p.syntax.op) {
                 .eq => order == .eq,
                 .ne => order != .eq,
                 .lt => order == .lt,
@@ -134,6 +220,7 @@ fn scalar(value: std.json.Value) bool {
 fn validField(field: []const u8) bool {
     for ([_][]const u8{ "/edge_id", "/owner_document", "/source", "/target", "/type", "/weight", "/created_at", "/updated_at" }) |name| if (std.mem.eql(u8, field, name)) return true;
     if (!std.mem.startsWith(u8, field, "/metadata/")) return false;
+    if (std.mem.count(u8, field[10..], "/") >= 256) return false;
     var i: usize = 0;
     while (i < field.len) : (i += 1) if (field[i] == '~') {
         i += 1;
@@ -142,7 +229,7 @@ fn validField(field: []const u8) bool {
     return true;
 }
 
-fn edgeValue(alloc: Allocator, edge: anytype, metadata: std.json.Value, field: []const u8, timestamp_buffer: *[32]u8) !?std.json.Value {
+fn edgeValue(edge: anytype, field: []const u8, timestamp_buffer: *[32]u8) !?std.json.Value {
     if (std.mem.eql(u8, field, "/edge_id")) return if (edge.edge_id.len > 0) .{ .string = edge.edge_id } else null;
     if (std.mem.eql(u8, field, "/owner_document")) return .{ .string = if (edge.owner_document.len > 0) edge.owner_document else edge.source };
     if (std.mem.eql(u8, field, "/source")) return .{ .string = edge.source };
@@ -151,12 +238,48 @@ fn edgeValue(alloc: Allocator, edge: anytype, metadata: std.json.Value, field: [
     if (std.mem.eql(u8, field, "/weight")) return .{ .float = edge.weight };
     if (std.mem.eql(u8, field, "/created_at")) return .{ .number_string = try std.fmt.bufPrint(timestamp_buffer, "{d}", .{edge.created_at}) };
     if (std.mem.eql(u8, field, "/updated_at")) return .{ .number_string = try std.fmt.bufPrint(timestamp_buffer, "{d}", .{edge.updated_at}) };
-    if (!std.mem.startsWith(u8, field, "/metadata/")) return null;
-    var current = metadata;
-    var components = std.mem.splitScalar(u8, field[10..], '/');
+    return null;
+}
+
+fn comparePrepared(actual: std.json.Value, predicate: PreparedPredicate) ?std.math.Order {
+    if (predicate.expected_time) |time| {
+        if (actual != .string) return null;
+        return std.math.order(schema.parseRfc3339ToSignedNs(actual.string) orelse return null, time);
+    }
+    if (predicate.expected_number) |expected| {
+        var buffer: [64]u8 = undefined;
+        const number = json_number.fromValue(actual, &buffer) orelse return null;
+        return number.order(expected);
+    }
+    const expected = predicate.expected;
+    if (actual == .string and expected == .string) return std.mem.order(u8, actual.string, expected.string);
+    if (actual == .bool and expected == .bool) return std.math.order(@intFromBool(actual.bool), @intFromBool(expected.bool));
+    return null;
+}
+
+const PreparedPredicate = struct {
+    syntax: Predicate,
+    path: []const []const u8,
+    metadata_slot: ?usize = null,
+    expected: std.json.Value,
+    expected_number: ?json_number.Number = null,
+    expected_time: ?i128 = null,
+};
+const Prepared = struct {
+    arena: std.heap.ArenaAllocator,
+    properties: []PreparedPredicate = &.{},
+    nodes: []ProjectionNode = &.{},
+    slot_count: usize = 0,
+    valid_interval: ?IntervalSlots = null,
+    known_interval: ?IntervalSlots = null,
+};
+
+fn decodePointer(alloc: Allocator, text: []const u8) ![]const []const u8 {
+    var parts = std.ArrayListUnmanaged([]const u8).empty;
+    var components = std.mem.splitScalar(u8, text, '/');
     while (components.next()) |component| {
+        if (parts.items.len == 256) return error.InvalidRelationshipFilter;
         var key = std.ArrayListUnmanaged(u8).empty;
-        defer key.deinit(alloc);
         var i: usize = 0;
         while (i < component.len) : (i += 1) {
             var ch = component[i];
@@ -171,41 +294,90 @@ fn edgeValue(alloc: Allocator, edge: anytype, metadata: std.json.Value, field: [
             }
             try key.append(alloc, ch);
         }
-        current = switch (current) {
-            .object => |object| object.get(key.items) orelse return null,
-            .array => |array| blk: {
-                const index = std.fmt.parseUnsigned(usize, key.items, 10) catch return null;
-                if (index >= array.items.len) return null;
-                break :blk array.items[index];
-            },
-            else => return null,
-        };
+        try parts.append(alloc, try key.toOwnedSlice(alloc));
     }
-    return current;
+    return try parts.toOwnedSlice(alloc);
 }
 
-fn compare(actual: std.json.Value, expected: std.json.Value, value_type: ValueType) ?std.math.Order {
-    if (value_type == .datetime) {
-        if (actual != .string or expected != .string) return null;
-        const a = schema.parseRfc3339ToSignedNs(actual.string) orelse return null;
-        const b = schema.parseRfc3339ToSignedNs(expected.string) orelse return null;
-        return std.math.order(a, b);
+const IntervalSlots = struct { lower: usize, upper: usize };
+const ProjectionNode = struct {
+    children: std.StringHashMapUnmanaged(usize) = .empty,
+    slot: ?usize = null,
+};
+
+fn internPath(alloc: Allocator, nodes: *std.ArrayListUnmanaged(ProjectionNode), slots: *usize, path: []const []const u8) !usize {
+    var current: usize = 0;
+    for (path) |key| {
+        const entry = try nodes.items[current].children.getOrPut(alloc, key);
+        if (!entry.found_existing) {
+            entry.value_ptr.* = nodes.items.len;
+            try nodes.append(alloc, .{});
+        }
+        current = entry.value_ptr.*;
     }
-    var actual_buffer: [64]u8 = undefined;
-    var expected_buffer: [64]u8 = undefined;
-    if (json_number.fromValue(actual, &actual_buffer)) |a| {
-        const b = json_number.fromValue(expected, &expected_buffer) orelse return null;
-        return a.order(b);
+    if (nodes.items[current].slot == null) {
+        nodes.items[current].slot = slots.*;
+        slots.* += 1;
     }
-    if (actual == .string and expected == .string) return std.mem.order(u8, actual.string, expected.string);
-    if (actual == .bool and expected == .bool) return std.math.order(@intFromBool(actual.bool), @intFromBool(expected.bool));
-    return null;
+    return nodes.items[current].slot.?;
 }
 
-fn intervalContains(metadata: std.json.Value, lower: []const u8, upper: []const u8, at: i128, require_lower: bool) bool {
-    if (metadata != .object) return false;
-    const begin = metadata.object.get(lower) orelse .null;
-    const end = metadata.object.get(upper) orelse .null;
+/// One scan projects every selected scalar. Unrelated containers are skipped,
+/// never materialized. Every selected pointer node can appear only once;
+/// duplicate keys along a selected path fail closed as ambiguous.
+fn projectMetadata(alloc: Allocator, raw: []const u8, prepared: *const Prepared, values: *[68]?std.json.Value) !void {
+    var scanner = std.json.Scanner.initCompleteInput(alloc, raw);
+    defer scanner.deinit();
+    if ((prepared.valid_interval != null or prepared.known_interval != null) and try scanner.peekNextTokenType() != .object_begin) return error.InvalidRelationshipFilter;
+    const seen = try alloc.alloc(bool, prepared.nodes.len);
+    @memset(seen, false);
+    try projectNode(alloc, &scanner, prepared.nodes, 0, values, seen);
+    if (try scanner.next() != .end_of_document) return error.InvalidRelationshipFilter;
+}
+
+fn projectNode(alloc: Allocator, scanner: *std.json.Scanner, nodes: []const ProjectionNode, index: usize, values: *[68]?std.json.Value, seen: []bool) anyerror!void {
+    if (seen[index]) return error.DuplicateField;
+    seen[index] = true;
+    const node = nodes[index];
+    const kind = try scanner.peekNextTokenType();
+    if (kind != .object_begin and kind != .array_begin) {
+        if (node.slot) |slot| values[slot] = switch (try scanner.nextAlloc(alloc, .alloc_if_needed)) {
+            .string, .allocated_string => |v| .{ .string = v },
+            .number, .allocated_number => |v| .{ .number_string = v },
+            .true => .{ .bool = true },
+            .false => .{ .bool = false },
+            .null => .null,
+            else => return error.InvalidRelationshipFilter,
+        } else try scanner.skipValue();
+        return;
+    }
+    if (node.slot) |slot| values[slot] = if (kind == .object_begin) .{ .object = .empty } else .{ .array = std.json.Array.init(alloc) };
+    if (node.children.count() == 0) return scanner.skipValue();
+    _ = try scanner.next();
+    if (kind == .object_begin) {
+        while (try scanner.peekNextTokenType() != .object_end) {
+            const token = try scanner.nextAlloc(alloc, .alloc_if_needed);
+            const key = switch (token) {
+                .string, .allocated_string => |v| v,
+                else => return error.InvalidRelationshipFilter,
+            };
+            defer if (token == .allocated_string) alloc.free(token.allocated_string);
+            if (node.children.get(key)) |child| try projectNode(alloc, scanner, nodes, child, values, seen) else try scanner.skipValue();
+        }
+    } else {
+        var ordinal: usize = 0;
+        while (try scanner.peekNextTokenType() != .array_end) : (ordinal += 1) {
+            var buffer: [32]u8 = undefined;
+            const key = try std.fmt.bufPrint(&buffer, "{d}", .{ordinal});
+            if (node.children.get(key)) |child| try projectNode(alloc, scanner, nodes, child, values, seen) else try scanner.skipValue();
+        }
+    }
+    _ = try scanner.next();
+}
+
+fn intervalContainsValues(begin_value: ?std.json.Value, end_value: ?std.json.Value, at: i128, require_lower: bool) bool {
+    const begin = begin_value orelse .null;
+    const end = end_value orelse .null;
     if (begin == .null and require_lower) return false;
     if (begin != .null) {
         if (begin != .string) return false;
@@ -267,7 +439,7 @@ pub fn parsePublicAlloc(alloc: Allocator, value: anytype) !Filter {
     errdefer result.deinit(alloc);
     try result.validate(alloc);
     if (!result.active()) return error.InvalidRelationshipFilter;
-    return result;
+    return try result.prepare(alloc);
 }
 
 test "relationship predicates enforce bitemporal intervals and Cypher null semantics" {
@@ -358,4 +530,94 @@ test "relationship predicates distinguish arbitrary precision metadata" {
     const enormous = Filter{ .properties = &.{.{ .field = "/metadata/value", .op = .eq, .value_json = "10e999999999999999999999999999999999999" }} };
     try enormous.validate(alloc);
     try std.testing.expect(try enormous.matches(alloc, Edge{ .metadata = "{\"value\":1e1000000000000000000000000000000000000}" }));
+}
+
+const RegressionEdge = struct {
+    source: []const u8 = "a",
+    target: []const u8 = "b",
+    edge_type: []const u8 = "R",
+    edge_id: []const u8 = "",
+    owner_document: []const u8 = "",
+    weight: f64 = 0.1,
+    created_at: u64 = 0,
+    updated_at: u64 = 0,
+    metadata: []const u8 = "{}",
+};
+
+test "relationship predicates prepared intrinsic filters allocate no per-edge state" {
+    const alloc = std.testing.allocator;
+    const raw = Filter{ .properties = &.{.{ .field = "/weight", .op = .eq, .value_json = "0.1" }} };
+    const filter = try raw.prepare(alloc);
+    defer filter.releasePrepared(alloc);
+    var counter = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    for (0..100) |_| try std.testing.expect(try filter.matches(counter.allocator(), RegressionEdge{ .metadata = "legacy malformed metadata" }));
+    try std.testing.expectEqual(@as(usize, 0), counter.allocations);
+    const wire = try std.json.Stringify.valueAlloc(alloc, filter, .{});
+    defer alloc.free(wire);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "prepared") == null);
+    var parsed = try std.json.parseFromSlice(Filter, alloc, wire, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.prepared == null);
+    try std.testing.expect(try parsed.value.matches(alloc, RegressionEdge{}));
+}
+
+test "relationship predicates scan unused arrays without materializing them" {
+    const alloc = std.testing.allocator;
+    const raw = Filter{ .properties = &.{.{ .field = "/metadata/value", .op = .eq, .value_json = "1.00000000000000000000000000000000001" }} };
+    const filter = try raw.prepare(alloc);
+    defer filter.releasePrepared(alloc);
+    var metadata = std.ArrayListUnmanaged(u8).empty;
+    defer metadata.deinit(alloc);
+    try metadata.appendSlice(alloc, "{\"value\":1.00000000000000000000000000000000001,\"unused\":[0");
+    for (0..10000) |_| try metadata.appendSlice(alloc, ",0");
+    try metadata.appendSlice(alloc, "]}");
+    var counter = std.testing.FailingAllocator.init(alloc, .{});
+    try std.testing.expect(try filter.matches(counter.allocator(), RegressionEdge{ .metadata = metadata.items }));
+    try std.testing.expect(counter.allocated_bytes < 4096);
+    try std.testing.expectEqual(counter.allocated_bytes, counter.freed_bytes);
+    try std.testing.expect(!try filter.matches(alloc, RegressionEdge{ .metadata = "{\"value\":1,\"value\":2}" }));
+    const valid = Filter{ .valid_at_ns = 0 };
+    try std.testing.expect(!try valid.matches(alloc, RegressionEdge{ .metadata = "null" }));
+}
+
+test "relationship predicates selected decoding respects graph memory admission" {
+    const alloc = std.testing.allocator;
+    const raw = Filter{ .properties = &.{.{ .field = "/metadata/text", .op = .eq, .value_json = "\"" ++ ("a" ** 1024) ++ "\"" }} };
+    const filter = try raw.prepare(alloc);
+    defer filter.releasePrepared(alloc);
+    const metadata = "{\"text\":\"" ++ ("\\u0061" ** 1024) ++ "\"}";
+    var budget = work_budget.WorkBudget.initWithLimits(.{ .max_retained_state_bytes = 64 });
+    try std.testing.expectError(error.GraphWorkBudgetExceeded, filter.matchesWithBudget(alloc, RegressionEdge{ .metadata = metadata }, &budget));
+    try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+    try std.testing.expect(try filter.matches(alloc, RegressionEdge{ .metadata = metadata }));
+}
+
+fn preparedFilterAllocationScenario(alloc: Allocator) !void {
+    const raw = Filter{ .properties = &.{.{ .field = "/metadata/a~1b/~0key/0", .op = .eq, .value_json = "\"escaped\\u0020value\"" }} };
+    const prepared = try raw.prepare(alloc);
+    defer prepared.releasePrepared(alloc);
+    const clone = try prepared.clone(alloc);
+    defer clone.deinit(alloc);
+    try std.testing.expect(try clone.matches(alloc, RegressionEdge{ .metadata = "{\"a/b\":{\"~key\":[\"escaped value\"]}}" }));
+}
+
+test "relationship predicates preparation cloning and projection clean up every failed allocation" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, preparedFilterAllocationScenario, .{});
+}
+
+test "relationship predicates project overlapping paths and shared array leaves once" {
+    const alloc = std.testing.allocator;
+    const raw = Filter{ .properties = &.{
+        .{ .field = "/metadata/a", .op = .is_not_null },
+        .{ .field = "/metadata/a/items/0", .op = .eq, .value_json = "7" },
+        .{ .field = "/metadata/a/items/0", .op = .lt, .value_json = "8" },
+        .{ .field = "/metadata/a/items/1", .op = .is_null },
+        .{ .field = "/metadata/a/", .op = .eq, .value_json = "true" },
+    } };
+    const filter = try raw.prepare(alloc);
+    defer filter.releasePrepared(alloc);
+    try std.testing.expectEqual(@as(usize, 4), filter.prepared.?.slot_count);
+    try std.testing.expect(try filter.matches(alloc, RegressionEdge{ .metadata = "{\"a\":{\"items\":[7,null],\"\":true}}" }));
+    try std.testing.expect(!try filter.matches(alloc, RegressionEdge{ .metadata = "{\"a\":{\"items\":[7,null],\"items\":[7,null],\"\":true}}" }));
+    try std.testing.expect(!try filter.matches(alloc, RegressionEdge{ .metadata = "{\"a\":{\"items\":[7,null],\"\":true}} trailing" }));
 }

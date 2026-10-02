@@ -84,6 +84,8 @@ pub const PathWeightMode = enum { min_hops, min_weight, max_weight };
 
 pub const PathFindOptions = struct {
     edge_filter: relationship_filter.Filter = .{},
+    // Yen owns one cache lease shared by all of its spur searches.
+    edge_filter_retained: bool = false,
     weight_mode: PathWeightMode = .min_hops,
     edge_types: []const []const u8 = &.{},
     direction: EdgeDirection = .out,
@@ -484,7 +486,12 @@ fn findShortestPathWithExclusionsAndEdgeReader(
         work_budget_mod.default_max_explored_edges,
     );
     var effective_opts = opts;
+    effective_opts.edge_filter = try opts.edge_filter.prepare(alloc);
+    defer if (opts.edge_filter.prepared == null) effective_opts.edge_filter.releasePrepared(alloc);
     if (effective_opts.work_budget == null) effective_opts.work_budget = &local_work_budget;
+    var filter_lease = try work_budget_mod.RetainedLease.init(effective_opts.work_budget, if (opts.edge_filter_retained) 0 else effective_opts.edge_filter.retainedBytes());
+    defer filter_lease.deinit();
+    effective_opts.edge_filter_retained = true;
 
     if (effective_opts.node_admission) |admission| {
         if (!try traversal_mod.startNodeAdmittedWithEdgeReader(alloc, edge_reader, source, effective_opts.direction, admission, effective_opts.work_budget)) {
@@ -870,8 +877,13 @@ pub fn findKShortestPathsWithEdgeReader(
         work_budget_mod.default_max_explored_edges,
     );
     var effective_opts = opts;
+    effective_opts.edge_filter = try opts.edge_filter.prepare(alloc);
+    defer if (opts.edge_filter.prepared == null) effective_opts.edge_filter.releasePrepared(alloc);
     const uses_local_work_budget = effective_opts.work_budget == null;
     if (effective_opts.work_budget == null) effective_opts.work_budget = &local_work_budget;
+    var filter_lease = try work_budget_mod.RetainedLease.init(effective_opts.work_budget, if (opts.edge_filter_retained) 0 else effective_opts.edge_filter.retainedBytes());
+    defer filter_lease.deinit();
+    effective_opts.edge_filter_retained = true;
     // Yen needs releasable leases for transient spur/candidate paths. Strip the
     // local pointer only from paths that actually escape this function.
     const transient_state_budget = effective_opts.work_budget;
@@ -1112,7 +1124,7 @@ fn shouldTraverseEdge(alloc: Allocator, opts: PathFindOptions, edge: *const Edge
         }
         if (!matched) return false;
     }
-    return opts.edge_filter.matches(alloc, edge.*);
+    return opts.edge_filter.matchesWithBudget(alloc, edge.*, opts.work_budget);
 }
 
 pub fn pathEdgeCost(mode: PathWeightMode, weight: f64) !f64 {
