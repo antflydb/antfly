@@ -181,14 +181,25 @@ validates nested decision specifications before opening reads. Ordering
 expressions evaluate in bounded batches over qualifying rows, including grouped
 and windowed results. Reusing a computed CTE column does not re-evaluate it.
 
-Decision functions also work in mutation expressions, including MERGE arms,
+Decision functions also work in ordinary UPDATE/DELETE predicates, UPDATE
+assignments, and mutation expressions including MERGE arms,
 conflict-update predicates and assignments, and RETURNING. Validate every bound
 decision specification and provider before starting mutation reads. MERGE keeps
 ordered arm selection lazy, and conflict updates evaluate assignments only for
-existing owner rows whose predicates pass. External mutation work uses bounded
-decision pages and retains the existing native row and read-set fences. Resolve
-all decision results, including RETURNING, before publishing the native commit;
+existing owner rows whose predicates pass. External mutation work uses
+row- and byte-bounded decision pages and retains the existing native row and
+read-set fences. Assignment inference runs only for rows passing the predicate.
+RETURNING uses the same page bounds and releases provider scratch after each
+page. Resolve all decision results, including RETURNING, before publishing the native commit;
 provider failure never publishes a partial mutation batch.
+
+DSL provider preflight traverses the parsed expression and predicate domains.
+Aggregation names and literal JSON contents cannot change validation behavior.
+Every call is validated before reads, including calls in untaken branches.
+Direct calls in predicates, sorting, and aggregations evaluate in batches;
+Boolean branches retain per-row short-circuiting and three-valued NULL logic.
+Expression documents use public source visibility for both document and graph
+queries: storage revision markers cannot be projected through `_computed`.
 
 ## Runtime contract
 

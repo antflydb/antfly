@@ -710,6 +710,50 @@ pub const Context = struct {
         return .{ .value = result, .sql_null = result == .null and !(column.type == .json and literal == .string) };
     }
 
+    const MutationDecisionPage = struct {
+        cells: []const []const Datum,
+        positions: []const ?usize,
+        assignments: []const ?[]const Datum,
+    };
+
+    /// Predicate demand is resolved before assignment demand. Scratch belongs
+    /// to one row/byte-bounded page; only staged postimages outlive the page.
+    fn mutationDecisionPage(self: Context, scratch: std.mem.Allocator, rows: []const catalog.Row, remaining: usize) !MutationDecisionPage {
+        const decision = @import("decision_eval.zig");
+        var cells: std.ArrayList([]const Datum) = .empty;
+        var bytes: usize = 0;
+        for (rows) |row| {
+            try self.checkpoint();
+            const values = try self.binding.scalars.cells(scratch, row);
+            try cells.append(scratch, values);
+            for (values) |cell| bytes +|= try operators.datumBytes(cell);
+            if (cells.items.len >= self.limits.page_rows or bytes >= self.limits.page_bytes) break;
+        }
+        const predicates = if (self.binding.scalars.predicate) |*program|
+            try decision.evaluateBatch(scratch, self.backend.decision_provider, program, cells.items, self.parameters)
+        else
+            null;
+        const positions = try scratch.alloc(?usize, cells.items.len);
+        @memset(positions, null);
+        var accepted: std.ArrayList([]const Datum) = .empty;
+        for (cells.items, 0..) |row, index| {
+            if (predicates) |values| {
+                if (values[index].sql_null) continue;
+                if (values[index].value != .bool) return error.SqlTypeMismatch;
+                if (!values[index].value.bool) continue;
+            }
+            if (accepted.items.len == remaining) return error.SqlProgramLimitExceeded;
+            positions[index] = accepted.items.len;
+            try accepted.append(scratch, row);
+        }
+        const assignments = try scratch.alloc(?[]const Datum, self.binding.scalars.assignments.len);
+        for (self.binding.scalars.assignments, assignments) |optional, *values| values.* = if (optional) |*program|
+            try decision.evaluateBatch(scratch, self.backend.decision_provider, program, accepted.items, self.parameters)
+        else
+            null;
+        return .{ .cells = cells.items, .positions = positions, .assignments = assignments };
+    }
+
     fn change(self: Context, _: ast.Name, predicate: ?*const ast.Predicate, assignments: ?[]const ast.Assignment, requested_returning: ?[]const ast.Projection) !Output {
         const returning = if (requested_returning != null) self.binding.returning_projections else null;
         const table_def = self.binding.table orelse return error.InvalidSqlBackendResponse;
@@ -771,6 +815,11 @@ pub const Context = struct {
         defer if (after) |key| self.alloc.free(key);
         var scan_state: ScanState = .{};
         defer scan_state.deinit();
+        const decision = @import("decision_eval.zig");
+        var external = if (self.binding.scalars.predicate) |*program| decision.hasExternal(program) else false;
+        for (self.binding.scalars.assignments) |optional| if (optional) |*program| {
+            external = external or decision.hasExternal(program);
+        };
         while (!predicates.empty) {
             try self.checkpoint();
             page_count += 1;
@@ -780,66 +829,78 @@ pub const Context = struct {
             const page = try scan_state.page(self, page_arena.allocator(), table_def, .{ .fields = fields.items, .include_primary_digest = true, .include_document = table_def.storage_mode == .document and assignments != null, .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .after = after, .limit = self.limits.page_rows });
             defer page.deinit();
             if (page.rows.len > self.limits.page_rows) return error.InvalidSqlBackendResponse;
+            if (page.rows.len > self.limits.scan_rows -| visited) return error.SqlProgramLimitExceeded;
             // Grow once per bounded native page. Arena-backed geometric growth
             // otherwise retains every superseded per-row staging buffer.
             try mutations.ensureUnusedCapacity(self.arena, @min(page.rows.len, self.limits.mutation_rows - mutations.items.len));
-            for (page.rows) |row| {
-                try self.checkpoint();
-                visited += 1;
-                if (visited > self.limits.scan_rows) return error.SqlProgramLimitExceeded;
-                const expression_cells = try self.binding.scalars.cells(page_arena.allocator(), row);
-                if (!try self.binding.scalars.matchesWithProvider(page_arena.allocator(), expression_cells, self.parameters, self.backend.decision_provider)) continue;
-                if (mutations.items.len >= self.limits.mutation_rows) return error.SqlProgramLimitExceeded;
-                var document: ?Json = null;
-                var json_null_fields: std.ArrayList([]const u8) = .empty;
-                if (assignments != null) {
-                    if (row.value != .object) return error.InvalidSqlBackendResponse;
-                    var copy: Json = .{ .object = .empty };
-                    if (table_def.storage_mode == .document) {
-                        const original = row.document orelse return error.InvalidSqlBackendResponse;
-                        if (original != .object or (row.expected_content_digest == null and row.version != 0)) return error.InvalidSqlBackendResponse;
-                        var members = original.object.iterator();
-                        while (members.next()) |member| {
-                            if (replaced.contains(member.key_ptr.*)) continue;
-                            const declared = table_def.column(member.key_ptr.*) catch null;
-                            if (declared) |column| if (column.generated) continue;
-                            try copy.object.put(self.arena, try self.arena.dupe(u8, member.key_ptr.*), try clone(self.arena, member.value_ptr.*));
-                            if (declared) |column| if (column.type == .json and member.value_ptr.* == .null) try json_null_fields.append(self.arena, column.path);
+            var first: usize = 0;
+            while (first < page.rows.len) {
+                var decision_arena = std.heap.ArenaAllocator.init(self.alloc);
+                defer decision_arena.deinit();
+                const scratch = if (external) decision_arena.allocator() else page_arena.allocator();
+                const evaluated = if (external) try self.mutationDecisionPage(scratch, page.rows[first..], self.limits.mutation_rows - mutations.items.len) else null;
+                const end = first + if (evaluated) |batch| batch.cells.len else page.rows.len;
+                for (page.rows[first..end], 0..) |row, row_index| {
+                    try self.checkpoint();
+                    visited += 1;
+                    if (visited > self.limits.scan_rows) return error.SqlProgramLimitExceeded;
+                    const expression_cells = if (evaluated) |batch| batch.cells[row_index] else try self.binding.scalars.cells(scratch, row);
+                    if (evaluated) |batch| {
+                        if (batch.positions[row_index] == null) continue;
+                    } else if (!try self.binding.scalars.matchesWithProvider(scratch, expression_cells, self.parameters, self.backend.decision_provider)) continue;
+                    if (mutations.items.len >= self.limits.mutation_rows) return error.SqlProgramLimitExceeded;
+                    var document: ?Json = null;
+                    var json_null_fields: std.ArrayList([]const u8) = .empty;
+                    if (assignments != null) {
+                        if (row.value != .object) return error.InvalidSqlBackendResponse;
+                        var copy: Json = .{ .object = .empty };
+                        if (table_def.storage_mode == .document) {
+                            const original = row.document orelse return error.InvalidSqlBackendResponse;
+                            if (original != .object or (row.expected_content_digest == null and row.version != 0)) return error.InvalidSqlBackendResponse;
+                            var members = original.object.iterator();
+                            while (members.next()) |member| {
+                                if (replaced.contains(member.key_ptr.*)) continue;
+                                const declared = table_def.column(member.key_ptr.*) catch null;
+                                if (declared) |column| if (column.generated) continue;
+                                try copy.object.put(self.arena, try self.arena.dupe(u8, member.key_ptr.*), try clone(self.arena, member.value_ptr.*));
+                                if (declared) |column| if (column.type == .json and member.value_ptr.* == .null) try json_null_fields.append(self.arena, column.path);
+                            }
                         }
-                    }
-                    for (table_def.columns) |column| {
-                        if (table_def.storage_mode == .document) continue;
-                        if (column.generated or replaced.contains(column.path)) continue;
-                        if (row.value.object.get(column.path)) |old| {
-                            const cell = try row.cell(column.path);
-                            if (old == .null and !cell.sql_null) try json_null_fields.append(self.arena, column.path);
-                            try putField(self.arena, &copy.object, column.path, try clone(self.arena, old));
+                        for (table_def.columns) |column| {
+                            if (table_def.storage_mode == .document) continue;
+                            if (column.generated or replaced.contains(column.path)) continue;
+                            if (row.value.object.get(column.path)) |old| {
+                                const cell = try row.cell(column.path);
+                                if (old == .null and !cell.sql_null) try json_null_fields.append(self.arena, column.path);
+                                try putField(self.arena, &copy.object, column.path, try clone(self.arena, old));
+                            }
                         }
+                        for (bound_assignments, 0..) |bound, assignment_index| {
+                            const assigned_value = if (bound.program) |program| blk: {
+                                const assigned = if (evaluated) |batch| batch.assignments[assignment_index].?[batch.positions[row_index].?] else try self.evaluate(scratch, program, expression_cells);
+                                if (assigned.sql_null and !bound.column.nullable) return error.SqlNotNullViolation;
+                                if (!assigned.sql_null and assigned.value == .null) try json_null_fields.append(self.arena, bound.column.path);
+                                break :blk try clone(self.arena, try coerce(self.arena, assigned.value, bound.column.type));
+                            } else blk: {
+                                if (!bound.sql_null and bound.value == .null) try json_null_fields.append(self.arena, bound.column.path);
+                                break :blk bound.value;
+                            };
+                            try putField(self.arena, &copy.object, bound.column.path, assigned_value);
+                        }
+                        document = copy;
                     }
-                    for (bound_assignments) |bound| {
-                        const assigned_value = if (bound.program) |program| blk: {
-                            const evaluated = try self.evaluate(page_arena.allocator(), program, expression_cells);
-                            if (evaluated.sql_null and !bound.column.nullable) return error.SqlNotNullViolation;
-                            if (!evaluated.sql_null and evaluated.value == .null) try json_null_fields.append(self.arena, bound.column.path);
-                            break :blk try clone(self.arena, try coerce(self.arena, evaluated.value, bound.column.type));
-                        } else blk: {
-                            if (!bound.sql_null and bound.value == .null) try json_null_fields.append(self.arena, bound.column.path);
-                            break :blk bound.value;
-                        };
-                        try putField(self.arena, &copy.object, bound.column.path, assigned_value);
-                    }
-                    document = copy;
+                    retained = std.math.add(usize, retained, row.id.len + if (document) |doc| jsonSize(doc) else 0) catch return error.SqlProgramLimitExceeded;
+                    if (retained > self.limits.retained_bytes) return error.SqlProgramLimitExceeded;
+                    const key = try self.arena.dupe(u8, row.id);
+                    if (table_def.storage_mode == .document and row.expected_content_digest == null and row.version != 0) return error.InvalidSqlBackendResponse;
+                    const previous = if (assignments == null and returning != null) blk: {
+                        const owned = try self.arena.create(catalog.Row);
+                        owned.* = .{ .id = key, .version = row.version, .value = try clone(self.arena, row.value), .sql_nulls = if (row.sql_nulls) |flags| try self.arena.dupe(bool, flags) else null };
+                        break :blk owned;
+                    } else null;
+                    try mutations.append(self.arena, .{ .key = key, .expected_version = row.version, .expected_content_digest = row.expected_content_digest, .row = document, .json_null_fields = json_null_fields.items, .previous = previous });
                 }
-                retained = std.math.add(usize, retained, row.id.len + if (document) |doc| jsonSize(doc) else 0) catch return error.SqlProgramLimitExceeded;
-                if (retained > self.limits.retained_bytes) return error.SqlProgramLimitExceeded;
-                const key = try self.arena.dupe(u8, row.id);
-                if (table_def.storage_mode == .document and row.expected_content_digest == null and row.version != 0) return error.InvalidSqlBackendResponse;
-                const previous = if (assignments == null and returning != null) blk: {
-                    const owned = try self.arena.create(catalog.Row);
-                    owned.* = .{ .id = key, .version = row.version, .value = try clone(self.arena, row.value), .sql_nulls = if (row.sql_nulls) |flags| try self.arena.dupe(bool, flags) else null };
-                    break :blk owned;
-                } else null;
-                try mutations.append(self.arena, .{ .key = key, .expected_version = row.version, .expected_content_digest = row.expected_content_digest, .row = document, .json_null_fields = json_null_fields.items, .previous = previous });
+                first = end;
             }
             const next = page.after orelse break;
             if (!scan_state.retained(self)) return error.SqlStatementSnapshotRequired;
@@ -906,20 +967,15 @@ pub const Context = struct {
             } else for (projections) |projection| try fields.append(self.arena, if (projection.expression != null) "" else (try table.column(projection.field)).path);
             const rows = try self.arena.alloc([]const Json, prepared.len);
             const flags = try self.arena.alloc([]const bool, prepared.len);
-            for (prepared, input, rows, flags) |mutation, original, *cells, *nulls| {
+            var external = false;
+            for (binding.scalars.projections) |optional| if (optional) |*program| {
+                external = external or @import("decision_eval.zig").hasExternal(program);
+            };
+            if (external) {
+                try context.decisionMutationReturning(table, fields.items, prepared, input, rows, flags);
+            } else for (prepared, input, rows, flags) |mutation, original, *cells, *nulls| {
                 try self.checkpoint();
-                if (!std.mem.eql(u8, mutation.key, original.key) or mutation.expected_version != original.expected_version or (mutation.row == null) != (original.row == null)) return error.InvalidSqlBackendResponse;
-                const row = if (mutation.row) |value_| blk: {
-                    if (value_ != .object) return error.InvalidSqlBackendResponse;
-                    const typed_nulls = try self.arena.alloc(bool, value_.object.count());
-                    for (value_.object.values(), typed_nulls) |cell_value, *flag| flag.* = cell_value == .null;
-                    for (mutation.json_null_fields) |name| {
-                        const index = value_.object.getIndex(name) orelse return error.InvalidSqlBackendResponse;
-                        if (!typed_nulls[index] or (try table.column(name)).type != .json) return error.InvalidSqlBackendResponse;
-                        typed_nulls[index] = false;
-                    }
-                    break :blk catalog.Row{ .id = mutation.key, .version = mutation.expected_version, .value = value_, .sql_nulls = typed_nulls };
-                } else (original.previous orelse return error.InvalidSqlBackendResponse).*;
+                const row = try mutationReturningRow(self.arena, table, mutation, original);
                 const expressions = try binding.scalars.cells(self.arena, row);
                 const projected = try context.projectValues(self.arena, row, fields.items, expressions);
                 const values = try self.arena.alloc(Json, projected.len);
@@ -958,6 +1014,56 @@ pub const Context = struct {
         else
             try self.backend.vtable.mutate(self.backend.ptr, commit_arena.allocator(), table, committed);
         return output;
+    }
+
+    fn mutationReturningRow(a: std.mem.Allocator, table: catalog.Table, mutation: catalog.Mutation, original: catalog.Mutation) !catalog.Row {
+        if (!std.mem.eql(u8, mutation.key, original.key) or mutation.expected_version != original.expected_version or (mutation.row == null) != (original.row == null)) return error.InvalidSqlBackendResponse;
+        const datum = mutation.row orelse return (original.previous orelse return error.InvalidSqlBackendResponse).*;
+        if (datum != .object) return error.InvalidSqlBackendResponse;
+        const nulls = try a.alloc(bool, datum.object.count());
+        for (datum.object.values(), nulls) |cell, *flag| flag.* = cell == .null;
+        for (mutation.json_null_fields) |name| {
+            const index = datum.object.getIndex(name) orelse return error.InvalidSqlBackendResponse;
+            if (!nulls[index] or (try table.column(name)).type != .json) return error.InvalidSqlBackendResponse;
+            nulls[index] = false;
+        }
+        return .{ .id = mutation.key, .version = mutation.expected_version, .value = datum, .sql_nulls = nulls };
+    }
+
+    /// Provider scratch must not accumulate in the retained mutation/output
+    /// arena. Resolve RETURNING pages before publishing any native mutation.
+    fn decisionMutationReturning(self: Context, table: catalog.Table, fields: []const []const u8, prepared: []const catalog.Mutation, input: []const catalog.Mutation, rows: [][]const Json, flags: [][]const bool) !void {
+        var first: usize = 0;
+        while (first < prepared.len) {
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            var page: std.ArrayList(catalog.Row) = .empty;
+            var cells: std.ArrayList([]const Datum) = .empty;
+            var bytes: usize = 0;
+            while (first + page.items.len < prepared.len and page.items.len < self.limits.page_rows) {
+                try self.checkpoint();
+                const index = first + page.items.len;
+                const row = try mutationReturningRow(scratch, table, prepared[index], input[index]);
+                const values = try self.binding.scalars.cells(scratch, row);
+                try page.append(scratch, row);
+                try cells.append(scratch, values);
+                for (values) |datum| bytes +|= try operators.datumBytes(datum);
+                if (bytes >= self.limits.page_bytes) break;
+            }
+            const projected = try self.projectValuesBatch(scratch, page.items, fields, cells.items);
+            for (projected, first..) |values, index| {
+                const output = try self.arena.alloc(Json, values.len);
+                const nulls = try self.arena.alloc(bool, values.len);
+                for (values, output, nulls) |datum, *cell, *flag| {
+                    cell.* = try self.outputValue(datum.value);
+                    flag.* = datum.sql_null;
+                }
+                rows[index] = output;
+                flags[index] = nulls;
+            }
+            first += page.items.len;
+        }
     }
 };
 
@@ -2438,4 +2544,52 @@ test "SQL malformed decision specifications report client errors before reads" {
     const diagnostic = @import("errors.zig").describe(error.InvalidDecisionSpecification);
     try std.testing.expectEqualStrings("22023", diagnostic.code);
     try std.testing.expectEqual(@as(u16, 400), diagnostic.httpStatus());
+}
+
+test "SQL ordinary mutations batch decisions and fail before commit" {
+    const Provider = @import("decision_eval.zig").testing.Provider;
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "UPDATE things SET id=id WHERE ai_probability(_id,'Refund?','local')>0.8",
+        "UPDATE things SET id=CASE WHEN ai_probability(_id,'Refund?','local')>0.8 THEN id ELSE id END",
+        "DELETE FROM things WHERE ai_probability(_id,'Refund?','local')>0.8",
+        "DELETE FROM things RETURNING ai_probability(_id,'Refund?','local')",
+    }) |sql| {
+        for ([_]usize{ 1, 65536 }) |page_bytes| {
+            var fixture: TestBackend = .{ .row_count = 8 };
+            var provider: Provider = .{};
+            var backend = fixture.iface();
+            backend.decision_provider = provider.provider();
+            var compiled = try compiler.compile(a, sql, .{});
+            defer compiled.deinit();
+            var result = try execute(a, backend, &compiled, &.{}, .{ .page_rows = 4, .page_bytes = page_bytes });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 8), provider.calls);
+            try std.testing.expectEqual(@as(usize, if (page_bytes == 1) 1 else 4), provider.max_batch);
+            try std.testing.expectEqual(@as(usize, 1), fixture.writes);
+            try std.testing.expectEqual(@as(u64, 8), result.output.rows_affected);
+            if (std.mem.indexOf(u8, sql, "RETURNING") != null) {
+                try std.testing.expectEqual(@as(usize, 8), result.output.rows.len);
+                for (result.output.rows) |row| try std.testing.expectApproxEqAbs(@as(f64, 0.9), row[0].float, 0.001);
+            }
+        }
+        var fixture: TestBackend = .{ .row_count = 8 };
+        var provider: Provider = .{ .fail_after = 4 };
+        var backend = fixture.iface();
+        backend.decision_provider = provider.provider();
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.DecisionProviderUnavailable, execute(a, backend, &compiled, &.{}, .{ .page_rows = 4 }));
+        try std.testing.expectEqual(@as(usize, 0), fixture.writes);
+    }
+    var fixture: TestBackend = .{ .row_count = 8 };
+    var provider: Provider = .{};
+    var backend = fixture.iface();
+    backend.decision_provider = provider.provider();
+    var compiled = try compiler.compile(a, "UPDATE things SET id=CASE WHEN ai_probability(_id,'Refund?','local')>0.8 THEN id ELSE id END WHERE _id<>'0'", .{});
+    defer compiled.deinit();
+    var result = try execute(a, backend, &compiled, &.{}, .{ .page_rows = 4 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 7), provider.calls);
+    try std.testing.expectEqual(@as(usize, 4), provider.max_batch);
 }

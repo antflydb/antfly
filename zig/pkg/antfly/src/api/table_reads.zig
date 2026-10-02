@@ -8623,10 +8623,7 @@ fn validateDecisionRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchReq
         }
     };
     const provider: @import("../functions/decisions.zig").DecisionProvider = .{ .ptr = @constCast(configs), .validate_fn = Validate.call, .evaluate_batch_fn = Validate.unavailable };
-    for (plan.compute.values()) |value| try @import("../functions/expressions.zig").validateProviders(a, value, provider);
-    if (plan.where) |value| try @import("../functions/expressions.zig").validateProviders(a, value, provider);
-    if (plan.order_by) |value| try @import("../functions/expressions.zig").validateProviders(a, value, provider);
-    if (plan.aggregations) |value| try @import("../functions/expressions.zig").validateProviders(a, value, provider);
+    try @import("../functions/expressions.zig").validatePlanProviders(a, plan, provider);
 }
 
 fn decisionCollectionRequest(req: db_mod.types.SearchRequest) db_mod.types.SearchRequest {

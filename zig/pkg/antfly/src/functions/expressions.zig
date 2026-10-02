@@ -65,22 +65,32 @@ fn allowedKeys(obj: std.json.ObjectMap, allowed: []const []const u8) !void {
     }
 }
 
-/// Validates every specification, including untaken branches, without inference.
-pub fn validateProviders(a: std.mem.Allocator, value: Json, provider: d.DecisionProvider) anyerror!void {
-    switch (value) {
-        .object => |obj| {
-            if (obj.get("literal") != null or obj.get("field") != null or obj.get("ref") != null) return;
-            if (obj.get("call")) |name| if (name == .string) {
-                const function = d.descriptor(try d.text(name)) orelse return error.UnknownQueryFunction;
-                const args = try callArgs(a, function.function, obj, .null);
-                try provider.validate(try d.text(obj.get("decider").?), try d.questionsFor(a, function.function, args));
-                try validateProviders(a, obj.get("input").?, provider);
-                return;
-            };
-            for (obj.values()) |child| try validateProviders(a, child, provider);
-        },
-        .array => |array| for (array.items) |child| try validateProviders(a, child, provider),
-        else => {},
+/// Traverse the validated plan's typed domains, not arbitrary JSON objects:
+/// aggregation names and literal contents are not expression discriminants.
+/// Validate every call, including untaken branches, without inference.
+pub fn validatePlanProviders(a: std.mem.Allocator, plan: Plan, provider: d.DecisionProvider) !void {
+    for (plan.compute.values()) |value| try validateExpressionProviders(a, value, provider);
+    if (plan.where) |value| try validatePredicateProviders(a, value, provider);
+    if (plan.order_by) |orders| for (orders.array.items) |order| try validateExpressionProviders(a, order.object.get("expression").?, provider);
+    if (plan.aggregations) |aggregations| for (aggregations.object.values()) |config| try validateExpressionProviders(a, config.object.get("expression").?, provider);
+}
+fn validateExpressionProviders(a: std.mem.Allocator, value: Json, provider: d.DecisionProvider) anyerror!void {
+    const obj = value.object;
+    if (obj.get("call")) |name| {
+        const function = d.descriptor(name.string).?;
+        const args = try callArgs(a, function.function, obj, .null);
+        try provider.validate(try d.text(obj.get("decider").?), try d.questionsFor(a, function.function, args));
+        try validateExpressionProviders(a, obj.get("input").?, provider);
+    }
+}
+fn validatePredicateProviders(a: std.mem.Allocator, value: Json, provider: d.DecisionProvider) anyerror!void {
+    const op = value.object.keys()[0];
+    const args = value.object.values()[0];
+    if (std.mem.eql(u8, op, "not")) return validatePredicateProviders(a, args, provider);
+    if (std.mem.eql(u8, op, "is_null")) return validateExpressionProviders(a, args, provider);
+    const logical = std.mem.eql(u8, op, "and") or std.mem.eql(u8, op, "or");
+    for (args.array.items) |arg| {
+        if (logical) try validatePredicateProviders(a, arg, provider) else try validateExpressionProviders(a, arg, provider);
     }
 }
 
@@ -217,10 +227,10 @@ pub fn evaluateBatch(a: std.mem.Allocator, plan: Plan, provider: d.DecisionProvi
         const values = try evalExpressions(a, provider, expr, documents, rows, 0);
         for (rows, values) |*row, value| try d.put(a, &row.computed, name, value);
     }
-    if (plan.where) |predicate| for (rows, documents) |*row, document| {
-        const result = try evalPredicate(a, provider, predicate, document, row.*, 0);
-        row.accepted = result == .bool and result.bool;
-    };
+    if (plan.where) |predicate| {
+        const values = try evalPredicates(a, provider, predicate, documents, rows, 0);
+        for (rows, values) |*row, value| row.accepted = value == .bool and value.bool;
+    }
     return rows;
 }
 fn evalExpressions(a: std.mem.Allocator, provider: d.DecisionProvider, expr: Json, documents: []const Json, rows: []const Evaluation, depth: usize) anyerror![]const Json {
@@ -259,36 +269,60 @@ fn evalExpressions(a: std.mem.Allocator, provider: d.DecisionProvider, expr: Jso
     }
     return values;
 }
-pub fn evalExpression(a: std.mem.Allocator, provider: d.DecisionProvider, expr: Json, document: Json, row: Evaluation) !Json {
-    return (try evalExpressions(a, provider, expr, &.{document}, &.{row}, 0))[0];
+pub fn evaluateExpressions(a: std.mem.Allocator, provider: d.DecisionProvider, expression: Json, documents: []const Json, rows: []const Evaluation) ![]const Json {
+    return evalExpressions(a, provider, expression, documents, rows, 0);
 }
-fn evalPredicate(a: std.mem.Allocator, provider: d.DecisionProvider, predicate: Json, document: Json, row: Evaluation, depth: usize) anyerror!Json {
+fn evalPredicates(a: std.mem.Allocator, provider: d.DecisionProvider, predicate: Json, documents: []const Json, rows: []const Evaluation, depth: usize) anyerror![]Json {
     if (depth > 64) return error.DecisionLimitExceeded;
     const op = predicate.object.keys()[0];
     const args = predicate.object.values()[0];
     if (std.mem.eql(u8, op, "not")) {
-        const v = try evalPredicate(a, provider, args, document, row, depth + 1);
-        return if (v == .null) .null else .{ .bool = !v.bool };
+        const values = try evalPredicates(a, provider, args, documents, rows, depth + 1);
+        for (values) |*v| if (v.* != .null) {
+            v.* = .{ .bool = !v.bool };
+        };
+        return values;
     }
-    if (std.mem.eql(u8, op, "is_null")) return .{ .bool = (try evalExpression(a, provider, args, document, row)) == .null };
+    const output = try a.alloc(Json, documents.len);
+    if (std.mem.eql(u8, op, "is_null")) {
+        const values = try evalExpressions(a, provider, args, documents, rows, depth + 1);
+        for (output, values) |*out, value| out.* = .{ .bool = value == .null };
+        return output;
+    }
     if (std.mem.eql(u8, op, "and") or std.mem.eql(u8, op, "or")) {
         const is_and = std.mem.eql(u8, op, "and");
-        var unknown = false;
+        @memset(output, .{ .bool = is_and });
         for (args.array.items) |arg| {
-            const v = try evalPredicate(a, provider, arg, document, row, depth + 1);
-            if (v == .null) {
-                unknown = true;
-                continue;
+            // Only rows whose Boolean result is still undecided enter the next
+            // wave. UNKNOWN remains active until a decisive FALSE/TRUE appears.
+            var active_documents: std.ArrayList(Json) = .empty;
+            var active_rows: std.ArrayList(Evaluation) = .empty;
+            var positions: std.ArrayList(usize) = .empty;
+            for (output, documents, rows, 0..) |value, document, row, index| {
+                if (value == .bool and value.bool != is_and) continue;
+                try active_documents.append(a, document);
+                try active_rows.append(a, row);
+                try positions.append(a, index);
             }
-            if (v.bool != is_and) return v;
+            if (positions.items.len == 0) break;
+            const values = try evalPredicates(a, provider, arg, active_documents.items, active_rows.items, depth + 1);
+            for (positions.items, values) |index, value| {
+                if (value == .null or (value == .bool and value.bool != is_and)) output[index] = value;
+            }
         }
-        return if (unknown) .null else .{ .bool = is_and };
+        return output;
     }
-    const left = try evalExpression(a, provider, args.array.items[0], document, row);
-    const right = try evalExpression(a, provider, args.array.items[1], document, row);
-    if (left == .null or right == .null) return .null;
-    const cmp = try compare(left, right);
-    return .{ .bool = if (std.mem.eql(u8, op, "eq")) cmp == .eq else if (std.mem.eql(u8, op, "neq")) cmp != .eq else if (std.mem.eql(u8, op, "lt")) cmp == .lt else if (std.mem.eql(u8, op, "lte")) cmp != .gt else if (std.mem.eql(u8, op, "gt")) cmp == .gt else cmp != .lt };
+    const left = try evalExpressions(a, provider, args.array.items[0], documents, rows, depth + 1);
+    const right = try evalExpressions(a, provider, args.array.items[1], documents, rows, depth + 1);
+    for (left, right, output) |l, r, *out| {
+        if (l == .null or r == .null) {
+            out.* = .null;
+            continue;
+        }
+        const cmp = try compare(l, r);
+        out.* = .{ .bool = if (std.mem.eql(u8, op, "eq")) cmp == .eq else if (std.mem.eql(u8, op, "neq")) cmp != .eq else if (std.mem.eql(u8, op, "lt")) cmp == .lt else if (std.mem.eql(u8, op, "lte")) cmp != .gt else if (std.mem.eql(u8, op, "gt")) cmp == .gt else cmp != .lt };
+    }
+    return output;
 }
 pub fn compare(left: Json, right: Json) !std.math.Order {
     if (left == .null or right == .null) return if (left == .null and right == .null) .eq else if (left == .null) .gt else .lt;
@@ -313,4 +347,72 @@ test "function bindings reject cycles and unknown names and order dependencies" 
     try std.testing.expectEqualSlices(usize, &.{ 1, 0 }, plan.order);
     const cyclic = try std.json.parseFromSliceLeaky(Json, a, "{\"scope\":\"matches\",\"max_rows\":20,\"compute\":{\"a\":{\"ref\":\"b\"},\"b\":{\"ref\":\"a\"}}}", .{});
     try std.testing.expectError(error.CyclicFunctionBinding, Plan.parse(a, cyclic));
+}
+
+test "decision functions provider preflight treats aggregation names and literals as data" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Missing = struct {
+        fn validate(_: *anyopaque, _: []const u8, _: Json) !void {
+            return error.UnknownDecider;
+        }
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const d.Request) ![]const Json {
+            return error.UnexpectedInference;
+        }
+    };
+    var dummy: u8 = 0;
+    const provider: d.DecisionProvider = .{ .ptr = &dummy, .validate_fn = Missing.validate, .evaluate_batch_fn = Missing.batch };
+    for ([_][]const u8{ "literal", "field", "ref", "call", "expression", "type" }) |name| {
+        const bytes = try std.fmt.allocPrint(a,
+            \\{{"scope":"candidates","candidate_count":4,"compute":{{"x":{{"literal":{{"call":"ai_probability","decider":"missing"}}}}}},"aggregations":{{"{s}":{{"type":"avg","expression":{{"call":"ai_probability","input":{{"field":"body"}},"statement":"Refund?","decider":"missing"}}}}}}}}
+        , .{name});
+        const plan = try Plan.parse(a, try std.json.parseFromSliceLeaky(Json, a, bytes, .{}));
+        try std.testing.expectError(error.UnknownDecider, validatePlanProviders(a, plan, provider));
+    }
+    const literal = try Plan.parse(a, try std.json.parseFromSliceLeaky(Json, a,
+        \\{"scope":"candidates","candidate_count":4,"compute":{"x":{"literal":{"call":"ai_probability","decider":"missing"}}}}
+    , .{}));
+    try validatePlanProviders(a, literal, provider);
+}
+
+test "decision functions predicates batch only active rows and preserve unknown truth" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var provider: @import("../sql/decision_eval.zig").testing.Provider = .{};
+    const docs = try a.alloc(Json, 4);
+    for ([_][]const u8{ "{\"body\":\"a\",\"gate\":true}", "{\"body\":\"b\",\"gate\":false}", "{\"body\":\"c\",\"gate\":null}", "{\"body\":null,\"gate\":true}" }, docs) |bytes, *doc| doc.* = try std.json.parseFromSliceLeaky(Json, a, bytes, .{});
+    const bytes =
+        \\{"scope":"candidates","candidate_count":4,"compute":{"x":{"literal":1}},"where":{"and":[{"eq":[{"field":"gate"},{"literal":true}]},{"gte":[{"call":"ai_probability","input":{"field":"body"},"statement":"Refund?","decider":"local"},{"literal":0.8}]}]}}
+    ;
+    const plan = try Plan.parse(a, try std.json.parseFromSliceLeaky(Json, a, bytes, .{}));
+    const rows = try evaluateBatch(a, plan, provider.provider(), docs);
+    try std.testing.expectEqual(@as(usize, 2), provider.calls);
+    try std.testing.expectEqual(@as(usize, 2), provider.max_batch);
+    for (rows, 0..) |row, i| try std.testing.expectEqual(i == 0, row.accepted);
+}
+
+test "decision functions Boolean waves retain SQL unknown through OR and NOT" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const docs = [_]Json{ .null, .null, .null };
+    const rows = [_]Evaluation{ .{ .computed = .null, .accepted = true }, .{ .computed = .null, .accepted = true }, .{ .computed = .null, .accepted = true } };
+    var provider: @import("../sql/decision_eval.zig").testing.Provider = .{ .fail = true };
+    for ([_]struct { predicate: []const u8, expected: Json }{
+        .{ .predicate = "{\"or\":[{\"eq\":[{\"literal\":null},{\"literal\":1}]},{\"eq\":[{\"literal\":1},{\"literal\":1}]}]}", .expected = .{ .bool = true } },
+        .{ .predicate = "{\"or\":[{\"eq\":[{\"literal\":null},{\"literal\":1}]},{\"eq\":[{\"literal\":0},{\"literal\":1}]}]}", .expected = .null },
+        .{ .predicate = "{\"not\":{\"eq\":[{\"literal\":null},{\"literal\":1}]}}", .expected = .null },
+        .{ .predicate = "{\"and\":[{\"eq\":[{\"literal\":null},{\"literal\":1}]},{\"eq\":[{\"literal\":0},{\"literal\":1}]}]}", .expected = .{ .bool = false } },
+        .{ .predicate = "{\"or\":[{\"eq\":[{\"literal\":1},{\"literal\":1}]},{\"gte\":[{\"call\":\"ai_probability\",\"input\":{\"literal\":\"refund\"},\"statement\":\"Refund?\",\"decider\":\"local\"},{\"literal\":0.8}]}]}", .expected = .{ .bool = true } },
+    }) |case| {
+        const predicate = try std.json.parseFromSliceLeaky(Json, a, case.predicate, .{});
+        const values = try evalPredicates(a, provider.provider(), predicate, &docs, &rows, 0);
+        for (values) |result| {
+            try std.testing.expectEqual(std.meta.activeTag(case.expected), std.meta.activeTag(result));
+            if (result == .bool) try std.testing.expectEqual(case.expected.bool, result.bool);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), provider.calls);
 }

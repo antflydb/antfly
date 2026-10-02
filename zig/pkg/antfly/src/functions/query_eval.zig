@@ -9,6 +9,15 @@ const d = @import("decisions.zig");
 const runtime = @import("runtime.zig");
 const Json = std.json.Value;
 
+/// Expression fields have the same visibility as public stored documents.
+/// Keep this independent of the caller's final projection so hidden inputs
+/// remain available without exposing storage revision metadata via _computed.
+fn publicExpressionDocument(a: std.mem.Allocator, bytes: []const u8) !Json {
+    var value = try std.json.parseFromSliceLeaky(Json, a, bytes, .{ .allocate = .alloc_always });
+    @import("../storage/hierarchy_navigation.zig").stripPublicInternalFieldsValue(a, &value);
+    return value;
+}
+
 pub fn apply(a: std.mem.Allocator, req: types.SearchRequest, result: *types.SearchResult, meta: anytype, options: anytype) !void {
     var budget: @import("../sql/memory_budget.zig") = .{ .backing = a, .limit = 64 * 1024 * 1024 };
     return applyBounded(a, req, result, meta, options, budget.allocator()) catch |err| {
@@ -45,21 +54,30 @@ fn applyBounded(a: std.mem.Allocator, req: types.SearchRequest, result: *types.S
     };
     var execution: runtime.Runtime = .{ .profile_allocator = scratch, .registry = registry, .http = http, .io = io, .context = .{ .io = io, .deadline_ns = req.execution_deadline_ns, .cancellation = req.cancellation }, .source_table = options.source_table, .secret_store = options.secret_store, .antfly_provider = options.antfly_provider, .antfly_url = options.inference_api_url };
     const provider = execution.provider();
+    try expr.validatePlanProviders(scratch, plan, provider);
     const documents = try scratch.alloc(Json, count);
-    for (result.hits[0..count], documents) |hit, *doc| doc.* = if (hit.stored_data) |bytes| try std.json.parseFromSliceLeaky(Json, scratch, bytes, .{}) else .null;
+    for (result.hits[0..count], documents) |hit, *doc| doc.* = if (hit.stored_data) |bytes| try publicExpressionDocument(scratch, bytes) else .null;
     const evaluations = try expr.evaluateBatch(scratch, plan, provider, documents);
     var indexes: std.ArrayList(usize) = .empty;
     for (evaluations, 0..) |row, i| if (row.accepted) {
         try indexes.append(scratch, i);
     };
-    const aggregations = try aggregate(scratch, plan, provider, documents, evaluations, indexes.items);
+    const accepted_documents = try scratch.alloc(Json, indexes.items.len);
+    const accepted_rows = try scratch.alloc(expr.Evaluation, indexes.items.len);
+    for (indexes.items, accepted_documents, accepted_rows) |index, *document, *row| {
+        document.* = documents[index];
+        row.* = evaluations[index];
+    }
+    const aggregations = try aggregate(scratch, plan, provider, accepted_documents, accepted_rows);
     if (plan.order_by) |order_by| {
         const keys = try scratch.alloc([]const Json, count);
         @memset(keys, &.{});
         for (indexes.items) |index| {
-            const list = try scratch.alloc(Json, order_by.array.items.len);
-            for (order_by.array.items, list) |order, *v| v.* = try expr.evalExpression(scratch, provider, order.object.get("expression").?, documents[index], evaluations[index]);
-            keys[index] = list;
+            keys[index] = try scratch.alloc(Json, order_by.array.items.len);
+        }
+        for (order_by.array.items, 0..) |order, column| {
+            const values = try expr.evaluateExpressions(scratch, provider, order.object.get("expression").?, accepted_documents, accepted_rows);
+            for (indexes.items, values) |index, value| @constCast(keys[index])[column] = value;
         }
         // Validate comparability before entering an infallible sort callback.
         for (0..order_by.array.items.len) |k| {
@@ -151,7 +169,7 @@ fn applyGraph(a: std.mem.Allocator, scratch: std.mem.Allocator, req: types.Searc
             for (graph.hits) |stored| {
                 if (!std.mem.eql(u8, stored.id, binding.node.key)) continue;
                 if (!std.mem.eql(u8, stored.source_table orelse options.source_table, binding.node.table orelse options.source_table)) continue;
-                if (stored.stored_data) |bytes| payload = try std.json.parseFromSliceLeaky(Json, scratch, bytes, .{});
+                if (stored.stored_data) |bytes| payload = try publicExpressionDocument(scratch, bytes);
                 break;
             }
             try d.put(scratch, &node, "document", payload);
@@ -193,7 +211,7 @@ fn applyGraph(a: std.mem.Allocator, scratch: std.mem.Allocator, req: types.Searc
     graph.truncated = graph.truncated or (plan.scope == .candidates and count < kept.len) or relation.total_hits > matches.len + req.offset;
 }
 
-fn aggregate(a: std.mem.Allocator, plan: expr.Plan, provider: d.DecisionProvider, documents: []const Json, rows: []const expr.Evaluation, indexes: []const usize) !Json {
+fn aggregate(a: std.mem.Allocator, plan: expr.Plan, provider: d.DecisionProvider, documents: []const Json, rows: []const expr.Evaluation) !Json {
     var output = d.jsonObject();
     const configs = plan.aggregations orelse return output;
     var it = configs.object.iterator();
@@ -203,8 +221,8 @@ fn aggregate(a: std.mem.Allocator, plan: expr.Plan, provider: d.DecisionProvider
         var sum: f64 = 0;
         var count: usize = 0;
         var buckets: std.StringArrayHashMapUnmanaged(struct { value: Json, count: usize }) = .empty;
-        for (indexes) |i| {
-            const value = try expr.evalExpression(a, provider, config.get("expression").?, documents[i], rows[i]);
+        const values = try expr.evaluateExpressions(a, provider, config.get("expression").?, documents, rows);
+        for (values) |value| {
             if (value == .null) continue;
             count += 1;
             if (std.mem.eql(u8, kind, "terms")) {
@@ -294,7 +312,7 @@ test "decision functions candidate filtering sorting and aggregates reuse a name
     const matches = "{\"scope\":\"matches\",\"max_rows\":3,\"compute\":{\"x\":{\"literal\":1}}}";
     try std.testing.expectError(error.DecisionLimitExceeded, apply(a, .{ .evaluation_json = matches, .evaluation_limit = 3, .evaluation_matches = true }, &incomplete, &meta, options));
     const graph_hits = try a.alloc(types.SearchHit, 2);
-    for (graph_hits, 0..) |*hit, i| hit.* = .{ .id = try std.fmt.allocPrint(a, "node{d}", .{i}), .stored_data = try a.dupe(u8, if (i == 0) "{\"title\":\"Public\",\"body\":\"refund\"}" else "{\"title\":\"Public\",\"body\":\"other\"}") };
+    for (graph_hits, 0..) |*hit, i| hit.* = .{ .id = try std.fmt.allocPrint(a, "node{d}", .{i}), .stored_data = try a.dupe(u8, if (i == 0) "{\"title\":\"Public\",\"body\":\"refund\",\"_artifact_unit_fingerprint\":\"private\"}" else "{\"title\":\"Public\",\"body\":\"other\"}") };
     const graph_matches = try a.alloc(types.GraphPatternMatch, 2);
     for (graph_matches, 0..) |*match, i| {
         const bindings = try a.alloc(types.GraphPatternBinding, 1);
@@ -305,7 +323,7 @@ test "decision functions candidate filtering sorting and aggregates reuse a name
     graphs[0] = .{ .name = try a.dupe(u8, "customers"), .matches = graph_matches, .hits = graph_hits, .total_hits = 2 };
     var graph_result: types.SearchResult = .{ .alloc = a, .hits = &.{}, .total_hits = 0, .graph_results = graphs };
     defer graph_result.deinit();
-    const graph_stage = "{\"graph_query\":\"customers\",\"scope\":\"matches\",\"max_rows\":2,\"compute\":{\"p\":{\"call\":\"ai_probability\",\"input\":{\"field\":\"customer.document.body\"},\"statement\":\"Refund?\",\"decider\":\"local\"}},\"where\":{\"gte\":[{\"ref\":\"p\"},{\"literal\":0.8}]}}";
+    const graph_stage = "{\"graph_query\":\"customers\",\"scope\":\"matches\",\"max_rows\":2,\"compute\":{\"hidden\":{\"field\":\"customer.document._artifact_unit_fingerprint\"},\"p\":{\"call\":\"ai_probability\",\"input\":{\"field\":\"customer.document.body\"},\"statement\":\"Refund?\",\"decider\":\"local\"}},\"where\":{\"gte\":[{\"ref\":\"p\"},{\"literal\":0.8}]}}";
     const query = @import("../api/query_contract.zig");
     const body = try std.fmt.allocPrint(a, "{{\"limit\":2,\"graph_queries\":{{\"customers\":{{\"index\":\"graph\",\"match\":{{\"anchor\":\"customer\",\"nodes\":{{\"customer\":{{}}}},\"edges\":[]}},\"return\":{{\"bindings\":[\"customer\"],\"include_documents\":true,\"fields\":[\"title\"],\"limit\":2}}}}}},\"evaluate\":{s}}}", .{graph_stage});
     defer a.free(body);
@@ -327,14 +345,50 @@ test "decision functions candidate filtering sorting and aggregates reuse a name
     try std.testing.expect(document.object.contains("title"));
     try std.testing.expect(!document.object.contains("body"));
     try std.testing.expect(graph_wire.object.get("computed").?.array.items[0].object.contains("p"));
+    try std.testing.expect(graph_wire.object.get("computed").?.array.items[0].object.get("hidden").? == .null);
     try std.testing.expectEqual(@as(usize, 1), graphs[0].matches.len);
     try std.testing.expectEqualStrings("node0", graphs[0].matches[0].bindings[0].node.key);
     try std.testing.expect(graphs[0].matches[0].computed_json != null);
+
+    // Direct calls in each stage form one wave, independent of row count.
+    const direct_hits = try a.alloc(types.SearchHit, 4);
+    for (direct_hits, 0..) |*hit, i| hit.* = .{ .id = try std.fmt.allocPrint(a, "direct{d}", .{i}), .stored_data = try a.dupe(u8, "{\"body\":\"refund\"}") };
+    var direct_result: types.SearchResult = .{ .alloc = a, .hits = direct_hits, .total_hits = 4 };
+    defer direct_result.deinit();
+    const direct_stage =
+        \\{"scope":"candidates","candidate_count":4,"compute":{"x":{"literal":1}},"where":{"gte":[{"call":"ai_probability","input":{"field":"body"},"statement":"Refund?","decider":"local"},{"literal":0.8}]},"order_by":[{"expression":{"call":"ai_probability","input":{"field":"body"},"statement":"Refund?","decider":"local"}}],"aggregations":{"literal":{"type":"avg","expression":{"call":"ai_probability","input":{"field":"body"},"statement":"Refund?","decider":"local"}}}}
+    ;
+    try apply(a, .{ .evaluation_json = direct_stage, .evaluation_limit = 4, .limit = 4 }, &direct_result, &meta, options);
+    const direct_summary = try std.json.parseFromSlice(Json, a, meta.evaluation_json.?, .{});
+    defer direct_summary.deinit();
+    try std.testing.expectEqual(@as(i64, 3), direct_summary.value.object.get("batches").?.integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.9), direct_summary.value.object.get("aggregations").?.object.get("literal").?.float, 0.001);
+    try std.testing.expectEqual(@as(usize, 4), direct_result.hits.len);
+
     var local_options = options;
     local_options.decision_registry = null;
     local_options.antfly_provider = null;
     const local_stage = "{\"scope\":\"candidates\",\"candidate_count\":1,\"compute\":{\"value\":{\"literal\":null}},\"where\":{\"is_null\":{\"ref\":\"value\"}}}";
     try apply(a, .{ .evaluation_json = local_stage, .evaluation_limit = 1, .limit = 1 }, &result, &meta, local_options);
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
-    try std.testing.expectEqual(@as(usize, 4), fake.calls.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 16), fake.calls.load(.monotonic));
+}
+
+test "decision functions expression documents hide storage revision markers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const document = try publicExpressionDocument(a,
+        \\{"body":"public","_artifact_unit_fingerprint":"private","_hierarchy_unit_revision_token":"private"}
+    );
+    try std.testing.expect(document.object.contains("body"));
+    var provider: @import("../sql/decision_eval.zig").testing.Provider = .{};
+    const stage =
+        \\{"scope":"candidates","candidate_count":1,"compute":{"artifact":{"field":"_artifact_unit_fingerprint"},"revision":{"field":"_hierarchy_unit_revision_token"},"public":{"field":"body"}}}
+    ;
+    const plan = try expr.Plan.parse(a, try std.json.parseFromSliceLeaky(Json, a, stage, .{}));
+    const rows = try expr.evaluateBatch(a, plan, provider.provider(), &.{document});
+    try std.testing.expect(rows[0].computed.object.get("artifact").? == .null);
+    try std.testing.expect(rows[0].computed.object.get("revision").? == .null);
+    try std.testing.expectEqualStrings("public", rows[0].computed.object.get("public").?.string);
 }
