@@ -190,7 +190,7 @@ pub fn forIndex(index_ref: index_manager_mod.ManagedIndexRef, resource_manager: 
                 .cursor_refresh_records = replayCursorRefreshRecords(),
                 .max_windows_per_publish = replayMaxWindowsPerPublish(),
                 .max_items_per_window = denseReplayMaxItemsPerWindow(),
-                .max_chunk_bytes = denseReplayMaxWindowBytes(resource_manager),
+                .max_chunk_bytes = denseReplayMaxWindowBytes(resource_manager, index_ref.dense_replay_working_set_factor),
                 .estimated_dense_vector_bytes = denseReplayEstimatedVectorBytes(index_ref),
                 .force_persist_applied_sequence = true,
                 .not_found_is_recoverable = true,
@@ -313,15 +313,19 @@ fn replayMaxWindowBytes(resource_manager: ?*resource_manager_mod.ResourceManager
     return budget;
 }
 
-fn denseReplayMaxWindowBytes(resource_manager: ?*resource_manager_mod.ResourceManager) u64 {
+/// `working_set_factor` scales only the unconstrained ceilings, which are in
+/// estimated bytes. Slice limits are real memory and still cap the result.
+fn denseReplayMaxWindowBytes(resource_manager: ?*resource_manager_mod.ResourceManager, working_set_factor: u64) u64 {
+    const factor = @max(@as(u64, 1), working_set_factor);
+    const default_bytes = dense_replay_default_window_bytes *| factor;
     if (getenv("ANTFLY_DENSE_REPLAY_MAX_WINDOW_BYTES")) |raw_z| {
         const raw = std.mem.span(raw_z);
-        if (raw.len > 0) return std.fmt.parseUnsigned(u64, raw, 10) catch dense_replay_default_window_bytes;
+        if (raw.len > 0) return std.fmt.parseUnsigned(u64, raw, 10) catch default_bytes;
     }
-    const manager = resource_manager orelse return dense_replay_default_window_bytes;
+    const manager = resource_manager orelse return default_bytes;
     return manager.denseReplayWindowBudget(.{
-        .default_bytes = dense_replay_default_window_bytes,
-        .max_bytes = dense_replay_max_window_bytes,
+        .default_bytes = default_bytes,
+        .max_bytes = dense_replay_max_window_bytes *| factor,
     });
 }
 
@@ -400,4 +404,33 @@ test "dense replay policy uses the index dimensions for its byte estimate" {
         .estimated_dense_vector_bytes = 1536 * @sizeOf(f32),
     }, null);
     try std.testing.expectEqual(@as(u64, 1536 * @sizeOf(f32)), policy.estimated_dense_vector_bytes);
+}
+
+test "dense replay working-set factor scales the estimate and the unbudgeted window together" {
+    const raw = forIndex(.{
+        .name = "dense",
+        .kind = .dense_vector,
+        .estimated_dense_vector_bytes = 1536 * @sizeOf(f32),
+    }, null);
+    const scaled = forIndex(.{
+        .name = "dense",
+        .kind = .dense_vector,
+        .estimated_dense_vector_bytes = 8 * 1536 * @sizeOf(f32),
+        .dense_replay_working_set_factor = 8,
+    }, null);
+    // Without a memory budget the window holds the same number of vectors.
+    try std.testing.expectEqual(dense_replay_default_window_bytes, raw.max_chunk_bytes);
+    try std.testing.expectEqual(
+        raw.max_chunk_bytes / raw.estimated_dense_vector_bytes,
+        scaled.max_chunk_bytes / scaled.estimated_dense_vector_bytes,
+    );
+
+    // A real slice limit is physical memory: the scaled ceiling cannot lift
+    // the window above it.
+    var options = resource_manager_mod.Options{};
+    options.budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = .{ .soft_limit_bytes = 48 * 1024 * 1024, .hard_limit_bytes = 64 * 1024 * 1024 };
+    var manager = resource_manager_mod.ResourceManager.init(options);
+    defer manager.deinit(std.testing.allocator);
+    const budgeted = denseReplayMaxWindowBytes(&manager, 8);
+    try std.testing.expect(budgeted <= 64 * 1024 * 1024);
 }

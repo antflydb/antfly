@@ -298,6 +298,7 @@ pub var test_before_source_vector_checkpoint: ?struct {
 const sparse_backfill_batch_size: usize = 1024;
 const vector_backfill_page_items: usize = 1024;
 const vector_backfill_page_bytes: usize = 16 * 1024 * 1024;
+const dense_lsm_posting_apply_working_set_factor: u64 = 8;
 pub var test_sparse_backfill_batch_size: ?usize = null;
 pub var test_abort_sparse_backfill_after_batches: ?usize = null;
 
@@ -308,6 +309,10 @@ pub const ManagedIndexRef = struct {
     /// Zero preserves the conservative fallback for callers that only know
     /// the projection kind (for example status-only catalog entries).
     estimated_dense_vector_bytes: u64 = 0,
+    /// How many times larger than the raw vector the estimate above is. The
+    /// unconstrained window ceiling scales with it, so only a real memory
+    /// budget shrinks the window; an unbudgeted node keeps its item count.
+    dense_replay_working_set_factor: u64 = 1,
 };
 
 pub const LsmOwnerStats = struct {
@@ -13825,10 +13830,12 @@ pub const IndexManager = struct {
             initialized += 1;
         }
         for (self.dense_indexes.items) |entry| {
+            const working_set_factor = self.denseReplayWorkingSetFactor();
             refs[initialized] = .{
                 .name = try alloc.dupe(u8, entry.config.name),
                 .kind = .dense_vector,
-                .estimated_dense_vector_bytes = @as(u64, entry.dims) * @sizeOf(f32),
+                .estimated_dense_vector_bytes = @as(u64, entry.dims) * @sizeOf(f32) *| working_set_factor,
+                .dense_replay_working_set_factor = working_set_factor,
             };
             initialized += 1;
         }
@@ -15777,6 +15784,17 @@ pub const IndexManager = struct {
     fn densePostingSidecarEnabled() bool {
         return densePostingWalMutationStoreEnabled() or
             environmentFlag("ANTFLY_HBC_POSTING_SIDECAR", false);
+    }
+
+    /// Replay windows are sized from estimated bytes per vector. Storage that
+    /// cannot host the native posting store (Lite) applies through
+    /// HBC-over-LSM, where one write transaction owns a copy of every point
+    /// read until it commits: the measured working set is about 57 KiB per
+    /// 1536-dimension vector, not 6 KiB.
+    fn denseReplayWorkingSetFactor(self: *const IndexManager) u64 {
+        if (self.configuredDenseNativePostingStoreSupported() and
+            nativeBackupStoragePublicationCompatible(self.effectiveDenseStorage())) return 1;
+        return dense_lsm_posting_apply_working_set_factor;
     }
 
     fn configuredDenseNativePostingStoreSupported(self: *const IndexManager) bool {

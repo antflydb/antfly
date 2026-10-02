@@ -413,6 +413,28 @@ pub const ContextMetricsResult = extern struct {
     lsm_run_table_index: ContextCacheKindStats = .{},
     lsm_run_table_block: ContextCacheKindStats = .{},
     lsm_run_table_physical_block: ContextCacheKindStats = .{},
+    /// The context's ResourceManager is the ledger storage owners charge.
+    /// Slices are indexed by the manager's slice ordinal.
+    resource_memory: ContextResourceBudgetStats = .{},
+    resource_slice_count: u32 = 0,
+    /// Opt-in live-heap diagnostic for the kernel's own process allocator.
+    heap_accounting_enabled: u32 = 0,
+    heap_live_bytes: i64 = 0,
+    heap_peak_live_bytes: u64 = 0,
+    heap_allocated_bytes_total: u64 = 0,
+    heap_allocations_total: u64 = 0,
+    resource_slices: [context_resource_slice_capacity]ContextResourceBudgetStats = [_]ContextResourceBudgetStats{.{}} ** context_resource_slice_capacity,
+};
+
+pub const context_resource_slice_capacity: usize = 64;
+
+pub const ContextResourceBudgetStats = extern struct {
+    used_bytes: u64 = 0,
+    peak_bytes: u64 = 0,
+    soft_limit_bytes: u64 = 0,
+    hard_limit_bytes: u64 = 0,
+    soft_limit_events: u64 = 0,
+    hard_limit_rejections: u64 = 0,
 };
 
 /// Process-owned data-Raft apply/projection store. Requests are deliberately
