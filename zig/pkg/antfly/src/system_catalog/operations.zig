@@ -75,7 +75,8 @@ pub fn storeRootEnrollmentStatus(svc: anytype, alloc: std.mem.Allocator, context
 pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: Request) ![]u8 {
     try context.ensureActive();
     if (request.mutation.table_id != 0 or request.mutation.storage_name.len != 0) return error.InvalidCatalogMutation;
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.system_catalog_version);
+    const required_version = if (request.mutation.kind == .table and request.mutation.action == .drop) protocol.system_catalog_drop_version else protocol.system_catalog_version;
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, required_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.ensureLinearizableReadWithContext(context);
@@ -109,6 +110,15 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
         command.mutation.storage_name = storage_name;
         command.topology = .{ .create = .{ .expected_transition_generation = generation, .table = table, .ranges = ranges } };
     } else if (request.create_table_json != null) return error.InvalidCatalogMutation;
+    if (request.mutation.action == .drop and request.mutation.kind == .table) {
+        const target: domain.Target = .{ .database = request.mutation.database, .namespace = request.mutation.namespace, .table = request.mutation.name };
+        const table = (try store.resolveSystemCatalogTable(a, svc.metadata_group_id, target)) orelse return error.CatalogNotFound;
+        const drop = try svc.captureTableDropAdmission(a, table.name);
+        if (drop.table_id != table.table_id) return error.TableGenerationChanged;
+        command.mutation.table_id = drop.table_id;
+        command.mutation.storage_name = drop.expected_name;
+        command.topology = .{ .drop = .{ .table_id = drop.table_id, .expected_name = drop.expected_name, .expected_transition_generation = drop.expected_transition_generation, .range_contract = .{ .membership = drop.range_membership } } };
+    }
     if (request.mutation.action == .set_tablespace and request.mutation.kind == .table) {
         const target: domain.Target = .{ .database = request.mutation.database, .namespace = request.mutation.namespace, .table = request.mutation.name };
         const current = (try store.resolveSystemCatalogTable(a, svc.metadata_group_id, target)) orelse return error.TableNotFound;
@@ -130,7 +140,10 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
     var expected_hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &expected_hash, .{});
     if (observed.revision != command.expected_revision + 1 or !std.mem.eql(u8, &observed.last_command, &expected_hash)) return error.MetadataMutationOutcomeUnknown;
-    if (command.topology) |topology| svc.verifyTableCreateProjection(a, topology.create.table, topology.create.ranges) catch return error.MetadataMutationOutcomeUnknown;
+    if (command.topology) |topology| switch (topology) {
+        .create => |create| svc.verifyTableCreateProjection(a, create.table, create.ranges) catch return error.MetadataMutationOutcomeUnknown,
+        .drop => |drop| svc.verifyTableDropProjection(a, drop.table_id) catch return error.MetadataMutationOutcomeUnknown,
+    };
     return result;
 }
 

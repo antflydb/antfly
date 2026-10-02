@@ -26,7 +26,7 @@ pub const Datum = struct {
 pub const Type = struct { kind: ?ast.ColumnType = null, nullable: bool = true };
 pub const Column = struct { name: []const u8, type: ast.ColumnType, nullable: bool = true };
 pub const BindLimits = struct { nodes: usize = 8192, depth: usize = 64, parameters: usize = 1024 };
-pub const EvalLimits = struct { steps: usize = 65_536, depth: usize = 64, output_bytes: usize = 1024 * 1024 };
+pub const EvalLimits = struct { steps: usize = 65_536, pattern_steps: usize = 8 * 1024 * 1024, depth: usize = 64, output_bytes: usize = 1024 * 1024 };
 pub const Function = enum { abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified" };
 
 pub const Instruction = struct {
@@ -436,6 +436,7 @@ const Evaluator = struct {
     parameters: []const Json,
     limits: EvalLimits,
     steps: usize = 0,
+    pattern_steps: usize = 0,
     bytes: usize = 0,
 
     fn charge(self: *Evaluator, bytes: usize) !void {
@@ -938,9 +939,10 @@ const Evaluator = struct {
         var star: ?usize = null;
         var restart: usize = 0;
         while (i < text.len) {
-            if (self.steps >= self.limits.steps) return error.SqlProgramLimitExceeded;
-            self.steps += 1;
+            if (self.pattern_steps >= self.limits.pattern_steps) return error.SqlProgramLimitExceeded;
+            self.pattern_steps += 1;
             if (j < glob.len and glob[j] == '%') {
+                if (j + 1 == glob.len) return true;
                 star = j + 1;
                 j += 1;
                 restart = i;
@@ -1229,4 +1231,20 @@ test "SQL scalar bound arithmetic hot loop does not allocate per row" {
     const elapsed = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start;
     try std.testing.expectEqual(@as(i64, 15000534143), checksum);
     std.debug.print("SQL scalar hot loop: rows=100000 instructions={} allocated_bytes=0 checksum={} elapsed_ns={}\n", .{ program.instructions.len, checksum, elapsed });
+}
+
+test "SQL LIKE admits large ordinary text with an independent bounded work budget" {
+    var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, "$1 ILIKE $2", .{});
+    defer compiled.deinit();
+    var program = try bind(std.testing.allocator, compiled.expression, &.{}, &.{ .string, .string }, .{});
+    defer program.deinit();
+    const text = try std.testing.allocator.alloc(u8, 64 * 1024);
+    defer std.testing.allocator.free(text);
+    @memset(text, 'X');
+    @memcpy(text[text.len - 6 ..], "needle");
+    for ([_][]const u8{ "%NEEDLE", "%NEEDLE%", "%absent%" }, [_]bool{ true, true, false }) |pattern, expected| {
+        const actual = try program.evaluate(std.testing.allocator, &.{}, &.{ .{ .string = text }, .{ .string = pattern } }, .{});
+        try std.testing.expectEqual(expected, actual.value.bool);
+    }
+    try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(std.testing.allocator, &.{}, &.{ .{ .string = text }, .{ .string = "%absent%" } }, .{ .pattern_steps = 32 }));
 }

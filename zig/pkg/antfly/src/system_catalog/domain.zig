@@ -626,6 +626,12 @@ pub const PhysicalTable = struct { id: u64, name: []const u8 };
 /// Planning uses a transaction-pinned reader. Point mutations touch only their
 /// dependencies; dropping a database enumerates only that database's children.
 pub fn planWithReader(alloc: std.mem.Allocator, reader: anytype, next: u64, request: Mutation) !Delta {
+    return planWithTopology(alloc, reader, next, request, false);
+}
+
+/// Physical table deletion is admitted only alongside an atomic topology
+/// mutation. Its identity is resolved by the authority, never the caller.
+pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, request: Mutation, dropping_table: bool) !Delta {
     try validateResourceName(request.kind, request.name);
     try validateName(request.database);
     try validateName(request.namespace);
@@ -709,7 +715,10 @@ pub fn planWithReader(alloc: std.mem.Allocator, reader: anytype, next: u64, requ
                         },
                         .namespace => if ((try reader.children(.table, existing.id, 1)).len != 0) return error.NamespaceNotEmpty,
                         .tablespace => if (try reader.tablespaceInUse(existing.id)) return error.TablespaceInUse,
-                        .table => return error.CatalogTableTopologyRequired,
+                        .table => {
+                            if (!dropping_table) return error.CatalogTableTopologyRequired;
+                            if (request.table_id != existing.id or !std.mem.eql(u8, request.storage_name, existing.storage_name)) return error.CatalogGenerationChanged;
+                        },
                     }
                     try removes.append(alloc, existing);
                 }

@@ -349,7 +349,7 @@ const Parser = struct {
         }
         const negative = self.take(.minus);
         if (!negative) _ = self.take(.plus);
-        if (!self.peek(.number)) return self.fail(error.UnsupportedSqlShape, "expected a literal or positional parameter; expression is not supported");
+        if (!self.peek(.number)) return self.fail(if (self.pos == self.tokens.len or self.peek(.semicolon) or self.peek(.rparen)) error.InvalidSqlSyntax else error.UnsupportedSqlShape, "expected a literal or positional parameter; expression is not supported");
         const t = self.tokens[self.pos];
         self.pos += 1;
         if (std.mem.indexOfAny(u8, t.text, ".eE") != null) {
@@ -2392,4 +2392,10 @@ test "compiler preserves keyword-named columns and quoted SQL-looking values" {
     try std.testing.expectEqualStrings("count", columns.statement.select.columns[0].field);
     try std.testing.expectEqualStrings("select", columns.statement.select.predicate.?.comparison.field);
     try std.testing.expectEqualStrings("x'; DELETE FROM t; --", columns.statement.select.predicate.?.comparison.value.string);
+}
+
+test "SQL incomplete value expressions report syntax errors" {
+    for ([_][]const u8{ "SELECT", "SELECT 1 +", "SELECT (1 +)", "INSERT INTO items (_id) VALUES (", "UPDATE items SET n =" }) |sql| {
+        try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, sql, .{}));
+    }
 }

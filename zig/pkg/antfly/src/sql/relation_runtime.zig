@@ -235,7 +235,7 @@ fn Engine(comptime Context: type) type {
         fn normalize(alloc: Allocator, columns: []const binding.Column, values: []const Datum) ![]const Datum {
             if (columns.len != values.len) return error.SqlTypeMismatch;
             const result = try alloc.alloc(Datum, values.len);
-            for (values, columns, result) |value, column, *out| out.* = .{ .value = try describe.coerce(value.value, column.type), .sql_null = value.sql_null };
+            for (values, columns, result) |value, column, *out| out.* = .{ .value = try describe.coerceAlloc(alloc, value.value, column.type), .sql_null = value.sql_null };
             return result;
         }
 
@@ -371,7 +371,7 @@ fn Engine(comptime Context: type) type {
                         const values = try alloc.alloc(Datum, self.node.columns.len);
                         for (scan.source_columns, self.node.columns, values) |name, column, *out| {
                             const cell = try @import("joined_mutation.zig").cell(alloc, row, name);
-                            out.* = .{ .value = try describe.coerce(cell.value, column.type), .sql_null = cell.sql_null };
+                            out.* = .{ .value = try describe.coerceAlloc(alloc, cell.value, column.type), .sql_null = cell.sql_null };
                         }
                         break :blk values;
                     },
@@ -400,7 +400,7 @@ fn Engine(comptime Context: type) type {
                         const sql_nulls = if (output.sql_nulls) |nulls| nulls[self.output_index] else null;
                         self.output_index += 1;
                         const values = try alloc.alloc(Datum, row.len);
-                        for (row, self.node.columns, values, 0..) |value, column, *out, i| out.* = .{ .value = try describe.coerce(value, column.type), .sql_null = if (sql_nulls) |flags| flags[i] else value == .null };
+                        for (row, self.node.columns, values, 0..) |value, column, *out, i| out.* = .{ .value = try describe.coerceAlloc(alloc, value, column.type), .sql_null = if (sql_nulls) |flags| flags[i] else value == .null };
                         break :blk values;
                     },
                 };
@@ -448,7 +448,7 @@ fn Engine(comptime Context: type) type {
             fn setValues(self: *Iterator, alloc: Allocator, values: []const Datum) ![]const Datum {
                 const result = try alloc.alloc(Datum, values.len);
                 for (values, result, self.node.columns) |value, *out, column| out.* = .{
-                    .value = try describe.coerce(value.value, column.type),
+                    .value = try describe.coerceAlloc(alloc, value.value, column.type),
                     .sql_null = value.sql_null,
                 };
                 return result;
@@ -601,7 +601,7 @@ fn Engine(comptime Context: type) type {
                             // returned cells still reference the stable probe/build
                             // rows, not this transient candidate allocation.
                             _ = self.scratch.reset(.retain_capacity);
-                            const values = try self.combine(self.scratch.allocator(), self.left_values, match.values);
+                            const values = try self.combine(self.scratch.allocator(), self.left_values, try match.materializeValues(self.scratch.allocator()));
                             if (join.condition) |program| {
                                 const accepted = try program.evaluate(self.scratch.allocator(), values, self.engine.context.parameters, .{});
                                 if (accepted.sql_null) continue;
@@ -617,7 +617,7 @@ fn Engine(comptime Context: type) type {
                     }
                     if (self.eof) {
                         if (kind == .right or kind == .full) {
-                            if (self.hash_join.?.unmatched(&self.unmatched_index)) |match| return try self.combine(alloc, null, match.values);
+                            if (self.hash_join.?.unmatched(&self.unmatched_index)) |match| return try self.combine(alloc, null, try match.materializeValues(alloc));
                         }
                         return null;
                     }
@@ -669,8 +669,11 @@ fn Engine(comptime Context: type) type {
             fn next(ptr: *anyopaque, alloc: Allocator, limit: u32) !catalog.Page {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
                 var rows: std.ArrayList(catalog.Row) = .empty;
+                var bytes: usize = 0;
+                var stopped_for_bytes = false;
                 while (rows.items.len < limit) {
                     const values = try self.iterator.next(alloc) orelse break;
+                    for (values) |value| bytes +|= try operators.datumBytes(value);
                     var object: std.json.ObjectMap = .empty;
                     const nulls = try alloc.alloc(bool, values.len);
                     for (values, self.iterator.node.columns, nulls) |value, column, *sql_null| {
@@ -680,8 +683,12 @@ fn Engine(comptime Context: type) type {
                     }
                     self.ordinal += 1;
                     try rows.append(alloc, .{ .id = try std.fmt.allocPrint(alloc, "{d}", .{self.ordinal}), .version = 0, .value = .{ .object = object }, .sql_nulls = nulls });
+                    if (bytes >= self.engine.context.limits.page_bytes) {
+                        stopped_for_bytes = true;
+                        break;
+                    }
                 }
-                const more = rows.items.len == limit;
+                const more = rows.items.len == limit or stopped_for_bytes;
                 return .{ .rows = try rows.toOwnedSlice(alloc), .after = if (more) try std.fmt.allocPrint(alloc, "{d}", .{self.ordinal}) else null };
             }
         };

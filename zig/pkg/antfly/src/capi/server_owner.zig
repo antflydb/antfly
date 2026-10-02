@@ -202,6 +202,7 @@ pub const StorageOwnerContext = struct {
 pub const SystemStoreHandle = struct {
     store: *antfly.storage_backend_erased.Store,
     context: *StorageOwnerContext,
+    refs: std.atomic.Value(usize) = .init(1),
 };
 
 pub const SystemReadTxnHandle = struct {
@@ -234,6 +235,7 @@ pub const MetadataApplyStoreHandle = struct {
     alloc: Allocator,
     store: metadata_raft_apply.RaftApplyStore,
     context: ?*StorageOwnerContext,
+    system_store: ?*SystemStoreHandle = null,
     listener_bridges: std.ArrayListUnmanaged(*MetadataListenerBridge) = .empty,
     listener_mutex: std.Io.Mutex = .init,
 };
@@ -956,6 +958,7 @@ pub fn storageContextSystemStoreOpen(
 
 pub fn storageSystemStoreClose(store_ptr: ?*anyopaque) callconv(.c) void {
     const handle = asSystemStore(store_ptr) orelse return;
+    if (handle.refs.fetchSub(1, .acq_rel) != 1) return;
     const context = handle.context;
     context.alloc.destroy(handle);
     context.release();
@@ -1356,10 +1359,13 @@ pub fn metadataApplyStoreOpen(
         .root_dir = root_dir,
         .no_sync = request.no_sync != 0,
         .read_only = request.read_only != 0,
+        .borrowed_store = if (asSystemStore(request.system_store)) |system| system.store else null,
     }) catch |err| return storageOwnerStatusFromError(err);
     errdefer store.deinit();
     const handle = alloc.create(MetadataApplyStoreHandle) catch return .out_of_memory;
-    handle.* = .{ .alloc = alloc, .store = store, .context = context };
+    const system_store = asSystemStore(request.system_store);
+    if (system_store) |system| _ = system.refs.fetchAdd(1, .monotonic);
+    handle.* = .{ .alloc = alloc, .store = store, .context = context, .system_store = system_store };
     context_borrowed = false;
     out_store.* = handle;
     return .ok;
@@ -1370,6 +1376,7 @@ pub fn metadataApplyStoreClose(store_ptr: ?*anyopaque) callconv(.c) void {
     const alloc = handle.alloc;
     const context = handle.context;
     handle.store.deinit();
+    if (handle.system_store) |system| storageSystemStoreClose(system);
     for (handle.listener_bridges.items) |bridge| alloc.destroy(bridge);
     handle.listener_bridges.deinit(alloc);
     handle.* = undefined;
