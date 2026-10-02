@@ -95709,6 +95709,7 @@ test "db multi-source full text unions chunk and textual asset streams across de
         var chunk_match = try waitForSearchResult(alloc, &db, .{
             .index_name = "document_text",
             .full_text = .{ .match = .{ .field = "body", .text = "chunkonlytoken" } },
+            .return_mode = .member,
         }, 1);
         defer chunk_match.deinit();
         try std.testing.expectEqual(@as(usize, 1), chunk_match.hits.len);
@@ -95718,6 +95719,7 @@ test "db multi-source full text unions chunk and textual asset streams across de
         var asset_match = try waitForSearchResult(alloc, &db, .{
             .index_name = "document_text",
             .full_text = .{ .match = .{ .field = "summary", .text = "assetonlytoken" } },
+            .return_mode = .member,
         }, 1);
         defer asset_match.deinit();
         try std.testing.expectEqual(@as(usize, 1), asset_match.hits.len);
@@ -95728,6 +95730,7 @@ test "db multi-source full text unions chunk and textual asset streams across de
             .index_name = "document_text",
             .full_text = .{ .match_all = {} },
             .limit = 10,
+            .return_mode = .member,
         }, 2);
         defer members.deinit();
         try std.testing.expectEqual(@as(usize, 2), members.hits.len);
@@ -95773,6 +95776,7 @@ test "db multi-source full text unions chunk and textual asset streams across de
             .full_text = .{ .match = .{ .field = "body", .text = "chunkonlytoken" } },
             .filter_prefix = "doc:a",
             .limit = 10,
+            .return_mode = .member,
         }, 1);
         defer prefixed_text.deinit();
         try std.testing.expectEqual(@as(u32, 1), prefixed_text.total_hits);
@@ -95820,6 +95824,7 @@ test "db multi-source full text unions chunk and textual asset streams across de
             .index_name = "document_text",
             .full_text = .{ .match_all = {} },
             .limit = 10,
+            .return_mode = .member,
         }, 1);
         defer after_delete.deinit();
         try std.testing.expectEqual(@as(usize, 1), after_delete.hits.len);
@@ -95834,6 +95839,7 @@ test "db multi-source full text unions chunk and textual asset streams across de
         .index_name = "document_text",
         .full_text = .{ .match_all = {} },
         .limit = 10,
+        .return_mode = .member,
     }, 1);
     defer recovered.deinit();
     try std.testing.expectEqual(@as(usize, 1), recovered.hits.len);
