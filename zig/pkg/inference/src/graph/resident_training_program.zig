@@ -493,6 +493,9 @@ test "resident program preserves backend and request controls without GPU dispat
     var vtable: ops.ComputeBackend.VTable = undefined;
     vtable.backendKind = Fake.kind;
     vtable.residentTrainingInstruction = Fake.instruction;
+    // No resident command batch: every dispatch completes individually.
+    vtable.residentTrainingBeginBatch = null;
+    vtable.residentTrainingEndBatch = null;
     var cb = ops.ComputeBackend{ .ptr = &fake, .vtable = &vtable, .execution_control = base };
     const bindings = [_]Binding{.{ .node_id = input, .value = @ptrCast(&fake) }};
     original.failure = error.OriginalControlStopped;
