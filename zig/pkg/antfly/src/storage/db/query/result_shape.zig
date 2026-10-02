@@ -554,6 +554,18 @@ pub fn reshapeChunkBackedResult(
         for (parents.items) |*hit| hit.deinit(alloc);
         parents.deinit(alloc);
     }
+    // Multiple named sources (e.g. two direct document-level embeddings) can
+    // resolve to the same parent id without being chunk fragments of one
+    // another. Folding them into one representative would silently drop a
+    // real member. Set the loser aside here instead and append it as its own
+    // independent hit once primary grouping is complete, so a page asking
+    // for more hits than there are distinct parents still surfaces every
+    // source rather than truncating early.
+    var extra_direct_members = std.ArrayListUnmanaged(types.SearchHit).empty;
+    errdefer {
+        for (extra_direct_members.items) |*hit| hit.deinit(alloc);
+        extra_direct_members.deinit(alloc);
+    }
 
     for (raw.hits, 0..) |chunk_hit, chunk_index| {
         var unit_identity = if (group_by_unit)
@@ -612,6 +624,17 @@ pub fn reshapeChunkBackedResult(
 
         const parent_hit = &parents.items[gop.value_ptr.*];
         if (parent_hit.doc_ordinal == null) parent_hit.doc_ordinal = chunk_hit.doc_ordinal;
+        if (gop.found_existing and !group_by_unit and
+            !try hitHasChunkIdentity(alloc, chunk_hit) and
+            !try hitHasChunkIdentity(alloc, .{ .id = parent_hit.id, .artifact_ref = parent_hit.artifact_ref }))
+        {
+            // Neither this hit nor the existing representative is a chunk
+            // fragment, so they are independent members that merely share a
+            // resolved parent (e.g. two direct embedding sources on the same
+            // document). Preserve this one instead of folding it away.
+            try extra_direct_members.append(alloc, try chunk_hit.clone(alloc));
+            continue;
+        }
         if (parent_hit.score == null or (chunk_hit.score != null and chunk_hit.score.? > parent_hit.score.?)) {
             parent_hit.score = chunk_hit.score;
             parent_hit.distance = chunk_hit.distance;
@@ -644,6 +667,12 @@ pub fn reshapeChunkBackedResult(
             });
             parent_hit.chunk_hits = try chunks.toOwnedSlice(alloc);
         }
+    }
+
+    {
+        const extras = try extra_direct_members.toOwnedSlice(alloc);
+        defer alloc.free(extras);
+        try parents.appendSlice(alloc, extras);
     }
 
     if (parents.items.len > 0) {
@@ -1791,13 +1820,15 @@ pub fn postprocessVectorSearchResult(
     // Artifact-backed vector indexes retain one independent member for every
     // (artifact, source key). Raw member modes therefore deduplicate by the
     // complete artifact identity, not by the resolved document key. Grouped
-    // document-level search still returns each logical document once, with raw
-    // score order making the first occurrence authoritative. Chunk members
-    // remain distinct until hierarchy grouping.
-    if (req.return_mode == .member or req.return_mode == .chunk) {
+    // document-level search still folds chunk fragments down to one hit per
+    // parent, but two differently-sourced direct members (same resolved id,
+    // different artifact) are not chunk fragments of one another and must
+    // stay distinct going into reshapeChunkBackedResult, which is what
+    // actually decides whether same-id members fold together or remain
+    // independent hits (hitHasChunkIdentity). Chunk members remain distinct
+    // until hierarchy grouping.
+    if (req.return_mode == .member or req.return_mode == .chunk or chunk_backed) {
         try dedupeSearchHitsByMemberIdentity(alloc, &filtered);
-    } else if (chunk_backed) {
-        try dedupeSearchHitsByExactId(alloc, &filtered);
     } else {
         try dedupeSearchHitsById(alloc, &filtered);
     }
