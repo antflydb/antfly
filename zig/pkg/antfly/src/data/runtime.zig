@@ -12111,6 +12111,8 @@ pub const DataServer = struct {
     }
 
     fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        if (@import("../api/batch.zig").requiresRowSemanticsEnvelope(req.writes, req.predicates))
+            return @import("../common/data_raft_protocol.zig").batch_row_semantics_protocol_version;
         if (req.merge_proof_adoption != null) return data_raft_batch.merge_proof_adoption_protocol_version;
         if (req.artifact_publication_transport != null) return @import("../common/data_raft_protocol.zig").batch_artifact_publication_transport_protocol_version;
         const extended = @import("../common/data_raft_protocol.zig").batch_artifact_publication_protocol_version;
@@ -36634,6 +36636,9 @@ fn consumerTests() type {
         }
 
         test "data raft source finalization and receiver checkpoints apply document range metadata" {
+            const row_protocol = @import("../common/data_raft_protocol.zig").batch_row_semantics_protocol_version;
+            try std.testing.expectEqual(row_protocol, DataServer.requiredRaftBatchProtocolVersion(.{ .writes = &.{.{ .key = "row", .value = "{\"j\":null}", .json_null_fields = &.{"j"} }} }));
+            try std.testing.expectEqual(row_protocol, DataServer.requiredRaftBatchProtocolVersion(.{ .predicates = &.{.{ .key = "row", .expected_version = 0, .unique_absence = true }} }));
             try std.testing.expectEqual(
                 data_raft_batch.merge_artifacts_protocol_version,
                 DataServer.requiredRaftBatchProtocolVersion(.{ .merge_artifacts = &.{.{ .key = "artifact", .value = "payload" }} }),

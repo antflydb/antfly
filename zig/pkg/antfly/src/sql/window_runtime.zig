@@ -479,7 +479,7 @@ fn evaluate(context: anytype, cells: [][]Datum, indices: []const usize, sort: bi
             else => try tree.?.querySet(selected),
         };
         cells[row][column] = if (result.sql_null) result else .{
-            .value = try describe.coerce(result.value, spec.type),
+            .value = try describe.coerceAlloc(context.arena, result.value, spec.type),
             .sql_null = false,
         };
     }
@@ -508,7 +508,7 @@ pub fn execute(context: anytype, statement: ast.Select) anyerror!@import("runtim
     for (input.rows, cells, 0..) |row, *values, index| {
         values.* = try alloc.alloc(Datum, row.len + bound.specs.len);
         @memset(values.*, .{});
-        for (row, bound.input.columns, values.*[0..row.len], 0..) |value, column, *out, i| out.* = .{ .value = try describe.coerce(value, column.type), .sql_null = if (input.sql_nulls) |flags| flags[index][i] else value == .null };
+        for (row, bound.input.columns, values.*[0..row.len], 0..) |value, column, *out, i| out.* = .{ .value = try describe.coerceAlloc(alloc, value, column.type), .sql_null = if (input.sql_nulls) |flags| flags[index][i] else value == .null };
     }
     for (bound.sorts, 0..) |sort, sort_index| {
         try context.checkpoint();

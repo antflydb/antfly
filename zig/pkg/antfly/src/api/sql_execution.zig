@@ -539,6 +539,7 @@ pub const Adapter = struct {
                 .fields = request.fields,
                 .limit = request.limit,
                 .relational_query = .{
+                    .page_bytes = 256 * 1024,
                     .fields = request.fields,
                     .conditions = conditions,
                     .index = if (request.index_equality) |probe| probe.name else null,
@@ -931,7 +932,7 @@ pub const Adapter = struct {
             var deletes: std.ArrayList([]const u8) = .empty;
             const predicates = try alloc.alloc(db_types.TransactionVersionPredicate, input.len);
             for (input, predicates) |mutation, *predicate| {
-                predicate.* = .{ .key = mutation.key, .expected_version = mutation.expected_version, .expected_content_digest = mutation.expected_content_digest };
+                predicate.* = .{ .key = mutation.key, .expected_version = mutation.expected_version, .expected_content_digest = mutation.expected_content_digest, .unique_absence = mutation.unique_absence };
                 if (mutation.predicate_only) continue;
                 if (self.inserting and mutation.expected_version == 0) if (self.staged) |staged| for (staged.tables) |existing| {
                     if (!std.mem.eql(u8, staged.physicalName(existing.table_name), table.physical_name)) continue;
@@ -939,6 +940,9 @@ pub const Adapter = struct {
                     for (existing.batch.deletes) |deleted| if (std.mem.eql(u8, deleted, mutation.key)) {
                         for (existing.predicates.items) |observed| if (std.mem.eql(u8, observed.key, mutation.key)) {
                             predicate.expected_version = observed.expected_version;
+                            // Reinsert after a staged DELETE checks the original
+                            // row version, rather than absence in durable storage.
+                            if (observed.expected_version != 0) predicate.unique_absence = false;
                             break;
                         };
                         break;
@@ -988,7 +992,7 @@ pub const Adapter = struct {
         var deletes: std.ArrayList([]const u8) = .empty;
         const predicates = try alloc.alloc(db_types.TransactionVersionPredicate, input.len);
         for (input, predicates) |mutation, *predicate| {
-            predicate.* = .{ .key = mutation.key, .expected_version = mutation.expected_version, .expected_content_digest = mutation.expected_content_digest };
+            predicate.* = .{ .key = mutation.key, .expected_version = mutation.expected_version, .expected_content_digest = mutation.expected_content_digest, .unique_absence = mutation.unique_absence };
             if (mutation.predicate_only) continue;
             if (mutation.row) |row| {
                 try writes.append(alloc, .{ .key = mutation.key, .value = try std.json.Stringify.valueAlloc(alloc, row, .{}), .json_null_fields = if (table.storage_mode == .document) &.{} else mutation.json_null_fields });
@@ -1087,6 +1091,9 @@ fn classifyMutationFailure(status: u16, body: []const u8) MutationFailure {
     // A commit/unknown receipt contradicts any definite-abort error field.
     if (parsed.value.status) |state| if (std.mem.startsWith(u8, state, "committed") or std.mem.eql(u8, state, "unknown"))
         return .{ .err = error.SqlMutationOutcomeUnknown, .transaction_id = id };
+    if (status == 503) if (parsed.value.code) |code| {
+        if (std.mem.eql(u8, code, "constraint_activation_pending")) return .{ .err = error.SqlWriteCapacityUnavailable, .transaction_id = id };
+    };
     return .{ .err = definiteMutationFailure(status, parsed.value.@"error" orelse "") orelse error.SqlMutationOutcomeUnknown, .transaction_id = id };
 }
 
@@ -2502,6 +2509,9 @@ test "SQL unknown mutation keeps native reconciliation receipt without allocatio
     try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, receipt.err);
     try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", &receipt.transaction_id.?);
     try std.testing.expectEqual(error.DuplicateSqlRow, classifyMutationFailure(409, "{\"error\":\"UniqueConstraintViolation\"}").err);
+    try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, classifyMutationFailure(503, "write unavailable").err);
+    try std.testing.expectEqual(error.SqlWriteCapacityUnavailable, classifyMutationFailure(503, "{\"code\":\"constraint_activation_pending\"}").err);
+    try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, classifyMutationFailure(503, "{\"code\":\"constraint_activation_pending\",\"status\":\"committed_pending\"}").err);
     try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, classifyMutationFailure(503, "write committed locally; standby durability acknowledgment pending").err);
     try std.testing.expectEqual(catalog.MutationOutcome.committed_pending, try committedMutationOutcome("{\"status\":\"committed_pending\"}"));
     try std.testing.expectEqual(catalog.MutationOutcome.committed_repair_required, try committedMutationOutcome("{\"status\":\"committed_repair_required\"}"));

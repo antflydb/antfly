@@ -230,8 +230,12 @@ pub const Cache = struct {
 
 fn intentDigest(intent: contract.Intent) [32]u8 {
     var hash = std.crypto.hash.Blake3.init(.{});
-    hash.update("antfly.rewrite-program-cache.input.v1");
-    hash.update(&.{ intent.version, @intFromBool(intent.preserve_document), @intFromBool(intent.apply_defaults_to_absent), @intFromBool(intent.allow_column_drops) });
+    hash.update("antfly.rewrite-program-cache.input.v2");
+    hash.update(&.{ intent.version, @intFromBool(intent.preserve_document), @intFromBool(intent.allow_column_drops) });
+    if (intent.default_columns.len != 0) {
+        hash.update("scoped-defaults-v1");
+        for (intent.default_columns) |name| hashPart(&hash, name);
+    }
     hash.update(&intent.program_digest);
     hashPart(&hash, intent.target_schema);
     hashPart(&hash, intent.target_read_schema);
