@@ -6866,6 +6866,18 @@ pub const IndexManager = struct {
         }
         self.alloc.free(self.base_path);
         self.native_read_scratch.destroy();
+        // PR #957 review on the #938 escalation commit: the process-wide
+        // ResourceManager's replay-document-not-visible tracker is keyed in
+        // part by this IndexManager's own address (see
+        // resource_manager_mod.replayOwnerIdFromPtr), so it must be told
+        // this owner is gone -- both to let that address be reused by a
+        // later IndexManager without inheriting stale retry/skip state, and
+        // so the tracker cannot grow without bound across DB/table
+        // open-close churn. Do this before destroying resource_manager
+        // below, in case it is the same instance as owned_resource_manager.
+        if (self.resource_manager) |manager| {
+            manager.removeReplayNotVisibleOwner(resource_manager_mod.replayOwnerIdFromPtr(self));
+        }
         if (self.owned_resource_manager) |manager| {
             manager.deinit(self.alloc);
             self.alloc.destroy(manager);

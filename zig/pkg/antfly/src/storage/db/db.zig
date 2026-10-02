@@ -34968,7 +34968,7 @@ pub const DB = struct {
                 .target_sequence = target_sequence,
                 .catch_up_required = applied_sequence < target_sequence,
                 .replay_document_not_visible_skipped = if (self.core.index_manager.resource_manager) |manager|
-                    manager.replayDocumentNotVisibleSkippedTotal(index_ref.name)
+                    manager.replayDocumentNotVisibleSkippedTotal(resource_manager_mod.replayOwnerIdFromPtr(self.core.index_manager), index_ref.name)
                 else
                     0,
             };
@@ -69815,8 +69815,15 @@ fn applyDerivedBatchToIndexContextProfiled(
         // consecutive failures here, give up on the still-missing documents
         // in this window instead of blocking the worker -- and anything
         // waiting on it to drain, like Lite's run_until_idle() -- forever.
+        // Keyed by this owner's IndexManager address (PR #957 review on the
+        // #938 escalation commit): the ResourceManager below is shared
+        // process-wide across every storage owner, and same-named indexes
+        // (the default `full_text_index_v0` is the common case) or
+        // coincidentally equal sequence numbers across owners must not
+        // combine or reset each other's retry counts.
+        const replay_owner = resource_manager_mod.replayOwnerIdFromPtr(ctx.index_manager);
         const tolerate_missing_replay_documents = if (ctx.index_manager.resource_manager) |manager|
-            manager.shouldEscalateReplayDocumentNotVisible(index_ref.name, batch.sequence)
+            manager.shouldEscalateReplayDocumentNotVisible(replay_owner, index_ref.name, batch.sequence)
         else
             false;
         var collected = try collectTextDocumentWritesForIndex(
@@ -69836,7 +69843,7 @@ fn applyDerivedBatchToIndexContextProfiled(
         defer collected.deinit();
         if (collected.missing_required != 0) return error.ReplayDocumentNotVisible;
         if (ctx.index_manager.resource_manager) |manager|
-            manager.clearReplayDocumentNotVisibleEscalation(index_ref.name, batch.sequence);
+            manager.clearReplayDocumentNotVisibleEscalation(replay_owner, index_ref.name, batch.sequence);
 
         const reservation_limit = if (ctx.text_merge_runtime) |runtime| runtime.producerSegmentReservationLimit() else std.math.maxInt(usize);
         var write_start: usize = 0;
@@ -71439,7 +71446,7 @@ fn collectTextDocumentWritesForIndex(
                     "full-text replay giving up on a document with no visible content after bounded retries index={s} key={s}",
                     .{ index_name, item.doc_key },
                 );
-                if (index_manager.resource_manager) |manager| manager.recordReplayDocumentNotVisibleSkipped(index_name);
+                if (index_manager.resource_manager) |manager| manager.recordReplayDocumentNotVisibleSkipped(resource_manager_mod.replayOwnerIdFromPtr(index_manager), index_name);
                 continue;
             }
             result.missing_required += 1;
@@ -117859,11 +117866,15 @@ test "collectTextDocumentWritesForIndex tolerates a missing document only when t
         try std.testing.expectEqual(@as(usize, 0), collected.docs.items.len);
     }
 
-    // A skipped document is not silently lost: it is counted per index, both
-    // directly and through the same status listDerivedReplayDebt surfaces.
+    // A skipped document is not silently lost: it is counted per owner and
+    // index, both directly and through the same status listDerivedReplayDebt
+    // surfaces.
     try std.testing.expectEqual(
         @as(u64, 1),
-        db.core.index_manager.resource_manager.?.replayDocumentNotVisibleSkippedTotal("ft_v1"),
+        db.core.index_manager.resource_manager.?.replayDocumentNotVisibleSkippedTotal(
+            resource_manager_mod.replayOwnerIdFromPtr(db.core.index_manager),
+            "ft_v1",
+        ),
     );
     const debt = try db.listDerivedReplayDebt(alloc);
     defer {
