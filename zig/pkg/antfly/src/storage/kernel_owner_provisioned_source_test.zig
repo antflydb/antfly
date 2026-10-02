@@ -30,6 +30,74 @@ const table_reads = @import("antfly_source_root").antfly_sources.table_reads;
 const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 const shard_state_store = @import("../data/storage/shard_state_store.zig");
 
+test "cold warmup reopens transient owners without disturbing resident siblings" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const Catalog = struct {
+        fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{
+                    .metadata_group_id = 1,
+                    .metadata_incarnation = "61616161616161616161616161616161".*,
+                    .metrics = .{},
+                },
+                .tables = @constCast(&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 71,
+                    .name = "warmup_probe",
+                    .placement_role = "data",
+                    .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"}}",
+                }}),
+                .ranges = @constCast(&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7501, .table_id = 71, .range_id = 7501, .start_key = "", .end_key = "m" },
+                    .{ .group_id = 7502, .table_id = 71, .range_id = 7502, .start_key = "m", .end_key = null },
+                }),
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn validate(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
+            var current = try snapshot(ptr);
+            return contract.matches(&current);
+        }
+        fn source(self: *@This()) table_catalog.CatalogSource {
+            return .{ .ptr = self, .vtable = &.{
+                .admin_snapshot = snapshot,
+                .free_admin_snapshot = free,
+                .routing_snapshot = table_catalog.TestAdminRoutingAdapter(snapshot, free).routingSnapshot,
+                .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(snapshot, free).linearizableSnapshot,
+                .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(snapshot, free).freeRoutingSnapshot,
+                .validate_publication = validate,
+            } };
+        }
+    };
+    var catalog = Catalog{};
+    var owners = kernel_owner_source.ProvisionedKernelOwnerSource.init(alloc, root, catalog.source(), read_gate.alreadyReadSafeBarrier());
+    defer owners.deinit();
+    _ = try owners.reconcileTableGroup(7501, "warmup_probe");
+    try std.testing.expectEqual(@as(usize, 1), owners.ownerCountForTest());
+    const resident = owners.entries.items[0];
+    const misses_before_resident_warmup = owners.cacheStats().miss_count;
+    try owners.warmTableGroup(7501, "warmup_probe");
+    try std.testing.expectEqual(misses_before_resident_warmup, owners.cacheStats().miss_count);
+
+    for (0..2) |_| {
+        const misses_before = owners.cacheStats().miss_count;
+        try std.testing.expect((try owners.writeSource().localRuntimeStatusGroupLocal(alloc, 7502, "warmup_probe")) == null);
+        try std.testing.expectEqual(misses_before, owners.cacheStats().miss_count);
+        try owners.warmTableGroup(7502, "warmup_probe");
+        try std.testing.expect(owners.cacheStats().miss_count > misses_before);
+        try std.testing.expectEqual(@as(usize, 1), owners.ownerCountForTest());
+        try std.testing.expectEqual(resident, owners.entries.items[0]);
+        try std.testing.expect((try owners.writeSource().localRuntimeStatusGroupLocal(alloc, 7502, "warmup_probe")) == null);
+    }
+}
+
 test "bulk callback ABI retains exact consumer error identity" {
     try kernel_owner_source.ProvisionedKernelOwnerSource.validateBulkCallbackIdentityForTest();
 }

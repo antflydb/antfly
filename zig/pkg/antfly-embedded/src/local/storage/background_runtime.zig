@@ -694,7 +694,7 @@ fn initIoLane(alloc: Allocator, concurrent_limit: u32) !*IoImpl {
 /// per additional detected CPU; the caller always runs one task inline.
 fn boundedIoAsyncLimit(concurrent_limit: u32) Io.Limit {
     if (comptime builtin.single_threaded) return .nothing;
-    const cpu_count = std.Thread.getCpuCount() catch return .limited(concurrent_limit);
+    const cpu_count = platform.process_memory.cpuCapacity().parallelism();
     return .limited(@min(@as(usize, concurrent_limit), cpu_count -| 1));
 }
 
@@ -1073,7 +1073,8 @@ pub const BackendRuntime = struct {
         const scheduler_io = self.io() orelse return error.MissingBackendRuntimeIo;
         // One coordinator and the durable-job reaper also use this lane.
         if (self.lane_limits.durable_background < 8) return error.InvalidMaintenanceCapacity;
-        const scheduler = try MaintenanceScheduler.create(self.alloc, scheduler_io, @max(1, self.lane_limits.durable_background / 2));
+        const cpu_limit = platform.process_memory.cpuCapacity().parallelism();
+        const scheduler = try MaintenanceScheduler.create(self.alloc, scheduler_io, MaintenanceScheduler.cpuLimitedCapacity(cpu_limit, @max(1, self.lane_limits.durable_background / 2)));
         self.maintenance_scheduler.store(scheduler, .release);
         return scheduler;
     }
@@ -3360,10 +3361,7 @@ test "backend runtime async lane limit is CPU aware" {
         try std.testing.expectEqual(std.Io.Limit.nothing, boundedIoAsyncLimit(8));
         return;
     }
-    const expected = if (std.Thread.getCpuCount()) |cpu_count|
-        std.Io.Limit.limited(@min(@as(usize, 8), cpu_count -| 1))
-    else |_|
-        std.Io.Limit.limited(8);
+    const expected = std.Io.Limit.limited(@min(@as(usize, 8), platform.process_memory.cpuCapacity().parallelism() -| 1));
     try std.testing.expectEqual(expected, boundedIoAsyncLimit(8));
 }
 

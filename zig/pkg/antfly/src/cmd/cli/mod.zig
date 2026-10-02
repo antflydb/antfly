@@ -94,6 +94,7 @@ pub fn commandUsage(command: []const u8) ?[]const u8 {
     \\  --pruner <json>                   Result pruner configuration
     \\  --limit <n>                       Result limit
     \\  --offset <n>                      Result offset
+    \\  --wait-ready-ms <n>               Wait for this query to serve within n milliseconds
     \\
     ;
     if (std.mem.eql(u8, command, "load")) return
