@@ -13766,26 +13766,33 @@ test "standalone catalog journal preserves imported policy publication as fail c
         .acknowledged_owners = &.{},
     }};
     {
-        var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), &store, .local);
-        defer metadata.deinit();
-        var imported = metadata.systemCatalogState();
-        imported.policy_publications = &publications;
-        const replacement = try system_catalog.MutableState.clone(alloc, imported);
-        metadata.system_catalog_state.?.deinit();
-        metadata.system_catalog_state = replacement;
-        // Import the entire legacy snapshot into native authority; ordinary
-        // catalog deltas do not persist an injected in-memory publication.
-        try metadata.persistLocked();
-        const result = try metadata.statusSource().systemCatalog(alloc, .{}, .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .database, .name = "policy_import" } } });
-        alloc.free(result);
-        try std.testing.expectError(error.RowPolicyCatalogChanged, metadata.statusSource().systemCatalog(alloc, .{ .row_policy_install_authority = true }, .{ .policy_publication_status = 7 }));
+        // Seed the released journal before native authority bootstraps. Full
+        // snapshot imports are intentionally forbidden after the first open.
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        for ([_]system_catalog.Resource{
+            .{ .kind = .database, .id = 1, .name = "default" },
+            .{ .kind = .namespace, .id = 2, .parent_id = 1, .name = "public" },
+        }) |resource| try LocalStandaloneMetadata.putCatalogRow(alloc, &txn, .{ .resource = resource });
+        try LocalStandaloneMetadata.putCatalogRow(alloc, &txn, .{ .policy_publication = publications[0] });
+        const head = try std.json.Stringify.valueAlloc(alloc, LocalStandaloneMetadata.CatalogHead{ .epoch = 1, .revision = 1, .next_id = 3 }, .{});
+        defer alloc.free(head);
+        try txn.put(LocalStandaloneMetadata.catalog_head_key, head);
+        try txn.commit();
+        try store.sync(true);
     }
-    var reopened = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), &store, .local);
-    defer reopened.deinit();
-    try std.testing.expectEqual(@as(usize, 1), reopened.systemCatalogState().policy_publications.len);
-    try std.testing.expectEqual(@as(u64, 11), reopened.systemCatalogState().policy_publications[0].required_owners[0].group_id);
-    try std.testing.expectError(error.RowPolicyCatalogChanged, reopened.statusSource().systemCatalog(alloc, .{ .row_policy_install_authority = true }, .{ .policy_publication_status = 7 }));
-    try std.testing.expectError(error.RowPolicyUnsupported, reopened.statusSource().systemCatalog(alloc, .{}, .export_snapshot));
+    // A catalog-only import cannot prove that policy owners installed this
+    // pending generation. Reject bootstrap on every reopen, preserving the
+    // legacy source for an explicit coordinated restore.
+    for (0..2) |_| try std.testing.expectError(error.RowPolicyUnsupported, LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), &store, .local));
+    var txn = try store.beginRead();
+    defer txn.abort();
+    const key = try LocalStandaloneMetadata.catalogRowKey(alloc, .{ .policy_publication = publications[0] });
+    defer alloc.free(key);
+    var preserved = try std.json.parseFromSlice(LocalStandaloneMetadata.CatalogRow, alloc, try txn.get(key), .{});
+    defer preserved.deinit();
+    try std.testing.expectEqual(@as(u64, 11), preserved.value.policy_publication.required_owners[0].group_id);
+    try std.testing.expect(preserved.value.policy_publication.phase == .pending_install);
 }
 
 fn exerciseStandalonePolicyPublication(use_ha: bool) !void {
