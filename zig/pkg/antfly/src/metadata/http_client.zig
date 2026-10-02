@@ -1124,7 +1124,7 @@ pub const MetadataHttpClient = struct {
 
     /// Read-only retries are safe. The response proves the metadata identity;
     /// callers need no preceding status/discovery round trip on the happy path.
-    pub fn readSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: system_catalog.Call, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !CatalogRead {
+    pub fn readSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: @import("../system_catalog/server_call.zig").Call, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !CatalogRead {
         if (input == .fk_initial_retirement_page) return error.InitialFkRetirementNotActivated;
         if (input.isMutation()) return error.InvalidCatalogMutation;
         if (remaining_ms == 0) return error.Timeout;
@@ -1192,7 +1192,7 @@ pub const MetadataHttpClient = struct {
         };
     }
 
-    pub fn forwardSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: system_catalog.Call, forwarding: raft_mutation_forwarding.Context, setting_admin: bool) ![]u8 {
+    pub fn forwardSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: @import("../system_catalog/server_call.zig").Call, forwarding: raft_mutation_forwarding.Context, setting_admin: bool) ![]u8 {
         if (input.requiresAdministrativeGrant() != setting_admin) return error.Forbidden;
         const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
         defer self.alloc.free(body);
@@ -4553,7 +4553,7 @@ test "system catalog FK decision preserves absent publication for initial-parent
     var executor = Executor{ .body = "GenerationPublicationNotFound" };
     var client = MetadataHttpClient.init(alloc, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
     _ = client.withSettingAuthority("fk-decision-test-secret", "fk-decision-test");
-    const decision: system_catalog.Call = .{ .fk_generation_publication_decision = .{
+    const decision: @import("../system_catalog/server_call.zig").Call = .{ .fk_generation_publication_decision = .{
         .plan_id = .{1} ** 16,
         .parent_table_id = 1,
         .parent_group_id = 2,
@@ -4588,7 +4588,7 @@ test "system catalog initial FK retirement page requires a store-bound transport
     var executor = Executor{};
     var client = MetadataHttpClient.init(std.testing.allocator, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
     _ = client.withSettingAuthority("retirement-read-test-secret", "retirement-read-test");
-    const call: system_catalog.Call = .{ .fk_initial_retirement_page = .{ .store_id = 13, .limit = 1 } };
+    const call: @import("../system_catalog/server_call.zig").Call = .{ .fk_initial_retirement_page = .{ .store_id = 13, .limit = 1 } };
     try std.testing.expectError(error.InitialFkRetirementNotActivated, client.readSystemCatalog("http://metadata.invalid", call, 25, null));
     try std.testing.expectEqual(@as(usize, 0), executor.calls);
 }

@@ -43,7 +43,7 @@ const test_contract_helpers = @import("../api/test_contract_helpers.zig");
 const api_table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 const api_tables = @import("../api/tables.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
-const raft_catalog = @import("../raft/catalog.zig");
+const raft_catalog = @import("../raft/storage/catalog.zig");
 const raft_host = @import("../raft/host.zig");
 const raft_metadata_apply = @import("../raft/metadata_apply.zig");
 const raft_metadata_view = @import("../raft/metadata_view.zig");
@@ -3674,7 +3674,7 @@ pub const MetadataHttpNodeVopr = struct {
     pub fn catalogRoutingSnapshotWithClock(
         self: MetadataHttpNodeVopr,
         deadline_ns: ?u64,
-        deadline_io: ?@import("../runtime_io_abi.zig").Borrow,
+        deadline_io: ?@import("antfly_runtime_abi").io_abi.Borrow,
     ) !metadata_api.CatalogRoutingSnapshot {
         self.cluster.scheduler_gate.lock();
         defer self.cluster.scheduler_gate.unlock();
@@ -6893,7 +6893,7 @@ pub const MetadataAdminVoprSource = struct {
         };
     }
 
-    fn systemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/domain.zig").Call) ![]u8 {
+    fn systemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
         try context.ensureActive();
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (input == .mutate) return error.UnsupportedOperation;
@@ -7219,7 +7219,7 @@ const PublicApiCatalogSource = struct {
     fn iface(self: *@This()) api_table_catalog.CatalogSource {
         return .{
             .ptr = self,
-            .io = @import("../runtime_io_abi.zig").Borrow.init(&(self.node.cluster.backendRuntime(self.node.index).io() orelse std.Options.debug_io)),
+            .io = @import("antfly_runtime_abi").io_abi.Borrow.init(&(self.node.cluster.backendRuntime(self.node.index).io() orelse std.Options.debug_io)),
             .vtable = &.{
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,

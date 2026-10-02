@@ -11,7 +11,7 @@
 
 const std = @import("std");
 const Crc32 = @import("antfly_hash").Crc32;
-const fs_paths = @import("../../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const root_identity = @import("root_identity.zig");
 const Ed25519 = std.crypto.sign.Ed25519;
 const Allocator = std.mem.Allocator;

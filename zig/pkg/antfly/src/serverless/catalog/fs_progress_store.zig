@@ -15,10 +15,10 @@
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const Allocator = std.mem.Allocator;
-const fs_paths = @import("../../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const catalog_types = @import("types.zig");
 const progress_store = @import("progress_store.zig");
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const work_lease = @import("../build/work_lease.zig");
 const head_coordination = @import("../head_coordination.zig");
 

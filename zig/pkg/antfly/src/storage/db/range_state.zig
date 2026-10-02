@@ -23,7 +23,7 @@ pub const range_key = "\x00\x00__metadata__:range";
 pub const InitialOwnerRange = struct {
     range: docstore_mod.ByteRange,
     namespace: @import("doc_identity.zig").Namespace,
-    cancellation: @import("../../common/cancellation.zig").CancellationToken = .none,
+    cancellation: @import("antfly_cancellation").CancellationToken = .none,
     deadline_ns: ?u64 = null,
 
     fn check(self: @This()) !void {

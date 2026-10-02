@@ -20,7 +20,7 @@ const progress_store = @import("progress_store.zig");
 const head_coordination = @import("../head_coordination.zig");
 const remote_uri = @import("../remote_uri.zig");
 const object_store_support = @import("../object_store_support.zig");
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const work_lease = @import("../build/work_lease.zig");
 const ObjectWorkLeaseStore = @import("../build/object_work_lease_store.zig").ObjectWorkLeaseStore;
 

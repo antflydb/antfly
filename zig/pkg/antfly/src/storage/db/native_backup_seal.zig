@@ -18,8 +18,8 @@
 const std = @import("std");
 const backup = @import("native_backup.zig");
 const topology = @import("relational_integrity_topology.zig");
-const fs_paths = @import("../../common/fs_paths.zig");
-const Cancellation = @import("../../common/cancellation.zig").CancellationToken;
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
+const Cancellation = @import("antfly_cancellation").CancellationToken;
 const json = @import("relational_integrity_json.zig");
 const Allocator = std.mem.Allocator;
 pub const wal_budget_bytes: u64 = 16 * 1024 * 1024;

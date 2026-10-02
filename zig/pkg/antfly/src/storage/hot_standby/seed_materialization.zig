@@ -12,7 +12,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const data_format = @import("../../common/data_format.zig");
-const fs_paths = @import("../../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const raft_catalog = @import("../../raft/storage/catalog.zig");
 const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
 const generation_lifecycle = @import("../db/generation_lifecycle.zig");
@@ -203,7 +203,7 @@ pub fn materialize(alloc: Allocator, request: MaterializeRequest) !MaterializeRe
         defer transition.deinit();
         var staged = try transition.beginStaging();
         defer staged.deinit();
-        try db_mod.DB.restoreCoherentHASeedReplicaToStagedGeneration(&staged, alloc, snapshot_root, staged.path(), .{
+        try @import("../server_db_adapter.zig").restoreAuthenticatedReplicaToStagedGeneration(&staged, alloc, snapshot_root, staged.path(), .{
             .identity_namespace = .{
                 .table_id = replica.identity_table_id,
                 .shard_id = replica.identity_shard_id,
@@ -491,7 +491,7 @@ fn verifyOpenedReplicaRowPolicy(
     };
     if (expected) |program| {
         if (db.core.table_catalog.row_policy_phase != .active) return error.SeedReplicaPolicyMismatch;
-        const installed = if (db.row_policy_bundle) |*bundle| bundle else return error.SeedReplicaPolicyMismatch;
+        const installed = if (db.local_execution.row_policy_bundle) |*bundle| bundle else return error.SeedReplicaPolicyMismatch;
         if (!(try policyInstallSnapshotsEqual(alloc, installed.parsed.value, program.*))) return error.SeedReplicaPolicyMismatch;
     } else if (db.core.table_catalog.row_policy_phase != .disabled) {
         return error.SeedReplicaPolicyMismatch;

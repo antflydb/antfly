@@ -16,8 +16,8 @@
 //! Both the focused kernel root and broad benchmark root share this surface.
 
 pub const relational_expression_errors = @import("schema/relational_expression_errors.zig");
-pub const runtime_native_abi = @import("runtime_native_abi.zig");
-pub const runtime_error_abi = @import("runtime_error_abi.zig");
+pub const runtime_native_abi = @import("antfly_runtime_abi").native_abi;
+pub const runtime_error_abi = @import("antfly_runtime_abi").error_abi;
 pub const relational_read_provider = @import("storage/relational_read_provider.zig");
 pub const statement_read_fence = @import("storage/statement_read_fence.zig");
 pub const sql_catalog = @import("sql/catalog.zig");
@@ -31,8 +31,8 @@ pub const sql_document_row = @import("sql/document_row.zig");
 pub const storage_row_identity = @import("storage/row_identity.zig");
 pub const storage_range_protection = @import("storage/range_protection.zig");
 pub const storage_coordinated_ttl = @import("storage/coordinated_ttl.zig");
-pub const storage_metadata_ha_port = @import("storage/metadata_ha_port.zig");
-pub const storage_hot_standby_replication_record = @import("storage/hot_standby/replication_record.zig");
+pub const storage_metadata_hot_standby_port = @import("storage/metadata_hot_standby_port.zig");
+pub const storage_hot_standby_replication_record = @import("storage/db/replication_record.zig");
 pub const storage_docstore = @import("storage/docstore.zig");
 pub const metadata_restore_staging = @import("metadata/restore_staging.zig");
 pub const metadata_storage_raft_apply_store = @import("metadata/storage/raft_apply_store.zig");
@@ -49,7 +49,7 @@ pub const storage_db_native_backup_seal_contract = @import("storage/db/native_ba
 pub const storage_db_backup_pin_control = @import("storage/db/backup_pin_control.zig");
 pub const storage_db_native_backup_seal = @import("storage/db/native_backup_seal.zig");
 pub const storage_db_relational_integrity_topology_contract = @import("storage/db/relational_integrity_topology_contract.zig");
-pub const storage_db_native_raft_snapshot = @import("storage/db/native_raft_snapshot.zig");
+pub const storage_db_native_raft_snapshot = @import("raft/storage/native_snapshot.zig");
 pub const storage_db_doc_identity = @import("storage/db/doc_identity.zig");
 pub const api_restore_owner_contract = @import("api/restore_owner_contract.zig");
 pub const storage_restore_owner = @import("storage/restore_owner.zig");
@@ -65,3 +65,5 @@ pub const common_topology_records = @import("common/topology_records.zig");
 pub const raft_read_gate = @import("raft/read_gate.zig");
 pub const storage_db_relational_transition_contract = @import("storage/db/relational_transition_contract.zig");
 pub const storage_db_relational_integrity_json = @import("storage/db/relational_integrity_json.zig");
+
+pub const storage_db_replication_ingress = @import("storage/db/replication_ingress.zig");

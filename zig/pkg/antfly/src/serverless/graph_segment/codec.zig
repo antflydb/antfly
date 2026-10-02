@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const graph_types = @import("types.zig");
 const graph_edge_type = @import("../../graph/edge_type.zig");
 pub const compact = @import("packed.zig");

@@ -1878,6 +1878,7 @@ fn writePjrtExecutableArtifact(
     is_partial_artifact: bool,
 ) !void {
     try guardPjrtExecutableExportBudget(is_partial_artifact, hlo_bytes.len);
+    if (!build_options.enable_pjrt) return error.BackendUnavailable;
     const pjrt_lib = @import("pjrt");
     const plugin_path = try native_backend_choice.pjrtPluginPathFromEnv(allocator) orelse return error.MissingPjrtPluginPath;
     defer allocator.free(plugin_path);

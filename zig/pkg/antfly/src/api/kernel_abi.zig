@@ -16,10 +16,10 @@
 //! Keep this file free of production imports so both codegen units agree on one
 //! ABI definition without pulling either implementation across the boundary.
 
-const error_abi = @import("../runtime_error_abi.zig");
-const http_abi = @import("../runtime_http_abi.zig");
+const error_abi = @import("antfly_runtime_abi").error_abi;
+const http_abi = @import("antfly_runtime_abi").http_abi;
 pub const memory_abi = @import("runtime_memory_abi");
-pub const native_abi = @import("../runtime_native_abi.zig");
+pub const native_abi = @import("antfly_runtime_abi").native_abi;
 
 pub const Status = error_abi.Status;
 pub const StatusCode = error_abi.Code;

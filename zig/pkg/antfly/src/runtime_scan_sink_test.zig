@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const Sink = @import("runtime_scan_sink.zig").ScanStreamSink;
-const errors = @import("runtime_error_abi.zig");
+const errors = @import("antfly_runtime_abi").error_abi;
 extern fn scan_sink_test_consume(*const Sink, [*]const u8, usize) callconv(.c) errors.Status;
 extern fn scan_sink_test_provider_sink(*Sink, *errors.Status) callconv(.c) void;
 

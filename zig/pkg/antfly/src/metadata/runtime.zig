@@ -18,7 +18,7 @@ const storage_source_options = @import("storage_source_options");
 const kernel_owner_client = @import("../storage/kernel_owner_client.zig");
 const metadata_replica_root_client = @import("../storage/metadata_replica_root_client.zig");
 const internal_service_auth = @import("../api/internal_service_auth.zig");
-const fs_paths = @import("../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const group_ids = @import("../common/group_ids.zig");
 const build_options = @import("build_options");
 const raft_engine = @import("raft_engine");
@@ -1179,10 +1179,11 @@ pub fn runFromIterator(
     try ensureDirPath(setup_io.io(), resolved.snapshot_root_dir);
     try fs_paths.createDirPathPortable(setup_io.io(), resolved.auth_store_root_dir);
 
-    var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
+    var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.initWithOptions(
         alloc,
         setup_io.io(),
         if (loaded_config) |*cfg| cfg else null,
+        .{ .secret_store = if (secret_store_initialized) &secret_store else null },
     );
     defer active_audio_runtime.deinit();
 

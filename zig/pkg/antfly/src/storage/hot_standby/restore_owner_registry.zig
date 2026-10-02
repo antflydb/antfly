@@ -17,7 +17,7 @@
 const std = @import("std");
 const native = @import("../db/restore_staging_contract.zig");
 const backup = @import("../db/native_backup.zig");
-const fs = @import("../../common/fs_paths.zig");
+const fs = @import("antfly_runtime_fs").fs_paths;
 const records = @import("../../common/topology_records.zig");
 pub const directory = "native-restore-owners";
 pub const max_owners = @import("restore_owner_contract.zig").max_owners;

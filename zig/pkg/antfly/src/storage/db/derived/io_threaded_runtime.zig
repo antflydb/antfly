@@ -26,7 +26,7 @@ const types = @import("../types.zig");
 const runtime_types = @import("runtime_types.zig");
 const change_journal_mod = @import("change_journal.zig");
 const derived_types = @import("derived_types.zig");
-const threaded_io_limits = @import("../../../common/threaded_io_limits.zig");
+const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const platform_time = @import("antfly_platform").time;
 const Scheduler = @import("../../../common/maintenance_scheduler.zig").Scheduler;
 

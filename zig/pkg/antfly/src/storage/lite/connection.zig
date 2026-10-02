@@ -30,6 +30,7 @@ pub const Connection = struct {
     pub const Options = struct {
         fsync: bool = true,
         writer_lock_marker: []const u8 = "",
+        reclamation: backend.ReclamationOptions = .{},
     };
 
     pub fn open(allocator: Allocator, path: []const u8, open_mode: db_mod.OpenOptions.OpenMode) !Connection {
@@ -38,6 +39,7 @@ pub const Connection = struct {
 
     pub fn openWithOptions(allocator: Allocator, path: []const u8, open_mode: db_mod.OpenOptions.OpenMode, opts: Options) !Connection {
         var lite_backend = try backend.Handle.open(allocator, path, .{
+            .reclamation = opts.reclamation,
             .read_only = openModeRequiresReadOnlyBackends(open_mode),
             .no_sync = !opts.fsync,
         });
@@ -66,6 +68,7 @@ pub const Connection = struct {
 
     pub fn createWithOptions(allocator: Allocator, path: []const u8, exclusive: bool, opts: Options) !Connection {
         var lite_backend = try backend.Handle.createWithOptions(allocator, path, .{
+            .reclamation = opts.reclamation,
             .exclusive = exclusive,
             .no_sync = !opts.fsync,
             .writer_lock_marker = opts.writer_lock_marker,

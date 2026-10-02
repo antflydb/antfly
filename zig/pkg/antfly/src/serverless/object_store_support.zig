@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const object_storage = @import("../storage/object_storage.zig");
-const bedrock = @import("../inference/bedrock.zig");
+const bedrock = @import("antfly_inference_bedrock");
 const google_auth = @import("antfly_google").auth;
 const remote_uri = @import("remote_uri.zig");
 
@@ -357,7 +357,7 @@ pub const OpenedObjectStore = struct {
         };
         if (dynamic) {
             const io = try alloc.create(std.Io.Threaded);
-            io.* = @import("../common/threaded_io_limits.zig").initServerlessObjectStore(alloc);
+            io.* = @import("antfly_runtime_fs").threaded_io_limits.initServerlessObjectStore(alloc);
             credential_io = io;
             const context = try alloc.create(AwsCredentialContext);
             errdefer alloc.destroy(context);

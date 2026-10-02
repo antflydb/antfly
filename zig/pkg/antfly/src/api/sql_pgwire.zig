@@ -28,7 +28,7 @@ const catalog = @import("../sql/catalog.zig");
 const ast = @import("../sql/ast.zig");
 const operation = @import("operation.zig");
 const usermgr = @import("../usermgr/mod.zig");
-const io_abi = @import("../runtime_io_abi.zig");
+const io_abi = @import("antfly_runtime_abi").io_abi;
 const Mac = std.crypto.auth.hmac.sha2.HmacSha256;
 const credential_domain = "antfly.pgwire.password-session.v1";
 

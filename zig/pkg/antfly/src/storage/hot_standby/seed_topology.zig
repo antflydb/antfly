@@ -21,7 +21,7 @@ pub const topology_format_version: u16 = 4;
 pub const topology_name = "TOPOLOGY.json";
 pub const private_provisioning_name = "restore-provisioning.json";
 pub const standalone_metadata_name = "standalone-metadata.bin";
-pub const logical_snapshot_manifest_name = "SNAPSHOT.json";
+pub const logical_snapshot_manifest_name = @import("../backup_codec.zig").logical_snapshot_manifest_file_name;
 pub const max_topology_bytes: usize = 64 * 1024 * 1024;
 pub const max_files: usize = 1_000_000;
 pub const max_file_bytes: u64 = 64 * 1024 * 1024 * 1024;
@@ -375,7 +375,7 @@ fn readFileAlloc(io: std.Io, alloc: Allocator, path: []const u8, max_bytes: usiz
 pub fn validateLogicalCatalog(alloc: Allocator, version: u16, catalog: LogicalCatalog) !void {
     if (version >= 4 and catalog.system_catalog == null) return error.InvalidSeedTopology;
     if (catalog.system_catalog) |state| {
-        @import("../../system_catalog/projection.zig").validatePolicyPrograms(alloc, state.policy_publications, catalog.policy_install_snapshots) catch |err| switch (err) {
+        @import("../../system_catalog/portable_policy_contract.zig").validatePolicyPrograms(alloc, state.policy_publications, catalog.policy_install_snapshots) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return error.InvalidSeedTopology,
         };

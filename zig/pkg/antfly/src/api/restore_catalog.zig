@@ -48,7 +48,7 @@ pub const Catalog = struct {
     plan_id: [16]u8,
     plan_digest: [32]u8,
     authority: Authority,
-    io: ?@import("../runtime_io_abi.zig").Borrow = null,
+    io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
 
     /// All snapshot/owner slices are immutable and borrowed for this Catalog's
     /// lifetime. The driver owns their arena through completion of a page/2PC.
@@ -581,7 +581,7 @@ test "distributed txn staged mixed restore rebuilds fresh FK claims with durable
         var threaded: std.Io.Threaded = .init(alloc, .{ .async_limit = .limited(4) });
         defer threaded.deinit();
         const io = threaded.io();
-        const control: @import("operation.zig").RequestContext = if (concurrent) .{ .fanout_io = @import("../runtime_io_abi.zig").Borrow.init(&io) } else .{};
+        const control: @import("operation.zig").RequestContext = if (concurrent) .{ .fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io) } else .{};
         var validation: ValidationCursor = .{};
         for (0..80) |_| {
             const complete = validateWindow(alloc, &private_catalog, reader, writer, &validation, control) catch |err| {
