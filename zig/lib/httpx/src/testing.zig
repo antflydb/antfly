@@ -33,6 +33,7 @@ const types = @import("core/types.zig");
 /// Specification for a canned response.
 pub const ResponseSpec = struct {
     status: u16 = 200,
+    headers: []const HeaderPair = &.{},
     body: ?[]const u8 = null,
     content_type: ?[]const u8 = null,
     /// Delay the response on the borrowed `std.Io` clock. This is logical time
@@ -259,8 +260,12 @@ pub const TestServer = struct {
         const ct = spec.content_type orelse "application/json";
         const body = spec.body orelse "";
 
-        const header = try std.fmt.allocPrint(alloc, "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ spec.status, reason, ct, body.len });
-        defer alloc.free(header);
+        var header_buffer = Io.Writer.Allocating.init(alloc);
+        defer header_buffer.deinit();
+        try header_buffer.writer.print("HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n", .{ spec.status, reason, ct, body.len });
+        for (spec.headers) |entry| try header_buffer.writer.print("{s}: {s}\r\n", .{ entry.name, entry.value });
+        try header_buffer.writer.writeAll("\r\n");
+        const header = header_buffer.written();
 
         // Concatenate header + body so we can send in one call.
         const transmitted_len = @min(spec.truncate_body_at orelse body.len, body.len);

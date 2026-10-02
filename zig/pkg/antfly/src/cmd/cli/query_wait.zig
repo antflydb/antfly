@@ -13,10 +13,9 @@ fn retryableStatus(status: i32) bool {
 }
 
 fn retryableTransport(err: anyerror) bool {
-    return switch (err) {
-        error.Timeout, error.ConnectionRefused, error.ConnectionReset, error.ConnectionResetByPeer, error.ConnectionClosed, error.ConnectionAborted, error.ConnectionTimedOut, error.ConnectionTimeout, error.BrokenPipe => true,
-        else => false,
-    };
+    // HTTPX keeps timeouts terminal for ordinary request replay. The wake
+    // barrier handles them against its own overall readiness deadline.
+    return err == error.Timeout or client_mod.httpx.isRetryableTransportError(err);
 }
 
 const Disposition = enum { ready, retry, failed };
@@ -135,4 +134,102 @@ test "query wake barrier bounds a stalled first data request" {
     const start = std.Io.Clock.awake.now(io).nanoseconds;
     try std.testing.expectError(error.ServingReadinessTimeout, wait(io, &client, "docs", .{}, 50));
     try std.testing.expect(std.Io.Clock.awake.now(io).nanoseconds - start < 1000 * std.time.ns_per_ms);
+}
+
+test "query wake barrier retries premature response EOF" {
+    const httpx = client_mod.httpx;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var server = try httpx.TestServer.start(alloc, io, &.{
+        .{ .method = .POST, .path = "/db/v1/tables/docs/query", .max_uses = 1, .respond = .{ .disconnect_before_response = true } },
+        .{ .method = .POST, .path = "/db/v1/tables/docs/query", .respond = .{ .body = "{\"responses\":[{\"status\":200,\"took\":0}]}" } },
+    });
+    defer server.deinit();
+    var http = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+    defer http.deinit();
+    var client = try client_mod.AntflyClient.init(alloc, &http, server.baseUrl());
+    defer client.deinit();
+    const Task = struct {
+        fn serve(test_server: *httpx.TestServer) std.Io.Cancelable!void {
+            for (0..2) |_| test_server.handleOne() catch return;
+        }
+    };
+    var group: std.Io.Group = .init;
+    try group.concurrent(io, Task.serve, .{&server});
+    defer group.cancel(io);
+    var response = try wait(io, &client, "docs", .{}, 1000);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+}
+
+test "query wake barrier retries temporary DNS failure and preserves terminal lookup errors" {
+    const httpx = client_mod.httpx;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const HostName = std.Io.net.HostName;
+    const Fixture = struct {
+        var calls = std.atomic.Value(usize).init(0);
+        var terminal = false;
+        fn lookup(_: ?*anyopaque, _: HostName, resolved: *std.Io.Queue(HostName.LookupResult), options: HostName.LookupOptions) HostName.LookupError!void {
+            defer resolved.close(std.testing.io);
+            if (terminal) return error.UnknownHostName;
+            if (calls.fetchAdd(1, .acq_rel) == 0) return error.NameServerFailure;
+            resolved.putOne(std.testing.io, .{ .address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = options.port } } }) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                error.Closed => unreachable,
+            };
+        }
+    };
+    Fixture.calls.store(0, .release);
+    Fixture.terminal = false;
+    var vtable = io.vtable.*;
+    vtable.netLookup = Fixture.lookup;
+    const fault_io: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+    var server = try httpx.TestServer.start(alloc, io, &.{
+        .{ .method = .POST, .path = "/db/v1/tables/docs/query", .respond = .{ .body = "{\"responses\":[{\"status\":200,\"took\":0}]}" } },
+    });
+    defer server.deinit();
+    var serving = try io.concurrent(httpx.TestServer.handleOne, .{&server});
+    defer serving.cancel(io) catch {};
+    var http = httpx.Client.initWithConfig(alloc, fault_io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+    defer http.deinit();
+    const url = try std.fmt.allocPrint(alloc, "http://wake.test:{d}", .{server.port});
+    defer alloc.free(url);
+    var client = try client_mod.AntflyClient.init(alloc, &http, url);
+    defer client.deinit();
+    var response = try wait(fault_io, &client, "docs", .{}, 2000);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqual(@as(usize, 2), Fixture.calls.load(.acquire));
+    try serving.await(io);
+    Fixture.terminal = true;
+    defer Fixture.terminal = false;
+    try std.testing.expectError(error.UnknownHostName, wait(fault_io, &client, "docs", .{}, 2000));
+}
+
+test "query wake barrier bounds redirected queries with one total budget" {
+    const httpx = client_mod.httpx;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var server = try httpx.TestServer.start(alloc, io, &.{
+        .{ .method = .POST, .path = "/db/v1/tables/docs/query", .respond = .{ .status = 307, .headers = &.{.{ .name = "Location", .value = "/final" }}, .delay_ns = 100 * std.time.ns_per_ms } },
+        .{ .method = .POST, .path = "/final", .respond = .{ .delay_ns = 500 * std.time.ns_per_ms, .body = "{\"responses\":[{\"status\":200,\"took\":0}]}" } },
+    });
+    defer server.deinit();
+    var http = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+    defer http.deinit();
+    var client = try client_mod.AntflyClient.init(alloc, &http, server.baseUrl());
+    defer client.deinit();
+    const Task = struct {
+        fn serve(ts: *httpx.TestServer) std.Io.Cancelable!void {
+            for (0..2) |_| ts.handleOne() catch return;
+        }
+    };
+    var group: std.Io.Group = .init;
+    try group.concurrent(io, Task.serve, .{&server});
+    defer group.cancel(io);
+    const start = std.Io.Clock.awake.now(io).nanoseconds;
+    try std.testing.expectError(error.ServingReadinessTimeout, wait(io, &client, "docs", .{}, 250));
+    try std.testing.expect(std.Io.Clock.awake.now(io).nanoseconds - start < 330 * std.time.ns_per_ms);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 1 }, server.route_hits);
 }
