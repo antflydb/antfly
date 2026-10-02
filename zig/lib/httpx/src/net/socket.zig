@@ -931,6 +931,9 @@ pub const PrefixedReader = struct {
 pub const ContentLengthReader = struct {
     inner: *Io.Reader,
     remaining: usize,
+    // Io.Reader exposes only ReadFailed/EndOfStream. Preserve the actual
+    // transport failure for callers that must decide whether replay is safe.
+    read_error: ?anyerror = null,
     reader_iface: Io.Reader,
 
     pub fn init(inner: *Io.Reader, limit: usize, buffer: []u8) ContentLengthReader {
@@ -950,6 +953,10 @@ pub const ContentLengthReader = struct {
         return @fieldParentPtr("reader_iface", r);
     }
 
+    pub fn checkReadError(self: *const ContentLengthReader) !void {
+        if (self.read_error) |err| return err;
+    }
+
     fn readVec(r: *Io.Reader, bufs: [][]u8) Io.Reader.Error!usize {
         const p = parent(r);
         if (p.remaining == 0) return error.EndOfStream;
@@ -961,9 +968,9 @@ pub const ContentLengthReader = struct {
         bufs[entry.index] = orig_buf[0..clamped_len];
         defer bufs[entry.index] = orig_buf; // restore original slice for caller
 
-        const n = readVecOnce(p.inner, bufs[entry.index]) catch |err| switch (err) {
-            error.EndOfStream => return error.ReadFailed,
-            error.ReadFailed => return error.ReadFailed,
+        const n = readVecOnce(p.inner, bufs[entry.index]) catch |err| {
+            p.read_error = if (err == error.EndOfStream) error.UnexpectedEof else err;
+            return error.ReadFailed;
         };
         p.remaining -= n;
         return n;
@@ -981,6 +988,7 @@ pub const ContentLengthReader = struct {
 /// parsing chunk-size lines and inter-chunk delimiters.
 pub const ChunkedBodyReader = struct {
     inner: *Io.Reader,
+    read_error: ?anyerror = null,
     chunk_remaining: usize = 0,
     state: ChunkState = .chunk_size,
     line_buf: [32]u8 = undefined,
@@ -1053,7 +1061,20 @@ pub const ChunkedBodyReader = struct {
         return p.ahead_end - p.ahead_start;
     }
 
+    pub fn checkReadError(self: *const ChunkedBodyReader) !void {
+        if (self.read_error) |err| return err;
+    }
+
     fn readVec(r: *Io.Reader, bufs: [][]u8) Io.Reader.Error!usize {
+        const p = parent(r);
+        return readVecInner(r, bufs) catch |err| {
+            if (err == error.EndOfStream and p.state == .done) return error.EndOfStream;
+            p.read_error = if (err == error.EndOfStream) error.UnexpectedEof else err;
+            return error.ReadFailed;
+        };
+    }
+
+    fn readVecInner(r: *Io.Reader, bufs: [][]u8) !usize {
         const p = parent(r);
         var iovecs_buffer: [8][]u8 = undefined;
         const dest_n, const data_size = try r.writableVector(&iovecs_buffer, bufs);
@@ -1073,7 +1094,7 @@ pub const ChunkedBodyReader = struct {
                             // Accumulate line content (excluding \r and \n) into line_buf.
                             for (buffered[0..nl_pos]) |byte| {
                                 if (byte == '\r') continue;
-                                if (p.line_len >= p.line_buf.len) return error.ReadFailed;
+                                if (p.line_len >= p.line_buf.len) return error.InvalidResponse;
                                 p.line_buf[p.line_len] = byte;
                                 p.line_len += 1;
                             }
@@ -1083,7 +1104,7 @@ pub const ChunkedBodyReader = struct {
                         // No newline yet — accumulate all buffered bytes into line_buf.
                         for (buffered) |byte| {
                             if (byte == '\r') continue;
-                            if (p.line_len >= p.line_buf.len) return error.ReadFailed;
+                            if (p.line_len >= p.line_buf.len) return error.InvalidResponse;
                             p.line_buf[p.line_len] = byte;
                             p.line_len += 1;
                         }
@@ -1098,7 +1119,7 @@ pub const ChunkedBodyReader = struct {
                     p.line_len = 0;
                     const hex_end = std.mem.indexOfScalar(u8, line, ';') orelse line.len;
                     const hex = std.mem.trim(u8, line[0..hex_end], " \t");
-                    p.chunk_remaining = std.fmt.parseInt(usize, hex, 16) catch return error.ReadFailed;
+                    p.chunk_remaining = std.fmt.parseInt(usize, hex, 16) catch return error.InvalidResponse;
 
                     if (p.chunk_remaining == 0) {
                         // Terminal chunk. Consume trailer lines until empty line.
@@ -1151,9 +1172,9 @@ pub const ChunkedBodyReader = struct {
                     const b1 = p.readOneByte() catch |err| return err;
                     if (b1 == '\r') {
                         const b2 = p.readOneByte() catch |err| return err;
-                        if (b2 != '\n') return error.ReadFailed;
+                        if (b2 != '\n') return error.InvalidResponse;
                     } else if (b1 != '\n') {
-                        return error.ReadFailed;
+                        return error.InvalidResponse;
                     }
                     p.state = .chunk_size;
                     continue;
@@ -1794,6 +1815,7 @@ test "ContentLengthReader reports premature EOF as ReadFailed" {
 
     var out: [8]u8 = undefined;
     try std.testing.expectError(error.ReadFailed, limited.reader_iface.readSliceShort(out[0..4]));
+    try std.testing.expectError(error.UnexpectedEof, limited.checkReadError());
 }
 
 test "ChunkedBodyReader skips leading empty buffers" {
@@ -1944,4 +1966,32 @@ test "timed fallback denied write sends no bytes" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     try TimedFallbackTest.denied(true, 0);
     try TimedFallbackTest.denied(true, 1);
+}
+
+test "ChunkedBodyReader preserves truncation versus invalid framing at every phase" {
+    const Case = struct { wire: []const u8, expected: anyerror };
+    for ([_]Case{
+        .{ .wire = "", .expected = error.UnexpectedEof },
+        .{ .wire = "5\r", .expected = error.UnexpectedEof },
+        .{ .wire = "5\r\nhel", .expected = error.UnexpectedEof },
+        .{ .wire = "5\r\nhello\r", .expected = error.UnexpectedEof },
+        .{ .wire = "5\r\nhello\r\n", .expected = error.UnexpectedEof },
+        .{ .wire = "0\r\nTrailer: value\r\n", .expected = error.UnexpectedEof },
+        .{ .wire = "z\r\n", .expected = error.InvalidResponse },
+        .{ .wire = "1\r\nx!", .expected = error.InvalidResponse },
+    }) |case| {
+        var inner = Io.Reader.fixed(case.wire);
+        var buffer: [32]u8 = undefined;
+        var chunked = ChunkedBodyReader.init(&inner, &buffer);
+        var output: [32]u8 = undefined;
+        try std.testing.expectError(error.ReadFailed, chunked.reader_iface.readSliceShort(&output));
+        try std.testing.expectError(case.expected, chunked.checkReadError());
+    }
+    var inner = Io.Reader.fixed("5\r\nhello\r\n0\r\nTrailer: value\r\n\r\n");
+    var buffer: [32]u8 = undefined;
+    var chunked = ChunkedBodyReader.init(&inner, &buffer);
+    var output: [32]u8 = undefined;
+    const n = try chunked.reader_iface.readSliceShort(&output);
+    try std.testing.expectEqualStrings("hello", output[0..n]);
+    try chunked.checkReadError();
 }
