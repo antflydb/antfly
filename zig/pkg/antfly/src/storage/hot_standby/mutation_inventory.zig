@@ -74,6 +74,14 @@ pub const Surface = enum {
     enrichment_worker,
     resolution_worker,
     compaction_worker,
+
+    /// Preserve certification and diagnostic wire names across internal renames.
+    pub fn wireName(self: Surface) []const u8 {
+        return switch (self) {
+            .hot_standby_control => "ha_control",
+            else => @tagName(self),
+        };
+    }
 };
 
 pub const Entry = struct {
@@ -248,7 +256,7 @@ test "hot-standby mutation inventory JSON exactly covers runtime surfaces and di
     defer parsed.deinit();
     try std.testing.expectEqual(entries.len, parsed.value.len);
     for (entries, parsed.value) |expected, actual| {
-        try std.testing.expectEqualStrings(@tagName(expected.surface), actual.surface);
+        try std.testing.expectEqualStrings(expected.surface.wireName(), actual.surface);
         try std.testing.expectEqualStrings(@tagName(expected.disposition), actual.disposition);
         try std.testing.expectEqualStrings(expected.path_pattern, actual.path_pattern);
         try std.testing.expectEqualStrings(expected.reason, actual.reason);

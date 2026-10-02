@@ -1213,7 +1213,7 @@ pub const AntflyApiHandler = struct {
         return try ctx.json(.{
             .@"error" = "mutation is not continuously replicated while HA is active",
             .code = "ha_mutation_not_replicated",
-            .surface = @tagName(mutation.surface),
+            .surface = mutation.surface.wireName(),
         });
     }
 
