@@ -32,6 +32,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
     const relationship_identity_filters = [_][]const u8{
         "db graph endpoint cleanup pages",
+        "derived worker pause",
         "graph endpoint cleanup byte admission",
         "bulk append index",
         "graph relationship integration",
@@ -87,6 +88,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_relationship_identity_tests = addCuratedTestRunArtifact(b, relationship_identity_tests, &relationship_identity_filters);
     b.step("antfly-storage-graph-identity-test", "Run relationship ownership, lifecycle, snapshot and replay regressions").dependOn(&run_relationship_identity_tests.step);
+    const worker_lifecycle_filters = [_][]const u8{
+        "storage.db.derived.io_threaded_runtime.",
+        "db graph endpoint cleanup pages rejected deletion",
+        "db graph endpoint cleanup pages rejected index deletion",
+        "db managed index deletion commits catalog absence with marker removal",
+    };
+    const worker_lifecycle_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &worker_lifecycle_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_worker_lifecycle_tests = addCuratedTestRunArtifact(b, worker_lifecycle_tests, &worker_lifecycle_filters);
+    b.step("antfly-storage-index-worker-lifecycle-test", "Run derived worker pause, replay retention, visibility and catalog retirement regressions").dependOn(&run_worker_lifecycle_tests.step);
     const direct_vector_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "online direct vector", "online graph snapshot", "retained transaction vector", "api module compiles", "metadata module compiles" },

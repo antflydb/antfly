@@ -1402,6 +1402,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "stored graph weights are finite and non-negative",
         "relationship predicates",
         "fact temporal predicates",
+        "derived worker pause",
         "exact two-edge pattern preserves same type parallel relationship matches",
         "canonical graph admission preserves and validates weight bounds",
         "graph edge type policy is byte-bounded UTF-8",
