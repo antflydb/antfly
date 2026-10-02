@@ -47452,13 +47452,17 @@ pub const DB = struct {
         var lifted_bool_filter = ChunkBoolFilterLowering{};
         defer lifted_bool_filter.deinit(alloc);
         if (suppress_text_doc_num_filter) {
-            // Discard any doc-number/ordinal resolution a composed search's
+            // Discard the composed-search doc-number/ordinal resolution a
             // shared filter step may already have attached upstream
             // (searchComposed resolves these unconditionally before
-            // dispatching to per-arm searches); they would be just as wrong
-            // here.
+            // dispatching to per-arm searches); it would be just as wrong
+            // here. resolved_doc_filter -- the generic doc-identity form
+            // filter_prefix resolves into (searchRequestWithIdentityPrefixFilterAlloc)
+            // -- is left intact: db_query_search.searchTextQuery itself
+            // skips using it natively for a chunk-backed member/chunk-mode
+            // query and instead carries it through to
+            // applyStoredSearchPatternFilters' parent-aware matcher.
             execution_req.resolved_text_doc_filter = null;
-            execution_req.resolved_doc_filter = null;
             // query.bool.filter/must_not (native TextQuery filter_text/
             // exclusion_text) are resolved the same wrong way: against the
             // chunk-backed index's own doc-number/ordinal space, which never

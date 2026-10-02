@@ -866,6 +866,14 @@ pub fn cloneNamedSetAsResult(alloc: Allocator, set: NamedResultSet, include_stor
             try alloc.dupe(u8, hit.stored_data.?)
         else
             null;
+        // A single-arm composed query (the common case) takes this clone
+        // shortcut instead of fuseNamedSets, but a chunk/asset member's
+        // provenance is carried only in artifact_ref -- drop it here and a
+        // composed filter_prefix query over a chunk-backed index returns a
+        // parent-mode hit indistinguishable from a plain document (same gap
+        // fuseNamedSets' ancestor-payload carry-forward exists for, issue
+        // #930).
+        cloned.artifact_ref = if (hit.artifact_ref) |ref| try ref.clone(alloc) else null;
         hits[i] = cloned;
         initialized += 1;
     }
@@ -987,6 +995,8 @@ pub fn fuseNamedSets(
             errdefer if (ancestor_source_data) |value| alloc.free(value);
             const ancestor_unit_data = if (ancestors) |a| (if (a.unit) |u| try alloc.dupe(u8, u) else null) else null;
             errdefer if (ancestor_unit_data) |value| alloc.free(value);
+            var owned_artifact_ref: ?types.ArtifactRef = if (ancestors) |a| (if (a.artifact_ref) |ref| try ref.clone(alloc) else null) else null;
+            errdefer if (owned_artifact_ref) |*ref| ref.deinit(alloc);
             break :blk types.SearchHit{
                 .id = owned_id,
                 .doc_ordinal = if (representative) |entry| entry.ordinal else if (ordinal_by_id.get(hit.doc_id)) |ordinal| ordinal else null,
@@ -995,6 +1005,7 @@ pub fn fuseNamedSets(
                 .stored_data = stored_data,
                 .ancestor_source_data = ancestor_source_data,
                 .ancestor_unit_data = ancestor_unit_data,
+                .artifact_ref = owned_artifact_ref,
             };
         };
         hits[i] = materialized;
@@ -1033,26 +1044,33 @@ const OrdinalFusionEntry = struct {
 const AncestorPayload = struct {
     source: ?[]const u8 = null,
     unit: ?[]const u8 = null,
+    // Borrowed from the source named_sets' hit, same lifetime guarantee as
+    // source/unit above; fuseNamedSets clones it into the materialized fused
+    // hit rather than taking ownership here.
+    artifact_ref: ?types.ArtifactRef = null,
 };
 
-/// Records the ancestor payload (if any) carried by a pre-fusion hit under
-/// its fusion key, preferring any arm's hit that actually hydrated one for
-/// this member (issue #930: fusion previously rebuilt hits from scratch and
-/// silently dropped ancestor_source_data/ancestor_unit_data).
+/// Records the ancestor payload and artifact_ref (if any) carried by a
+/// pre-fusion hit under its fusion key, preferring any arm's hit that
+/// actually populated one for this member (issue #930: fusion previously
+/// rebuilt hits from scratch and silently dropped ancestor_source_data/
+/// ancestor_unit_data; artifact_ref -- a chunk/asset member's provenance --
+/// is lost by the same rebuild and needs the same carry-forward).
 fn recordAncestorPayload(
     alloc: Allocator,
     map: *std.StringHashMapUnmanaged(AncestorPayload),
     key: []const u8,
     hit: types.SearchHit,
 ) !void {
-    if (hit.ancestor_source_data == null and hit.ancestor_unit_data == null) return;
+    if (hit.ancestor_source_data == null and hit.ancestor_unit_data == null and hit.artifact_ref == null) return;
     const gop = try map.getOrPut(alloc, key);
     if (!gop.found_existing) {
-        gop.value_ptr.* = .{ .source = hit.ancestor_source_data, .unit = hit.ancestor_unit_data };
+        gop.value_ptr.* = .{ .source = hit.ancestor_source_data, .unit = hit.ancestor_unit_data, .artifact_ref = hit.artifact_ref };
         return;
     }
     if (gop.value_ptr.source == null) gop.value_ptr.source = hit.ancestor_source_data;
     if (gop.value_ptr.unit == null) gop.value_ptr.unit = hit.ancestor_unit_data;
+    if (gop.value_ptr.artifact_ref == null) gop.value_ptr.artifact_ref = hit.artifact_ref;
 }
 
 fn namedSetsHaveCompleteOrdinals(named_sets: []const NamedResultSet) bool {

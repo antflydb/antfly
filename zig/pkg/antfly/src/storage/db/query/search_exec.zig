@@ -11402,6 +11402,15 @@ pub fn searchTextQuery(
     const group_chunk_parents = shouldGroupChunkParents(effective_req, chunk_backed);
     const paging = componentPaging(effective_req);
     effective_req.full_text = text_query;
+    // Chunk/asset members are separate full-text documents from their parent
+    // row with their own doc numbers, so a resolved_doc_filter keyed by
+    // parent-row identity (e.g. filter_prefix, resolved once before composed
+    // search fans out) never covers them here -- the same issue #931 already
+    // fixed for filter_text. Skip the native application below and carry the
+    // filter through to postprocess unresolved; applyStoredSearchPatternFilters
+    // matches it against each hit's resolved parent id instead.
+    const member_mode_for_filter = effective_req.return_mode == .member or effective_req.return_mode == .chunk;
+    const suppress_native_resolved_doc_filter = chunk_backed and member_mode_for_filter;
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -11433,7 +11442,10 @@ pub fn searchTextQuery(
     const derive_constraints_ns = if (bench_query_profile) platform_time.monotonicNs() - constraints_start_ns else 0;
 
     const resolved_filter_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-    if (resolvedTextDocNumFilterFromRequest(effective_req)) |filter| {
+    if (suppress_native_resolved_doc_filter) {
+        // Leave native_constraints untouched; the filter still reaches
+        // postprocess below via effective_req.resolved_doc_filter.
+    } else if (resolvedTextDocNumFilterFromRequest(effective_req)) |filter| {
         try applyResolvedTextDocNumFilterAlloc(alloc, &native_constraints, filter);
     } else if (resolvedDocFilterFromRequest(effective_req)) |filter| {
         try applyResolvedDocFilterToTextDocNumsAlloc(alloc, snapshot, &native_constraints, filter, .{
@@ -11666,6 +11678,16 @@ pub fn searchTextQuery(
             native_constraints.filter_query_json_resolved,
             native_constraints.exclusion_query_json_resolved,
         );
+        // requestAfterNativeFilters assumes a resolved_doc_filter was already
+        // enforced against this candidate window and always clears it.
+        // Never applied natively here (suppress_native_resolved_doc_filter
+        // above), so restore the borrowed reference: it is still owed to
+        // applyStoredSearchPatternFilters, which matches it against each
+        // hit's resolved parent id instead.
+        if (suppress_native_resolved_doc_filter) {
+            postprocess_req.resolved_doc_filter = effective_req.resolved_doc_filter;
+            postprocess_req.resolved_doc_filter_owned = effective_req.resolved_doc_filter_owned;
+        }
         if (late_visibility_paginate or requires_field_sort or group_chunk_parents) {
             postprocess_req.offset = 0;
             postprocess_req.limit = candidate_limit;
@@ -11722,7 +11744,7 @@ pub fn searchTextQuery(
                 };
                 var assigned = false;
                 errdefer if (!assigned) materialized.deinit(alloc);
-                if (chunk_backed and returnModeRequiresUnitGrouping(effective_req.return_mode)) {
+                if (chunk_backed) {
                     materialized.artifact_ref = try artifact_ids.decodeArtifactRefAlloc(alloc, stored.id);
                 }
                 materialized.index_scores = try types.cloneIndexScores(alloc, hit.index_scores);
@@ -11741,7 +11763,7 @@ pub fn searchTextQuery(
             };
             var assigned = false;
             errdefer if (!assigned) materialized.deinit(alloc);
-            if (chunk_backed and returnModeRequiresUnitGrouping(effective_req.return_mode)) {
+            if (chunk_backed) {
                 materialized.artifact_ref = try artifact_ids.decodeArtifactRefAlloc(alloc, id);
             }
             materialized.index_scores = try types.cloneIndexScores(alloc, hit.index_scores);
