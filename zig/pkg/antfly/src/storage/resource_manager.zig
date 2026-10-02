@@ -3735,14 +3735,17 @@ pub const BudgetedAllocator = struct {
         std.debug.assert(self.budget_denied);
         const failure = self.last_allocation_failure orelse return true;
         if (failure.cause != .admission) return true;
+        const requested = std.math.cast(u64, failure.requested_bytes) orelse return true;
+        const own_need = std.math.add(u64, failure.live_bytes, requested) catch return true;
+        // A sole owner may exceed the slice limit by the allocator's multiple,
+        // but never the node-wide memory limit.
+        if (failure.aggregate_limit_bytes > 0 and own_need > failure.aggregate_limit_bytes) return true;
         const limit = failure.slice_limit_bytes;
-        if (limit == 0) return true;
+        if (limit == 0) return failure.aggregate_limit_bytes == 0;
         const sole_owner_limit = if (self.max_hard_limit_multiple <= 1)
             limit
         else
             std.math.mul(u64, limit, self.max_hard_limit_multiple) catch std.math.maxInt(u64);
-        const requested = std.math.cast(u64, failure.requested_bytes) orelse return true;
-        const own_need = std.math.add(u64, failure.live_bytes, requested) catch return true;
         return own_need > sole_owner_limit;
     }
 
@@ -3957,6 +3960,20 @@ test "budgeted allocator denial separates slice contention from own oversize dem
     try std.testing.expectError(error.OutOfMemory, oversized.threadSafeAllocator().alloc(u8, 4097));
     try std.testing.expect(oversized.denied());
     try std.testing.expect(oversized.deniedByOwnDemand());
+}
+
+test "budgeted allocator denial over the node memory limit is own demand" {
+    const alloc = std.testing.allocator;
+    var budgets = Options.defaultBudgets();
+    budgets[@intFromEnum(Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = 200 };
+    var manager = ResourceManager.init(.{ .budgets = budgets, .memory_budget = .{ .hard_limit_bytes = 100 } });
+    defer manager.deinit(alloc);
+
+    var budgeted = BudgetedAllocator.init(&manager, .document_extraction_working_set, alloc, 1);
+    defer budgeted.deinit();
+    try std.testing.expectError(error.OutOfMemory, budgeted.threadSafeAllocator().alloc(u8, 150));
+    try std.testing.expect(budgeted.denied());
+    try std.testing.expect(budgeted.deniedByOwnDemand());
 }
 
 test "default tokenizer cache budget is aligned with its resource slice" {

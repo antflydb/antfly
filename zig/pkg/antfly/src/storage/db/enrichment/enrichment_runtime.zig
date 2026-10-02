@@ -19001,7 +19001,7 @@ const RuntimeDocumentReplaySegmentLease = struct {
                 runtime_document_replay_segment_memory_bytes,
             ) catch |err| switch (err) {
                 error.ResourceBudgetExceeded => {
-                    const hard_limit = resource_manager.sliceStats(.document_extraction_working_set).hard_limit_bytes;
+                    const hard_limit = resource_manager.memoryHardLimitForSlice(.document_extraction_working_set);
                     return if (hard_limit > 0 and runtime_document_replay_segment_memory_bytes > hard_limit)
                         error.DocumentExtractionWorkingSetTooLarge
                     else
@@ -20181,12 +20181,13 @@ const RuntimeDocumentExtractionResourceTracker = struct {
     fn reserveAdditional(self: *@This(), bytes: usize) !void {
         const additional = std.math.cast(u64, bytes) orelse return error.DocumentExtractionWorkingSetTooLarge;
         if (self.manager) |manager| {
-            const stats = manager.sliceStats(.document_extraction_working_set);
+            // Own demand is bounded by the tighter of the slice and node limits.
+            const hard_limit = manager.memoryHardLimitForSlice(.document_extraction_working_set);
             const operation_current = std.math.add(u64, self.current_bytes, self.externallyAccountedDownloadedBytes()) catch
                 return error.DocumentExtractionWorkingSetTooLarge;
             const operation_next = std.math.add(u64, operation_current, additional) catch
                 return error.DocumentExtractionWorkingSetTooLarge;
-            if (stats.hard_limit_bytes > 0 and operation_next > stats.hard_limit_bytes)
+            if (hard_limit > 0 and operation_next > hard_limit)
                 return error.DocumentExtractionWorkingSetTooLarge;
         }
         const next = std.math.add(u64, self.current_bytes, additional) catch return error.DocumentExtractionWorkingSetTooLarge;
@@ -20196,10 +20197,11 @@ const RuntimeDocumentExtractionResourceTracker = struct {
     fn setBytes(self: *@This(), bytes: usize) !void {
         const next = std.math.cast(u64, bytes) orelse return error.ResourceBudgetExceeded;
         if (self.manager) |manager| {
-            const stats = manager.sliceStats(.document_extraction_working_set);
+            // Own demand is bounded by the tighter of the slice and node limits.
+            const hard_limit = manager.memoryHardLimitForSlice(.document_extraction_working_set);
             const operation_next = std.math.add(u64, next, self.externallyAccountedDownloadedBytes()) catch
                 return error.DocumentExtractionWorkingSetTooLarge;
-            if (stats.hard_limit_bytes > 0 and operation_next > stats.hard_limit_bytes)
+            if (hard_limit > 0 and operation_next > hard_limit)
                 return error.DocumentExtractionWorkingSetTooLarge;
         }
         return try self.setAccountedBytes(next);
@@ -20207,14 +20209,15 @@ const RuntimeDocumentExtractionResourceTracker = struct {
 
     fn setAccountedBytes(self: *@This(), next: u64) !void {
         const manager = self.manager orelse return;
-        const stats = manager.sliceStats(.document_extraction_working_set);
-        if (stats.hard_limit_bytes > 0 and next > stats.hard_limit_bytes) {
+        // Own demand is bounded by the tighter of the slice and node limits.
+        const hard_limit = manager.memoryHardLimitForSlice(.document_extraction_working_set);
+        if (hard_limit > 0 and next > hard_limit) {
             return error.DocumentExtractionWorkingSetTooLarge;
         }
         manager.adjustUsage(.document_extraction_working_set, &self.current_bytes, next) catch |err| switch (err) {
             // The own-demand check above already rejected `next` exceeding
-            // the hard limit, so this failure means other owners hold the
-            // slice: retryable contention.
+            // the slice or node hard limit, so this failure means other
+            // owners hold the memory: retryable contention.
             error.ResourceBudgetExceeded => return error.ResourceTemporarilyUnavailable,
             else => return err,
         };
@@ -20268,6 +20271,19 @@ test "document extraction working set contention is retryable while own oversize
     try std.testing.expect(!isRetryableEnrichmentError(error.DocumentExtractionWorkingSetTooLarge));
 
     try other.setBytes(0);
+    try tracker.setBytes(50);
+}
+
+test "document extraction working set over the node memory limit stays terminal" {
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+        .soft_limit_bytes = 0,
+        .hard_limit_bytes = 200,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets, .memory_budget = .{ .hard_limit_bytes = 100 } });
+    var tracker = RuntimeDocumentExtractionResourceTracker{ .manager = &manager };
+    defer tracker.deinit();
+    try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, tracker.setBytes(150));
     try tracker.setBytes(50);
 }
 
