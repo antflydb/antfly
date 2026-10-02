@@ -10,7 +10,7 @@ pub const sgemm_tile = core.sgemm_tile;
 pub const applyBeta = core.applyBeta;
 pub const sgemmTransA = core.sgemmTransA;
 
-extern "c" fn antfly_x86_sgemm(m_start: usize, m_end: usize, n: usize, k: usize, alpha: f32, a: [*]const f32, b: [*]const f32, c: [*]f32) void;
+extern fn antfly_x86_sgemm(m_start: usize, m_end: usize, n: usize, k: usize, alpha: f32, a: [*]const f32, b: [*]const f32, c: [*]f32) callconv(.c) void;
 
 pub fn sgemmAddSlice(m_start: usize, m_end: usize, n: usize, k: usize, alpha: f32, a: []const f32, b: []const f32, c: []f32) void {
     if (comptime x86.enabled) {
@@ -22,7 +22,7 @@ pub fn sgemmAddSlice(m_start: usize, m_end: usize, n: usize, k: usize, alpha: f3
     core.sgemmAddSlice(m_start, m_end, n, k, alpha, a, b, c);
 }
 
-extern "c" fn antfly_x86_sgemm_transb(m_start: usize, m_end: usize, n: usize, k: usize, alpha: f32, a: [*]const f32, b: [*]const f32, c: [*]f32) void;
+extern fn antfly_x86_sgemm_transb(m_start: usize, m_end: usize, n: usize, k: usize, alpha: f32, a: [*]const f32, b: [*]const f32, c: [*]f32) callconv(.c) void;
 
 pub fn sgemmTransBAddSlice(m_start: usize, m_end: usize, n: usize, k: usize, alpha: f32, a: []const f32, b: []const f32, c: []f32) void {
     if (comptime x86.enabled) {
@@ -34,7 +34,7 @@ pub fn sgemmTransBAddSlice(m_start: usize, m_end: usize, n: usize, k: usize, alp
     core.sgemmTransBAddSlice(m_start, m_end, n, k, alpha, a, b, c);
 }
 
-extern "c" fn antfly_x86_sgemm_transb_f16(m_start: usize, m_end: usize, n: usize, k: usize, alpha: f32, a: [*]const f32, b: [*]const f16, c: [*]f32) void;
+extern fn antfly_x86_sgemm_transb_f16(m_start: usize, m_end: usize, n: usize, k: usize, alpha: f32, a: [*]const f32, b: [*]const f16, c: [*]f32) callconv(.c) void;
 
 pub fn sgemmTransBF16AddSlice(m_start: usize, m_end: usize, n: usize, k: usize, alpha: f32, a: []const f32, b: []const f16, c: []f32) void {
     if (comptime x86.enabled) {

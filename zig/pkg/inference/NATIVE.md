@@ -22,7 +22,7 @@ That makes Linux and cross-platform builds more fragile than they need to be. Th
 ## Status
 
 - Native CPU backend availability is decoupled from system BLAS linkage.
-- `-Dsystem-blas` controls link-time system BLAS acceleration.
+- `-Dblas=auto|linked|off` controls native CPU BLAS acceleration.
 - Linux x86 GNU builds prefer runtime-loaded OpenBLAS when installed, with native fallback.
 - Native builds report the `native` backend explicitly.
 - Backend identity stays `native`.
@@ -73,7 +73,24 @@ official amd64 `zig/Dockerfile.runtime` image includes it. The executable has
 no required OpenBLAS dependency and still starts and runs native kernels when
 the library is absent. Mac Accelerate and portable musl builds are unchanged.
 
-Runtime controls (read once on first native matrix operation):
+Build policy (shared by the root and standalone inference builds):
+
+| Option | Behavior |
+| --- | --- |
+| `-Dblas=auto` (default) | Keep macOS Accelerate linkage; prefer optional runtime OpenBLAS on Linux x86 GNU; use native kernels elsewhere. An explicit `-Dblas-root` selects link-time BLAS, preserving existing behavior. |
+| `-Dblas=linked` | Require link-time system BLAS: Accelerate on macOS, OpenBLAS elsewhere. Requires a native build with libc. |
+| `-Dblas=off` | Disable both link-time BLAS and runtime loading; use native kernels. |
+
+`-Dblas-root=/path` supplies include/library/runtime search paths for linked
+OpenBLAS. It does not override `-Dblas=off`.
+
+The deprecated `-Dsystem-blas` and `-Druntime-openblas` flags remain accepted
+when `-Dblas` is absent, with their previous independent meanings. In particular,
+`-Dsystem-blas=false` disables linkage but still permits runtime loading by
+default; use `-Dblas=off` to disable both. Do not combine either deprecated flag
+with `-Dblas`: the build rejects that ambiguous configuration.
+
+Runtime controls for optional loading (read once on first native matrix operation):
 
 - `ANTFLY_INFERENCE_BLAS=auto` (default): prefer compatible OpenBLAS, otherwise
   use the native kernels. `off` disables runtime loading; `openblas` requires
@@ -84,8 +101,6 @@ Runtime controls (read once on first native matrix operation):
   clamped to the existing native CPU budget (affinity, cgroup quota, maximum
   eight workers, and `ANTFLY_INFERENCE_CPU_THREADS`). Explicit requests are
   also clamped to that budget. The selected count is logged once.
-- `-Druntime-openblas=false` removes runtime loading support at build time.
-  This is independent of `-Dsystem-blas`, which retains its link-time meaning.
 
 The runtime path supports LP64 pthread OpenBLAS. It rejects ILP64, OpenMP,
 sequential, and incomplete libraries before calling GEMM, using native fallback
@@ -102,7 +117,7 @@ check loading, fallback, thread limits, and numerical behavior. Add
 Non-macOS native acceleration is configured with:
 
 - `-Dblas-root=/path`
-- `-Dsystem-blas=true|false`
+- `-Dblas=linked`
 
 This configures include/library/runtime search paths without making ONNX Runtime bundles part of the native backend contract.
 
@@ -142,5 +157,5 @@ Quantized direct kernels use the persistent native worker pool by default. Use
 ## Notes
 
 - macOS can keep using `Accelerate` by default when system BLAS acceleration is enabled.
-- On non-macOS, `-Dsystem-blas=true` links OpenBLAS, and `-Dblas-root=/path` points the build at an explicit OpenBLAS-style install with `include/` and `lib/`.
+- On non-macOS, `-Dblas=linked` links OpenBLAS, and `-Dblas-root=/path` points the build at an explicit OpenBLAS-style install with `include/` and `lib/`.
 - Performance work belongs after the portability boundary is correct.

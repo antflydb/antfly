@@ -124,6 +124,13 @@ only after CPUID and OS XMM/YMM-state checks. Sequential attention uses the same
 selection. The baseline kernels use separate multiply/add rather than scalar
 software FMA. macOS, Accelerate, and ARM arithmetic are unchanged.
 
+Use `-Dblas=auto` (the default) for optional BLAS, `-Dblas=linked` to require
+link-time BLAS, or `-Dblas=off` for a binary with both BLAS paths disabled.
+For same-binary runtime comparisons, use `ANTFLY_INFERENCE_BLAS=off` versus
+`auto` on an auto-policy build without `-Dblas-root`. The old `-Dsystem-blas`
+and `-Druntime-openblas` build flags are compatibility options; do not mix them
+with `-Dblas`.
+
 Linux x86 GNU builds now prefer optional runtime OpenBLAS for FP32 GEMM when a
 compatible LP64 pthread library is installed. The amd64 runtime image includes
 it; other installations retain native fallback when it is absent. See
@@ -159,7 +166,9 @@ python3 zig/tools/verify_linux_x86_kernels.py --zig /path/to/zig
 ```
 
 Install `qemu-x86_64` and pass `--require-qemu` to require no-AVX execution and
-unsupported-force rejection. The checker also audits assembly for software
+unsupported-force rejection locally. CI does not install or require QEMU;
+these execution checks are skipped when it is unavailable. Native GNU/musl
+checks, including libc-free builds, still run. The checker also audits assembly for software
 FMA in portable GEMM and vector FMA in the accelerated object.
 
 For end-to-end HTTP evidence, `benchmark_linux_cpu_http.py` compares already

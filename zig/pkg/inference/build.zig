@@ -188,11 +188,8 @@ pub fn build(b: *std.Build) void {
     const enable_native = !enable_wasm;
     // The native CPU backend is always available on native builds. System BLAS
     // remains an optional acceleration layer for hot kernels.
-    const system_blas_available = target.result.os.tag == .macos or blas_root_opt != null;
-    const enable_system_blas = if (enable_wasm or !link_libc)
-        false
-    else
-        (b.option(bool, "system-blas", "Enable system BLAS acceleration for native CPU math") orelse system_blas_available);
+    const blas = @import("build/blas.zig").configure(b, !enable_wasm and link_libc, target.result.os.tag == .macos, blas_root_opt != null);
+    const enable_system_blas = blas.system;
     const blas_root = if (enable_wasm or !enable_system_blas or target.result.os.tag == .macos)
         null
     else
@@ -269,7 +266,7 @@ pub fn build(b: *std.Build) void {
             .enable_pjrt = enable_pjrt,
             .enable_native = enable_native,
             .enable_system_blas = enable_system_blas,
-            .enable_runtime_openblas = b.option(bool, "runtime-openblas", "Prefer runtime-loaded OpenBLAS on Linux x86 GNU, with native fallback") orelse true,
+            .enable_runtime_openblas = blas.runtime,
             .blas_root = blas_root,
             .enable_wasm = enable_wasm,
             .enable_webgpu = enable_webgpu,

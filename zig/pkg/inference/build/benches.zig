@@ -32,6 +32,7 @@ fn createCpuComputeModule(ctx: Context, source: []const u8) *std.Build.Module {
     });
     module.addOptions("build_options", runtime_build.addBuildOptions(ctx.b, .{
         .enable_system_blas = ctx.backend.enable_system_blas,
+        .enable_runtime_openblas = ctx.backend.enable_runtime_openblas,
         .enable_native_quant_dispatch_stats = ctx.backend.enable_native_quant_dispatch_stats,
     }));
     if (ctx.backend.enable_system_blas)

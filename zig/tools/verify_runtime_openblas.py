@@ -148,6 +148,7 @@ def main():
             run([args.cc, '-shared', '-fPIC', *flags, out/'fixture.c', '-o', libs[name]])
         (out/'probe.zig').write_text(PROBE)
         cache = ['--cache-dir', out/'cache', '--global-cache-dir', out/'global']
+        run([args.zig, 'test', root/'pkg/inference/build/blas.zig', *cache])
         obj = out/'avx2.o'
         run([args.zig, 'build-obj', root/'lib/linalg/src/x86_avx2.zig', '-target', 'x86_64-linux-gnu',
              '-mcpu=baseline+avx+avx2+fma+f16c', '-O', 'ReleaseFast', '-fPIC', f'-femit-bin={obj}', *cache])

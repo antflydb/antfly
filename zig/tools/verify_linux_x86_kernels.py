@@ -50,6 +50,17 @@ def main():
                  f"-femit-asm={portable_asm}", *cache])
             if re.search(r"\bcall\w*\s+[^\n]*\bfmaf?\b", portable_asm.read_text()):
                 raise RuntimeError("portable GEMM contains a software FMA call")
+            # The AVX2 symbols belong to the supplied object, not libc. Keep
+            # this link-and-run check libc-free to catch accidental library tags.
+            no_libc = out / f"test-{abi}-no-libc"
+            run([args.zig, "test", source / "mod.zig", obj, "-target", target,
+                 "-mcpu=baseline", "-O", "ReleaseSafe", "--test-no-exec",
+                 f"-femit-bin={no_libc}", *cache])
+            result = run([no_libc])
+            print(f"{abi}/no-libc: {result.stdout.strip().splitlines()[-1]}")
+            if qemu:
+                result = run([qemu, "-cpu", "qemu64", no_libc])
+                print(f"{abi}/no-libc/no-AVX: {result.stdout.strip().splitlines()[-1]}")
             binary = out / f"test-{abi}"
             run([args.zig, "test", source / "mod.zig", obj, "-lc", "-target", target,
                  "-mcpu=baseline", "-O", "ReleaseSafe", "--test-no-exec",

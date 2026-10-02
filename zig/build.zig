@@ -156,11 +156,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     else
         false;
     const inference_blas_root_opt = b.option([]const u8, "blas-root", "Path to system BLAS root with include/ and lib/ for non-macOS native acceleration");
-    const inference_system_blas_available = link_libc and (target.result.os.tag == .macos or inference_blas_root_opt != null);
-    const inference_enable_system_blas = if (link_libc)
-        b.option(bool, "system-blas", "Enable system BLAS acceleration for native CPU math") orelse inference_system_blas_available
-    else
-        false;
+    const inference_blas = @import("pkg/inference/build/blas.zig").configure(b, link_libc, target.result.os.tag == .macos, inference_blas_root_opt != null);
+    const inference_enable_system_blas = inference_blas.system;
     const inference_blas_root = if (inference_enable_system_blas and target.result.os.tag != .macos)
         inference_blas_root_opt
     else
@@ -670,7 +667,7 @@ pub fn create(b: *std.Build) ?Artifacts {
             .wasm_memory_model = b.option([]const u8, "wasm-memory-model", "Inference WASM memory model: wasm32 or wasm64") orelse "wasm32",
             .enable_webgpu = b.option(bool, "webgpu", "Enable WebGPU for inference WASM") orelse false,
             .enable_system_blas = inference_enable_system_blas,
-            .enable_runtime_openblas = b.option(bool, "runtime-openblas", "Prefer runtime-loaded OpenBLAS on Linux x86 GNU, with native fallback") orelse true,
+            .enable_runtime_openblas = inference_blas.runtime,
             .blas_root = inference_blas_root,
             .link_libc = link_libc,
             .skip_openapi = false,
