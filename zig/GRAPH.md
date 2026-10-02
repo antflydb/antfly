@@ -925,6 +925,16 @@ implemented as a separate lake graph feature: lake sidecars are built from
 row-source JSON and receive neither this index TTL policy nor the authoritative
 edge creation timestamp. Stateful TTL-enabled graph indexes do not publish
 through that sidecar path.
+
+Canonical serverless traversal, shortest paths,
+k-shortest paths, and MATCH apply relationship predicates on `/source`,
+`/target`, `/type`, and `/weight` before admission and path ranking. Published
+lake sidecars do not store fact IDs, owners, fact metadata, or creation/update times;
+filters on these fields, `valid_at`, and `known_at` are rejected with HTTP 422
+(`edge_filter`, `request_control_not_supported`), including in OPTIONAL and
+NOT EXISTS clauses. Temporal/fact predicates require the stateful graph index
+until lake publication has an explicit format supporting those fields.
+
 The DB materializer and enrichment runtime both consult source tombstones
 during replay, clear them on source retirement, and admit a changed source
 revision with a new lifetime. A guarded cleanup transaction now
