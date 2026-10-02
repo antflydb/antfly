@@ -1954,6 +1954,14 @@ pub fn isGraphEdgeContenderKey(key: []const u8) bool {
     return state_term + 2 == key.len;
 }
 
+/// Only membership rows carry a GEC1 contender, unlike count and TTL rows.
+pub fn isGraphEdgeContenderMembershipKey(key: []const u8) bool {
+    if (!isGraphEdgeContenderKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1).?;
+    const index_term = findComponentTerminator(key, doc_term + 3).?;
+    return key[index_term + 2] == graph_edge_contender_record_kind;
+}
+
 pub fn isGraphEdgeTtlLifetimeKey(key: []const u8) bool {
     if (!isGraphEdgeContenderKey(key)) return false;
     const doc_term = findComponentTerminator(key, 1) orelse return false;
@@ -2951,6 +2959,9 @@ test "graph edge contender keys are edge and state scoped" {
     const count_key = try graphEdgeContenderCountKeyAlloc(alloc, "doc:a", "gr_v1");
     defer alloc.free(count_key);
     try std.testing.expect(isGraphEdgeContenderKey(count_key));
+    try std.testing.expect(!isGraphEdgeContenderMembershipKey(count_key));
+    try std.testing.expect(isGraphEdgeContenderMembershipKey(key));
+    try std.testing.expect(!isGraphEdgeContenderMembershipKey("invalid"));
 }
 
 test "global graph contender keys are generation fenced and priority ordered" {

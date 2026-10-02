@@ -10414,7 +10414,7 @@ test "httpx multi batch route uses the batch commit hook and public response con
     const alloc = std.testing.allocator;
     var status = AuthStatusSource{};
     var writes = FakeWrites{};
-    var api_server = ApiHttpServer.init(alloc, .{}, status.iface(), null, writes.source());
+    var api_server = ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone }, status.iface(), null, writes.source());
     var e2e_server: HttpxE2eServer = undefined;
     e2e_server.init(alloc, &api_server) catch |err| switch (err) {
         // Restricted test environments may forbid even loopback listeners.
@@ -10660,7 +10660,7 @@ test "httpx stable transaction commit durably hands off recovery before acknowle
     const alloc = std.testing.allocator;
     var status = AuthStatusSource{};
     var writes = FakeWrites{};
-    var api_server = ApiHttpServer.init(alloc, .{}, status.iface(), null, writes.source());
+    var api_server = ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone }, status.iface(), null, writes.source());
     defer api_server.deinit();
     var e2e_server: HttpxE2eServer = undefined;
     e2e_server.init(alloc, &api_server) catch |err| switch (err) {
@@ -14437,6 +14437,9 @@ test "httpx lookup revalidates missing catalog bindings across restore" {
         const original = "{\"table_id\":7,\"name\":\"physical-old\"}";
 
         fn catalog(ptr: *anyopaque, alloc: std.mem.Allocator, _: operation_contract.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            // This fixture has no row policy publication. The catalog still
+            // authoritatively answers the policy probe before the row lookup.
+            if (call == .policy_publication_status) return error.RowPolicyCatalogChanged;
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const target = switch (call) {
                 .resolve => |target| target,

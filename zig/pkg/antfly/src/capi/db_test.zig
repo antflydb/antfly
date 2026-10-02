@@ -2110,7 +2110,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"index_layout\":\"native_index_catalog_pages\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"index_layout\":\"lsm") == null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"index_namespace\":\"__antfly_lite\"") != null);
-    const expected_format_version = try std.fmt.allocPrint(alloc, "\"format_version\":{d}", .{antfly.lite.native.format_version});
+    const expected_format_version = try std.fmt.allocPrint(alloc, "\"format_version\":{d}", .{(try antfly.lite.native.inspect(alloc, std.testing.io, src_path)).format_version});
     defer alloc.free(expected_format_version);
     try std.testing.expect(std.mem.indexOf(u8, status_json, expected_format_version) != null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"page_size\":4096") != null);
@@ -4267,7 +4267,7 @@ test "storage owner runtime status bulk recovery bridge preserves identities cap
     bridge.owner_id = &owner_id;
     bridge.config = .{ .callback_ctx = &capture, .replicated_metadata = 1, .acknowledge_participants_fn = Capture.acknowledge };
     const config = bridge.dbConfig();
-    try std.testing.expect(config.acknowledge_participants_fn != null);
+    try std.testing.expect(config.factory != null);
     try StorageOwnerTransactionRecovery.acknowledgeParticipants(&bridge, @splat(5), "owner", &.{ "first", "second" });
     for ([_]anyerror{ error.UnsupportedOperation, error.UnsupportedRaftBatchProtocolVersion, error.RaftBatchWriteOutcomeUnknown }) |err| {
         capture.result = kernel_error_identity.statusFromError(err);
@@ -4276,7 +4276,7 @@ test "storage owner runtime status bulk recovery bridge preserves identities cap
     try std.testing.expectError(error.InvalidParticipant, StorageOwnerTransactionRecovery.acknowledgeParticipants(&bridge, @splat(5), "owner", &.{}));
     try std.testing.expectEqual(@as(usize, 4), capture.calls);
     bridge.config.acknowledge_participants_fn = null;
-    try std.testing.expect(bridge.dbConfig().acknowledge_participants_fn == null);
+    try std.testing.expectError(error.UnsupportedOperation, StorageOwnerTransactionRecovery.acknowledgeParticipants(&bridge, @splat(5), "owner", &.{ "first", "second" }));
 }
 
 // These callbacks are installed only by the private server owner. Public Lite

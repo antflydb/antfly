@@ -2573,7 +2573,7 @@ test "lite status json includes pending work" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"index_layout\":\"native_index_catalog_pages\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"index_layout\":\"lsm") == null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"index_namespace\":\"__antfly_lite\"") != null);
-    const expected_format_version = try std.fmt.allocPrint(allocator, "\"format_version\":{d}", .{antfly.lite.native.format_version});
+    const expected_format_version = try std.fmt.allocPrint(allocator, "\"format_version\":{d}", .{(try antfly.lite.native.inspect(allocator, std.testing.io, path)).format_version});
     defer allocator.free(expected_format_version);
     try std.testing.expect(std.mem.indexOf(u8, json, expected_format_version) != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"page_size\":4096") != null);

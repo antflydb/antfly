@@ -824,7 +824,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.IntentConflict => status(.conflict, .intent_conflict),
         error.VersionConflict => status(.conflict, .version_conflict),
         error.MergePageRequired => status(.conflict, .merge_page_required),
-        error.InvalidResponse => status(.internal, .invalid_response),
+        error.InvalidResponse, error.UnexpectedEof => status(.internal, .invalid_response),
         error.TransitionOperationsRetired => status(.retryable, .transition_operations_retired),
         error.TransitionOperationBusy => status(.retryable, .transition_operation_busy),
         error.UnknownSplitRuntime => status(.not_found, .unknown_split_runtime),
@@ -2043,6 +2043,7 @@ test "stable status preserves deterministic raft rejection and malformed respons
     // A malformed response is not proof that a mutation failed to commit.
     // Preserve its identity without granting automatic retry authority.
     const malformed = statusFromError(error.InvalidResponse);
+    try std.testing.expectEqualDeep(malformed, statusFromError(error.UnexpectedEof));
     try std.testing.expectEqual(@intFromEnum(Code.internal), malformed.code);
     try std.testing.expectEqual(error.InvalidResponse, errorFromStatus(malformed));
 }

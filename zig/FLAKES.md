@@ -1,5 +1,53 @@
 # Zig runtime flakes
 
+## 2026-10-01: shared-module wiring and snapshot publication scheduling
+
+[Run 36961250636](https://github.com/antflydb/antfly/actions/runs/36961250636)
+failed both build-cache shards because serverless's transitive import graph
+included the Raft read observer. Serverless now imports only the provisioning
+contract it uses. GPU-enabled cache checks also exposed inference implementation
+imports in common archive wiring: inference-host code belongs to the inference
+owner and explicit implementation fixtures, while directory resolution is now
+independent of backend implementations. Backend-name parsing lives on the
+canonical `BackendType`. The cache audit reports the complete import path when
+a backend identity escapes its owner.
+
+The full unit gate exposed standalone roots missing shared runtime contracts,
+a deleted `hot_standby/primary_effect.zig` manifest import (the retained source
+is already covered as `db/primary_effect.zig`), obsolete catalog/recovery/HA test
+API calls, an outdated generated-client invocation, and Lite command consumers
+without their storage-owner provider archives. These roots now receive their
+explicit dependencies and providers. Shared runtime and query-cache tests run
+at their owning module boundaries rather than through unreachable cross-module
+filters; both remain in the aggregate unit and API gates.
+
+Local full-gate execution also reproduced a snapshot-publication fixture race:
+the test injected a publication failure after a Ready drain could already start
+compaction. The recorder now has separate snapshot-publication and ordinary
+persistence controls. The failure and publication hold are armed before the
+proposal, preserving durable write progress and the read-during-publication,
+retry, and compaction-fence assertions. The focused test passed 200/200
+fresh-process repetitions using `scripts/ci/zig_vopr_soak.py`'s process runner.
+
+The full storage gate also exposed stale fixture assumptions about generation
+proofs, native source clocks, key-scoped reads, topology fences, and initial
+catalog flushes. Fixtures now exercise the current authority contracts. Asset
+cleanup exposed a real batch-overlay defect: direct graph reconciliation read
+an old contender count after the same batch had retired its membership. Counts
+and membership now share the pending write/delete view, preserving the strict
+producer-absence proof. Enrichment callback contexts now retain the durable
+root incarnation required to checkpoint worker turns after reopen. Focused
+regressions exercise both graph deletion paths and reopened worker progress.
+Both graph callback regressions and the native clock/replay regression passed
+200/200 fresh-process repetitions with the same bounded process runner.
+
+Aggregate test ownership is audited against the original selected union. The
+shared module gates own their contract tests; implementation gates receive
+explicit runtime dependencies and exclude only tests executed by another gate.
+Focused targets keep their original selections. Public API fixtures with local
+database mocks now declare standalone deployment explicitly, while the restore
+binding fixture authoritatively answers the no-policy publication probe.
+
 ## 2026-10-01: full CI discovery drift and virtual HTTP teardown
 
 [Run 36903575966](https://github.com/antflydb/antfly/actions/runs/36903575966)

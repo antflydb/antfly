@@ -1,5 +1,52 @@
 # Zig E2E flakes
 
+## 2026-10-02: restore proofs and follower artifact admission
+
+[Run 36961250636](https://github.com/antflydb/antfly/actions/runs/36961250636)
+failed restore, FK merge recovery, standby restart and scoped-secret scenarios.
+These had separate causes:
+
+- Private restore provisioning reconstructed an incomplete bootstrap and lost
+  the source-generation proof. It now retains the canonical bootstrap, with
+  borrowed strings rebound to the immutable provisioning projection. The
+  three-by-three harness refreshes physical table IDs after restore publication.
+- FK merge admission waited for a follower's managed full-text initial build,
+  while ordinary repair scheduling waited for serving admission. Committed
+  artifact reconciliation now advances one bounded initial-build quantum under
+  its exact durable intent. Repair kind, configuration, root and group fences
+  remain checked; unrelated repairs cannot use this path.
+- A truncated HTTP response escaped as `UnexpectedEof`, which the standby error
+  boundary treated as an unknown fatal failure. The shared transport and runtime
+  ABI normalize it to `InvalidResponse` without certifying mutation delivery or
+  replaying a mutation. Standby recovery retains its durable retry position.
+- Provider-only secret grants correctly deny row-policy signing keys. Opening
+  an ordinary data owner now leaves that optional authority unavailable on
+  `Unauthorized`; other failures still propagate and policy admission remains
+  fail-closed.
+
+Readiness and secret fixtures now accept the current compatible readiness
+payload and explicitly recognized committed/pending write responses, and still
+wait for their serving or provider assertions. Missing backup repositories are
+checked at admission rather than expecting a job for a rejected request.
+
+Use the repository regression loop with a frozen Debug server:
+
+```sh
+SKIP_BUILD=1 ANTFLY_BIN="$PWD/zig/zig-out/bin/antfly" \
+ANTFLY_E2E_REGRESSION_REPEATS=20 \
+scripts/ci/zig-e2e-regression-loop.sh \
+  'e2e/antfly/test_online_merge_recovery.py::test_online_fk_merge_preserves_shadow_claims_and_retained_references[snapshot-child_owner]'
+```
+
+The FK failure reproduced three times before the fix, then passed 20/20
+isolated repetitions with the final Debug server. Restore, standby restart
+and scoped-secret cases passed 35/35 tests across five repetitions of each
+selector (including both portable and native mixed restore). Readiness and
+harness checks passed 105/105; exact FK schema admission and missing-backup
+rejection also passed against the final server.
+Local macOS runs do not establish Linux storage latency or qualify the complete
+E2E suite.
+
 ## 2026-09-29: receipt-driven recovery and native graph read budgets (#918)
 
 Rewrite source preparation, owner replay, validation and final owner publication

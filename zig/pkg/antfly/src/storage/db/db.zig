@@ -5301,6 +5301,29 @@ const LocalExecutionState = struct {
     optional_runtime_workers_enabled: bool = false,
 };
 
+// A narrowly scoped secret reader can serve a provider without access to the
+// row-policy signing authority. Denial leaves that authority unavailable;
+// policy admission still requires both credentials and fails closed.
+fn optionalRowPolicyAuthority(alloc: std.mem.Allocator, store: anytype, key: []const u8) !?[]u8 {
+    return store.getOwned(alloc, key) catch |err| switch (err) {
+        error.Unauthorized => null,
+        else => return err,
+    };
+}
+
+test "db optional row policy authority preserves scoped secret denial and outages" {
+    const Reader = struct {
+        failure: anyerror = error.Unauthorized,
+        fn getOwned(self: *@This(), _: std.mem.Allocator, _: []const u8) anyerror!?[]u8 {
+            return self.failure;
+        }
+    };
+    var reader: Reader = .{};
+    try std.testing.expectEqual(@as(?[]u8, null), try optionalRowPolicyAuthority(std.testing.allocator, &reader, "antfly.trusted_principal.secret"));
+    reader.failure = error.Unavailable;
+    try std.testing.expectError(error.Unavailable, optionalRowPolicyAuthority(std.testing.allocator, &reader, "antfly.trusted_principal.secret"));
+}
+
 pub const DB = struct {
     /// Shared local mutation state outlives foreground and recovery execution.
     local_execution: *LocalExecutionState,
@@ -6464,7 +6487,7 @@ pub const DB = struct {
             // Freestanding builds have no file-backed secret store. Keep the
             // native FileStore implementation out of the WASM module graph.
             const policy_secret: ?[]u8 = if (comptime builtin.os.tag == .freestanding) null else if (opts.secret_store) |store|
-                try store.getOwned(alloc, "antfly.trusted_principal.secret")
+                try optionalRowPolicyAuthority(alloc, store, "antfly.trusted_principal.secret")
             else
                 null;
             var policy_authority_owned = true;
@@ -6473,7 +6496,7 @@ pub const DB = struct {
                 alloc.free(value);
             };
             const policy_issuer: ?[]u8 = if (comptime builtin.os.tag == .freestanding) null else if (opts.secret_store) |store|
-                try store.getOwned(alloc, "antfly.trusted_principal.issuer")
+                try optionalRowPolicyAuthority(alloc, store, "antfly.trusted_principal.issuer")
             else
                 null;
             errdefer if (policy_authority_owned) if (policy_issuer) |value| alloc.free(value);
@@ -7915,6 +7938,7 @@ pub const DB = struct {
         const resources = self.core.batchExecutionResources();
         append_ctx.* = .{
             .alloc = self.runtime_alloc,
+            .root_incarnation = self.root_incarnation,
             .read_only = openModeRequiresReadOnlyBackends(self.open_mode),
             .clock = runtime_cfg.clock orelse self.backend_runtime.clock(),
             .store = resources.store,
@@ -8133,6 +8157,7 @@ pub const DB = struct {
         const resources = self.core.batchExecutionResources();
         append_ctx.* = .{
             .alloc = self.runtime_alloc,
+            .root_incarnation = self.root_incarnation,
             .artifact_publication_dispatcher = self.local_execution.artifact_publication_dispatcher,
             .store = resources.store,
             .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
@@ -31256,6 +31281,41 @@ pub const DB = struct {
         try self.core.index_manager.alignRowDerivedArtifactCatalog(&txn, command.catalogs, configs);
         try txn.commit();
         self.core.index_manager.invalidateWritePlanSnapshot();
+    }
+
+    /// Advance one replica-local initial-build quantum under the exact durable
+    /// admission fence. This never grants authority to unrelated operator
+    /// repairs or to an obsolete catalog. The primary apply cut is stationary
+    /// while reconciliation runs; physical projection publication remains
+    /// fenced by the repair intent's root/config/control identity.
+    pub fn advanceOrderedArtifactInitialBuild(self: *DB, configs: []const types.IndexConfig, context: @import("artifact_reconcile_intent.zig").Context) !void {
+        {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            try @import("artifact_reconcile_intent.zig").requireContext(self.alloc, &read, context);
+        }
+        for (configs) |config| {
+            if (!self.core.index_manager.repairUnavailable(config.name)) continue;
+            const repair_id = try self.indexRepairIdForIndex(self.alloc, config.name) orelse continue;
+            var entry = try self.loadIndexRepairEntryById(self.alloc, repair_id);
+            defer entry.deinit(self.alloc);
+            if (entry.intent.work_class != .initial_build or entry.intent.trigger != .catalog_admission or
+                entry.intent.config_hash != types.indexConfigHash(config) or entry.intent.kind != config.kind or
+                entry.intent.root_generation != self.core.root_generation or entry.intent.group_id != self.localRepairGroupId()) continue;
+            const Quantum = struct {
+                deadline_ns: u64,
+                fn requested(ptr: *anyopaque) bool {
+                    const quantum: *@This() = @ptrCast(@alignCast(ptr));
+                    return monotonicTimeNs() >= quantum.deadline_ns;
+                }
+            };
+            var quantum: Quantum = .{ .deadline_ns = monotonicTimeNs() +| 20 * std.time.ns_per_ms };
+            _ = try self.advanceIndexRepairIntent(self.alloc, repair_id, .{
+                .target_index_name = config.name,
+                .yield_check = .{ .ptr = &quantum, .is_requested = Quantum.requested },
+            });
+            return;
+        }
     }
 
     pub fn reconcileArtifactAddIndex(self: *DB, cfg: types.IndexConfig, context: @import("artifact_reconcile_intent.zig").Context) !?u128 {
@@ -56083,6 +56143,7 @@ const PendingGraphContenderOverlay = struct {
     write_positions: std.StringHashMapUnmanaged(usize) = .empty,
     delete_keys: std.StringHashMapUnmanaged(void) = .empty,
     global_writes_by_edge: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)) = .empty,
+    local_writes_by_edge: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)) = .empty,
 
     fn init(
         alloc: Allocator,
@@ -56094,13 +56155,18 @@ const PendingGraphContenderOverlay = struct {
         errdefer overlay.deinit(alloc);
         for (pending_writes, 0..) |write, i| {
             try overlay.write_positions.put(alloc, write.key, i);
-            if (!internal_keys.isGraphGlobalEdgeContenderKey(write.key)) continue;
+            const bucket = if (internal_keys.isGraphGlobalEdgeContenderKey(write.key))
+                &overlay.global_writes_by_edge
+            else if (internal_keys.isGraphEdgeContenderMembershipKey(write.key))
+                &overlay.local_writes_by_edge
+            else
+                continue;
             // One document batch may reconcile multiple graph indexes or
             // generations. Only index writes authenticated for this
             // generation; unrelated overlay records remain addressable by
             // full key but do not participate in its edge buckets.
             const view = (try graph_edge_contender.decode(write.value, expected_generation)) orelse continue;
-            const gop = try overlay.global_writes_by_edge.getOrPut(alloc, view.edge_key);
+            const gop = try bucket.getOrPut(alloc, view.edge_key);
             if (!gop.found_existing) gop.value_ptr.* = .empty;
             try gop.value_ptr.append(alloc, i);
         }
@@ -56112,6 +56178,9 @@ const PendingGraphContenderOverlay = struct {
         var it = self.global_writes_by_edge.valueIterator();
         while (it.next()) |indexes| indexes.deinit(alloc);
         self.global_writes_by_edge.deinit(alloc);
+        var local = self.local_writes_by_edge.valueIterator();
+        while (local.next()) |indexes| indexes.deinit(alloc);
+        self.local_writes_by_edge.deinit(alloc);
         self.write_positions.deinit(alloc);
         self.delete_keys.deinit(alloc);
         self.* = undefined;
@@ -56626,11 +56695,18 @@ fn reconcileGraphEdgeContendersWithLifetimePolicy(
 
     const count_key = try internal_keys.graphEdgeContenderCountKeyAlloc(alloc, doc_key, index_name);
     defer alloc.free(count_key);
-    const raw_count = store.get(alloc, count_key) catch |err| switch (err) {
+    // Counts and membership must observe the same batch-local view. Primary
+    // deletion retires every local witness before direct-source reconciliation;
+    // reading the old count here would recreate nonempty debt for a dead row.
+    var pending = try PendingGraphContenderOverlay.init(alloc, pending_writes, pending_deletes, expected_generation);
+    defer pending.deinit(alloc);
+    const overlay_count = pending.write_positions.contains(count_key) or pending.delete_keys.contains(count_key);
+    const owned_count = if (!overlay_count) store.get(alloc, count_key) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
-    };
-    defer if (raw_count) |raw| alloc.free(raw);
+    } else null;
+    defer if (owned_count) |raw| alloc.free(raw);
+    const raw_count = if (pending.write_positions.get(count_key)) |pos| pending_writes[pos].value else owned_count;
     const count_present = raw_count != null and (try graph_edge_contender.decodeVisibleCount(raw_count.?, expected_generation)) != null;
     result.visible_count = if (raw_count) |raw| (try graph_edge_contender.decodeVisibleCount(raw, expected_generation)) orelse 0 else 0;
     var saw_current_contender = false;
@@ -56653,9 +56729,11 @@ fn reconcileGraphEdgeContendersWithLifetimePolicy(
             const expected_key = try internal_keys.graphEdgeContenderKeyAlloc(alloc, doc_key, index_name, edge_key, view.state_key);
             defer alloc.free(expected_key);
             if (!std.mem.eql(u8, contender.key, expected_key)) return error.InvalidGraphEdgeContender;
+            const replaced = pending.delete_keys.contains(contender.key) or pending.write_positions.contains(contender.key);
+            if (overlay_count and replaced) continue;
             saw_current_contender = true;
             try bulk_existing_edges.put(alloc, edge_key, {});
-            if (graphContenderStateChanged(edge_changes.items, view.state_key)) continue;
+            if (replaced or graphContenderStateChanged(edge_changes.items, view.state_key)) continue;
             try bulk_surviving_edges.put(alloc, edge_key, {});
         }
     }
@@ -56677,12 +56755,25 @@ fn reconcileGraphEdgeContendersWithLifetimePolicy(
                 const expected_key = try internal_keys.graphEdgeContenderKeyAlloc(alloc, doc_key, index_name, edge_key, view.state_key);
                 defer alloc.free(expected_key);
                 if (!std.mem.eql(u8, contender.key, expected_key)) return error.InvalidGraphEdgeContender;
+                const replaced = pending.delete_keys.contains(contender.key) or pending.write_positions.contains(contender.key);
+                if (overlay_count and replaced) continue;
                 saw_current_contender = true;
                 existed_before = true;
-                if (graphContenderStateChanged(edge_changes, view.state_key)) continue;
+                if (replaced or graphContenderStateChanged(edge_changes, view.state_key)) continue;
                 exists_after = true;
             }
         }
+
+        if (pending.local_writes_by_edge.get(edge_key)) |positions| for (positions.items) |pos| {
+            const write = pending_writes[pos];
+            const view = (try graph_edge_contender.decode(write.value, expected_generation)) orelse continue;
+            const expected_key = try internal_keys.graphEdgeContenderKeyAlloc(alloc, doc_key, index_name, edge_key, view.state_key);
+            defer alloc.free(expected_key);
+            // Other documents/indexes can contribute to the same logical edge.
+            if (!std.mem.eql(u8, write.key, expected_key)) continue;
+            if (overlay_count) existed_before = true;
+            if (!graphContenderStateChanged(edge_changes, view.state_key)) exists_after = true;
+        };
 
         for (edge_changes) |change| {
             const contender_key = try internal_keys.graphEdgeContenderKeyAlloc(alloc, doc_key, index_name, edge_key, change.state_key);
@@ -56716,8 +56807,6 @@ fn reconcileGraphEdgeContendersWithLifetimePolicy(
     // another. Reset the local winner projection before selecting globally.
     result.winners.deinit(alloc);
     result.winners = .{};
-    var pending = try PendingGraphContenderOverlay.init(alloc, pending_writes, pending_deletes, expected_generation);
-    defer pending.deinit(alloc);
     var global_it = changes.iterator();
     while (global_it.next()) |entry| {
         try reconcileGlobalGraphEdgeWinner(
@@ -137839,6 +137928,7 @@ test "db bulk ingest primary lsm writes use direct sorted ingest batch mode" {
     });
     defer db.close();
 
+    const before = db.snapshotPrimaryLsmWriteStatsForTest() orelse return error.TestExpectedEqual;
     try db.beginBulkIngestSession();
     errdefer db.abortBulkIngestSession();
 
@@ -137853,8 +137943,8 @@ test "db bulk ingest primary lsm writes use direct sorted ingest batch mode" {
     });
 
     const stats = db.snapshotPrimaryLsmWriteStatsForTest() orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(u64, 0), stats.flushes);
-    try std.testing.expect(stats.sorted_ingest_runs > 0);
+    try std.testing.expectEqual(before.flushes, stats.flushes);
+    try std.testing.expect(stats.sorted_ingest_runs > before.sorted_ingest_runs);
 
     const visible_before_finish = (try db.get(alloc, "doc:bulk_lsm_d")) orelse return error.TestExpectedEqual;
     alloc.free(visible_before_finish);
