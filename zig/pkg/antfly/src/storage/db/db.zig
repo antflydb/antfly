@@ -11671,17 +11671,31 @@ pub const DB = struct {
             if (requires_inline_generated and effective_req.writes.len > 0) {
                 const precompute_generated_start_ns = monotonicTimeNs();
                 generated_precompute_snapshot = try self.captureWriteKeyVersionSnapshot(preparation_alloc, effective_req.writes);
-                // Pinned before prepareGeneratedEnrichments runs (which may
-                // take slightly longer than this read), so any catalog
-                // publication racing with this precompute is also caught as
-                // a generation change under the lock, never silently used.
-                document_generated_write_plan_generation = self.core.index_manager.writePlanGeneration();
+                // Every catalog-derived input this loop needs (dense/sparse
+                // direct-field vectors, graph field-edge configs) is read
+                // from an owned, refcounted WritePlanSnapshot acquired here
+                // -- the same mechanism the relational-row hoist above uses
+                // via `write_plan_snapshot` -- instead of touching
+                // `self.core.index_manager`'s live catalog arrays directly.
+                // The snapshot is cloned under `catalog_mutex.lockShared()`
+                // once per generation and stays valid after that lock is
+                // released, so a concurrent catalog publish can replace or
+                // free the live entries without this precompute observing
+                // freed memory. Pinned before prepareGeneratedEnrichments
+                // runs (which may take slightly longer than this read), so
+                // any catalog publication racing with this precompute is
+                // also caught as a generation change under the lock, never
+                // silently used.
+                write_plan_snapshot = try self.core.index_manager.acquireWritePlanSnapshot();
+                document_generated_write_plan_generation = write_plan_snapshot.?.generation();
                 const extracted_rows = try preparation_alloc.alloc(mapper.ExtractedWrite, effective_req.writes.len);
                 var extracted_rows_initialized: usize = 0;
                 defer {
                     for (extracted_rows[0..extracted_rows_initialized]) |*item| item.deinit(preparation_alloc);
                     preparation_alloc.free(extracted_rows);
                 }
+                const doc_plan = write_plan_snapshot.?.plan().*;
+                const doc_plan_needs_parse = doc_plan.graph_fields.len != 0 or doc_plan.dense_fields.len != 0 or doc_plan.sparse_fields.len != 0;
                 for (effective_req.writes, 0..) |write, i| {
                     if (isMetadataKey(write.key)) {
                         extracted_rows[i] = .{
@@ -11696,8 +11710,12 @@ pub const DB = struct {
                     }
                     extracted_rows[i] = try mapper.extractWrite(preparation_alloc, write.key, write.value);
                     extracted_rows_initialized += 1;
-                    try augmentExtractedWriteWithGraphFieldEdges(self, preparation_alloc, write.key, write.value, &extracted_rows[i]);
-                    try self.core.index_manager.appendIndexFieldEmbeddingsToExtractedWrite(preparation_alloc, write.key, write.value, &extracted_rows[i]);
+                    if (doc_plan_needs_parse) {
+                        var parsed = try std.json.parseFromSlice(std.json.Value, preparation_alloc, write.value, .{});
+                        defer parsed.deinit();
+                        try augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed(doc_plan, preparation_alloc, write.key, parsed.value, &extracted_rows[i]);
+                        try doc_plan.appendIndexFieldEmbeddingsFromParsedToExtractedWrite(preparation_alloc, write.key, parsed.value, &extracted_rows[i]);
+                    }
                 }
                 preprepared_document_generated = try prepareGeneratedEnrichments(
                     self,
@@ -59983,6 +60001,16 @@ fn appendPrecomputedArtifactCoverageOutcomes(
     request: enrichment_types.GeneratedEnrichmentRequest,
     outcome: DerivedCoverageOutcome,
 ) !void {
+    // `indexesDependingOnArtifact` and `derivedCoverageAppliesToIndex` both
+    // walk live `enrichments`/`dense_indexes`/`sparse_indexes`/`graph_indexes`/
+    // `text_indexes` arrays on the IndexManager. This runs from the pre-lock
+    // precompute path (no exclusive apply lock held), so take the catalog's
+    // own shared lock for this short, allocation-only scan -- never held
+    // across chunking, rendering, or model inference -- instead of reading
+    // those arrays while a concurrent catalog publish could replace or free
+    // them.
+    db.core.index_manager.catalog_mutex.lockShared();
+    defer db.core.index_manager.catalog_mutex.unlockShared();
     const consumers = try db.core.index_manager.indexesDependingOnArtifact(alloc, requestArtifactName(request));
     defer {
         for (consumers) |name| alloc.free(name);
@@ -105871,6 +105899,147 @@ test "db document extraction concurrent same-key writes converge without stale p
     // gamma delta") generation this write raced against.
     try std.testing.expectEqual(@as(usize, 1), chunk_count);
     try std.testing.expect(std.mem.indexOf(u8, last_chunk_payload, "alpha beta gamma") != null);
+}
+
+test "db document extraction pre-lock precompute survives a concurrent catalog mutation without touching freed memory" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
+    var deterministic_sparse = embedder_mod.DeterministicSparseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic_dense.interface(),
+            .sparse_embedder = deterministic_sparse.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 256,
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunk_dense_v1",
+        .kind = .embedding,
+        .field = "text",
+        .source_artifact_name = "document_chunks_v1",
+        .expected_dims = 3,
+    });
+    try db.addIndex(.{
+        .name = "document_vectors",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}",
+    });
+    // An enrichment doc:a's own write never touches. Deleting it still
+    // replaces the whole catalog generation -- including the dense/sparse
+    // field-write-plan and generated-enrichment template arrays thread_a's
+    // pre-lock precompute already read -- so this exercises a catalog
+    // publish racing precompute that has moved on past its catalog reads,
+    // not whether the delete is itself relevant to doc:a.
+    try db.addEnrichment(.{
+        .name = "unrelated_summary_v1",
+        .kind = .asset,
+        .field = "summary",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+    });
+
+    var hook = PortableRuntimeBatchPrelockTestHook{};
+    test_portable_runtime_batch_prelock_hook = &hook;
+    defer test_portable_runtime_batch_prelock_hook = null;
+
+    // thread_a's pre-lock precompute (extraction against the owned write-plan
+    // snapshot, then chunk/embedding derivation) runs to completion and
+    // parks at the prelock test hook, just before the apply lock.
+    const Writer = struct {
+        db: *DB,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.db.batch(.{
+                .writes = &.{.{
+                    .key = "doc:a",
+                    .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\"}",
+                }},
+                .sync_level = .enrichments,
+            }) catch |err| {
+                self.err = err;
+            };
+        }
+    };
+    var writer_a = Writer{ .db = &db };
+    const thread_a = try std.Thread.spawn(.{}, Writer.run, .{&writer_a});
+    var joined_a = false;
+    defer if (!joined_a) {
+        hook.release.store(true, .release);
+        thread_a.join();
+    };
+
+    const prelock_deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
+    while (!hook.entered.load(.acquire) and monotonicTimeNs() < prelock_deadline) {
+        @import("antfly_platform").time.yieldNow();
+    }
+    try std.testing.expect(hook.entered.load(.acquire));
+
+    // Delete an unrelated enrichment while thread_a is parked. This is the
+    // exact window #957's review blocker identified: a catalog publish can
+    // replace or free IndexManager's live dense/sparse/graph/enrichment
+    // arrays while pre-lock preparation holds data derived from them.
+    // thread_a's PrecomputedGeneratedBatch and the write-plan snapshot it
+    // was built from must be fully owned (or re-validated by generation),
+    // never a borrowed pointer into what this delete can free -- whether
+    // thread_a goes on to retry against the new catalog or commit, this
+    // must not read or free memory `deleteEnrichment` already freed, which
+    // the testing allocator below would catch as corruption or a double
+    // free.
+    test_portable_runtime_batch_prelock_hook = null;
+    try std.testing.expect(try db.deleteEnrichment(.asset, "unrelated_summary_v1"));
+
+    hook.release.store(true, .release);
+    thread_a.join();
+    joined_a = true;
+    try std.testing.expectEqual(@as(?anyerror, null), writer_a.err);
+
+    // doc:a's own enrichment chain is untouched by the deletion above: its
+    // chunk and embedding artifacts must exist, whether thread_a's result
+    // came from its pre-lock precompute or a generation-changed retry.
+    const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "document_chunks_v1");
+    defer alloc.free(chunk_prefix);
+    const chunk_entries = try db.core.store.scanPrefix(alloc, chunk_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, chunk_entries);
+    var chunk_count: usize = 0;
+    var dense_artifact_count: usize = 0;
+    for (chunk_entries) |entry| {
+        if (!internal_keys.isChunkArtifactRecordKey(entry.key)) continue;
+        chunk_count += 1;
+        const dense_artifact_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, entry.key, "document_chunk_dense_v1");
+        defer alloc.free(dense_artifact_key);
+        const dense_artifact_payload = db.core.store.get(alloc, dense_artifact_key) catch |err| switch (err) {
+            error.NotFound => continue,
+            else => return err,
+        };
+        alloc.free(dense_artifact_payload);
+        dense_artifact_count += 1;
+    }
+    try std.testing.expect(chunk_count > 0);
+    try std.testing.expectEqual(chunk_count, dense_artifact_count);
 }
 
 test "db document extraction unit chunks embed in provider batches, not per chunk" {
