@@ -503,3 +503,71 @@ test "SQL native generated identity VALUES SELECT and explicit identity share pr
     try std.testing.expectError(error.EntropyUnavailable, runtime.execute(std.testing.allocator, backend, &generated, &.{}, .{}));
     try std.testing.expectEqual(@as(usize, 1), fixture.commits);
 }
+
+test "SQL decisions in conflict predicates assignments and returning retain atomic fences" {
+    const Provider = @import("decision_eval.zig").testing.Provider;
+    const cases = [_]struct { sql: []const u8, calls: usize, affected: usize }{
+        .{ .sql = "INSERT INTO items (_id,n) VALUES ('existing',3) ON CONFLICT (_id) DO UPDATE SET n=CASE WHEN ai_probability(CAST(excluded.n AS TEXT),'Refund?','local')>0.8 THEN items.n+excluded.n ELSE 0 END WHERE ai_probability(CAST(items.n AS TEXT),'Refund?','local')>0.8 RETURNING ai_probability(CAST(n AS TEXT),'Refund?','local')", .calls = 3, .affected = 1 },
+        .{ .sql = "INSERT INTO items (_id,n) VALUES ('existing',3) ON CONFLICT (_id) DO UPDATE SET n=CASE WHEN ai_probability('unused','Refund?','local')>0.8 THEN 7 ELSE 0 END WHERE FALSE", .calls = 0, .affected = 0 },
+        .{ .sql = "INSERT INTO items (_id,n) VALUES ('new',3) ON CONFLICT (_id) DO UPDATE SET n=CASE WHEN ai_probability('unused','Refund?','local')>0.8 THEN 7 ELSE 0 END", .calls = 0, .affected = 1 },
+    };
+    for (cases) |case| {
+        var fixture: Fixture = .{};
+        var provider: Provider = .{};
+        var backend = fixture.backend();
+        backend.decision_provider = provider.provider();
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, backend, &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(case.calls, provider.calls);
+        try std.testing.expectEqual(case.affected, fixture.affected);
+        try std.testing.expectEqual(@as(usize, 1), fixture.commits);
+        if (case.calls != 0) {
+            try std.testing.expectEqual(@as(i64, 7), fixture.seen_n);
+            try std.testing.expectApproxEqAbs(@as(f64, 0.9), result.output.rows[0][0].float, 0.001);
+        }
+    }
+    var fixture: Fixture = .{};
+    var provider: Provider = .{ .fail = true };
+    var backend = fixture.backend();
+    backend.decision_provider = provider.provider();
+    var compiled = try compiler.compile(std.testing.allocator, cases[0].sql, .{});
+    defer compiled.deinit();
+    try std.testing.expectError(error.DecisionProviderUnavailable, runtime.execute(std.testing.allocator, backend, &compiled, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fixture.commits);
+    try std.testing.expectError(error.DecisionProviderUnavailable, runtime.execute(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fixture.commits);
+}
+
+test "SQL conflict decisions batch fenced owner rows across bounded pages" {
+    const a = std.testing.allocator;
+    var sql: std.ArrayList(u8) = .empty;
+    defer sql.deinit(a);
+    try sql.appendSlice(a, "INSERT INTO items (_id,n) VALUES ");
+    for (0..259) |index| {
+        const value = try std.fmt.allocPrint(a, "{s}('existing-{d}',3)", .{ if (index == 0) "" else ",", index });
+        defer a.free(value);
+        try sql.appendSlice(a, value);
+    }
+    try sql.appendSlice(a, " ON CONFLICT (_id) DO UPDATE SET n=CASE WHEN ai_probability(CAST(excluded.n AS TEXT),'Refund?','local')>0.8 THEN items.n+excluded.n ELSE 0 END WHERE ai_probability(CAST(items.n AS TEXT),'Refund?','local')>0.8");
+    var fixture: Fixture = .{};
+    var provider: @import("decision_eval.zig").testing.Provider = .{};
+    var backend = fixture.backend();
+    backend.decision_provider = provider.provider();
+    var compiled = try compiler.compile(a, sql.items, .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(a, backend, &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 259), fixture.affected);
+    try std.testing.expectEqual(@as(usize, 1), fixture.commits);
+    try std.testing.expectEqual(@as(usize, 518), provider.calls);
+    try std.testing.expectEqual(@as(usize, 128), provider.max_batch);
+    fixture = .{};
+    provider = .{ .fail_after = 256 };
+    // A later decision page fails after the first page has been prepared.
+    try std.testing.expectError(error.DecisionProviderUnavailable, runtime.execute(a, backend, &compiled, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 256), provider.calls);
+    try std.testing.expectEqual(@as(usize, 0), fixture.commits);
+    try std.testing.expectEqual(@as(usize, 0), fixture.affected);
+}

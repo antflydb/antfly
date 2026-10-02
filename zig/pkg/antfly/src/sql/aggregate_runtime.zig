@@ -13,25 +13,78 @@ const Json = std.json.Value;
 
 fn addRow(context: anytype, bound: *const binding.Bound, grouped: *operators.Grouped, alloc: std.mem.Allocator, row: catalog.Row) !void {
     const cells = try bound.input.cells(alloc, row);
-    if (!try bound.input.matches(alloc, cells, context.parameters)) return;
+    if (!try bound.input.matchesWithProvider(alloc, cells, context.parameters, context.backend.decision_provider)) return;
     const values = try alloc.alloc(Datum, bound.group_count);
-    for (bound.input.projections[0..bound.group_count], values) |program, *value| value.* = try program.?.evaluate(alloc, cells, context.parameters, .{});
+    for (bound.input.projections[0..bound.group_count], values) |program, *value| value.* = try context.evaluate(alloc, program.?, cells);
     const inputs = try alloc.alloc(Datum, bound.inputs.len);
     for (bound.inputs, bound.filters, inputs) |index, filter, *value| {
         value.* = .{};
         if (filter) |slot| {
-            const test_value = try bound.input.projections[slot].?.evaluate(alloc, cells, context.parameters, .{});
+            const test_value = try context.evaluate(alloc, bound.input.projections[slot].?, cells);
             if (test_value.sql_null) continue;
             if (test_value.value != .bool) return error.SqlTypeMismatch;
             if (!test_value.value.bool) continue;
         }
-        value.* = if (index) |slot| try bound.input.projections[slot].?.evaluate(alloc, cells, context.parameters, .{}) else Datum.json(.{ .integer = 1 });
+        value.* = if (index) |slot| try context.evaluate(alloc, bound.input.projections[slot].?, cells) else Datum.json(.{ .integer = 1 });
     }
     try grouped.add(values, inputs);
 }
 
+fn addRows(context: anytype, bound: *const binding.Bound, grouped: *operators.Grouped, alloc: std.mem.Allocator, rows: []const catalog.Row) !void {
+    const decision = @import("decision_eval.zig");
+    const cells = try alloc.alloc([]const Datum, rows.len);
+    for (rows, cells) |row, *out| out.* = try bound.input.cells(alloc, row);
+    const predicates = if (bound.input.predicate) |*program| try decision.evaluateBatch(alloc, context.backend.decision_provider, program, cells, context.parameters) else null;
+    var accepted: std.ArrayList([]const Datum) = .empty;
+    for (cells, 0..) |row, i| {
+        if (predicates) |values| {
+            if (values[i].sql_null) continue;
+            if (values[i].value != .bool) return error.SqlTypeMismatch;
+            if (!values[i].value.bool) continue;
+        }
+        try accepted.append(alloc, row);
+    }
+    const keys = try alloc.alloc([]Datum, accepted.items.len);
+    const inputs = try alloc.alloc([]Datum, accepted.items.len);
+    for (keys, inputs) |*key, *input| {
+        key.* = try alloc.alloc(Datum, bound.group_count);
+        input.* = try alloc.alloc(Datum, bound.inputs.len);
+        @memset(input.*, .{});
+    }
+    for (bound.input.projections[0..bound.group_count], 0..) |optional, k| {
+        const values = try decision.evaluateBatch(alloc, context.backend.decision_provider, &optional.?, accepted.items, context.parameters);
+        for (keys, values) |key, value| key[k] = value;
+    }
+    for (bound.inputs, bound.filters, 0..) |index, filter, k| {
+        const filters = if (filter) |slot| try decision.evaluateBatch(alloc, context.backend.decision_provider, &bound.input.projections[slot].?, accepted.items, context.parameters) else null;
+        var selected: std.ArrayList([]const Datum) = .empty;
+        var positions: std.ArrayList(usize) = .empty;
+        for (accepted.items, 0..) |row, i| {
+            if (filters) |values| {
+                if (values[i].sql_null) continue;
+                if (values[i].value != .bool) return error.SqlTypeMismatch;
+                if (!values[i].value.bool) continue;
+            }
+            try selected.append(alloc, row);
+            try positions.append(alloc, i);
+        }
+        if (index) |slot| {
+            const values = try decision.evaluateBatch(alloc, context.backend.decision_provider, &bound.input.projections[slot].?, selected.items, context.parameters);
+            for (positions.items, values) |i, value| inputs[i][k] = value;
+        } else for (positions.items) |i| {
+            inputs[i][k] = Datum.json(.{ .integer = 1 });
+        }
+    }
+    for (keys, inputs) |key, input| try grouped.add(key, input);
+}
+
 pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").Output {
     const bound = context.binding.aggregate orelse return error.InvalidSqlBackendResponse;
+    try bound.input.validateDecisions(context.arena, context.parameters, context.backend.decision_provider);
+    var external = if (bound.input.predicate) |*program| @import("decision_eval.zig").hasExternal(program) else false;
+    for (bound.input.projections) |optional| if (optional) |*program| {
+        external = external or @import("decision_eval.zig").hasExternal(program);
+    };
     const limit = try context.count(statement.limit, context.limits.result_rows);
     const offset = try context.count(statement.offset, 0);
     if (limit > context.limits.result_rows or offset > context.limits.scan_rows) return error.SqlProgramLimitExceeded;
@@ -64,7 +117,11 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
             const page = try scan.page(context, arena.allocator(), table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .after = after, .limit = context.limits.page_rows });
             defer page.deinit();
             if (page.rows.len > context.limits.page_rows) return error.InvalidSqlBackendResponse;
-            for (page.rows) |row| {
+            if (visited + page.rows.len > context.limits.scan_rows) return error.SqlProgramLimitExceeded;
+            if (external) {
+                visited += page.rows.len;
+                try addRows(context, bound, grouped, arena.allocator(), page.rows);
+            } else for (page.rows) |row| {
                 try context.checkpoint();
                 visited += 1;
                 if (visited > context.limits.scan_rows) return error.SqlProgramLimitExceeded;
@@ -101,15 +158,15 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         @memcpy(cells[0..group.keys.len], group.keys);
         @memcpy(cells[group.keys.len..], group.aggregates);
         if (bound.having) |program| {
-            const result = try program.evaluate(alloc, cells, context.parameters, .{});
+            const result = try context.evaluate(alloc, program, cells);
             if (result.sql_null) continue;
             if (result.value != .bool) return error.SqlTypeMismatch;
             if (!result.value.bool) continue;
         }
         const values = try alloc.alloc(Datum, bound.outputs.len);
-        for (bound.outputs, values) |program, *value| value.* = try program.evaluate(alloc, cells, context.parameters, .{});
+        for (bound.outputs, values) |program, *value| value.* = try context.evaluate(alloc, program, cells);
         const keys = try alloc.alloc(Datum, bound.orders.len);
-        for (bound.orders, keys) |program, *value| value.* = try program.evaluate(alloc, cells, context.parameters, .{});
+        for (bound.orders, keys) |program, *value| value.* = try context.evaluate(alloc, program, cells);
         try top.add(.{ .values = values, .keys = keys, .ordinal = group.ordinal });
     }
     const ordered = try top.finish(context.arena);

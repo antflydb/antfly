@@ -810,6 +810,7 @@ pub const storage_read_temporarily_unavailable_retry_after_seconds: u32 = 1;
 /// Stable, machine-readable reasons for a retryable query 503. Keep this set in
 /// sync with QueryTemporarilyUnavailableError in the public OpenAPI contract.
 pub const QueryTemporarilyUnavailableReason = enum {
+    decision_provider_unavailable,
     doc_identity_unavailable,
     read_requires_primary,
     standby_read_unavailable,
@@ -825,6 +826,7 @@ pub fn queryTemporarilyUnavailableOwnedResponse(
     reason: QueryTemporarilyUnavailableReason,
 ) !OwnedResponse {
     const message: []const u8 = switch (reason) {
+        .decision_provider_unavailable => "decision provider unavailable",
         .doc_identity_unavailable => "doc identity unavailable",
         .read_requires_primary => "read requires primary",
         .standby_read_unavailable => "standby read unavailable",

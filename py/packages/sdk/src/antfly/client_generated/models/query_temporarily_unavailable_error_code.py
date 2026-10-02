@@ -2,6 +2,7 @@ from enum import StrEnum
 
 
 class QueryTemporarilyUnavailableErrorCode(StrEnum):
+    DECISION_PROVIDER_UNAVAILABLE = "decision_provider_unavailable"
     DISTRIBUTED_QUERY_UNAVAILABLE = "distributed_query_unavailable"
     DOC_IDENTITY_UNAVAILABLE = "doc_identity_unavailable"
     INDEX_REBUILDING = "index_rebuilding"

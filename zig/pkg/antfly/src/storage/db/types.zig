@@ -1797,6 +1797,9 @@ pub const GraphQueryTransport = struct {
 };
 
 pub const SearchRequest = struct {
+    evaluation_json: []const u8 = "",
+    evaluation_limit: u32 = 0,
+    evaluation_matches: bool = false,
     /// Set only after catalog schema/index preparation; never populated by public JSON.
     prepared_read_table_id: u64 = 0,
     /// Request-owned routing map parallel to filter_doc_ids; never serialized.
@@ -1982,6 +1985,9 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
 };
 
 const hierarchy_children_rejected_fields = [_][]const u8{
+    "evaluation_json",
+    "evaluation_limit",
+    "evaluation_matches",
     "query",
     "index_name",
     "primary_text_index_name",
@@ -2449,6 +2455,7 @@ pub const GraphMetricRerankScoreDetails = struct {
 };
 
 pub const SearchHit = struct {
+    computed_json: ?[]u8 = null,
     id: []u8,
     /// Internal graph-hydration namespace. Null means the query's source
     /// table. This is not serialized as part of the public search-hit shape.
@@ -2476,6 +2483,7 @@ pub const SearchHit = struct {
         var cloned = SearchHit{ .id = try alloc.dupe(u8, self.id) };
         errdefer {
             alloc.free(cloned.id);
+            if (cloned.computed_json) |data| alloc.free(data);
             if (cloned.source_table) |table| alloc.free(table);
             if (cloned.score_details) |*details| details.deinit(alloc);
             freeIndexScores(alloc, cloned.index_scores);
@@ -2486,6 +2494,7 @@ pub const SearchHit = struct {
             if (cloned.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
             freeHighlights(alloc, cloned.highlights);
         }
+        cloned.computed_json = if (self.computed_json) |data| try alloc.dupe(u8, data) else null;
         cloned.source_table = if (self.source_table) |table| try alloc.dupe(u8, table) else null;
         cloned.doc_ordinal = self.doc_ordinal;
         cloned.native_text_doc_id = self.native_text_doc_id;
@@ -2518,6 +2527,7 @@ pub const SearchHit = struct {
 
     pub fn deinit(self: *SearchHit, alloc: Allocator) void {
         alloc.free(self.id);
+        if (self.computed_json) |data| alloc.free(data);
         if (self.source_table) |table| alloc.free(table);
         if (self.score_details) |*details| details.deinit(alloc);
         freeIndexScores(alloc, self.index_scores);
@@ -3056,11 +3066,13 @@ pub const GraphPatternBinding = struct {
 };
 
 pub const GraphPatternMatch = struct {
+    computed_json: ?[]u8 = null,
     bindings: []GraphPatternBinding,
     path: []graph_query_mod.PathEdgeInfo,
     null_aliases: [][]u8 = &.{},
 
     pub fn deinit(self: *GraphPatternMatch, alloc: Allocator) void {
+        if (self.computed_json) |bytes| alloc.free(bytes);
         for (self.bindings) |*binding| binding.deinit(alloc);
         if (self.bindings.len > 0) alloc.free(self.bindings);
         for (self.path) |edge| {

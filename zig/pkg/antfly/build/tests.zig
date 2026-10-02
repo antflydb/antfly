@@ -153,6 +153,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_source_file = b.path("lib/lmdb/src/lmdb_vopr.zig"),
     });
 
+    const functions_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/functions_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, functions_test_mod, true, true);
+    const functions_tests = b.addTest(.{ .root_module = functions_test_mod, .filters = &.{ "decision functions", "function bindings", "decision provider" } });
+    b.step("functions-test", "Run provider and expression decision function contracts").dependOn(&b.addRunArtifact(functions_tests).step);
+
+    // Parser/worker projection contracts need no HTTP server or linked kernel.
+    // Reuse the lean source-discovery root so this boundary remains affordable
+    // to check independently of the full API runtime harness.
+    const query_contract_tests = b.addTest(.{ .root_module = functions_test_mod, .filters = &.{ "api query contract", "local query contract", "decision functions worker transport" } });
+    b.step("query-contract-test", "Run query parsing, worker transport and projection contracts").dependOn(&b.addRunArtifact(query_contract_tests).step);
+
     const api_http_runtime_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_http_runtime_test_root.zig"),
         .target = target,

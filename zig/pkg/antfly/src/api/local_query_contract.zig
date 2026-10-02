@@ -3266,7 +3266,12 @@ pub fn encodeQueryRequestWithGraphWireMode(
         try out.appendSlice(alloc, req.aggregations_json);
     }
 
-    if (!req.include_all_fields) {
+    // This envelope describes worker retrieval, not the coordinator's final
+    // projection. Deferred projection needs the complete stored document for
+    // coordinator-owned expressions/rerankers even after their stages have
+    // been removed from the shard request. Omitting fields is the established
+    // all-fields wire representation and also works with older workers.
+    if (!req.include_all_fields and !(req.include_stored and req.defer_stored_projection)) {
         try appendJsonFieldNames(alloc, &out, &first, "fields", req.fields);
     }
     if (req.highlight) |highlight| {

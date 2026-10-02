@@ -560,9 +560,9 @@ pub fn execute(context: anytype, statement: ast.Select) anyerror!@import("runtim
         try context.checkpoint();
         _ = eval.reset(.retain_capacity);
         const values = try eval.allocator().alloc(Datum, bound.outputs.len);
-        for (bound.outputs, values) |program, *out| out.* = try program.evaluate(eval.allocator(), row, context.parameters, .{});
+        for (bound.outputs, values) |program, *out| out.* = try context.evaluate(eval.allocator(), program, row);
         const keys = try eval.allocator().alloc(Datum, bound.orders.len);
-        for (bound.orders, keys) |program, *out| out.* = try program.evaluate(eval.allocator(), row, context.parameters, .{});
+        for (bound.orders, keys) |program, *out| out.* = try context.evaluate(eval.allocator(), program, row);
         try top.add(.{ .values = values, .keys = keys, .ordinal = index });
     }
     const ordered = try top.finish(alloc);

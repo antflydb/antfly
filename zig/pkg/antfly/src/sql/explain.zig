@@ -22,6 +22,7 @@ const Plan = struct {
     table_id: ?u64 = null,
     schema_version: ?u32 = null,
     fields: ?[]const []const u8 = null,
+    functions: ?[]const []const u8 = null,
     plans: []const Plan = &.{},
 };
 
@@ -29,8 +30,38 @@ fn wrap(alloc: Allocator, name: []const u8, child: Plan) !Plan {
     return .{ .node_type = name, .plans = try alloc.dupe(Plan, &.{child}) };
 }
 
+fn decisionFunctions(alloc: Allocator, program: *const @import("scalar.zig").Program, functions: *std.ArrayList([]const u8)) !void {
+    for (program.instructions) |instruction| if (instruction.operation == .call) {
+        const name = @tagName(instruction.operation.call.function);
+        if (@import("../functions/decisions.zig").descriptor(name) != null) try functions.append(alloc, name);
+    };
+}
+
+fn boundDecisionFunctions(alloc: Allocator, bound: describe.BoundStatement, functions: *std.ArrayList([]const u8)) anyerror!void {
+    try scalarDecisionFunctions(alloc, bound.scalars, functions);
+    if (bound.aggregate) |aggregate| {
+        try scalarDecisionFunctions(alloc, aggregate.input, functions);
+        for (aggregate.outputs) |*program| try decisionFunctions(alloc, program, functions);
+        for (aggregate.orders) |*program| try decisionFunctions(alloc, program, functions);
+        if (aggregate.having) |*program| try decisionFunctions(alloc, program, functions);
+    }
+    if (bound.window) |window| {
+        try boundDecisionFunctions(alloc, window.input.*, functions);
+        for (window.outputs) |*program| try decisionFunctions(alloc, program, functions);
+        for (window.orders) |*program| try decisionFunctions(alloc, program, functions);
+    }
+}
+fn scalarDecisionFunctions(alloc: Allocator, bound: @import("bound_scalars.zig").Bound, functions: *std.ArrayList([]const u8)) !void {
+    if (bound.predicate) |*program| try decisionFunctions(alloc, program, functions);
+    for (bound.projections) |optional| if (optional) |*program| try decisionFunctions(alloc, program, functions);
+    for (bound.orders) |optional| if (optional) |*program| try decisionFunctions(alloc, program, functions);
+}
+
 fn queryStages(alloc: Allocator, source: Plan, statement: ast.Select, bound: describe.BoundStatement) !Plan {
     var plan = source;
+    var functions: std.ArrayList([]const u8) = .empty;
+    try boundDecisionFunctions(alloc, bound, &functions);
+    if (functions.items.len > 0) plan = .{ .node_type = "DecisionEval", .functions = functions.items, .plans = try alloc.dupe(Plan, &.{plan}) };
     if (bound.aggregate != null or statement.group_by.len != 0 or statement.having != null) plan = try wrap(alloc, "Aggregate", plan);
     if (bound.window != null) plan = try wrap(alloc, "Window", plan);
     if (statement.order_by.len != 0) plan = try wrap(alloc, "Order", plan);
@@ -58,10 +89,18 @@ fn relationPlan(alloc: Allocator, bound: *const relation.Bound, node: *const rel
                 .fields = if (verbose) source.request.fields else null,
             };
         },
-        .join => |join| .{
-            .node_type = if (join.left_keys.len != 0 and join.right_keys.len != 0) "Hash Join" else "Join",
-            .join_kind = @tagName(join.kind),
-            .plans = try alloc.dupe(Plan, &.{ try relationPlan(alloc, bound, join.left, verbose, depth + 1, remaining), try relationPlan(alloc, bound, join.right, verbose, depth + 1, remaining) }),
+        .join => |join| blk: {
+            const source: Plan = .{
+                .node_type = if (join.left_keys.len != 0 and join.right_keys.len != 0) "Hash Join" else "Join",
+                .join_kind = @tagName(join.kind),
+                .plans = try alloc.dupe(Plan, &.{ try relationPlan(alloc, bound, join.left, verbose, depth + 1, remaining), try relationPlan(alloc, bound, join.right, verbose, depth + 1, remaining) }),
+            };
+            var functions: std.ArrayList([]const u8) = .empty;
+            if (join.condition) |*program| try decisionFunctions(alloc, program, &functions);
+            for (join.left_keys) |*program| try decisionFunctions(alloc, program, &functions);
+            for (join.right_keys) |*program| try decisionFunctions(alloc, program, &functions);
+            if (functions.items.len == 0) break :blk source;
+            break :blk .{ .node_type = "DecisionEval", .functions = functions.items, .plans = try alloc.dupe(Plan, &.{source}) };
         },
         .query => |query| .{ .node_type = "Query", .plans = try alloc.dupe(Plan, &.{try queryStages(alloc, try relationPlan(alloc, bound, query.source, verbose, depth + 1, remaining), query.statement, query.binding)}) },
         .set => |set| .{ .node_type = @tagName(set.kind), .plans = try alloc.dupe(Plan, &.{ try relationPlan(alloc, bound, set.left, verbose, depth + 1, remaining), try relationPlan(alloc, bound, set.right, verbose, depth + 1, remaining) }) },
@@ -96,6 +135,11 @@ fn statementPlan(alloc: Allocator, statement: ast.Statement, bound: describe.Bou
         }})
     else
         &.{};
+    if (statement == .select and child.len == 0) {
+        var functions: std.ArrayList([]const u8) = .empty;
+        try boundDecisionFunctions(alloc, bound, &functions);
+        if (functions.items.len > 0) child = try alloc.dupe(Plan, &.{.{ .node_type = "Values" }});
+    }
     if (statement == .select and child.len != 0 and (relation_bound == null or relation_bound.?.root.operation != .query))
         child = try alloc.dupe(Plan, &.{try queryStages(alloc, child[0], statement.select, bound)});
     return .{
@@ -110,6 +154,10 @@ fn statementPlan(alloc: Allocator, statement: ast.Statement, bound: describe.Bou
 fn appendText(alloc: Allocator, out: *std.ArrayList(u8), plan: Plan, depth: usize) !void {
     for (0..depth) |_| try out.appendSlice(alloc, "  ");
     try out.appendSlice(alloc, plan.node_type);
+    if (plan.functions) |functions| for (functions) |name| {
+        try out.appendSlice(alloc, " ");
+        try out.appendSlice(alloc, name);
+    };
     if (plan.join_kind) |kind| try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " ({s})", .{kind}));
     if (plan.relation) |name| try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " on {s}", .{name}));
     if (plan.index) |name| try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " using {s}", .{name}));

@@ -19,6 +19,15 @@ pub const Bound = struct {
     predicate: ?scalar.Program = null,
     required: []const u32 = &.{},
 
+    pub fn validateDecisions(self: Bound, alloc: Allocator, parameters: []const std.json.Value, provider: ?@import("../functions/decisions.zig").DecisionProvider) !void {
+        const evaluator = @import("decision_eval.zig");
+        if (self.predicate) |*program| try evaluator.validate(alloc, provider, program, parameters);
+        for (self.projections) |optional| if (optional) |*program| try evaluator.validate(alloc, provider, program, parameters);
+        for (self.orders) |optional| if (optional) |*program| try evaluator.validate(alloc, provider, program, parameters);
+        for (self.assignments) |optional| if (optional) |*program| try evaluator.validate(alloc, provider, program, parameters);
+        for (self.insert_rows) |row| for (row) |optional| if (optional) |*program| try evaluator.validate(alloc, provider, program, parameters);
+    }
+
     /// Page-local cells. Required ordinals only are materialized; generated
     /// expression values use the same page arena and cannot retain prior pages.
     pub fn cells(self: Bound, alloc: Allocator, row: catalog.Row) ![]const scalar.Datum {
@@ -33,8 +42,12 @@ pub const Bound = struct {
     }
 
     pub fn matches(self: Bound, alloc: Allocator, values: []const scalar.Datum, parameters: []const std.json.Value) !bool {
+        return self.matchesWithProvider(alloc, values, parameters, null);
+    }
+
+    pub fn matchesWithProvider(self: Bound, alloc: Allocator, values: []const scalar.Datum, parameters: []const std.json.Value, provider: ?@import("../functions/decisions.zig").DecisionProvider) !bool {
         const program = self.predicate orelse return true;
-        const value = try program.evaluate(alloc, values, parameters, .{});
+        const value = try @import("decision_eval.zig").evaluate(alloc, provider, &program, values, parameters);
         if (value.sql_null) return false;
         if (value.value != .bool) return error.SqlTypeMismatch;
         return value.value.bool;

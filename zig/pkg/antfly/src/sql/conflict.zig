@@ -6,6 +6,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const catalog = @import("catalog.zig");
 const scalar = @import("scalar.zig");
+const decision_eval = @import("decision_eval.zig");
 
 pub const Bound = struct {
     pub const Deferred = struct { query: *const ast.Select, binding: *const @import("describe.zig").BoundStatement };
@@ -231,6 +232,13 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
     // The conflict-resolution scan-page budget belongs to the whole mutation
     // batch, not each conflicted key. Otherwise a bounded batch can multiply
     // one expensive point cursor by the mutation-row limit before commit.
+    var has_decisions = if (binding.predicate) |*program| decision_eval.hasExternal(program) else false;
+    for (binding.assignments) |optional| if (optional) |*program| {
+        has_decisions = has_decisions or decision_eval.hasExternal(program);
+    };
+    var decision_arena = std.heap.ArenaAllocator.init(context.alloc);
+    defer decision_arena.deinit();
+    var pending: std.ArrayList(DecisionConflictRow) = .empty;
     var point_pages: usize = 0;
     for (result, captured_buffer[0..count]) |*mutation, captured_row| {
         try context.checkpoint();
@@ -298,8 +306,27 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
             cells[width * 2 + i] = .{ .value = try @import("describe.zig").coerce(value, binding.columns[i].type), .sql_null = sql_null };
         }
         for (captured_row, cells[width * 3 ..]) |capture, *cell| cell.* = capture;
+        if (has_decisions) {
+            // Point cursors have independent lifetimes. Retain at most one
+            // bounded decision page, then resolve predicates and assignments
+            // together before releasing it. Mutation fences remain unchanged.
+            const scratch = decision_arena.allocator();
+            var old = previous;
+            old.id = mutation.key;
+            old.value = try @import("runtime.zig").clone(scratch, previous.value);
+            old.sql_nulls = if (previous.sql_nulls) |flags| try scratch.dupe(bool, flags) else null;
+            const owned = try scratch.alloc(scalar.Datum, cells.len);
+            for (cells, owned) |cell, *out| out.* = try @import("operators.zig").cloneDatum(scratch, cell);
+            try pending.append(context.arena, .{ .mutation = mutation, .previous = old, .cells = owned });
+            if (pending.items.len == 128) {
+                try applyDecisionConflicts(context, scratch, table, clause, binding, pending.items, deferred_cache);
+                pending.clearRetainingCapacity();
+                if (!decision_arena.reset(.retain_capacity)) return error.OutOfMemory;
+            }
+            continue;
+        }
         const matches = if (binding.predicate) |program| blk: {
-            const value = try program.evaluate(page_alloc, cells, context.parameters, .{});
+            const value = try @import("decision_eval.zig").evaluate(page_alloc, context.backend.decision_provider, &program, cells, context.parameters);
             break :blk !value.sql_null and value.value == .bool and value.value.bool;
         } else true;
         if (!matches) {
@@ -325,7 +352,7 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
                     const deferred = binding.deferred[assignment_index] orelse return error.InvalidSqlBackendResponse;
                     if (deferred_cache[assignment_index] == null) deferred_cache[assignment_index] = try context.deferredScalar(deferred.query, deferred.binding);
                     break :blk deferred_cache[assignment_index].?;
-                } else try (program orelse return error.InvalidSqlBackendResponse).evaluate(page_alloc, cells, context.parameters, .{});
+                } else try @import("decision_eval.zig").evaluate(page_alloc, context.backend.decision_provider, &(program orelse return error.InvalidSqlBackendResponse), cells, context.parameters);
                 break;
             };
             if (datum.sql_null and !column.nullable) return error.SqlNotNullViolation;
@@ -335,7 +362,79 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
         mutation.row = .{ .object = row };
         mutation.json_null_fields = nulls.items;
     }
+    if (pending.items.len != 0) try applyDecisionConflicts(context, decision_arena.allocator(), table, clause, binding, pending.items, deferred_cache);
     return result;
+}
+
+const DecisionConflictRow = struct { mutation: *catalog.Mutation, previous: catalog.Row, cells: []const scalar.Datum };
+
+fn applyDecisionConflicts(context: anytype, scratch: std.mem.Allocator, table: catalog.Table, clause: ast.Conflict, binding: Bound, pending: []const DecisionConflictRow, deferred_cache: []?scalar.Datum) !void {
+    try context.checkpoint();
+    const all_cells = try scratch.alloc([]const scalar.Datum, pending.len);
+    for (pending, all_cells) |row, *out| out.* = row.cells;
+    const predicates = if (binding.predicate) |*program|
+        try decision_eval.evaluateBatch(scratch, context.backend.decision_provider, program, all_cells, context.parameters)
+    else
+        null;
+    var selected: std.ArrayList(DecisionConflictRow) = .empty;
+    var cells: std.ArrayList([]const scalar.Datum) = .empty;
+    for (pending, 0..) |row, index| {
+        if (predicates) |values| {
+            const value = values[index];
+            if (!value.sql_null and value.value != .bool) return error.InvalidSqlBackendResponse;
+            if (value.sql_null or !value.value.bool) {
+                row.mutation.predicate_only = true;
+                row.mutation.row = null;
+                row.mutation.json_null_fields = &.{};
+                continue;
+            }
+        }
+        try selected.append(scratch, row);
+        try cells.append(scratch, row.cells);
+    }
+    if (selected.items.len == 0) return;
+    const assignment_values = try scratch.alloc([]const scalar.Datum, clause.assignments.len);
+    for (clause.assignments, binding.assignments, assignment_values, 0..) |assignment, optional, *output, index| {
+        if (assignment.capture_ordinal != null and assignment.capture_expression == null) {
+            const ordinal = binding.row_width * 3 + assignment.capture_ordinal.?;
+            const values = try scratch.alloc(scalar.Datum, cells.items.len);
+            for (cells.items, values) |row, *value| {
+                if (ordinal >= row.len) return error.InvalidSqlBackendResponse;
+                value.* = row[ordinal];
+            }
+            output.* = values;
+        } else if (assignment.deferred_scalar) {
+            const deferred = binding.deferred[index] orelse return error.InvalidSqlBackendResponse;
+            if (deferred_cache[index] == null) deferred_cache[index] = try context.deferredScalar(deferred.query, deferred.binding);
+            const values = try scratch.alloc(scalar.Datum, cells.items.len);
+            @memset(values, deferred_cache[index].?);
+            output.* = values;
+        } else {
+            const program = optional orelse return error.InvalidSqlBackendResponse;
+            output.* = try decision_eval.evaluateBatch(scratch, context.backend.decision_provider, &program, cells.items, context.parameters);
+        }
+    }
+    for (selected.items, 0..) |candidate, row_index| {
+        try context.checkpoint();
+        var row: std.json.ObjectMap = .empty;
+        var nulls: std.ArrayList([]const u8) = .empty;
+        for (table.columns) |column| {
+            if (column.generated) continue;
+            var datum: scalar.Datum = blk: {
+                const old = try candidate.previous.cell(column.name);
+                break :blk .{ .value = old.value, .sql_null = old.sql_null };
+            };
+            for (clause.assignments, 0..) |assignment, index| if (std.mem.eql(u8, assignment.field, column.name)) {
+                datum = assignment_values[index][row_index];
+                break;
+            };
+            if (datum.sql_null and !column.nullable) return error.SqlNotNullViolation;
+            if (datum.value == .null and !datum.sql_null) try nulls.append(context.arena, column.name);
+            try row.put(context.arena, column.name, try @import("runtime.zig").clone(context.arena, try @import("describe.zig").coerce(datum.value, column.type)));
+        }
+        candidate.mutation.row = .{ .object = row };
+        candidate.mutation.json_null_fields = nulls.items;
+    }
 }
 
 /// Targetless DO NOTHING arbitrates every native unique generation and the
