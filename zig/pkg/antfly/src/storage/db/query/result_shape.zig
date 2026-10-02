@@ -1602,6 +1602,18 @@ pub fn applyStoredSearchPatternFilters(
     // resolved parent row instead of the hit's own stored data (issue #931).
     const member_mode = req.return_mode == .member or req.return_mode == .chunk;
     const parent_aware = member_mode and executor.resolve_parent_id != null and executor.load_parent_stored != null;
+    // load_parent_stored projects the parent row through the RESPONSE
+    // request's own field selection (`req.fields`/`req.include_all_fields`).
+    // A predicate field the caller didn't ask back in the response (e.g.
+    // selecting only `body` while filtering on `category`) would otherwise
+    // be stripped before the matcher below ever sees it, silently turning a
+    // positive filter into a rejection and an exclusion into a no-op
+    // (PR #957 review blocker 3). Evaluate predicates against the
+    // unprojected parent row; the response's own projection is applied
+    // separately when the final hit is shaped.
+    var unprojected_parent_req = req;
+    unprojected_parent_req.fields = &.{};
+    unprojected_parent_req.include_all_fields = true;
 
     const source = result;
     const original_hits_len = result.hits.len;
@@ -1657,7 +1669,7 @@ pub fn applyStoredSearchPatternFilters(
                 };
                 defer alloc.free(parent_id);
                 if (parent_stored_cache.get(parent_id)) |cached| break :pblk cached;
-                const loaded = try executor.load_parent_stored.?(executor.ctx, alloc, req, parent_id);
+                const loaded = try executor.load_parent_stored.?(executor.ctx, alloc, unprojected_parent_req, parent_id);
                 const owned_key = try alloc.dupe(u8, parent_id);
                 try parent_stored_cache.put(alloc, owned_key, loaded);
                 break :pblk loaded;

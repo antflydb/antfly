@@ -95747,6 +95747,24 @@ test "db member-mode chunk hits apply filter_query/exclusion_query against the p
     defer prefixed.deinit();
     try std.testing.expectEqual(@as(u32, 3), prefixed.total_hits);
     for (prefixed.hits) |hit| try std.testing.expectEqualStrings("doc:keep", hit.artifact_ref.?.document_id);
+
+    // PR #957 review blocker 3: StoredPatternFilterExecutor's
+    // load_parent_stored loaded the parent row through the RESPONSE
+    // request's own field selection. Restricting the response to `body`
+    // must not change whether the `category` predicate above matches -
+    // the matcher needs the unprojected parent row.
+    var included_body_only = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 10 },
+        .return_mode = .member,
+        .filter_query_json = "{\"term\":{\"category\":\"keep\"}}",
+        .fields = &.{"body"},
+        .include_all_fields = false,
+        .require_algebraic_filter_resolution = true,
+    });
+    defer included_body_only.deinit();
+    try std.testing.expectEqual(@as(u32, 3), included_body_only.total_hits);
+    for (included_body_only.hits) |hit| try std.testing.expectEqualStrings("doc:keep", hit.artifact_ref.?.document_id);
 }
 
 // PR #957 review blocker 1: the same resolved_doc_filter gap as the dense
