@@ -11427,6 +11427,24 @@ pub fn searchTextQuery(
     var constraint_req = effective_req;
     constraint_req.resolved_doc_filter = null;
     constraint_req.full_text = null;
+    if (suppress_native_resolved_doc_filter) {
+        // deriveNativeDocIdConstraintsAlloc's own filter_query_json/
+        // exclusion_query_json handling has a syntactic fast path
+        // (collectStructuredFilterDocIdsAlloc / collectPositiveDocIdSuperset
+        // / collectExactDocIds) that extracts concrete doc ids straight out
+        // of a doc_id clause -- including one lowered here from
+        // query.bool.filter/must_not -- without going through the
+        // suppressed algebraic/live-filter resolvers above. Applied against
+        // this chunk-backed index's own doc-number space, it silently
+        // matches zero members for a positive doc_id filter and excludes
+        // none for a negative one (PR #957 review blocker 6). Null both out
+        // of the native pass entirely; effective_req below (not this
+        // constraint_req copy) still carries them through to postprocess
+        // unresolved, for applyStoredSearchPatternFilters' parent-aware
+        // matcher to evaluate against each hit's resolved parent id.
+        constraint_req.filter_query_json = "";
+        constraint_req.exclusion_query_json = "";
+    }
     var native_constraints = try deriveNativeDocIdConstraintsAlloc(alloc, constraint_req, .{
         .ctx = executor.ctx,
         .text_index_entry = executor.text_index_entry,
@@ -12940,7 +12958,20 @@ fn searchDenseInternal(
     const index_stats = entry.index.stats();
     const constraint_start = platform_time.monotonicNs();
     var constraint_req = req;
-    if (suppress_native_resolved_doc_filter) constraint_req.resolved_doc_filter = null;
+    if (suppress_native_resolved_doc_filter) {
+        constraint_req.resolved_doc_filter = null;
+        // See searchTextQuery: deriveNativeDenseConstraintsAlloc's own
+        // filter_query_json/exclusion_query_json handling can extract
+        // concrete doc ids straight out of a doc_id clause and apply them
+        // natively against this chunk-backed index's own doc-number space,
+        // independent of the suppressed resolved_doc_filter path above
+        // (PR #957 review blocker 6). Null both out of the native pass;
+        // postprocess_req below still carries the originals through
+        // unresolved for applyStoredSearchPatternFilters' parent-aware
+        // matcher.
+        constraint_req.filter_query_json = "";
+        constraint_req.exclusion_query_json = "";
+    }
     var native_constraints = try deriveNativeDenseConstraintsAlloc(alloc, constraint_req, executor, req.index_name orelse entry.config.name, true);
     profile.constraint_ns = platform_time.monotonicNs() - constraint_start;
     defer native_constraints.deinit(alloc);
@@ -15058,7 +15089,20 @@ pub fn searchSparse(
     const paging = componentPaging(req);
     const constraint_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     var constraint_req = req;
-    if (suppress_native_resolved_doc_filter) constraint_req.resolved_doc_filter = null;
+    if (suppress_native_resolved_doc_filter) {
+        constraint_req.resolved_doc_filter = null;
+        // See searchDenseInternal/searchTextQuery: deriveNativeDocIdConstraintsAlloc's
+        // own filter_query_json/exclusion_query_json handling can extract
+        // concrete doc ids straight out of a doc_id clause and apply them
+        // natively against this chunk-backed index's own doc-number space,
+        // independent of the suppressed resolved_doc_filter path above
+        // (PR #957 review blocker 6). Null both out of the native pass;
+        // postprocess_req below still carries the originals through
+        // unresolved for applyStoredSearchPatternFilters' parent-aware
+        // matcher.
+        constraint_req.filter_query_json = "";
+        constraint_req.exclusion_query_json = "";
+    }
     var native_constraints = try deriveNativeDocIdConstraintsAlloc(alloc, constraint_req, .{
         .ctx = executor.ctx,
         .text_index_entry = executor.text_index_entry,

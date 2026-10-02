@@ -1687,6 +1687,23 @@ pub fn applyStoredSearchPatternFilters(
             break :blk try std.json.parseFromSlice(std.json.Value, hit_alloc, stored, .{});
         } else null;
 
+        // Member/chunk-mode hits are a separate document from their parent
+        // row and only share its ordinal, not its own `_id`/doc_id. A
+        // doc_id clause inside filter_query_json/exclusion_query_json
+        // (including one lowered from query.bool.filter/must_not's native
+        // doc_id query via liftChunkBoolFilterClausesAlloc /
+        // lowerTextQueryToStoredPatternValueAlloc) must match the resolved
+        // parent id, not the chunk's own hit.id, or it silently matches
+        // nothing (PR #957 review blocker 6).
+        const resolved_match_parent_id: ?[]u8 = if (parent_aware) pidblk: {
+            break :pidblk executor.resolve_parent_id.?(executor.ctx, alloc, hit) catch |err| switch (err) {
+                error.InvalidChunkArtifact, error.StoredDocMissing => break :pidblk null,
+                else => return err,
+            };
+        } else null;
+        defer if (resolved_match_parent_id) |parent_id| alloc.free(parent_id);
+        const match_id: []const u8 = resolved_match_parent_id orelse hit.id;
+
         var keep = true;
         if (has_positive_doc_ids) {
             keep = resolvedPatternContainsHit(native_include, hit);
@@ -1706,15 +1723,15 @@ pub fn applyStoredSearchPatternFilters(
         if (keep and compiled_filter != null) {
             const compiled = compiled_filter.?;
             keep = if (filter_needs_stored)
-                try compiled.matches(hit_alloc, hit.id, parsed_stored.?.value)
+                try compiled.matches(hit_alloc, match_id, parsed_stored.?.value)
             else
-                try compiled.matches(hit_alloc, hit.id, .null);
+                try compiled.matches(hit_alloc, match_id, .null);
         }
         if (keep and compiled_exclusion != null) {
             keep = !(if (exclusion_needs_stored)
-                try compiled_exclusion.?.matches(hit_alloc, hit.id, parsed_stored.?.value)
+                try compiled_exclusion.?.matches(hit_alloc, match_id, parsed_stored.?.value)
             else
-                try compiled_exclusion.?.matches(hit_alloc, hit.id, .null));
+                try compiled_exclusion.?.matches(hit_alloc, match_id, .null));
         }
 
         keep_hits[i] = keep;

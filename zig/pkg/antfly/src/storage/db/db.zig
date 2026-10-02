@@ -95574,6 +95574,75 @@ test "db member-mode chunk hits apply query.bool.filter/must_not against the par
     }));
 }
 
+// PR #957 review blocker 6: a doc_id clause inside query.bool.filter/
+// must_not (native TextQuery filter_text/exclusion_text) lowers through
+// liftChunkBoolFilterClausesAlloc / lowerTextQueryToStoredPatternValueAlloc
+// into a stored-pattern "doc_id" predicate. applyStoredSearchPatternFilters
+// used to match that predicate against the chunk hit's own id instead of its
+// resolved parent id, so a doc_id filter silently matched nothing and a
+// doc_id exclusion silently excluded nothing.
+test "db member-mode chunk hits apply query.bool.filter/must_not doc_id against the resolved parent id on the full-text arm (PR #957)" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .enable_without_producers = true,
+        },
+    });
+    defer db.close();
+
+    const ephemeral_chunker =
+        "{\"provider\":\"antfly\",\"store_chunks\":false,\"text\":{\"target_tokens\":32,\"overlap_tokens\":0}}";
+    try db.addEnrichment(.{
+        .name = "body_chunks_v1",
+        .kind = .chunk,
+        .field = "body",
+        .chunker_json = ephemeral_chunker,
+    });
+    try db.addIndex(.{
+        .name = "selected_text",
+        .kind = .full_text,
+        .config_json = "{\"sources\":[{\"artifact\":\"body_chunks_v1\"}]}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:keep", .value = "{\"body\":\"alpha searchable text\",\"category\":\"keep\"}" },
+            .{ .key = "doc:drop", .value = "{\"body\":\"alpha also appears here\",\"category\":\"drop\"}" },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    var included = try db.search(alloc, .{
+        .index_name = "selected_text",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .filter_text = .{ .doc_id = .{ .ids = &.{"doc:keep"} } },
+        .return_mode = .member,
+    });
+    defer included.deinit();
+    try std.testing.expectEqual(@as(u32, 1), included.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), included.hits.len);
+    try std.testing.expectEqualStrings("doc:keep", included.hits[0].artifact_ref.?.document_id);
+
+    var excluded = try db.search(alloc, .{
+        .index_name = "selected_text",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .exclusion_text = .{ .doc_id = .{ .ids = &.{"doc:keep"} } },
+        .return_mode = .member,
+    });
+    defer excluded.deinit();
+    try std.testing.expectEqual(@as(u32, 1), excluded.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), excluded.hits.len);
+    try std.testing.expectEqualStrings("doc:drop", excluded.hits[0].artifact_ref.?.document_id);
+}
+
 test "db member-mode chunk hits apply query.bool.filter/must_not against the parent row on the dense arm" {
     const alloc = std.testing.allocator;
 
@@ -95636,6 +95705,69 @@ test "db member-mode chunk hits apply query.bool.filter/must_not against the par
         .index_name = "dv_v1",
         .dense = .{ .vector = query_vec, .k = 10 },
         .exclusion_text = .{ .term = .{ .field = "category", .term = "keep" } },
+        .return_mode = .member,
+    });
+    defer excluded.deinit();
+    try std.testing.expectEqual(@as(u32, 3), excluded.total_hits);
+    for (excluded.hits) |hit| try std.testing.expectEqualStrings("doc:drop", hit.artifact_ref.?.document_id);
+}
+
+// PR #957 review blocker 6: same doc_id-against-hit.id gap as the full-text
+// arm above, on the chunk-backed member-mode dense arm. Two parents each
+// producing three chunks: filtering for doc:keep's doc_id used to return 0
+// (hit.id is the chunk's own artifact key, never equal to "doc:keep")
+// instead of 3, and excluding it returned all 6 instead of 3.
+test "db member-mode chunk hits apply query.bool.filter/must_not doc_id against the resolved parent id on the dense arm (PR #957)" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var embedder = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = embedder.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
+    });
+
+    // Each 15-char body yields exactly 3 chunks at chunk_size 8 / overlap 2.
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:keep", .value = "{\"body\":\"abcdefghijklmno\",\"category\":\"keep\"}" },
+            .{ .key = "doc:drop", .value = "{\"body\":\"pqrstuvwxyzabcd\",\"category\":\"drop\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(u64, 6), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+
+    const query_vec = try embedder.interface().embedDense(alloc, "chunk_dense_v1", "abcdefgh", 3);
+    defer alloc.free(query_vec);
+
+    var included = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 10 },
+        .filter_text = .{ .doc_id = .{ .ids = &.{"doc:keep"} } },
+        .return_mode = .member,
+    });
+    defer included.deinit();
+    try std.testing.expectEqual(@as(u32, 3), included.total_hits);
+    for (included.hits) |hit| try std.testing.expectEqualStrings("doc:keep", hit.artifact_ref.?.document_id);
+
+    var excluded = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 10 },
+        .exclusion_text = .{ .doc_id = .{ .ids = &.{"doc:keep"} } },
         .return_mode = .member,
     });
     defer excluded.deinit();
