@@ -2064,14 +2064,14 @@ test "storage.hot_standby pending acknowledgement preserves batch and replay tai
     var replay_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .replication_async_batch_mirror = blk: {
-            var configured = mirror;
+            var configured = hot_standby_publisher_adapter.options(mirror);
             configured.last_lsn = &batch_lsn;
-            break :blk configured;
+            break :blk hot_standby_publisher_adapter.bindMirror(&primary, configured);
         },
         .replication_async_effect_mirror = blk: {
-            var configured = mirror;
+            var configured = hot_standby_publisher_adapter.options(mirror);
             configured.last_lsn = &replay_lsn;
-            break :blk configured;
+            break :blk hot_standby_publisher_adapter.bindMirror(&primary, configured);
         },
         .start_index_workers = false,
     });
