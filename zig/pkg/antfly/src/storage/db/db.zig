@@ -33837,6 +33837,7 @@ pub const DB = struct {
     const managed_index_admission_encoded_len = 48;
     const managed_catalog_admission_rebuild_reason = "managed_catalog_admission_rebuild";
     var test_fail_managed_index_delete_after_catalog_commit = false;
+    var test_index_delete_after_worker_removed: ?*const fn (*DB) anyerror!void = null;
     var test_fail_managed_index_repair_cleanup_after_catalog_commit = false;
     var test_fail_index_activation_after_catalog_commit = false;
     var test_block_generated_artifact_finalization: std.atomic.Value(bool) = .init(false);
@@ -35796,10 +35797,30 @@ pub const DB = struct {
         return self.deleteIndexWhileQuiescedForReconciliation(name, null);
     }
 
+    /// A rejected structural mutation must restore derived replay from its
+    /// durable checkpoint. The structural guard keeps the catalog incarnation
+    /// stable while workers stop, admission rechecks, and rollback completes.
+    fn restoreManagedWorkerAfterRejectedDeletion(self: *DB, index_ref: index_manager_mod.ManagedIndexRef) !void {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        if (self.executor.appliedSequence(index_ref.name) != null) return;
+        const configs = try self.core.listIndexes(self.alloc);
+        defer types.freeIndexConfigs(self.alloc, configs);
+        const cfg = for (configs) |candidate| {
+            if (std.mem.eql(u8, candidate.name, index_ref.name)) break candidate;
+        } else return; // Catalog deletion committed; never resurrect a worker.
+        if (cfg.kind != index_ref.kind) return error.IndexConfigMismatch;
+        const applied = try self.core.loadAppliedSequence(self.alloc, index_ref.name);
+        try self.executor.addWorker(index_ref.name, index_ref, applied);
+        const target = self.core.nextDerivedSequence();
+        if (target > applied) self.executor.notifyIndexes(target, &.{index_ref.name});
+    }
+
     fn deleteIndexWhileQuiescedForReconciliation(self: *DB, name: []const u8, context: ?@import("artifact_reconcile_intent.zig").Context) !bool {
         // A worker stop joins its task, which may need the apply lock. Probe
         // before that join; the caller's structural mutex also prevents a
         // source admission between this probe and the locked recheck below.
+        var removed_worker: ?index_manager_mod.ManagedIndexRef = null;
         {
             lockApplyShared(self);
             defer self.core.unlockApplyShared();
@@ -35808,8 +35829,27 @@ pub const DB = struct {
             try self.requireArtifactReconcileUnfenced(&read, context);
             try self.requireOnlineArtifactCatalogMutableWithContextLocked(&read, context);
             if (self.core.index_manager.graphIndex(name) != null) try self.requireGraphCatalogMutableForTransactions();
+            if (self.executor.appliedSequence(name) != null) {
+                const indexes = try self.core.managedIndexes(self.alloc);
+                defer {
+                    for (indexes) |index_ref| self.alloc.free(@constCast(index_ref.name));
+                    self.alloc.free(indexes);
+                }
+                for (indexes) |index_ref| if (std.mem.eql(u8, index_ref.name, name)) {
+                    removed_worker = index_ref;
+                    removed_worker.?.name = name;
+                    break;
+                };
+            }
         }
+        // Register before acquiring apply: rollback runs after its unlock and
+        // cannot join/start a worker while owning the exclusive mutation fence.
+        defer if (removed_worker) |index_ref| self.restoreManagedWorkerAfterRejectedDeletion(index_ref) catch |err| {
+            std.log.err("failed to restore derived worker after rejected index deletion index={s} err={s}", .{ name, @errorName(err) });
+            notifyQueryVisibilityHook(self.async_context, .status);
+        };
         self.executor.removeWorker(name);
+        if (builtin.is_test) if (test_index_delete_after_worker_removed) |hook| try hook(self);
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         {
@@ -35825,6 +35865,7 @@ pub const DB = struct {
         defer self.alloc.free(admission_key);
         const removed = try self.core.deleteManagedIndex(name, admission_key);
         if (removed) {
+            removed_worker = null;
             if (builtin.is_test and test_fail_managed_index_delete_after_catalog_commit)
                 return error.TestManagedIndexDeleteCrash;
             self.core.index_manager.clearManagedAdmissionSnapshotForIndex(name);
@@ -151468,4 +151509,34 @@ test "db graph endpoint cleanup pages transaction dependencies retain stronger c
     try db.writeTransaction(txn_id, .{ .writes = &.{.{ .key = "a", .value = "{\"_edges\":{\"g\":{\"R\":[{\"target\":\"hub\"}]}}}" }} });
     try std.testing.expectError(error.IntentConflict, graphTestApplyOrdered(&db, .{ .deletes = &.{"hub"} }, .{ .term = 1, .index = 1 }));
     try db.commitTransaction(txn_id, 2);
+}
+
+test "db graph endpoint cleanup pages rejected index deletion restores worker and replay" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("graph-delete-prepare-race");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+    try std.testing.expect(db.executor.appliedSequence("g") != null);
+    const Race = struct {
+        var txn_id: types.TxnId = undefined;
+        fn prepare(owner: *DB) !void {
+            txn_id = try owner.beginTransaction(1);
+            try owner.writeTransaction(txn_id, .{ .writes = &.{.{ .key = "prepared", .value = "{}" }} });
+        }
+    };
+    DB.test_index_delete_after_worker_removed = Race.prepare;
+    defer DB.test_index_delete_after_worker_removed = null;
+    try std.testing.expectError(error.SchemaInUse, db.deleteIndex("g"));
+    DB.test_index_delete_after_worker_removed = null;
+    try std.testing.expect(db.core.index_manager.graphIndex("g") != null);
+    try std.testing.expect(db.executor.appliedSequence("g") != null);
+    try db.abortTransaction(Race.txn_id, 2);
+    try db.batch(.{ .writes = &.{.{ .key = "source", .value = "{\"_edges\":{\"g\":{\"R\":[{\"target\":\"target\"}]}}}" }}, .sync_level = .full_index });
+    try db.runUntilIdle();
+    const edges = try db.getEdges(alloc, "g", "source", "", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("target", edges[0].target);
 }

@@ -389,10 +389,7 @@ fn updateGraphEndpointCleanupAdmission(txn: anytype, alloc: Allocator, key: []co
     } else {
         // A partial older queue has no complete admission summary. Preserve
         // the conservative fallback until it drains, then initialize anew.
-        var cursor = try txn.openCursor();
-        defer cursor.close();
-        const row = try cursor.seekAtOrAfter(internal_keys.graph_endpoint_cleanup_prefix);
-        if (row != null and std.mem.startsWith(u8, row.?.key, internal_keys.graph_endpoint_cleanup_prefix)) {
+        if (try txn.hasPrefix(internal_keys.graph_endpoint_cleanup_prefix)) {
             if (endpoint == null) txn.delete(ref) catch |err| if (err != error.NotFound) return err;
             return;
         }
@@ -405,10 +402,7 @@ fn updateGraphEndpointCleanupAdmission(txn: anytype, alloc: Allocator, key: []co
             if (ready) {
                 const prefix = try internal_keys.graphIncomingPrefixAlloc(alloc, target);
                 defer alloc.free(prefix);
-                var cursor = try txn.openCursor();
-                defer cursor.close();
-                const row = try cursor.seekAtOrAfter(prefix);
-                active = row != null and std.mem.startsWith(u8, row.?.key, prefix);
+                active = try txn.hasPrefix(prefix);
             }
             if (active) {
                 count = try std.math.add(u64, count, 1);
@@ -795,6 +789,14 @@ pub const DocStore = struct {
             return try wrapPayloadCursor(self.alloc, cursor_adapter, self.payload_session, self.current_scan != null or self.probe != null);
         }
 
+        pub fn hasPrefix(self: *Txn, prefix: []const u8) !bool {
+            if (self.write) |*write| return try write.hasPrefix(prefix);
+            var cursor = try self.openPhysicalCursorAdapter();
+            defer cursor.close();
+            const row = (try cursor.seekAtOrAfter(prefix)) orelse return false;
+            return std.mem.startsWith(u8, row.key, prefix);
+        }
+
         pub fn openPhysicalCursorAdapter(self: *Txn) !CursorAdapter {
             if (self.write) |*write| return try write.openCursor();
             if (self.current_scan) |*current_scan| return try current_scan.openCursor();
@@ -998,6 +1000,10 @@ pub const DocStore = struct {
                     else => return err,
                 };
                 self.columns_invalidated.* = true;
+            }
+
+            pub fn hasPrefix(self: @This(), prefix: []const u8) !bool {
+                return try self.runtime.?.hasPrefix(prefix);
             }
 
             pub fn openCursor(self: @This()) !backend_erased.Cursor {
@@ -5641,4 +5647,66 @@ test "graph relationship bulk ingestion preserves direct append and retirement w
     const job = try internal_keys.graphEndpointCleanupKeyAlloc(scratch, "target");
     try store.put(job, "target");
     try std.testing.expectError(error.IntegrityTopologyBusy, store.putBatchWithReplayWithOptions(null, writes, &.{}, null, .{ .mode = .bulk_ingest }));
+}
+
+test "graph endpoint cleanup byte admission has bounded allocation growth for empty jobs" {
+    var previous_bytes: usize = 0;
+    for ([_]usize{ 64, 128, 256 }) |size| {
+        var counter = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        const alloc = counter.allocator();
+        var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 1_000_000 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        const initial = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, "seed", "g", "R", "target", "seed", "seed");
+        defer alloc.free(initial);
+        try store.put(initial, "seed");
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const writes = try scratch.alloc(KVPair, size);
+        for (writes, 0..) |*write, i| {
+            const endpoint = try std.fmt.allocPrint(scratch, "empty:{d}", .{i});
+            write.* = .{ .key = try internal_keys.graphEndpointCleanupKeyAlloc(scratch, endpoint), .value = endpoint };
+        }
+        const before = counter.allocated_bytes;
+        try store.putBatch(writes, &.{});
+        const bytes = counter.allocated_bytes - before;
+        // Allow tree/container growth, but reject repeated overlay copies
+        // (the old cursor path grew by more than 3.5x on every doubling).
+        if (previous_bytes != 0) try std.testing.expect(bytes < previous_bytes * 3);
+        previous_bytes = bytes;
+        try std.testing.expect(try store.hasGraphEndpointCleanup());
+        try std.testing.expect(!try store.graphEndpointCleanupBlocksReads());
+    }
+}
+
+test "graph endpoint cleanup byte admission observes pending incoming additions and deletions" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    const edge = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, "source", "g", "R", "target", "source", "id");
+    defer alloc.free(edge);
+    const job = try internal_keys.graphEndpointCleanupKeyAlloc(alloc, "target");
+    defer alloc.free(job);
+    try store.put(edge, "edge");
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.delete(edge);
+        try txn.put(job, "target");
+        try txn.commit();
+    }
+    try std.testing.expect(!try store.graphEndpointCleanupBlocksReads());
+    try store.delete(job);
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(edge, "edge");
+        try txn.put(job, "target");
+        try txn.commit();
+    }
+    try std.testing.expect(try store.graphEndpointCleanupBlocksReads());
 }

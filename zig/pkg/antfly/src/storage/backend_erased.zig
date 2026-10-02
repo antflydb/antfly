@@ -498,6 +498,7 @@ pub const WriteTxn = struct {
         abort: *const fn (Allocator, *anyopaque) void,
         commit: *const fn (Allocator, *anyopaque) anyerror!void,
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
+        has_prefix: ?*const fn (*anyopaque, []const u8) anyerror!bool = null,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
         put: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
         delete: *const fn (*anyopaque, []const u8) anyerror!void,
@@ -542,6 +543,18 @@ pub const WriteTxn = struct {
 
     pub fn delete(self: *WriteTxn, key: []const u8) !void {
         try BoundaryAbi.call("delete", self.boundary_dispatch, self.vtable.delete, .{ self.ptr, key });
+    }
+
+    /// Test the current transactional key view without hydrating values.
+    /// Backends without native support retain ordinary cursor semantics.
+    pub fn hasPrefix(self: *WriteTxn, prefix: []const u8) !bool {
+        if (self.vtable.has_prefix) |has_prefix| {
+            return try BoundaryAbi.call("has_prefix", self.boundary_dispatch, has_prefix, .{ self.ptr, prefix });
+        }
+        var cursor = try self.openCursor();
+        defer cursor.close();
+        const row = (try cursor.seekAtOrAfter(prefix)) orelse return false;
+        return std.mem.startsWith(u8, row.key, prefix);
     }
 
     pub fn openCursor(self: *WriteTxn) !Cursor {
@@ -620,6 +633,7 @@ pub const Batch = struct {
         abort: *const fn (Allocator, *anyopaque) void,
         commit: *const fn (Allocator, *anyopaque) anyerror!void,
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
+        has_prefix: ?*const fn (*anyopaque, []const u8) anyerror!bool = null,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
         put: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
         append_put: ?*const fn (*anyopaque, []const u8, []const u8) anyerror!void = null,
@@ -685,6 +699,18 @@ pub const Batch = struct {
 
     pub fn delete(self: *Batch, key: []const u8) !void {
         try self.vtable.delete(self.ptr, key);
+    }
+
+    /// Test the current transactional key view without hydrating values.
+    /// Backends without native support retain ordinary cursor semantics.
+    pub fn hasPrefix(self: *Batch, prefix: []const u8) !bool {
+        if (self.vtable.has_prefix) |has_prefix| {
+            return try has_prefix(self.ptr, prefix);
+        }
+        var cursor = try self.openCursor();
+        defer cursor.close();
+        const row = (try cursor.seekAtOrAfter(prefix)) orelse return false;
+        return std.mem.startsWith(u8, row.key, prefix);
     }
 
     pub fn openCursor(self: *Batch) !Cursor {
@@ -1490,6 +1516,10 @@ pub fn writeTxnFrom(allocator: Allocator, handle: anytype) !WriteTxn {
             }
         }
 
+        fn hasPrefix(ptr: *anyopaque, prefix: []const u8) anyerror!bool {
+            return try unbox(ptr).handle.hasPrefix(prefix);
+        }
+
         fn put(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
             try unbox(ptr).handle.put(key, value);
         }
@@ -1516,6 +1546,7 @@ pub fn writeTxnFrom(allocator: Allocator, handle: anytype) !WriteTxn {
             .commit = vt.commit,
             .get = vt.get,
             .get_many_sorted = vt.getManySorted,
+            .has_prefix = if (@hasDecl(Handle, "hasPrefix")) vt.hasPrefix else null,
             .put = vt.put,
             .delete = vt.delete,
             .open_cursor = vt.openCursor,
@@ -1630,6 +1661,10 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             }
         }
 
+        fn hasPrefix(ptr: *anyopaque, prefix: []const u8) anyerror!bool {
+            return try unbox(ptr).handle.hasPrefix(prefix);
+        }
+
         fn put(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
             try unbox(ptr).handle.put(key, value);
         }
@@ -1671,6 +1706,7 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             .commit = vt.commit,
             .get = vt.get,
             .get_many_sorted = vt.getManySorted,
+            .has_prefix = if (@hasDecl(Handle, "hasPrefix")) vt.hasPrefix else null,
             .put = vt.put,
             .append_put = if (@hasDecl(Handle, "appendPut")) vt.appendPut else null,
             .delete = vt.delete,

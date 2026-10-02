@@ -12146,6 +12146,38 @@ fn implementationTests() type {
             try std.testing.expectEqualStrings(update, try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:00000499"));
         }
 
+        test "bulk append index prefix probes merge pending keys namespaces and disk tombstones" {
+            const alloc = std.testing.allocator;
+            var backend = Backend.init(alloc, .{ .flush_threshold = 1 });
+            defer backend.close();
+            {
+                var initial = try backend.beginBatchWithOptions(.{});
+                defer initial.abort();
+                try initial.put(.{ .name = "docs" }, "p:a", "disk");
+                try initial.put(.{ .name = "docs" }, "p:b", "disk");
+                try initial.put(.{ .name = "other" }, "p:a", "other");
+                try initial.commit();
+            }
+            var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+            defer txn.abort();
+            try std.testing.expect(try txn.hasPrefix(.{ .name = "docs" }, "p:"));
+            try std.testing.expect(!try txn.hasPrefix(.{}, "p:"));
+            try txn.appendPut(.{}, "bulk:a", "first");
+            try txn.appendPut(.{}, "bulk:a", "last");
+            try std.testing.expect(try txn.hasPrefix(.{}, "bulk:"));
+            try std.testing.expectEqual(@as(usize, 2), txn.bulk_appends.entryCount());
+            try txn.delete(.{ .name = "docs" }, "p:a");
+            try std.testing.expect(try txn.hasPrefix(.{ .name = "docs" }, "p:"));
+            try txn.delete(.{ .name = "docs" }, "p:b");
+            try std.testing.expect(!try txn.hasPrefix(.{ .name = "docs" }, "p:"));
+            try std.testing.expect(try txn.hasPrefix(.{ .name = "other" }, "p:"));
+            try txn.put(.{ .name = "docs" }, "p:c", "new");
+            try std.testing.expect(try txn.hasPrefix(.{ .name = "docs" }, "p:"));
+            try txn.delete(.{}, "bulk:a");
+            try std.testing.expect(!try txn.hasPrefix(.{}, "bulk:"));
+            try txn.commit();
+        }
+
         test "bulk append index native namespace overlay preserves latest values across drain" {
             const alloc = std.testing.allocator;
             var backend = Backend.init(alloc, .{ .flush_threshold = 1, .bulk_ingest_flush_threshold_multiplier = 2 });

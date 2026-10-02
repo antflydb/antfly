@@ -175,7 +175,10 @@ Fact-owned projections retain their independent lifecycle and do not reserve
 endpoint documents. Target dependencies are deduplicated across the prepare.
 Configured field-derived edges use the same guards, including relational rows.
 Graph catalog additions, replacements, and deletion return `SchemaInUse` until
-durable prepares resolve, so commit uses the same relationship mapping admitted at prepare.
+durable prepares resolve, so commit uses the same relationship mapping admitted
+at prepare. A rejected index deletion restores its stopped derived worker from
+the durable replay checkpoint and notifies it of the current replay target. Successful catalog
+deletion never recreates that worker.
 
 Native unordered bulk writers maintain a namespace/key index over their append
 arena. Scalar and sorted-batch point reads use that index, including missing-job
@@ -184,6 +187,13 @@ write wins within the overlay; a mutable-write fallback clears the index after
 draining, and commit or abort releases it. Duplicate detection reuses the index.
 This keeps endpoint admission linear in batch size while preserving direct
 sorted ingestion and the same transactional cleanup fence.
+Cleanup-job admission uses transactional prefix-existence probes. Native writers
+lazily build a key-only ordered overlay, update it as writes and tombstones arrive,
+and seek pinned committed generations without copying the growing write buffer
+or base memtable for every endpoint. Matching pending deletions suppress committed
+rows; pending insertions count immediately. Other backends use their ordinary
+transactional cursor. These probes do not change durable directory formats or
+force unordered bulk appends through the mutable-write fallback.
 
 The distributed cleanup worker retains one immutable indexed routing generation
 per sweep and visits each range once, checking current local leadership before
