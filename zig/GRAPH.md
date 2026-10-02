@@ -220,6 +220,15 @@ Comparison borrows digit views and never allocates big integers or expands
 exponent zeros; its work is linear in the input number lengths. Canonical and
 legacy graph responses preserve these numeric tokens in metadata and evidence.
 
+Algebraic provenance labels are opaque strings. Binary relationship identities are exposed
+as `antfly:graph-provenance:v1:` followed by unpadded base64url of the executor's
+label bytes; safe legacy tuple labels retain their existing representation. The
+prefix is reserved, so legacy labels beginning with it are encoded too. Internal
+path reconstruction keeps compact framed bytes and never decodes public text.
+Distributed relationship deduplication hashes length-prefixed identity components,
+including the ID and owner, so differing component splits do not cause systematic
+hash collisions.
+
 Relationship filters prepare constants, numeric views, and decoded JSON pointers
 once, then reuse immutable prepared state across expansions and Yen spur searches.
 Intrinsic-only filters do not inspect metadata and allocate no per-edge state.

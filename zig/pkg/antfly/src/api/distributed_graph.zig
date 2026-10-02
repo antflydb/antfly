@@ -3441,13 +3441,15 @@ const GraphEdgeIdentity = struct {
 const GraphEdgeIdentityContext = struct {
     pub fn hash(_: @This(), value: GraphEdgeIdentity) u64 {
         var hasher = std.hash.Wyhash.init(0);
-        hasher.update(value.source);
-        hasher.update("\x00");
-        hasher.update(value.target);
-        hasher.update("\x00");
-        hasher.update(value.edge_type);
-        hasher.update(value.edge_id);
-        hasher.update(value.owner_document);
+        // Frame every component: arbitrary identity bytes (including NUL)
+        // and differing ID/owner splits must not share the same hash input.
+        inline for (.{ "source", "target", "edge_type", "edge_id", "owner_document" }) |field| {
+            const part = @field(value, field);
+            var length: [8]u8 = undefined;
+            std.mem.writeInt(u64, &length, @intCast(part.len), .little);
+            hasher.update(&length);
+            hasher.update(part);
+        }
         return hasher.final();
     }
 
@@ -3464,6 +3466,37 @@ const GraphEdgeIdentitySet = std.HashMapUnmanaged(
     GraphEdgeIdentityContext,
     std.hash_map.default_max_load_percentage,
 );
+
+test "distributed graph identity hashing bounds probes for ambiguous component splits" {
+    const Context = struct {
+        probes: *usize,
+        pub fn hash(_: @This(), value: GraphEdgeIdentity) u64 {
+            return (GraphEdgeIdentityContext{}).hash(value);
+        }
+        pub fn eql(self: @This(), left: GraphEdgeIdentity, right: GraphEdgeIdentity) bool {
+            self.probes.* += 1;
+            return (GraphEdgeIdentityContext{}).eql(left, right);
+        }
+    };
+    var text: [1025]u8 = @splat('x');
+    // Include NUL bytes too: separators alone cannot frame arbitrary identities.
+    text[512] = 0;
+    var probes: usize = 0;
+    const context = Context{ .probes = &probes };
+    var seen = std.HashMapUnmanaged(GraphEdgeIdentity, usize, Context, 80).empty;
+    defer seen.deinit(std.testing.allocator);
+    for (1..text.len) |split| {
+        const identity = GraphEdgeIdentity{ .source = "a", .target = "b", .edge_type = "R", .edge_id = text[0..split], .owner_document = text[split..] };
+        try seen.putContext(std.testing.allocator, identity, split, context);
+    }
+    try std.testing.expectEqual(@as(usize, 1024), seen.count());
+    for (1..text.len) |split| {
+        const identity = GraphEdgeIdentity{ .source = "a", .target = "b", .edge_type = "R", .edge_id = text[0..split], .owner_document = text[split..] };
+        try std.testing.expectEqual(split, seen.getContext(identity, context).?);
+    }
+    // The former unframed hash used nearly a million equality probes here.
+    try std.testing.expect(probes < 20 * seen.count());
+}
 
 fn graphEdgeIdentity(edge: graph_mod.Edge) GraphEdgeIdentity {
     return .{ .source = edge.source, .target = edge.target, .edge_type = edge.edge_type, .edge_id = edge.edge_id, .owner_document = edge.owner_document };

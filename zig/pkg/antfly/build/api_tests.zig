@@ -1285,6 +1285,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "distributed graph edges response round trips owned edges",
             "distributed graph retries once on topology change and succeeds",
             "distributed K path identity preserves same type fact ids",
+            "distributed graph identity hashing",
             "distributed weighted fact paths",
             "distributed graph expand request preserves algebraic semiring planning flag",
             "canonical relationship predicates",

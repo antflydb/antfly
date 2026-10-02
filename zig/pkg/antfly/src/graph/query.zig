@@ -2498,6 +2498,11 @@ fn algebraicTraversalResultNodeAlloc(
     errdefer alloc.free(key);
     const provenance = try algebraic_path_mod.provenanceLabelsAlloc(alloc, result.provenance);
     errdefer freeProvenanceLabels(alloc, provenance);
+    for (provenance) |*label| if (provenanceLabelNeedsEncoding(label.*)) {
+        const text = try publicProvenanceLabelAlloc(alloc, label.*);
+        alloc.free(label.*);
+        label.* = text;
+    };
     return .{
         .key = key,
         .depth = result.depth,
@@ -2593,7 +2598,13 @@ fn algebraicShortestPathResultNodeAlloc(
 }
 
 fn graphEdgeProvenanceLabelAlloc(alloc: Allocator, edge: graph_mod.Edge) ![]u8 {
-    if (edge.edge_id.len == 0) return std.fmt.allocPrint(alloc, "{s}\x1f{s}\x1f{s}", .{ edge.source, edge.edge_type, edge.target });
+    // Keep unambiguous legacy tuples readable. A reserved leading byte or
+    // an embedded separator needs the same framed identity as explicit edges.
+    if (edge.edge_id.len == 0 and (edge.source.len == 0 or edge.source[0] != 2) and
+        std.mem.indexOfScalar(u8, edge.source, 0x1f) == null and
+        std.mem.indexOfScalar(u8, edge.edge_type, 0x1f) == null and
+        std.mem.indexOfScalar(u8, edge.target, 0x1f) == null)
+        return std.fmt.allocPrint(alloc, "{s}\x1f{s}\x1f{s}", .{ edge.source, edge.edge_type, edge.target });
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     try out.append(alloc, 2);
@@ -2618,7 +2629,7 @@ fn parseProvenanceEdge(label: []const u8) ?ParsedProvenanceEdge {
             part.* = label[pos..][0..len];
             pos += len;
         }
-        if (pos != label.len or parts[3].len == 0) return null;
+        if (pos != label.len) return null;
         return .{ .source = parts[0], .edge_type = parts[1], .target = parts[2], .edge_id = parts[3], .owner_document = parts[4] };
     }
 
@@ -2679,6 +2690,23 @@ fn resolveUniqueGraphPathEdge(
     });
 }
 
+/// Public provenance is opaque text, never the executor's binary identity.
+/// Reserve the prefix so even a legacy tuple beginning with it is encoded.
+const public_provenance_prefix = "antfly:graph-provenance:v1:";
+fn provenanceLabelNeedsEncoding(label: []const u8) bool {
+    return (label.len > 0 and label[0] == 2) or !std.unicode.utf8ValidateSlice(label) or
+        std.mem.startsWith(u8, label, public_provenance_prefix);
+}
+fn publicProvenanceLabelAlloc(alloc: Allocator, label: []const u8) ![]u8 {
+    if (!provenanceLabelNeedsEncoding(label)) return alloc.dupe(u8, label);
+    const encoder = std.base64.url_safe_no_pad.Encoder;
+    const length = try std.math.add(usize, public_provenance_prefix.len, encoder.calcSize(label.len));
+    const out = try alloc.alloc(u8, length);
+    @memcpy(out[0..public_provenance_prefix.len], public_provenance_prefix);
+    _ = encoder.encode(out[public_provenance_prefix.len..], label);
+    return out;
+}
+
 fn cloneProvenanceLabelsAlloc(alloc: Allocator, labels: []const []const u8) ![][]u8 {
     const out = try alloc.alloc([]u8, labels.len);
     var initialized: usize = 0;
@@ -2687,7 +2715,7 @@ fn cloneProvenanceLabelsAlloc(alloc: Allocator, labels: []const []const u8) ![][
         alloc.free(out);
     }
     for (labels, 0..) |label, i| {
-        out[i] = try alloc.dupe(u8, label);
+        out[i] = try publicProvenanceLabelAlloc(alloc, label);
         initialized += 1;
     }
     return out;
@@ -4968,6 +4996,100 @@ test "graph algebraic provenance preserves binary relationship identity" {
     try std.testing.expectEqualStrings("fact\x00:1", parsed.edge_id);
     try std.testing.expectEqualStrings("a\x1f", parsed.source);
     try std.testing.expectEqualStrings("fact:1", parsed.owner_document);
+}
+
+test "graph algebraic provenance public labels are lossless text at length boundaries" {
+    const alloc = std.testing.allocator;
+    for ([_]usize{ 128, 255, 256, 65536 }) |length| {
+        const source = try alloc.alloc(u8, length);
+        defer alloc.free(source);
+        @memset(source, 'a');
+        const label = try graphEdgeProvenanceLabelAlloc(alloc, .{ .source = source, .target = "b", .edge_type = "R", .edge_id = "fact\xff\x00", .owner_document = "fact", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" });
+        defer alloc.free(label);
+        const text = try publicProvenanceLabelAlloc(alloc, label);
+        defer alloc.free(text);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(text));
+        const json = try std.json.Stringify.valueAlloc(alloc, .{ .provenance = &[_][]const u8{text} }, .{});
+        defer alloc.free(json);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(text, parsed.value.object.get("provenance").?.array.items[0].string);
+        const decoder = std.base64.url_safe_no_pad.Decoder;
+        const payload = text[public_provenance_prefix.len..];
+        const decoded = try alloc.alloc(u8, try decoder.calcSizeForSlice(payload));
+        defer alloc.free(decoded);
+        try decoder.decode(decoded, payload);
+        try std.testing.expectEqualSlices(u8, label, decoded);
+        const edge = parseProvenanceEdge(decoded).?;
+        try std.testing.expectEqualStrings(source, edge.source);
+        try std.testing.expectEqualStrings("fact\xff\x00", edge.edge_id);
+    }
+    // Protect the textual namespace from legacy source names using that prefix.
+    const legacy = "antfly:graph-provenance:v1:a\x1fR\x1fb";
+    const escaped = try publicProvenanceLabelAlloc(alloc, legacy);
+    defer alloc.free(escaped);
+    try std.testing.expect(!std.mem.eql(u8, legacy, escaped));
+    for ([_][]const u8{ "a\x1fb", "\x02a" }) |source| {
+        const label = try graphEdgeProvenanceLabelAlloc(alloc, .{ .source = source, .target = "b", .edge_type = "R", .edge_id = "", .owner_document = "", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" });
+        defer alloc.free(label);
+        const edge = parseProvenanceEdge(label).?;
+        try std.testing.expectEqualStrings(source, edge.source);
+        try std.testing.expectEqualStrings("", edge.edge_id);
+    }
+}
+
+test "graph algebraic provenance traversal and shortest path return textual explicit identities" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    var rb: [256]u8 = undefined;
+    const ctx = try setupGraph(alloc, "gq-public-provenance-s", "gq-public-provenance-r", &sb, &rb);
+    defer {
+        ctx.deinit();
+        alloc.destroy(ctx);
+    }
+    const source = [_]u8{'a'} ** 128;
+    const id = [_]u8{'i'} ** 128;
+    try ctx.graph.batchApply(&.{.{ .source = &source, .target = "b", .edge_type = "R", .edge_id = &id, .owner_document = "fact" }}, &.{});
+    var engine = GraphQueryEngine{ .alloc = alloc };
+    const start_keys: []const []const u8 = &.{&source};
+    for ([_]QueryType{ .traverse, .shortest_path }) |query_type| {
+        for ([_]bool{ false, true }) |include_paths| {
+            var result = try engine.execute(&ctx.graph, .{
+                .query_type = query_type,
+                .index_name = "test",
+                .start_nodes = .{ .keys = start_keys },
+                .target_nodes = .{ .keys = &.{"b"} },
+                .params = .{ .max_depth = 1, .algebraic_semiring = true, .include_paths = include_paths },
+            }, start_keys);
+            defer result.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), result.nodes.len);
+            const labels = result.nodes[0].provenance.?;
+            try std.testing.expectEqual(@as(usize, 1), labels.len);
+            try std.testing.expect(std.mem.startsWith(u8, labels[0], public_provenance_prefix));
+            const json = try std.json.Stringify.valueAlloc(alloc, .{ .provenance = labels }, .{});
+            defer alloc.free(json);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings(labels[0], parsed.value.object.get("provenance").?.array.items[0].string);
+            if (result.nodes[0].path_edges) |edges| try std.testing.expectEqualStrings(&id, edges[0].edge_id);
+        }
+    }
+}
+
+test "graph algebraic provenance public conversion releases partial allocations" {
+    const Case = struct {
+        fn run(alloc: Allocator) !void {
+            const label = try graphEdgeProvenanceLabelAlloc(alloc, .{ .source = "a", .target = "b", .edge_type = "R", .edge_id = "fact", .owner_document = "fact", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" });
+            defer alloc.free(label);
+            const token = try algebraic_path_mod.provenanceTokenAlloc(alloc, &.{label});
+            defer alloc.free(token);
+            var node = try algebraicTraversalResultNodeAlloc(alloc, .{ .node = @constCast("b"), .depth = 1, .provenance = token });
+            defer node.deinit(alloc);
+            const copy = try cloneProvenanceLabelsAlloc(alloc, &.{ label, "a\x1fR\x1fb", label });
+            defer freeProvenanceLabels(alloc, copy);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
 test "graph pattern path conversion releases partial relationship allocations" {

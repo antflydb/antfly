@@ -1399,6 +1399,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "relationship predicates",
         "graph relationship protocol gates",
         "canonical and legacy graph metadata responses",
+        "graph algebraic provenance",
+        "distributed graph identity hashing",
         "JSON decimal comparison",
         "traversal decimal weight filters",
         "fact temporal predicates",
