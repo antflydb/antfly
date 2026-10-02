@@ -1621,6 +1621,28 @@ fn ownerStatusEventually(owner: *client.Owner) !client.Response {
     }
 }
 
+// textMemoryJson is, by design, an observational read that tries the owner's
+// apply lock without waiting (storageOwnerTextMemoryJson ->
+// trySnapshotTextMemoryAttributionStats): a concurrent background checkpoint
+// or compaction worker from a preceding reconcile/full-index batch can hold
+// that lock just long enough to surface a transient StorageBusy here, the
+// same category of contention ownerStatusEventually already retries for
+// runtimeStatusJson.
+fn ownerTextMemoryEventually(owner: *client.Owner, table_name: []const u8) !client.Response {
+    const time = @import("antfly_platform").time;
+    const deadline = time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (true) {
+        return owner.textMemoryJson(table_name) catch |err| switch (err) {
+            error.StorageBusy => {
+                if (time.monotonicNs() >= deadline) return err;
+                try std.testing.io.sleep(.fromMilliseconds(2), .awake);
+                continue;
+            },
+            else => return err,
+        };
+    }
+}
+
 test "opaque storage owner preserves dense profiles and captured identity" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-owner-dense-profile";
@@ -1673,12 +1695,19 @@ test "opaque storage owner preserves dense profiles and captured identity" {
 }
 
 test "opaque storage owner performs coarse batch and query on one live DB" {
-    const path = "/tmp/antfly-storage-kernel-owner-batch-query";
-    const backup_root = "/tmp/antfly-storage-kernel-owner-backups";
-    cleanup(path);
-    cleanup(backup_root);
-    defer cleanup(path);
-    defer cleanup(backup_root);
+    // A fixed /tmp literal collides with any other process (including a
+    // concurrent test run) that opens the same path, racing the storage
+    // owner's process-wide generation/lease lifecycle and surfacing spurious
+    // StorageBusy/LsmRootWriterAlreadyOpen failures. Use a per-run unique
+    // directory like the rest of this file's tests.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/batch-query", .{root});
+    defer std.testing.allocator.free(path);
+    const backup_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/backups", .{root});
+    defer std.testing.allocator.free(backup_root);
 
     var owner = try client.Owner.open(.{
         .path = .fromSlice(path),
@@ -2145,7 +2174,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
         "{\"inserts\":{\"doc:artifact\":{\"title\":\"artifact\",\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YQ==\"},\"doc:c\":{\"title\":\"gamma\",\"_embeddings\":{\"dense_idx\":[1,0,0]}},\"doc:d\":{\"title\":\"delta\",\"_embeddings\":{\"dense_idx\":[0,1,0]}}},\"sync_level\":\"full_index\"}",
     );
     defer indexed_batch.deinit();
-    var text_memory = try owner.textMemoryJson("docs");
+    var text_memory = try ownerTextMemoryEventually(&owner, "docs");
     defer text_memory.deinit();
     try std.testing.expect(std.mem.indexOf(u8, text_memory.bytes(), "\"text_indexes\":1") != null);
     var dense_response = try owner.queryJson(
