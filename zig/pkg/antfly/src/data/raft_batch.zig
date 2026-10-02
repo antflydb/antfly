@@ -232,6 +232,9 @@ fn consumerTests() type {
             try std.testing.expect(merge_copy_attempt_protocol_version > merge_artifacts_protocol_version);
             try std.testing.expect(merge_page_protocol_version > merge_copy_attempt_protocol_version);
             try std.testing.expect(source_scope_protocol_version > relational_transfer_protocol_version);
+            // artifact_catalog was the newest feature when this was written;
+            // later versions (acknowledge_many, row_semantics, ...) have
+            // since advanced protocol_version past it, same as the next check.
             try std.testing.expect(protocol_version >= artifact_catalog_protocol_version);
             try std.testing.expect(protocol_version >= acknowledge_many_protocol_version);
             try std.testing.expect(acknowledge_many_protocol_version > source_scope_protocol_version);
