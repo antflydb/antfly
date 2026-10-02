@@ -42,7 +42,9 @@ const std = @import("std");
 /// Version 20 admits ordered direct-vector artifact merges. The entire ordered
 /// artifact workflow requires this capability, so a partial rolling upgrade
 /// cannot certify a source whose later pages an older voter cannot execute.
-pub const current_version: u16 = 20;
+/// Version 21 applies catalog-qualified DROP and physical topology removal in
+/// one command. Earlier voters understand the union but reject its DROP arm.
+pub const current_version: u16 = 21;
 pub const durable_activation_version: u16 = 9;
 pub const store_report_update_version: u16 = 8;
 // Preflight and final append require the same complete decoder capability.
@@ -53,6 +55,7 @@ pub const source_scope_version: u16 = 11;
 pub const restore_job_admission_version: u16 = 5;
 pub const restore_job_expiry_version: u16 = 6;
 pub const system_catalog_version: u16 = 7;
+pub const system_catalog_drop_version: u16 = 21;
 pub const sql_setting_catalog_version: u16 = 12;
 pub const sql_row_policy_catalog_version: u16 = 13;
 pub const sql_row_policy_publication_version: u16 = 14;

@@ -9,7 +9,22 @@ const transform = @import("relational_row_transform.zig");
 const staging = @import("restore_staging_contract.zig");
 const codec = @import("algebraic/relational_row_codec.zig");
 const Allocator = std.mem.Allocator;
-pub const LogicalRow = struct { json: []u8, timestamp: u64 };
+pub const LogicalRow = struct { json: []u8, timestamp: u64, json_null_fields: []const []const u8 = &.{} };
+
+/// Preserve the legacy digest for rows without provenance, while binding the
+/// extra SQL/JSON distinction whenever JSON reconstruction needs it.
+pub fn hashJsonNullFields(hash: *std.crypto.hash.Blake3, fields: []const []const u8) void {
+    if (fields.len == 0) return;
+    hash.update("antfly-logical-json-null-fields-v1");
+    var size: [8]u8 = undefined;
+    std.mem.writeInt(u64, &size, fields.len, .little);
+    hash.update(&size);
+    for (fields) |field| {
+        std.mem.writeInt(u64, &size, field.len, .little);
+        hash.update(&size);
+        hash.update(field);
+    }
+}
 
 pub const ProgramSet = struct {
     alloc: Allocator,
@@ -69,7 +84,7 @@ pub const ProgramSet = struct {
             }
         }.less);
         var hash = std.crypto.hash.Blake3.init(.{});
-        hash.update("antfly-relational-rewrite-program-set-v1");
+        hash.update("antfly-relational-rewrite-program-set-v2");
         for (programs) |program| hash.update(&program.identity);
         const encoded = try @import("../schema.zig").serializeSchema(alloc, programs[0].target.tableSchema().*);
         defer alloc.free(encoded);
@@ -81,7 +96,7 @@ pub const ProgramSet = struct {
     pub fn initIntent(alloc: Allocator, intent: contract.Intent) !ProgramSet {
         try intent.validate();
         var value = if (intent.preserve_document) try initDocumentPreservationWithRead(alloc, intent.target_schema, intent.target_read_schema) else try init(alloc, intent.source_schemas, intent.target_schema, .{
-            .defaults = if (intent.apply_defaults_to_absent) .apply_to_absent else .preserve_absence,
+            .default_columns = intent.default_columns,
             .dropped_columns = if (intent.allow_column_drops) .allow else .reject,
         });
         errdefer value.deinit();
@@ -140,7 +155,9 @@ pub const ProgramSet = struct {
         var result = try program.transform(alloc, row);
         defer result.deinit(alloc);
         const typed = try codec.ordinalRowViewSelective(result.packed_row, program.target.tableSchema().*, program.target.physicalLayout());
-        return .{ .json = try typed.reconstructValueAlloc(alloc), .timestamp = typed.writeTimestampNs() };
+        const json = try typed.reconstructValueAlloc(alloc);
+        errdefer alloc.free(json);
+        return .{ .json = json, .timestamp = typed.writeTimestampNs(), .json_null_fields = try typed.jsonNullFieldsAlloc(alloc) };
     }
 
     pub fn preserveDocument(self: *const ProgramSet, alloc: Allocator, json: []const u8) ![]u8 {

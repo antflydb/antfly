@@ -12271,6 +12271,7 @@ pub const DB = struct {
                     .key = predicate.key,
                     .expected_version = predicate.expected_version,
                     .expected_content_digest = predicate.expected_content_digest,
+                    .unique_absence = predicate.unique_absence,
                 });
             }
             try self.core.checkVersionPredicates(predicates.items, null);
@@ -30126,6 +30127,7 @@ pub const DB = struct {
                 .key = predicate.key,
                 .expected_version = predicate.expected_version,
                 .expected_content_digest = predicate.expected_content_digest,
+                .unique_absence = predicate.unique_absence,
             });
         }
 
@@ -43795,10 +43797,12 @@ pub const DB = struct {
             };
             if (!self.core.byteRange().contains(document_key)) return error.RestoreStagingScopeChanged;
             var timestamp: u64 = 0;
+            var json_null_fields: []const []const u8 = &.{};
             const json = if (internal_keys.isRelationalRowKey(row.key)) logical: {
                 if (program) |rewrite| {
                     const transformed = try rewrite.transformJson(owned, row.value);
                     timestamp = transformed.timestamp;
+                    json_null_fields = transformed.json_null_fields;
                     break :logical transformed.json;
                 }
                 const version = try relational_store.rowSchemaVersion(row.value);
@@ -43809,6 +43813,7 @@ pub const DB = struct {
                 const view = historical.?;
                 const typed = try relational_row_codec.ordinalRowViewSelective(row.value, view.tableSchema().*, view.physicalLayout());
                 timestamp = typed.writeTimestampNs();
+                json_null_fields = try typed.jsonNullFieldsAlloc(owned);
                 break :logical try typed.reconstructValueAlloc(owned);
             } else logical: {
                 timestamp = try source.getTimestamp(owned, document_key);
@@ -43823,7 +43828,7 @@ pub const DB = struct {
             // preparation. These historical logical values must be validated,
             // not treated as new API input that fills today's defaults or
             // recomputes (and thereby repairs) stored generated results.
-            try writes.append(owned, .{ .key = document_key, .value = json });
+            try writes.append(owned, .{ .key = document_key, .value = json, .json_null_fields = json_null_fields });
             try timestamps.append(owned, .{ .key = document_key, .timestamp = timestamp });
             var hash = std.crypto.hash.Blake3.init(.{});
             hash.update(&next.logical_digest);
@@ -43832,6 +43837,7 @@ pub const DB = struct {
             hash.update(&length);
             hash.update(document_key);
             hash.update(json);
+            @import("relational_rewrite_program.zig").hashJsonNullFields(&hash, json_null_fields);
             hash.final(&next.logical_digest);
             next.rows = std.math.add(u64, next.rows, 1) catch return error.InvalidRestoreStagingCommand;
             continuation_buffer.clearRetainingCapacity();
@@ -45597,8 +45603,11 @@ pub const DB = struct {
             return null;
         };
         errdefer replay.release();
-        try self.ensurePrimaryOnlySnapshot();
+        // SQL pins only the primary row store. External vector payloads are
+        // irrelevant to this visibility cut; the full-backup capability gate
+        // would incorrectly reject ordinary SQL on such tables.
         var manager = try self.core.initTxnManager();
+        defer manager.deinit();
         if (try manager.hasUnresolvedWriteIntents()) {
             replay.release();
             primary.release();
@@ -45613,6 +45622,7 @@ pub const DB = struct {
     pub const RelationalReadSession = struct {
         row_policy_lease: ?row_policy_gate_mod.Gate.Lease = null,
         range_proofs: ?[]@import("../range_protection.zig").Proof = null,
+        page_bytes: usize = 16 * 1024 * 1024,
         alloc: Allocator,
         reader: RelationalRows.Reader = undefined,
         filter_context: ?*anyopaque = null,
@@ -45641,7 +45651,9 @@ pub const DB = struct {
 
         pub fn nextTypedPage(session: *RelationalReadSession, alloc: Allocator, io: ?std.Io, budget: RelationalRows.Budget) !RelationalRows.Page {
             try session.checkpoint();
-            var page = try session.reader.nextTypedPage(alloc, io, budget);
+            var bounded = budget;
+            bounded.target_bytes = @min(bounded.output_bytes, if (bounded.target_bytes == 0) session.page_bytes else @min(bounded.target_bytes, session.page_bytes));
+            var page = try session.reader.nextTypedPage(alloc, io, bounded);
             errdefer page.deinit();
             try session.checkpoint();
             return page;
@@ -45766,6 +45778,8 @@ pub const DB = struct {
         } else null;
         defer if (parsed_json) |*owned| owned.deinit();
         const parsed = .{ .value = opts.relational_query orelse parsed_json.?.value };
+        if (parsed.value.page_bytes == 0 or parsed.value.page_bytes > 16 * 1024 * 1024) return error.InvalidRelationalRowsRequest;
+        session.page_bytes = parsed.value.page_bytes;
         if (parsed.value.conditions.len > 256 or parsed.value.fields.len > 256) return error.InvalidRelationalRowsRequest;
         var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
         defer view.release();
@@ -83074,6 +83088,61 @@ fn expectTestRelationalIndexRow(db: *DB, document: []const u8, json: []const u8,
     }
 }
 
+test "relational rows snapshot streams flushed companion families without point probes" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("relational-primary-stream");
+    defer tmp.cleanup();
+    {
+        var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{ .flush_threshold = 2 } } });
+        defer db.close();
+        try db.setSchemaJson(alloc,
+            \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"}},"additionalProperties":false}}}}
+        );
+        for (0..20) |batch| {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const writes = try a.alloc(types.BatchWrite, 250);
+            for (writes, 0..) |*write, index| {
+                const ordinal = batch * 250 + index;
+                write.* = .{ .key = try std.fmt.allocPrint(a, "row:{d:0>5}", .{ordinal}), .value = try std.fmt.allocPrint(a, "{{\"n\":{d}}}", .{ordinal}) };
+            }
+            try db.batch(.{ .timestamp_ns = 100, .writes = writes });
+        }
+        // A preceding document companion exercises the seek fallback; orphan
+        // companions before and after the corpus must not lose continuation.
+        const companion = try internal_keys.documentKeyAlloc(alloc, "row:00000");
+        defer alloc.free(companion);
+        try db.core.store.put(companion, "{}");
+        for ([_][]const u8{ "orphan", "z-orphan" }) |id| {
+            const key = try internal_keys.ttlKeyAlloc(alloc, id);
+            defer alloc.free(key);
+            const timestamp = [_]u8{0} ** 8;
+            try db.core.store.put(key, &timestamp);
+        }
+    }
+    // Reopen so the test measures the persisted-run path, not a memtable.
+    var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    var reader = try db.beginRelationalRows(alloc, .{ .fields = &.{"n"} });
+    defer reader.deinit();
+    var count: usize = 0;
+    var pages: usize = 0;
+    while (true) {
+        var page = try reader.nextTypedPage(alloc, null, .{ .rows = 17, .records = 17 });
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 0), page.primary_lookups);
+        for (page.rows) |row| {
+            try std.testing.expectEqual(@as(i64, @intCast(count)), row.typed.?.object.get("n").?.integer);
+            count += 1;
+        }
+        pages += 1;
+        if (!page.more) break;
+        try std.testing.expect(pages < 512);
+    }
+    try std.testing.expectEqual(@as(usize, 5000), count);
+}
+
 test "relational rows snapshot projects exact composite ranges through writes DDL and garbage collection" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("relational-rows");
@@ -83174,6 +83243,18 @@ test "relational rows snapshot projects exact composite ranges through writes DD
     try db.writeIntents(parent_read, &.{}, &.{.{ .key = "b", .expected_version = 100 }});
     try std.testing.expectError(error.IntentConflict, db.batch(.{ .deletes = &.{"b"} }));
     try db.commitTransaction(parent_read, 102);
+    {
+        var soft_reader = try db.beginRelationalRows(alloc, .{ .fields = &.{"payload"} });
+        defer soft_reader.deinit();
+        var first = try soft_reader.nextTypedPage(alloc, null, .{ .target_bytes = 1, .output_bytes = 16 * 1024 * 1024 });
+        defer first.deinit();
+        try std.testing.expectEqual(@as(usize, 1), first.rows.len);
+        var second = try soft_reader.nextTypedPage(alloc, null, .{ .target_bytes = 1, .output_bytes = 16 * 1024 * 1024 });
+        defer second.deinit();
+        try std.testing.expectEqual(@as(usize, 1), second.rows.len);
+        try std.testing.expectEqualStrings("b", second.rows[0].key);
+        try std.testing.expect(second.output_bytes > 1024 * 1024);
+    }
     var reader = try db.beginRelationalRows(alloc, request);
     defer reader.deinit();
     try std.testing.expectError(error.RelationalRowResultTooLarge, reader.nextPage(alloc, null, .{ .output_bytes = 1 }));

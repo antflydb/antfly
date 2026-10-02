@@ -1494,6 +1494,9 @@ pub const RelationalRowQuery = struct {
         value: ?std.json.Value = null,
         collation: ?[]const u8 = null,
     };
+    /// Retained typed readers bound bytes as well as rows. Transported with
+    /// the query so every owner uses the same requested page envelope.
+    page_bytes: usize = 16 * 1024 * 1024,
     fields: []const []const u8,
     index: ?[]const u8 = null,
     /// Let the storage reader choose a READY covering/key index from the
@@ -1691,6 +1694,8 @@ pub const TransactionVersionPredicate = struct {
     /// Internal observation guard. TTL timestamps need not change on updates.
     /// SHA-256 binds the exact primary row read before planning FK actions.
     expected_content_digest: ?[32]u8 = null,
+    /// A server-authored INSERT identity constraint, rather than an observed read.
+    unique_absence: bool = false,
 };
 
 /// Server-compiled integrity effects. The logical routing key is separate from

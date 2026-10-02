@@ -114,6 +114,7 @@ pub const TableApi = struct {
         Conflict,
         IntegrityTopologyBusy,
         UniqueConstraintViolation,
+        RelationalCheckViolation,
         ForeignKeyParentMissing,
         ForeignKeyReferenced,
         MethodNotAllowed,
@@ -121,6 +122,7 @@ pub const TableApi = struct {
         DenseRepairBackpressure,
         Unavailable,
         WriteUnavailable,
+        ConstraintActivationUnavailable,
         WriteDefinitelyAbortedUnavailable,
         HAWriteDurabilityPending,
         OutcomeUnknown,
@@ -1720,7 +1722,7 @@ fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batc
             .json = true,
             .retry_after_seconds = 1,
         },
-        error.UniqueConstraintViolation, error.ForeignKeyParentMissing, error.ForeignKeyReferenced => return .{
+        error.UniqueConstraintViolation, error.RelationalCheckViolation, error.ForeignKeyParentMissing, error.ForeignKeyReferenced => return .{
             .status = 409,
             .json = true,
             .body = try std.json.Stringify.valueAlloc(alloc, .{ .@"error" = @errorName(err) }, .{}),
@@ -1740,6 +1742,12 @@ fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batc
         },
         error.Unavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "maintenance routes unavailable on query-only runtime") },
         error.WriteUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "write unavailable") },
+        error.ConstraintActivationUnavailable => return .{
+            .status = 503,
+            .body = try alloc.dupe(u8, "{\"code\":\"constraint_activation_pending\",\"message\":\"constraint activation is not ready; no mutation was admitted\",\"retryable\":true,\"retry_after_ms\":1000}"),
+            .json = true,
+            .retry_after_seconds = 1,
+        },
         error.WriteDefinitelyAbortedUnavailable => return .{
             .status = 503,
             .body = try alloc.dupe(u8, "{\"code\":\"transaction_precommit_aborted\",\"message\":\"the transaction was durably aborted before commit; retrying the batch is safe\",\"retryable\":true,\"retry_after_ms\":1000}"),
@@ -3744,6 +3752,7 @@ test "public table batch handler maps write unavailable errors" {
         retry_after_seconds: ?u32 = null,
     }{
         .{ .err = error.WriteUnavailable, .status = 503, .body = "write unavailable" },
+        .{ .err = error.ConstraintActivationUnavailable, .status = 503, .body = "{\"code\":\"constraint_activation_pending\",\"message\":\"constraint activation is not ready; no mutation was admitted\",\"retryable\":true,\"retry_after_ms\":1000}", .json = true, .retry_after_seconds = 1 },
         .{ .err = error.WriteDefinitelyAbortedUnavailable, .status = 503, .body = "{\"code\":\"transaction_precommit_aborted\",\"message\":\"the transaction was durably aborted before commit; retrying the batch is safe\",\"retryable\":true,\"retry_after_ms\":1000}", .json = true, .retry_after_seconds = 1 },
         .{ .err = error.IntegrityTopologyBusy, .status = 409, .body = "{\"code\":\"integrity_topology_busy\",\"message\":\"table integrity topology is changing; retry this batch after publication\",\"retryable\":true,\"retry_after_ms\":1000}", .json = true, .retry_after_seconds = 1 },
         .{

@@ -5598,9 +5598,10 @@ pub const DataServer = struct {
     provisioned_startup_catch_up_target_group_id: u64 = 0,
     provisioned_startup_catch_up_target_table_name: ?[]u8 = null,
     provisioned_startup_catch_up_dirty: std.atomic.Value(bool) = .init(true),
+    provisioned_startup_catch_up_tables: @import("dirty_tables.zig").Queue = .{},
     // Full scans and exact admission retries are separate work classes. A
     // monotonic epoch lets exact retries avoid rescanning every local shard
-    // without allowing a concurrent topology/data wake to be mistaken for an
+    // without allowing a concurrent topology wake to be mistaken for an
     // exact-only pass.
     provisioned_startup_catch_up_full_scan_epoch: std.atomic.Value(u64) = .init(1),
     provisioned_startup_catch_up_completed_full_scan_epoch: std.atomic.Value(u64) = .init(0),
@@ -9465,6 +9466,7 @@ pub const DataServer = struct {
         }
         self.provisioned_index_repair_group_ages.deinit(self.alloc);
         self.schema_repair_schedule.deinit(self.alloc);
+        self.provisioned_startup_catch_up_tables.deinit(self.alloc);
         self.provisioned_index_repair_terminal_log_groups.deinit(self.alloc);
         self.provisioned_index_repair_cancel_groups.deinit(self.alloc);
         self.provisioned_index_repair_routes.deinit(self.alloc);
@@ -12144,6 +12146,8 @@ pub const DataServer = struct {
 
     fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
         if (antfly.db.types.requiresGraphRelationshipProtocol(req)) return @import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version;
+        if (@import("../api/batch.zig").requiresRowSemanticsEnvelope(req.writes, req.predicates))
+            return @import("../common/data_raft_protocol.zig").batch_row_semantics_protocol_version;
         if (req.merge_proof_adoption != null) return data_raft_batch.merge_proof_adoption_protocol_version;
         if (req.artifact_publication_transport != null) return @import("../common/data_raft_protocol.zig").batch_artifact_publication_transport_protocol_version;
         const extended = @import("../common/data_raft_protocol.zig").batch_artifact_publication_protocol_version;
@@ -14135,10 +14139,17 @@ pub const DataServer = struct {
         table_name: []const u8,
         kind: antfly.public_api.ProvisionedTableWriteSource.LocalChangeKind,
     ) void {
-        _ = table_name;
         self.runtime_status_dirty.store(true, .release);
         switch (kind) {
-            .data => self.markProvisionedStartupCatchUpFullScanDirty(),
+            .data => {
+                self.provisioned_startup_catch_up_tables.mark(self.alloc, table_name) catch {
+                    // A missed allocation must broaden inspection, not lose
+                    // recovery work. Structural and startup scans stay broad.
+                    self.markProvisionedStartupCatchUpFullScanDirty();
+                    return;
+                };
+                self.provisioned_startup_catch_up_dirty.store(true, .release);
+            },
             .index_repair, .runtime_reconciled, .runtime_status, .runtime_activity, .startup_catch_up => {},
             .structural => {
                 self.clearProvisionedStartupCatchUpBackoffs();
@@ -21188,7 +21199,7 @@ pub const DataServer = struct {
         return warmed_group_count;
     }
 
-    fn collectStartupCatchUpRoutes(self: *DataServer, snapshot: anytype, local_group_ids: []const u64, deferred_groups: anytype, full_scan: bool, now_ms: u64) ![]@import("schema_repair_schedule.zig").Route {
+    fn collectStartupCatchUpRoutes(self: *DataServer, snapshot: anytype, local_group_ids: []const u64, deferred_groups: anytype, dirty_tables: *const @import("dirty_tables.zig").Queue.Batch, full_scan: bool, now_ms: u64) ![]@import("schema_repair_schedule.zig").Route {
         const Route = @import("schema_repair_schedule.zig").Route;
         const TableRoute = struct { index: usize, schema_hash: u64 };
         var tables: std.AutoHashMapUnmanaged(u64, TableRoute) = .empty;
@@ -21220,7 +21231,7 @@ pub const DataServer = struct {
                     .root_generation = self.liveRuntimeWriteSource().visibleRootGenerationForRepair(range.group_id),
                     .ownership_generation = ownership_generation,
                 });
-            } else if (full_scan or containsSortedDeferredStartupCatchUpGroup(deferred_groups, range.group_id)) {
+            } else if (full_scan or dirty_tables.contains(table.name) or containsSortedDeferredStartupCatchUpGroup(deferred_groups, range.group_id)) {
                 try ordinary.append(self.alloc, route);
             }
         }
@@ -21271,6 +21282,13 @@ pub const DataServer = struct {
             return stats;
         };
 
+        var dirty_tables = self.provisioned_startup_catch_up_tables.take();
+        defer dirty_tables.deinit(self.alloc);
+        defer if (!inspection_complete) {
+            self.provisioned_startup_catch_up_tables.restore(self.alloc, &dirty_tables) catch
+                self.markProvisionedStartupCatchUpFullScanDirty();
+        };
+
         const deferred_groups = self.liveRuntimeWriteSource().snapshotDeferredStartupCatchUpGroups(self.alloc) catch |err| {
             _ = self.provisioned_startup_catch_up_failed.fetchAdd(1, .monotonic);
             std.log.warn("provisioned startup catch-up deferred-group snapshot failed err={s}", .{@errorName(err)});
@@ -21290,7 +21308,7 @@ pub const DataServer = struct {
         };
         defer self.alloc.free(retained_deferred_groups);
         @memset(retained_deferred_groups, false);
-        if (!full_scan and deferred_groups.len == 0) {
+        if (!full_scan and deferred_groups.len == 0 and dirty_tables.count() == 0) {
             inspection_complete = true;
             return stats;
         }
@@ -21322,6 +21340,11 @@ pub const DataServer = struct {
             local_group_ids = fallback_group_ids;
         }
         defer self.alloc.free(local_group_ids);
+        // Ranges can precede their placement publication. An empty ownership
+        // projection is not a completed inspection; retain the table batch
+        // and full-scan epoch until the catalog identifies local owners.
+        if (local_group_ids.len == 0 and snapshot.ranges.len != 0 and snapshot.placement_intents.len == 0)
+            return stats;
 
         const filesystem_io = blk: {
             const backend_runtime = self.ensureBackendRuntime() catch |err| {
@@ -21336,7 +21359,7 @@ pub const DataServer = struct {
             };
         };
 
-        const routes = self.collectStartupCatchUpRoutes(snapshot, local_group_ids, deferred_groups, full_scan, started_at_ms) catch |err| {
+        const routes = self.collectStartupCatchUpRoutes(snapshot, local_group_ids, deferred_groups, &dirty_tables, full_scan, started_at_ms) catch |err| {
             std.log.warn("startup routing failed err={s}", .{@errorName(err)});
             stats.debt_remaining = true;
             stats.unparked_debt_remaining = true;
@@ -36657,6 +36680,9 @@ fn consumerTests() type {
                 @import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version,
                 DataServer.requiredRaftBatchProtocolVersion(.{ .merge_artifacts = &.{.{ .key = retirement, .value = "1" }} }),
             );
+            const row_protocol = @import("../common/data_raft_protocol.zig").batch_row_semantics_protocol_version;
+            try std.testing.expectEqual(row_protocol, DataServer.requiredRaftBatchProtocolVersion(.{ .writes = &.{.{ .key = "row", .value = "{\"j\":null}", .json_null_fields = &.{"j"} }} }));
+            try std.testing.expectEqual(row_protocol, DataServer.requiredRaftBatchProtocolVersion(.{ .predicates = &.{.{ .key = "row", .expected_version = 0, .unique_absence = true }} }));
             try std.testing.expectEqual(
                 data_raft_batch.merge_artifacts_protocol_version,
                 DataServer.requiredRaftBatchProtocolVersion(.{ .merge_artifacts = &.{.{ .key = "artifact", .value = "payload" }} }),
@@ -39248,9 +39274,13 @@ fn consumerTests() type {
             defer server.deinit();
             try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
 
+            try server.provisioned_startup_catch_up_tables.mark(alloc, "docs");
             server.provisioned_startup_catch_up_dirty.store(false, .monotonic);
             _ = server.runProvisionedStartupCatchUp();
 
+            var retained = server.provisioned_startup_catch_up_tables.take();
+            defer retained.deinit(alloc);
+            try std.testing.expect(retained.contains("docs"));
             try std.testing.expect(server.provisioned_startup_catch_up_dirty.load(.monotonic));
             try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_started.load(.monotonic));
             try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_completed.load(.monotonic));
@@ -39351,6 +39381,41 @@ fn consumerTests() type {
             try std.testing.expect(server.shouldDeferProvisionedReplicaRootReconcile());
         }
 
+        test "data runtime startup catch-up selects dirty tables and deferred groups without cold siblings" {
+            const alloc = std.testing.allocator;
+            var server: DataServer = .{
+                .alloc = alloc,
+                .provisioned_storage = undefined,
+                .read_source = undefined,
+                .write_source = undefined,
+                .status_source = undefined,
+                .api_server_cfg = .{},
+                .query_async_limit = .limited(8),
+                .listener_cfg = undefined,
+            };
+            defer server.schema_repair_schedule.deinit(alloc);
+            var queue: @import("dirty_tables.zig").Queue = .{};
+            defer queue.deinit(alloc);
+            try queue.mark(alloc, "active");
+            var dirty = queue.take();
+            defer dirty.deinit(alloc);
+            const Table = struct { table_id: u64, name: []const u8, read_schema_json: []const u8 = "", schema_json: []const u8 = "{}", indexes_json: []const u8 = "[]" };
+            const Range = struct { table_id: u64, group_id: u64 };
+            const snapshot = .{
+                .tables = &[_]Table{ .{ .table_id = 1, .name = "active" }, .{ .table_id = 2, .name = "idle" }, .{ .table_id = 3, .name = "deferred" } },
+                .ranges = &[_]Range{ .{ .table_id = 1, .group_id = 11 }, .{ .table_id = 2, .group_id = 22 }, .{ .table_id = 3, .group_id = 33 } },
+            };
+            const deferred = [_]antfly.public_api.ProvisionedTableWriteSource.DeferredStartupCatchUp{.{ .group_id = 33, .generation = 1 }};
+            const targeted = try server.collectStartupCatchUpRoutes(snapshot, &.{ 11, 22, 33 }, &deferred, &dirty, false, 0);
+            defer alloc.free(targeted);
+            try std.testing.expectEqual(@as(usize, 2), targeted.len);
+            try std.testing.expectEqual(@as(u64, 11), targeted[0].group_id);
+            try std.testing.expectEqual(@as(u64, 33), targeted[1].group_id);
+            const broad = try server.collectStartupCatchUpRoutes(snapshot, &.{ 11, 22, 33 }, &deferred, &dirty, true, 0);
+            defer alloc.free(broad);
+            try std.testing.expectEqual(@as(usize, 3), broad.len);
+        }
+
         test "data runtime data changes mark provisioned startup catch-up dirty" {
             var server: DataServer = .{
                 .alloc = std.testing.allocator,
@@ -39363,13 +39428,19 @@ fn consumerTests() type {
                 .listener_cfg = undefined,
             };
 
+            defer server.provisioned_startup_catch_up_tables.deinit(std.testing.allocator);
             server.runtime_status_dirty.store(false, .release);
             server.provisioned_startup_catch_up_dirty.store(false, .release);
 
+            const full_scan_before = server.provisioned_startup_catch_up_full_scan_epoch.load(.acquire);
             DataServer.onLocalTableChanged(&server, "docs", .data);
 
             try std.testing.expect(server.runtime_status_dirty.load(.acquire));
             try std.testing.expect(server.provisioned_startup_catch_up_dirty.load(.acquire));
+            var pending = server.provisioned_startup_catch_up_tables.take();
+            defer pending.deinit(std.testing.allocator);
+            try std.testing.expect(pending.contains("docs"));
+            try std.testing.expectEqual(full_scan_before, server.provisioned_startup_catch_up_full_scan_epoch.load(.acquire));
         }
 
         test "data runtime reconciled changes invalidate status without scheduling root catch-up" {
@@ -40094,9 +40165,13 @@ fn consumerTests() type {
             defer server.deinit();
             try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
 
+            try server.provisioned_startup_catch_up_tables.mark(alloc, "docs");
             server.provisioned_startup_catch_up_dirty.store(false, .monotonic);
             _ = server.runProvisionedStartupCatchUp();
 
+            var retained = server.provisioned_startup_catch_up_tables.take();
+            defer retained.deinit(alloc);
+            try std.testing.expect(retained.contains("docs"));
             try std.testing.expect(server.provisioned_startup_catch_up_dirty.load(.monotonic));
             try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_started.load(.monotonic));
             try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_completed.load(.monotonic));
