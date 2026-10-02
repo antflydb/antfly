@@ -1876,9 +1876,11 @@ test "relational integrity live two phase HA replay preserves rows and binary cl
     const invalid_key = invalid_address.claimKey();
     const invalid_value = try claim.encode(alloc, invalid_address);
     defer alloc.free(invalid_value);
-    const invalid_lsn = try effects.appendBatchMutationRequest(alloc, &primary, .{
+    const invalid_payload = try effects.encodeBatchMutationRequestAlloc(alloc, .{
         .writes = &.{.{ .key = &invalid_key, .value = invalid_value }},
-    }, .{});
+    });
+    defer alloc.free(invalid_payload);
+    const invalid_lsn = try primary.append(.{ .payload_codec = .json, .payload = invalid_payload });
     var invalid_entry = (try primary.log.entryAt(alloc, invalid_lsn)).?;
     defer invalid_entry.deinit(alloc);
     try std.testing.expectError(error.IntegrityCatalogChanged, replication_ingress.applyRecord(&replica, invalid_entry.record));
@@ -2125,7 +2127,7 @@ test "relational integrity topology handoff transfers routed companions with res
     const parent_acknowledge: topology.Command = .{ .action = .acknowledge_parent_retirement, .fence = parent_fence, .parent_activation = .{ .plan_id = @splat(4), .plan_digest = @splat(5), .publication_digest = retirement.publicationDigest(@splat(4), @splat(5)) } };
     const source_fence: topology.Fence = .{ .transition_id = 800, .attempt = 1, .owner_group_id = 601, .peer_group_id = 602, .role = .split_source, .namespace = source_owner.namespace, .catalog_digest = source_owner.catalog_digest, .admission_epoch = source_owner.next_epoch + 1 };
     const destination_fence: topology.Fence = .{ .transition_id = 800, .attempt = 1, .owner_group_id = 602, .peer_group_id = 601, .role = .split_destination, .namespace = destination_owner.namespace, .catalog_digest = destination_owner.catalog_digest };
-    try std.testing.expectError(error.GenerationRetirementAcknowledgementPending, source.applyRelationalTopologyControl(.{ .action = .begin, .fence = source_fence }, null));
+    try std.testing.expectError(error.IntegrityTopologyBusy, source.applyRelationalTopologyControl(.{ .action = .begin, .fence = source_fence }, null));
     try source.applyRelationalTopologyControl(parent_acknowledge, null);
     try source.applyRelationalTopologyControl(.{ .action = .begin, .fence = source_fence }, null);
     try destination.applyRelationalTopologyControl(.{ .action = .begin, .fence = destination_fence }, null);
@@ -2405,8 +2407,8 @@ fn verifyMergeReplicationReplay(primary: *@import("../hot_standby/primary.zig").
     while (lsn <= primary.lastLsn()) : (lsn += 1) {
         var entry = (try primary.log.entryAt(std.testing.allocator, lsn)) orelse return error.TestUnexpectedResult;
         defer entry.deinit(std.testing.allocator);
-        try replication_ingress.applyRecord(&standby, entry.record);
-        try replication_ingress.applyRecord(&standby, entry.record);
+        try replication_ingress.applyRecord(standby, entry.record);
+        try replication_ingress.applyRecord(standby, entry.record);
     }
     try std.testing.expect((try standby.relationalTopologyStatus()).fence == null);
     try std.testing.expectEqualStrings(if (rollback) "m" else "", standby.getRange().end);

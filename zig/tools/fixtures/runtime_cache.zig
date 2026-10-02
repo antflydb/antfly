@@ -176,6 +176,11 @@ pub fn build(b: *std.Build) void {
     inline for (std.meta.tags(runtime.RuntimeLibraryUnit)) |unit| {
         const artifact = artifacts.runtime.runtime_library_artifacts[@intFromEnum(unit)].?;
         var seen = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
+        if (unit != .inference) {
+            var identity_seen = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
+            if (inferenceIdentityPath(b, artifact.root_module, &identity_seen, @tagName(unit))) |path|
+                std.debug.panic("{s} archive depends on inference backend identity through {s}", .{ @tagName(unit), path });
+        }
         inspect(artifact.root_module, unit, artifacts.inference.build_info_object, &seen);
         if (unit == .distributed) artifact.root_module.addImport("cache_lite_capabilities", b.createModule(.{
             .root_source_file = b.path("pkg/antfly/src/storage/lite/capabilities.zig"),
@@ -250,6 +255,18 @@ pub fn build(b: *std.Build) void {
         identities.addImports(identity_probe.root_module);
         b.step("cache-identity", "Read enabled backends' actual source identities").dependOn(&b.addRunArtifact(identity_probe).step);
     }
+}
+
+fn inferenceIdentityPath(b: *std.Build, module: *std.Build.Module, seen: *std.AutoHashMap(*std.Build.Module, void), path: []const u8) ?[]const u8 {
+    if ((seen.getOrPut(module) catch @panic("OOM")).found_existing) return null;
+    var imports = module.import_table.iterator();
+    while (imports.next()) |entry| {
+        const name = entry.key_ptr.*;
+        const next = b.fmt("{s}/{s}", .{ path, name });
+        if (std.mem.eql(u8, name, "metal_jit_identity") or std.mem.eql(u8, name, "cuda_jit_identity")) return next;
+        if (inferenceIdentityPath(b, entry.value_ptr.*, seen, next)) |found| return found;
+    }
+    return null;
 }
 
 fn findSourceModule(module: *std.Build.Module, suffix: []const u8, seen: *std.AutoHashMap(*std.Build.Module, void)) ?*std.Build.Module {

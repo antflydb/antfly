@@ -45,7 +45,11 @@ def test_relational_fk_binding_preserves_exact_schema_defaults(auth_api, with_fk
         response = api.request_raw(
             "POST", f"/tables/children_{case}", data=body, timeout=30
         )
-        assert response.status_code in (200, 201), response.text
+        assert response.status_code in (200, 201, 202), response.text
+        if response.status_code == 202:
+            assert response.json()["code"] == "fk_initial_create_publication", (
+                response.text
+            )
         _ready(api, f"children_{case}")
         response = api.request_raw("GET", f"/tables/children_{case}", timeout=30)
         assert response.status_code == 200, response.text

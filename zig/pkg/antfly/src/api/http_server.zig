@@ -38312,7 +38312,7 @@ test "api http server serves table batch writes" {
     };
 
     var source = FakeSource{};
-    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, table_source.source());
+    var server = ApiHttpServer.init(std.testing.allocator, .{ .deployment_mode = .standalone }, source.iface(), null, table_source.source());
     defer server.deinit();
     const batch_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator, "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\"}},\"deletes\":[\"doc:gone\"]}");
     defer std.testing.allocator.free(batch_body);
@@ -38863,7 +38863,7 @@ test "api http server serves table batch transforms" {
     };
 
     var source = FakeSource{};
-    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, table_source.source());
+    var server = ApiHttpServer.init(std.testing.allocator, .{ .deployment_mode = .standalone }, source.iface(), null, table_source.source());
     defer server.deinit();
 
     const insert_body = try test_contract_helpers.normalizeBatchRequest(
@@ -39136,7 +39136,7 @@ test "api http server serves public transaction commit route" {
     };
 
     var source = FakeSource{};
-    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), read_source.source(), table_source.source());
+    var server = ApiHttpServer.init(std.testing.allocator, .{ .deployment_mode = .standalone }, source.iface(), read_source.source(), table_source.source());
     defer server.deinit();
 
     const commit_batch = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator, "{\"inserts\":{\"doc:a\":{\"title\":\"beta\"}}}");
@@ -39287,7 +39287,7 @@ test "api http server surfaces structured participant diagnostics for unavailabl
 
     var source = FakeSource{};
     var writes = FakeWrites{};
-    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, writes.source());
+    var server = ApiHttpServer.init(std.testing.allocator, .{ .deployment_mode = .standalone }, source.iface(), null, writes.source());
     defer server.deinit();
 
     const commit_body = try test_contract_helpers.encodeTransactionCommitRequest(
@@ -39396,7 +39396,7 @@ test "api http server surfaces structured decision conflicts for transaction com
 
     var source = FakeSource{};
     var writes = FakeWrites{};
-    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.source());
+    var server = ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone }, source.iface(), null, writes.source());
     defer server.deinit();
 
     const commit_body = try test_contract_helpers.encodeTransactionCommitRequest(
@@ -39612,7 +39612,7 @@ test "api http server surfaces structured torn-state conflicts when txn record i
 
     var source = FakeSource{};
     var writes = FakeWrites{};
-    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.source());
+    var server = ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone }, source.iface(), null, writes.source());
     defer server.deinit();
 
     const commit_body = try test_contract_helpers.encodeTransactionCommitRequest(
@@ -39718,7 +39718,7 @@ test "api http server surfaces structured torn-state conflicts when txn record i
 
     var source = FakeSource{};
     var writes = FakeWrites{};
-    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.source());
+    var server = ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone }, source.iface(), null, writes.source());
     defer server.deinit();
 
     const commit_body = try test_contract_helpers.encodeTransactionCommitRequest(

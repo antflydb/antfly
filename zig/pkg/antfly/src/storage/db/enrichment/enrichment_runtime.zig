@@ -32731,6 +32731,16 @@ fn testOrderedAssetLifecycle(generated: bool, graph: bool, delete_live: bool) !v
             if (!deleted) {
                 try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .timestamp_ns = 101 }, .{ .term = 1, .index = pass * entries_per_pass + 3 });
             } else try server_test_adapter.applyOrdered(&db, .{ .deletes = &.{"doc"}, .timestamp_ns = 102 }, .{ .term = 1, .index = pass * entries_per_pass + 3 });
+            if (graph and deleted) {
+                const count_key = try internal_keys.graphEdgeContenderCountKeyAlloc(alloc, "doc", "g");
+                defer alloc.free(count_key);
+                const count = db.core.store.get(alloc, count_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                defer if (count) |value| alloc.free(value);
+                if (count) |value| try std.testing.expectEqual(@as(?usize, 0), try graph_edge_contender.decodeVisibleCount(value, db.core.index_manager.graphIndex("g").?.config.coverage_generation));
+            }
             // The old upstream bytes still exist, but their proof refers to
             // the old primary. No downstream provider may consume them.
             if (!deleted) try std.testing.expectError(error.EnrichmentSourceChanged, processAsset(runtime, downstream, &batch, &prepared_sources, &window, &scope));

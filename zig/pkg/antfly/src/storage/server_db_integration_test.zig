@@ -4082,3 +4082,60 @@ test "db transaction recovery observes admission replacement after execution bin
     try std.testing.expectEqualStrings("{\"title\":\"recovered\"}", value);
     try std.testing.expect(gate.calls > 1);
 }
+
+test "db ordered artifact inventory follower completes initial build under durable admission across reopen" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const leader_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/admission-leader", .{tmp.sub_path});
+    defer alloc.free(leader_path);
+    const follower_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/admission-follower", .{tmp.sub_path});
+    defer alloc.free(follower_path);
+    const options: OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
+    var leader = try DB.open(alloc, leader_path, options);
+    defer leader.close();
+    try leader.setSchemaJson(alloc, "{}");
+    try leader.addIndex(.{ .name = "admitted_text", .kind = .full_text, .config_json = "{}" });
+    var command = try leader.artifactInventoryCommand(alloc);
+    defer command.catalogs.deinit(alloc);
+    var follower = try DB.open(alloc, follower_path, options);
+    defer follower.close();
+    try follower.setSchemaJson(alloc, "{}");
+    try server_test_adapter.applyOrdered(&follower, .{ .writes = &.{.{ .key = "doc", .value = "{\"text\":\"retained follower source\"}" }} }, .{ .term = 1, .index = 1 });
+    const owner = try follower.relationalTopologyIdentity();
+    const scope: @import("db/online_source_contract.zig").Scope = .{
+        .authority = .raft,
+        .fence = .{ .role = .merge_source, .transition_id = 7, .attempt = 1, .admission_epoch = owner.next_epoch, .owner_group_id = 2, .peer_group_id = 3, .namespace = owner.namespace, .catalog_digest = owner.catalog_digest },
+        .receiver_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 },
+        .consumer_epoch = 1,
+        .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
+    };
+    const request: types.BatchRequest = .{ .artifact_catalog = command, .online_source = .{ .admit = .{ .scope = scope, .artifact_catalog = command.binding } } };
+    var saw_pending = false;
+    var completed = false;
+    for (0..256) |turn| {
+        server_test_adapter.applyOrdered(&follower, request, .{ .term = 1, .index = 2 }) catch |err| {
+            if (err != error.ArtifactCatalogDrift) return err;
+            saw_pending = true;
+            if (turn == 0) {
+                follower.close();
+                follower = try DB.open(alloc, follower_path, options);
+                try std.testing.expectError(error.ArtifactCatalogEpochChanged, follower.advanceOrderedArtifactInitialBuild(&.{}, .{ .token = @splat(0xff) }));
+            }
+            continue;
+        };
+        completed = true;
+        break;
+    }
+    try std.testing.expect(saw_pending);
+    try std.testing.expect(completed);
+    try server_test_adapter.applyOrdered(&follower, request, .{ .term = 1, .index = 2 });
+    try std.testing.expect((try follower.artifactInventoryStatus()).ready);
+    try std.testing.expectEqual(@as(u64, 2), (try follower.orderedApplyReceipt()).?.index);
+    const document = (try follower.get(alloc, "doc")).?;
+    defer alloc.free(document);
+    try std.testing.expect(std.mem.indexOf(u8, document, "retained follower source") != null);
+    var result = try follower.search(alloc, .{ .index_name = "admitted_text", .query = .{ .match = .{ .field = "_all", .text = "retained" } }, .limit = 1 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+}
