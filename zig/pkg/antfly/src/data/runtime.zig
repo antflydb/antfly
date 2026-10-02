@@ -21303,6 +21303,11 @@ pub const DataServer = struct {
             local_group_ids = fallback_group_ids;
         }
         defer self.alloc.free(local_group_ids);
+        // Ranges can precede their placement publication. An empty ownership
+        // projection is not a completed inspection; retain the table batch
+        // and full-scan epoch until the catalog identifies local owners.
+        if (local_group_ids.len == 0 and snapshot.ranges.len != 0 and snapshot.placement_intents.len == 0)
+            return stats;
 
         const filesystem_io = blk: {
             const backend_runtime = self.ensureBackendRuntime() catch |err| {
@@ -40097,9 +40102,13 @@ fn consumerTests() type {
             defer server.deinit();
             try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
 
+            try server.provisioned_startup_catch_up_tables.mark(alloc, "docs");
             server.provisioned_startup_catch_up_dirty.store(false, .monotonic);
             _ = server.runProvisionedStartupCatchUp();
 
+            var retained = server.provisioned_startup_catch_up_tables.take();
+            defer retained.deinit(alloc);
+            try std.testing.expect(retained.contains("docs"));
             try std.testing.expect(server.provisioned_startup_catch_up_dirty.load(.monotonic));
             try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_started.load(.monotonic));
             try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_completed.load(.monotonic));
