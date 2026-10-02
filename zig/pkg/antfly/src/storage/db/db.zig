@@ -57392,6 +57392,23 @@ fn reconcileGlobalGraphEdgeWinner(
             try considerGraphEdgeWinner(alloc, &result.winners, edge_key, change.state_key, change.source_priority, source_payload);
         } else {
             try result.deletes.append(alloc, contender_key);
+            // This source's own contender row is gone, but the scan above
+            // may already have selected an unrelated, lower-priority (e.g.
+            // asset-derived) contender as the edge's winner because that
+            // contender's own state was untouched by this batch. A caller
+            // that explicitly deletes a top-level graph edge (no owner --
+            // appendMixedDirectGraphContenderMutations is the only caller
+            // of this path) is asking to retire the edge outright, the same
+            // way an explicit write at this priority outranks every asset
+            // contender. Retiring one contributor must not let a surviving
+            // independent one resurrect the edge out from under an explicit
+            // delete; drop any winner so the edge's primary key is deleted
+            // instead of rewritten from that leftover contender.
+            if (result.winners.map.fetchRemove(edge_key)) |removed| {
+                alloc.free(@constCast(removed.key));
+                alloc.free(removed.value.owner_state_key);
+                alloc.free(removed.value.payload);
+            }
         }
     }
 }
