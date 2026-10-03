@@ -2265,10 +2265,11 @@ fn applyCommonSearchRequestOptions(
 
     const has_semantic = request.semantic_search != null or request.embeddings != null;
     // Approximate vector sources cannot page independently by offset. A
-    // coordinator-owned reranker is different: component and shard retrieval
-    // are widened to the bounded candidate window, then offset/limit are
-    // applied once after global scoring.
-    if (has_semantic and req.offset > 0 and req.reranker == null) return error.UnsupportedQueryRequest;
+    // coordinator-owned reranker or hit evaluation widens component and shard
+    // retrieval to its bounded candidate window, then applies offset/limit
+    // once after global scoring and filtering. Graph evaluation does not
+    // change the retrieval window of ordinary hits.
+    if (has_semantic and req.offset > 0 and req.reranker == null and !req.hasHitEvaluation()) return error.UnsupportedQueryRequest;
     if (has_semantic and req.order_by.len > 0) {
         return unsupportedExactSort(approximateSemanticSortField(req.order_by), "approximate_candidate_source", "approximate_candidate_source");
     }

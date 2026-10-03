@@ -131,8 +131,9 @@ pub const Runtime = struct {
                 headers[count] = .{ "Authorization", try std.fmt.allocPrint(a, "Bearer {s}", .{value}) };
                 count += 1;
             }
-            if (cfg.provider == .antfly and self.runtime.source_table.len > 0) {
-                headers[count] = .{ execution.source_table_header, self.runtime.source_table };
+            const source_table = if (self.request.source_table.len > 0) self.request.source_table else self.runtime.source_table;
+            if (cfg.provider == .antfly and source_table.len > 0) {
+                headers[count] = .{ execution.source_table_header, source_table };
                 count += 1;
             }
             const ctx = self.runtime.context;
@@ -230,6 +231,7 @@ test "decision functions Antfly and Jev HTTP adapters preserve payload credentia
     const Check = struct {
         fn request(req: httpx.testing_mod.RequestInfo) !void {
             try std.testing.expectEqualStrings("Bearer decision-test", req.header("Authorization") orelse return error.TestUnexpectedResult);
+            if (std.mem.eql(u8, req.path, "/decide")) try std.testing.expectEqualStrings("docs", req.header(execution.source_table_header) orelse return error.TestUnexpectedResult) else try std.testing.expect(req.header(execution.source_table_header) == null);
             const parsed = try std.json.parseFromSlice(decisions.Json, std.testing.allocator, req.body, .{});
             defer parsed.deinit();
             try std.testing.expectEqualStrings("refund", parsed.value.object.get("state").?.string);
@@ -258,7 +260,7 @@ test "decision functions Antfly and Jev HTTP adapters preserve payload credentia
     var runtime: Runtime = .{ .registry = &registry, .http = &client, .io = io };
     const Run = struct {
         fn run(r: *Runtime, alloc: std.mem.Allocator, q: decisions.Json, failure: *?anyerror) void {
-            const results = r.provider().evaluateBatch(alloc, &.{ .{ .input = "refund", .decider = "local", .questions = q }, .{ .input = "refund", .decider = "remote", .questions = q } }) catch |err| {
+            const results = r.provider().withSourceTable("docs").evaluateBatch(alloc, &.{ .{ .input = "refund", .decider = "local", .questions = q }, .{ .input = "refund", .decider = "remote", .questions = q } }) catch |err| {
                 failure.* = err;
                 return;
             };

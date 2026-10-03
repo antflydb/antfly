@@ -42,6 +42,7 @@ pub const Node = struct {
         literal_rows: []const []const scalar.Datum,
     },
 };
+pub const virtual_table_name = "$sql_relation";
 pub const Bound = struct { root: *const Node, scans: []const catalog.StatementScan, table: catalog.Table, statement: ast.Select };
 
 fn qualified(node: *const ast.Scalar) bool {
@@ -443,7 +444,7 @@ const Builder = struct {
     fn virtualTable(self: *Builder, columns: []const Column) !catalog.Table {
         const result = try self.alloc.alloc(catalog.Column, columns.len);
         for (columns, result) |column, *out| out.* = .{ .name = column.internal, .path = column.internal, .type = column.type, .nullable = column.nullable };
-        return .{ .id = 0, .physical_name = "$sql_relation", .schema_version = 0, .columns = result };
+        return .{ .id = 0, .physical_name = virtual_table_name, .schema_version = 0, .columns = result };
     }
     fn scalarColumns(self: *Builder, columns: []const Column) ![]const scalar.Column {
         const result = try self.alloc.alloc(scalar.Column, columns.len);

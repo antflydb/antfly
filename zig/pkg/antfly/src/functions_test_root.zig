@@ -132,3 +132,26 @@ test "decision functions graph dependency views keep the original prefix" {
     try std.testing.expect(view.truncated);
     try std.testing.expectEqual(@as(usize, 2), result.matches.len);
 }
+
+test "decision functions vector candidate evaluation supports final offset paging" {
+    const std = @import("std");
+    const query = @import("api/query_contract.zig");
+    const a = std.testing.allocator;
+    var request = try query.parseQueryRequest(a, null, "docs",
+        \\{"limit":1,"offset":1,"embeddings":{"vector":[0.1,0.2]},"evaluate":{"scope":"candidates","candidate_count":20,"compute":{"x":{"literal":1}}}}
+    );
+    defer request.deinit(a);
+    try std.testing.expectEqual(@as(u32, 1), request.req.offset);
+    try std.testing.expectEqual(@as(u32, 20), request.req.dense_queries[0].query.k);
+    try std.testing.expectError(error.UnsupportedQueryRequest, query.parseQueryRequest(a, null, "docs",
+        \\{"limit":1,"offset":1,"embeddings":{"vector":[0.1,0.2]}}
+    ));
+}
+
+test "decision functions graph evaluation preserves vector hit offset restrictions" {
+    const std = @import("std");
+    const query = @import("api/query_contract.zig");
+    try std.testing.expectError(error.UnsupportedQueryRequest, query.parseQueryRequest(std.testing.allocator, null, "docs",
+        \\{"limit":1,"offset":1,"embeddings":{"vector":[0.1,0.2]},"graph_queries":{"customers":{"index":"graph","match":{"anchor":"customer","nodes":{"customer":{}},"edges":[]},"return":{"bindings":["customer"],"include_documents":true,"limit":1}}},"evaluate":{"graph_query":"customers","scope":"candidates","candidate_count":20,"compute":{"x":{"literal":1}}}}
+    ));
+}

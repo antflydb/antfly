@@ -116,7 +116,10 @@ Indexed retrieval + ordinary filters
 ```
 
 Expose the stage's order relative to fusion and reranking. Apply the window
-globally, rather than independently per shard. A filtered candidate window may
+globally, rather than independently per shard. Vector hit evaluation supports
+nonzero final offsets: retrieve the candidate window from offset zero and page
+after global evaluation. Graph evaluation leaves ordinary vector hit paging
+restrictions unchanged. A filtered candidate window may
 return fewer than `limit`; initially do not refill implicitly. Report scope,
 evaluated population, and whether the window was truncated. Computed counts and
 aggregations must identify candidate scope rather than claim table-wide totals.
@@ -186,6 +189,10 @@ run after sorting and pagination; calls used as sort keys remain before sorting
 and direct sort aliases reuse the same evaluated output. Window arguments,
 partition keys, and window ordering still evaluate over the full input relation.
 Top-K owns the required deferred input cells under its existing memory quota.
+Tableless SELECT uses temporary evaluation storage for each predicate and
+projection, copying only final output values into statement storage. Discarded
+provider metadata and normalization scratch do not accumulate across columns;
+retained JSON and text outputs remain owned by the statement.
 
 Decision functions also work in ordinary UPDATE/DELETE predicates, UPDATE
 assignments, and mutation expressions including MERGE arms,
@@ -207,6 +214,16 @@ Direct calls in predicates, sorting, and aggregations evaluate in batches;
 Boolean branches retain per-row short-circuiting and three-valued NULL logic.
 Expression documents use public source visibility for both document and graph
 queries: storage revision markers cannot be projected through `_computed`.
+
+Antfly SQL routing uses trusted bound catalog identities. Single-source reads,
+including CTEs, self-joins, grouped queries, windows, and pull streams, send the
+physical table identity through `X-Antfly-Source-Table`. Multi-table reads and
+tableless queries use general inference routing without a table header. Mutation
+expressions route through the target table; an INSERT SELECT input is a read
+and uses its own source scope. Synthetic relation tables inherit their enclosing
+query scope. Routing does not depend on catalog resolution order, client JSON,
+or mutable provider state; concurrent statements keep independent scopes. Jev
+requests never receive Antfly table-routing headers.
 
 ## Runtime contract
 

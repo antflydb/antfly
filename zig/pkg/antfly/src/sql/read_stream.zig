@@ -245,7 +245,7 @@ pub const Stream = struct {
             alloc.destroy(self);
             return null;
         }
-        self.context = .{ .alloc = self.budget.allocator(), .arena = arena, .backend = statement_backend, .binding = binding, .parameters = &.{}, .limits = limits, .typed_output = true };
+        self.context = .{ .alloc = self.budget.allocator(), .arena = arena, .backend = @import("decision_eval.zig").scopedBackend(statement_backend, binding), .binding = binding, .parameters = &.{}, .limits = limits, .typed_output = true };
         const params = try arena.alloc(Json, parameters.len);
         for (parameters, params) |value, *out| out.* = try self.context.outputValue(value);
         self.context.parameters = params;
@@ -516,4 +516,19 @@ test "SQL decision pull pages honor byte limits without losing cursor rows" {
     try std.testing.expectEqual(@as(usize, 2), second.output.rows.len);
     try std.testing.expectEqual(@as(usize, 5), provider.calls);
     try std.testing.expectEqual(@as(usize, 1), provider.max_batch);
+}
+
+test "SQL decision pull streams carry trusted source routing" {
+    const a = std.testing.allocator;
+    var fixture: Fixture = .{ .count = 2 };
+    var provider: @import("decision_eval.zig").testing.Provider = .{ .expected_source = "docs" };
+    var backend = fixture.backend();
+    backend.decision_provider = provider.provider();
+    var compiled = try compiler.compile(a, "SELECT ai_probability(CAST(n AS TEXT),'Refund?','local') FROM docs LIMIT 1", .{});
+    defer compiled.deinit();
+    const stream = (try Stream.open(a, backend, &compiled, &.{}, .{})).?;
+    defer stream.close();
+    var page = try stream.next(1);
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), provider.calls);
 }

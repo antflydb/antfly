@@ -242,12 +242,19 @@ pub fn normalizeResponse(a: std.mem.Allocator, questions: Json, source: Json) !J
     try put(a, &result, "answers", normalized);
     return result;
 }
-pub const Request = struct { decider: []const u8, questions: Json, input: []const u8 };
+pub const Request = struct { decider: []const u8, questions: Json, input: []const u8, source_table: []const u8 = "" };
 pub const DecisionProvider = struct {
+    /// Trusted routing scope borrowed from the bound statement, never public JSON.
+    source_table: []const u8 = "",
     ptr: *anyopaque,
     validate_fn: *const fn (*anyopaque, []const u8, Json) anyerror!void,
     evaluate_batch_fn: *const fn (*anyopaque, std.mem.Allocator, []const Request) anyerror![]const Json,
     checkpoint_fn: ?*const fn (*anyopaque) anyerror!void = null,
+    pub fn withSourceTable(self: @This(), table: []const u8) @This() {
+        var scoped = self;
+        scoped.source_table = table;
+        return scoped;
+    }
     pub fn checkpoint(self: @This()) !void {
         if (self.checkpoint_fn) |f| try f(self.ptr);
     }
@@ -260,7 +267,12 @@ pub const DecisionProvider = struct {
             try self.validate(request.decider, request.questions);
             _ = try text(.{ .string = request.input });
         }
-        const results = try self.evaluate_batch_fn(self.ptr, a, requests);
+        const scoped = if (self.source_table.len > 0) try a.dupe(Request, requests) else null;
+        defer if (scoped) |owned| a.free(owned);
+        if (scoped) |owned| for (owned) |*request| {
+            request.source_table = self.source_table;
+        };
+        const results = try self.evaluate_batch_fn(self.ptr, a, scoped orelse requests);
         if (results.len != requests.len) return error.InvalidDecisionOutput;
         const out = try a.alloc(Json, results.len);
         for (requests, results, out) |request, result, *value| value.* = try normalizeResponse(a, request.questions, result);

@@ -183,7 +183,9 @@ pub const Context = struct {
         }
     };
 
-    fn run(context: Context, input: ast.Statement) !Output {
+    fn run(unscoped: Context, input: ast.Statement) !Output {
+        var context = unscoped;
+        context.backend = @import("decision_eval.zig").scopedBackend(context.backend, context.binding);
         if (input != .select) try @import("decision_eval.zig").validateStatement(context.arena, context.backend.decision_provider, context.binding, context.parameters);
         if (context.binding.joined_mutation) |joined| return @import("joined_mutation.zig").execute(context, joined.*);
         if (context.binding.merge_mutation) |merge| return @import("merge_mutation.zig").execute(context, merge.*);
@@ -313,7 +315,9 @@ pub const Context = struct {
         if (output.terms.items.len > 256) return error.SqlProgramLimitExceeded;
     }
 
-    pub fn select(self: Context, statement: ast.Select) anyerror!Output {
+    pub fn select(unscoped: Context, statement: ast.Select) anyerror!Output {
+        var self = unscoped;
+        self.backend = @import("decision_eval.zig").scopedBackend(self.backend, self.binding);
         try @import("decision_eval.zig").validateStatement(self.arena, self.backend.decision_provider, self.binding, self.parameters);
         if (self.binding.relation != null) return @import("relation_runtime.zig").execute(self);
         if (self.binding.window != null) return @import("window_runtime.zig").execute(self, statement);
@@ -625,7 +629,10 @@ pub const Context = struct {
         const columns = self.binding.columns;
         if (limit == 0 or offset != 0) return .{ .columns = columns, .command_tag = "SELECT" };
         try self.checkpoint();
-        const matches = try self.binding.scalars.matchesWithProvider(self.arena, &.{}, self.parameters, self.backend.decision_provider);
+        var evaluation = std.heap.ArenaAllocator.init(self.alloc);
+        defer evaluation.deinit();
+        const matches = try self.binding.scalars.matchesWithProvider(evaluation.allocator(), &.{}, self.parameters, self.backend.decision_provider);
+        if (!evaluation.reset(.retain_capacity)) return error.OutOfMemory;
         if (!matches and !statement.count_all) return .{ .columns = columns, .command_tag = "SELECT" };
         const rows = try self.arena.alloc([]const Json, 1);
         const cells = try self.arena.alloc(Json, columns.len);
@@ -636,7 +643,8 @@ pub const Context = struct {
             nulls[0] = false;
         } else for (self.binding.scalars.projections, cells, nulls) |optional, *cell, *is_null| {
             const program = optional orelse return error.InvalidSqlBackendResponse;
-            const evaluated = try self.evaluate(self.arena, program, &.{});
+            if (!evaluation.reset(.retain_capacity)) return error.OutOfMemory;
+            const evaluated = try self.evaluate(evaluation.allocator(), program, &.{});
             cell.* = try self.outputValue(evaluated.value);
             is_null.* = evaluated.sql_null;
         }
@@ -2665,7 +2673,7 @@ test "SQL ordinary mutations batch decisions and fail before commit" {
     }) |sql| {
         for ([_]usize{ 1, 65536 }) |page_bytes| {
             var fixture: TestBackend = .{ .row_count = 8 };
-            var provider: Provider = .{};
+            var provider: Provider = .{ .expected_source = "table:stable" };
             var backend = fixture.iface();
             backend.decision_provider = provider.provider();
             var compiled = try compiler.compile(a, sql, .{});
@@ -2898,4 +2906,53 @@ fn insertDecisionAllocationScenario(a: std.mem.Allocator) !void {
 }
 test "SQL INSERT decision pages unwind allocation failures before commit" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, insertDecisionAllocationScenario, .{});
+}
+
+fn constantDecisionAllocationScenario(a: std.mem.Allocator) !void {
+    var fixture: InsertDecisionFixture = .{ .metadata_bytes = 0 };
+    var compiled = try compiler.compile(a, "SELECT ai_probability('input','Refund?','local'),ai_decide('input','{\"answer\":{\"type\":\"noul\",\"instructions\":\"Refund?\"}}','local')", .{});
+    defer compiled.deinit();
+    var result = try execute(a, fixture.backend(), &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    try std.testing.expectEqualStrings("mock", result.output.rows[0][1].object.get("model").?.string);
+}
+
+test "SQL constant decisions release discarded provider payloads and own final values" {
+    const a = std.testing.allocator;
+    var sql: std.ArrayList(u8) = .empty;
+    defer sql.deinit(a);
+    try sql.appendSlice(a, "SELECT ");
+    for (0..16) |index| {
+        if (index != 0) try sql.appendSlice(a, ",");
+        try sql.appendSlice(a, "ai_probability('input','Refund?','local')");
+    }
+    var compiled = try compiler.compile(a, sql.items, .{});
+    defer compiled.deinit();
+    var fixture: InsertDecisionFixture = .{};
+    var result = try execute(a, fixture.backend(), &compiled, &.{}, .{ .page_rows = 1, .retained_bytes = 1024 * 1024 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 16), fixture.calls);
+    for (result.output.rows[0]) |cell| try std.testing.expectApproxEqAbs(@as(f64, 0.9), cell.float, 0.001);
+    try std.testing.checkAllAllocationFailures(a, constantDecisionAllocationScenario, .{});
+}
+
+test "SQL decisions retain trusted routing across reads CTEs grouped and window inputs" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT ai_probability(_id,'Refund?','local') FROM things LIMIT 1",
+        "WITH q AS (SELECT _id FROM things) SELECT ai_probability(_id,'Refund?','local') FROM q LIMIT 1",
+        "SELECT ai_probability(_id,'Refund?','local') FROM things GROUP BY _id LIMIT 1",
+        "SELECT ai_probability(_id,'Refund?','local'),row_number() OVER (ORDER BY id) FROM things LIMIT 1",
+    }) |sql| {
+        var fixture: TestBackend = .{};
+        var provider: @import("decision_eval.zig").testing.Provider = .{ .expected_source = "table:stable" };
+        var backend = fixture.coordinated();
+        backend.decision_provider = provider.provider();
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, backend, &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), provider.calls);
+    }
 }

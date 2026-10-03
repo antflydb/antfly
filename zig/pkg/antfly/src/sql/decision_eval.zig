@@ -6,6 +6,30 @@
 const std = @import("std");
 const scalar = @import("scalar.zig");
 const decisions = @import("../functions/decisions.zig");
+/// Single-source reads route by their bound physical identity. Mutations route
+/// by the target. Multi-source reads use the provider's general routing policy;
+/// synthetic relation tables inherit the enclosing query's selected scope.
+pub fn scopedBackend(backend: @import("catalog.zig").Backend, bound: @import("describe.zig").BoundStatement) @import("catalog.zig").Backend {
+    var scoped = backend;
+    if (backend.decision_provider) |provider| scoped.decision_provider = provider.withSourceTable(sourceTable(bound, provider.source_table));
+    return scoped;
+}
+fn sourceTable(bound: @import("describe.zig").BoundStatement, inherited: []const u8) []const u8 {
+    if (bound.action != .read) if (bound.table) |table| return table.physical_name;
+    if (bound.window) |window| return sourceTable(window.input.*, inherited);
+    if (bound.relation) |relation| {
+        if (relation.scans.len == 0) return "";
+        const table = relation.scans[0].table.physical_name;
+        for (relation.scans[1..]) |scan| if (!std.mem.eql(u8, table, scan.table.physical_name)) return "";
+        return table;
+    }
+    if (bound.table) |table| {
+        if (!std.mem.eql(u8, table.physical_name, @import("relation_binding.zig").virtual_table_name)) return table.physical_name;
+        return inherited;
+    }
+    return "";
+}
+
 pub fn validateStatement(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, bound: @import("describe.zig").BoundStatement, parameters: []const std.json.Value) anyerror!void {
     try bound.scalars.validateDecisions(a, parameters, provider);
     if (bound.insert_source) |source| try validateStatement(a, provider, source.*, parameters);
@@ -171,6 +195,7 @@ pub fn hasExternal(program: *const scalar.Program) bool {
 }
 
 const Mock = struct {
+    expected_source: ?[]const u8 = null,
     calls: usize = 0,
     max_batch: usize = 0,
     fail: bool = false,
@@ -185,6 +210,7 @@ const Mock = struct {
         self.max_batch = @max(self.max_batch, requests.len);
         const results = try a.alloc(decisions.Json, requests.len);
         for (requests, results) |request, *result| {
+            if (self.expected_source) |table| try std.testing.expectEqualStrings(table, request.source_table);
             const kind = request.questions.object.get("answer").?.object.get("type").?.string;
             const bytes = if (std.mem.eql(u8, kind, "choice"))
                 "{\"model\":\"mock\",\"answers\":{\"answer\":{\"type\":\"choice\",\"choice\":\"yes\",\"probabilities\":{\"yes\":0.8,\"no\":0.2}}},\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}"
@@ -376,3 +402,30 @@ pub const SortedProjection = struct {
         return .{ .columns = context.binding.columns, .rows = rows, .sql_nulls = flags, .command_tag = "SELECT" };
     }
 };
+
+test "SQL decision routing selects catalog identity and clears ambiguous relation scopes" {
+    const catalog = @import("catalog.zig");
+    const bound_type = @import("describe.zig").BoundStatement;
+    const table: catalog.Table = .{ .id = 7, .physical_name = "private-physical", .schema_version = 1, .columns = &.{} };
+    var provider: Mock = .{};
+    const backend: catalog.Backend = .{ .ptr = &provider, .decision_provider = provider.provider().withSourceTable("enclosing"), .vtable = undefined };
+    var bound: bound_type = .{ .table = table, .action = .read, .columns = &.{}, .parameter_types = &.{}, .json_literals = .empty };
+    try std.testing.expectEqualStrings("private-physical", scopedBackend(backend, bound).decision_provider.?.source_table);
+    bound.table = .{ .id = 0, .schema_version = 0, .physical_name = @import("relation_binding.zig").virtual_table_name, .columns = &.{} };
+    try std.testing.expectEqualStrings("enclosing", scopedBackend(backend, bound).decision_provider.?.source_table);
+    bound.table = null;
+    try std.testing.expectEqualStrings("", scopedBackend(backend, bound).decision_provider.?.source_table);
+    const scans = [_]catalog.StatementScan{
+        .{ .table = table, .request = .{ .fields = &.{}, .limit = 1 } },
+        .{ .table = .{ .id = 8, .physical_name = "other-physical", .schema_version = 1, .columns = &.{} }, .request = .{ .fields = &.{}, .limit = 1 } },
+    };
+    const node: @import("relation_binding.zig").Node = .{ .columns = &.{}, .operation = .singleton };
+    var relation: @import("relation_binding.zig").Bound = .{ .root = &node, .scans = scans[0..1], .table = table, .statement = .{ .columns = &.{}, .table = null } };
+    bound.relation = &relation;
+    try std.testing.expectEqualStrings("private-physical", scopedBackend(backend, bound).decision_provider.?.source_table);
+    relation.scans = &scans;
+    try std.testing.expectEqualStrings("", scopedBackend(backend, bound).decision_provider.?.source_table);
+    bound.table = table;
+    bound.action = .write;
+    try std.testing.expectEqualStrings("private-physical", scopedBackend(backend, bound).decision_provider.?.source_table);
+}
