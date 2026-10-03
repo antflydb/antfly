@@ -98,7 +98,7 @@ test "ordered artifact inventory activation boundary authenticates its entire sc
 
 test "ordered artifact inventory activation boundary is atomic immutable local and survives reopen" {
     const alloc = std.testing.allocator;
-    const db_mod = @import("db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/activation-boundary", .{tmp.sub_path});

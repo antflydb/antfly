@@ -443,7 +443,7 @@ test "initial self FK reserves one hidden child owner and no duplicate parent ro
         .public_schema_json_digest = candidate.public_schema_json_digest,
         .catalog_digest = candidate.catalog_digest,
     };
-    const db_options: @import("../../storage/db/db.zig").OpenOptions = .{ .identity_namespace = namespace, .initial_child_bootstrap = bootstrap, .start_optional_runtimes = false, .start_index_workers = false };
+    const db_options: @import("antfly_source_root").antfly_sources.physical_db.OpenOptions = .{ .identity_namespace = namespace, .initial_child_bootstrap = bootstrap, .start_optional_runtimes = false, .start_index_workers = false };
     const child_fence: @import("../../storage/db/relational_integrity_topology_contract.zig").Fence = .{
         .role = .child_generation_source,
         .transition_id = child.table_id,
@@ -455,7 +455,7 @@ test "initial self FK reserves one hidden child owner and no duplicate parent ro
         .catalog_digest = candidate.catalog_digest,
     };
     {
-        var db = try @import("../../storage/db/db.zig").DB.open(alloc, db_path, db_options);
+        var db = try @import("antfly_source_root").antfly_sources.physical_db.DB.open(alloc, db_path, db_options);
         defer db.close();
         try std.testing.expectError(error.InitialChildNotPublished, db.lookup(alloc, "unpublished", .{}));
         try @import("../../storage/server_db_adapter.zig").applyOrdered(&db, .{ .relational_topology = .{ .action = .provision_initial_child, .fence = child_fence, .initial_child_provision = .{
@@ -497,7 +497,7 @@ test "initial self FK reserves one hidden child owner and no duplicate parent ro
     defer store.freeTables(alloc, public_tables);
     try std.testing.expectEqual(@as(usize, 0), public_tables.len);
     {
-        var db = try @import("../../storage/db/db.zig").DB.open(alloc, db_path, db_options);
+        var db = try @import("antfly_source_root").antfly_sources.physical_db.DB.open(alloc, db_path, db_options);
         defer db.close();
         try std.testing.expectError(error.InitialChildNotPublished, db.lookup(alloc, "unpublished", .{}));
         try @import("../../storage/server_db_adapter.zig").applyOrdered(&db, .{ .relational_topology = .{ .action = .release_initial_child, .fence = child_fence, .initial_child_control = .{

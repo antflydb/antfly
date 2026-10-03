@@ -535,7 +535,7 @@ test "empty generation install digest binds mapped active generations and empty 
 }
 
 test "empty generation owner lookup streams a coherent summary from a read transaction" {
-    const db_mod = @import("db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

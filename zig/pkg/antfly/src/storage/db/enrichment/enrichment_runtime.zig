@@ -28818,7 +28818,7 @@ fn storedChunkEmbeddingSourcesForRequest(
 
 test "ordered artifact inventory embedding fallback reads selected chunk generations including empty output" {
     const alloc = std.testing.allocator;
-    const db_mod = @import("../db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const chunks = @import("../artifact_chunk_manifest.zig");
     const generations = @import("../artifact_chunk_generation.zig");
     var tmp = std.testing.tmpDir(.{});
@@ -31798,7 +31798,7 @@ test "asset batch fallback isolates malformed envelope and preserves typed mixed
 
 test "ordered artifact inventory unit chunk callback reconstructs publishes and retires accepted inputs" {
     const alloc = std.testing.allocator;
-    const db_mod = @import("../db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const publication = ordered_publication;
     const manifest = @import("../artifact_chunk_manifest.zig");
     const Harness = struct {
@@ -31951,7 +31951,7 @@ test "ordered artifact inventory unit chunk callback reconstructs publishes and 
 }
 
 test "ordered artifact inventory chunk callback waits for acceptance and atomically publishes empty streams" {
-    const db_mod = @import("../db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const inventory = @import("../artifact_chunk_manifest.zig");
     const alloc = std.testing.allocator;
     const Harness = struct {
@@ -32128,7 +32128,7 @@ test "ordered artifact inventory chunk callback waits for acceptance and atomica
 
 test "ordered artifact inventory authored document callbacks bypass providers and publication" {
     const alloc = std.testing.allocator;
-    const db_mod = @import("../db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const publication = ordered_publication;
     const Harness = struct {
         calls: usize = 0,
@@ -32209,7 +32209,7 @@ test "ordered artifact inventory chunk vector callback publishes and retires wit
 }
 
 fn testOrderedChunkVectorCallback(dense: bool) !void {
-    const db_mod = @import("../db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const inventory = @import("../artifact_chunk_manifest.zig");
     const alloc = std.testing.allocator;
     const Harness = struct {
@@ -32767,7 +32767,7 @@ fn testOrderedAssetCallback(generated: bool, graph: bool) !void {
 }
 
 fn testOrderedAssetLifecycle(generated: bool, graph: bool, delete_live: bool) !void {
-    const db_mod = @import("../db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const alloc = std.testing.allocator;
     const Harness = struct {
         encoded: ?[]u8 = null,
