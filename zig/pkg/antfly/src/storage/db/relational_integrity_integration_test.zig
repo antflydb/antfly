@@ -594,7 +594,7 @@ test "child FK generation schema install commits catalog and source release with
     fence.transition_id = 12;
     fence.admission_epoch = 2;
     try db.applyRelationalTopologyControl(.{ .action = .begin, .fence = fence }, null);
-    const publication: db_mod.DB.PublishedChildSchema = .{ .fence = fence, .before_schema_json_digest = before_schema_json_digest, .schema_json_digest = schema_json_digest, .before_catalog_digest = before_digest, .after_catalog_digest = after_digest, .raft_entry = .{ .term = 1, .index = 1 } };
+    const publication: db_mod.DB.PublishedChildSchema = .{ .fence = fence, .before_schema_json_digest = before_schema_json_digest, .schema_json_digest = schema_json_digest, .before_catalog_digest = before_digest, .after_catalog_digest = after_digest, .ordered_receipt = .{ .term = 1, .index = 1 } };
     var changed = publication;
     changed.after_catalog_digest = @splat(9);
     try std.testing.expectError(error.IntegrityCatalogChanged, db.installPublishedChildSchema(alloc, after_json, changed));
