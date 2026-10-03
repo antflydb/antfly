@@ -622,7 +622,9 @@ test "parent generation scope denies retired and unknown generations after activ
 test "parent generation publication stages then activates exact successor and remains default-deny after drop" {
     const Mock = struct {
         value: ?[]u8 = null,
-        pub fn get(self: *@This(), _: []const u8) error{NotFound}![]const u8 {
+        pub fn get(self: *@This(), key: []const u8) error{NotFound}![]const u8 {
+            const expected = scopeKey("children", "fk") catch unreachable;
+            if (!std.mem.eql(u8, key, &expected)) return error.NotFound;
             return self.value orelse error.NotFound;
         }
         pub fn put(self: *@This(), _: []const u8, value: []const u8) !void {

@@ -3978,7 +3978,7 @@ test "docstore retained REF5 graph language persists exact value and tombstone a
         try admit.commit();
         var put = try store.beginWriteTxn();
         errdefer put.abort();
-        try put.put(&internal_keys.raft_document_applied_entry_key, "entry-1");
+        try put.put(&internal_keys.ordered_document_applied_entry_key, "entry-1");
         try put.put(key, value);
         try put.commit();
     }
@@ -4007,7 +4007,7 @@ test "docstore retained REF5 graph language persists exact value and tombstone a
         }
         var remove = try store.beginWriteTxn();
         errdefer remove.abort();
-        try remove.put(&internal_keys.raft_document_applied_entry_key, "entry-2");
+        try remove.put(&internal_keys.ordered_document_applied_entry_key, "entry-2");
         try remove.delete(key);
         try remove.commit();
         var read = try store.beginReadTxn();

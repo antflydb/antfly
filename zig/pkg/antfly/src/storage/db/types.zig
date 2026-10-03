@@ -4010,9 +4010,6 @@ pub const OrderedApplyReceipt = struct {
     index: u64,
 };
 
-/// Server source compatibility; the durable term/index encoding is unchanged.
-pub const RaftAppliedEntryIdentity = OrderedApplyReceipt;
-
 pub const ArtifactRepairResult = struct {
     scanned: u64 = 0,
     groups_scanned: u64 = 0,
@@ -5061,6 +5058,28 @@ pub fn requiresGraphRelationshipProtocol(req: BatchRequest) bool {
     for (req.writes) |row| if (keys.isGraphRetirementKey(row.key) or keys.graphArtifactHasRelationshipId(row.key)) return true;
     return false;
 }
+
+/// Shared binary-safe planner response and ordered maintenance request.
+/// Missing afterimages decode as an empty page for historical planners.
+pub const GraphEndpointCleanupStatus = struct {
+    pending: bool = false,
+    guards: []const @import("../graph_cleanup_contract.zig").Guard = &.{},
+    graph_deletes: []const GraphEdgeDelete = &.{},
+    deletes: []const []const u8 = &.{},
+    merge_artifacts: []const BatchWrite = &.{},
+
+    pub fn request(self: @This()) BatchRequest {
+        return .{
+            .graph_endpoint_cleanup = true,
+            .graph_endpoint_cleanup_planned = true,
+            .graph_endpoint_cleanup_guards = self.guards,
+            .graph_deletes = self.graph_deletes,
+            .deletes = self.deletes,
+            .merge_artifacts = self.merge_artifacts,
+            .sync_level = .write,
+        };
+    }
+};
 
 /// Cleanup is a private, effect-bearing command, never a flag that can be
 /// attached to a public mutation or a lifecycle control.

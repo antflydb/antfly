@@ -60,7 +60,7 @@ const AuthenticatedIdentity = http_server_mod.AuthenticatedIdentity;
 
 const common_secrets = @import("../common/secrets.zig");
 const common_config = @import("../common/config.zig");
-const ha_mutation_inventory = @import("../storage/hot_standby/mutation_inventory.zig");
+const hot_standby_mutation_inventory = @import("../storage/hot_standby/mutation_inventory.zig");
 const cluster = @import("cluster.zig");
 const cluster_api_http = @import("cluster_api_http.zig");
 const connections_api = @import("connections.zig");
@@ -943,7 +943,7 @@ pub const AntflyApiHandler = struct {
         try server.use(httpx.Middleware.bind("antfly-internal-service-auth", self, enforceInternalServiceAuth));
         try server.use(httpx.Middleware.bind("antfly-auth-before-encoded-body", self, authorizeBeforeEncodedBody));
         try server.use(httpx.Middleware.bind("antfly-request-content-encoding", self, decodeRequestContent));
-        try server.use(httpx.Middleware.bind("antfly-ha-mutation-policy", self, enforceHaMutationPolicy));
+        try server.use(httpx.Middleware.bind("antfly-ha-mutation-policy", self, enforceHotStandbyMutationPolicy));
     }
 
     /// Authenticate and authorize compressed requests before spending CPU or
@@ -1103,8 +1103,8 @@ pub const AntflyApiHandler = struct {
     /// compatibility dispatcher or individual business handlers. The
     /// classifier consumes canonical application paths, so generated
     /// `/db/v1` routes and root contextual routes share one inventory.
-    fn enforceHaMutationPolicy(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
-        if (try self.haMutationRejection(ctx)) |response| return response;
+    fn enforceHotStandbyMutationPolicy(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
+        if (try self.hotStandbyMutationRejection(ctx)) |response| return response;
         return next.call(ctx);
     }
 
@@ -1156,7 +1156,7 @@ pub const AntflyApiHandler = struct {
         try self.api_server.reachRequestLifecycle(.ingress, null);
         establishInternalRoutedBatchDeadline(ctx);
         establishInternalTxnPreDecisionDeadline(ctx);
-        if (try self.haMutationRejection(ctx)) |response| {
+        if (try self.hotStandbyMutationRejection(ctx)) |response| {
             try self.api_server.reachRequestLifecycle(.response_ready, null);
             return response;
         }
@@ -1191,15 +1191,15 @@ pub const AntflyApiHandler = struct {
         return self.internalServiceAuthRejection(ctx);
     }
 
-    fn haMutationRejection(self: *AntflyApiHandler, ctx: *httpx.Context) !?httpx.Response {
+    fn hotStandbyMutationRejection(self: *AntflyApiHandler, ctx: *httpx.Context) !?httpx.Response {
         const policy = self.api_server.hotStandbyMutationPolicy();
         if (!policy.failover_safe_mutations_only) return null;
         const path = http_server_mod.stripApiPrefix(ctx.request.uri.path);
-        const mutation = classifyHaMutation(ctx.request.method, path) orelse return null;
+        const mutation = classifyHotStandbyMutation(ctx.request.method, path) orelse return null;
         // Backup and table restore are adapters over the same durable cohort
         // and staging authority; handlers reject uncertified historical cuts.
         if ((mutation.surface == .cluster_restore or mutation.surface == .restore_job or mutation.surface == .table_restore or mutation.surface == .backup) and
-            self.api_server.haCoordinatedRestoreAvailable()) return null;
+            self.api_server.hotStandbyCoordinatedRestoreAvailable()) return null;
         if (policy.catalog_create_enabled and policy.remote_apply_mutations_enabled and
             mutation.surface == .table_catalog and ctx.request.method == .POST)
             return null;
@@ -1213,11 +1213,11 @@ pub const AntflyApiHandler = struct {
         return try ctx.json(.{
             .@"error" = "mutation is not continuously replicated while HA is active",
             .code = "ha_mutation_not_replicated",
-            .surface = @tagName(mutation.surface),
+            .surface = mutation.surface.wireName(),
         });
     }
 
-    fn classifyHaMutation(method: httpx.Method, path: []const u8) ?ha_mutation_inventory.Classification {
+    fn classifyHotStandbyMutation(method: httpx.Method, path: []const u8) ?hot_standby_mutation_inventory.Classification {
         const inventory_method: http_common.Method = switch (method) {
             .GET, .HEAD, .OPTIONS => return null,
             .POST => .POST,
@@ -1232,7 +1232,7 @@ pub const AntflyApiHandler = struct {
                 .disposition = .reject,
             },
         };
-        return ha_mutation_inventory.classify(inventory_method, path);
+        return hot_standby_mutation_inventory.classify(inventory_method, path);
     }
 
     fn metadataNotLeaderResponse(ctx: *httpx.Context) !httpx.Response {
@@ -1360,18 +1360,18 @@ pub const AntflyApiHandler = struct {
 
         // Canonical `/admin/v1/standby` and the pre-0.3 `/admin/v1/ha` alias;
         // the hot-standby handler normalises the path before dispatch.
-        const ha_admin_paths = [_][]const u8{
+        const hot_standby_admin_paths = [_][]const u8{
             admin_routes.standby,
             admin_routes.standby ++ "/*",
             admin_routes.legacy_standby_prefix,
             admin_routes.legacy_standby_prefix ++ "/*",
         };
-        const ha_handler = httpx.Handler.bind(self, haRoute);
-        inline for (ha_admin_paths) |path| {
-            try server.get(path, ha_handler);
-            try server.post(path, ha_handler);
-            try server.put(path, ha_handler);
-            try server.delete(path, ha_handler);
+        const hot_standby_handler = httpx.Handler.bind(self, hotStandbyRoute);
+        inline for (hot_standby_admin_paths) |path| {
+            try server.get(path, hot_standby_handler);
+            try server.post(path, hot_standby_handler);
+            try server.put(path, hot_standby_handler);
+            try server.delete(path, hot_standby_handler);
         }
         try server.post(admin_routes.maintenance_check, httpx.Handler.bind(self, checkStorage));
         try server.post(admin_routes.maintenance_compact, httpx.Handler.bind(self, compactStorage));
@@ -1380,17 +1380,17 @@ pub const AntflyApiHandler = struct {
         try self.registerRaftAdminRoutes(server);
         try server.delete(admin_routes.maintenance_jobs_prefix ++ "*", httpx.Handler.bind(self, cancelStorageMaintenanceJob));
 
-        const ha_internal_paths = [_][]const u8{
+        const hot_standby_internal_paths = [_][]const u8{
             internal_routes.standby,
             internal_routes.standby ++ "/*",
             internal_routes.legacy_standby,
             internal_routes.legacy_standby ++ "/*",
         };
-        inline for (ha_internal_paths) |path| {
-            try server.get(path, ha_handler);
-            try server.post(path, ha_handler);
-            try server.put(path, ha_handler);
-            try server.delete(path, ha_handler);
+        inline for (hot_standby_internal_paths) |path| {
+            try server.get(path, hot_standby_handler);
+            try server.post(path, hot_standby_handler);
+            try server.put(path, hot_standby_handler);
+            try server.delete(path, hot_standby_handler);
         }
 
         const group_prefix = routes.internal_groups_prefix ++ ":group_id";
@@ -1664,7 +1664,7 @@ pub const AntflyApiHandler = struct {
         return try respondOwnedContextualResponse(ctx, &response, self.api_server.alloc);
     }
 
-    fn haRoute(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+    fn hotStandbyRoute(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         const method: contextual_operations.Method = switch (ctx.request.method) {
             .GET => .get,
             .POST => .post,
@@ -1673,7 +1673,7 @@ pub const AntflyApiHandler = struct {
             else => return textResponse(ctx, 405, "method not allowed"),
         };
         const body = (try ctx.body()) orelse "";
-        var response = (try self.api_server.executeHaRoute(.{
+        var response = (try self.api_server.executeHotStandbyRoute(.{
             .method = method,
             .target = ctx.request.uri.raw,
             .authorization = ctx.header("authorization"),
@@ -10287,21 +10287,21 @@ test "internal transaction ingress establishes and validates pre-decision deadli
 }
 
 test "HA mutation middleware fails closed for unregistered HTTP methods" {
-    try std.testing.expect(AntflyApiHandler.classifyHaMutation(.GET, "/tables/docs") == null);
-    try std.testing.expect(AntflyApiHandler.classifyHaMutation(.HEAD, "/tables/docs") == null);
-    try std.testing.expect(AntflyApiHandler.classifyHaMutation(.OPTIONS, "/tables/docs") == null);
+    try std.testing.expect(AntflyApiHandler.classifyHotStandbyMutation(.GET, "/tables/docs") == null);
+    try std.testing.expect(AntflyApiHandler.classifyHotStandbyMutation(.HEAD, "/tables/docs") == null);
+    try std.testing.expect(AntflyApiHandler.classifyHotStandbyMutation(.OPTIONS, "/tables/docs") == null);
 
-    const global_query = AntflyApiHandler.classifyHaMutation(.POST, routes.global_query).?;
-    try std.testing.expectEqual(ha_mutation_inventory.Surface.read_like_post, global_query.surface);
-    try std.testing.expectEqual(ha_mutation_inventory.Disposition.read_only, global_query.disposition);
+    const global_query = AntflyApiHandler.classifyHotStandbyMutation(.POST, routes.global_query).?;
+    try std.testing.expectEqual(hot_standby_mutation_inventory.Surface.read_like_post, global_query.surface);
+    try std.testing.expectEqual(hot_standby_mutation_inventory.Disposition.read_only, global_query.disposition);
 
-    const unknown_query_suffix = AntflyApiHandler.classifyHaMutation(.POST, "/query/future-action").?;
-    try std.testing.expectEqual(ha_mutation_inventory.Surface.unclassified_non_get, unknown_query_suffix.surface);
-    try std.testing.expectEqual(ha_mutation_inventory.Disposition.reject, unknown_query_suffix.disposition);
+    const unknown_query_suffix = AntflyApiHandler.classifyHotStandbyMutation(.POST, "/query/future-action").?;
+    try std.testing.expectEqual(hot_standby_mutation_inventory.Surface.unclassified_non_get, unknown_query_suffix.surface);
+    try std.testing.expectEqual(hot_standby_mutation_inventory.Disposition.reject, unknown_query_suffix.disposition);
 
-    const patch = AntflyApiHandler.classifyHaMutation(.PATCH, "/tables/docs").?;
-    try std.testing.expectEqual(ha_mutation_inventory.Surface.unclassified_non_get, patch.surface);
-    try std.testing.expectEqual(ha_mutation_inventory.Disposition.reject, patch.disposition);
+    const patch = AntflyApiHandler.classifyHotStandbyMutation(.PATCH, "/tables/docs").?;
+    try std.testing.expectEqual(hot_standby_mutation_inventory.Surface.unclassified_non_get, patch.surface);
+    try std.testing.expectEqual(hot_standby_mutation_inventory.Disposition.reject, patch.disposition);
 }
 
 test "httpx multi batch route uses the batch commit hook and public response contract" {
@@ -10415,7 +10415,7 @@ test "httpx multi batch route uses the batch commit hook and public response con
     const alloc = std.testing.allocator;
     var status = AuthStatusSource{};
     var writes = FakeWrites{};
-    var api_server = ApiHttpServer.init(alloc, .{}, status.iface(), null, writes.source());
+    var api_server = ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone }, status.iface(), null, writes.source());
     var e2e_server: HttpxE2eServer = undefined;
     e2e_server.init(alloc, &api_server) catch |err| switch (err) {
         // Restricted test environments may forbid even loopback listeners.
@@ -10661,7 +10661,7 @@ test "httpx stable transaction commit durably hands off recovery before acknowle
     const alloc = std.testing.allocator;
     var status = AuthStatusSource{};
     var writes = FakeWrites{};
-    var api_server = ApiHttpServer.init(alloc, .{}, status.iface(), null, writes.source());
+    var api_server = ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone }, status.iface(), null, writes.source());
     defer api_server.deinit();
     var e2e_server: HttpxE2eServer = undefined;
     e2e_server.init(alloc, &api_server) catch |err| switch (err) {
@@ -14438,6 +14438,9 @@ test "httpx lookup revalidates missing catalog bindings across restore" {
         const original = "{\"table_id\":7,\"name\":\"physical-old\"}";
 
         fn catalog(ptr: *anyopaque, alloc: std.mem.Allocator, _: operation_contract.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            // This fixture has no row policy publication. The catalog still
+            // authoritatively answers the policy probe before the row lookup.
+            if (call == .policy_publication_status) return error.RowPolicyCatalogChanged;
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const target = switch (call) {
                 .resolve => |target| target,

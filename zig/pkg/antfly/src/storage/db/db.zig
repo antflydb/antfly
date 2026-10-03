@@ -674,26 +674,18 @@ pub const OpenOptions = struct {
     /// `name_embedding` model and the extraction artifact carries no vector.
     /// Caller-owned; must outlive the DB. Null disables backfill.
     resolution_embedder: ?embedder_mod.DenseEmbedder = null,
-    /// Optional mirror for committed derived/change-journal effects into the HA
-    /// replication stream. The default policy is async/best-effort; configuring
-    /// a non-async sync_policy makes normal DB writes evaluate the HA commit
-    /// gate for the appended replication record.
+    /// Optional publication of committed derived/change-journal effects.
+    /// The adapter declares local commit requirements and owns remote policy.
     replication_async_effect_mirror: ?ReplicationAsyncEffectMirror = null,
-    /// Optional mirror for committed user batch mutations into the HA
-    /// replication stream. This emits versioned `batch_mutation` envelopes for
-    /// catch-up/read-replica apply and can be paired with sync_policy for
-    /// remote-write/remote-apply gate decisions.
+    /// Optional publication of committed user batch mutations, using versioned
+    /// batch_mutation envelopes for replay. Completion is an adapter callback.
     replication_async_batch_mirror: ?ReplicationAsyncBatchMirror = null,
-    /// Optional mirror for committed metadata/catalog changes into the HA
-    /// replication stream. The initial metadata mutation payload covers table
-    /// schema changes; additional catalog mutation kinds should be nested under
-    /// the stable HA `metadata_mutation` envelope.
+    /// Optional publication of committed metadata/catalog changes, using the
+    /// stable metadata_mutation envelope.
     replication_async_metadata_mirror: ?ReplicationAsyncMetadataMirror = null,
-    /// Optional HA write ownership gate. Client/API writes are allowed only
-    /// when this DB is attached to the current HA primary. Standby apply paths
-    /// must use replicated-apply entry points that explicitly bypass this
-    /// client-write guard. A standby gate also suppresses mutating background
-    /// runtimes at open, even if the generic runtime defaults are enabled.
+    /// Borrowed write admission. Replicated apply explicitly bypasses this
+    /// client guard; the adapter also decides whether mutating background work
+    /// may start, independently of the DB's requested runtime defaults.
     replication_write_gate: ?ReplicationWriteGate = null,
     /// Bounded stall guard for the foreground `runUntilIdle` drain (Lite's
     /// synchronous ingest drain, in particular): if a managed derived index
@@ -792,7 +784,6 @@ test "uninstalled enrichment config releases owned chunk provider routing" {
 }
 
 pub const ReplicationAsyncEffectMirror = replication_contract.AsyncEffectMirror;
-pub const ReplicationSyncWaitFn = replication_contract.SyncWaitFn;
 
 const ReplicationDeferredCommitGate = replication_commit.ReplicationDeferredCommitGate;
 
@@ -803,14 +794,8 @@ pub const ReplicationAsyncMetadataMirror = replication_contract.AsyncMetadataMir
 pub const SharedReplicationWriteGate = replication_contract.SharedWriteGate;
 pub const ReplicationWriteGate = replication_contract.WriteGate;
 
-fn replicationWriteGateIsStandby(gate: ?ReplicationWriteGate) bool {
-    const configured = gate orelse return false;
-    return switch (configured) {
-        .primary => false,
-        .fenced_primary => false,
-        .standby => true,
-        .shared => |shared| shared.state.isStandbyRole(),
-    };
+fn replicationWriteGateAllowsBackgroundWork(gate: ?ReplicationWriteGate) bool {
+    return if (gate) |configured| configured.allowsBackgroundWork() else true;
 }
 
 pub const ReplayProgress = struct {
@@ -1737,6 +1722,8 @@ var test_graph_merge_import_abort_after_primary: std.atomic.Value(bool) = .init(
 var test_graph_merge_import_abort_during_projection: std.atomic.Value(bool) = .init(false);
 var test_graph_merge_import_abort_during_recovery: std.atomic.Value(bool) = .init(false);
 var test_before_graph_contender_commit: ?struct { ctx: *anyopaque, call: *const fn (*anyopaque) void } = null;
+var test_graph_overlay_examined: ?*usize = null;
+var test_entity_rewrite_apply_admitted: ?struct { ctx: *anyopaque, call: *const fn (*anyopaque, *DB) anyerror!void } = null;
 var test_before_graph_replay_apply: ?struct { ctx: *anyopaque, call: *const fn (*anyopaque) void } = null;
 var test_dense_repair_rebuild_batch_size: ?usize = null;
 var test_algebraic_repair_rebuild_batch_size: ?usize = null;
@@ -2291,7 +2278,7 @@ const LocalMutationExecution = struct {
     const acquireReplicationMutationShared = DB.acquireReplicationMutationShared;
     const acquireTransactionSchemaView = DB.acquireTransactionSchemaView;
     const artifactMaterializationsReady = DB.artifactMaterializationsReady;
-    const graphCleanupRequiresRaft = DB.graphCleanupRequiresRaft;
+    const graphCleanupRequiresOrderedApply = DB.graphCleanupRequiresOrderedApply;
     fn finishBatchGraphEndpointCleanup(_: *@This(), _: types.BatchRequest, _: BatchExecutionOptions) !void {
         // Recovery owns only the committed mutation. The resident DB services
         // its durable jobs independently after recovery releases admission.
@@ -3146,7 +3133,7 @@ const BatchExecutionOptions = struct {
     bypass_replication_write_gate: bool = false,
     replication_applied_lsn_marker: ?u64 = null,
     online_source_applied_index: ?u64 = null,
-    raft_applied_entry_marker: ?OrderedApplyReceipt = null,
+    ordered_apply_receipt: ?OrderedApplyReceipt = null,
     /// Metadata-authorized native hidden-child receipt identity. Never
     /// writes the data-Raft watermark into a native source-authority root.
     native_initial_child_entry: ?OrderedApplyReceipt = null,
@@ -3164,7 +3151,6 @@ const BatchExecutionOptions = struct {
 };
 
 pub const OrderedApplyReceipt = types.OrderedApplyReceipt;
-pub const RaftAppliedEntryIdentity = OrderedApplyReceipt;
 
 const ordered_apply_receipt_value_len = apply_receipts.ordered_apply_receipt_value_len;
 
@@ -5307,6 +5293,29 @@ const LocalExecutionState = struct {
     optional_runtime_workers_enabled: bool = false,
 };
 
+// A narrowly scoped secret reader can serve a provider without access to the
+// row-policy signing authority. Denial leaves that authority unavailable;
+// policy admission still requires both credentials and fails closed.
+fn optionalRowPolicyAuthority(alloc: std.mem.Allocator, store: anytype, key: []const u8) !?[]u8 {
+    return store.getOwned(alloc, key) catch |err| switch (err) {
+        error.Unauthorized => null,
+        else => return err,
+    };
+}
+
+test "db optional row policy authority preserves scoped secret denial and outages" {
+    const Reader = struct {
+        failure: anyerror = error.Unauthorized,
+        fn getOwned(self: *@This(), _: std.mem.Allocator, _: []const u8) anyerror!?[]u8 {
+            return self.failure;
+        }
+    };
+    var reader: Reader = .{};
+    try std.testing.expectEqual(@as(?[]u8, null), try optionalRowPolicyAuthority(std.testing.allocator, &reader, "antfly.trusted_principal.secret"));
+    reader.failure = error.Unavailable;
+    try std.testing.expectError(error.Unavailable, optionalRowPolicyAuthority(std.testing.allocator, &reader, "antfly.trusted_principal.secret"));
+}
+
 pub const DB = struct {
     /// Shared local mutation state outlives foreground and recovery execution.
     local_execution: *LocalExecutionState,
@@ -5568,7 +5577,7 @@ pub const DB = struct {
     fn enforceReplicationWriteGate(self: anytype) !void {
         try self.enforcePortableRuntimeGate();
         try enforceReplicationWriteGateOptional(self.local_execution.replication_write_gate);
-        if (self.async_context.primary_replication_append_pending.load(.acquire)) return error.HAMirrorUnavailable;
+        if (self.async_context.primary_replication_append_pending.load(.acquire)) return error.ReplicationPublisherUnavailable;
     }
 
     /// Keep unavailable work out of lock queues, then revalidate after acquiring
@@ -5959,12 +5968,12 @@ pub const DB = struct {
         // not silently discard it if a restart temporarily removes or
         // downgrades the corresponding mirror configuration.
         if (outbox.batch_payload != null) {
-            const mirror = self.local_execution.replication_async_batch_mirror orelse return error.HAMirrorUnavailable;
-            if (!replicationMirrorSyncEnabled(mirror)) return error.HAMirrorUnavailable;
+            const mirror = self.local_execution.replication_async_batch_mirror orelse return error.ReplicationPublisherUnavailable;
+            if (!replicationMirrorSyncEnabled(mirror)) return error.ReplicationPublisherUnavailable;
         }
         if (outbox.replay_payload != null) {
-            const mirror = self.local_execution.replication_async_effect_mirror orelse return error.HAMirrorUnavailable;
-            if (!replicationMirrorSyncEnabled(mirror)) return error.HAMirrorUnavailable;
+            const mirror = self.local_execution.replication_async_effect_mirror orelse return error.ReplicationPublisherUnavailable;
+            if (!replicationMirrorSyncEnabled(mirror)) return error.ReplicationPublisherUnavailable;
         }
         try self.enforceReplicationWriteGate();
         var ctx = self.batchContext();
@@ -6062,16 +6071,16 @@ pub const DB = struct {
         const schema_outbox = if (schema_raw) |raw| try decodeDurableReplicationOutbox(raw) else null;
 
         if (batch_outbox != null) {
-            const mirror = self.local_execution.replication_async_batch_mirror orelse return error.HAMirrorUnavailable;
-            if (!replicationMirrorRequiresDurableOutbox(mirror)) return error.HAMirrorUnavailable;
+            const mirror = self.local_execution.replication_async_batch_mirror orelse return error.ReplicationPublisherUnavailable;
+            if (!replicationMirrorRequiresDurableOutbox(mirror)) return error.ReplicationPublisherUnavailable;
         }
         if (replay_outbox != null) {
-            const mirror = self.local_execution.replication_async_effect_mirror orelse return error.HAMirrorUnavailable;
-            if (!replicationMirrorRequiresDurableOutbox(mirror)) return error.HAMirrorUnavailable;
+            const mirror = self.local_execution.replication_async_effect_mirror orelse return error.ReplicationPublisherUnavailable;
+            if (!replicationMirrorRequiresDurableOutbox(mirror)) return error.ReplicationPublisherUnavailable;
         }
         if (schema_outbox != null) {
-            const mirror = self.local_execution.replication_async_metadata_mirror orelse return error.HAMirrorUnavailable;
-            if (!replicationMirrorRequiresDurableOutbox(mirror)) return error.HAMirrorUnavailable;
+            const mirror = self.local_execution.replication_async_metadata_mirror orelse return error.ReplicationPublisherUnavailable;
+            if (!replicationMirrorRequiresDurableOutbox(mirror)) return error.ReplicationPublisherUnavailable;
         }
         // Recovery delivers the unlogged effect that closes foreground writes.
         try self.enforcePortableRuntimeGate();
@@ -6100,8 +6109,8 @@ pub const DB = struct {
                 .batch, .restore_batch => self.local_execution.replication_async_batch_mirror,
                 .replay, .primary_effect => self.local_execution.replication_async_effect_mirror,
                 .schema, .row_policy => self.local_execution.replication_async_metadata_mirror,
-            } orelse return error.HAMirrorUnavailable;
-            if (kind != .restore_batch and kind != .primary_effect and kind != .row_policy and !replicationMirrorRequiresDurableOutbox(mirror)) return error.HAMirrorUnavailable;
+            } orelse return error.ReplicationPublisherUnavailable;
+            if (kind != .restore_batch and kind != .primary_effect and kind != .row_policy and !replicationMirrorRequiresDurableOutbox(mirror)) return error.ReplicationPublisherUnavailable;
             var ctx = self.batchContext();
             try recoverDurableReplicationOutboxContext(&ctx, mirror, outbox, kind);
             // The key names this exact mutation, so concurrent publishers cannot
@@ -6446,8 +6455,8 @@ pub const DB = struct {
                 .lsm_memory => |*lsm_opts| lsm_opts.background_executor = null,
                 .mem => {},
             }
-            const replication_standby_role = replicationWriteGateIsStandby(replication_write_gate);
-            const start_index_workers = opts.open_mode.allowsIndexWorkers() and opts.start_index_workers and !replication_standby_role;
+            const background_work_allowed = replicationWriteGateAllowsBackgroundWork(replication_write_gate);
+            const start_index_workers = opts.open_mode.allowsIndexWorkers() and opts.start_index_workers and background_work_allowed;
 
             core_owner.* = try db_core.DBCore.fromOpened(
                 alloc,
@@ -6472,7 +6481,7 @@ pub const DB = struct {
             // Freestanding builds have no file-backed secret store. Keep the
             // native FileStore implementation out of the WASM module graph.
             const policy_secret: ?[]u8 = if (comptime builtin.os.tag == .freestanding) null else if (opts.secret_store) |store|
-                try store.getOwned(alloc, "antfly.trusted_principal.secret")
+                try optionalRowPolicyAuthority(alloc, store, "antfly.trusted_principal.secret")
             else
                 null;
             var policy_authority_owned = true;
@@ -6481,7 +6490,7 @@ pub const DB = struct {
                 alloc.free(value);
             };
             const policy_issuer: ?[]u8 = if (comptime builtin.os.tag == .freestanding) null else if (opts.secret_store) |store|
-                try store.getOwned(alloc, "antfly.trusted_principal.issuer")
+                try optionalRowPolicyAuthority(alloc, store, "antfly.trusted_principal.issuer")
             else
                 null;
             errdefer if (policy_authority_owned) if (policy_issuer) |value| alloc.free(value);
@@ -6669,7 +6678,7 @@ pub const DB = struct {
                 if (graph_retirement.intent != null)
                     db.core.index_manager.setGraphRetirementAdmissionAssumeCatalogLock(false);
             }
-            const optional_runtimes_initialized = opts.open_mode.allowsOptionalRuntimes() and opts.start_optional_runtimes and !replication_standby_role;
+            const optional_runtimes_initialized = opts.open_mode.allowsOptionalRuntimes() and opts.start_optional_runtimes and background_work_allowed;
             const optional_runtime_workers_enabled = optional_runtimes_initialized and opts.start_optional_runtime_workers;
             db.local_execution.optional_runtime_workers_enabled = optional_runtime_workers_enabled;
             if (optional_runtimes_initialized) {
@@ -7925,6 +7934,7 @@ pub const DB = struct {
         const resources = self.core.batchExecutionResources();
         append_ctx.* = .{
             .alloc = self.runtime_alloc,
+            .root_incarnation = self.root_incarnation,
             .read_only = openModeRequiresReadOnlyBackends(self.open_mode),
             .clock = runtime_cfg.clock orelse self.backend_runtime.clock(),
             .store = resources.store,
@@ -8143,6 +8153,7 @@ pub const DB = struct {
         const resources = self.core.batchExecutionResources();
         append_ctx.* = .{
             .alloc = self.runtime_alloc,
+            .root_incarnation = self.root_incarnation,
             .artifact_publication_dispatcher = self.local_execution.artifact_publication_dispatcher,
             .store = resources.store,
             .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
@@ -9599,7 +9610,7 @@ pub const DB = struct {
     /// cleanup independently through subsequent ordered Raft entries.
     fn finishBatchGraphEndpointCleanup(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
         if (req.graph_endpoint_cleanup or !opts.wait_for_sync_level or
-            opts.raft_applied_entry_marker != null or opts.replication_applied_lsn_marker != null or
+            opts.ordered_apply_receipt != null or opts.replication_applied_lsn_marker != null or
             opts.native_initial_child_entry != null or opts.restore_staging != null or
             req.restore_staging_scope != null or req.restore_staging != null) return;
         // Weak sync levels pay for at most one bounded maintenance page.
@@ -9618,24 +9629,22 @@ pub const DB = struct {
     /// but cannot choose cleanup effects or mutate its local directory on its own.
     fn graphEndpointCleanupWriteAuthority(self: *DB) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
-        if (self.local_execution.replication_write_gate) |gate| gate.check() catch |err| switch (err) {
-            error.HAReadOnlyStandby, error.HAPromotedStandbyRequiresPrimaryOpen, error.HAFencedPrimary => return false,
-            else => return err,
-        };
+        if (!replicationWriteGateAllowsBackgroundWork(self.local_execution.replication_write_gate)) return false;
+        try enforceReplicationWriteGateOptional(self.local_execution.replication_write_gate);
         return true;
     }
 
     fn canRunLocalGraphEndpointCleanup(self: *DB) !bool {
         if (!try self.graphEndpointCleanupWriteAuthority()) return false;
-        return !try self.graphCleanupRequiresRaft();
+        return !try self.graphCleanupRequiresOrderedApply();
     }
 
-    fn graphCleanupRequiresRaft(self: anytype) !bool {
+    fn graphCleanupRequiresOrderedApply(self: anytype) !bool {
         return blk: {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
             if (try @import("../source_authority.zig").load(&read)) |authority| if (authority.kind == .raft) break :blk true;
-            break :blk if (read.get(&internal_keys.raft_document_applied_entry_key)) |_| true else |err| if (err == error.NotFound) false else return err;
+            break :blk if (read.get(&internal_keys.ordered_document_applied_entry_key)) |_| true else |err| if (err == error.NotFound) false else return err;
         };
     }
 
@@ -9950,7 +9959,7 @@ pub const DB = struct {
             .validate_range_ownership = false,
             .wait_for_sync_level = false,
             .bypass_replication_write_gate = bypass_write_gate,
-            .raft_applied_entry_marker = identity,
+            .ordered_apply_receipt = identity,
         });
     }
 
@@ -9959,7 +9968,7 @@ pub const DB = struct {
             .validate_range_ownership = false,
             .wait_for_sync_level = false,
             .bypass_replication_write_gate = bypass_write_gate,
-            .raft_applied_entry_marker = identity,
+            .ordered_apply_receipt = identity,
         });
     }
 
@@ -10147,7 +10156,7 @@ pub const DB = struct {
         if (identity) |entry| try metadata_writes.append(self.alloc, orderedApplyReceiptWrite(entry, &marker_buf));
         if (replication_lsn) |lsn| try metadata_writes.append(self.alloc, replicationAppliedSequenceWrite(lsn, &replication_marker_buf));
         if (replication_payload) |payload| {
-            const mirror = self.local_execution.replication_async_batch_mirror orelse return error.HAMirrorUnavailable;
+            const mirror = self.local_execution.replication_async_batch_mirror orelse return error.ReplicationPublisherUnavailable;
             const from_lsn = mirror.publisher.nextLsn();
             outbox_value = try encodeDurableReplicationOutboxAlloc(self.alloc, from_lsn, payload);
             outbox_key = try durableReplicationOutboxKeyAlloc(self.alloc, .restore_batch, from_lsn, self.core.root_generation, payload);
@@ -10436,12 +10445,12 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         if (identity.term == 0 or identity.index == 0 or (replication_lsn != null and replication_lsn.? == 0)) return error.InvalidRowPolicyPublication;
         if (replication_lsn == null and self.local_execution.replication_async_metadata_mirror == null and
-            (self.local_execution.replication_async_batch_mirror != null or self.local_execution.replication_write_gate != null)) return error.HAMirrorUnavailable;
+            (self.local_execution.replication_async_batch_mirror != null or self.local_execution.replication_write_gate != null)) return error.ReplicationPublisherUnavailable;
         // The policy cut must be serialized with all in-flight primary writes,
         // including writers that passed their fast outbox preflight already.
         // Production HA mirrors share this capture barrier with every mutation.
         if (replication_lsn == null) if (self.local_execution.replication_async_metadata_mirror) |mirror|
-            if (mirror.mutation_barrier == null) return error.HAMirrorUnavailable;
+            if (mirror.mutation_barrier == null) return error.ReplicationPublisherUnavailable;
         var replication_mutation: ?MutationBarrier.ExclusiveLease = null;
         defer if (replication_mutation) |*lease| lease.release();
         if (replication_lsn == null) {
@@ -10678,7 +10687,7 @@ pub const DB = struct {
     pub fn clearOrderedApplyReceipt(self: *DB) !void {
         lockApply(self);
         defer self.core.unlockApply();
-        try self.core.store.putBatch(&.{}, &.{internal_keys.raft_document_applied_entry_key[0..]});
+        try self.core.store.putBatch(&.{}, &.{internal_keys.ordered_document_applied_entry_key[0..]});
     }
 
     fn batchReplicatedApplyWithMarker(self: *DB, req: types.BatchRequest, applied_lsn_marker: ?u64) anyerror!void {
@@ -10881,7 +10890,7 @@ pub const DB = struct {
         };
         switch (mutation.receipt) {
             .native => |position| options.native_topology_position = position,
-            .ordered => |entry| options.raft_applied_entry_marker = entry,
+            .ordered => |entry| options.ordered_apply_receipt = entry,
             .online_source => |index| {
                 request.sync_level = .write;
                 options.online_source_applied_index = index;
@@ -11144,7 +11153,7 @@ pub const DB = struct {
         var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
         defer if (verified_principal) |*principal| principal.deinit();
         var row_policy_lease: ?row_policy_gate_mod.Gate.Lease = null;
-        const trusted_replay = opts.raft_applied_entry_marker != null or opts.native_initial_child_entry != null or opts.replication_applied_lsn_marker != null;
+        const trusted_replay = opts.ordered_apply_receipt != null or opts.native_initial_child_entry != null or opts.replication_applied_lsn_marker != null;
         // Strict private-command validation above confines this exemption to
         // derived inline-edge/job maintenance. It cannot mutate user rows,
         // and must progress while a policy publication is preparing or active.
@@ -11581,7 +11590,7 @@ pub const DB = struct {
         // schema or its durable catalog.
         const request_schema_binding: ?transactions_mod.SchemaBinding = if (opts.transaction_resolution) |resolution|
             resolution.schema_binding
-        else if (opts.raft_applied_entry_marker != null and req.relational_schema_version != null)
+        else if (opts.ordered_apply_receipt != null and req.relational_schema_version != null)
             .{ .version = req.relational_schema_version }
         else
             null;
@@ -11620,7 +11629,7 @@ pub const DB = struct {
         defer if (prepared_index_keys) |*keys| keys.deinit();
         if (relational_index_snapshot) |index_snapshot| {
             const view = request_schema_view orelse return error.PreparedGenerationChanged;
-            if (index_snapshot.plan.schemaView().epoch != view.epoch and opts.raft_applied_entry_marker == null)
+            if (index_snapshot.plan.schemaView().epoch != view.epoch and opts.ordered_apply_receipt == null)
                 return error.PreparedGenerationChanged;
         }
         var index_writer = relational_index_records.Writer.init(preparation_alloc);
@@ -11820,14 +11829,14 @@ pub const DB = struct {
         // walking and encoding every document in a large request.
         var preencoded_replication_batch_payload: ?[]u8 = null;
         defer if (preencoded_replication_batch_payload) |payload| preparation_alloc.free(payload);
-        const scoped_restore_ha = opts.restore_staging != null or replication_contract.requiresDurableLifecycleReplication(effective_req);
+        const scoped_replication = opts.restore_staging != null or replication_contract.requiresDurableLifecycleReplication(effective_req);
         const local_graph_cleanup = req.graph_endpoint_cleanup and !req.graph_endpoint_cleanup_planned;
         // Cleanup identities depend on the current incoming directory. Encode
         // that bounded page under apply after selection, never the planner command.
         if (!opts.bypass_replication_write_gate and !local_graph_cleanup) if (self.local_execution.replication_async_batch_mirror) |mirror| {
             preencoded_replication_batch_payload = (if (req.artifact_catalog != null)
-                replication_effects_mod.encodeArtifactCatalogMutationRequestAlloc(preparation_alloc, req, opts.raft_applied_entry_marker orelse return error.InvalidArtifactCatalogCommand)
-            else if (opts.raft_applied_entry_marker) |entry|
+                replication_effects_mod.encodeArtifactCatalogMutationRequestAlloc(preparation_alloc, req, opts.ordered_apply_receipt orelse return error.InvalidArtifactCatalogCommand)
+            else if (opts.ordered_apply_receipt) |entry|
                 replication_effects_mod.encodeRaftBatchMutationRequestAlloc(preparation_alloc, opts.restore_replication_request orelse effective_req, entry)
             else
                 replication_effects_mod.encodeBatchMutationRequestAlloc(preparation_alloc, opts.restore_replication_request orelse effective_req)) catch |err| blk: {
@@ -11835,7 +11844,7 @@ pub const DB = struct {
                 // Non-resource encoding failures retain best-effort async
                 // behavior. Admission failures must never retry allocation
                 // uncharged after commit.
-                if (scoped_restore_ha or replicationMirrorSyncEnabled(mirror)) return err;
+                if (scoped_replication or replicationMirrorSyncEnabled(mirror)) return err;
                 break :blk null;
             };
         };
@@ -11942,7 +11951,7 @@ pub const DB = struct {
             }
         }
 
-        if (opts.raft_applied_entry_marker) |identity| {
+        if (opts.ordered_apply_receipt) |identity| {
             switch (try orderedApplyDisposition(
                 try readOrderedApplyReceipt(self.alloc, self.core.store),
                 identity,
@@ -11974,7 +11983,7 @@ pub const DB = struct {
                 if (!opts.bypass_replication_write_gate) return error.MergeCopyFenced;
                 // A delayed committed command must advance the receipt without
                 // touching documents, artifacts, indexes or visibility state.
-                if (opts.raft_applied_entry_marker) |identity| {
+                if (opts.ordered_apply_receipt) |identity| {
                     var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
                     try self.core.store.putBatch(&.{orderedApplyReceiptWrite(identity, &marker_buf)}, &.{});
                 }
@@ -12002,7 +12011,7 @@ pub const DB = struct {
                             var count: usize = 0;
                             var raft_buffer: [ordered_apply_receipt_value_len]u8 = undefined;
                             var standby_buffer: [replication_applied_lsn_value_len]u8 = undefined;
-                            if (opts.raft_applied_entry_marker) |identity| {
+                            if (opts.ordered_apply_receipt) |identity| {
                                 marker_writes[count] = orderedApplyReceiptWrite(identity, &raft_buffer);
                                 count += 1;
                             }
@@ -12112,7 +12121,7 @@ pub const DB = struct {
                 // receipt and coordinator acknowledgement must still commit in
                 // the same terminal batch before Raft advances this entry.
                 var raft_marker_value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
-                const completion_writes: []const docstore_mod.KVPair = if (opts.raft_applied_entry_marker) |identity|
+                const completion_writes: []const docstore_mod.KVPair = if (opts.ordered_apply_receipt) |identity|
                     &.{orderedApplyReceiptWrite(identity, &raft_marker_value_buf)}
                 else
                     &.{};
@@ -12156,7 +12165,7 @@ pub const DB = struct {
         // including ordinary graph writes and document/relational deletes.
         // Coalescer flushing above may run nested visibility waits, so acquire
         // only after it finishes, without retaining a catalog lease.
-        if (!opts.bypass_replication_write_gate and self.async_context.primary_replication_append_pending.load(.acquire)) return error.HAMirrorUnavailable;
+        if (!opts.bypass_replication_write_gate and self.async_context.primary_replication_append_pending.load(.acquire)) return error.ReplicationPublisherUnavailable;
         var graph_publication = if (self.core.index_manager.hasGraphIndexes())
             self.core.index_manager.beginGraphPrimaryMutation()
         else
@@ -12430,7 +12439,7 @@ pub const DB = struct {
         if (req.graph_endpoint_cleanup and !req.graph_endpoint_cleanup_planned) {
             // Recheck under the apply fence: ownership may have changed since
             // the scheduler or foreground drain probed it.
-            if (try self.graphCleanupRequiresRaft()) return error.InvalidBatchRequest;
+            if (try self.graphCleanupRequiresOrderedApply()) return error.InvalidBatchRequest;
             effective_req.graph_endpoint_cleanup_planned = true;
             graph_cleanup_page = try self.core.store.prepareGraphEndpointCleanupPage(self.alloc);
             if (graph_cleanup_page) |page| {
@@ -12846,7 +12855,7 @@ pub const DB = struct {
         const cleanup_contract = @import("../graph_cleanup_contract.zig");
         const graph_lifecycle_generation: u64 = if (effective_req.graph_endpoint_cleanup or effective_req.graph_deletes.len != 0 or effective_req.deletes.len != 0 or
             (std.mem.indexOfScalar(bool, derived_changed_flags, true) != null))
-            try appendGraphLifecycleGeneration(self.alloc, self.core.store, if (opts.raft_applied_entry_marker) |entry| entry.index else 0, &store_writes, &owned_store_values)
+            try appendGraphLifecycleGeneration(self.alloc, self.core.store, if (opts.ordered_apply_receipt) |entry| entry.index else 0, &store_writes, &owned_store_values)
         else
             0;
 
@@ -12999,7 +13008,7 @@ pub const DB = struct {
         // derived replay and page-receipt transaction as ordinary artifacts.
         var transferred_artifact_position_bytes: [@import("artifact_publication.zig").Position.encoded_len]u8 = undefined;
         if (transferred_artifacts.len != 0) {
-            const entry = opts.raft_applied_entry_marker orelse return error.InvalidMergePage;
+            const entry = opts.ordered_apply_receipt orelse return error.InvalidMergePage;
             transferred_artifact_position_bytes = try (@import("artifact_publication.zig").Position{ .raft = .{ .term = entry.term, .index = entry.index } }).encode();
         }
         var receiver_artifact_namespace: @import("artifact_publication.zig").Namespace = undefined;
@@ -13271,7 +13280,7 @@ pub const DB = struct {
             opts.extra_store_writes.len == 0 and
             opts.transaction_resolution == null and
             opts.replication_applied_lsn_marker == null and
-            opts.raft_applied_entry_marker == null and
+            opts.ordered_apply_receipt == null and
             !thinReplayInputsHaveDerivedWork(
                 effective_req,
                 deleted_artifact_keys,
@@ -13466,9 +13475,9 @@ pub const DB = struct {
         var durable_replication_replay_payload: ?[]u8 = null;
         var durable_replication_batch_outbox_key: ?[]const u8 = null;
         var durable_replication_replay_outbox_key: ?[]const u8 = null;
-        if (!opts.bypass_replication_write_gate and (opts.transaction_resolution == null or scoped_restore_ha)) {
-            if (self.local_execution.replication_async_batch_mirror) |mirror| if (scoped_restore_ha or replicationMirrorRequiresDurableOutbox(mirror)) {
-                const payload = preencoded_replication_batch_payload orelse return error.HAMirrorUnavailable;
+        if (!opts.bypass_replication_write_gate and (opts.transaction_resolution == null or scoped_replication)) {
+            if (self.local_execution.replication_async_batch_mirror) |mirror| if (scoped_replication or replicationMirrorRequiresDurableOutbox(mirror)) {
+                const payload = preencoded_replication_batch_payload orelse return error.ReplicationPublisherUnavailable;
                 const from_lsn = mirror.publisher.nextLsn();
                 const outbox = try encodeDurableReplicationOutboxAlloc(self.alloc, from_lsn, payload);
                 owned_store_values.append(self.alloc, outbox) catch |err| {
@@ -13477,7 +13486,7 @@ pub const DB = struct {
                 };
                 const outbox_key = try durableReplicationOutboxKeyAlloc(
                     self.alloc,
-                    if (scoped_restore_ha) .restore_batch else .batch,
+                    if (scoped_replication) .restore_batch else .batch,
                     from_lsn,
                     self.core.root_generation,
                     outbox[replication_outbox_header_len .. outbox.len - replication_outbox_checksum_len],
@@ -13490,7 +13499,7 @@ pub const DB = struct {
                 durable_replication_batch_payload = outbox[replication_outbox_header_len .. outbox.len - replication_outbox_checksum_len];
                 durable_replication_batch_outbox_key = outbox_key;
             };
-            if (append_derived_replay and !scoped_restore_ha) if (self.local_execution.replication_async_effect_mirror) |mirror| if (replicationMirrorRequiresDurableOutbox(mirror)) {
+            if (append_derived_replay and !scoped_replication) if (self.local_execution.replication_async_effect_mirror) |mirror| if (replicationMirrorRequiresDurableOutbox(mirror)) {
                 const from_lsn = mirror.publisher.nextLsn();
                 const outbox = try encodeDurableReplicationOutboxAlloc(self.alloc, from_lsn, replay_payload);
                 owned_store_values.append(self.alloc, outbox) catch |err| {
@@ -13529,16 +13538,16 @@ pub const DB = struct {
                 try store_writes.append(self.alloc, replicationAppliedSequenceWrite(lsn, &replication_applied_lsn_value_buf));
             }
         }
-        var raft_applied_entry_value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
-        const raft_applied_entry_write: ?docstore_mod.KVPair = if (opts.raft_applied_entry_marker) |identity|
-            orderedApplyReceiptWrite(identity, &raft_applied_entry_value_buf)
+        var ordered_apply_receipt_value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+        const ordered_apply_receipt_write: ?docstore_mod.KVPair = if (opts.ordered_apply_receipt) |identity|
+            orderedApplyReceiptWrite(identity, &ordered_apply_receipt_value_buf)
         else
             null;
         // A transaction resolution owns a second idempotency boundary: normal
         // document writes must not be replayed once its decision is terminal,
         // while the command receipt and participant acknowledgement still
         // must be completed. Keep those completion writes separate.
-        if (raft_applied_entry_write) |write| {
+        if (ordered_apply_receipt_write) |write| {
             if (opts.transaction_resolution == null) try store_writes.append(self.alloc, write);
         }
         var split_range_value: ?[]u8 = null;
@@ -13553,7 +13562,7 @@ pub const DB = struct {
         var ordered_artifact_value: ?[]u8 = null;
         defer if (ordered_artifact_value) |value| self.alloc.free(value);
         if (req.artifact_catalog) |command| {
-            const entry = opts.raft_applied_entry_marker orelse return error.InvalidArtifactCatalogCommand;
+            const entry = opts.ordered_apply_receipt orelse return error.InvalidArtifactCatalogCommand;
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
             if (!std.mem.eql(u8, &command.namespace, &@import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace))) return error.IdentityNamespaceMismatch;
@@ -13775,9 +13784,9 @@ pub const DB = struct {
         // data from already-deleted intents.
         var transaction_replication_batch_payload: ?[]const u8 = null;
         var transaction_replication_replay_payload: ?[]const u8 = null;
-        if (opts.transaction_resolution) |resolution| if (!opts.bypass_replication_write_gate and !scoped_restore_ha) {
+        if (opts.transaction_resolution) |resolution| if (!opts.bypass_replication_write_gate and !scoped_replication) {
             if (self.local_execution.replication_async_batch_mirror) |mirror| if (replicationMirrorSyncEnabled(mirror)) {
-                const payload = preencoded_replication_batch_payload orelse return error.HAMirrorUnavailable;
+                const payload = preencoded_replication_batch_payload orelse return error.ReplicationPublisherUnavailable;
                 // The outbox borrows the request-owned buffer through commit
                 // and the HA wait; keep its original budgeted owner intact.
                 const key_array = transactions_mod.makeTransactionReplicationBatchOutboxKey(resolution.txn_id);
@@ -13846,7 +13855,7 @@ pub const DB = struct {
                     .expected_intent_revision = resolution.expected_intent_revision,
                     .known_intent_keys = resolution.intent_keys,
                     .skip_all_intent_application = relationalColumns(self) != null,
-                    .completion_writes = if (raft_applied_entry_write) |write| &.{write} else &.{},
+                    .completion_writes = if (ordered_apply_receipt_write) |write| &.{write} else &.{},
                     .resolved_participant = resolution.resolved_participant,
                 },
             );
@@ -13888,7 +13897,7 @@ pub const DB = struct {
             if (transaction_replication_batch_payload) |payload| {
                 deferred_replication_gates.append(try appendReplicationEncodedBatchMutationCommitLockedContext(&replication_ctx, payload));
             } else if (durable_replication_batch_payload) |payload| {
-                deferred_replication_gates.append(try appendReplicationEncodedBatchMutationCommitLockedContextStrict(&replication_ctx, payload, scoped_restore_ha));
+                deferred_replication_gates.append(try appendReplicationEncodedBatchMutationCommitLockedContextStrict(&replication_ctx, payload, scoped_replication));
             } else if (preencoded_replication_batch_payload) |payload| {
                 deferred_replication_gates.append(try appendReplicationEncodedBatchMutationCommitLockedContext(&replication_ctx, payload));
             } else deferred_replication_gates.append(try appendReplicationBatchMutationCommitLockedContext(&replication_ctx, effective_req));
@@ -13896,7 +13905,7 @@ pub const DB = struct {
                 deferred_replication_gates.append(try appendReplicationReplayPayloadCommitLockedContext(&replication_ctx, payload));
             } else if (durable_replication_replay_payload) |payload| {
                 deferred_replication_gates.append(try appendReplicationReplayPayloadCommitLockedContext(&replication_ctx, payload));
-            } else if (append_derived_replay and !scoped_restore_ha) deferred_replication_gates.append(try appendReplicationReplayPayloadCommitLockedContext(&replication_ctx, replay_payload));
+            } else if (append_derived_replay and !scoped_replication) deferred_replication_gates.append(try appendReplicationReplayPayloadCommitLockedContext(&replication_ctx, replay_payload));
         }
         if (opts.committed_batch_effects_observer) |observer| {
             try observer.observe(if (append_derived_replay) replay_payload else "");
@@ -28995,7 +29004,7 @@ pub const DB = struct {
         var apply_held = true;
         errdefer if (apply_held) self.core.unlockApply();
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
-        if (self.async_context.primary_replication_append_pending.load(.acquire)) return error.HAMirrorUnavailable;
+        if (self.async_context.primary_replication_append_pending.load(.acquire)) return error.ReplicationPublisherUnavailable;
         try self.enforceVectorMigrationConfigurationGate();
         const reconciled_row_count = try self.validateStorageModeCompatibilityLocked(table_schema);
         if (durable_replication_schema_outbox_key != null) self.local_execution.durable_replication_outbox_maybe.store(true, .release);
@@ -29246,7 +29255,7 @@ pub const DB = struct {
         schema_json_digest: [32]u8,
         before_catalog_digest: [32]u8,
         after_catalog_digest: [32]u8,
-        raft_entry: OrderedApplyReceipt,
+        ordered_receipt: OrderedApplyReceipt,
         native: bool = false,
     };
 
@@ -29258,7 +29267,7 @@ pub const DB = struct {
         schema_digest: [32]u8,
         public_schema_json_digest: [32]u8,
         catalog_digest: [32]u8,
-        raft_entry: OrderedApplyReceipt,
+        ordered_receipt: OrderedApplyReceipt,
         native: bool = false,
     };
 
@@ -29285,7 +29294,7 @@ pub const DB = struct {
             return error.InvalidInitialChildPublication;
         const replay = if (input.native)
             try self.core.getStoreValue(self.alloc, hidden.key)
-        else if (try self.orderedMutationAlreadyApplied(input.raft_entry))
+        else if (try self.orderedMutationAlreadyApplied(input.ordered_receipt))
             (try self.core.getStoreValue(self.alloc, hidden.key)) orelse return error.InitialChildPublicationChanged
         else
             null;
@@ -29298,7 +29307,7 @@ pub const DB = struct {
                 !std.mem.eql(u8, &prior.schema_digest, &input.schema_digest) or
                 !std.mem.eql(u8, &prior.public_schema_json_digest, &input.public_schema_json_digest) or
                 !std.mem.eql(u8, &prior.catalog_digest, &input.catalog_digest) or
-                prior.provision_term != input.raft_entry.term or prior.provision_index != input.raft_entry.index)
+                prior.provision_term != input.ordered_receipt.term or prior.provision_index != input.ordered_receipt.index)
                 return error.InitialChildPublicationChanged;
             if (replication_lsn) |lsn| try self.recordReplicationApplied(lsn);
             return;
@@ -29334,12 +29343,12 @@ pub const DB = struct {
             .schema_digest = input.schema_digest,
             .public_schema_json_digest = input.public_schema_json_digest,
             .catalog_digest = input.catalog_digest,
-            .provision_term = input.raft_entry.term,
-            .provision_index = input.raft_entry.index,
+            .provision_term = input.ordered_receipt.term,
+            .provision_index = input.ordered_receipt.index,
         };
         const encoded_record = try record.encode();
         var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
-        const marker = orderedApplyReceiptWrite(input.raft_entry, &marker_buf);
+        const marker = orderedApplyReceiptWrite(input.ordered_receipt, &marker_buf);
         // Self-referential parents share these hidden child owners. Install
         // their accepted generation scopes in the same durable transaction as
         // the initial schema and hidden gate, before any release can route a
@@ -29381,7 +29390,7 @@ pub const DB = struct {
             write_count += 1;
         }
         const replication_outbox = if (replication_payload) |payload| blk: {
-            const mirror = self.local_execution.replication_async_batch_mirror orelse return error.HAMirrorUnavailable;
+            const mirror = self.local_execution.replication_async_batch_mirror orelse return error.ReplicationPublisherUnavailable;
             const from_lsn = mirror.publisher.nextLsn();
             const encoded = try encodeDurableReplicationOutboxAlloc(self.alloc, from_lsn, payload);
             const key = try durableReplicationOutboxKeyAlloc(self.alloc, .restore_batch, from_lsn, self.core.root_generation, payload);
@@ -29407,7 +29416,7 @@ pub const DB = struct {
         try self.lockApplyForPortableRuntime();
         var apply_held = true;
         errdefer if (apply_held) self.core.unlockApply();
-        if (!input.native) switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), input.raft_entry)) {
+        if (!input.native) switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), input.ordered_receipt)) {
             .already_applied => {
                 self.core.unlockApply();
                 apply_held = false;
@@ -29453,7 +29462,7 @@ pub const DB = struct {
                 !std.mem.eql(u8, &prior.schema_digest, &input.schema_digest) or
                 !std.mem.eql(u8, &prior.public_schema_json_digest, &input.public_schema_json_digest) or
                 !std.mem.eql(u8, &prior.catalog_digest, &input.catalog_digest) or
-                prior.provision_term != input.raft_entry.term or prior.provision_index != input.raft_entry.index)
+                prior.provision_term != input.ordered_receipt.term or prior.provision_index != input.ordered_receipt.index)
                 return error.InitialChildPublicationChanged;
             self.core.unlockApply();
             apply_held = false;
@@ -29644,7 +29653,7 @@ pub const DB = struct {
                 const expected = try admission.sourceInstallDigest(publication.fence, publication.before_schema_json_digest, publication.schema_json_digest, publication.before_catalog_digest, publication.after_catalog_digest);
                 if (std.mem.eql(u8, &receipt.digest, &expected)) {
                     const completed = (try @import("relational_integrity_topology.zig").completed(&read)) orelse return error.GenerationAdmissionChanged;
-                    if (!completed.eql(publication.fence) or receipt.term != publication.raft_entry.term or receipt.index != publication.raft_entry.index)
+                    if (!completed.eql(publication.fence) or receipt.term != publication.ordered_receipt.term or receipt.index != publication.ordered_receipt.index)
                         return error.GenerationAdmissionChanged;
                     const actual = try read.get(public_schema_json_key);
                     if (!std.mem.eql(u8, actual, schema_json)) return error.IntegrityCatalogChanged;
@@ -29659,7 +29668,7 @@ pub const DB = struct {
         // already advanced. Check its durable marker before re-preparing the
         // old→new catalog comparison; the apply-locked check below still
         // closes the race with another entry.
-        if (!publication.native and try self.orderedMutationAlreadyApplied(publication.raft_entry)) return;
+        if (!publication.native and try self.orderedMutationAlreadyApplied(publication.ordered_receipt)) return;
         return self.setSchemaJsonMode(alloc, schema_json, publication);
     }
 
@@ -29697,8 +29706,8 @@ pub const DB = struct {
                     .schema_json_digest = published.schema_json_digest,
                     .before_catalog_digest = published.before_catalog_digest,
                     .after_catalog_digest = published.after_catalog_digest,
-                    .applied_term = published.raft_entry.term,
-                    .applied_index = published.raft_entry.index,
+                    .applied_term = published.ordered_receipt.term,
+                    .applied_index = published.ordered_receipt.index,
                 })
             else if (replicationMirrorRequiresDurableOutbox(mirror))
                 try replication_effects_mod.encodeSchemaMetadataMutationAlloc(self.alloc, runtime_schema, schema_json)
@@ -29739,13 +29748,13 @@ pub const DB = struct {
         var source_receipt_buffer: [48]u8 = undefined;
         if (publication) |published| {
             if (!published.native) {
-                const marker = orderedApplyReceiptWrite(published.raft_entry, &raft_marker_buffer);
+                const marker = orderedApplyReceiptWrite(published.ordered_receipt, &raft_marker_buffer);
                 schema_metadata_writes[schema_metadata_write_count] = marker;
                 schema_metadata_write_count += 1;
             }
             const admission = @import("relational_integrity_generation_admission.zig");
             const digest = try admission.sourceInstallDigest(published.fence, published.before_schema_json_digest, published.schema_json_digest, published.before_catalog_digest, published.after_catalog_digest);
-            source_receipt_buffer = (admission.AppliedReceipt{ .digest = digest, .term = published.raft_entry.term, .index = published.raft_entry.index }).encode();
+            source_receipt_buffer = (admission.AppliedReceipt{ .digest = digest, .term = published.ordered_receipt.term, .index = published.ordered_receipt.index }).encode();
             schema_metadata_writes[schema_metadata_write_count] = .{ .key = admission.source_install_receipt_key, .value = &source_receipt_buffer };
             schema_metadata_write_count += 1;
         }
@@ -29767,7 +29776,7 @@ pub const DB = struct {
         try self.lockApplyForPortableRuntime();
         var apply_held = true;
         errdefer if (apply_held) self.core.unlockApply();
-        if (publication) |published| if (!published.native) switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), published.raft_entry)) {
+        if (publication) |published| if (!published.native) switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), published.ordered_receipt)) {
             .already_applied => {
                 self.core.unlockApply();
                 apply_held = false;
@@ -29957,7 +29966,7 @@ pub const DB = struct {
         );
     }
 
-    pub fn beginReplicatedTransactionAtRaftEntry(
+    pub fn beginReplicatedTransactionAtOrderedReceipt(
         self: *DB,
         txn_id: transactions_mod.TxnId,
         timestamp_ns: u64,
@@ -30090,7 +30099,7 @@ pub const DB = struct {
         try self.writeTransactionInternal(txn_id, req, null);
     }
 
-    pub fn writeReplicatedTransactionAtRaftEntry(
+    pub fn writeReplicatedTransactionAtOrderedReceipt(
         self: *DB,
         txn_id: types.TxnId,
         req: types.TransactionIntentRequest,
@@ -30104,9 +30113,9 @@ pub const DB = struct {
         self: *DB,
         txn_id: types.TxnId,
         req: types.TransactionIntentRequest,
-        raft_entry: ?OrderedApplyReceipt,
+        ordered_receipt: ?OrderedApplyReceipt,
     ) !void {
-        if (raft_entry == null) try self.maybeFinalizePendingRowPolicyPublication();
+        if (ordered_receipt == null) try self.maybeFinalizePendingRowPolicyPublication();
         var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
         defer if (verified_principal) |*principal| principal.deinit();
         var row_policy_lease: ?row_policy_gate_mod.Gate.Lease = null;
@@ -30114,14 +30123,14 @@ pub const DB = struct {
             if (req.row_policy_database.len == 0 or req.row_policy_admitted_at_seconds <= 0 or
                 req.restore_staging_scope != null) return error.RowPolicyAuthenticationRequired;
             const now_seconds: i64 = @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s));
-            verified_principal = try self.verifyRowPolicyPrincipal(self.alloc, req.row_policy_principal_proof, req.row_policy_database, .write, if (raft_entry != null) req.row_policy_admitted_at_seconds else now_seconds);
-            row_policy_lease = if (raft_entry != null)
+            verified_principal = try self.verifyRowPolicyPrincipal(self.alloc, req.row_policy_principal_proof, req.row_policy_database, .write, if (ordered_receipt != null) req.row_policy_admitted_at_seconds else now_seconds);
+            row_policy_lease = if (ordered_receipt != null)
                 try self.local_execution.row_policy_gate.enterReplicatedPrincipal(&verified_principal.?.value)
             else
                 try self.local_execution.row_policy_gate.enterVerifiedPrincipal(&verified_principal.?.value, now_seconds);
         } else if (req.row_policy_database.len != 0 or req.row_policy_admitted_at_seconds != 0) {
             return error.RowPolicyAuthenticationRequired;
-        } else if (raft_entry == null) {
+        } else if (ordered_receipt == null) {
             row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         } else if (self.local_execution.row_policy_gate.currentPhase() != .disabled and
             (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0))
@@ -30135,7 +30144,7 @@ pub const DB = struct {
         const max_prepared_retries = 2;
         var retries: usize = 0;
         while (true) {
-            self.writeTransactionInternalOnce(txn_id, req, raft_entry, preparation.guard.allocator(), if (verified_principal) |*principal| &principal.value else null, if (row_policy_lease) |*lease| lease else null) catch |err| switch (err) {
+            self.writeTransactionInternalOnce(txn_id, req, ordered_receipt, preparation.guard.allocator(), if (verified_principal) |*principal| &principal.value else null, if (row_policy_lease) |*lease| lease else null) catch |err| switch (err) {
                 error.PreparedGenerationChanged, error.PreparedReadSetChanged => {
                     if (retries >= max_prepared_retries) return err;
                     retries += 1;
@@ -30151,7 +30160,7 @@ pub const DB = struct {
         self: *DB,
         txn_id: types.TxnId,
         req: types.TransactionIntentRequest,
-        raft_entry: ?OrderedApplyReceipt,
+        ordered_receipt: ?OrderedApplyReceipt,
         preparation_alloc: Allocator,
         row_policy_principal: ?*const row_policy_authority_mod.Payload,
         row_policy_lease: ?*const row_policy_gate_mod.Gate.Lease,
@@ -30478,7 +30487,7 @@ pub const DB = struct {
         defer endpoint_dependencies.deinit();
         try self.prepareGraphEndpointDependenciesLocked(preparation_alloc, endpoint_dependencies.allocator(), txn_id, intents.items, prepared_schema_view, &predicates);
         if (row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
-        if (raft_entry) |identity| {
+        if (ordered_receipt) |identity| {
             switch (try orderedApplyDisposition(try readOrderedApplyReceipt(preparation_alloc, self.core.store), identity)) {
                 .already_applied => return,
                 .apply => {},
@@ -30895,7 +30904,7 @@ pub const DB = struct {
         );
     }
 
-    pub fn resolveReplicatedTransactionAtRaftEntry(
+    pub fn resolveReplicatedTransactionAtOrderedReceipt(
         self: *DB,
         txn_id: transactions_mod.TxnId,
         status: transactions_mod.TxnStatus,
@@ -30923,7 +30932,7 @@ pub const DB = struct {
         commit_version: u64,
         sync_level: types.SyncLevel,
         visibility_cancellation: types.CancellationToken,
-        raft_entry: ?OrderedApplyReceipt,
+        ordered_receipt: ?OrderedApplyReceipt,
         resolved_participant: ?[]const u8,
     ) !void {
         var preparation: RequestPreparationContext = undefined;
@@ -30935,7 +30944,7 @@ pub const DB = struct {
             commit_version,
             sync_level,
             visibility_cancellation,
-            raft_entry,
+            ordered_receipt,
             resolved_participant,
             &preparation.guard,
         ) catch |err| return preparation.mapError(err);
@@ -30948,7 +30957,7 @@ pub const DB = struct {
         commit_version: u64,
         sync_level: types.SyncLevel,
         visibility_cancellation: types.CancellationToken,
-        raft_entry: ?OrderedApplyReceipt,
+        ordered_receipt: ?OrderedApplyReceipt,
         resolved_participant: ?[]const u8,
         preparation: *PreparedRowAllocator,
     ) !void {
@@ -30957,16 +30966,16 @@ pub const DB = struct {
         defer if (staging_progress) |*progress| progress.deinit();
         const restore_scope: ?[32]u8 = if (staging_progress) |progress| progress.value.scope.digest() else null;
         const mirror_scoped_restore = restore_scope != null and self.local_execution.replication_async_batch_mirror != null;
-        const bypass_ha = raft_entry != null and !mirror_scoped_restore;
-        var replication_mutation = if (!bypass_ha) self.acquireReplicationMutationShared() else null;
+        const bypass_replication_write_gate = ordered_receipt != null and !mirror_scoped_restore;
+        var replication_mutation = if (!bypass_replication_write_gate) self.acquireReplicationMutationShared() else null;
         defer if (replication_mutation) |*lease| lease.release();
-        if (!bypass_ha) try self.enforceReplicationWriteGate();
+        if (!bypass_replication_write_gate) try self.enforceReplicationWriteGate();
         if (mirror_scoped_restore) try self.flushDurableReplicationOutboxes();
         if (status != .committed) {
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
             var marker_value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
-            const marker_writes: []const docstore_mod.KVPair = if (raft_entry) |identity| blk: {
+            const marker_writes: []const docstore_mod.KVPair = if (ordered_receipt) |identity| blk: {
                 switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity)) {
                     .already_applied => return,
                     .apply => {},
@@ -31005,7 +31014,7 @@ pub const DB = struct {
                     return error.PreparedGenerationChanged;
                 }
                 var marker_value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
-                const marker_writes: []const docstore_mod.KVPair = if (raft_entry) |identity| blk: {
+                const marker_writes: []const docstore_mod.KVPair = if (ordered_receipt) |identity| blk: {
                     switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity)) {
                         .already_applied => {
                             self.core.unlockApply();
@@ -31052,8 +31061,8 @@ pub const DB = struct {
                 .restore_staging_scope = restore_scope,
             }, null, .{
                 .visibility_cancellation = visibility_cancellation,
-                .bypass_replication_write_gate = bypass_ha,
-                .raft_applied_entry_marker = raft_entry,
+                .bypass_replication_write_gate = bypass_replication_write_gate,
+                .ordered_apply_receipt = ordered_receipt,
                 .durable_rows = &durable_rows,
                 .transaction_resolution = .{
                     .txn_id = txn_id,
@@ -31237,8 +31246,8 @@ pub const DB = struct {
                 if (try self.prepareGraphEndpointCleanupBatch(alloc)) |owned| {
                     var cleanup = owned;
                     defer cleanup.deinit();
-                    try @import("relational_integrity_json.zig").write(.{ .pending = true, .guards = cleanup.page.guards, .graph_deletes = cleanup.graph_deletes, .deletes = cleanup.page.deletes }, &stream);
-                } else try @import("relational_integrity_json.zig").write(.{ .pending = false, .guards = @as([]const @import("../graph_cleanup_contract.zig").Guard, &.{}), .graph_deletes = @as([]const types.GraphEdgeDelete, &.{}), .deletes = @as([]const []const u8, &.{}) }, &stream);
+                    try @import("relational_integrity_json.zig").write(types.GraphEndpointCleanupStatus{ .pending = true, .guards = cleanup.page.guards, .graph_deletes = cleanup.graph_deletes, .deletes = cleanup.page.deletes, .merge_artifacts = cleanup.replay_writes }, &stream);
+                } else try @import("relational_integrity_json.zig").write(types.GraphEndpointCleanupStatus{}, &stream);
             },
             .graph_retirement => {
                 self.core.lockApplyShared();
@@ -31484,9 +31493,9 @@ pub const DB = struct {
     pub fn applyRelationalTopologyControl(
         self: *DB,
         command: @import("relational_integrity_topology.zig").Command,
-        raft_entry: ?OrderedApplyReceipt,
+        ordered_receipt: ?OrderedApplyReceipt,
     ) !void {
-        return self.applyRelationalTopologyControlWithReplication(command, raft_entry, null, null, null, null);
+        return self.applyRelationalTopologyControlWithReplication(command, ordered_receipt, null, null, null, null);
     }
 
     /// Internal source-retention controls share the lifecycle transaction path:
@@ -31511,7 +31520,7 @@ pub const DB = struct {
             try self.flushDurableReplicationOutboxes();
             try self.preflightReplicationBatchSyncCommit();
         }
-        var applied_index = if (opts.raft_applied_entry_marker) |entry| entry.index else opts.online_source_applied_index orelse 0;
+        var applied_index = if (opts.ordered_apply_receipt) |entry| entry.index else opts.online_source_applied_index orelse 0;
         var payload: ?[]u8 = null;
         defer if (payload) |bytes| self.alloc.free(bytes);
         apply_source: {
@@ -31528,7 +31537,7 @@ pub const DB = struct {
             defer if (catalog_admission) self.local_execution.index_structural_mutation_mutex.unlock();
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
-            if (opts.raft_applied_entry_marker) |entry| switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry)) {
+            if (opts.ordered_apply_receipt) |entry| switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry)) {
                 .already_applied => {
                     if (command == .admit) {
                         const repair = blk: {
@@ -31544,7 +31553,7 @@ pub const DB = struct {
                 .apply => {},
             };
             if (!command.scope().fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
-            if (command.scope().authority == .native and opts.raft_applied_entry_marker != null) return error.OnlineSourceScopeChanged;
+            if (command.scope().authority == .native and opts.ordered_apply_receipt != null) return error.OnlineSourceScopeChanged;
             // Complete any committed native admission before a retry can
             // advance the owner clock. It must never recapture a later cut.
             if (command.scope().authority == .native and command == .admit) {
@@ -31636,9 +31645,9 @@ pub const DB = struct {
             try @import("online_source.zig").stage(&txn, command, applied_index);
             if (req.artifact_catalog) |install| try @import("artifact_reconcile_intent.zig").clear(self.alloc, &txn, install, applied_index);
             if (!opts.bypass_replication_write_gate and self.local_execution.replication_async_batch_mirror != null)
-                payload = if (req.artifact_catalog != null) try replication_effects_mod.encodeArtifactCatalogMutationRequestAlloc(self.alloc, req, opts.raft_applied_entry_marker orelse return error.InvalidArtifactCatalogCommand) else try replication_effects_mod.encodeOnlineSourceMutationRequestAlloc(self.alloc, req, applied_index);
+                payload = if (req.artifact_catalog != null) try replication_effects_mod.encodeArtifactCatalogMutationRequestAlloc(self.alloc, req, opts.ordered_apply_receipt orelse return error.InvalidArtifactCatalogCommand) else try replication_effects_mod.encodeOnlineSourceMutationRequestAlloc(self.alloc, req, applied_index);
             for (opts.extra_store_writes) |write| try txn.put(write.key, write.value);
-            if (opts.raft_applied_entry_marker) |entry| {
+            if (opts.ordered_apply_receipt) |entry| {
                 var bytes: [ordered_apply_receipt_value_len]u8 = undefined;
                 const marker = orderedApplyReceiptWrite(entry, &bytes);
                 try txn.put(marker.key, marker.value);
@@ -31783,6 +31792,41 @@ pub const DB = struct {
         self.core.index_manager.invalidateWritePlanSnapshot();
     }
 
+    /// Advance one replica-local initial-build quantum under the exact durable
+    /// admission fence. This never grants authority to unrelated operator
+    /// repairs or to an obsolete catalog. The primary apply cut is stationary
+    /// while reconciliation runs; physical projection publication remains
+    /// fenced by the repair intent's root/config/control identity.
+    pub fn advanceOrderedArtifactInitialBuild(self: *DB, configs: []const types.IndexConfig, context: @import("artifact_reconcile_intent.zig").Context) !void {
+        {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            try @import("artifact_reconcile_intent.zig").requireContext(self.alloc, &read, context);
+        }
+        for (configs) |config| {
+            if (!self.core.index_manager.repairUnavailable(config.name)) continue;
+            const repair_id = try self.indexRepairIdForIndex(self.alloc, config.name) orelse continue;
+            var entry = try self.loadIndexRepairEntryById(self.alloc, repair_id);
+            defer entry.deinit(self.alloc);
+            if (entry.intent.work_class != .initial_build or entry.intent.trigger != .catalog_admission or
+                entry.intent.config_hash != types.indexConfigHash(config) or entry.intent.kind != config.kind or
+                entry.intent.root_generation != self.core.root_generation or entry.intent.group_id != self.localRepairGroupId()) continue;
+            const Quantum = struct {
+                deadline_ns: u64,
+                fn requested(ptr: *anyopaque) bool {
+                    const quantum: *@This() = @ptrCast(@alignCast(ptr));
+                    return monotonicTimeNs() >= quantum.deadline_ns;
+                }
+            };
+            var quantum: Quantum = .{ .deadline_ns = monotonicTimeNs() +| 20 * std.time.ns_per_ms };
+            _ = try self.advanceIndexRepairIntent(self.alloc, repair_id, .{
+                .target_index_name = config.name,
+                .yield_check = .{ .ptr = &quantum, .is_requested = Quantum.requested },
+            });
+            return;
+        }
+    }
+
     pub fn reconcileArtifactAddIndex(self: *DB, cfg: types.IndexConfig, context: @import("artifact_reconcile_intent.zig").Context) !?u128 {
         return self.addIndexForReconciliation(cfg, .managed, context);
     }
@@ -31875,7 +31919,7 @@ pub const DB = struct {
         const provenance = @import("artifact_producer_provenance.zig");
         try adoption.validateRequest(req);
         const command = req.merge_proof_adoption orelse return error.InvalidBatchRequest;
-        const entry = opts.raft_applied_entry_marker orelse return error.InvalidBatchRequest;
+        const entry = opts.ordered_apply_receipt orelse return error.InvalidBatchRequest;
         if (entry.term == 0 or entry.index == 0 or opts.artifact_upload_finalize != null or
             opts.extra_store_writes.len != 0 or opts.extra_store_deletes.len != 0) return error.InvalidBatchRequest;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
@@ -31977,7 +32021,7 @@ pub const DB = struct {
         const transport = @import("artifact_publication_transport.zig");
         const control = req.artifact_publication_transport orelse return error.InvalidBatchRequest;
         try transport.validateBatchRequest(req);
-        const entry = opts.raft_applied_entry_marker orelse return error.InvalidBatchRequest;
+        const entry = opts.ordered_apply_receipt orelse return error.InvalidBatchRequest;
         if (entry.term == 0 or entry.index == 0 or opts.artifact_upload_finalize != null) return error.InvalidBatchRequest;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var namespace: [24]u8 = undefined;
@@ -32098,7 +32142,7 @@ pub const DB = struct {
         // A source/catalog race is an ordered outcome, not an apply failure.
         // Keep accepted provenance intact and commit the rejection with the
         // applied watermark, so retries cannot wedge a committed Raft entry.
-        const entry = opts.raft_applied_entry_marker orelse return error.InvalidBatchRequest;
+        const entry = opts.ordered_apply_receipt orelse return error.InvalidBatchRequest;
         var txn = try self.core.store.beginWriteTxn();
         errdefer txn.abort();
         try @import("artifact_publication.zig").stageRejection(&txn, command, entry.index, reason);
@@ -32128,7 +32172,7 @@ pub const DB = struct {
         const inventory = @import("artifact_inventory.zig");
         try publication.validateRequest(self.alloc, req);
         const command = req.artifact_publication orelse return error.InvalidBatchRequest;
-        const entry = opts.raft_applied_entry_marker orelse return error.InvalidBatchRequest;
+        const entry = opts.ordered_apply_receipt orelse return error.InvalidBatchRequest;
         if (entry.term == 0 or entry.index == 0) return error.InvalidBatchRequest;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
@@ -32576,7 +32620,7 @@ pub const DB = struct {
         const inventory = @import("artifact_inventory.zig");
         try inventory.validateRequest(req);
         const command = req.artifact_catalog orelse return error.InvalidArtifactCatalogCommand;
-        const entry = opts.raft_applied_entry_marker orelse return error.InvalidArtifactCatalogCommand;
+        const entry = opts.ordered_apply_receipt orelse return error.InvalidArtifactCatalogCommand;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
@@ -32703,7 +32747,7 @@ pub const DB = struct {
         defer admission.release();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
-        if (opts.raft_applied_entry_marker) |entry| switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry)) {
+        if (opts.ordered_apply_receipt) |entry| switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry)) {
             .already_applied => return,
             .apply => {},
         };
@@ -32720,7 +32764,7 @@ pub const DB = struct {
                 else => return err,
             };
         }
-        if (opts.raft_applied_entry_marker) |entry| {
+        if (opts.ordered_apply_receipt) |entry| {
             var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
             const marker = orderedApplyReceiptWrite(entry, &marker_buf);
             try txn.put(marker.key, marker.value);
@@ -32766,14 +32810,14 @@ pub const DB = struct {
                 command.transfer != null or command.parent_retirement != null or command.parent_activation != null or
                 command.child_generations != null) return error.InvalidBatchRequest;
             const install = command.child_schema_install.?;
-            const entry = opts.raft_applied_entry_marker orelse opts.native_fk_generation_entry orelse return error.InvalidBatchRequest;
+            const entry = opts.ordered_apply_receipt orelse opts.native_fk_generation_entry orelse return error.InvalidBatchRequest;
             return self.installPublishedChildSchema(self.alloc, install.schema_json, .{
                 .fence = command.fence,
                 .before_schema_json_digest = install.before_schema_json_digest,
                 .schema_json_digest = install.schema_json_digest,
                 .before_catalog_digest = install.before_catalog_digest,
                 .after_catalog_digest = install.after_catalog_digest,
-                .raft_entry = entry,
+                .ordered_receipt = entry,
                 .native = opts.native_fk_generation_entry != null,
             });
         };
@@ -32782,11 +32826,11 @@ pub const DB = struct {
                 command.child_schema_install != null or command.transfer != null or command.parent_retirement != null or
                 command.parent_activation != null or command.child_generations != null) return error.InvalidBatchRequest;
             const provision = command.initial_child_provision.?;
-            const entry = opts.raft_applied_entry_marker orelse opts.native_initial_child_entry orelse return error.InvalidBatchRequest;
+            const entry = opts.ordered_apply_receipt orelse opts.native_initial_child_entry orelse return error.InvalidBatchRequest;
             var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
             defer if (replication_mutation) |*lease| lease.release();
             if (!opts.bypass_replication_write_gate) {
-                if (self.local_execution.replication_async_metadata_mirror != null and self.local_execution.replication_async_batch_mirror == null) return error.HAMirrorUnavailable;
+                if (self.local_execution.replication_async_metadata_mirror != null and self.local_execution.replication_async_batch_mirror == null) return error.ReplicationPublisherUnavailable;
                 try self.enforceReplicationWriteGate();
                 try self.ensureDurableReplicationStartupBarrier();
                 try self.flushDurableReplicationOutboxes();
@@ -32805,7 +32849,7 @@ pub const DB = struct {
                 .schema_digest = provision.schema_digest,
                 .public_schema_json_digest = provision.public_schema_json_digest,
                 .catalog_digest = provision.catalog_digest,
-                .raft_entry = entry,
+                .ordered_receipt = entry,
                 .native = opts.native_initial_child_entry != null,
             }, opts.replication_applied_lsn_marker, payload);
             if (payload != null) try self.flushDurableReplicationOutboxes();
@@ -32815,11 +32859,11 @@ pub const DB = struct {
             if (command.initial_child_control == null or command.initial_child_provision != null or
                 command.child_schema_install != null or command.transfer != null or command.parent_retirement != null or
                 command.parent_activation != null or command.child_generations != null) return error.InvalidBatchRequest;
-            const entry = opts.raft_applied_entry_marker orelse opts.native_initial_child_entry orelse return error.InvalidBatchRequest;
+            const entry = opts.ordered_apply_receipt orelse opts.native_initial_child_entry orelse return error.InvalidBatchRequest;
             var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
             defer if (replication_mutation) |*lease| lease.release();
             if (!opts.bypass_replication_write_gate) {
-                if (self.local_execution.replication_async_metadata_mirror != null and self.local_execution.replication_async_batch_mirror == null) return error.HAMirrorUnavailable;
+                if (self.local_execution.replication_async_metadata_mirror != null and self.local_execution.replication_async_batch_mirror == null) return error.ReplicationPublisherUnavailable;
                 try self.enforceReplicationWriteGate();
                 try self.ensureDurableReplicationStartupBarrier();
                 try self.flushDurableReplicationOutboxes();
@@ -32842,14 +32886,14 @@ pub const DB = struct {
             try self.flushDurableReplicationOutboxes();
             try self.preflightReplicationBatchSyncCommit();
         }
-        const native_control = opts.raft_applied_entry_marker == null and opts.native_fk_generation_entry == null and
+        const native_control = opts.ordered_apply_receipt == null and opts.native_fk_generation_entry == null and
             (if (req.relational_topology) |command| @import("native_topology_receipt.zig").supports(command) else false);
         if (native_control) try @import("native_topology_receipt.zig").validateRequest(self.alloc, req);
         const mirror_control = !opts.bypass_replication_write_gate and self.local_execution.replication_async_batch_mirror != null;
         const payload = if (mirror_control and !native_control)
             if (req.relational_topology) |command|
                 if (command.action == .seal_graph_retirement)
-                    try replication_effects_mod.encodeGraphRetirementSealMutationRequestAlloc(self.alloc, req, opts.raft_applied_entry_marker orelse return error.InvalidBatchRequest)
+                    try replication_effects_mod.encodeGraphRetirementSealMutationRequestAlloc(self.alloc, req, opts.ordered_apply_receipt orelse return error.InvalidBatchRequest)
                 else
                     try replication_effects_mod.encodeBatchMutationRequestAlloc(self.alloc, req)
             else
@@ -32858,9 +32902,9 @@ pub const DB = struct {
             null;
         defer if (payload) |bytes| self.alloc.free(bytes);
         if (req.relational_topology) |command| {
-            try self.applyRelationalTopologyControlWithReplication(command, opts.raft_applied_entry_marker, opts.replication_applied_lsn_marker, payload, opts.native_fk_generation_entry, if (native_control) .{ .request = req, .replay = opts.native_topology_position, .mirror = mirror_control } else null);
+            try self.applyRelationalTopologyControlWithReplication(command, opts.ordered_apply_receipt, opts.replication_applied_lsn_marker, payload, opts.native_fk_generation_entry, if (native_control) .{ .request = req, .replay = opts.native_topology_position, .mirror = mirror_control } else null);
         } else {
-            try self.applyRangeFinalization(req.split_transition.?, opts.raft_applied_entry_marker, opts.replication_applied_lsn_marker, payload);
+            try self.applyRangeFinalization(req.split_transition.?, opts.ordered_apply_receipt, opts.replication_applied_lsn_marker, payload);
         }
         if (mirror_control) try self.flushDurableReplicationOutboxes();
     }
@@ -32874,14 +32918,14 @@ pub const DB = struct {
     fn applyRelationalTopologyControlWithReplication(
         self: *DB,
         command: @import("relational_integrity_topology.zig").Command,
-        raft_entry: ?OrderedApplyReceipt,
+        ordered_receipt: ?OrderedApplyReceipt,
         replication_lsn: ?u64,
         replication_payload: ?[]const u8,
         native_receipt: ?OrderedApplyReceipt,
         native_control: ?NativeTopologyContext,
     ) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        const receipt_entry = raft_entry orelse native_receipt;
+        const receipt_entry = ordered_receipt orelse native_receipt;
         var mutation = self.core.snapshot_admission.acquireMutation();
         defer mutation.release();
         const structural_held = command.action == .begin;
@@ -32889,7 +32933,7 @@ pub const DB = struct {
         defer if (structural_held) self.local_execution.index_structural_mutation_mutex.unlock();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
-        if (raft_entry) |entry| switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry)) {
+        if (ordered_receipt) |entry| switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry)) {
             .already_applied => return,
             .apply => {},
         };
@@ -32910,7 +32954,7 @@ pub const DB = struct {
             try txn.put(&internal_keys.identity_namespace_key, &namespace_bytes);
         }
         const topology = @import("relational_integrity_topology.zig");
-        if (raft_entry != null) try @import("../source_authority.zig").requireRaftMarkerAllowed(&txn);
+        if (ordered_receipt != null) try @import("../source_authority.zig").requireRaftMarkerAllowed(&txn);
         if ((command.action == .transfer) != (command.transfer != null) or
             (command.action == .seal_graph_retirement and command.graph_retirement == null) or
             (command.graph_retirement != null and command.action != .begin and command.action != .seal_graph_retirement) or
@@ -32923,7 +32967,7 @@ pub const DB = struct {
                 (command.action == .cancel and (command.fence.role == .child_generation_parent or command.fence.role == .child_generation_dual))) != (command.child_generations != null))) return error.InvalidBatchRequest;
         if (command.child_schema_install != null) return error.InvalidBatchRequest;
         const native_prepared: ?@import("native_topology_receipt.zig").Prepared = if (native_control) |control| blk: {
-            if (raft_entry != null or native_receipt != null) return error.InvalidControlReceiptPosition;
+            if (ordered_receipt != null or native_receipt != null) return error.InvalidControlReceiptPosition;
             const owner = try @import("../source_authority.zig").load(&txn);
             if (owner == null or owner.?.kind != .native) {
                 if (control.replay != null) return error.InvalidControlReceiptPosition;
@@ -32933,7 +32977,7 @@ pub const DB = struct {
         } else null;
         const stamp: ?@import("receipt_position.zig").Position = if (native_prepared) |prepared|
             .{ .native = prepared.receipt }
-        else if (raft_entry) |entry|
+        else if (ordered_receipt) |entry|
             .{ .raft = .{ .term = entry.term, .index = entry.index } }
         else
             null;
@@ -33220,7 +33264,7 @@ pub const DB = struct {
             .provision_initial_child, .release_initial_child, .cancel_initial_child => unreachable, // Handled before generic topology transaction.
             .prune => try @import("relational_integrity_handoff.zig").prune(self.alloc, &txn, command.fence, self.core.byteRange()),
         };
-        if (raft_entry) |entry| {
+        if (ordered_receipt) |entry| {
             var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
             const marker = orderedApplyReceiptWrite(entry, &marker_buf);
             try txn.put(marker.key, marker.value);
@@ -33254,7 +33298,7 @@ pub const DB = struct {
         try self.core.markTransactionParticipantsResolvedExtraBatch(txn_id, participants, .{});
     }
 
-    pub fn markReplicatedTransactionParticipantResolvedAtRaftEntry(
+    pub fn markReplicatedTransactionParticipantResolvedAtOrderedReceipt(
         self: *DB,
         txn_id: transactions_mod.TxnId,
         participant: []const u8,
@@ -33278,7 +33322,7 @@ pub const DB = struct {
         };
     }
 
-    pub fn markReplicatedTransactionParticipantsResolvedAtRaftEntry(self: *DB, txn_id: transactions_mod.TxnId, participants: []const []const u8, identity: OrderedApplyReceipt) !void {
+    pub fn markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(self: *DB, txn_id: transactions_mod.TxnId, participants: []const []const u8, identity: OrderedApplyReceipt) !void {
         lockApply(self);
         defer self.core.unlockApply();
         switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity)) {
@@ -33308,7 +33352,7 @@ pub const DB = struct {
         return try self.core.cleanupTransactionMetadataIfEligible(txn_id, cutoff_timestamp, retained_cutoff_timestamp);
     }
 
-    pub fn cleanupReplicatedTransactionAtRaftEntry(
+    pub fn cleanupReplicatedTransactionAtOrderedReceipt(
         self: *DB,
         txn_id: transactions_mod.TxnId,
         cutoff_timestamp: u64,
@@ -35029,8 +35073,9 @@ pub const DB = struct {
     /// Eager edge rewrite for an entity merge: repoint every inbound edge of
     /// `old_key` (the merged-away entity) at `new_key` (the survivor) in the
     /// given graph index, preserving edge type, weight, and metadata. Already
-    /// materialized provenance mention edges do not follow `merged_into` on their
-    /// own; this brings the graph in line with a merge.
+    /// materialized contributions move with their producer manifests, counts,
+    /// and deadlines. Resolver curation keeps replay on the survivor. This local
+    /// administrative entry point requires native/unscoped owner authority.
     /// Returns the number of edges rewritten.
     pub fn rewriteEntityEdges(
         self: *DB,
@@ -35040,31 +35085,143 @@ pub const DB = struct {
         new_key: []const u8,
     ) !usize {
         if (std.mem.eql(u8, old_key, new_key)) return 0;
-        const inbound = try self.getEdges(alloc, index_name, old_key, "", .in);
+        if (new_key.len == 0) return error.InvalidGraphEdgeArtifact;
+        var policy = try self.local_execution.row_policy_gate.enterRaw();
+        defer policy.release();
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try self.ensureDurableReplicationStartupBarrier();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
+        if (self.local_execution.replication_async_batch_mirror != null and self.local_execution.replication_async_effect_mirror == null)
+            return error.ReplicationPublisherUnavailable;
+        try self.executor.failIfUnhealthy();
+        var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
+        defer snapshot_mutation.release();
+        try self.lockApplyForPortableRuntime();
+        var apply_held = true;
+        defer if (apply_held) self.core.unlockApply();
+        if (builtin.is_test) if (test_entity_rewrite_apply_admitted) |hook| try hook.call(hook.ctx, self);
+        var graph_publication = self.core.index_manager.beginGraphPrimaryMutation();
+        defer graph_publication.release();
+        // Primary publication excludes both new graph mutations and replay.
+        // Verify the projection cut under this fence, and release every fence
+        // before waiting. Recheck after waiting so a racing mutation cannot
+        // make the adjacency older than the primary snapshot we rewrite.
+        const clock = self.backend_runtime.monotonicClock();
+        const wait = derived_executor_mod.VisibilityWait{
+            .clock = clock,
+            .deadline_ns = clock.nowRealtimeNs() +| default_visibility_wait_timeout_ms * std.time.ns_per_ms,
+        };
+        while (true) {
+            try wait.check();
+            {
+                var read = try self.core.store.beginProbeTxn();
+                defer read.abort();
+                try self.requireOnlineArtifactCatalogMutableLocked(&read);
+                try self.requireArtifactReconcileUnfenced(&read, null);
+                try @import("relational_integrity_retirement.zig").requireMutable(&read);
+                try @import("restore_staging.zig").requireScope(alloc, &read, null, false);
+                if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+                // This local administrative entry point cannot invent a Raft
+                // position. Hosted owners must order curation through their owner.
+                if (try @import("../source_authority.zig").load(&read)) |authority| {
+                    if (authority.kind == .raft) return error.OnlineSourceScopeChanged;
+                }
+            }
+            if (self.core.index_manager.graphIndex(index_name) == null) return error.IndexNotFound;
+            if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
+            const applied = try self.managedIndexAppliedSequence(alloc, index_name);
+            const target = try self.managedIndexReplayTargetSequence(alloc, index_name, .graph, applied);
+            if (applied >= target) break;
+            graph_publication.release();
+            self.core.unlockApply();
+            apply_held = false;
+            snapshot_mutation.release();
+            if (self.executor.hasWorkers()) {
+                try self.runDerivedUntilTargetsWithVisibilityWait(target, &.{index_name}, wait);
+            } else {
+                try replayPendingDerivedBatches(self, null, null, .{
+                    .index_names = &.{index_name},
+                    .truncate_replay = false,
+                    .deadline_ns = wait.deadline_ns,
+                });
+            }
+            snapshot_mutation = self.core.snapshot_admission.acquireMutation();
+            try self.lockApplyForPortableRuntime();
+            apply_held = true;
+            if (builtin.is_test) if (test_entity_rewrite_apply_admitted) |hook| try hook.call(hook.ctx, self);
+            graph_publication = self.core.index_manager.beginGraphPrimaryMutation();
+            try self.enforceReplicationWriteGate();
+            if (!self.executor.hasWorkers() and try self.managedIndexAppliedSequence(alloc, index_name) < target)
+                return error.GraphMaintenanceInProgress;
+        }
+        const entry = self.core.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
+        const inbound = try entry.index.getEdges(alloc, old_key, "", .in);
         defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
         if (inbound.len == 0) return 0;
-
-        var writes = try alloc.alloc(types.GraphEdgeWrite, inbound.len);
-        defer alloc.free(writes);
-        var deletes = try alloc.alloc(types.GraphEdgeDelete, inbound.len);
-        defer alloc.free(deletes);
-        for (inbound, 0..) |edge, i| {
-            deletes[i] = .{ .index_name = index_name, .source = edge.source, .target = old_key, .edge_type = edge.edge_type, .edge_id = edge.edge_id, .owner_document = edge.owner_document };
-            writes[i] = .{
-                .index_name = index_name,
-                .source = edge.source,
-                .target = new_key,
-                .edge_type = edge.edge_type,
-                .edge_id = edge.edge_id,
-                .owner_document = edge.owner_document,
-                .weight = edge.weight,
-                .created_at = edge.created_at,
-                .updated_at = edge.updated_at,
-                .metadata_json = edge.metadata,
-            };
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const mutation = try prepareEntityGraphRewrite(scratch, self, index_name, inbound, new_key);
+        if (mutation.rewritten == 0) return 0;
+        // The outbox appends using the DB allocator, independently of scratch.
+        var writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty;
+        defer writes.deinit(self.alloc);
+        try writes.appendSlice(self.alloc, mutation.writes.items);
+        {
+            var read = try self.core.store.beginProbeTxn();
+            defer read.abort();
+            const authority_mod = @import("../source_authority.zig");
+            if (try authority_mod.load(&read)) |observed| {
+                var authority = try authority_mod.require(&read, .native, observed.namespace);
+                authority.sequence = std.math.add(u64, authority.sequence, 1) catch return error.OnlineSourceCorrupt;
+                const bytes = authority.encode();
+                try writes.append(self.alloc, .{ .key = authority_mod.key, .value = try scratch.dupe(u8, &bytes) });
+            }
         }
-        try self.batch(.{ .graph_writes = writes, .graph_deletes = deletes, .sync_level = .write });
-        return inbound.len;
+        const sequence = self.core.reserveDerivedAppendSequence();
+        const replay = try encodeChangeRecordPayload(&self.batchContext(), .{
+            .sequence = sequence,
+            .changed_artifact_keys = mutation.changed.items,
+        }, sequence);
+        defer self.alloc.free(replay);
+        var revision_keys: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (revision_keys.items) |key| self.alloc.free(key);
+            revision_keys.deinit(self.alloc);
+        }
+        var revision_values: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (revision_values.items) |value| self.alloc.free(value);
+            revision_values.deinit(self.alloc);
+        }
+        try appendArtifactSourceRevisionWritesFromReplay(self.alloc, replay, sequence, &writes, &revision_keys, &revision_values);
+        var context = self.batchContext();
+        var primary_replication = try PrimaryReplicationEffect.prepare(&context, writes.items, mutation.deletes.items, replay);
+        defer primary_replication.deinit(self.alloc);
+        try primary_replication.stage(&context, &writes);
+        var backlog = try self.executor.admitBacklogBytes(@intCast(replay.len));
+        defer backlog.cancel();
+        try policy.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+        try self.core.store.putBatchWithReplay(self.backend_runtime.io(), writes.items, mutation.deletes.items, .{ .sequence = sequence, .payload = replay });
+        self.executor.commitBacklogAdmission(sequence, &backlog);
+        if (shouldAppendSplitDelta(self)) try self.core.appendSplitDelta(currentTimeNs(), writes.items, mutation.deletes.items);
+        graph_publication.release();
+        var gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(&context));
+        defer gates.releaseTransition();
+        gates.append(try primary_replication.appendLocked(&context));
+        self.core.unlockApply();
+        apply_held = false;
+        snapshot_mutation.release();
+        notifyQueryVisibilityTargetAdvanced(self.async_context, sequence);
+        self.executor.notifySequence(sequence);
+        self.notifyResolverReplayRuntimes(sequence);
+        gates.releaseTransition();
+        releaseReplicationMutationShared(&replication_mutation);
+        try gates.waitForDurabilityAndAuthority(context.replication_write_gate);
+        try primary_replication.clear(&context);
+        return mutation.rewritten;
     }
 
     pub fn hasIndex(self: *DB, name: []const u8) bool {
@@ -36196,6 +36353,8 @@ pub const DB = struct {
 
     const ReplayDrainOptions = struct {
         truncate_replay: bool = true,
+        /// Empty selects all indexes; foreground curation selects its graph.
+        index_names: []const []const u8 = &.{},
         wait_for_enrichment_retries: bool = false,
         cancellation: types.CancellationToken = .none,
         max_windows_per_index: usize = 0,
@@ -43265,10 +43424,10 @@ pub const DB = struct {
         try txn.commit();
     }
 
-    fn encodeRestoreStagingReplicationPayload(self: *DB, req: types.BatchRequest, raft_entry: ?OrderedApplyReceipt) ![]u8 {
+    fn encodeRestoreStagingReplicationPayload(self: *DB, req: types.BatchRequest, ordered_receipt: ?OrderedApplyReceipt) ![]u8 {
         const staging = @import("restore_staging.zig");
         if (req.restore_staging.? == .install_generation_admissions)
-            return replication_effects_mod.encodeRestoreGenerationAdmissionMutationRequestAlloc(self.alloc, req, raft_entry orelse return error.InvalidRestoreStagingCommand);
+            return replication_effects_mod.encodeRestoreGenerationAdmissionMutationRequestAlloc(self.alloc, req, ordered_receipt orelse return error.InvalidRestoreStagingCommand);
         if (req.restore_staging.? == .begin) {
             const stored = try self.core.getStoreValue(self.alloc, staging.bootstrap_key);
             defer if (stored) |bytes| self.alloc.free(bytes);
@@ -43364,7 +43523,7 @@ pub const DB = struct {
         // receipt before its projection watermark was durable. Repair one
         // bounded local slice on EVERY committed-control retry; no optional
         // worker or leader RPC is required, and no apply lock is held here.
-        if (opts.raft_applied_entry_marker != null or opts.replication_applied_lsn_marker != null) {
+        if (opts.ordered_apply_receipt != null or opts.replication_applied_lsn_marker != null) {
             if (req.restore_staging.? == .finish and (req.restore_staging.?.finish.phase == .validated or req.restore_staging.?.finish.phase == .published)) {
                 if (!try self.prepareRestoreStagingIndexesStepLocal(self.alloc, req.restore_staging.?.finish.scope, true)) return error.RestoreProjectionCatchUpPending;
             }
@@ -43378,14 +43537,14 @@ pub const DB = struct {
             try self.preflightReplicationBatchSyncCommit();
         }
         const payload = if (!opts.bypass_replication_write_gate and self.local_execution.replication_async_batch_mirror != null)
-            try self.encodeRestoreStagingReplicationPayload(req, opts.raft_applied_entry_marker)
+            try self.encodeRestoreStagingReplicationPayload(req, opts.ordered_apply_receipt)
         else
             null;
         defer if (payload) |bytes| self.alloc.free(bytes);
         switch (req.restore_staging.?) {
-            .begin => |scope| try self.beginRestoreStagingWithMarker(self.alloc, scope, opts.raft_applied_entry_marker, opts.replication_applied_lsn_marker, payload),
-            .finish => |finish| _ = try self.finishRestoreStagingWithMarker(self.alloc, finish.scope, finish.phase, opts.raft_applied_entry_marker, opts.replication_applied_lsn_marker, payload),
-            .install_generation_admissions => |install| _ = try self.installRestoreGenerationAdmissionsWithMarker(self.alloc, install, opts.raft_applied_entry_marker, opts.replication_applied_lsn_marker, payload),
+            .begin => |scope| try self.beginRestoreStagingWithMarker(self.alloc, scope, opts.ordered_apply_receipt, opts.replication_applied_lsn_marker, payload),
+            .finish => |finish| _ = try self.finishRestoreStagingWithMarker(self.alloc, finish.scope, finish.phase, opts.ordered_apply_receipt, opts.replication_applied_lsn_marker, payload),
+            .install_generation_admissions => |install| _ = try self.installRestoreGenerationAdmissionsWithMarker(self.alloc, install, opts.ordered_apply_receipt, opts.replication_applied_lsn_marker, payload),
             .import_page, .rewrite_page => unreachable,
         }
         if (payload != null) try self.flushDurableReplicationOutboxes();
@@ -43496,7 +43655,7 @@ pub const DB = struct {
 
     fn stageRestoreStagingReplicationOutbox(self: *DB, txn: anytype, payload: ?[]const u8) !void {
         const bytes = payload orelse return;
-        const mirror = self.local_execution.replication_async_batch_mirror orelse return error.HAMirrorUnavailable;
+        const mirror = self.local_execution.replication_async_batch_mirror orelse return error.ReplicationPublisherUnavailable;
         const from_lsn = mirror.publisher.nextLsn();
         const encoded = try encodeDurableReplicationOutboxAlloc(self.alloc, from_lsn, bytes);
         defer self.alloc.free(encoded);
@@ -56665,6 +56824,202 @@ const GraphContenderChange = struct {
 
 const GraphContenderChanges = std.StringHashMapUnmanaged(std.ArrayListUnmanaged(GraphContenderChange));
 
+/// Prepare a source-preserving rewrite from the same apply-fenced primary
+/// snapshot as the inbound adjacency. Caller commits all rows with one replay.
+fn prepareEntityGraphRewrite(alloc: Allocator, db: *DB, index_name: []const u8, inbound: []const graph_mod.Edge, new_target: []const u8) !struct {
+    writes: std.ArrayListUnmanaged(docstore_mod.KVPair),
+    deletes: std.ArrayListUnmanaged([]const u8),
+    changed: std.ArrayListUnmanaged([]u8),
+    rewritten: usize,
+} {
+    const entry = db.core.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
+    const generation = entry.config.coverage_generation;
+    const Group = struct {
+        doc: []const u8,
+        changes: GraphContenderChanges = .empty,
+        states: std.StringHashMapUnmanaged(void) = .empty,
+    };
+    var groups: std.ArrayListUnmanaged(Group) = .empty;
+    var group_positions: std.StringHashMapUnmanaged(usize) = .empty;
+    var replacements: std.StringHashMapUnmanaged([]const u8) = .empty;
+    var writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty;
+    var deletes: std.ArrayListUnmanaged([]const u8) = .empty;
+    var changed: std.ArrayListUnmanaged([]u8) = .empty;
+    var changed_set: std.StringHashMapUnmanaged(void) = .empty;
+    var write_positions: StoreWritePositions = .empty;
+    var rewritten: usize = 0;
+    for (inbound) |edge| {
+        var moved = false;
+        var owners = if (edge.edge_id.len != 0)
+            try alloc.dupe([]u8, &.{try alloc.dupe(u8, if (edge.owner_document.len != 0) edge.owner_document else edge.source)})
+        else
+            try entry.index.edgeOwnersAlloc(alloc, edge.source, edge.edge_type, edge.target);
+        if (owners.len == 0) owners = try alloc.dupe([]u8, &.{try alloc.dupe(u8, edge.source)});
+        for (owners) |owner| {
+            const gop = try group_positions.getOrPut(alloc, owner);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = groups.items.len;
+                try groups.append(alloc, .{ .doc = owner });
+            }
+            const group = &groups.items[gop.value_ptr.*];
+            const old_key = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, owner, index_name, edge.edge_type, edge.target, edge.source, edge.edge_id);
+            const new_key = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, owner, index_name, edge.edge_type, new_target, edge.source, edge.edge_id);
+            try replacements.put(alloc, old_key, new_key);
+            const prefix = try internal_keys.graphGlobalEdgeContenderEdgePrefixAlloc(alloc, index_name, generation, old_key);
+            const contenders = try db.core.store.scanPrefix(alloc, prefix);
+            if (contenders.len == 0) {
+                // Source-free direct graphs have no contender sidecars yet.
+                // Preserve their complete primary payload, including TTL.
+                const payload = db.core.store.get(alloc, old_key) catch |err| switch (err) {
+                    error.NotFound => continue,
+                    else => return err,
+                };
+                moved = true;
+                if (entry.artifact_sources.len == 0) {
+                    const canonical = db.core.store.get(alloc, new_key) catch |err| switch (err) {
+                        error.NotFound => payload,
+                        else => return err,
+                    };
+                    try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, new_key, canonical);
+                    try deletes.append(alloc, old_key);
+                    try appendUniqueOwnedKeyIndexed(alloc, &changed, &changed_set, old_key);
+                    try appendUniqueOwnedKeyIndexed(alloc, &changed, &changed_set, new_key);
+                    var owned_keys: std.ArrayListUnmanaged([]u8) = .empty;
+                    var owned_values: std.ArrayListUnmanaged([]u8) = .empty;
+                    try appendDirectGraphTtlDueWrite(alloc, db.core.index_manager, .{ .key = new_key, .value = canonical }, &writes, &owned_keys, &owned_values);
+                    continue;
+                }
+                const state = try internal_keys.graphDirectStateKeyAlloc(alloc, owner, index_name);
+                try appendGraphContenderChange(alloc, &group.changes, old_key, state, @intCast(graph_mod.direct_source_priority), null);
+                try appendGraphContenderChange(alloc, &group.changes, new_key, state, @intCast(graph_mod.direct_source_priority), payload);
+            }
+            if (contenders.len != 0) moved = true;
+            for (contenders) |row| {
+                const view = (try graph_edge_contender.decode(row.value, generation)) orelse return error.InvalidGraphEdgeContender;
+                const expected = try internal_keys.graphGlobalEdgeContenderKeyAlloc(alloc, index_name, generation, old_key, view.source_priority, view.state_key);
+                if (!std.mem.eql(u8, row.key, expected)) return error.InvalidGraphEdgeContender;
+                const destination = try internal_keys.graphGlobalEdgeContenderKeyAlloc(alloc, index_name, generation, new_key, view.source_priority, view.state_key);
+                const existing = db.core.store.get(alloc, destination) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                // An already canonical assertion by the same producer wins a
+                // collision. Moving another assertion must not overwrite it.
+                const payload = if (existing) |raw| blk: {
+                    const canonical = (try graph_edge_contender.decode(raw, generation)) orelse return error.InvalidGraphEdgeContender;
+                    if (!std.mem.eql(u8, canonical.edge_key, new_key) or !std.mem.eql(u8, canonical.state_key, view.state_key) or canonical.source_priority != view.source_priority)
+                        return error.InvalidGraphEdgeContender;
+                    break :blk canonical.payload;
+                } else view.payload;
+                try appendGraphContenderChange(alloc, &group.changes, old_key, view.state_key, view.source_priority, null);
+                try appendGraphContenderChange(alloc, &group.changes, new_key, view.state_key, view.source_priority, payload);
+                if (view.source_priority != graph_mod.direct_source_priority and internal_keys.isGraphAssetStateRootKey(view.state_key)) try group.states.put(alloc, view.state_key, {});
+                if (entry.ttl_duration_ns != 0) {
+                    const old_lifetime = try internal_keys.graphEdgeTtlLifetimeKeyAlloc(alloc, old_key, index_name, generation, view.state_key);
+                    const new_lifetime = try internal_keys.graphEdgeTtlLifetimeKeyAlloc(alloc, new_key, index_name, generation, view.state_key);
+                    const lifetime = db.core.store.get(alloc, old_lifetime) catch |err| switch (err) {
+                        error.NotFound => null,
+                        else => return err,
+                    };
+                    if (lifetime) |raw| if (existing == null) try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, new_lifetime, raw);
+                    try deletes.append(alloc, old_lifetime);
+                }
+            }
+            try appendUniqueOwnedKeyIndexed(alloc, &changed, &changed_set, old_key);
+            try appendUniqueOwnedKeyIndexed(alloc, &changed, &changed_set, new_key);
+        }
+        if (moved) rewritten += 1;
+    }
+    var pending = try PendingGraphContenderOverlay.init(db.alloc, writes.items, deletes.items, generation);
+    defer pending.deinit(db.alloc);
+    for (groups.items) |*group| {
+        if (group.changes.count() == 0) continue;
+        var owner_arena = std.heap.ArenaAllocator.init(db.alloc);
+        defer owner_arena.deinit();
+        const temporary = owner_arena.allocator();
+        var states = group.states.keyIterator();
+        while (states.next()) |state| {
+            const previous = try loadGraphAssetStateKeysAlloc(temporary, db.core.store, state.*, generation) orelse return error.InvalidGraphAssetState;
+            var keys: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty;
+            var seen: std.StringHashMapUnmanaged(void) = .empty;
+            for (previous) |key| {
+                const replacement = replacements.get(key) orelse key;
+                const pos = try seen.getOrPut(temporary, replacement);
+                if (!pos.found_existing) try keys.append(temporary, .{ .key = replacement, .value = "" });
+            }
+            try appendGraphAssetStateSegmentDeleteKeys(alloc, db.core.store, state.*, &deletes);
+            const manifest = try encodeGraphAssetStateKeysAlloc(alloc, generation, keys.items);
+            try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, state.*, manifest);
+        }
+        try pending.extend(db.alloc, writes.items, deletes.items, generation);
+        const reconciled = try reconcileGraphEdgeContendersWithOverlay(temporary, db.core.store, group.doc, index_name, generation, entry.ttl_duration_ns, &group.changes, writes.items, &pending, true);
+        if (reconciled.visible_count > graph_asset_state.effectiveEdgeLimit(entry.max_edges_per_document)) return error.ResourceLimitExceeded;
+        const affected = try temporary.alloc([]const u8, group.changes.count());
+        var changes = group.changes.keyIterator();
+        var i: usize = 0;
+        while (changes.next()) |key| : (i += 1) affected[i] = key.*;
+        const mutation = try prepareGraphContenderReconcilePage(temporary, affected, &reconciled, &.{}, &.{});
+        for (mutation.writes.items) |write| try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, write.key, try alloc.dupe(u8, write.value));
+        for (mutation.deletes.items) |key| try deletes.append(alloc, try alloc.dupe(u8, key));
+        // Persist resolver decisions at their source, not as a new direct
+        // contributor. Unchanged-source replay and repair keep the survivor;
+        // deleting the producer document still retires its ordinary manifest.
+        for (db.core.index_manager.resolvers.items) |cfg| {
+            var relevant = false;
+            for (entry.artifact_sources) |source| if (std.mem.eql(u8, source.artifact_name, cfg.source_artifact)) {
+                relevant = true;
+                break;
+            };
+            if (!relevant) continue;
+            const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, group.doc, cfg.resolution_artifact);
+            const raw = db.core.store.get(temporary, resolution_key) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            var parsed = try std.json.parseFromSlice(std.json.Value, temporary, raw, .{});
+            const entities = if (parsed.value == .object) parsed.value.object.getPtr("entities") orelse continue else continue;
+            if (entities.* != .array) return error.InvalidGraphEdgeArtifact;
+            const override_key = try resolution_runtime_mod.reviewOverrideArtifactKeyAlloc(alloc, group.doc, cfg.source_artifact, cfg.resolution_artifact);
+            const override: ?[]const u8 = db.core.store.get(temporary, override_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            var decisions: std.ArrayListUnmanaged(resolution_runtime_mod.ReviewDecision) = .empty;
+            for (entities.array.items) |*entity| {
+                if (entity.* != .object) continue;
+                const ref = entity.object.getPtr("doc_ref") orelse continue;
+                if (ref.* != .object) continue;
+                const target = ref.object.getPtr("key") orelse continue;
+                if (target.* != .string) continue;
+                // Every inbound edge has the same merged-away target.
+                if (!std.mem.eql(u8, target.string, inbound[0].target)) continue;
+                const local_id = jsonStringField(entity.*, "local_id") orelse return error.InvalidGraphEdgeArtifact;
+                try decisions.append(temporary, .{ .local_id = local_id, .decision = .match, .table = jsonStringField(ref.*, "table") orelse cfg.table, .key = new_target });
+                target.* = .{ .string = new_target };
+            }
+            if (decisions.items.len == 0) continue;
+            const override_bytes = try resolution_runtime_mod.buildReviewDecisionsBytesAlloc(temporary, override, decisions.items);
+            try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, override_key, try alloc.dupe(u8, override_bytes));
+            try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, resolution_key, try std.json.Stringify.valueAlloc(alloc, parsed.value, .{}));
+            const source_key = try sourceArtifactKeyForResolutionAlloc(alloc, group.doc, cfg.source_artifact);
+            try appendUniqueOwnedKeyIndexed(alloc, &changed, &changed_set, source_key);
+            try appendUniqueOwnedKeyIndexed(alloc, &changed, &changed_set, resolution_key);
+        }
+    }
+    var owned_due_deletes: std.ArrayListUnmanaged([]u8) = .empty;
+    try appendRetiredDirectGraphTtlDueDeletes(alloc, db.core.store, db.core.index_manager, writes.items, deletes.items, &deletes, &owned_due_deletes);
+    // Store batches apply deletes before puts. Normalize the same view for
+    // reconciliation and replication so a surviving write cannot be deleted.
+    var filtered: std.ArrayListUnmanaged([]const u8) = .empty;
+    var delete_set: std.StringHashMapUnmanaged(void) = .empty;
+    for (deletes.items) |key| {
+        if (write_positions.contains(key)) continue;
+        const pos = try delete_set.getOrPut(alloc, key);
+        if (!pos.found_existing) try filtered.append(alloc, key);
+    }
+    return .{ .writes = writes, .deletes = filtered, .changed = changed, .rewritten = rewritten };
+}
+
 /// Batch-local contender overlay. Reconciliation may touch thousands of
 /// logical edges, so pending writes/deletes must be indexed once rather than
 /// rescanned for every edge winner lookup.
@@ -56672,6 +57027,9 @@ const PendingGraphContenderOverlay = struct {
     write_positions: std.StringHashMapUnmanaged(usize) = .empty,
     delete_keys: std.StringHashMapUnmanaged(void) = .empty,
     global_writes_by_edge: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)) = .empty,
+    local_writes_by_edge: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)) = .empty,
+    indexed_writes: usize = 0,
+    indexed_deletes: usize = 0,
 
     fn init(
         alloc: Allocator,
@@ -56681,26 +57039,59 @@ const PendingGraphContenderOverlay = struct {
     ) !@This() {
         var overlay = @This(){};
         errdefer overlay.deinit(alloc);
-        for (pending_writes, 0..) |write, i| {
+        try overlay.extend(alloc, pending_writes, pending_deletes, expected_generation);
+        return overlay;
+    }
+
+    /// Incremental batches retain positions and key identities when replacing
+    /// values. Only the appended suffix needs indexing; callers must preserve
+    /// each existing key's contender generation and edge identity.
+    fn extend(self: *@This(), alloc: Allocator, pending_writes: []const docstore_mod.KVPair, pending_deletes: []const []const u8, expected_generation: u64) !void {
+        const overlay = self;
+        if (builtin.is_test) if (test_graph_overlay_examined) |examined| {
+            examined.* += pending_writes.len - self.indexed_writes + pending_deletes.len - self.indexed_deletes;
+        };
+        for (pending_writes[self.indexed_writes..], self.indexed_writes..) |write, i| {
             try overlay.write_positions.put(alloc, write.key, i);
-            if (!internal_keys.isGraphGlobalEdgeContenderKey(write.key)) continue;
+            const bucket = if (internal_keys.isGraphGlobalEdgeContenderKey(write.key))
+                &overlay.global_writes_by_edge
+            else if (internal_keys.isGraphEdgeContenderMembershipKey(write.key))
+                &overlay.local_writes_by_edge
+            else
+                continue;
             // One document batch may reconcile multiple graph indexes or
             // generations. Only index writes authenticated for this
             // generation; unrelated overlay records remain addressable by
             // full key but do not participate in its edge buckets.
             const view = (try graph_edge_contender.decode(write.value, expected_generation)) orelse continue;
-            const gop = try overlay.global_writes_by_edge.getOrPut(alloc, view.edge_key);
-            if (!gop.found_existing) gop.value_ptr.* = .empty;
-            try gop.value_ptr.append(alloc, i);
+            // Payloads may be replaced in place between owners. Bucket keys
+            // must outlive those values, independently of the mutation arena.
+            const positions = bucket.getPtr(view.edge_key) orelse blk: {
+                const owned = try alloc.dupe(u8, view.edge_key);
+                errdefer alloc.free(owned);
+                try bucket.put(alloc, owned, .empty);
+                break :blk bucket.getPtr(owned).?;
+            };
+            try positions.append(alloc, i);
         }
-        for (pending_deletes) |key| try overlay.delete_keys.put(alloc, key, {});
-        return overlay;
+        for (pending_deletes[self.indexed_deletes..]) |key| try overlay.delete_keys.put(alloc, key, {});
+        self.indexed_writes = pending_writes.len;
+        self.indexed_deletes = pending_deletes.len;
     }
 
     fn deinit(self: *@This(), alloc: Allocator) void {
-        var it = self.global_writes_by_edge.valueIterator();
-        while (it.next()) |indexes| indexes.deinit(alloc);
+        var it = self.global_writes_by_edge.iterator();
+        while (it.next()) |entry| {
+            alloc.free(@constCast(entry.key_ptr.*));
+            entry.value_ptr.deinit(alloc);
+        }
         self.global_writes_by_edge.deinit(alloc);
+        var local = self.local_writes_by_edge.iterator();
+        while (local.next()) |entry| {
+            alloc.free(@constCast(entry.key_ptr.*));
+            entry.value_ptr.deinit(alloc);
+        }
+        self.local_writes_by_edge.deinit(alloc);
         self.write_positions.deinit(alloc);
         self.delete_keys.deinit(alloc);
         self.* = undefined;
@@ -57210,16 +57601,38 @@ fn reconcileGraphEdgeContendersWithLifetimePolicy(
     pending_deletes: []const []const u8,
     preserve_incoming_lifetimes: bool,
 ) !GraphContenderReconcileResult {
+    var pending = try PendingGraphContenderOverlay.init(alloc, pending_writes, pending_deletes, expected_generation);
+    defer pending.deinit(alloc);
+    return reconcileGraphEdgeContendersWithOverlay(alloc, store, doc_key, index_name, expected_generation, ttl_duration_ns, changes, pending_writes, &pending, preserve_incoming_lifetimes);
+}
+
+fn reconcileGraphEdgeContendersWithOverlay(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    doc_key: []const u8,
+    index_name: []const u8,
+    expected_generation: u64,
+    ttl_duration_ns: u64,
+    changes: *GraphContenderChanges,
+    pending_writes: []const docstore_mod.KVPair,
+    pending: *const PendingGraphContenderOverlay,
+    preserve_incoming_lifetimes: bool,
+) !GraphContenderReconcileResult {
     var result = GraphContenderReconcileResult{};
     errdefer result.deinit(alloc);
 
     const count_key = try internal_keys.graphEdgeContenderCountKeyAlloc(alloc, doc_key, index_name);
     defer alloc.free(count_key);
-    const raw_count = store.get(alloc, count_key) catch |err| switch (err) {
+    // Counts and membership must observe the same batch-local view. Primary
+    // deletion retires every local witness before direct-source reconciliation;
+    // reading the old count here would recreate nonempty debt for a dead row.
+    const overlay_count = pending.write_positions.contains(count_key) or pending.delete_keys.contains(count_key);
+    const owned_count = if (!overlay_count) store.get(alloc, count_key) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
-    };
-    defer if (raw_count) |raw| alloc.free(raw);
+    } else null;
+    defer if (owned_count) |raw| alloc.free(raw);
+    const raw_count = if (pending.write_positions.get(count_key)) |pos| pending_writes[pos].value else owned_count;
     const count_present = raw_count != null and (try graph_edge_contender.decodeVisibleCount(raw_count.?, expected_generation)) != null;
     result.visible_count = if (raw_count) |raw| (try graph_edge_contender.decodeVisibleCount(raw, expected_generation)) orelse 0 else 0;
     var saw_current_contender = false;
@@ -57242,9 +57655,11 @@ fn reconcileGraphEdgeContendersWithLifetimePolicy(
             const expected_key = try internal_keys.graphEdgeContenderKeyAlloc(alloc, doc_key, index_name, edge_key, view.state_key);
             defer alloc.free(expected_key);
             if (!std.mem.eql(u8, contender.key, expected_key)) return error.InvalidGraphEdgeContender;
+            const replaced = pending.delete_keys.contains(contender.key) or pending.write_positions.contains(contender.key);
+            if (overlay_count and replaced) continue;
             saw_current_contender = true;
             try bulk_existing_edges.put(alloc, edge_key, {});
-            if (graphContenderStateChanged(edge_changes.items, view.state_key)) continue;
+            if (replaced or graphContenderStateChanged(edge_changes.items, view.state_key)) continue;
             try bulk_surviving_edges.put(alloc, edge_key, {});
         }
     }
@@ -57266,12 +57681,25 @@ fn reconcileGraphEdgeContendersWithLifetimePolicy(
                 const expected_key = try internal_keys.graphEdgeContenderKeyAlloc(alloc, doc_key, index_name, edge_key, view.state_key);
                 defer alloc.free(expected_key);
                 if (!std.mem.eql(u8, contender.key, expected_key)) return error.InvalidGraphEdgeContender;
+                const replaced = pending.delete_keys.contains(contender.key) or pending.write_positions.contains(contender.key);
+                if (overlay_count and replaced) continue;
                 saw_current_contender = true;
                 existed_before = true;
-                if (graphContenderStateChanged(edge_changes, view.state_key)) continue;
+                if (replaced or graphContenderStateChanged(edge_changes, view.state_key)) continue;
                 exists_after = true;
             }
         }
+
+        if (pending.local_writes_by_edge.get(edge_key)) |positions| for (positions.items) |pos| {
+            const write = pending_writes[pos];
+            const view = (try graph_edge_contender.decode(write.value, expected_generation)) orelse continue;
+            const expected_key = try internal_keys.graphEdgeContenderKeyAlloc(alloc, doc_key, index_name, edge_key, view.state_key);
+            defer alloc.free(expected_key);
+            // Other documents/indexes can contribute to the same logical edge.
+            if (!std.mem.eql(u8, write.key, expected_key)) continue;
+            if (overlay_count) existed_before = true;
+            if (!graphContenderStateChanged(edge_changes, view.state_key)) exists_after = true;
+        };
 
         for (edge_changes) |change| {
             const contender_key = try internal_keys.graphEdgeContenderKeyAlloc(alloc, doc_key, index_name, edge_key, change.state_key);
@@ -57305,8 +57733,6 @@ fn reconcileGraphEdgeContendersWithLifetimePolicy(
     // another. Reset the local winner projection before selecting globally.
     result.winners.deinit(alloc);
     result.winners = .{};
-    var pending = try PendingGraphContenderOverlay.init(alloc, pending_writes, pending_deletes, expected_generation);
-    defer pending.deinit(alloc);
     var global_it = changes.iterator();
     while (global_it.next()) |entry| {
         try reconcileGlobalGraphEdgeWinner(
@@ -57318,7 +57744,7 @@ fn reconcileGraphEdgeContendersWithLifetimePolicy(
             entry.key_ptr.*,
             entry.value_ptr.items,
             pending_writes,
-            &pending,
+            pending,
             &result,
             preserve_incoming_lifetimes,
         );
@@ -58120,6 +58546,12 @@ fn appendRetiredDirectGraphTtlDueDeletes(
     // table before growth can invalidate the borrowed input allocation.
     const input_deletes = try alloc.dupe([]const u8, deletes);
     defer alloc.free(input_deletes);
+    var due_writes = std.StringHashMapUnmanaged(void).empty;
+    defer due_writes.deinit(alloc);
+    for (writes) |write| try due_writes.put(alloc, write.key, {});
+    var due_deletes = std.StringHashMapUnmanaged(void).empty;
+    defer due_deletes.deinit(alloc);
+    for (owned_delete_keys.items) |key| try due_deletes.put(alloc, key, {});
     var seen = std.StringHashMapUnmanaged(void).empty;
     defer seen.deinit(alloc);
     var artifact_keys = std.ArrayListUnmanaged([]const u8).empty;
@@ -58156,11 +58588,15 @@ fn appendRetiredDirectGraphTtlDueDeletes(
         if (old_edge.ttl_created_ns == 0) continue;
         const deadline = std.math.add(u64, old_edge.ttl_created_ns, entry.ttl_duration_ns) catch std.math.maxInt(u64);
         const due_key = try graph_edge_ttl_expiration.directIndexKeyAlloc(alloc, deadline, key);
-        if (containsStoreWriteKey(writes, due_key) or containsOwnedKey(owned_delete_keys.items, due_key)) {
+        var due_key_unowned = true;
+        errdefer if (due_key_unowned) alloc.free(due_key);
+        if (due_writes.contains(due_key) or due_deletes.contains(due_key)) {
             alloc.free(due_key);
             continue;
         }
+        try due_deletes.put(alloc, due_key, {});
         try owned_delete_keys.append(alloc, due_key);
+        due_key_unowned = false;
         try store_deletes.append(alloc, due_key);
     }
     // A document delete can also retire producer contenders directly. Their
@@ -58188,11 +58624,15 @@ fn appendRetiredDirectGraphTtlDueDeletes(
         if (edge.ttl_created_ns == 0) continue;
         const deadline = std.math.add(u64, edge.ttl_created_ns, duration_ns) catch std.math.maxInt(u64);
         const due_key = try graph_edge_ttl_expiration.indexKeyAlloc(alloc, deadline, key);
-        if (containsStoreWriteKey(writes, due_key) or containsOwnedKey(owned_delete_keys.items, due_key)) {
+        var due_key_unowned = true;
+        errdefer if (due_key_unowned) alloc.free(due_key);
+        if (due_writes.contains(due_key) or due_deletes.contains(due_key)) {
             alloc.free(due_key);
             continue;
         }
+        try due_deletes.put(alloc, due_key, {});
         try owned_delete_keys.append(alloc, due_key);
+        due_key_unowned = false;
         try store_deletes.append(alloc, due_key);
     }
 }
@@ -63066,7 +63506,7 @@ const PrimaryReplicationEffect = struct {
 
     fn prepare(ctx: *const BatchExecutionContext, writes: []const docstore_mod.KVPair, deletes: []const []const u8, replay: []const u8) !@This() {
         const mirror = ctx.replication_async_effect_mirror orelse return .{};
-        if (ctx.async_context) |async_ctx| if (async_ctx.primary_replication_append_pending.load(.acquire)) return error.HAMirrorUnavailable;
+        if (ctx.async_context) |async_ctx| if (async_ctx.primary_replication_append_pending.load(.acquire)) return error.ReplicationPublisherUnavailable;
         try preflightReplicationMirrorSyncCommitContext(ctx, mirror);
         const payload = try replication_effects_mod.primary_effect.encodeAlloc(ctx.alloc, writes, deletes, replay);
         return prepareEncoded(ctx, payload);
@@ -63081,7 +63521,7 @@ const PrimaryReplicationEffect = struct {
 
     fn prepareEncoded(ctx: *const BatchExecutionContext, payload: []u8) !@This() {
         errdefer ctx.alloc.free(payload);
-        const mirror = ctx.replication_async_effect_mirror orelse return error.HAMirrorUnavailable;
+        const mirror = ctx.replication_async_effect_mirror orelse return error.ReplicationPublisherUnavailable;
         const from_lsn = mirror.publisher.nextLsn();
         const key = try durableReplicationOutboxKeyAlloc(ctx.alloc, .primary_effect, from_lsn, ctx.root_generation, payload);
         errdefer ctx.alloc.free(key);
@@ -63104,7 +63544,7 @@ const PrimaryReplicationEffect = struct {
 
     fn appendLocked(self: *const @This(), ctx: *const BatchExecutionContext) !?ReplicationDeferredCommitGate {
         const payload = self.payload orelse return null;
-        const mirror = ctx.replication_async_effect_mirror orelse return error.HAMirrorUnavailable;
+        const mirror = ctx.replication_async_effect_mirror orelse return error.ReplicationPublisherUnavailable;
         lockAtomic(ctx.log_mutex);
         defer ctx.log_mutex.*.unlock();
         // A failed append keeps the outbox, even under asynchronous policy.
@@ -63113,7 +63553,7 @@ const PrimaryReplicationEffect = struct {
             noteReplicationMirrorFailure(mirror, "primary effect", err);
             return err;
         };
-        if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+        mirror.notePublished(lsn);
         return .{ .mirror = mirror, .lsn = lsn };
     }
 
@@ -63397,9 +63837,9 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
     }
     const replay_payload = try encodeChangeRecordPayload(ctx, derived_batch, sequence);
     defer ctx.alloc.free(replay_payload);
-    var primary_ha = try PrimaryReplicationEffect.prepare(ctx, store_writes.items, delete_keys.items, replay_payload);
-    defer primary_ha.deinit(ctx.alloc);
-    try primary_ha.stage(ctx, &store_writes);
+    var primary_replication = try PrimaryReplicationEffect.prepare(ctx, store_writes.items, delete_keys.items, replay_payload);
+    defer primary_replication.deinit(ctx.alloc);
+    try primary_replication.stage(ctx, &store_writes);
     var backlog_admission = try ctx.executor.admitBacklogBytes(@intCast(replay_payload.len));
     defer backlog_admission.cancel();
     try ctx.store.putBatchWithReplay(ctx.io, store_writes.items, delete_keys.items, .{
@@ -63414,7 +63854,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
     }
     var deferred_replication_gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(ctx));
     defer deferred_replication_gates.releaseTransition();
-    deferred_replication_gates.append(try primary_ha.appendLocked(ctx));
+    deferred_replication_gates.append(try primary_replication.appendLocked(ctx));
     ctx.apply_mutex.unlockExclusive();
     apply_mutex_held = false;
     if (snapshot_mutation) |*lease| lease.release();
@@ -63422,7 +63862,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
     DB.notifyQueryVisibilityTargetAdvancedScopedContext(ctx, sequence, sync_targets);
     releaseReplicationMutationShared(&replication_mutation);
     try deferred_replication_gates.waitForDurabilityAndAuthority(ctx.replication_write_gate);
-    try primary_ha.clear(ctx);
+    try primary_replication.clear(ctx);
     try markPrecomputedEnrichmentAppliedForSyncContext(ctx, sync_level, sequence);
     try applyDerivedBacklogPressureContext(ctx, sequence, sync_level, sync_targets);
     if (ctx.executor.hasWorkers()) {
@@ -63754,11 +64194,11 @@ fn expireDirectGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: 
     derived_batch.sequence = sequence;
     const replay_payload = try encodeChangeRecordPayload(ctx, derived_batch, sequence);
     defer ctx.alloc.free(replay_payload);
-    var primary_ha = try PrimaryReplicationEffect.prepare(ctx, &.{}, &.{ candidate.artifact_key, due_key }, replay_payload);
-    defer primary_ha.deinit(ctx.alloc);
+    var primary_replication = try PrimaryReplicationEffect.prepare(ctx, &.{}, &.{ candidate.artifact_key, due_key }, replay_payload);
+    defer primary_replication.deinit(ctx.alloc);
     var primary_writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty;
     defer primary_writes.deinit(ctx.alloc);
-    try primary_ha.stage(ctx, &primary_writes);
+    try primary_replication.stage(ctx, &primary_writes);
     var backlog_admission = try ctx.executor.admitBacklogBytes(@intCast(replay_payload.len));
     defer backlog_admission.cancel();
     var guard = GraphDirectTtlCommitGuard{
@@ -63791,7 +64231,7 @@ fn expireDirectGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: 
     ctx.executor.commitBacklogAdmission(sequence, &backlog_admission);
     var deferred_replication_gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(ctx));
     defer deferred_replication_gates.releaseTransition();
-    deferred_replication_gates.append(try primary_ha.appendLocked(ctx));
+    deferred_replication_gates.append(try primary_replication.appendLocked(ctx));
     ctx.apply_mutex.unlockExclusive();
     apply_mutex_held = false;
     if (snapshot_mutation) |*lease| lease.release();
@@ -63799,7 +64239,7 @@ fn expireDirectGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: 
     DB.notifyQueryVisibilityTargetAdvancedScopedContext(ctx, sequence, sync_targets);
     releaseReplicationMutationShared(&replication_mutation);
     try deferred_replication_gates.waitForDurabilityAndAuthority(ctx.replication_write_gate);
-    try primary_ha.clear(ctx);
+    try primary_replication.clear(ctx);
     try applyDerivedBacklogPressureContext(ctx, sequence, .full_index, sync_targets);
     if (ctx.executor.hasWorkers()) {
         notifyExecutorForSyncLevelWithDenseBulkDeferral(ctx.async_context, ctx.executor, .full_index, sequence, sync_targets);
@@ -63992,12 +64432,12 @@ fn expireGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: GraphT
     derived_batch.sequence = sequence;
     const replay_payload = try encodeChangeRecordPayload(ctx, derived_batch, sequence);
     defer ctx.alloc.free(replay_payload);
-    var primary_ha = try PrimaryReplicationEffect.prepareGraphRetirement(ctx, .{ .candidate = candidate, .source_digest = source_digest }, replay_payload);
-    defer primary_ha.deinit(ctx.alloc);
+    var primary_replication = try PrimaryReplicationEffect.prepareGraphRetirement(ctx, .{ .candidate = candidate, .source_digest = source_digest }, replay_payload);
+    defer primary_replication.deinit(ctx.alloc);
     var primary_writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty;
     defer primary_writes.deinit(ctx.alloc);
     try primary_writes.appendSlice(ctx.alloc, mutation.writes.items);
-    try primary_ha.stage(ctx, &primary_writes);
+    try primary_replication.stage(ctx, &primary_writes);
     var backlog_admission = try ctx.executor.admitBacklogBytes(@intCast(replay_payload.len));
     defer backlog_admission.cancel();
     _ = ctx.store.putBatchWithPromotionsReplayAndBuiltWrite(
@@ -64020,7 +64460,7 @@ fn expireGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: GraphT
     ctx.executor.commitBacklogAdmission(sequence, &backlog_admission);
     var deferred_replication_gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(ctx));
     defer deferred_replication_gates.releaseTransition();
-    deferred_replication_gates.append(try primary_ha.appendLocked(ctx));
+    deferred_replication_gates.append(try primary_replication.appendLocked(ctx));
     ctx.apply_mutex.unlockExclusive();
     apply_mutex_held = false;
     if (snapshot_mutation) |*lease| lease.release();
@@ -64028,7 +64468,7 @@ fn expireGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: GraphT
     DB.notifyQueryVisibilityTargetAdvancedScopedContext(ctx, sequence, sync_targets);
     releaseReplicationMutationShared(&replication_mutation);
     try deferred_replication_gates.waitForDurabilityAndAuthority(ctx.replication_write_gate);
-    try primary_ha.clear(ctx);
+    try primary_replication.clear(ctx);
     try applyDerivedBacklogPressureContext(ctx, sequence, .full_index, sync_targets);
     if (ctx.executor.hasWorkers()) {
         notifyExecutorForSyncLevelWithDenseBulkDeferral(ctx.async_context, ctx.executor, .full_index, sequence, sync_targets);
@@ -64320,7 +64760,7 @@ const enforceReplicationWriteGateOptional = replication_commit.enforceReplicatio
 
 fn enforceReplicationWriteGateContext(ctx: *const BatchExecutionContext) !void {
     try enforceReplicationWriteGateOptional(ctx.replication_write_gate);
-    if (ctx.async_context) |async_ctx| if (async_ctx.primary_replication_append_pending.load(.acquire)) return error.HAMirrorUnavailable;
+    if (ctx.async_context) |async_ctx| if (async_ctx.primary_replication_append_pending.load(.acquire)) return error.ReplicationPublisherUnavailable;
 }
 
 fn enforcePortableRuntimeGateOptional(pending: ?*const std.atomic.Value(bool)) !void {
@@ -64422,7 +64862,7 @@ fn replicationTransitionMutexFromContext(ctx: *const BatchExecutionContext) ?*st
     return transition_mutex;
 }
 
-const DurableReplicationOutboxKind = durable_outbox.Kind;
+const DurableReplicationOutboxKind = @import("durable_outbox.zig").Kind;
 
 /// Finish a crash-left local outbox without appending its non-idempotent
 /// mutation twice. The transition mutex serializes this lookup-and-append with
@@ -67650,6 +68090,7 @@ fn replayPendingDerivedBatches(
         .dense_bulk_session_scope = .external,
     };
     for (managed_indexes) |index_ref| {
+        if (options.index_names.len != 0 and !containsName(options.index_names, index_ref.name)) continue;
         const applied = try self.core.loadAppliedSequence(self.alloc, index_ref.name);
         const use_dense_catch_up = index_ref.kind == .dense_vector;
         const resources = self.core.batchExecutionResources();
@@ -69801,7 +70242,7 @@ fn applyDerivedBatchToIndexContextProfiled(
     else
         null;
     defer if (graph_publication) |*lease| lease.release();
-    if (index_ref.kind == .graph and ctx.primary_replication_append_pending.load(.acquire)) return error.HAMirrorUnavailable;
+    if (index_ref.kind == .graph and ctx.primary_replication_append_pending.load(.acquire)) return error.ReplicationPublisherUnavailable;
     var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
     defer index_apply_guard.unlock();
     if (index_ref.kind == .graph) {
@@ -77144,7 +77585,7 @@ fn clearSystemMetadataFromSplitDestination(alloc: Allocator, dest_store: *docsto
     // A destination prepared from an older layout must not inherit the
     // parent's merge ownership or retired-transition fences either.
     try dest_store.putBatch(&.{}, &.{
-        internal_keys.raft_document_applied_entry_key[0..],
+        internal_keys.ordered_document_applied_entry_key[0..],
         merge_state_mod.legacy_key,
     });
 }
@@ -96315,6 +96756,335 @@ test "db rewriteEntityEdges repoints provenance edges to a merge survivor" {
         try std.testing.expectEqualStrings("doc:a", new_inbound[0].source);
         try std.testing.expectEqualStrings("person/ada_canonical", new_inbound[0].target);
     }
+    // Curation and producer ownership survive reopen and re-resolution of the
+    // unchanged extraction. No higher-priority direct contender is invented.
+    try std.testing.expectEqual(@as(usize, 0), try db.rewriteEntityEdges(alloc, "prov_graph", "person/ada_lovelace", "person/ada_canonical"));
+    db.close();
+    db = try DB.open(alloc, std.mem.span(path), .{});
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"updated\",\"relations\":{\"entities\":[{\"id\":\"e0\",\"label\":\"person\",\"text\":\"Ada Lovelace\"}]}}" }}, .sync_level = .enrichments });
+    try db.runUntilIdle();
+    {
+        const edges = try db.getEdges(alloc, "prov_graph", "person/ada_canonical", "mentions", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+        const old = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, old);
+        try std.testing.expectEqual(@as(usize, 0), old.len);
+        const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "prov_graph", "mentions", "person/ada_canonical");
+        defer alloc.free(key);
+        const prefix = try internal_keys.graphGlobalEdgeContenderEdgePrefixAlloc(alloc, "prov_graph", db.core.index_manager.graphIndex("prov_graph").?.config.coverage_generation, key);
+        defer alloc.free(prefix);
+        const contenders = try db.core.store.scanPrefix(alloc, prefix);
+        defer docstore_mod.DocStore.freeResults(alloc, contenders);
+        try std.testing.expectEqual(@as(usize, 1), contenders.len);
+        const view = (try graph_edge_contender.decode(contenders[0].value, db.core.index_manager.graphIndex("prov_graph").?.config.coverage_generation)).?;
+        try std.testing.expect(view.source_priority != graph_mod.direct_source_priority);
+    }
+    try db.batch(.{ .deletes = &.{"doc:a"}, .sync_level = .enrichments });
+    try db.runUntilIdle();
+    const retired = try db.getEdges(alloc, "prov_graph", "person/ada_canonical", "mentions", .in);
+    defer graph_mod.GraphIndex.freeEdges(alloc, retired);
+    try std.testing.expectEqual(@as(usize, 0), retired.len);
+}
+
+test "db rewriteEntityEdges preserves owners TTL and destination collisions" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |asset| {
+        var directory = try TestDirectory.init("entity-rewrite-collision");
+        defer directory.cleanup();
+        const options: OpenOptions = .{ .online_source_authority = .native, .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 } };
+        var db = try DB.open(alloc, directory.path(), options);
+        defer db.close();
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = if (asset)
+            "{\"ttl\":{\"duration\":\"1h\"},\"source\":{\"artifact\":\"relations\"},\"artifact\":{\"name\":\"relations\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"relations\"},\"content_type\":\"application/json\"}}"
+        else
+            "{\"ttl\":{\"duration\":\"1h\"}}" });
+        if (asset) {
+            try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value =
+                \\{"relations":[{"type":"links","source":"node:a","target":{"document_id":"old"},"weight":1},{"type":"links","source":"node:a","target":{"document_id":"survivor"},"weight":2}]}
+            }}, .sync_level = .enrichments });
+        } else {
+            try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{}" }}, .graph_writes = &.{
+                .{ .index_name = "g", .source = "node:a", .owner = "doc:a", .target = "old", .edge_type = "links", .weight = 1 },
+                .{ .index_name = "g", .source = "node:a", .owner = "doc:a", .target = "survivor", .edge_type = "links", .weight = 2 },
+            }, .sync_level = .full_index });
+        }
+        if (asset) try db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = "{\"relations\":[{\"type\":\"links\",\"source\":\"node:a\",\"target\":{\"document_id\":\"old\"},\"weight\":3}]}" }}, .sync_level = .enrichments });
+        try db.runUntilIdle();
+        const destination = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, "doc:a", "g", "links", "survivor", "node:a");
+        defer alloc.free(destination);
+        const before_raw = try db.core.store.get(alloc, destination);
+        defer alloc.free(before_raw);
+        var before = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, before_raw);
+        defer before.deinit(alloc);
+        try std.testing.expect(before.ttl_created_ns != 0);
+        const before_sequence = blk: {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            break :blk (try @import("../source_authority.zig").load(&read)).?.sequence;
+        };
+        try std.testing.expectEqual(@as(usize, 1), try db.rewriteEntityEdges(alloc, "g", "old", "survivor"));
+        {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqual(before_sequence + 1, (try @import("../source_authority.zig").load(&read)).?.sequence);
+        }
+        try db.runUntilIdle();
+        db.close();
+        db = try DB.open(alloc, directory.path(), options);
+        try db.runUntilIdle();
+        const after_raw = try db.core.store.get(alloc, destination);
+        defer alloc.free(after_raw);
+        var after = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, after_raw);
+        defer after.deinit(alloc);
+        try std.testing.expectEqual(before.ttl_created_ns, after.ttl_created_ns);
+        try std.testing.expectEqual(@as(f64, 2), after.weight);
+        const old = try db.getEdges(alloc, "g", "old", "links", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, old);
+        try std.testing.expectEqual(@as(usize, 0), old.len);
+        const survivor = try db.getEdges(alloc, "g", "survivor", "links", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, survivor);
+        try std.testing.expectEqual(@as(usize, 1), survivor.len);
+        try std.testing.expectEqualStrings("node:a", survivor[0].source);
+        if (asset) {
+            const count_key = try internal_keys.graphEdgeContenderCountKeyAlloc(alloc, "doc:a", "g");
+            defer alloc.free(count_key);
+            const count = try db.core.store.get(alloc, count_key);
+            defer alloc.free(count);
+            try std.testing.expectEqual(@as(?usize, 1), try graph_edge_contender.decodeVisibleCount(count, db.core.index_manager.graphIndex("g").?.config.coverage_generation));
+        }
+        try db.batch(.{ .deletes = &.{"doc:a"}, .sync_level = .enrichments });
+        try db.runUntilIdle();
+        if (asset) {
+            const remaining = try db.getEdges(alloc, "g", "survivor", "links", .in);
+            defer graph_mod.GraphIndex.freeEdges(alloc, remaining);
+            try std.testing.expectEqual(@as(usize, 1), remaining.len);
+            try db.batch(.{ .deletes = &.{"doc:b"}, .sync_level = .enrichments });
+            try db.runUntilIdle();
+        }
+        const retired = try db.getEdges(alloc, "g", "survivor", "links", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, retired);
+        try std.testing.expectEqual(@as(usize, 0), retired.len);
+    }
+}
+
+test "db rewriteEntityEdges fences stale adjacency and leaves unrelated replay pending" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("entity-rewrite-cut");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+    try db.addIndex(.{ .name = "unrelated", .kind = .graph, .config_json = "{}" });
+    try db.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "before", .target = "old", .edge_type = "links" }}, .sync_level = .full_index });
+    try db.runUntilIdle();
+    // A writer replaces the source while retaining the target. Primary state
+    // has never lacked an inbound edge, but adjacency still names `before`.
+    try db.batch(.{
+        .graph_deletes = &.{.{ .index_name = "g", .source = "before", .target = "old", .edge_type = "links" }},
+        .graph_writes = &.{
+            .{ .index_name = "g", .source = "after", .target = "old", .edge_type = "links" },
+            .{ .index_name = "unrelated", .source = "another", .target = "old", .edge_type = "links" },
+        },
+        .sync_level = .write,
+    });
+    const Admission = struct {
+        calls: usize = 0,
+        fn check(ptr: *anyopaque, owner: *DB) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (owner.core.apply_mutex.tryLockShared()) {
+                owner.core.apply_mutex.unlockShared();
+                return error.ApplyAdmissionMissing;
+            }
+            if (!owner.core.index_manager.graph_primary_publication.tryLockExclusive()) return error.PublicationAcquiredBeforeApply;
+            owner.core.index_manager.graph_primary_publication.unlockExclusive();
+            self.calls += 1;
+        }
+    };
+    var admission: Admission = .{};
+    test_entity_rewrite_apply_admitted = .{ .ctx = &admission, .call = Admission.check };
+    defer test_entity_rewrite_apply_admitted = null;
+    const unrelated_applied = try db.managedIndexAppliedSequence(alloc, "unrelated");
+    try std.testing.expectEqual(@as(usize, 1), try db.rewriteEntityEdges(alloc, "g", "old", "survivor"));
+    try std.testing.expectEqual(@as(usize, 2), admission.calls);
+    test_entity_rewrite_apply_admitted = null;
+    try std.testing.expectEqual(unrelated_applied, try db.managedIndexAppliedSequence(alloc, "unrelated"));
+    const new_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "after", "g", "links", "survivor");
+    defer alloc.free(new_key);
+    const payload = try db.core.store.get(alloc, new_key);
+    defer alloc.free(payload);
+    try db.runUntilIdle();
+    const edges = try db.getEdges(alloc, "g", "survivor", "links", .in);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("after", edges[0].source);
+}
+
+test "db rewriteEntityEdges retains scoped source replay and curation" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |chunk| {
+        var directory = try TestDirectory.init("entity-rewrite-scoped");
+        defer directory.cleanup();
+        var db = try DB.open(alloc, directory.path(), .{});
+        defer db.close();
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"source\":{\"artifact\":\"relations\",\"mention_edge_type\":\"mentions\"},\"artifact\":{\"name\":\"relations\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"relations\"},\"content_type\":\"application/json\"}}" });
+        try db.addResolver(.{ .name = "kg", .table = "entities", .source_artifact = "relations", .source_artifact_kind = if (chunk) .chunk else .asset, .resolution_artifact = "resolution", .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}", .config_generation = 1 });
+        const source_key = if (chunk) try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc:a", "relations", "page:1", 0) else try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:a", "relations", "page:1");
+        defer alloc.free(source_key);
+        const extraction = "{\"entities\":[{\"id\":\"e0\",\"label\":\"person\",\"text\":\"Ada Lovelace\"},{\"id\":\"e1\",\"label\":\"person\",\"text\":\"Ada Lovelace\"}]}";
+        // Seed the authoritative scoped resolution explicitly, through the
+        // production resolver seam. The rewrite owns already-materialized
+        // contributions; source-production scheduling is a separate contract.
+        try db.core.store.putBatch(&.{.{ .key = source_key, .value = extraction }}, &.{});
+        var artifacts: resolution_runtime_mod.DbArtifactStore(@TypeOf(db.core.store.runtime_store)) = .{ .store = &db.core.store.runtime_store, .index_manager = db.core.index_manager };
+        const outcome = (try resolution_runtime_mod.processChangedExtraction(alloc, db.core.index_manager.resolvers.items, artifacts.artifactStore(), null, source_key, null, null)).?;
+        defer alloc.free(outcome.resolution_key);
+        const initial_resolution = try db.core.store.get(alloc, outcome.resolution_key);
+        defer alloc.free(initial_resolution);
+        _ = try db.applyDocumentArtifactChildRangeBatch(.{ .artifact_writes = &.{.{ .key = outcome.resolution_key, .value = initial_resolution }}, .sync_level = .write });
+        try db.runUntilIdle();
+        const before = try db.getEdges(alloc, "g", "person/ada_lovelace", "mentions", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, before);
+        try std.testing.expectEqual(@as(usize, 1), before.len);
+        try std.testing.expectEqual(@as(usize, 1), try db.rewriteEntityEdges(alloc, "g", "person/ada_lovelace", "survivor"));
+        try db.runUntilIdle();
+        db.close();
+        db = try DB.open(alloc, directory.path(), .{});
+        try db.runUntilIdle();
+        const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, source_key, "resolution");
+        defer alloc.free(resolution_key);
+        const raw = try db.core.store.get(alloc, resolution_key);
+        defer alloc.free(raw);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+        defer parsed.deinit();
+        for (parsed.value.object.get("entities").?.array.items) |entity|
+            try std.testing.expectEqualStrings("survivor", entity.object.get("doc_ref").?.object.get("key").?.string);
+        const edges = try db.getEdges(alloc, "g", "survivor", "mentions", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+    }
+}
+
+test "db rewriteEntityEdges clears acknowledged replication outbox and retains failed acknowledgement" {
+    const alloc = std.testing.allocator;
+    const contract = @import("replication_contract.zig");
+    const FakePublisher = struct {
+        fail: bool = false,
+        barrier: *MutationBarrier,
+        published: usize = 0,
+        fn next(_: *anyopaque) u64 {
+            return 1;
+        }
+        fn identity(_: *anyopaque) contract.Publisher.Identity {
+            return .{ .table_id = 0, .shard_id = 0, .timeline_id = 1, .epoch = 1 };
+        }
+        fn publish(mirror: contract.AsyncEffectMirror, kind: @import("durable_outbox.zig").Kind, payload: []const u8, _: doc_identity.Namespace) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(mirror.publisher.ptr));
+            try std.testing.expectEqual(@import("durable_outbox.zig").Kind.primary_effect, kind);
+            try std.testing.expect(replication_effects_mod.primary_effect.isPrimaryEffect(payload));
+            self.published += 1;
+            return 1;
+        }
+        fn recover(_: contract.AsyncEffectMirror, _: @import("durable_outbox.zig").Kind, _: @import("durable_outbox.zig").DurableReplicationOutbox, _: doc_identity.Namespace) !u64 {
+            return error.UnexpectedRecovery;
+        }
+        fn preflight(_: contract.AsyncEffectMirror, _: bool) !void {}
+        fn complete(mirror: contract.AsyncEffectMirror, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(mirror.publisher.ptr));
+            // A replacement seed must freeze the local commit/tail pair
+            // before remote recovery can acknowledge this mutation.
+            var capture = self.barrier.tryAcquireExclusive() orelse return error.CheckpointCaptureBlockedByCompletionWait;
+            capture.release();
+            if (self.fail) return error.TestAcknowledgementFailed;
+        }
+        fn publisher(self: *@This()) contract.Publisher {
+            return .{ .ptr = self, .vtable = &.{ .next_lsn = next, .identity = identity, .publish = publish, .recover = recover, .preflight = preflight, .complete = complete } };
+        }
+    };
+    for ([_]bool{ false, true }) |fail| {
+        var directory = try TestDirectory.init("entity-rewrite-ha");
+        defer directory.cleanup();
+        var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+        try db.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "doc:a", .target = "old", .edge_type = "links" }}, .sync_level = .full_index });
+        var barrier: MutationBarrier = .{};
+        var publisher: FakePublisher = .{ .fail = fail, .barrier = &barrier };
+        // A coarse batch publisher cannot represent the exact artifact and
+        // producer-ownership changes. Reject before mutating or publishing.
+        db.local_execution.replication_async_batch_mirror = .{ .publisher = publisher.publisher() };
+        try std.testing.expectError(error.ReplicationPublisherUnavailable, db.rewriteEntityEdges(alloc, "g", "old", "survivor"));
+        try std.testing.expectEqual(@as(usize, 0), publisher.published);
+        {
+            const unchanged = try db.getEdges(alloc, "g", "old", "links", .in);
+            defer graph_mod.GraphIndex.freeEdges(alloc, unchanged);
+            try std.testing.expectEqual(@as(usize, 1), unchanged.len);
+            var pending = try durable_outbox_store.readPending(alloc, db.core.store);
+            defer pending.deinit(alloc);
+            try std.testing.expect(pending.isEmpty());
+        }
+        db.local_execution.replication_async_batch_mirror = null;
+        db.local_execution.replication_async_effect_mirror = .{ .publisher = publisher.publisher(), .mutation_barrier = &barrier };
+        if (fail) try std.testing.expectError(error.TestAcknowledgementFailed, db.rewriteEntityEdges(alloc, "g", "old", "survivor")) else try std.testing.expectEqual(@as(usize, 1), try db.rewriteEntityEdges(alloc, "g", "old", "survivor"));
+        try std.testing.expectEqual(@as(usize, 1), publisher.published);
+        var pending = try durable_outbox_store.readPending(alloc, db.core.store);
+        defer pending.deinit(alloc);
+        try std.testing.expectEqual(!fail, pending.isEmpty());
+        // Avoid recovery through a fixture publisher after its lifetime ends.
+        db.local_execution.replication_async_effect_mirror = null;
+        if (!fail) {
+            db.close();
+            db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+            try db.batch(.{ .writes = &.{.{ .key = "still-writable", .value = "{}" }}, .sync_level = .write });
+        }
+    }
+}
+
+test "db rewriteEntityEdges indexes a multi-owner mutation in linear work" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("entity-rewrite-many-owners");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"ttl\":{\"duration\":\"1h\"},\"source\":{\"artifact\":\"relations\"},\"artifact\":{\"name\":\"relations\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"relations\"},\"content_type\":\"application/json\"}}" });
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const owner_count = 64;
+    var documents: [owner_count]types.BatchWrite = undefined;
+    var owners: [owner_count][]const u8 = undefined;
+    for (&documents, &owners, 0..) |*document, *owner, i| {
+        owner.* = try std.fmt.allocPrint(scratch, "doc:{d}", .{i});
+        document.* = .{ .key = owner.*, .value = "{\"relations\":[{\"type\":\"links\",\"target\":{\"document_id\":\"old\"}}]}" };
+    }
+    try db.batch(.{ .writes = &documents, .sync_level = .enrichments });
+    try db.runUntilIdle();
+    var examined: usize = 0;
+    test_graph_overlay_examined = &examined;
+    defer test_graph_overlay_examined = null;
+    try std.testing.expectEqual(@as(usize, owner_count), try db.rewriteEntityEdges(alloc, "g", "old", "survivor"));
+    test_graph_overlay_examined = null;
+    // Rebuilding the accumulated overlay per owner exceeds this linear bound.
+    try std.testing.expect(examined >= owner_count);
+    try std.testing.expect(examined <= owner_count * 32);
+    try db.runUntilIdle();
+    const edges = try db.getEdges(alloc, "g", "survivor", "links", .in);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, owner_count), edges.len);
+    try db.batch(.{ .deletes = &owners, .sync_level = .write });
+    try db.runUntilIdle();
+    const retired = try db.getEdges(alloc, "g", "survivor", "links", .in);
+    defer graph_mod.GraphIndex.freeEdges(alloc, retired);
+    try std.testing.expectEqual(@as(usize, 0), retired.len);
+}
+
+test "db rewriteEntityEdges rejects unpositioned Raft curation" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("entity-rewrite-raft-fence");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .online_source_authority = .raft, .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 } });
+    defer db.close();
+    try std.testing.expectError(error.OnlineSourceScopeChanged, db.rewriteEntityEdges(alloc, "g", "old", "survivor"));
 }
 
 test "db complete-snapshot scope expands graph traversal through tagged entity nodes" {
@@ -131028,8 +131798,17 @@ test "db graph untimed migration restores source order and direct contributor pr
     try std.testing.expectEqual(@as(f64, 4), direct[0].weight);
     try std.testing.expectEqual(@as(u64, 0), direct[0].winner_rank);
     try db.batch(.{ .graph_deletes = &.{.{ .index_name = "relations_graph", .source = "doc:a", .target = "doc:b", .edge_type = "mentions" }}, .sync_level = .full_index });
+    // Explicit relationship deletion retires the complete assertion, including
+    // retained source inputs. Only a later owner lifecycle may revive it.
+    const retired = try db.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, retired);
+    try std.testing.expectEqual(@as(usize, 0), retired.len);
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value =
+        \\{"primary_relations":{"type":"mentions","target":{"document_id":"doc:b"},"weight":5},"fallback_relations":{"type":"mentions","target":{"document_id":"doc:b"},"weight":3},"revived":true}
+    }}, .sync_level = .full_index });
     const restored = try db.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
     defer graph_mod.GraphIndex.freeEdges(alloc, restored);
+    try std.testing.expectEqual(@as(usize, 1), restored.len);
     try std.testing.expectEqual(@as(f64, 5), restored[0].weight);
     try std.testing.expectEqual(@as(u64, 1), restored[0].winner_rank);
     const due = try db.core.store.scanPrefix(alloc, &internal_keys.graph_edge_expiration_index_prefix);
@@ -131110,10 +131889,17 @@ test "db graph untimed migration restores source order and direct contributor pr
             defer graph_mod.GraphIndex.freeEdges(alloc, direct);
             try std.testing.expectEqual(@as(f64, 4), direct[0].weight);
             try db.batch(.{ .graph_deletes = &.{.{ .index_name = "g", .source = "doc:a", .target = "doc:b", .edge_type = "mentions" }}, .sync_level = .full_index });
-            const fallback = try db.getEdges(alloc, "g", "doc:a", "mentions", .out);
-            defer graph_mod.GraphIndex.freeEdges(alloc, fallback);
-            try std.testing.expectEqual(@as(f64, 5), fallback[0].weight);
-            try std.testing.expectEqual(@as(u64, 1), fallback[0].winner_rank);
+            const retired = try db.getEdges(alloc, "g", "doc:a", "mentions", .out);
+            defer graph_mod.GraphIndex.freeEdges(alloc, retired);
+            try std.testing.expectEqual(@as(usize, 0), retired.len);
+            // Historical direct-contributor migration preserves deletion
+            // authority too; a new owner lifecycle can replay its asset input.
+            try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"relations\":{\"type\":\"mentions\",\"target\":{\"document_id\":\"doc:b\"},\"weight\":5},\"revived\":true}" }}, .sync_level = .full_index });
+            const revived = try db.getEdges(alloc, "g", "doc:a", "mentions", .out);
+            defer graph_mod.GraphIndex.freeEdges(alloc, revived);
+            try std.testing.expectEqual(@as(usize, 1), revived.len);
+            try std.testing.expectEqual(@as(f64, 5), revived[0].weight);
+            try std.testing.expectEqual(@as(u64, 1), revived[0].winner_rank);
             try db.batch(.{ .graph_deletes = &.{.{ .index_name = "g", .source = "doc:c", .target = "doc:b", .edge_type = "mentions" }}, .sync_level = .full_index });
             const deleted = try db.getEdges(alloc, "g", "doc:c", "mentions", .out);
             defer graph_mod.GraphIndex.freeEdges(alloc, deleted);
@@ -131796,8 +132582,9 @@ test "db graph ttl direct contribution yields to surviving asset source" {
     }}, .sync_level = .full_index });
     const restored = try db.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
     defer graph_mod.GraphIndex.freeEdges(alloc, restored);
-    try std.testing.expectEqual(@as(usize, 1), restored.len);
-    try std.testing.expectEqual(@as(f64, 2), restored[0].weight);
+    // Expiration withdrew only the direct source above. The later explicit
+    // relationship deletion also suppresses the retained asset assertion.
+    try std.testing.expectEqual(@as(usize, 0), restored.len);
     const generation = db.core.index_manager.graphIndex("relations_graph").?.config.coverage_generation;
     const edge_key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:b", "doc:a");
     defer alloc.free(edge_key);
@@ -134549,7 +135336,7 @@ fn testChildGenerationInstall(native: bool) !void {
             .schema_json_digest = next_json_digest,
             .before_catalog_digest = before_catalog_digest,
             .after_catalog_digest = after_catalog_digest,
-            .raft_entry = .{ .term = 1, .index = if (native) 5 else 1 },
+            .ordered_receipt = .{ .term = 1, .index = if (native) 5 else 1 },
             .native = native,
         };
         for (0..2) |_| {
@@ -150346,7 +151133,7 @@ test "db ordered artifact inventory chunk reconstruction resumes bounded pages a
         var marker: [16]u8 = undefined;
         std.mem.writeInt(u64, marker[0..8], 1, .little);
         std.mem.writeInt(u64, marker[8..16], 1, .little);
-        try txn.put(&internal_keys.raft_document_applied_entry_key, &marker);
+        try txn.put(&internal_keys.ordered_document_applied_entry_key, &marker);
         try txn.commit();
     }
     try std.testing.expectError(error.EnrichmentSourceChanged, reconstruction.prepare(alloc, db.core.store, scope, checkpoint, .{}));
@@ -150366,7 +151153,7 @@ test "db ordered artifact inventory chunk reconstruction resumes bounded pages a
         var marker: [16]u8 = undefined;
         std.mem.writeInt(u64, marker[0..8], 1, .little);
         std.mem.writeInt(u64, marker[8..16], 2, .little);
-        try txn.put(&internal_keys.raft_document_applied_entry_key, &marker);
+        try txn.put(&internal_keys.ordered_document_applied_entry_key, &marker);
         try txn.commit();
     }
     try std.testing.expectError(error.OnlineMergeArtifactTailsUnsupported, reconstruction.prepare(alloc, db.core.store, other_scope, null, .{}));
@@ -150925,7 +151712,7 @@ test "db graph endpoint cleanup pages are replicated bounded and restartable" {
         try std.testing.expectError(error.StorageBusy, portable_backup.exportPortable(alloc, db.core.store, &archive));
         var reply = (try db.lookup(alloc, "", .{ .relational_topology_json = "{\"mode\":\"graph_endpoint_cleanup\"}" })).?;
         defer reply.deinit(alloc);
-        var plan = try std.json.parseFromSlice(struct { pending: bool, guards: []const @import("../graph_cleanup_contract.zig").Guard, graph_deletes: []const types.GraphEdgeDelete, deletes: []const []const u8 }, alloc, reply.json, .{});
+        var plan = try std.json.parseFromSlice(types.GraphEndpointCleanupStatus, alloc, reply.json, .{});
         defer plan.deinit();
         try std.testing.expect(plan.value.pending);
         try std.testing.expectEqual(@as(usize, 256), plan.value.graph_deletes.len);
@@ -151914,4 +152701,69 @@ test "db graph owner revival retained input replay cannot overwrite a newer inpu
         sequence += 1;
     }
     try std.testing.expect(!try db.core.store.hasGraphEndpointCleanup());
+}
+
+test "db graph cleanup lookup carries and applies owner replay afterimages" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("fresh-owner-wire");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+    const contract = @import("../graph_cleanup_contract.zig");
+    const key = try contract.ownerJobKeyAlloc(alloc, "owner");
+    defer alloc.free(key);
+    const value = try contract.encodeOwnerJobAlloc(alloc, .{ .owner = "owner", .generation = 7, .phase = .inputs });
+    defer alloc.free(value);
+    try db.core.store.put(key, value);
+    var page = (try db.prepareGraphEndpointCleanupBatch(alloc)).?;
+    defer page.deinit();
+    try std.testing.expect(page.request().merge_artifacts.len > 0);
+    var response = (try db.lookupRelationalTopology(alloc, "{\"mode\":\"graph_endpoint_cleanup\"}", .{})).?;
+    defer response.deinit(alloc);
+    var parsed = try std.json.parseFromSlice(types.GraphEndpointCleanupStatus, alloc, response.json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(page.replay_writes.len, parsed.value.merge_artifacts.len);
+    const req = parsed.value.request();
+    try types.validateGraphEndpointCleanupCommand(req);
+    for (page.replay_writes, req.merge_artifacts) |expected, actual| {
+        try std.testing.expectEqualSlices(u8, expected.key, actual.key);
+        try std.testing.expectEqualSlices(u8, expected.value, actual.value);
+    }
+    try db.batch(req);
+    const advanced = try db.core.store.get(alloc, key);
+    defer alloc.free(advanced);
+    try std.testing.expectEqual(contract.OwnerPhase.chunks, (try contract.decodeOwnerJob(key, advanced)).phase);
+    // Duplicate ordered maintenance pages cannot roll back a newer checkpoint.
+    try db.batch(req);
+    const replayed = try db.core.store.get(alloc, key);
+    defer alloc.free(replayed);
+    try std.testing.expectEqualSlices(u8, advanced, replayed);
+}
+
+test "db rewriteEntityEdges preserves explicit fact identities after local replication boundary merge" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("entity-rewrite-fact-ids");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+    try db.batch(.{ .graph_writes = &.{
+        .{ .index_name = "g", .source = "a", .target = "old", .edge_type = "R", .edge_id = "one", .owner_document = "fact:one", .weight = 2 },
+        .{ .index_name = "g", .source = "a", .target = "old", .edge_type = "R", .edge_id = "two", .owner_document = "fact:two", .weight = 3 },
+    }, .sync_level = .full_index });
+    try std.testing.expectEqual(@as(usize, 2), try db.rewriteEntityEdges(alloc, "g", "old", "new"));
+    try db.runUntilIdle();
+    const edges = try db.getEdges(alloc, "g", "new", "R", .in);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 2), edges.len);
+    for (edges) |edge| {
+        try std.testing.expect(edge.edge_id.len != 0);
+        try std.testing.expect(edge.owner_document.len != 0);
+    }
+    try db.batch(.{ .deletes = &.{"fact:one"}, .sync_level = .full_index });
+    const survivor = try db.getEdges(alloc, "g", "new", "R", .in);
+    defer graph_mod.GraphIndex.freeEdges(alloc, survivor);
+    try std.testing.expectEqual(@as(usize, 1), survivor.len);
+    try std.testing.expectEqualStrings("two", survivor[0].edge_id);
 }

@@ -255,6 +255,17 @@ fn consumerTests() type {
             defer decoded.deinit(std.testing.allocator);
             try std.testing.expectEqual(timestamp_protocol_version, decoded.protocol_barrier_version.?);
             try std.testing.expectEqual(@as(usize, 0), decoded.batch.req.writes.len);
+
+            // Feature activation versions are persisted independently of the
+            // latest advertised decoder version. Keep older barriers readable
+            // as new features advance that maximum.
+            for ([_]u16{ artifact_catalog_protocol_version, merge_proof_adoption_protocol_version, protocol_version }) |version| {
+                const barrier = try encodeProtocolBarrier(std.testing.allocator, "docs", version);
+                defer std.testing.allocator.free(barrier);
+                var feature = try decode(std.testing.allocator, barrier);
+                defer feature.deinit(std.testing.allocator);
+                try std.testing.expectEqual(version, feature.protocol_barrier_version.?);
+            }
         }
 
         test "raft protocol barrier rejects unsupported future versions" {
@@ -555,4 +566,28 @@ fn consumerTests() type {
 }
 comptime {
     if (@import("builtin").is_test) _ = consumer_tests;
+}
+
+test "raft batch round trips guarded graph owner replay afterimages" {
+    const alloc = std.testing.allocator;
+    const contract = @import("../storage/graph_cleanup_contract.zig");
+    const key = try contract.ownerJobKeyAlloc(alloc, "owner\x00\xff");
+    defer alloc.free(key);
+    const old = try contract.encodeOwnerJobAlloc(alloc, .{ .owner = "owner\x00\xff", .generation = 7 });
+    defer alloc.free(old);
+    const next = try contract.encodeOwnerJobAlloc(alloc, .{ .owner = "owner\x00\xff", .generation = 7, .phase = .inputs });
+    defer alloc.free(next);
+    const req: db_mod.types.BatchRequest = .{
+        .graph_endpoint_cleanup = true,
+        .graph_endpoint_cleanup_planned = true,
+        .graph_endpoint_cleanup_guards = &.{.{ .endpoint = "owner\x00\xff", .generation = 7, .kind = .owner_replay, .checkpoint_digest = contract.checkpointDigest(old) }},
+        .merge_artifacts = &.{.{ .key = key, .value = next }},
+    };
+    const bytes = try encode(alloc, "docs", req);
+    defer alloc.free(bytes);
+    var decoded = try decode(alloc, bytes);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, next, decoded.batch.req.merge_artifacts[0].value);
+    try std.testing.expectEqualSlices(u8, key, decoded.batch.req.merge_artifacts[0].key);
+    try db_mod.types.validateGraphEndpointCleanupCommand(decoded.batch.req);
 }

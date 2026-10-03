@@ -102,7 +102,7 @@ pub const MemoryLimitSource = provisioned_storage.MemoryLimitSource;
 pub const ProvisionedTableReadCache = table_reads.ProvisionedTableReadCache;
 pub const ProvisionedTableReadSource = table_reads.ProvisionedTableReadSource;
 pub const GroupVisibleRootGenerationSource = table_reads.GroupVisibleRootGenerationSource;
-pub const HAReadGate = table_reads.HAReadGate;
+pub const HotStandbyReadGate = table_reads.HotStandbyReadGate;
 pub const backend_current_root_generation = table_reads.backend_current_root_generation;
 pub const HostedProvisionedTableReadSource = table_reads.HostedProvisionedTableReadSource;
 pub const DistributedCandidateSource = distributed_candidate_source.DistributedCandidateSource;
@@ -241,6 +241,7 @@ test "join inequality: incomparable types return 0" {
 }
 
 test "api module compiles" {
+    _ = @import("online_merge_io.zig");
     _ = @import("sql_truncate.zig");
     _ = @import("sql_policy_ddl.zig");
     _ = sql_execution;

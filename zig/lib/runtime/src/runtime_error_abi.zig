@@ -824,7 +824,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.IntentConflict => status(.conflict, .intent_conflict),
         error.VersionConflict => status(.conflict, .version_conflict),
         error.MergePageRequired => status(.conflict, .merge_page_required),
-        error.InvalidResponse => status(.internal, .invalid_response),
+        error.InvalidResponse, error.UnexpectedEof => status(.internal, .invalid_response),
         error.TransitionOperationsRetired => status(.retryable, .transition_operations_retired),
         error.TransitionOperationBusy => status(.retryable, .transition_operation_busy),
         error.UnknownSplitRuntime => status(.not_found, .unknown_split_runtime),
@@ -866,7 +866,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.RetainedEffectsIdentityRequired => status(.conflict, .retained_effects_identity_required),
         error.RetainedEffectsNamespaceMismatch => status(.conflict, .retained_effects_namespace_mismatch),
         error.BackendRuntimeIoUnavailable => status(.unavailable, .backend_runtime_io_unavailable),
-        error.CorruptRaftAppliedEntry => status(.corrupt, .corrupt_raft_applied_entry),
+        error.CorruptRaftAppliedEntry, error.CorruptOrderedApplyReceipt => status(.corrupt, .corrupt_raft_applied_entry),
         error.UnknownSchemaVersion => status(.conflict, .unknown_schema_version),
         error.MetadataHABindingBusy => status(.retryable, .metadata_ha_binding_busy),
         error.MetadataHAOutboxPending => status(.retryable, .metadata_ha_outbox_pending),
@@ -2043,6 +2043,7 @@ test "stable status preserves deterministic raft rejection and malformed respons
     // A malformed response is not proof that a mutation failed to commit.
     // Preserve its identity without granting automatic retry authority.
     const malformed = statusFromError(error.InvalidResponse);
+    try std.testing.expectEqualDeep(malformed, statusFromError(error.UnexpectedEof));
     try std.testing.expectEqual(@intFromEnum(Code.internal), malformed.code);
     try std.testing.expectEqual(error.InvalidResponse, errorFromStatus(malformed));
 }
@@ -2252,4 +2253,11 @@ test "online merge admission barrier preserves exact identity across runtime arc
     const err = error.OnlineMergeArtifactCatalogUncoordinated;
     try std.testing.expect(errorHasStableDetail(err));
     try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+}
+
+test "ordered receipt corruption preserves the released runtime status" {
+    const old = statusFromError(error.CorruptRaftAppliedEntry);
+    const renamed = statusFromError(error.CorruptOrderedApplyReceipt);
+    try std.testing.expectEqual(old, renamed);
+    try std.testing.expectEqual(error.CorruptRaftAppliedEntry, errorFromStatus(renamed));
 }

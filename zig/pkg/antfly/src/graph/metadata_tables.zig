@@ -140,10 +140,18 @@ pub fn adjacent(scratch: *Scratch, edge: anytype, current_key: []const u8, curre
     const source_table = (try scratch.table(edge.metadata, "source_table")) orelse index_table;
     const target_table = (try scratch.table(edge.metadata, "target_table")) orelse index_table;
     const here = current_table orelse index_table;
-    // Legacy callers without a table context retain their key-only contract.
-    // Qualified callers must match the departing endpoint, not just its key.
-    const at_source = std.mem.eql(u8, current_key, edge.source) and (here == null or optionalTableEql(here, source_table));
-    const at_target = std.mem.eql(u8, current_key, edge.target) and (here == null or optionalTableEql(here, target_table));
+    return adjacentResolved(edge, current_key, here, source_table, target_table, requested, here != null);
+}
+
+/// MATCH canonicalizes its anonymous local table before comparing identities.
+/// Here null is a real namespace, rather than the legacy key-only wildcard.
+pub fn adjacentInTables(edge: anytype, current_key: []const u8, current_table: ?[]const u8, source_table: ?[]const u8, target_table: ?[]const u8, requested: graph.EdgeDirection) Endpoint {
+    return adjacentResolved(edge, current_key, current_table, source_table, target_table, requested, true);
+}
+
+fn adjacentResolved(edge: anytype, current_key: []const u8, here: ?[]const u8, source_table: ?[]const u8, target_table: ?[]const u8, requested: graph.EdgeDirection, qualified: bool) Endpoint {
+    const at_source = std.mem.eql(u8, current_key, edge.source) and (!qualified or optionalTableEql(here, source_table));
+    const at_target = std.mem.eql(u8, current_key, edge.target) and (!qualified or optionalTableEql(here, target_table));
     const connected = switch (requested) {
         .out => at_source,
         .in => at_target,

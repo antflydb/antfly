@@ -132,7 +132,7 @@ pub const replication_applied_lsn_key = [_]u8{ replay_namespace, 0xff, 0x04 };
 /// Latest document-store mutation applied from the local data Raft log. The
 /// value stores term/index and is committed in the same primary batch as the
 /// document effects so restart replay cannot repeat non-idempotent transforms.
-pub const raft_document_applied_entry_key = [_]u8{ replay_namespace, 0xff, 0x05 };
+pub const ordered_document_applied_entry_key = [_]u8{ replay_namespace, 0xff, 0x05 };
 pub const artifact_presence_key = [_]u8{ replay_namespace, 0xff, 0x20 };
 pub const asset_artifact_source_index_kind: u8 = 0x21;
 pub const document_child_range_outbox_kind: u8 = 0x22;
@@ -2020,6 +2020,14 @@ pub fn isGraphEdgeContenderKey(key: []const u8) bool {
     return state_term + 2 == key.len;
 }
 
+/// Only membership rows carry a GEC1 contender, unlike count and TTL rows.
+pub fn isGraphEdgeContenderMembershipKey(key: []const u8) bool {
+    if (!isGraphEdgeContenderKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1).?;
+    const index_term = findComponentTerminator(key, doc_term + 3).?;
+    return key[index_term + 2] == graph_edge_contender_record_kind;
+}
+
 pub fn isGraphEdgeTtlLifetimeKey(key: []const u8) bool {
     if (!isGraphEdgeContenderKey(key)) return false;
     const doc_term = findComponentTerminator(key, 1) orelse return false;
@@ -3084,6 +3092,9 @@ test "graph edge contender keys are edge and state scoped" {
     const count_key = try graphEdgeContenderCountKeyAlloc(alloc, "doc:a", "gr_v1");
     defer alloc.free(count_key);
     try std.testing.expect(isGraphEdgeContenderKey(count_key));
+    try std.testing.expect(!isGraphEdgeContenderMembershipKey(count_key));
+    try std.testing.expect(isGraphEdgeContenderMembershipKey(key));
+    try std.testing.expect(!isGraphEdgeContenderMembershipKey("invalid"));
 }
 
 test "global graph contender keys are generation fenced and priority ordered" {

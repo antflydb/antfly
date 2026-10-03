@@ -1666,16 +1666,20 @@ fn resolvedEdgeEndpoint(
     graph_edge: graph_mod.Edge,
     traversal: PhysicalEdgeTraversal,
 ) !@import("metadata_tables.zig").Endpoint {
+    // Incoming adjacency was read from the declared source route. Its table
+    // supplies missing metadata; explicit endpoint tags remain authoritative.
+    const index_table = if (traversal.incoming_source) |route| route.table else current_table;
     const physical_table = if (comptime @hasDecl(@TypeOf(edge_reader), "routingIndexTable"))
-        edge_reader.routingIndexTable(current_table)
+        edge_reader.routingIndexTable(index_table)
+    else
+        index_table;
+    const source_table = canonicalizeNodeTable(edge_reader, (try scratch.table(graph_edge.metadata, "source_table")) orelse physical_table);
+    const target_table = canonicalizeNodeTable(edge_reader, (try scratch.table(graph_edge.metadata, "target_table")) orelse physical_table);
+    const current_namespace = if (comptime @hasDecl(@TypeOf(edge_reader), "routingIndexTable"))
+        current_table orelse edge_reader.routingIndexTable(current_table)
     else
         current_table;
-    var endpoint = try traversal_mod.resolveAdjacent(scratch, graph_edge, current_key, current_table, physical_table, traversal.step.direction);
-    if (traversal.incoming_source) |route| {
-        if (traversal.step.direction == .in) endpoint.table = route.table;
-    }
-    endpoint.table = canonicalizeNodeTable(edge_reader, endpoint.table);
-    return endpoint;
+    return @import("metadata_tables.zig").adjacentInTables(graph_edge, current_key, canonicalizeNodeTable(edge_reader, current_namespace), source_table, target_table, traversal.step.direction);
 }
 
 fn declaredNodeTableMatches(edge_reader: anytype, actual: ?[]const u8, declared: ?[]const u8) bool {
@@ -5641,5 +5645,77 @@ test "qualified MATCH rejects wrong departing table in every direction" {
         const matches = try matchPatternFromRefsWithEdgeReader(alloc, LocalGraphIndexEdgeReader.init(&graph, opts), &.{.{ .table = "companies", .key = "shared" }}, &.{ .{ .alias = "a" }, .{ .alias = "b", .edge = .{ .direction = direction } } }, opts);
         defer freeMatches(alloc, matches);
         try std.testing.expectEqual(@as(usize, 0), matches.len);
+    }
+}
+
+test "conjunctive reverse expansion honors explicit source tags from the incoming index route" {
+    const alloc = std.testing.allocator;
+    const Reader = struct {
+        metadata: []const u8,
+        pub fn routingIndexTable(_: @This(), table: ?[]const u8) ?[]const u8 {
+            return table orelse "docs";
+        }
+
+        pub fn canonicalizeTable(_: @This(), table: ?[]const u8) ?[]const u8 {
+            if (table) |name| if (std.mem.eql(u8, name, "docs")) return null;
+            return table;
+        }
+
+        pub fn getEdgesBoundedForPattern(
+            self: @This(),
+            a: Allocator,
+            table: ?[]const u8,
+            key: []const u8,
+            _: []const []const u8,
+            direction: graph_mod.EdgeDirection,
+            _: usize,
+            _: usize,
+            source_table_declared: bool,
+        ) ![]graph_mod.Edge {
+            const out = try a.alloc(graph_mod.Edge, 1);
+            if (std.mem.eql(u8, key, "author")) {
+                try std.testing.expect(table == null);
+                try std.testing.expectEqual(graph_mod.EdgeDirection.out, direction);
+                out[0] = .{ .source = "author", .target = "post", .edge_type = "AUTHORED", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" };
+                return out;
+            }
+            try std.testing.expectEqualStrings("post", key);
+            try std.testing.expectEqualStrings("entities", table.?);
+            try std.testing.expectEqual(graph_mod.EdgeDirection.in, direction);
+            try std.testing.expect(source_table_declared);
+            out[0] = .{ .source = "reply", .target = "post", .edge_type = "REPLIES_TO", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = self.metadata };
+            return out;
+        }
+
+        pub fn freeEdges(_: @This(), a: Allocator, edges: []graph_mod.Edge) void {
+            a.free(edges);
+        }
+    };
+
+    const nodes = [_]MatchNode{
+        .{ .alias = "author" },
+        .{ .alias = "post" },
+        .{ .alias = "reply", .table = "entities" },
+    };
+    const edges = [_]MatchEdge{
+        .{ .from = "author", .to = "post", .step = .{ .types = &.{"AUTHORED"} } },
+        .{ .from = "reply", .to = "post", .step = .{ .types = &.{"REPLIES_TO"} } },
+    };
+    for ([_]struct { metadata: []const u8, count: usize }{
+        .{ .metadata = "{\"target_table\":\"docs\"}", .count = 1 },
+        .{ .metadata = "{\"source_table\":\"entities\",\"target_table\":\"docs\"}", .count = 1 },
+        .{ .metadata = "{\"source_table\":\"foreign\",\"target_table\":\"docs\"}", .count = 0 },
+        .{ .metadata = "{\"source_table\":\"docs\",\"target_table\":\"docs\"}", .count = 0 },
+    }) |case| {
+        const matches = try matchConjunctivePatternWithEdgeReader(
+            alloc,
+            Reader{ .metadata = case.metadata },
+            &.{"author"},
+            .{ .anchor_alias = "author", .nodes = &nodes, .edges = &edges },
+            .{ .max_results = 0, .return_aliases = &.{"reply"} },
+        );
+        defer freeMatches(alloc, matches);
+        try std.testing.expectEqual(case.count, matches.len);
+        if (matches.len != 0) try std.testing.expectEqualStrings("entities", matches[0].bindings[0].table.?);
     }
 }

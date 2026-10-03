@@ -31700,7 +31700,7 @@ test "ordered artifact inventory unit chunk callback reconstructs publishes and 
             var marker: [16]u8 = undefined;
             std.mem.writeInt(u64, marker[0..8], 1, .little);
             std.mem.writeInt(u64, marker[8..16], index, .little);
-            try txn.put(&internal_keys.raft_document_applied_entry_key, &marker);
+            try txn.put(&internal_keys.ordered_document_applied_entry_key, &marker);
             try txn.commit();
         }
         fn apply(self: *@This(), db: *db_mod.DB, index: u64) !void {
@@ -31986,7 +31986,7 @@ test "ordered artifact inventory chunk callback waits for acceptance and atomica
     var marker: [16]u8 = undefined;
     std.mem.writeInt(u64, marker[0..8], 1, .little);
     std.mem.writeInt(u64, marker[8..16], 11, .little);
-    try db.core.store.putBatch(&.{ .{ .key = manifest_key, .value = &empty }, .{ .key = &internal_keys.raft_document_applied_entry_key, .value = &marker } }, &.{});
+    try db.core.store.putBatch(&.{ .{ .key = manifest_key, .value = &empty }, .{ .key = &internal_keys.ordered_document_applied_entry_key, .value = &marker } }, &.{});
     var read = try db.core.store.beginReadTxn();
     defer read.abort();
     try std.testing.expectError(error.EnrichmentSourceChanged, previous.?.requireCurrent(&read, db.root_incarnation));
@@ -32728,6 +32728,16 @@ fn testOrderedAssetLifecycle(generated: bool, graph: bool, delete_live: bool) !v
             if (!deleted) {
                 try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .timestamp_ns = 101 }, .{ .term = 1, .index = pass * entries_per_pass + 3 });
             } else try server_test_adapter.applyOrdered(&db, .{ .deletes = &.{"doc"}, .timestamp_ns = 102 }, .{ .term = 1, .index = pass * entries_per_pass + 3 });
+            if (graph and deleted) {
+                const count_key = try internal_keys.graphEdgeContenderCountKeyAlloc(alloc, "doc", "g");
+                defer alloc.free(count_key);
+                const count = db.core.store.get(alloc, count_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                defer if (count) |value| alloc.free(value);
+                if (count) |value| try std.testing.expectEqual(@as(?usize, 0), try graph_edge_contender.decodeVisibleCount(value, db.core.index_manager.graphIndex("g").?.config.coverage_generation));
+            }
             // The old upstream bytes still exist, but their proof refers to
             // the old primary. No downstream provider may consume them.
             if (!deleted) try std.testing.expectError(error.EnrichmentSourceChanged, processAsset(runtime, downstream, &batch, &prepared_sources, &window, &scope));

@@ -988,7 +988,6 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = optimize,
     });
     inference_runtime_paths_mod.addImport("antfly_platform", platform_mod);
-    inference_runtime_paths_mod.addImport("inference_server", inference_server_mod);
     const inference_query_embedding_cache_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/inference/providers/query_embedding_cache.zig"),
         .target = target,
@@ -1155,6 +1154,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .platform_target = target,
         .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
     };
+    antfly_imports.configureRuntimeContracts(usermgr_mod);
     // SQL shape fixtures reach native schema and storage contracts, but do not
     // need the inference/API module graph of a full storage owner.
     antfly_imports.storage_boundary.configureSources(sql_test_mod, false, false);
@@ -1621,6 +1621,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_lib_ha_compat_tests = owner_tests.run_lib_ha_compat_tests;
     const antfly_test_step = owner_tests.antfly_test_step;
     const unit_test_step = owner_tests.unit_test_step;
+    unit_test_step.dependOn(&b.addRunArtifact(openapi_docs_test).step);
     unit_test_step.dependOn(&run_sql_tests.step);
     unit_test_step.dependOn(&run_pgwire_tests.step);
     unit_test_step.dependOn(&pdf_integration.run.step);
@@ -1801,9 +1802,11 @@ pub fn create(b: *std.Build) ?Artifacts {
         .target = target,
         .optimize = optimize,
     }) });
+    graph_transfer_tests.root_module.addImport("antfly_hash", hash_mod);
     const run_graph_transfer_tests = b.addRunArtifact(graph_transfer_tests);
     b.step("antfly-graph-transfer-test", "Validate certified graph artifact generation transfer").dependOn(&run_graph_transfer_tests.step);
-    owner_tests.unit_test_step.dependOn(&run_graph_transfer_tests.step);
+    // The storage lanes already own every named graph-transfer contract.
+    // Keep this focused target without compiling a duplicate aggregate image.
     const standalone_policy_ha_tests = owner_tests.standalone_policy_ha_tests;
     standalone_policy_ha_tests.root_module.addObject(consumer_test_metadata.object);
     inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|

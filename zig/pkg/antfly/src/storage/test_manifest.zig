@@ -247,6 +247,7 @@ comptime {
     _ = @import("hot_standby/chaos.zig");
     _ = @import("hot_standby/commit_gate.zig");
     _ = @import("hot_standby/compat.zig");
+    _ = @import("hot_standby/db_commit.zig");
     _ = @import("hot_standby/effects.zig");
     _ = @import("hot_standby/fencing.zig");
     _ = @import("hot_standby/http_admin.zig");
@@ -274,9 +275,9 @@ comptime {
     _ = @import("hot_standby/replication_api.zig");
     _ = @import("hot_standby/replication_log.zig");
     _ = @import("db/replication_record.zig");
+    _ = @import("db/primary_effect.zig");
     _ = @import("hot_standby/seed_activation.zig");
     _ = @import("hot_standby/seed_artifact.zig");
-    _ = @import("db/primary_effect.zig");
     _ = @import("hot_standby/seed_capture.zig");
     _ = @import("hot_standby/seed_namespace_control.zig");
     _ = @import("hot_standby/seed_prefix_cleanup_test.zig");

@@ -1109,16 +1109,10 @@ fn parseBatchRequestWithOptions(
     var merge_artifacts: ?std.json.Parsed([]const db_mod.types.BatchWrite) = null;
     errdefer if (merge_artifacts) |*value| value.deinit();
     if (root.get("_merge_artifacts")) |value| {
-        if (!allow_internal or merge_replication == null) return error.InvalidBatchRequest;
+        if (!allow_internal) return error.InvalidBatchRequest;
         merge_artifacts = try std.json.parseFromValue([]const db_mod.types.BatchWrite, alloc, value, .{ .allocate = .alloc_always });
-        try db_mod.types.validateMergeArtifacts(.{
-            .merge_replication = merge_replication,
-            .merge_artifacts = merge_artifacts.?.value,
-            .writes = writes,
-            .deletes = deletes,
-            .transforms = transforms,
-            .predicates = predicates,
-        });
+        // Validate against the complete request below: cleanup afterimages
+        // require the planned page's guards as well as its private flags.
     }
 
     var transition_key: ?[]u8 = null;
@@ -1540,6 +1534,7 @@ fn parseBatchRequestWithOptions(
         for (result_value.req.transforms) |transform| if (keys.isGraphEndpointCleanupControlKey(transform.key)) return error.InvalidBatchRequest;
     }
     try db_mod.types.validateGraphEndpointCleanupCommand(result_value.req);
+    try db_mod.types.validateMergeArtifacts(result_value.req);
     try merge_pages.validateRequest(result_value.req);
     try @import("../storage/db/merge_proof_adoption.zig").validateRequest(result_value.req);
     try @import("../storage/db/online_source_contract.zig").validateRequest(result_value.req);
@@ -3203,4 +3198,32 @@ test "internal batch JSON null and insert precondition codecs survive allocation
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "graph cleanup owner replay afterimages survive internal batch round trip" {
+    const alloc = std.testing.allocator;
+    const contract = @import("../storage/graph_cleanup_contract.zig");
+    const key = try contract.ownerJobKeyAlloc(alloc, "owner");
+    defer alloc.free(key);
+    const old = try contract.encodeOwnerJobAlloc(alloc, .{ .owner = "owner", .generation = 7 });
+    defer alloc.free(old);
+    const next = try contract.encodeOwnerJobAlloc(alloc, .{ .owner = "owner", .generation = 7, .phase = .inputs });
+    defer alloc.free(next);
+    const req: db_mod.types.BatchRequest = .{
+        .graph_endpoint_cleanup = true,
+        .graph_endpoint_cleanup_planned = true,
+        .graph_endpoint_cleanup_guards = &.{.{ .endpoint = "owner", .generation = 7, .kind = .owner_replay, .checkpoint_digest = contract.checkpointDigest(old) }},
+        .merge_artifacts = &.{.{ .key = key, .value = next }},
+    };
+    try db_mod.types.validateGraphEndpointCleanupCommand(req);
+    const bytes = try encodeBatchRequest(alloc, req);
+    defer alloc.free(bytes);
+    var parsed = try parseInternalBatchRequest(alloc, bytes);
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), parsed.req.merge_artifacts.len);
+    try std.testing.expectEqualSlices(u8, key, parsed.req.merge_artifacts[0].key);
+    try std.testing.expectEqualSlices(u8, next, parsed.req.merge_artifacts[0].value);
+    try std.testing.expectEqualSlices(u8, &contract.checkpointDigest(old), &parsed.req.graph_endpoint_cleanup_guards[0].checkpoint_digest);
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, bytes));
+    try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(alloc, "{\"_merge_artifacts\":[{\"key\":\"arbitrary\",\"value\":\"payload\"}]}"));
 }
