@@ -1812,8 +1812,14 @@ test "metadata server can expose admin listener endpoints" {
         .content_type = "application/json",
     });
     defer authenticated_policy_status.deinit(std.heap.page_allocator);
-    try std.testing.expectEqual(@as(u16, 409), authenticated_policy_status.status);
-    try std.testing.expectEqualStrings("RowPolicyCatalogChanged", authenticated_policy_status.body);
+    // Table 77 never had row-policy install authority provisioned at all;
+    // loadPolicyPublicationStamp now reports that the same way its sibling
+    // loadServingPolicyInstallSnapshot already does for a missing
+    // publication -- RowPolicyUnsupported (426), not RowPolicyCatalogChanged
+    // (409), which is reserved for a stamp that exists but fails its own
+    // shape/identity check.
+    try std.testing.expectEqual(@as(u16, 426), authenticated_policy_status.status);
+    try std.testing.expectEqualStrings("RowPolicyUnsupported", authenticated_policy_status.body);
 
     // A forged service header must not reach the decoder-activation probe.
     // This exercises the real host authentication middleware, not just the
