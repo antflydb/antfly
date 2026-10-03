@@ -5,6 +5,7 @@
 // the License at https://www.antfly.io/licensing/ELv2-license.
 
 test {
+    _ = @import("common/http/mod.zig");
     _ = @import("common/http/io_http_executor.zig");
     _ = @import("common/http/std_http_executor.zig");
     _ = @import("antfly_local_sources").common_http_std_http_listener;

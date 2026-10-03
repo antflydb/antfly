@@ -2152,6 +2152,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{ "raft integration module compiles", "raft.transport.", "raft.reconciler.", "http host shares its borrowed clock" },
     });
     const run_raft_transport_tests = addFilteredTestRunArtifact(b, raft_transport_tests);
+    const run_unit_raft_transport_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, raft_transport_tests, &.{"raft.transport."});
     // Queued delivery lives in the harness root, outside antfly_test_mod's
     // reachable tests. Exercise its HTTP boundary in the transport gate too.
     const raft_queued_transport_tests = b.addTest(.{
@@ -4860,12 +4861,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // available as the convenient focused target containing both artifacts.
     unit_test_step.dependOn(&run_standby_cli_tests.step);
     unit_test_step.dependOn(&run_raft_unit_tests.step);
+    // The broad Raft owner excludes transport; its dedicated run owns that
+    // namespace in the aggregate while the focused target also tests routes.
+    unit_test_step.dependOn(&run_unit_raft_transport_tests.step);
     unit_test_step.dependOn(&run_raft_snapshot_maintenance_vopr_tests.step);
     unit_test_step.dependOn(&run_raft_runtime_tests.step);
     unit_test_step.dependOn(&run_raft_restore_tests.step);
-    // The standalone Raft library and Antfly-rooted Raft artifacts already
-    // contain the ready-continuation and transport selections, respectively.
-    // Preserve their focused targets without executing them twice in `antfly-unit-test`.
+    // The standalone Raft library owns the ready-continuation selection.
+    // Preserve its focused target without repeating it in the aggregate.
 
     const lmdb_unit_tests = b.addTest(.{
         .root_module = lmdb_engine_mod,
