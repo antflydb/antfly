@@ -1353,6 +1353,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "query builder maps canonical graph queries and ignores legacy expansion",
         "retrieval root scan pushes row inclusion and exclusion predicates into one filter",
         "retrieval contains filter treats wildcard operators as literals",
+        "api query contract graph evaluation preserves base hit paging and shard windows",
         "distributed reranking widens retrieval and stays coordinator owned",
         "reranker candidate and output windows have distinct bounds",
         "reranker admission precedes candidate rendering",
