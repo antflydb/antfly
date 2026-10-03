@@ -57999,25 +57999,13 @@ fn reconcileGlobalGraphEdgeWinner(
             try considerGraphEdgeWinner(alloc, &result.winners, edge_key, change.state_key, change.source_priority, source_payload);
         } else {
             try result.deletes.append(alloc, contender_key);
-            // Ordinary source removal (e.g. an asset re-render dropping a
-            // stale contender when its producing field disappears) must
+            // Retiring any one contender -- direct or asset-derived -- must
             // still fall back to the next-best surviving contender the scan
-            // above already selected -- that is the whole point of
-            // precedence. Only an explicit top-level graph_deletes entry
-            // (always posted at the reserved direct state key; see
-            // appendMixedDirectGraphContenderMutations, the only caller that
-            // ever touches it) is asking to retire the edge outright, the
-            // same way an explicit write at that priority outranks every
-            // asset contender. Scope the override to that one state key so
-            // retiring an asset contributor can never resurrect-then-drop an
-            // edge out from under an unrelated fallback (PR #957 review).
-            if (std.mem.eql(u8, change.state_key, direct_state_key)) {
-                if (result.winners.map.fetchRemove(edge_key)) |removed| {
-                    alloc.free(@constCast(removed.key));
-                    alloc.free(removed.value.owner_state_key);
-                    alloc.free(removed.value.payload);
-                }
-            }
+            // above already selected; that is the whole point of priority
+            // ordering. "db graph untimed migration restores source order
+            // and direct contributor precedence" and its legacy-writes
+            // sibling both depend on an explicit direct-priority delete
+            // falling back to a surviving asset contender.
         }
     }
 }
