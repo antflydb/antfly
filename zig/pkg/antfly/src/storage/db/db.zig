@@ -149318,7 +149318,7 @@ test "db ordered artifact inventory logical chunk projection merges generations 
             try std.testing.expectEqualStrings("generation-only", generated[0].object.get("body").?.string);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{&db});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{&db});
     var expected_nums: [2]u32 = undefined;
     for ([_]?[]const u8{ null, "z" }, &expected_nums) |unit, *expected| {
         const key = if (unit) |id|

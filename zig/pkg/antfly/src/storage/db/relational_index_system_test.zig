@@ -802,7 +802,7 @@ fn expressionKeyAllocations(test_alloc: std.mem.Allocator) !void {
 }
 
 test "relational index system expression keys share typed bounds historical projections and allocation cleanup" {
-    try std.testing.checkAllAllocationFailures(alloc, expressionKeyAllocations, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, expressionKeyAllocations, .{});
 }
 
 test "relational index system expression keys fence declarations dependency changes and aggregate expansion" {

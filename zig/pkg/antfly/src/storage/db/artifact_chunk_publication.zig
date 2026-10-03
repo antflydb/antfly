@@ -931,7 +931,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
             }
         };
         try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ session, unit_key });
-        try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.authorize, .{ &current, request, plan.plan() });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, AllocationCheck.authorize, .{ &current, request, plan.plan() });
     }
     {
         var current = try db.core.store.beginReadTxn();

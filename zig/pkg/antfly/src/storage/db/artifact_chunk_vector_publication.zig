@@ -254,7 +254,7 @@ fn testPreparation(sparse_kind: bool) !void {
             try std.testing.expect(prepared.chunk_vector_fence.?.requires_member);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ command, catalogs, sparse_kind });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{ command, catalogs, sparse_kind });
     var proof = try @import("artifact_producer_provenance.zig").fromCommand(alloc, command);
     defer proof.deinit();
     try proof.proof.requireInheritedBy(command);

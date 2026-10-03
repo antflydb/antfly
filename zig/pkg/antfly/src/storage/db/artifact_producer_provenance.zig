@@ -1675,7 +1675,7 @@ test "ordered artifact inventory document proof pages seek binary ranges and rej
             try std.testing.expectEqual(@as(usize, 2), page.entries.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &pinned, active, range });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &pinned, active, range });
     {
         var writer = try db.core.store.beginWriteTxn();
         errdefer writer.abort();
