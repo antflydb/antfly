@@ -252,7 +252,23 @@ pub fn catchUpIndexFromMatchingCursor(
     var completed_windows: usize = 0;
     const call_started_ns = monotonicTimeNs();
     var call_bytes: u64 = 0;
+    // Scratch belongs to this catch-up call, rather than one replay window.
+    // Its allocator charges retained capacity to the replay memory budget.
+    var scratch_budget: ?resource_manager_mod.BudgetedAllocator = if (options.resource_manager) |manager|
+        resource_manager_mod.BudgetedAllocator.init(manager, .derived_replay_window, alloc, 1)
+    else
+        null;
+    defer if (scratch_budget) |*budget| budget.deinit();
+    const scratch_alloc = if (scratch_budget) |*budget| budget.allocator() else alloc;
+    var decode_scratch: change_journal_mod.BorrowedBinaryRecordScratch = .{};
+    defer decode_scratch.deinit(scratch_alloc);
     while (true) {
+        // Oversized records may need more scratch once, but cannot establish
+        // a large retained high-water mark for subsequent windows.
+        defer {
+            decode_scratch.trimRetainedCapacity(scratch_alloc, 64 * 1024);
+            if (scratch_budget) |*budget| _ = budget.releaseUnusedCredit();
+        }
         if (options.deadline_ns) |deadline| {
             if (monotonicTimeNs() >= deadline) return error.CatchUpDeadlineExceeded;
         }
@@ -262,6 +278,8 @@ pub fn catchUpIndexFromMatchingCursor(
         builder.max_items = options.max_items_per_window;
         builder.estimated_dense_vector_bytes = options.estimated_dense_vector_bytes;
         builder.target_sequence = options.target_sequence;
+        builder.decode_scratch = &decode_scratch;
+        builder.scratch_alloc = scratch_alloc;
         defer builder.deinit();
 
         const collect_started_ns = monotonicTimeNs();
@@ -269,7 +287,12 @@ pub fn catchUpIndexFromMatchingCursor(
             options.max_records_per_window,
             &builder,
             replayChunkConsumeRecord,
-        ) catch |err| return err;
+        ) catch |err| {
+            if (err == error.OutOfMemory) {
+                if (scratch_budget) |*budget| if (budget.denied()) return error.ResourceBudgetExceeded;
+            }
+            return err;
+        };
         stats.window_collect_ns += monotonicTimeNs() - collect_started_ns;
         if (chunk_stats.last_sequence == 0) {
             break;
@@ -294,7 +317,7 @@ pub fn catchUpIndexFromMatchingCursor(
             });
         }
 
-        var batch = try builder.finish(chunk_stats.last_sequence);
+        const batch = try builder.finishBorrowed(chunk_stats.last_sequence);
         var window_open = false;
         errdefer if (window_open) {
             if (options.finish_window_fn) |finish_window| {
@@ -304,7 +327,6 @@ pub fn catchUpIndexFromMatchingCursor(
         if (options.begin_window_fn) |begin_window| {
             begin_window(options.window_ctx.?, index_ref) catch |err| {
                 logCatchUpError(index_ref, "begin_window", chunk_stats.last_sequence, stats.scanned_entries, stats.applied_entries, err);
-                derived_types.deinitDerivedBatch(alloc, &batch);
                 return err;
             };
             window_open = true;
@@ -314,7 +336,6 @@ pub fn catchUpIndexFromMatchingCursor(
         const applied = applyBatchBounded(apply_ctx, apply_fn, batch, index_ref, options.max_items_per_window) catch |err| {
             stats.apply_ns += monotonicTimeNs() - apply_started_ns;
             logCatchUpError(index_ref, "journal_apply", chunk_stats.last_sequence, stats.scanned_entries, stats.applied_entries, err);
-            derived_types.deinitDerivedBatch(alloc, &batch);
             return err;
         };
         if (applied) {
@@ -336,7 +357,6 @@ pub fn catchUpIndexFromMatchingCursor(
         if (options.finish_window_fn) |finish_window| {
             finish_window(options.window_ctx.?, index_ref, true) catch |err| {
                 logCatchUpError(index_ref, "finish_window", chunk_stats.last_sequence, stats.scanned_entries, stats.applied_entries, err);
-                derived_types.deinitDerivedBatch(alloc, &batch);
                 return err;
             };
             window_open = false;
@@ -345,12 +365,10 @@ pub fn catchUpIndexFromMatchingCursor(
             if (applied) {
                 persist(options.persist_ctx.?, index_ref.name, chunk_stats.last_sequence) catch |err| {
                     logCatchUpError(index_ref, "persist_progress", chunk_stats.last_sequence, stats.scanned_entries, stats.applied_entries, err);
-                    derived_types.deinitDerivedBatch(alloc, &batch);
                     return err;
                 };
             }
         }
-        derived_types.deinitDerivedBatch(alloc, &batch);
         completed_windows += 1;
         call_bytes +|= builder.tracked_bytes;
         // Oversized single records retain the existing one-record progress
@@ -431,7 +449,10 @@ const ReplayChunkBuilder = struct {
     alloc: Allocator,
     index_ref: index_manager_mod.ManagedIndexRef,
     resource_manager: ?*resource_manager_mod.ResourceManager,
-    decode_scratch: change_journal_mod.BorrowedBinaryRecordScratch = .{},
+    decode_scratch: *change_journal_mod.BorrowedBinaryRecordScratch = undefined,
+    scratch_alloc: Allocator = undefined,
+    documents: []derived_types.DerivedDocument = &.{},
+    target: [1]derived_types.DerivedTargetRef = undefined,
     max_chunk_bytes: u64,
     changed_doc_keys: std.ArrayListUnmanaged([]const u8) = .empty,
     deleted_doc_keys: std.ArrayListUnmanaged([]const u8) = .empty,
@@ -462,7 +483,7 @@ const ReplayChunkBuilder = struct {
     }
 
     fn deinit(self: *@This()) void {
-        self.decode_scratch.deinit(self.alloc);
+        if (self.documents.len > 0) self.alloc.free(self.documents);
         for (self.changed_doc_keys.items) |key| self.alloc.free(key);
         self.changed_doc_keys.deinit(self.alloc);
         for (self.deleted_doc_keys.items) |key| self.alloc.free(key);
@@ -495,6 +516,7 @@ const ReplayChunkBuilder = struct {
         try seen.put(self.alloc, owned, {});
         errdefer _ = seen.remove(owned);
         try list.append(self.alloc, owned);
+        errdefer list.items.len -= 1;
         var next_tracked_bytes = self.tracked_bytes;
         next_tracked_bytes +|= owned.len;
         next_tracked_bytes +|= @as(u64, @intCast(list.capacity - prior_list_capacity)) * @sizeOf([]const u8);
@@ -559,72 +581,29 @@ const ReplayChunkBuilder = struct {
         self.tracked_bytes = next_tracked_bytes;
     }
 
-    fn finish(self: *@This(), sequence: u64) !derived_types.DerivedBatch {
-        const changed_doc_keys = try self.changed_doc_keys.toOwnedSlice(self.alloc);
-        var transferred_changed_doc_keys: usize = 0;
-        var changed_doc_keys_owned = true;
-        errdefer if (changed_doc_keys_owned) {
-            for (changed_doc_keys[transferred_changed_doc_keys..]) |key| self.alloc.free(key);
-            if (changed_doc_keys.len > 0) self.alloc.free(changed_doc_keys);
+    /// Borrows keys, target metadata, and document descriptors from this
+    /// builder. Apply callbacks must finish using them before returning (or
+    /// clone them), just as with the previous per-window owned batch.
+    /// Only builder.deinit owns cleanup; never call deinitDerivedBatch here.
+    fn finishBorrowed(self: *@This(), sequence: u64) !derived_types.DerivedBatch {
+        const count = self.changed_doc_keys.items.len;
+        try self.observeTrackedBytes(self.tracked_bytes +| @as(u64, @intCast(count)) * @sizeOf(derived_types.DerivedDocument));
+        self.documents = try self.alloc.alloc(derived_types.DerivedDocument, count);
+        const targets: []const derived_types.DerivedTargetRef = switch (self.index_ref.kind) {
+            .full_text, .algebraic => blk: {
+                self.target[0] = .{
+                    .kind = if (self.index_ref.kind == .full_text) .full_text else .algebraic,
+                    .index_name = self.index_ref.name,
+                };
+                break :blk &self.target;
+            },
+            else => &.{},
         };
-
-        var documents = try self.alloc.alloc(derived_types.DerivedDocument, changed_doc_keys.len);
-        var initialized_docs: usize = 0;
-        errdefer {
-            for (documents[0..initialized_docs]) |doc|
-                derived_types.deinitDerivedDocument(self.alloc, doc);
-            if (documents.len > 0) self.alloc.free(documents);
+        for (self.changed_doc_keys.items, self.documents) |key, *doc| {
+            doc.* = .{ .key = key, .action = .upsert, .targets = targets };
         }
-        for (changed_doc_keys, 0..) |key, i| {
-            const targets: []const derived_types.DerivedTargetRef = switch (self.index_ref.kind) {
-                .full_text, .algebraic => blk: {
-                    const refs = try self.alloc.alloc(derived_types.DerivedTargetRef, 1);
-                    errdefer self.alloc.free(refs);
-                    const index_name = try self.alloc.dupe(u8, self.index_ref.name);
-                    errdefer self.alloc.free(index_name);
-                    refs[0] = .{
-                        .kind = if (self.index_ref.kind == .full_text) .full_text else .algebraic,
-                        .index_name = index_name,
-                    };
-                    break :blk refs;
-                },
-                else => &.{},
-            };
-            documents[i] = .{
-                .key = key,
-                .action = .upsert,
-                .targets = targets,
-            };
-            initialized_docs += 1;
-            transferred_changed_doc_keys += 1;
-        }
-        if (changed_doc_keys.len > 0) self.alloc.free(changed_doc_keys);
-        changed_doc_keys_owned = false;
-
-        const deleted_keys = try self.deleted_doc_keys.toOwnedSlice(self.alloc);
-        errdefer {
-            for (deleted_keys) |key| self.alloc.free(key);
-            if (deleted_keys.len > 0) self.alloc.free(deleted_keys);
-        }
-        const overwritten_doc_keys = try self.overwritten_doc_keys.toOwnedSlice(self.alloc);
-        errdefer {
-            for (overwritten_doc_keys) |key| self.alloc.free(key);
-            if (overwritten_doc_keys.len > 0) self.alloc.free(overwritten_doc_keys);
-        }
-        const changed_artifact_keys = try self.changed_artifact_keys.toOwnedSlice(self.alloc);
-        errdefer {
-            for (changed_artifact_keys) |key| self.alloc.free(key);
-            if (changed_artifact_keys.len > 0) self.alloc.free(changed_artifact_keys);
-        }
-
-        const batch: derived_types.DerivedBatch = .{
-            .sequence = sequence,
-            .documents = documents,
-            .deleted_keys = deleted_keys,
-            .overwritten_doc_keys = overwritten_doc_keys,
-            .changed_artifact_keys = changed_artifact_keys,
-        };
-
+        // Deduplication is finished. Do not carry its maps into indexing,
+        // where they would overlap with the consumer's working set.
         self.seen_changed_docs.deinit(self.alloc);
         self.seen_deleted_docs.deinit(self.alloc);
         self.seen_overwritten_docs.deinit(self.alloc);
@@ -633,7 +612,13 @@ const ReplayChunkBuilder = struct {
         self.seen_deleted_docs = .empty;
         self.seen_overwritten_docs = .empty;
         self.seen_changed_artifacts = .empty;
-        return batch;
+        return .{
+            .sequence = sequence,
+            .documents = self.documents,
+            .deleted_keys = self.deleted_doc_keys.items,
+            .overwritten_doc_keys = self.overwritten_doc_keys.items,
+            .changed_artifact_keys = self.changed_artifact_keys.items,
+        };
     }
 };
 
@@ -641,7 +626,7 @@ fn replayChunkConsumeRecord(ctx: *anyopaque, sequence: u64, payload: []const u8)
     const builder: *ReplayChunkBuilder = @ptrCast(@alignCast(ctx));
     if (builder.target_sequence != 0 and sequence > builder.target_sequence) return replay_source_mod.StopReplayChunk.StopReplayChunk;
     if (change_journal_mod.looksLikeBinaryRecord(payload)) {
-        const record = try change_journal_mod.decodeBinaryRecordBorrowedScratch(builder.alloc, payload, &builder.decode_scratch);
+        const record = try change_journal_mod.decodeBinaryRecordBorrowedScratch(builder.scratch_alloc, payload, builder.decode_scratch);
         if (builder.wouldOverflowWithRecord(record)) return replay_source_mod.StopReplayChunk.StopReplayChunk;
         try builder.appendRecord(record);
         return;
@@ -1728,4 +1713,68 @@ test "catchUpIndex batches resolution artifact graph journal records before appl
     try std.testing.expectEqual(@as(usize, 1), stats.applied_entries);
     try std.testing.expectEqual(@as(usize, 1), capture.applied_changed_artifact_keys);
     try std.testing.expectEqualStrings(artifact_key, capture.last_batch.?.changed_artifact_keys[0]);
+}
+
+test "replay batch borrows shared targets and clones retain independent ownership" {
+    const alloc = std.testing.allocator;
+    var builder = ReplayChunkBuilder.init(alloc, .{ .name = "text", .kind = .full_text }, null, 0);
+    var clone: derived_types.DerivedBatch = undefined;
+    {
+        defer builder.deinit();
+        try builder.appendRecord(.{ .changed_doc_keys = &.{ "a", "b", "c" }, .deleted_doc_keys = &.{"deleted"} });
+        const batch = try builder.finishBorrowed(1);
+        try std.testing.expectEqual(batch.documents[0].targets.ptr, batch.documents[1].targets.ptr);
+        try std.testing.expectEqual(builder.index_ref.name.ptr, batch.documents[0].targets[0].index_name.ptr);
+        clone = try derived_types.cloneBatch(alloc, batch);
+    }
+    defer derived_types.deinitDerivedBatch(alloc, &clone);
+    try std.testing.expectEqualStrings("c", clone.documents[2].key);
+    try std.testing.expectEqualStrings("text", clone.documents[2].targets[0].index_name);
+    try std.testing.expectEqualStrings("deleted", clone.deleted_keys[0]);
+}
+
+fn replayBatchAllocationFailure(alloc: Allocator) !void {
+    var builder = ReplayChunkBuilder.init(alloc, .{ .name = "text", .kind = .full_text }, null, 0);
+    defer builder.deinit();
+    try builder.appendRecord(.{ .changed_doc_keys = &.{ "a", "b", "c" }, .deleted_doc_keys = &.{"deleted"} });
+    _ = try builder.finishBorrowed(1);
+}
+
+test "replay batch cleans up every allocation failure before borrowed publication" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, replayBatchAllocationFailure, .{});
+}
+
+test "replay batch budget denial rolls back key ownership" {
+    const alloc = std.testing.allocator;
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = .{ .soft_limit_bytes = 1, .hard_limit_bytes = 1 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+    {
+        var builder = ReplayChunkBuilder.init(alloc, .{ .name = "text", .kind = .full_text }, &manager, 0);
+        defer builder.deinit();
+        try std.testing.expectError(error.ResourceBudgetExceeded, builder.appendRecord(.{ .changed_doc_keys = &.{"a"} }));
+        try std.testing.expectEqual(@as(usize, 0), builder.changed_doc_keys.items.len);
+    }
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+}
+
+test "catchUpIndex accounts shared decoding scratch and releases it after apply failure" {
+    const alloc = std.testing.allocator;
+    var log = try change_journal_mod.Journal.open("budgeted-replay-scratch", testInMemoryJournalOpenOptions());
+    defer log.close();
+    try appendChangeJournalRecord(&log, alloc, .{ .sequence = 1, .changed_doc_keys = &.{"a"}, .target_hints = &.{.full_text} });
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(alloc);
+    const Consumer = struct {
+        fn apply(ctx: *anyopaque, _: derived_types.DerivedBatch, _: index_manager_mod.ManagedIndexRef) !bool {
+            const resources: *resource_manager_mod.ResourceManager = @ptrCast(@alignCast(ctx));
+            try std.testing.expect(resources.sliceStats(.derived_replay_window).used_bytes > 0);
+            return error.InjectedApplyFailure;
+        }
+    };
+    @import("../../../test_error_logs.zig").expectErrorLogs(2);
+    try std.testing.expectError(error.InjectedApplyFailure, catchUpIndexWithOptions(alloc, replay_source_mod.Source.fromJournal(&log), .{ .name = "text", .kind = .full_text }, 0, &manager, Consumer.apply, .{ .resource_manager = &manager }));
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
 }

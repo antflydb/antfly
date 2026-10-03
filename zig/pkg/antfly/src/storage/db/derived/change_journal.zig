@@ -124,6 +124,18 @@ pub const BorrowedBinaryRecordScratch = struct {
         self.* = undefined;
     }
 
+    pub fn retainedCapacityBytes(self: *const BorrowedBinaryRecordScratch) usize {
+        return (self.changed_doc_keys.capacity + self.deleted_doc_keys.capacity +
+            self.overwritten_doc_keys.capacity + self.changed_artifact_keys.capacity) * @sizeOf([]const u8) +
+            self.target_hints.capacity * @sizeOf(TargetHint);
+    }
+
+    pub fn trimRetainedCapacity(self: *BorrowedBinaryRecordScratch, alloc: Allocator, max_bytes: usize) void {
+        if (self.retainedCapacityBytes() <= max_bytes) return;
+        self.deinit(alloc);
+        self.* = .{};
+    }
+
     fn reset(self: *BorrowedBinaryRecordScratch) void {
         self.changed_doc_keys.clearRetainingCapacity();
         self.deleted_doc_keys.clearRetainingCapacity();
@@ -1319,4 +1331,18 @@ test "change journal emits resolution and graph hints for changed asset artifact
 
     try std.testing.expect(recordHasHint(record, .graph));
     try std.testing.expect(recordHasHint(record, .resolution));
+}
+
+test "change journal borrowed binary scratch retention is bounded" {
+    const alloc = std.testing.allocator;
+    var scratch: BorrowedBinaryRecordScratch = .{};
+    defer scratch.deinit(alloc);
+    try scratch.changed_doc_keys.ensureTotalCapacity(alloc, 100);
+    const pointer = scratch.changed_doc_keys.items.ptr;
+    scratch.trimRetainedCapacity(alloc, scratch.retainedCapacityBytes());
+    try std.testing.expectEqual(pointer, scratch.changed_doc_keys.items.ptr);
+    scratch.trimRetainedCapacity(alloc, 0);
+    try std.testing.expectEqual(@as(usize, 0), scratch.retainedCapacityBytes());
+    try scratch.changed_doc_keys.append(alloc, "after trim");
+    try std.testing.expectEqualStrings("after trim", scratch.changed_doc_keys.items[0]);
 }

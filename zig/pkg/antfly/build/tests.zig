@@ -153,6 +153,29 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_source_file = b.path("lib/lmdb/src/lmdb_vopr.zig"),
     });
 
+    const replay_allocation_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/replay_allocation_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, replay_allocation_mod, true, true);
+    const replay_allocation_tests = b.addTest(.{
+        .root_module = replay_allocation_mod,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .filters = &.{ "catchUpIndex", "coalesced replay", "replay batch", "change journal borrowed binary scratch" },
+    });
+    b.step("replay-allocation-test", "Run replay ownership, scratch retention and window contracts")
+        .dependOn(&b.addRunArtifact(replay_allocation_tests).step);
+    const replay_allocation_bench_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/replay_allocation_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, replay_allocation_bench_mod, true, true);
+    const replay_allocation_bench = b.addExecutable(.{ .name = "replay-allocation-bench", .root_module = replay_allocation_bench_mod });
+    b.step("replay-allocation-bench", "Build the allocation-counted replay benchmark")
+        .dependOn(&b.addInstallArtifact(replay_allocation_bench, .{}).step);
+
     const functions_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/functions_test_root.zig"),
         .target = target,

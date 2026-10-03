@@ -1738,6 +1738,14 @@ pub const Store = struct {
                     }
                 } else continue;
             }
+            if (records.capacity == 0) {
+                // Arena growth retains superseded buffers until the batch ends.
+                // Reserve once, after skipping already durable payloads, so an
+                // idempotent retry does not allocate unused batch bookkeeping.
+                const remaining = prepared.len - item_index;
+                try records.ensureTotalCapacityPrecise(scratch, remaining);
+                try seen.ensureTotalCapacity(std.math.cast(u32, remaining) orelse return error.Overflow);
+            }
             if ((try seen.getOrPut(item.reference.digest)).found_existing) continue;
             const vector = if (decoded) |vectors| vectors[item_index] else (try codec.denseEmbeddingVectorView(item.artifact)) orelse try codec.decodeDenseEmbeddingAlloc(scratch, item.artifact);
             try records.append(scratch, .{
