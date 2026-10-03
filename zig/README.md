@@ -51,6 +51,9 @@ currently live under `pkg/inference/`.
 ## Build Requirements
 
 - Zig `0.17.0` (the official release pinned by CI and container builds).
+- Supported native toolchain hosts include macOS 15+ and Linux 5.10+.
+  Zig 0.17 raises the macOS standard-library minimum from 13 to 15; the
+  macOS packaging workflow already uses a macOS 15 runner.
 - `uv` for Python e2e suites and repository helper scripts.
 - Optional native runtime dependencies for some inference features, such as
   ONNX Runtime, FFmpeg, CUDA, or Metal. The build detects available local
