@@ -34,7 +34,7 @@ def main():
     parser.add_argument('--replay-sources', nargs='+', choices=['journal', 'primary'], default=['journal'])
     parser.add_argument('--documents-per-record', nargs='+', type=int, default=[1, 128])
     parser.add_argument('--batches', nargs='+', type=int, default=[256, 1024])
-    parser.add_argument('--replay-operation', choices=['replay', 'enrichment', 'latest'], default='replay')
+    parser.add_argument('--replay-operation', choices=['replay', 'enrichment', 'latest', 'ordinal'], default='replay')
     parser.add_argument('--repetitions', type=int, default=1)
     parser.add_argument('--replay-measurements', nargs='+', choices=['counted', 'timing'], default=['counted'])
     parser.add_argument('--replay-only', action='store_true')
@@ -42,6 +42,7 @@ def main():
     parser.add_argument('--vector-modes', nargs='+', choices=['ingest', 'retry', 'retry-mixed'], default=['ingest'])
     parser.add_argument('--document-lookup-only', action='store_true')
     parser.add_argument('--document-cases', nargs='+', choices=['short', 'long', 'missing', 'sparse', 'text', 'relational'], default=['short'])
+    parser.add_argument('--ordinal-case', choices=['short', 'long', 'missing'], default='short')
     args = parser.parse_args()
     if min(args.documents, args.dimensions, args.samples, args.vector_samples, *args.documents_per_record, *args.batches, args.repetitions) <= 0:
         parser.error('counts and sample sizes must be positive')
@@ -66,7 +67,7 @@ def main():
             for variant in (['baseline', 'changed'] if pair % 2 == 0 else ['changed', 'baseline']):
                 label = f'replay-{measurement}-{replay_source}-{kind}-{records}-{budgeted}-{batch}-{pair}-{variant}'
                 lines = run(label, [binaries[variant] / 'replay-allocation-bench', args.documents,
-                                   batch, 1, 'budgeted' if budgeted else 'unbudgeted', records, kind, replay_source, args.replay_operation, args.repetitions, measurement], env)
+                                   batch, 1, 'budgeted' if budgeted else 'unbudgeted', records, kind, replay_source, args.replay_operation, args.repetitions, measurement, args.ordinal_case], env)
                 data = json.loads(next(x for x in lines if x.startswith('{')))
                 if data.get('source', 'journal') != replay_source:
                     raise ValueError('both replay binaries must support the requested source')
@@ -157,7 +158,7 @@ def main():
                       for pair in range(len(group['baseline']))
                       if next(x[field] for x in group['baseline'] if x['pair'] == pair) != 0]
             stats['paired_elapsed_change_percent_median'] = statistics.median(ratios) if ratios else None
-            summary[f'{workload}-' + (f'{fixture}-' if workload != 'replay' else '') + f'{replay_source}-{kind}-{records}-{batch}-{mode}'] = stats
+            summary[f'{workload}-' + (f'{fixture}-' if workload != 'replay' or fixture != 'default' else '') + f'{replay_source}-{kind}-{records}-{batch}-{mode}'] = stats
     (args.output / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
     print(json.dumps(summary, indent=2))
 

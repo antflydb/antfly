@@ -13,7 +13,7 @@ const indexes = @import("storage/db/catalog/index_manager.zig");
 const resources = @import("storage/resource_manager.zig");
 const time = @import("antfly_platform").time;
 
-const Operation = enum { replay, enrichment, latest };
+const Operation = enum { replay, enrichment, latest, ordinal };
 
 const Counter = @import("allocation_bench_support.zig").Counter;
 
@@ -50,6 +50,10 @@ pub fn main(init: std.process.Init) !void {
     const index: indexes.ManagedIndexRef = .{ .name = "title_body", .kind = kind };
     if (batch == 0 or documents_per_record == 0) return error.InvalidBatch;
     const counting = args.len <= 10 or !std.mem.eql(u8, args[10], "timing");
+    if (operation == .ordinal) {
+        if (!primary or kind != .full_text or documents_per_record != 1 or repetitions != 1 or requested_budgeted) return error.InvalidOrdinalParameters;
+        return benchmarkOrdinals(count, batch, samples, counting, if (args.len > 11) args[11] else "short");
+    }
     const setup = std.heap.smp_allocator;
     var log = try journal.Journal.open("allocation-benchmark-memory", .{
         .backend = .lsm_memory,
@@ -93,6 +97,7 @@ pub fn main(init: std.process.Init) !void {
         const started = time.monotonicNs();
         var windows: usize = 0;
         switch (operation) {
+            .ordinal => unreachable,
             .replay => {
                 const stats = try worker.catchUpIndexWithOptions(run_alloc, replay_source, index, 0, &consumer, Consumer.apply, .{
                     .resource_manager = if (budgeted) &manager else null,
@@ -122,6 +127,7 @@ pub fn main(init: std.process.Init) !void {
         const elapsed = time.monotonicNs() - started;
         if (manager.snapshot().memory.used_bytes != 0) return error.LeakedReservation;
         const expected_count = switch (operation) {
+            .ordinal => unreachable,
             .replay => count,
             .enrichment => try std.math.divCeil(usize, count, repetitions),
             .latest => 0,
@@ -130,5 +136,72 @@ pub fn main(init: std.process.Init) !void {
         if (sample != 0) std.debug.print("{{\"sample\":{d},\"documents\":{d},\"batch\":{d},\"budgeted\":{},\"documents_per_record\":{d},\"index_kind\":\"{s}\",\"source\":\"{s}\",\"operation\":\"{s}\",\"repetitions\":{d},\"measurement\":\"{s}\",\"elapsed_ns\":{d},\"allocations\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d},\"windows\":{d}}}\n", .{
             sample, count, batch, budgeted, documents_per_record, @tagName(kind), if (primary) "primary" else "journal", @tagName(operation), repetitions, if (counting) "counted" else "timing", elapsed, counter.calls, counter.bytes, counter.peak, consumer.checksum, windows,
         });
+    }
+}
+
+// Measures the production identity lookup helper with a validating borrowed
+// sorted-read callback. Backend I/O is excluded so key preparation is isolated.
+fn benchmarkOrdinals(count: usize, batch: usize, samples: usize, counting: bool, fixture: []const u8) !void {
+    const identity = @import("storage/db/doc_identity.zig");
+    const internal = @import("storage/internal_keys.zig");
+    const long = std.mem.eql(u8, fixture, "long");
+    const missing = std.mem.eql(u8, fixture, "missing");
+    if (!long and !missing and !std.mem.eql(u8, fixture, "short")) return error.InvalidOrdinalFixture;
+    const setup = std.heap.smp_allocator;
+    const names = try setup.alloc([512]u8, count);
+    defer setup.free(names);
+    const ids = try setup.alloc([]const u8, count);
+    defer setup.free(ids);
+    const values = try setup.alloc([4]u8, count);
+    defer setup.free(values);
+    var expected_checksum: usize = 0;
+    for (names, ids, values, 0..) |*name, *id, *value, i| {
+        const number = count - 1 - i;
+        const prefix = try std.fmt.bufPrint(name, "document-{d:0>10}", .{number});
+        if (long) {
+            @memset(name[prefix.len..], 'x');
+            name[100] = 0;
+        }
+        id.* = if (long) name else prefix;
+        std.mem.writeInt(u32, value, @intCast(i + 1), .big);
+        if (!missing or number % 5 == 0) expected_checksum += number + 1;
+    }
+    const Txn = struct {
+        values: []const [4]u8,
+        missing: bool,
+        pub fn getManySorted(self: *@This(), keys: []const []const u8, outputs: []?[]const u8) !void {
+            for (keys, outputs, 0..) |key, *output, i| {
+                if (i > 0 and std.mem.order(u8, keys[i - 1], key) == .gt) return error.UnsortedIdentityRead;
+                if (key[0] != internal.identity_namespace or key[1] != internal.identity_doc_to_ordinal_kind or !std.mem.startsWith(u8, key[2..], "document-")) return error.InvalidIdentityKey;
+                const number = try std.fmt.parseInt(usize, key[11..21], 10);
+                if (number >= self.values.len) return error.InvalidIdentityKey;
+                output.* = if (self.missing and number % 5 != 0) null else &self.values[number];
+            }
+        }
+    };
+    // Values are indexed by document number, independent of input order.
+    for (values, 0..) |*value, number| std.mem.writeInt(u32, value, @intCast(number + 1), .big);
+    var txn: Txn = .{ .values = values, .missing = missing };
+    for (0..samples + 1) |sample| {
+        var counter: Counter = .{};
+        const alloc = if (counting) counter.allocator() else std.heap.smp_allocator;
+        var checksum: usize = 0;
+        const started = time.monotonicNs();
+        var offset: usize = 0;
+        while (offset < count) {
+            const end = @min(count, offset + batch);
+            const ordinals = try identity.lookupOrdinalsTxnAlloc(alloc, &txn, ids[offset..end]);
+            defer alloc.free(ordinals);
+            for (ordinals, offset..) |ordinal, i| {
+                const number = count - 1 - i;
+                const expected: ?u32 = if (missing and number % 5 != 0) null else @intCast(number + 1);
+                if (ordinal != expected) return error.InvalidOrdinalResult;
+                checksum += ordinal orelse 0;
+            }
+            offset = end;
+        }
+        const elapsed = time.monotonicNs() - started;
+        if (counter.live != 0 or checksum != expected_checksum) return error.InvalidOrdinalsOrLeakedMemory;
+        if (sample != 0) std.debug.print("{{\"sample\":{d},\"documents\":{d},\"batch\":{d},\"budgeted\":false,\"documents_per_record\":1,\"index_kind\":\"full_text\",\"source\":\"primary\",\"operation\":\"ordinal\",\"repetitions\":1,\"case\":\"{s}\",\"measurement\":\"{s}\",\"elapsed_ns\":{d},\"allocations\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d}}}\n", .{ sample, count, batch, fixture, if (counting) "counted" else "timing", elapsed, counter.calls, counter.bytes, counter.peak, checksum });
     }
 }

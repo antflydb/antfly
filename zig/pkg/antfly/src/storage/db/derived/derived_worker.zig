@@ -621,14 +621,19 @@ const ReplayChunkBuilder = struct {
         value: []const u8,
     ) !void {
         if (value.len == 0) return;
-        if (seen.contains(value)) return;
-        // Compact collection borrows new keys only until appendRecord finishes.
-        // Deduplication precedes allocation of one exact block for the record.
-        const owned = if (self.minimal_key_blocks) value else try self.copyKey(value);
         const prior_list_capacity = list.capacity;
         const prior_seen_capacity = seen.capacity();
-        try seen.put(self.alloc, owned, {});
-        errdefer _ = seen.remove(owned);
+        // Default StringHashMap load limit is public. Avoid getOrPut's
+        // pre-probe growth for duplicates only when the map has no room.
+        const load_limit = @as(u64, prior_seen_capacity) * std.hash_map.default_max_load_percentage / 100;
+        if (seen.count() >= load_limit and seen.contains(value)) return;
+        const entry = try seen.getOrPut(self.alloc, value);
+        if (entry.found_existing) return;
+        errdefer _ = seen.remove(value);
+        // Replace the temporary borrowed key only after ownership succeeds.
+        // Compact records transfer these keys together before the scan returns.
+        const owned = if (self.minimal_key_blocks) value else try self.copyKey(value);
+        entry.key_ptr.* = owned;
         try list.append(self.alloc, owned);
         errdefer list.items.len -= 1;
         var next_tracked_bytes = self.tracked_bytes;
@@ -656,7 +661,7 @@ const ReplayChunkBuilder = struct {
         if (self.minimal_key_blocks or list.items.len != 0 or seen.count() != 0 or keys.len < 16 or keys.len > 128) return;
         var new_count: usize = 0;
         for (keys) |key| {
-            if (key.len != 0 and artifactMatches(key, kind) and !seen.contains(key)) new_count += 1;
+            if (key.len != 0 and artifactMatches(key, kind)) new_count += 1;
         }
         if (new_count < 16) return;
         const desired_list = std.ArrayListUnmanaged([]const u8).growCapacity(try std.math.add(usize, list.items.len, new_count));
@@ -2335,4 +2340,20 @@ test "replay publication releases temporary metadata storage and admission befor
     defer manager.adjustUsage(.document_extraction_working_set, &apply_bytes, 0) catch unreachable;
     try std.testing.expect(counter.live + 400 <= 750);
     try std.testing.expect(counter.peak <= 750);
+}
+
+test "replay batcher duplicate metadata at its load limit does not grow" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var builder = ReplayChunkBuilder.init(failing.allocator(), .{ .name = "text", .kind = .full_text }, null, 0);
+    defer builder.deinit();
+    try builder.seen_changed_docs.ensureTotalCapacity(builder.alloc, 1);
+    const capacity = builder.seen_changed_docs.capacity();
+    const limit = @as(usize, capacity) * std.hash_map.default_max_load_percentage / 100;
+    var names: [16][16]u8 = undefined;
+    try std.testing.expect(limit <= names.len);
+    for (0..limit) |i| try builder.appendRecord(.{ .changed_doc_keys = &.{try std.fmt.bufPrint(&names[i], "key-{d}", .{i})} });
+    const allocations = failing.alloc_index;
+    for (0..256) |_| try builder.appendRecord(.{ .changed_doc_keys = &.{"key-0"} });
+    try std.testing.expectEqual(capacity, builder.seen_changed_docs.capacity());
+    try std.testing.expectEqual(allocations, failing.alloc_index);
 }

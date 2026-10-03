@@ -27,8 +27,9 @@ pub const Scratch = struct {
 
     noinline fn grow(self: *Scratch, stride: usize) !*Block {
         // Keep allocation and overflow handling out of the per-document loop.
-        const preferred = @min(@as(usize, 4096), stride *| self.remaining_keys +| block_header);
-        const bytes = @max(preferred, try std.math.add(usize, stride, block_header));
+        const slots = @max(@as(usize, 1), (4096 - block_header) / stride);
+        const count = @max(@as(usize, 1), @min(slots, self.remaining_keys));
+        const bytes = try std.math.add(usize, try std.math.mul(usize, stride, count), block_header);
         const memory = try self.alloc.alignedAlloc(u8, .fromByteUnits(key_alignment), bytes);
         const block: *Block = @ptrCast(memory.ptr);
         block.* = .{ .next = self.head, .len = bytes, .used = 0 };
@@ -47,14 +48,26 @@ pub const Scratch = struct {
             self.remaining_keys -|= 1;
             return document;
         }
-        const len = try std.math.add(usize, keys.encodedComponentLen(document), 2);
+        const output = try self.buffer(try std.math.add(usize, keys.encodedComponentLen(document), 2), key_alignment);
+        encode(output, document, relational);
+        return output;
+    }
+
+    pub inline fn identityKey(self: *Scratch, document: []const u8) ![]const u8 {
+        const output = try self.buffer(try std.math.add(usize, keys.encodedComponentLen(document), 2), 1);
+        output[0] = keys.identity_namespace;
+        output[1] = keys.identity_doc_to_ordinal_kind;
+        _ = keys.encodeComponent(output[2..], document);
+        return output;
+    }
+
+    inline fn buffer(self: *Scratch, len: usize, comptime slot_alignment: usize) ![]u8 {
         // Keep short encoded keys in aligned slots for repeated comparisons.
-        const stride = (try std.math.add(usize, len, key_alignment - 1)) & ~@as(usize, key_alignment - 1);
+        const stride = (try std.math.add(usize, len, slot_alignment - 1)) & ~@as(usize, slot_alignment - 1);
         if (stride <= self.inline_bytes.len - self.inline_used) {
             const output = self.inline_bytes[self.inline_used..][0..len];
             self.inline_used += stride;
             self.remaining_keys -|= 1;
-            encode(output, document, relational);
             return output;
         }
         const block = if (self.head) |current|
@@ -62,7 +75,6 @@ pub const Scratch = struct {
         else
             try self.grow(stride);
         const output = @as([*]u8, @ptrCast(block))[block_header + block.used ..][0..len];
-        encode(output, document, relational);
         block.used += stride;
         self.remaining_keys -|= 1;
         return output;
