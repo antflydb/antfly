@@ -2284,7 +2284,7 @@ const LocalMutationExecution = struct {
     const acquireReplicationMutationShared = DB.acquireReplicationMutationShared;
     const acquireTransactionSchemaView = DB.acquireTransactionSchemaView;
     const artifactMaterializationsReady = DB.artifactMaterializationsReady;
-    const graphCleanupRequiresOrderedApply = DB.graphCleanupRequiresOrderedApply;
+    const maintenanceRequiresOrderedApply = DB.maintenanceRequiresOrderedApply;
     fn finishBatchGraphEndpointCleanup(_: *@This(), _: types.BatchRequest, _: BatchExecutionOptions) !void {
         // Recovery owns only the committed mutation. The resident DB services
         // its durable jobs independently after recovery releases admission.
@@ -5437,10 +5437,6 @@ pub const DB = struct {
     artifact_producer_work_cursor: ?@import("artifact_producer_obligations.zig").WorkCursor = null,
     artifact_producer_retry_after_ns: ?u64 = null,
     artifact_producer_retry_round: ?struct { authority: @import("artifact_publication.zig").Authority, number: u64, more: bool = false } = null,
-    artifact_upload_recovery_cursor: std.atomic.Value(u64) = .init(0),
-    artifact_upload_recovery_mutex: std.Io.Mutex = .init,
-    artifact_upload_recovery_tracker: @import("artifact_publication_transport.zig").RecoveryTracker = .{},
-    artifact_upload_recovery_retry_after_ns: std.atomic.Value(u64) = .init(0),
     /// Bounded no-progress guard for `runUntilIdle` (see `OpenOptions.
     /// run_until_idle_no_progress_timeout_ms` and `ReplayDrainOptions.
     /// no_progress_timeout_ns`); 0 disables it. Copied into `ReplayDrainOptions`
@@ -9642,7 +9638,7 @@ pub const DB = struct {
             try self.waitForCurrentSyncLevelWithCancellation(.full_index, opts.visibility_cancellation);
     }
 
-    /// Local maintenance follows the same live HA authority as user writes.
+    /// Local maintenance follows the same captured write admission as user writes.
     /// A retained standby/fenced generation may open and replay exact commands,
     /// but cannot choose cleanup effects or mutate its local directory on its own.
     fn graphEndpointCleanupWriteAuthority(self: *DB) !bool {
@@ -9652,16 +9648,13 @@ pub const DB = struct {
 
     fn canRunLocalGraphEndpointCleanup(self: *DB) !bool {
         if (!try self.graphEndpointCleanupWriteAuthority()) return false;
-        return !try self.graphCleanupRequiresOrderedApply();
+        return !try self.maintenanceRequiresOrderedApply();
     }
 
-    fn graphCleanupRequiresOrderedApply(self: anytype) !bool {
-        return blk: {
-            var read = try self.core.store.beginReadTxn();
-            defer read.abort();
-            if (try @import("../source_authority.zig").load(&read)) |authority| if (authority.kind == .raft) break :blk true;
-            break :blk if (read.get(&internal_keys.ordered_document_applied_entry_key)) |_| true else |err| if (err == error.NotFound) false else return err;
-        };
+    fn maintenanceRequiresOrderedApply(self: anytype) !bool {
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        return try @import("../source_authority.zig").maintenanceMode(&read) == .ordered;
     }
 
     fn startGraphEndpointCleanupWorker(self: *DB) void {
@@ -12568,7 +12561,7 @@ pub const DB = struct {
         if (req.graph_endpoint_cleanup and !req.graph_endpoint_cleanup_planned) {
             // Recheck under the apply fence: ownership may have changed since
             // the scheduler or foreground drain probed it.
-            if (try self.graphCleanupRequiresOrderedApply()) return error.InvalidBatchRequest;
+            if (try self.maintenanceRequiresOrderedApply()) return error.InvalidBatchRequest;
             effective_req.graph_endpoint_cleanup_planned = true;
             graph_cleanup_page = try self.core.store.prepareGraphEndpointCleanupPage(self.alloc);
             if (graph_cleanup_page) |page| {
@@ -34902,13 +34895,13 @@ pub const DB = struct {
             defer activity.deinit();
             // No resolver can be removed while an old decision or promotion is
             // in flight. Wake the existing owner and retry on a later refresh.
-            const promotion = self.promotionStageStats();
-            // Followers cannot promote. Their queued hints reference the live
-            // artifacts deleted below and cannot publish after this callback
-            // fence; they must not prevent local catalog retirement forever.
-            const follower = std.mem.eql(u8, promotion.blocked_reason, "not_source_group_leader");
-            if (self.resolutionStageStats().catch_up_required or
-                (!follower and (promotion.catch_up_required or promotion.blocked)))
+            const promotion_ready = if (self.promotion_runtime) |runtime|
+                runtime.retirementReadinessLocked() != .pending
+            else blk: {
+                const persisted = self.promotionStageStats();
+                break :blk !persisted.catch_up_required and !persisted.blocked;
+            };
+            if (self.resolutionStageStats().catch_up_required or !promotion_ready)
                 return error.WriterLocked;
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
@@ -37259,16 +37252,10 @@ pub const DB = struct {
 
     fn runIndependentMaintenancePass(self: *DB) void {
         self.enforcePortableRuntimeGate() catch return;
-        const recovery_now = self.independentMaintenanceNowNs();
-        if (recovery_now >= self.artifact_upload_recovery_retry_after_ns.load(.acquire)) {
-            // Recovery must not inherit the tight active scan cadence: a
-            // coverage-blocked finalize may remain pending for many passes.
-            self.artifact_upload_recovery_retry_after_ns.store(recovery_now +| artifact_repair_metadata_poll_ns, .release);
-            _ = self.advanceArtifactUploadRecovery() catch |err| switch (err) {
-                error.NotLeader, error.Canceled, error.ResourceLimitExceeded, error.ResourceBudgetExceeded, error.ArtifactCatalogDrift => {},
-                else => std.log.warn("artifact upload recovery failed: {s}", .{@errorName(err)}),
-            };
-        }
+        _ = self.advanceArtifactUploadRecoveryWithTrigger(.maintenance) catch |err| switch (err) {
+            error.NotLeader, error.Canceled, error.ResourceLimitExceeded, error.ResourceBudgetExceeded, error.ArtifactCatalogDrift => {},
+            else => std.log.warn("artifact upload recovery failed: {s}", .{@errorName(err)}),
+        };
         _ = self.advanceArtifactProducerBaselinePage() catch |err| blk: {
             self.artifact_producer_baseline_pending.store(false, .release);
             switch (err) {
@@ -37330,30 +37317,33 @@ pub const DB = struct {
         return complete;
     }
 
-    /// Discover bounded upload state without reading payloads, then select a
-    /// ready finalization or idle retirement. Release the snapshot and tracker
-    /// mutex before dispatch; refusal retains the cursor and durable work.
-    /// Admission is only a hint, never an acknowledgement or seal.
+    /// Discover bounded durable upload facts without payload reads. Release
+    /// the storage snapshot before invoking the external scheduling owner.
+    /// Admission remains a hint, never an acknowledgement or seal.
     pub fn advanceArtifactUploadRecovery(self: *DB) !bool {
+        return self.advanceArtifactUploadRecoveryWithTrigger(.explicit);
+    }
+
+    fn advanceArtifactUploadRecoveryWithTrigger(self: *DB, trigger: @FieldType(@import("artifact_publication.zig").UploadRecoveryInvocation, "trigger")) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
         const dispatcher = self.local_execution.artifact_publication_dispatcher orelse return false;
+        const recover = dispatcher.recover_uploads orelse return false;
+        const now_ns = self.independentMaintenanceNowNs();
+        if (dispatcher.should_recover_uploads) |should_poll| {
+            if (!should_poll(dispatcher.ptr, .{ .now_ns = now_ns, .trigger = trigger })) return false;
+        }
         const inventory = blk: {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
-            const owner = (try @import("../source_authority.zig").load(&read)) orelse return false;
-            if (owner.kind != .raft) return false;
-            break :blk try @import("artifact_publication_transport.zig").recoveryInventory(&read, owner.namespace);
+            const namespace = (try @import("../source_authority.zig").externalPublicationNamespace(&read)) orelse return false;
+            break :blk try @import("artifact_publication_transport.zig").recoveryInventory(&read, namespace);
         };
-        const hint = blk: {
-            const io = self.core.index_manager.checkpointIo();
-            self.artifact_upload_recovery_mutex.lockUncancelable(io);
-            defer self.artifact_upload_recovery_mutex.unlock(io);
-            break :blk self.artifact_upload_recovery_tracker.observe(inventory, self.independentMaintenanceNowNs(), self.artifact_upload_recovery_cursor.load(.acquire)) orelse return false;
-        };
-        const encoded = hint.encode();
-        try dispatcher.enqueue(dispatcher.ptr, hint.namespace, &encoded);
-        self.artifact_upload_recovery_cursor.store(hint.created_index, .release);
-        return true;
+        return recover(dispatcher.ptr, .{
+            .io = self.core.index_manager.checkpointIo(),
+            .now_ns = now_ns,
+            .inventory = inventory,
+            .trigger = trigger,
+        });
     }
 
     /// Append root-producer requests using the existing durable replay journal.
@@ -37433,8 +37423,8 @@ pub const DB = struct {
         {
             var read = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
             defer read.abort();
-            const owner = (try @import("../source_authority.zig").load(&read)) orelse return error.ArtifactCatalogDrift;
-            if (owner.kind != .raft) return;
+            const owner = (try @import("../source_authority.zig").publicationOwner(&read)) orelse return error.ArtifactCatalogDrift;
+            if (owner.mode != .ordered) return;
             action = (try @import("artifact_completion_progress.zig").discoverNextAction(scratch, &read, self.root_incarnation, document, plan, .{})) orelse return;
             switch (action.?) {
                 .control => |*prepared| {

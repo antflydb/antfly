@@ -2981,8 +2981,13 @@ fn testAcceptedArtifactUpload(inject_missing_counter: bool) !void {
             try txn.commit();
         }
         const Capture = struct {
+            scheduler: @import("artifact_upload_recovery.zig").Scheduler = .{},
             refused: bool = true,
             hint: ?transport.RecoveryHint = null,
+            fn recover(ptr: *anyopaque, invocation: publication.UploadRecoveryInvocation) !bool {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                return self.scheduler.advance(.{ .ptr = self, .enqueue = enqueue }, invocation);
+            }
             fn enqueue(ptr: *anyopaque, namespace: [24]u8, bytes: []const u8) !void {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 if (self.refused) return error.ResourceLimitExceeded;
@@ -2991,10 +2996,10 @@ fn testAcceptedArtifactUpload(inject_missing_counter: bool) !void {
             }
         };
         var capture: Capture = .{};
-        db.local_execution.artifact_publication_dispatcher = .{ .ptr = &capture, .enqueue = Capture.enqueue };
+        db.local_execution.artifact_publication_dispatcher = .{ .ptr = &capture, .enqueue = Capture.enqueue, .recover_uploads = Capture.recover };
         defer db.local_execution.artifact_publication_dispatcher = null;
         try std.testing.expectError(error.ResourceLimitExceeded, db.advanceArtifactUploadRecovery());
-        try std.testing.expectEqual(@as(u64, 0), db.artifact_upload_recovery_cursor.load(.acquire));
+        try std.testing.expectEqual(@as(u64, 0), capture.scheduler.cursor.load(.acquire));
         capture.refused = false;
         try std.testing.expect(try db.advanceArtifactUploadRecovery());
         recovered = capture.hint.?;
@@ -3219,9 +3224,9 @@ test "db ordered artifact inventory idle upload retirement replays across owners
                 var read = try db.core.store.beginReadTxn();
                 defer read.abort();
                 const inventory = try transport.recoveryInventory(&read, namespace);
-                var tracker: transport.RecoveryTracker = .{};
+                var tracker: @import("artifact_upload_recovery.zig").RecoveryTracker = .{};
                 try std.testing.expect(tracker.observe(inventory, 0, 0) == null);
-                const hint = tracker.observe(inventory, transport.RecoveryTracker.idle_ns, 0).?;
+                const hint = tracker.observe(inventory, @import("artifact_upload_recovery.zig").RecoveryTracker.idle_ns, 0).?;
                 if (before_chunk) |expected| try std.testing.expectEqualDeep(expected, hint) else before_chunk = hint;
             }
             try server_test_adapter.applyOrdered(&db, .{ .artifact_publication_transport = .{ .action = .chunk, .namespace = namespace, .publication_digest = begin.publication_digest, .manifest_root = begin.proposedManifest().root(), .chunk_base64 = base64 } }, .{ .term = 1, .index = 6 });
@@ -3231,9 +3236,9 @@ test "db ordered artifact inventory idle upload retirement replays across owners
             const inventory = try transport.recoveryInventory(&read, namespace);
             try std.testing.expectEqual(@as(usize, 1), inventory.count);
             try std.testing.expect(!inventory.entries[0].complete);
-            var tracker: transport.RecoveryTracker = .{};
+            var tracker: @import("artifact_upload_recovery.zig").RecoveryTracker = .{};
             _ = tracker.observe(inventory, 0, 0);
-            const hint = tracker.observe(inventory, transport.RecoveryTracker.idle_ns, 0).?;
+            const hint = tracker.observe(inventory, @import("artifact_upload_recovery.zig").RecoveryTracker.idle_ns, 0).?;
             if (after_chunk) |expected| try std.testing.expectEqualDeep(expected, hint) else after_chunk = hint;
         }
         var reopened = try DB.open(alloc, path, options);

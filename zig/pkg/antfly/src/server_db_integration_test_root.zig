@@ -5,4 +5,5 @@ test {
     _ = @import("storage/db/maintenance/transaction_runtime.zig");
     _ = @import("storage/server_db_integration_test.zig");
     _ = @import("storage/server_transaction_recovery.zig");
+    _ = @import("storage/artifact_upload_recovery.zig");
 }

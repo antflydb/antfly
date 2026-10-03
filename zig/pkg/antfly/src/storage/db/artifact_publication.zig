@@ -880,8 +880,26 @@ pub fn validateSources(alloc: std.mem.Allocator, txn: anytype, namespace: Namesp
     }
 }
 
+pub const UploadRecoveryTick = struct {
+    now_ns: u64,
+    trigger: enum { maintenance, explicit },
+};
+
+pub const UploadRecoveryInvocation = struct {
+    io: std.Io,
+    now_ns: u64,
+    inventory: @import("artifact_publication_transport.zig").RecoveryInventory,
+    trigger: @FieldType(UploadRecoveryTick, "trigger"),
+};
+
 pub const Dispatcher = struct {
     ptr: *anyopaque,
+    /// Cheap owner cadence check before storage discovers bounded facts.
+    should_recover_uploads: ?*const fn (*anyopaque, UploadRecoveryTick) bool = null,
+    /// Borrowed synchronous owner hook. The snapshot has been released before
+    /// invocation. Queue scheduling, fairness and retry state belong to the
+    /// external owner; absence leaves local storage recovery inert.
+    recover_uploads: ?*const fn (*anyopaque, UploadRecoveryInvocation) anyerror!bool = null,
     /// No storage/apply lock may be held here. Success means bounded queue
     /// admission only; output remains pending until the local durable receipt.
     enqueue: *const fn (*anyopaque, Namespace, []const u8) anyerror!void,

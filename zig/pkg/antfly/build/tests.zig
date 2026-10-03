@@ -4753,7 +4753,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-local-transaction-recovery-test", "Run local transaction recovery regressions").dependOn(&addFilteredTestRunArtifact(b, local_recovery_tests).step);
-    const server_db_filters = [_][]const u8{ "storage.server_db_integration_test.", "storage.server_transaction_recovery." };
+    const server_db_filters = [_][]const u8{ "storage.server_db_integration_test.", "storage.server_transaction_recovery.", "storage.artifact_upload_recovery." };
     const server_db_tests = b.addTest(.{
         .root_module = server_db_test_mod,
         .filters = &server_db_filters,
@@ -5685,6 +5685,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     release_blocker_regression_step.dependOn(&run_release_blocker_regression_tests.step);
     unit_test_step.dependOn(&run_release_blocker_regression_tests.step);
 
+    // A focused entry point for the local maintenance ports. The ordinary
+    // support shard and server DB suite retain aggregate test ownership.
+    const local_maintenance_tests = b.addTest(.{
+        .name = "local-maintenance-contract-tests",
+        .root_module = antfly_test_mod,
+        .filters = &.{ "storage.source_authority.", "storage.db.promotion_runtime.", "storage.db.artifact_publication_transport." },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_local_maintenance_tests = addCuratedTestRunArtifact(b, local_maintenance_tests, local_maintenance_tests.filters);
+    b.step("antfly-local-maintenance-test", "Run local maintenance requirement and recovery contract regressions").dependOn(&run_local_maintenance_tests.step);
+
     // A small independently compilable entry point for work-count regressions
     // and repeated measurements. The ordinary storage gate also owns them.
     const storage_work_contract_tests = b.addTest(.{
@@ -6019,6 +6030,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.graph_retirement_seal.",
             "storage.db.empty_generation_handoff.",
             "storage.db.receipt_position.",
+            "storage.db.graph_edge_types.",
             "storage.db.graph_edge_ttl_expiration.",
             "storage.db.graph_edge_ttl_tombstone.",
             "storage.db.graph_state_name.",
@@ -6125,6 +6137,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.retained_read_registry.",
             "storage.row_identity.",
             "storage.statement_read_fence.",
+            "storage.document_mutation_revision.",
+            "storage.source_authority.",
             "storage.typed_json.",
             "storage.vector_payload_store.",
             "storage.vector_wal_view.",
@@ -6232,7 +6246,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         unit_storage_shard_audit.addArg("--dedicated");
         unit_storage_shard_audit.addFileArg(b.path(b.fmt("pkg/antfly/src/storage/{s}", .{source})));
     }
-    for ([_][]const u8{ "server_db_integration_test.zig", "server_transaction_recovery.zig" }) |source| {
+    for ([_][]const u8{ "server_db_integration_test.zig", "server_transaction_recovery.zig", "artifact_upload_recovery.zig" }) |source| {
         unit_storage_shard_audit.addArg("--dedicated");
         unit_storage_shard_audit.addFileArg(b.path(b.fmt("pkg/antfly/src/storage/{s}", .{source})));
     }

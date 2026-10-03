@@ -21,6 +21,9 @@
 //! duplicate, stale, or multiply-owned entries before any shard is compiled.
 
 comptime {
+    _ = @import("document_mutation_revision.zig");
+    _ = @import("db/graph_edge_types.zig");
+    _ = @import("source_authority.zig");
     _ = @import("db/apply_receipts.zig");
     _ = @import("db/durable_outbox.zig");
     _ = @import("db/durable_outbox_store.zig");
@@ -275,7 +278,6 @@ comptime {
     _ = @import("hot_standby/replication_api.zig");
     _ = @import("hot_standby/replication_log.zig");
     _ = @import("db/replication_record.zig");
-    _ = @import("db/primary_effect.zig");
     _ = @import("hot_standby/seed_activation.zig");
     _ = @import("hot_standby/seed_artifact.zig");
     _ = @import("hot_standby/seed_capture.zig");

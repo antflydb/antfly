@@ -98,3 +98,24 @@ The focused storage gate validates caller filters against the combined local
 and server test inventories before dispatching to either owner. A filter may
 select just one owner; unknown filters still fail. The server's aggregate
 slice remains independent of filters intended for the local root.
+
+## Local maintenance requirements and external upload recovery
+
+Resolver retirement asks the promotion runtime for typed readiness while holding
+its catalog activity fence. Diagnostic status strings remain available to users
+but do not grant retirement authority. A pending publisher blocks retirement;
+a runtime without local publication ownership leaves server reconciliation free
+to remove its local resolver.
+
+Storage interprets historical source-authority records as local or ordered
+maintenance requirements. The persisted format, legacy ordered receipt fence,
+publication namespace, and corruption checks remain unchanged. DB maintenance
+uses these requirements without selecting a Raft role.
+
+`storage/artifact_upload_recovery.zig` owns upload polling cadence, idle detection,
+fairness, and queue admission cursors. A cheap borrowed dispatcher hook checks
+cadence before DB reads its bounded upload inventory. Storage releases the read
+snapshot before handing those facts to the owner; the owner releases its own
+mutex before queue admission. A refused proposal never advances its cursor.
+Explicit retries bypass periodic cadence. Durable exact-incarnation and progress
+checks remain in storage and are the only authority to retire upload bytes.

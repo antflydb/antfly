@@ -513,10 +513,21 @@ pub const StorageOwnerRuntimeHooks = struct {
 
     config: kernel_owner_abi.RuntimeHooksConfig,
     group_id: u64,
+    artifact_upload_recovery: @import("../storage/artifact_upload_recovery.zig").Scheduler = .{},
 
     pub fn artifactPublicationDispatcher(self: *StorageOwnerRuntimeHooks) ?db_mod.ArtifactPublicationDispatcher {
         if (self.config.artifact_publication_enqueue_fn == null) return null;
-        return .{ .ptr = self, .enqueue = enqueueArtifactPublication };
+        return .{ .ptr = self, .enqueue = enqueueArtifactPublication, .recover_uploads = recoverArtifactUploads, .should_recover_uploads = shouldRecoverArtifactUploads };
+    }
+
+    fn shouldRecoverArtifactUploads(ptr: *anyopaque, tick: @import("../storage/db/artifact_publication.zig").UploadRecoveryTick) bool {
+        const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
+        return self.artifact_upload_recovery.shouldPoll(tick);
+    }
+
+    fn recoverArtifactUploads(ptr: *anyopaque, invocation: @import("../storage/db/artifact_publication.zig").UploadRecoveryInvocation) !bool {
+        const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
+        return self.artifact_upload_recovery.advance(self.artifactPublicationDispatcher().?, invocation);
     }
 
     pub fn enqueueArtifactPublication(ptr: *anyopaque, namespace: [24]u8, command: []const u8) !void {
