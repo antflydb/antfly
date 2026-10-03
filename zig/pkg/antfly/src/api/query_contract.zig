@@ -445,6 +445,7 @@ pub const QueryResponseMeta = struct {
         lookup_doc_key_hits: u32 = 0,
     };
 
+    evaluation_json: ?[]u8 = null,
     took_ms: i64 = 0,
     shard_count: u32 = 1,
     merged: bool = false,
@@ -454,6 +455,7 @@ pub const QueryResponseMeta = struct {
     aggregation_results: []aggregations_mod.SearchAggregationResult = &.{},
 
     pub fn deinit(self: *QueryResponseMeta, alloc: std.mem.Allocator) void {
+        if (self.evaluation_json) |data| alloc.free(data);
         aggregations_mod.deinitResults(alloc, self.aggregation_results);
         self.* = undefined;
     }
@@ -2179,12 +2181,46 @@ pub const SemanticResolver = struct {
     }
 };
 
+fn applyDecisionGraphInputProjection(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest) !void {
+    if (req.evaluation_limit == 0) return;
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const raw = try std.json.parseFromSliceLeaky(std.json.Value, scratch.allocator(), req.evaluation_json, .{});
+    const plan = try @import("../functions/expressions.zig").Plan.parse(scratch.allocator(), raw);
+    if (plan.graph_query) |name| for (@constCast(req.graph_queries)) |*graph| {
+        if (std.mem.eql(u8, graph.name, name)) {
+            graph.query.defer_document_projection = true;
+            graph.query.evaluation_output_limit = graph.query.return_limit;
+            graph.query.return_limit = plan.candidate_count;
+            graph.query.params.max_results = plan.candidate_count;
+            if (@as(usize, plan.candidate_count) * graph.query.return_aliases.len > public_limits.max_graph_hydrated_bindings) return error.DecisionLimitExceeded;
+        }
+    };
+}
+
 fn applyCommonSearchRequestOptions(
     alloc: std.mem.Allocator,
     request: anytype,
     req: *db_mod.types.SearchRequest,
 ) !void {
     if (request.limit) |limit| req.limit = @intCast(limit);
+    if (comptime @hasField(@TypeOf(request), "evaluate")) {
+        if (request.evaluate) |evaluation| {
+            req.evaluation_json = try jsonStringifyAlloc(alloc, evaluation);
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            const raw = try std.json.parseFromSliceLeaky(std.json.Value, scratch.allocator(), req.evaluation_json, .{});
+            const plan = try @import("../functions/expressions.zig").Plan.parse(scratch.allocator(), raw);
+            req.evaluation_limit = plan.candidate_count;
+            req.evaluation_matches = plan.scope == .matches;
+            req.evaluation_graph = plan.graph_query != null;
+            req.include_stored = true;
+            req.defer_stored_projection = true;
+            if (request.search_after != null or request.search_before != null or request.reranker != null or request.pruner != null or request.aggregations != null) return error.UnsupportedQueryRequest;
+            if (req.evaluation_matches and (request.semantic_search != null or request.embeddings != null)) return error.UnsupportedQueryRequest;
+        }
+    }
+
     if (request.offset) |offset| req.offset = @intCast(offset);
     if (request.count) |count| req.count_only = count;
     const has_result_page_options =
@@ -2231,10 +2267,11 @@ fn applyCommonSearchRequestOptions(
 
     const has_semantic = request.semantic_search != null or request.embeddings != null;
     // Approximate vector sources cannot page independently by offset. A
-    // coordinator-owned reranker is different: component and shard retrieval
-    // are widened to the bounded candidate window, then offset/limit are
-    // applied once after global scoring.
-    if (has_semantic and req.offset > 0 and req.reranker == null) return error.UnsupportedQueryRequest;
+    // coordinator-owned reranker or hit evaluation widens component and shard
+    // retrieval to its bounded candidate window, then applies offset/limit
+    // once after global scoring and filtering. Graph evaluation does not
+    // change the retrieval window of ordinary hits.
+    if (has_semantic and req.offset > 0 and req.reranker == null and !req.hasHitEvaluation()) return error.UnsupportedQueryRequest;
     if (has_semantic and req.order_by.len > 0) {
         return unsupportedExactSort(approximateSemanticSortField(req.order_by), "approximate_candidate_source", "approximate_candidate_source");
     }
@@ -2347,8 +2384,8 @@ fn applySearchRequestFields(
         &.{};
     req.fields = fields;
     req.include_all_fields = include_all_fields;
-    req.include_stored = include_all_fields or fields.len > 0 or req.reranker != null;
-    req.defer_stored_projection = canDeferStoredProjection(fields) or
+    req.include_stored = include_all_fields or fields.len > 0 or req.reranker != null or req.hasHitEvaluation();
+    req.defer_stored_projection = req.hasHitEvaluation() or canDeferStoredProjection(fields) or
         !req.hierarchy_match_include_all_fields or
         !req.hierarchy_source_include_all_fields or
         !req.hierarchy_unit_include_all_fields;
@@ -2701,7 +2738,7 @@ pub fn parseQueryRequestWithDeadline(
     // include-all projections at the DB boundary.
     try validateCanonicalHierarchyExecutionBudget(req);
 
-    var normalized_query = try normalizePublicQueryBucketsAlloc(alloc, request, req.limit);
+    var normalized_query = try normalizePublicQueryBucketsAlloc(alloc, request, if (req.hasHitEvaluation()) req.evaluation_limit else req.limit);
     errdefer normalized_query.deinit(alloc);
     try ensureQueryDeadline(execution_deadline_ns);
 
@@ -2751,7 +2788,7 @@ pub fn parseQueryRequestWithDeadline(
     try ensureQueryDeadline(execution_deadline_ns);
 
     {
-        const vector_queries = try buildSemanticVectorQueries(alloc, semantic_resolver, table_name, request, req.limit);
+        const vector_queries = try buildSemanticVectorQueries(alloc, semantic_resolver, table_name, request, if (req.hasHitEvaluation()) req.evaluation_limit else req.limit);
         errdefer vector_queries.deinit(alloc);
         try ensureQueryDeadline(execution_deadline_ns);
         req.dense_queries = vector_queries.dense;
@@ -2761,6 +2798,7 @@ pub fn parseQueryRequestWithDeadline(
     if (contract_fields.has_embedding_limits)
         try applyInternalEmbeddingLimits(alloc, effective_body, &req);
     req.graph_queries = try buildGraphQueries(alloc, request);
+    try applyDecisionGraphInputProjection(alloc, &req);
     req.graph_metric_queries = try parseGraphMetricQueriesAlloc(alloc, effective_body);
     req.graph_metric_rerank = try parseGraphMetricRerankAlloc(alloc, request.graph_metric_rerank, effective_body);
     if (req.graph_metric_rerank) |rerank| {
@@ -2780,6 +2818,55 @@ pub fn parseQueryRequestWithDeadline(
         .fields = fields,
         .req = req,
     };
+}
+
+/// Storage-only public consumers have no coordinator expression executor.
+/// Reject evaluation before semantic resolution or storage work, rather than
+/// accepting a stage whose filters and computed output would be ignored.
+pub fn validateStoragePublicQueryRequest(alloc: std.mem.Allocator, body: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), body, .{}) catch |err| {
+        return if (err == error.OutOfMemory) err else error.InvalidQueryRequest;
+    };
+    try validatePublicQueryEnvelopeValueAlloc(arena.allocator(), root);
+    if (root.object.get("evaluate")) |stage| {
+        if (stage != .null) return error.UnsupportedQueryRequest;
+    }
+}
+
+test "api query contract storage public consumers reject evaluation before execution" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{
+        "{\"evaluate\":{\"scope\":\"candidates\",\"candidate_count\":2,\"compute\":{\"x\":{\"literal\":1}},\"where\":{\"eq\":[{\"literal\":1},{\"literal\":0}]}}}",
+        "{\"eval\\u0075ate\":{}}",
+    }) |body| try std.testing.expectError(error.UnsupportedQueryRequest, validateStoragePublicQueryRequest(alloc, body));
+    try validateStoragePublicQueryRequest(alloc, "{\"evaluate\":null}");
+    try validateStoragePublicQueryRequest(alloc, "{\"full_text_search\":{\"match_all\":{}}}");
+}
+
+test "api query contract hierarchy worker wire preserves explicit deferred projection" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{
+        "{\"hierarchy\":{\"children\":{\"parent\":{\"level\":\"source\",\"id\":\"doc:a\"},\"level\":\"unit\"}},\"fields\":[\"unit_id\",\"unit_type\",\"text\"],\"order_by\":[{\"field\":\"_hierarchy.position\"}],\"limit\":1}",
+        "{\"full_text_search\":{\"match\":\"needle\",\"field\":\"content\"},\"fields\":[\"text\"],\"hierarchy\":{\"group_by\":{\"level\":\"unit\"}},\"limit\":1}",
+        "{\"full_text_search\":{\"match\":\"needle\",\"field\":\"content\"},\"fields\":[\"title\"],\"hierarchy\":{\"group_by\":{\"level\":\"source\",\"matches\":{\"fields\":[\"text\"]}}},\"limit\":1}",
+    }) |body| {
+        var original = try parsePublicQueryRequest(alloc, null, "docs", body);
+        defer original.deinit(alloc);
+        try std.testing.expect(original.req.defer_stored_projection);
+        const wire = try @import("local_query_contract.zig").encodeQueryRequest(alloc, original.req);
+        defer alloc.free(wire);
+        var worker = try parseQueryRequest(alloc, null, "docs", wire);
+        defer worker.deinit(alloc);
+        try std.testing.expectEqual(original.req.hierarchy_children != null, worker.req.hierarchy_children != null);
+        try std.testing.expectEqual(original.req.hierarchy_group_level, worker.req.hierarchy_group_level);
+        try std.testing.expectEqual(original.req.hierarchy_grouped_matches, worker.req.hierarchy_grouped_matches);
+        try std.testing.expect(!worker.req.include_all_fields);
+        try std.testing.expect(worker.req.defer_stored_projection);
+        try std.testing.expectEqual(original.req.fields.len, worker.req.fields.len);
+        for (original.req.fields, worker.req.fields) |expected, actual| try std.testing.expectEqualStrings(expected, actual);
+    }
 }
 
 pub fn parsePublicQueryRequest(
@@ -2831,6 +2918,13 @@ pub fn isPublicQueryValidationError(err: anyerror) bool {
         error.UnsupportedFilterQueryRequest,
         error.UnsupportedExclusionQueryRequest,
         error.RerankerCandidateLimitExceeded,
+        error.InvalidDecisionSpecification,
+        error.InvalidFunctionExpression,
+        error.UnknownQueryFunction,
+        error.UnknownFunctionBinding,
+        error.CyclicFunctionBinding,
+        error.FunctionTypeMismatch,
+        error.DecisionLimitExceeded,
         => true,
         else => false,
     };
@@ -3136,7 +3230,7 @@ fn buildPreflightSearchRequestAlloc(
     const fields = try applySearchRequestFields(alloc, request.fields, &req);
     errdefer freeClonedFields(alloc, fields);
 
-    var normalized_query = try normalizePublicQueryBucketsAlloc(alloc, request, req.limit);
+    var normalized_query = try normalizePublicQueryBucketsAlloc(alloc, request, if (req.hasHitEvaluation()) req.evaluation_limit else req.limit);
     errdefer normalized_query.deinit(alloc);
 
     if (normalized_query.full_text) |query| {
@@ -3172,12 +3266,13 @@ fn buildPreflightSearchRequestAlloc(
     req.exclusion_query_json = normalized_query.exclusion_query_json;
     normalized_query.exclusion_query_json = "";
 
-    const vector_queries = try buildPreflightSemanticVectorQueries(alloc, request, req.limit);
+    const vector_queries = try buildPreflightSemanticVectorQueries(alloc, request, if (req.hasHitEvaluation()) req.evaluation_limit else req.limit);
     errdefer vector_queries.deinit(alloc);
     req.dense_queries = vector_queries.dense;
     req.sparse_queries = vector_queries.sparse;
     try normalizeVectorMatchAllComponent(alloc, request, &req);
     req.graph_queries = try buildGraphQueries(alloc, request);
+    try applyDecisionGraphInputProjection(alloc, &req);
     if (comptime @hasField(@TypeOf(request), "expand_strategy")) {
         if (request.expand_strategy) |expand_strategy| {
             req.expand_strategy = try parseExpandStrategy(expand_strategy);
@@ -3362,6 +3457,7 @@ fn fastDensePublicQueryMayApply(body: []const u8) bool {
         "\"merge_config\"",
         "\"reranker\"",
         "\"pruner\"",
+        "\"evaluate\"",
         "\"semantic_search\"",
         "\"sparse\"",
         "\"graph\"",
@@ -3551,6 +3647,7 @@ pub fn encodeQueryResponses(
                     .hits = hits,
                     .max_score = computeMaxScore(emitted_hits),
                 },
+                .evaluation = if (meta.evaluation_json) |data| try takeOpenApiObjectMap(arena, try ant_json.parseFromSliceLeaky(std.json.Value, arena, data, .{})) else null,
                 .aggregations = aggregations,
                 .graph_metric_results = graph_metric_results,
                 .graph_results = graph_results,
@@ -3581,6 +3678,7 @@ pub fn encodeQueryResponses(
                     .hits = hits,
                     .max_score = computeMaxScore(emitted_hits),
                 },
+                .evaluation = if (meta.evaluation_json) |data| try takeOpenApiObjectMap(arena, try ant_json.parseFromSliceLeaky(std.json.Value, arena, data, .{})) else null,
                 .aggregations = aggregations,
                 .graph_metric_results = graph_metric_results,
                 .graph_results = graph_results,
@@ -3611,6 +3709,7 @@ fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: 
     try validateOpenApiHitSortTuple(req, hit);
 
     return .{
+        ._computed = if (hit.computed_json) |data| try takeOpenApiObjectMap(alloc, try ant_json.parseFromSliceLeaky(std.json.Value, alloc, data, .{})) else null,
         ._id = hit.id,
         ._score = if (hit.score) |score| finiteScoreOrZero(score) else 0,
         ._score_details = toOpenApiScoreDetails(hit.score_details),
@@ -4992,6 +5091,10 @@ const GraphDocumentLookup = struct {
         hits: []const db_mod.types.SearchHit,
         enabled: bool,
     ) !GraphDocumentLookup {
+        return initProjected(alloc, hits, enabled, .{});
+    }
+
+    fn initProjected(alloc: std.mem.Allocator, hits: []const db_mod.types.SearchHit, enabled: bool, projection: db_mod.types.LookupOptions) !GraphDocumentLookup {
         var self = GraphDocumentLookup{ .enabled = enabled };
         errdefer self.deinit(alloc);
         if (!enabled) return self;
@@ -5003,8 +5106,7 @@ const GraphDocumentLookup = struct {
             };
             if (self.entries.contains(identity)) continue;
             const parsed_document = if (hit.stored_data) |stored_data|
-                ant_json.parseFromSliceLeaky(std.json.ArrayHashMap(std.json.Value), alloc, stored_data, .{}) catch
-                    return error.InvalidRemoteResponse
+                try takeOpenApiObjectMap(alloc, try projectPublicStoredSourceValue(alloc, stored_data, projection))
             else
                 null;
             _ = try self.entries.putIfAbsent(alloc, identity, .{ .document = parsed_document });
@@ -5053,10 +5155,11 @@ fn toOpenApiStatefulGraphResultWithFormat(
     graph_result: db_mod.types.GraphSearchResult,
     response_format: GraphResponseFormat,
 ) !indexes_openapi.StatefulGraphResult {
-    var document_lookup = try GraphDocumentLookup.init(
+    var document_lookup = try GraphDocumentLookup.initProjected(
         alloc,
         graph_result.hits,
         query.include_documents,
+        .{ .fields = query.fields, .include_all_fields = query.include_all_fields },
     );
     defer document_lookup.deinit(alloc);
 
@@ -5080,7 +5183,7 @@ fn toOpenApiStatefulGraphResultWithFormat(
         return .{ .legacy_graph_search_result = response };
     }
     if (query.match_pattern != null and query.aggregates.len == 0) {
-        const return_limit: usize = @intCast(if (query.return_limit == 0) 100 else query.return_limit);
+        const return_limit: usize = @intCast(query.evaluation_output_limit orelse (if (query.return_limit == 0) 100 else query.return_limit));
         if (graph_result.matches.len > return_limit)
             return error.InvalidRemoteResponse;
         const rows = try toOpenApiGraphRows(
@@ -5089,10 +5192,16 @@ fn toOpenApiStatefulGraphResultWithFormat(
             query.return_aliases,
             &document_lookup,
         );
+        const computed: ?[]const std.json.ArrayHashMap(std.json.Value) = if (graph_result.matches.len > 0 and graph_result.matches[0].computed_json != null) blk: {
+            const values = try alloc.alloc(std.json.ArrayHashMap(std.json.Value), graph_result.matches.len);
+            for (graph_result.matches, values) |match, *value| value.* = try takeOpenApiObjectMap(alloc, try ant_json.parseFromSliceLeaky(std.json.Value, alloc, match.computed_json orelse return error.InvalidRemoteResponse, .{}));
+            break :blk values;
+        } else null;
         const response = try alloc.create(indexes_openapi.GraphBindingsResult);
         errdefer alloc.destroy(response);
         response.* = .{
             .kind = "bindings",
+            .computed = computed,
             .rows = rows,
             .stats = .{
                 .returned_items = @intCast(rows.len),
@@ -5220,6 +5329,7 @@ fn toOpenApiLegacyPatternMatches(
             });
         }
         out[i] = .{
+            ._computed = if (match.computed_json) |bytes| try takeOpenApiObjectMap(alloc, try ant_json.parseFromSliceLeaky(std.json.Value, alloc, bytes, .{})) else null,
             .bindings = bindings,
             .path = if (include_paths) try toOpenApiPathEdges(alloc, match.path) else null,
         };
@@ -10288,6 +10398,7 @@ fn appendUniqueOwnedString(
 fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest) void {
     if (req.index_name) |index_name| alloc.free(index_name);
     if (req.primary_text_index_name) |index_name| alloc.free(index_name);
+    if (req.evaluation_json.len > 0) alloc.free(req.evaluation_json);
     if (req.aggregations_json.len > 0) alloc.free(req.aggregations_json);
     if (req.filter_prefix.len > 0) alloc.free(req.filter_prefix);
     if (req.highlight) |highlight| freeHighlightRequest(alloc, highlight);

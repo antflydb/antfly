@@ -12879,6 +12879,7 @@ components:
             - index_rebuilding
             - query_embedding_temporarily_unavailable
             - reranker_temporarily_unavailable
+            - decision_provider_unavailable
           description: Stable machine-readable retry classification.
         message:
           type: string
@@ -12891,7 +12892,7 @@ components:
     QueryDependencyError:
       type: object
       additionalProperties: false
-      description: A stable failure envelope for query embedding and reranking dependencies.
+      description: A stable failure envelope for query embedding, reranking, and decision dependencies.
       required:
         - code
         - error
@@ -12908,6 +12909,11 @@ components:
             - query_embedding_upstream_failure
             - reranker_rate_limited
             - reranker_upstream_failure
+            - decision_limit_exceeded
+            - invalid_decision_evaluation
+            - decision_provider_unavailable
+            - decision_rate_limited
+            - decision_upstream_failure
             - query_timeout
         error:
           type: string
@@ -21175,6 +21181,138 @@ components:
       required:
         - table
       additionalProperties: false
+    QueryEvaluation:
+      type: object
+      additionalProperties: false
+      required:
+        - scope
+        - compute
+      description: >
+        Evaluate expressions after global retrieval merging, before final
+
+        offset/limit. Candidates require candidate_count; matches require
+
+        max_rows and fail if the full qualifying population exceeds that budget.
+
+        Cursor pagination, reranking, pruning, and ordinary aggregations cannot
+
+        be combined with evaluation. NULL inputs skip inference; errors fail.
+      properties:
+        graph_query:
+          type: string
+          description: Evaluate completed bindings of this named graph MATCH instead of retrieval hits.
+            Fields use alias.document.path or alias.key. Existing graph aggregates cannot be combined
+            with this stage.
+        scope:
+          type: string
+          enum:
+            - candidates
+            - matches
+        candidate_count:
+          type: integer
+          minimum: 1
+          maximum: 10000
+        max_rows:
+          type: integer
+          minimum: 1
+          maximum: 10000
+        compute:
+          type: object
+          minProperties: 1
+          maxProperties: 64
+          additionalProperties:
+            $ref: '#/components/schemas/QueryExpression'
+        where:
+          type: object
+          description: Exactly one of eq, neq, lt, lte, gt, gte (two expressions), is_null (expression),
+            not (predicate), and, or (predicate arrays). Comparisons propagate NULL.
+          additionalProperties: true
+        order_by:
+          type: array
+          maxItems: 16
+          items:
+            type: object
+            additionalProperties: false
+            required:
+              - expression
+            properties:
+              expression:
+                $ref: '#/components/schemas/QueryExpression'
+              descending:
+                type: boolean
+        aggregations:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties: false
+            required:
+              - type
+              - expression
+            properties:
+              type:
+                type: string
+                enum:
+                  - terms
+                  - avg
+                  - sum
+                  - count
+              expression:
+                $ref: '#/components/schemas/QueryExpression'
+    QueryExpression:
+      x-zig-type: std.json.Value
+      x-go-type-skip-optional-pointer: false
+      type: object
+      additionalProperties: false
+      description: >
+        Exactly one of literal, field, ref, or call. A call requires input and
+
+        decider. ai_decide requires questions; ai_probability requires statement;
+
+        ai_choice and ai_score require instructions and criteria. Named refs may
+
+        select nested JSON members with dotted paths. Binding cycles are invalid.
+      properties:
+        literal:
+          x-go-type: json.RawMessage
+        field:
+          type: string
+          minLength: 1
+        ref:
+          type: string
+          minLength: 1
+        call:
+          type: string
+          enum:
+            - ai_decide
+            - ai_choice
+            - ai_score
+            - ai_probability
+        input:
+          $ref: '#/components/schemas/QueryExpression'
+          x-go-type-skip-optional-pointer: false
+        decider:
+          type: string
+          minLength: 1
+        questions:
+          type: object
+          additionalProperties: true
+        statement:
+          type: string
+          minLength: 1
+        instructions:
+          type: string
+          minLength: 1
+        criteria:
+          description: Choice ID map or ordered score level array.
+          oneOf:
+            - type: object
+              additionalProperties:
+                type: string
+            - type: array
+              minItems: 2
+              maxItems: 64
+              items:
+                type: string
     QueryRequest:
       type: object
       not:
@@ -21340,6 +21478,8 @@ components:
                   - required:
                       - foreign_sources
       properties:
+        evaluate:
+          $ref: '#/components/schemas/QueryEvaluation'
         table_target:
           $ref: '#/components/schemas/CatalogTableTarget'
         table:
@@ -23089,6 +23229,10 @@ components:
         - _id
         - _score
       properties:
+        _computed:
+          type: object
+          additionalProperties: true
+          description: Named query-time computed values, separate from stored source.
         _id:
           type: string
           description: ID of the record.
@@ -23317,6 +23461,10 @@ components:
         - took
         - status
       properties:
+        evaluation:
+          type: object
+          additionalProperties: true
+          description: Function evaluation scope, population, usage, and scoped aggregations.
         hits:
           $ref: '#/components/schemas/QueryHits'
         aggregations:
@@ -25441,6 +25589,10 @@ components:
           additionalProperties: true
           writeOnly: true
           description: Write-only producer configuration. Cannot be combined with producer_json or transcriber.
+            Decision producers use type=decision and config={version, decider, questions}, where decider
+            is a frozen Antfly or Jev DeciderConfig. Outputs include answers, usage, resolved model, specification
+            hash, version, and source fingerprint. Change version or specification to rebuild through
+            the enrichment lifecycle.
         producer_json:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -25453,11 +25605,11 @@ components:
         neighbor_context:
           $ref: '#/components/schemas/EnrichmentNeighborContextConfig'
           description: Optional bounded sample of the document's graph neighbors appended to the producer
-            input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator
-            or extractor); producers that treat the source as a media locator (copy, reader, transcriber,
-            document_extraction) reject it. Only same-shard graph state is sampled; a graph index without
-            local state for a document yields empty neighbors at runtime while the graph index reference
-            itself is validated at admission.
+            input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator,
+            extractor, or decision); producers that treat the source as a media locator (copy, reader,
+            transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph
+            index without local state for a document yields empty neighbors at runtime while the graph
+            index reference itself is validated at admission.
         execution:
           $ref: '#/components/schemas/ExecutionPolicy'
           description: Non-semantic execution policy for this enrichment producer. This does not participate
@@ -34025,6 +34177,12 @@ components:
       description: A deterministic bounded prefix of projected bindings from a canonical graph MATCH query.
         Inspect stats.truncated to determine whether enumeration was exhaustive.
       properties:
+        computed:
+          type: array
+          description: Evaluated values parallel to returned rows, when decision evaluation was requested.
+          items:
+            type: object
+            additionalProperties: true
         kind:
           type: string
           enum:
@@ -34412,6 +34570,9 @@ components:
       deprecated: true
       description: Deprecated graph_searches pattern response row.
       properties:
+        _computed:
+          type: object
+          additionalProperties: true
         bindings:
           x-go-type-skip-optional-pointer: true
           type: object

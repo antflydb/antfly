@@ -10,8 +10,8 @@ const httpx = @import("httpx");
 const credentials = @import("credential_source_identity.zig");
 const sync = @import("antfly_platform").sync;
 
-pub const Operation = enum { embedding, generation, reranking };
-pub const Provider = enum { openai, openrouter, ollama, antfly, gemini, vertex, cohere, bedrock };
+pub const Operation = enum { embedding, generation, reranking, decision };
+pub const Provider = enum { openai, openrouter, ollama, antfly, gemini, vertex, cohere, bedrock, jev };
 pub const EndpointIdentity = struct {
     provider: Provider,
     endpoint: []const u8,
