@@ -98,15 +98,9 @@ pub fn stageBeginWithHandoff(txn: anytype, fence: Fence, handoff: ?@import("rela
     }
     if (try @import("relational_integrity_retirement.zig").active(txn)) return error.ConstraintRetirementInProgress;
     if (try current(txn)) |existing| {
-        if (existing.eql(fence)) {
-            if (handoff) |intent| try @import("empty_generation_handoff.zig").stageBegin(txn, fence, intent);
-            return;
-        }
-        // A completed-but-unacknowledged parent retirement blocks every other
-        // transition on this owner. Surface that specific, actionable reason
-        // before the generic busy fence mismatch below.
-        try @import("relational_integrity_generation_retirement.zig").requireActivationAcknowledged(txn);
-        return error.IntegrityTopologyBusy;
+        if (!existing.eql(fence)) return error.IntegrityTopologyBusy;
+        if (handoff) |intent| try @import("empty_generation_handoff.zig").stageBegin(txn, fence, intent);
+        return;
     }
     try @import("relational_integrity_generation_retirement.zig").requireClear(txn);
     try @import("relational_integrity_generation_retirement.zig").requireActivationAcknowledged(txn);
