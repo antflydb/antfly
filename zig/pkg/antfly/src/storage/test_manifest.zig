@@ -246,6 +246,7 @@ comptime {
     _ = @import("hot_standby/chaos.zig");
     _ = @import("hot_standby/commit_gate.zig");
     _ = @import("hot_standby/compat.zig");
+    _ = @import("hot_standby/db_commit.zig");
     _ = @import("hot_standby/effects.zig");
     _ = @import("hot_standby/fencing.zig");
     _ = @import("hot_standby/http_admin.zig");

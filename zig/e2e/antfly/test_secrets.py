@@ -540,6 +540,16 @@ def provider():
         server.close()
 
 
+def assert_committed_write(response):
+    assert response.status_code in (200, 201, 202), response.text
+    if response.status_code == 202:
+        assert response.json()["status"] in (
+            "committed_visibility_pending",
+            "committed_repair_required",
+            "committed_repair_unavailable",
+        ), response.text
+
+
 def create_consumer(deployment, provider):
     def create():
         response = deployment.request(
@@ -558,10 +568,18 @@ def create_consumer(deployment, provider):
         )
         if response.status_code == 503:
             return False  # Data-node routing/reporting may lag the first election.
-        assert response.status_code in (200, 201), response.text
+        assert_committed_write(response)
         return True
 
     eventually(create)
+    eventually(
+        lambda: (
+            deployment.request(
+                deployment.consumer, "GET", "/tables/secret_consumer"
+            ).status_code
+            == 200
+        )
+    )
     response = deployment.request(
         deployment.consumer,
         "POST",
@@ -598,7 +616,7 @@ def use_secret(deployment, provider, expected):
             "sync_level": "write",
         },
     )
-    assert response.status_code in (200, 201), response.text
+    assert_committed_write(response)
 
     def observed():
         assert deployment.consumer["proc"].poll() is None, (

@@ -620,23 +620,20 @@ test "parent generation scope denies retired and unknown generations after activ
 }
 
 test "parent generation publication stages then activates exact successor and remains default-deny after drop" {
-    // A real transaction keys every record independently: stageTransition and
-    // activateTransition now also probe the empty-generation handoff's own
-    // intent/seal keys through the same get(), which a single-value stand-in
-    // would corrupt.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
     const Mock = struct {
-        alloc: std.mem.Allocator,
-        records: std.StringHashMap([]const u8),
-        pub fn get(self: *@This(), requested: []const u8) ![]const u8 {
-            return self.records.get(requested) orelse error.NotFound;
+        value: ?[]u8 = null,
+        pub fn get(self: *@This(), key: []const u8) error{NotFound}![]const u8 {
+            const expected = scopeKey("children", "fk") catch unreachable;
+            if (!std.mem.eql(u8, key, &expected)) return error.NotFound;
+            return self.value orelse error.NotFound;
         }
-        pub fn put(self: *@This(), requested: []const u8, value: []const u8) !void {
-            try self.records.put(try self.alloc.dupe(u8, requested), try self.alloc.dupe(u8, value));
+        pub fn put(self: *@This(), _: []const u8, value: []const u8) !void {
+            if (self.value) |prior| std.testing.allocator.free(prior);
+            self.value = try std.testing.allocator.dupe(u8, value);
         }
     };
-    var txn: Mock = .{ .alloc = arena.allocator(), .records = std.StringHashMap([]const u8).init(arena.allocator()) };
+    var txn: Mock = .{};
+    defer if (txn.value) |value| std.testing.allocator.free(value);
     const alloc = std.testing.allocator;
     const create: Transition = .{ .child_table_id = 7, .child_table_name = "children", .constraint_name = "fk", .expected_generation = null, .next_generation = @splat(2), .plan_id = @splat(3), .decision_digest = @splat(4) };
     try stageTransition(alloc, &txn, create);

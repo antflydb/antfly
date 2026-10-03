@@ -229,8 +229,8 @@ test "relational replicated admission is identical across local memory envelopes
         const catalog = db.core.table_catalog.encode();
         try db.core.store.putBatch(&.{.{ .key = table_catalog_mod.key, .value = &catalog }}, &.{});
         const txn = try db.beginTransaction(100);
-        try db.writeReplicatedTransactionAtRaftEntry(txn, .{ .writes = &.{.{ .key = "a", .value = "{\"n\":1}" }} }, .{ .term = 1, .index = 1 });
-        try std.testing.expectError(error.TransactionTooLarge, db.writeReplicatedTransactionAtRaftEntry(txn, .{ .writes = &.{.{ .key = "b", .value = "{\"n\":2}" }} }, .{ .term = 1, .index = 2 }));
+        try db.writeReplicatedTransactionAtOrderedReceipt(txn, .{ .writes = &.{.{ .key = "a", .value = "{\"n\":1}" }} }, .{ .term = 1, .index = 1 });
+        try std.testing.expectError(error.TransactionTooLarge, db.writeReplicatedTransactionAtOrderedReceipt(txn, .{ .writes = &.{.{ .key = "b", .value = "{\"n\":2}" }} }, .{ .term = 1, .index = 2 }));
         try std.testing.expectEqual(@as(u64, 1), (try db.orderedApplyReceipt()).?.index);
         var intents = try db.core.collectTransactionIntentBatch(alloc, txn);
         defer intents.deinit(alloc);
@@ -670,7 +670,7 @@ test "db repair activation restarts unjournaled source races without penalizing 
             var marker: [16]u8 = undefined;
             std.mem.writeInt(u64, marker[0..8], 1, .little);
             std.mem.writeInt(u64, marker[8..16], 4, .little);
-            try txn.put(&internal_keys.raft_document_applied_entry_key, &marker);
+            try txn.put(&internal_keys.ordered_document_applied_entry_key, &marker);
             try txn.put(primary, "{\"title\":\"beta\"}");
             try txn.commit();
         } else try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"title\":\"beta\"}" }}, .sync_level = .write }, .{ .term = 1, .index = 4 });
@@ -860,7 +860,7 @@ test "db replicated transaction commits each raft receipt atomically" {
     const prepare_entry: OrderedApplyReceipt = .{ .term = 3, .index = 12 };
     const resolve_entry: OrderedApplyReceipt = .{ .term = 3, .index = 13 };
 
-    _ = try db.beginReplicatedTransactionAtRaftEntry(
+    _ = try db.beginReplicatedTransactionAtOrderedReceipt(
         txn_id,
         12_000,
         12_000,
@@ -872,7 +872,7 @@ test "db replicated transaction commits each raft receipt atomically" {
     try std.testing.expectEqualDeep(begin_entry, (try db.orderedApplyReceipt()).?);
 
     // An exact begin replay is fenced before it can alter the existing record.
-    _ = try db.beginReplicatedTransactionAtRaftEntry(
+    _ = try db.beginReplicatedTransactionAtOrderedReceipt(
         txn_id,
         99_000,
         99_000,
@@ -883,12 +883,12 @@ test "db replicated transaction commits each raft receipt atomically" {
     );
     try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(txn_id));
 
-    try db.writeReplicatedTransactionAtRaftEntry(txn_id, .{
+    try db.writeReplicatedTransactionAtOrderedReceipt(txn_id, .{
         .writes = &.{.{ .key = "doc:receipt", .value = "{\"title\":\"transaction\"}" }},
     }, prepare_entry);
     try std.testing.expectEqualDeep(prepare_entry, (try db.orderedApplyReceipt()).?);
 
-    try db.resolveReplicatedTransactionAtRaftEntry(
+    try db.resolveReplicatedTransactionAtOrderedReceipt(
         txn_id,
         .committed,
         15_000,
@@ -909,7 +909,7 @@ test "db replicated transaction commits each raft receipt atomically" {
         .writes = &.{.{ .key = "doc:receipt", .value = "{\"title\":\"newer\"}" }},
         .timestamp_ns = 16_000,
     });
-    try db.resolveReplicatedTransactionAtRaftEntry(
+    try db.resolveReplicatedTransactionAtOrderedReceipt(
         txn_id,
         .committed,
         15_000,
@@ -1069,7 +1069,7 @@ test "db raced replicated transaction completion persists receipt and participan
 
     const txn_id: transactions_mod.TxnId = .{0x6b} ** 16;
     const participant = "table:receipts:group:8";
-    _ = try db.beginReplicatedTransactionAtRaftEntry(
+    _ = try db.beginReplicatedTransactionAtOrderedReceipt(
         txn_id,
         20_000,
         20_000,
@@ -1078,7 +1078,7 @@ test "db raced replicated transaction completion persists receipt and participan
         true,
         .{ .term = 4, .index = 21 },
     );
-    try db.writeReplicatedTransactionAtRaftEntry(txn_id, .{
+    try db.writeReplicatedTransactionAtOrderedReceipt(txn_id, .{
         .writes = &.{.{ .key = "doc:raced-receipt", .value = "{\"title\":\"transaction\"}" }},
     }, .{ .term = 4, .index = 22 });
 
@@ -1101,7 +1101,7 @@ test "db raced replicated transaction completion persists receipt and participan
         .sync_level = .write,
     }, null, .{
         .bypass_replication_write_gate = true,
-        .raft_applied_entry_marker = resolve_entry,
+        .ordered_apply_receipt = resolve_entry,
         .transaction_resolution = .{
             .txn_id = txn_id,
             .status = .committed,
@@ -3801,7 +3801,7 @@ test "db ordered artifact inventory materialization replay cut is owner local at
             var marker: [16]u8 = undefined;
             std.mem.writeInt(u64, marker[0..8], 1, .little);
             std.mem.writeInt(u64, marker[8..16], 5, .little);
-            try txn.put(&internal_keys.raft_document_applied_entry_key, &marker);
+            try txn.put(&internal_keys.ordered_document_applied_entry_key, &marker);
             try txn.put(artifact_key, "unjournaled artifact");
             try txn.commit();
         }
@@ -4015,19 +4015,19 @@ test "db transaction batched acknowledgement migration preserves legacy replay a
     var index_key: [prefix.len + 16]u8 = undefined;
     @memcpy(index_key[0..prefix.len], prefix);
     @memcpy(index_key[prefix.len..], &txn);
-    _ = try db.beginReplicatedTransactionAtRaftEntry(txn, 10000, 10000, &.{ "a", "b", "c" }, false, false, .{ .term = 3, .index = 1 });
-    try db.markReplicatedTransactionParticipantResolvedAtRaftEntry(txn, "a", .{ .term = 3, .index = 2 });
+    _ = try db.beginReplicatedTransactionAtOrderedReceipt(txn, 10000, 10000, &.{ "a", "b", "c" }, false, false, .{ .term = 3, .index = 1 });
+    try db.markReplicatedTransactionParticipantResolvedAtOrderedReceipt(txn, "a", .{ .term = 3, .index = 2 });
     {
         var read = try db.core.store.beginProbeTxn();
         defer read.abort();
         try std.testing.expectError(error.NotFound, read.get(&index_key));
     }
-    try std.testing.expectError(error.InvalidParticipant, db.markReplicatedTransactionParticipantsResolvedAtRaftEntry(txn, &.{ "b", "absent" }, .{ .term = 3, .index = 3 }));
+    try std.testing.expectError(error.InvalidParticipant, db.markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(txn, &.{ "b", "absent" }, .{ .term = 3, .index = 3 }));
     try std.testing.expectEqual(@as(u64, 2), (try db.orderedApplyReceipt()).?.index);
-    try db.markReplicatedTransactionParticipantsResolvedAtRaftEntry(txn, &.{"b"}, .{ .term = 3, .index = 3 });
+    try db.markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(txn, &.{"b"}, .{ .term = 3, .index = 3 });
     // Exact replay is fenced before payload admission, preserving the durable
     // marker together with the indexed membership and migrated resolution.
-    try db.markReplicatedTransactionParticipantsResolvedAtRaftEntry(txn, &.{"absent"}, .{ .term = 3, .index = 3 });
+    try db.markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(txn, &.{"absent"}, .{ .term = 3, .index = 3 });
     db.close();
     opened = false;
     db = try DB.open(alloc, path, .{ .start_index_workers = false });
@@ -4037,7 +4037,7 @@ test "db transaction batched acknowledgement migration preserves legacy replay a
     defer transactions_mod.freeParticipantList(alloc, pending);
     try std.testing.expectEqual(@as(usize, 1), pending.len);
     try std.testing.expectEqualStrings("c", pending[0]);
-    try db.markReplicatedTransactionParticipantResolvedAtRaftEntry(txn, "c", .{ .term = 3, .index = 4 });
+    try db.markReplicatedTransactionParticipantResolvedAtOrderedReceipt(txn, "c", .{ .term = 3, .index = 4 });
     const complete = try db.getUnresolvedTransactionParticipants(alloc, txn);
     defer transactions_mod.freeParticipantList(alloc, complete);
     try std.testing.expectEqual(@as(usize, 0), complete.len);
@@ -4069,7 +4069,7 @@ test "db transaction recovery observes admission replacement after execution bin
     };
     var gate: Gate = .{};
     // Rebinding occurs after recovery has retained its execution capabilities.
-    db.local_execution.replication_write_gate = .{ .primary = .{ .ptr = &gate, .check_fn = Gate.check } };
+    db.local_execution.replication_write_gate = .{ .borrowed = .{ .ptr = &gate, .check_fn = Gate.check } };
     const context = db.transaction_runtime.?.local.?.config;
     try std.testing.expectError(error.TestRecoveryAdmissionClosed, context.resolve_local_fn.?(context.local_resolution_ctx.?, txn_id, .committed, 2_000));
     try std.testing.expectEqual(@as(usize, 1), gate.calls);
@@ -4083,4 +4083,61 @@ test "db transaction recovery observes admission replacement after execution bin
     defer alloc.free(value);
     try std.testing.expectEqualStrings("{\"title\":\"recovered\"}", value);
     try std.testing.expect(gate.calls > 1);
+}
+
+test "db ordered artifact inventory follower completes initial build under durable admission across reopen" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const leader_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/admission-leader", .{tmp.sub_path});
+    defer alloc.free(leader_path);
+    const follower_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/admission-follower", .{tmp.sub_path});
+    defer alloc.free(follower_path);
+    const options: OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
+    var leader = try DB.open(alloc, leader_path, options);
+    defer leader.close();
+    try leader.setSchemaJson(alloc, "{}");
+    try leader.addIndex(.{ .name = "admitted_text", .kind = .full_text, .config_json = "{}" });
+    var command = try leader.artifactInventoryCommand(alloc);
+    defer command.catalogs.deinit(alloc);
+    var follower = try DB.open(alloc, follower_path, options);
+    defer follower.close();
+    try follower.setSchemaJson(alloc, "{}");
+    try server_test_adapter.applyOrdered(&follower, .{ .writes = &.{.{ .key = "doc", .value = "{\"text\":\"retained follower source\"}" }} }, .{ .term = 1, .index = 1 });
+    const owner = try follower.relationalTopologyIdentity();
+    const scope: @import("db/online_source_contract.zig").Scope = .{
+        .authority = .raft,
+        .fence = .{ .role = .merge_source, .transition_id = 7, .attempt = 1, .admission_epoch = owner.next_epoch, .owner_group_id = 2, .peer_group_id = 3, .namespace = owner.namespace, .catalog_digest = owner.catalog_digest },
+        .receiver_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 },
+        .consumer_epoch = 1,
+        .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
+    };
+    const request: types.BatchRequest = .{ .artifact_catalog = command, .online_source = .{ .admit = .{ .scope = scope, .artifact_catalog = command.binding } } };
+    var saw_pending = false;
+    var completed = false;
+    for (0..256) |turn| {
+        server_test_adapter.applyOrdered(&follower, request, .{ .term = 1, .index = 2 }) catch |err| {
+            if (err != error.ArtifactCatalogDrift) return err;
+            saw_pending = true;
+            if (turn == 0) {
+                follower.close();
+                follower = try DB.open(alloc, follower_path, options);
+                try std.testing.expectError(error.ArtifactCatalogEpochChanged, follower.advanceOrderedArtifactInitialBuild(&.{}, .{ .token = @splat(0xff) }));
+            }
+            continue;
+        };
+        completed = true;
+        break;
+    }
+    try std.testing.expect(saw_pending);
+    try std.testing.expect(completed);
+    try server_test_adapter.applyOrdered(&follower, request, .{ .term = 1, .index = 2 });
+    try std.testing.expect((try follower.artifactInventoryStatus()).ready);
+    try std.testing.expectEqual(@as(u64, 2), (try follower.orderedApplyReceipt()).?.index);
+    const document = (try follower.get(alloc, "doc")).?;
+    defer alloc.free(document);
+    try std.testing.expect(std.mem.indexOf(u8, document, "retained follower source") != null);
+    var result = try follower.search(alloc, .{ .index_name = "admitted_text", .query = .{ .match = .{ .field = "_all", .text = "retained" } }, .limit = 1 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
 }

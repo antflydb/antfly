@@ -81,7 +81,6 @@ def test_catalog_fixture_waits_for_leader_profile_before_exposing_cluster(
     [
         status(ready=0),
         status(ready=16),
-        status(ready=18),
         status(role="follower"),
         status(incarnation=None),
     ],
@@ -94,6 +93,12 @@ def test_catalog_readiness_rejects_unready_or_unknown_profiles(readiness, payloa
     assert clock.now == 0.25
     assert observations
     assert all(timeout <= 0.25 - now for now, _, timeout in observations)
+
+
+def test_catalog_readiness_accepts_newer_compatible_profiles(readiness):
+    _, cluster, _, serve = readiness
+    serve(lambda: status(ready=18))
+    assert catalog_readiness.wait_for_catalog_protocol(cluster) == 0
 
 
 def test_catalog_readiness_does_not_require_activation_to_already_be_committed(

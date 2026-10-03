@@ -59,7 +59,7 @@ pub const ReplicationDeferredCommitGates = struct {
     }
 
     pub fn waitForDurabilityAndAuthority(self: *@This(), write_gate: ?ReplicationWriteGate) !void {
-        // The HA records are already durable and ordered with the local commit.
+        // The replication records are already durable and ordered with the local commit.
         // Remote acknowledgement must not retain the DB apply lock or the
         // transition mutex: status updates and safe reads need both paths to
         // remain live while a synchronous policy is pending.
@@ -85,16 +85,16 @@ pub fn evaluateReplicationMirrorCommitGate(mirror: ReplicationAsyncEffectMirror,
 }
 
 pub fn replicationMirrorSyncEnabled(mirror: ReplicationAsyncEffectMirror) bool {
-    return mirror.sync_policy.mode != .async;
+    return mirror.requirements.synchronous;
 }
 
 pub fn replicationMirrorRequiresDurableOutbox(mirror: ReplicationAsyncEffectMirror) bool {
-    return replicationMirrorSyncEnabled(mirror) and mirror.sync_policy.failure_policy != .degrade_to_async;
+    return mirror.requirements.durable_outbox;
 }
 
 pub fn noteReplicationMirrorFailure(mirror: ReplicationAsyncEffectMirror, comptime label: []const u8, err: anyerror) void {
-    if (mirror.failure_count) |counter| _ = counter.fetchAdd(1, .monotonic);
-    std.log.warn("failed to mirror DB " ++ label ++ " into HA stream: {s}", .{@errorName(err)});
+    mirror.noteFailure();
+    std.log.warn("failed to mirror DB " ++ label ++ " into replication stream: {s}", .{@errorName(err)});
 }
 
 pub fn enforceReplicationWriteGateOptional(gate: ?ReplicationWriteGate) !void {
@@ -106,7 +106,7 @@ pub fn enforceReplicationWriteGateOptional(gate: ?ReplicationWriteGate) !void {
 /// lock serializes this decision with append and the next-LSN observation.
 pub fn preflight(mirror: ?ReplicationAsyncEffectMirror, log_mutex: *std.atomic.Mutex) !void {
     const configured = mirror orelse return;
-    if (configured.sync_policy.mode == .async or configured.sync_policy.failure_policy != .fail_closed) return;
+    if (!configured.requirements.preflight) return;
     lockAtomic(log_mutex);
     defer log_mutex.unlock();
     try configured.publisher.preflight(configured);
@@ -155,7 +155,7 @@ pub fn recoverDurableOutbox(
             return err;
         };
     };
-    if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+    mirror.notePublished(lsn);
     deferred.append(.{ .mirror = mirror, .lsn = lsn });
     try deferred.waitForDurabilityAndAuthority(context.write_gate);
 }
@@ -176,7 +176,7 @@ pub const CommitContext = struct {
 
 fn checkWrite(ctx: *const CommitContext) !void {
     try enforceReplicationWriteGateOptional(ctx.replication_write_gate);
-    if (ctx.append_pending) |pending| if (pending.load(.acquire)) return error.HAMirrorUnavailable;
+    if (ctx.append_pending) |pending| if (pending.load(.acquire)) return error.ReplicationPublisherUnavailable;
 }
 
 pub fn mirrorReplicationReplayPayloadBestEffortContext(ctx: *const CommitContext, payload: []const u8) void {
@@ -188,11 +188,11 @@ pub fn mirrorReplicationReplayPayloadBestEffortContext(ctx: *const CommitContext
     lockAtomic(ctx.log_mutex);
     defer ctx.log_mutex.*.unlock();
     const lsn = mirror.publisher.publish(mirror, .replay, payload, ctx.identity_namespace) catch |err| {
-        if (mirror.failure_count) |counter| _ = counter.fetchAdd(1, .monotonic);
-        std.log.warn("failed to mirror DB derived effect into HA stream: {s}", .{@errorName(err)});
+        mirror.noteFailure();
+        std.log.warn("failed to mirror DB derived effect into replication stream: {s}", .{@errorName(err)});
         return;
     };
-    if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+    mirror.notePublished(lsn);
 }
 
 pub fn mirrorReplicationReplayPayloadCommitContext(ctx: *const CommitContext, payload: []const u8) !void {
@@ -205,7 +205,7 @@ pub fn mirrorReplicationReplayPayloadCommitContext(ctx: *const CommitContext, pa
 pub fn appendReplicationReplayPayloadCommitLockedContext(ctx: *const CommitContext, payload: []const u8) !?ReplicationDeferredCommitGate {
     const mirror = ctx.replication_async_effect_mirror orelse return null;
     // The local store has already committed. Always represent that mutation in
-    // the HA tail; a fence that arrived after the preflight gate may reject the
+    // the replication tail; a fence that arrived after the preflight gate may reject the
     // client acknowledgement below, but must not create an unlogged local fork.
     const lsn = blk: {
         lockAtomic(ctx.log_mutex);
@@ -215,7 +215,7 @@ pub fn appendReplicationReplayPayloadCommitLockedContext(ctx: *const CommitConte
             if (replicationMirrorSyncEnabled(mirror)) return err;
             return null;
         };
-        if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+        mirror.notePublished(lsn);
         break :blk lsn;
     };
     return .{ .mirror = mirror, .lsn = lsn };
@@ -230,11 +230,11 @@ pub fn mirrorReplicationBatchMutationBestEffortContext(ctx: *const CommitContext
     lockAtomic(ctx.log_mutex);
     defer ctx.log_mutex.*.unlock();
     const lsn = publishBatch(ctx, mirror, request) catch |err| {
-        if (mirror.failure_count) |counter| _ = counter.fetchAdd(1, .monotonic);
-        std.log.warn("failed to mirror DB batch mutation into HA stream: {s}", .{@errorName(err)});
+        mirror.noteFailure();
+        std.log.warn("failed to mirror DB batch mutation into replication stream: {s}", .{@errorName(err)});
         return;
     };
-    if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+    mirror.notePublished(lsn);
 }
 
 pub fn mirrorReplicationBatchMutationCommitContext(ctx: *const CommitContext, request: types.BatchRequest) !void {
@@ -257,7 +257,7 @@ pub fn appendReplicationBatchMutationCommitLockedContext(ctx: *const CommitConte
             if (replicationMirrorSyncEnabled(mirror)) return err;
             return null;
         };
-        if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+        mirror.notePublished(lsn);
         break :blk lsn;
     };
     return .{ .mirror = mirror, .lsn = lsn };
@@ -284,7 +284,7 @@ pub fn appendReplicationEncodedBatchMutationCommitLockedContextStrict(ctx: *cons
             if (strict_append or replicationMirrorSyncEnabled(mirror)) return err;
             return null;
         };
-        if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+        mirror.notePublished(lsn);
         break :blk lsn;
     };
     return .{ .mirror = mirror, .lsn = lsn };
@@ -303,11 +303,11 @@ pub fn mirrorReplicationSchemaMetadataBestEffortContext(
     lockAtomic(ctx.log_mutex);
     defer ctx.log_mutex.*.unlock();
     const lsn = publishSchema(ctx, mirror, table_schema, public_schema_json) catch |err| {
-        if (mirror.failure_count) |counter| _ = counter.fetchAdd(1, .monotonic);
-        std.log.warn("failed to mirror DB schema metadata into HA stream: {s}", .{@errorName(err)});
+        mirror.noteFailure();
+        std.log.warn("failed to mirror DB schema metadata into replication stream: {s}", .{@errorName(err)});
         return;
     };
-    if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+    mirror.notePublished(lsn);
 }
 
 pub fn appendReplicationSchemaMetadataCommitLockedContext(
@@ -317,7 +317,7 @@ pub fn appendReplicationSchemaMetadataCommitLockedContext(
 ) !?ReplicationDeferredCommitGate {
     const mirror = ctx.replication_async_metadata_mirror orelse return null;
     // As with document batches, committed metadata must remain represented in
-    // the HA tail even when authority expires before acknowledgement.
+    // the replication tail even when authority expires before acknowledgement.
     const lsn = blk: {
         lockAtomic(ctx.log_mutex);
         defer ctx.log_mutex.*.unlock();
@@ -326,7 +326,7 @@ pub fn appendReplicationSchemaMetadataCommitLockedContext(
             if (replicationMirrorSyncEnabled(mirror)) return err;
             return null;
         };
-        if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+        mirror.notePublished(lsn);
         break :blk lsn;
     };
     return .{ .mirror = mirror, .lsn = lsn };
@@ -345,7 +345,7 @@ pub fn appendReplicationEncodedSchemaMetadataCommitLockedContext(
             if (replicationMirrorSyncEnabled(mirror)) return err;
             return null;
         };
-        if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+        mirror.notePublished(lsn);
         break :blk lsn;
     };
     return .{ .mirror = mirror, .lsn = lsn };
@@ -363,7 +363,7 @@ fn publishSchema(ctx: *const CommitContext, mirror: ReplicationAsyncEffectMirror
     return try mirror.publisher.publish(mirror, .schema, payload, ctx.identity_namespace);
 }
 
-// A publisher with no dependency on the HA runtime exercises local ordering
+// A publisher with no dependency on the server runtime exercises local ordering
 // independently of transports, WAL implementations, and standby policy.
 const TestPublisher = struct {
     transition: std.atomic.Mutex = .unlocked,
@@ -378,7 +378,7 @@ const TestPublisher = struct {
         return @ptrCast(@alignCast(ptr));
     }
     fn mirror(self: *@This()) ReplicationAsyncEffectMirror {
-        return .{ .publisher = .{ .ptr = self, .vtable = &vtable }, .transition_mutex = &self.transition, .sync_policy = .{ .mode = .remote_apply, .failure_policy = .fail_closed } };
+        return .{ .publisher = .{ .ptr = self, .vtable = &vtable }, .transition_mutex = &self.transition, .requirements = .{ .synchronous = true, .durable_outbox = true, .preflight = true } };
     }
     fn next(_: *anyopaque) u64 {
         return 7;
@@ -414,7 +414,7 @@ const TestPublisher = struct {
         try std.testing.expect(self.log.tryLock());
         self.log.unlock();
         self.completed = true;
-        if (self.fail_completion) return error.HASyncCommitWouldBlock;
+        if (self.fail_completion) return error.CommitCompletionPending;
     }
     fn check(ptr: *const anyopaque) !void {
         const self: *const @This() = @ptrCast(@alignCast(ptr));
@@ -423,7 +423,7 @@ const TestPublisher = struct {
         if (self.fenced) return error.PrimaryFenced;
     }
     fn gate(self: *@This()) ReplicationWriteGate {
-        return .{ .primary = .{ .ptr = self, .check_fn = check } };
+        return .{ .borrowed = .{ .ptr = self, .check_fn = check } };
     }
     const vtable: replication_contract.Publisher.VTable = .{ .next_lsn = next, .identity = identity, .publish = publish, .recover = recover, .preflight = @This().preflight, .complete = complete };
 };
@@ -450,7 +450,7 @@ test "storage.hot_standby engine pending durability releases the transition fenc
     var gates = ReplicationDeferredCommitGates.begin(&publisher.transition);
     defer gates.releaseTransition();
     gates.append(.{ .mirror = publisher.mirror(), .lsn = 7 });
-    try std.testing.expectError(error.HASyncCommitWouldBlock, gates.waitForDurabilityAndAuthority(publisher.gate()));
+    try std.testing.expectError(error.CommitCompletionPending, gates.waitForDurabilityAndAuthority(publisher.gate()));
     try std.testing.expect(publisher.transition.tryLock());
     publisher.transition.unlock();
 }

@@ -156,11 +156,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     else
         false;
     const inference_blas_root_opt = b.option([]const u8, "blas-root", "Path to system BLAS root with include/ and lib/ for non-macOS native acceleration");
-    const inference_system_blas_available = link_libc and (target.result.os.tag == .macos or inference_blas_root_opt != null);
-    const inference_enable_system_blas = if (link_libc)
-        b.option(bool, "system-blas", "Enable system BLAS acceleration for native CPU math") orelse inference_system_blas_available
-    else
-        false;
+    const inference_blas = @import("pkg/inference/build/blas.zig").configure(b, link_libc, target.result.os.tag == .macos, inference_blas_root_opt != null);
+    const inference_enable_system_blas = inference_blas.system;
     const inference_blas_root = if (inference_enable_system_blas and target.result.os.tag != .macos)
         inference_blas_root_opt
     else
@@ -670,6 +667,7 @@ pub fn create(b: *std.Build) ?Artifacts {
             .wasm_memory_model = b.option([]const u8, "wasm-memory-model", "Inference WASM memory model: wasm32 or wasm64") orelse "wasm32",
             .enable_webgpu = b.option(bool, "webgpu", "Enable WebGPU for inference WASM") orelse false,
             .enable_system_blas = inference_enable_system_blas,
+            .enable_runtime_openblas = inference_blas.runtime,
             .blas_root = inference_blas_root,
             .link_libc = link_libc,
             .skip_openapi = false,
@@ -988,7 +986,6 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = optimize,
     });
     inference_runtime_paths_mod.addImport("antfly_platform", platform_mod);
-    inference_runtime_paths_mod.addImport("inference_server", inference_server_mod);
     const inference_query_embedding_cache_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/inference/providers/query_embedding_cache.zig"),
         .target = target,
@@ -1155,6 +1152,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .platform_target = target,
         .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
     };
+    antfly_imports.configureRuntimeContracts(usermgr_mod);
     // SQL shape fixtures reach native schema and storage contracts, but do not
     // need the inference/API module graph of a full storage owner.
     antfly_imports.storage_boundary.configureSources(sql_test_mod, false, false);
@@ -1621,6 +1619,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_lib_ha_compat_tests = owner_tests.run_lib_ha_compat_tests;
     const antfly_test_step = owner_tests.antfly_test_step;
     const unit_test_step = owner_tests.unit_test_step;
+    unit_test_step.dependOn(&b.addRunArtifact(openapi_docs_test).step);
     unit_test_step.dependOn(&run_sql_tests.step);
     unit_test_step.dependOn(&run_pgwire_tests.step);
     unit_test_step.dependOn(&pdf_integration.run.step);
@@ -1796,38 +1795,16 @@ pub fn create(b: *std.Build) ?Artifacts {
         standalone_initial_fk_tests.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(@as(@import("pkg/antfly/build/runtime.zig").RuntimeLibraryUnit, unit))].?);
     const run_standalone_initial_fk_tests = antfly_tests_build.addFilteredTestRunArtifact(b, standalone_initial_fk_tests);
     b.step("antfly-standalone-initial-fk-test", "Run linked native standalone initial-FK owner publication tests").dependOn(&run_standalone_initial_fk_tests.step);
-    // graph_transfer_test.zig's seed files reach, through ordinary relative
-    // imports, into the same wide storage graph the main test root depends
-    // on (down to db.zig and its own antfly_hash/vopr uses). A standalone
-    // module with a hand-picked or copied dependency subset collides on file
-    // ownership the moment that closure overlaps a big named import's own
-    // relative reach (e.g. vopr's own path back to root.zig's
-    // antfly_root-aliased files). Reuse antfly_test_mod itself, already
-    // self-consistently wired for exactly this file graph, and narrow the
-    // compiled test set with exact filters instead.
-    const graph_transfer_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
-        .filters = &.{
-            "ordered artifact inventory graph mutation scopes fence physical and embedded owners on tombstones",
-            "physical artifact catalog view rejects truncation and trailing data",
-            "online graph transfer rebinds edge bytes and rejects stale incarnations",
-            "online graph transfer preserves manifests contenders counts and tombstones",
-            "online graph transfer rejects foreign ownership hidden in a manifest",
-            "online graph transfer pinned plan preserves distinct logical endpoints",
-            "online graph transfer requires explicit source effect protocol for values and tombstones",
-            "source artifact batch rejects impossible counts before allocation",
-            "source artifact batch validates full ordered graph framing before exposing a prefix",
-            "source artifact descriptors resume short reads without materializing values",
-            "ordered artifact inventory source layout cache is owned and copy-attempt bound",
-        },
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
+    const graph_transfer_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/graph_transfer_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    graph_transfer_tests.root_module.addImport("antfly_hash", hash_mod);
     const run_graph_transfer_tests = b.addRunArtifact(graph_transfer_tests);
     b.step("antfly-graph-transfer-test", "Validate certified graph artifact generation transfer").dependOn(&run_graph_transfer_tests.step);
-    owner_tests.unit_test_step.dependOn(&run_graph_transfer_tests.step);
+    // The storage lanes already own every named graph-transfer contract.
+    // Keep this focused target without compiling a duplicate aggregate image.
     const standalone_policy_ha_tests = owner_tests.standalone_policy_ha_tests;
     standalone_policy_ha_tests.root_module.addObject(consumer_test_metadata.object);
     inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|

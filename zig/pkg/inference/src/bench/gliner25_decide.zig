@@ -3,6 +3,8 @@
 
 //! Loaded-model request latency for the pinned Decide multi-question case.
 const std = @import("std");
+const builtin = @import("builtin");
+const linalg = @import("inference_linalg");
 const inference = @import("inference_internal");
 const factory = inference.architectures.session_factory;
 const gliner = inference.pipelines.gliner;
@@ -88,6 +90,10 @@ pub fn main(init: std.process.Init) !void {
     const output = try std.json.Stringify.valueAlloc(a, .{
         .implementation = "antfly_gliner25_decide",
         .backend = selected,
+        .build_mode = @tagName(builtin.mode),
+        .zig_version = builtin.zig_version_string,
+        .x86_kernel = if (linalg.x86.enabled) @tagName(linalg.x86.selected()) else null,
+        .effective_cpu_threads = linalg.pool.cachedCpuCount(),
         .warmup = warmup,
         .reps = reps,
         .median_ms = median,

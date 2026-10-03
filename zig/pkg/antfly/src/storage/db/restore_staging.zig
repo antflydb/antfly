@@ -296,9 +296,6 @@ test "native restore artifact phase cannot skip row fencing or mutate logical pr
         .target_schema_digest = @splat(5),
         .preserve_artifacts = true,
     };
-    // This scope has no bootstrap generation proof requirement, so the owner
-    // starts with source_generation_proofs_complete already true (db.zig's
-    // reserveRestoreStagingScoped sets it to !source_proofs_required).
     const before: Progress = .{ .scope = scope, .source_generation_proofs_complete = true };
     const raw = try before.encode(alloc);
     defer alloc.free(raw);
