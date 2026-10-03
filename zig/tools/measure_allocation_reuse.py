@@ -6,7 +6,8 @@ Example:
     --baseline-bin ../.worktrees/baseline/zig/zig-out/bin \
     --candidate-bin zig-out/bin --output /tmp/allocation-comparison
 
-Replay timings include diagnostic counter overhead. Vector timing runs disable
+Replay counted timings include diagnostic counter overhead. Replay timing runs
+use the production smp allocator without counting. Vector timing runs disable
 counting and retain the benchmark's normal allocator. Heap counts are requested
 bytes through the benchmark allocator, not RSS or complete process allocation.
 """
@@ -35,7 +36,9 @@ def main():
     parser.add_argument('--batches', nargs='+', type=int, default=[256, 1024])
     parser.add_argument('--replay-operation', choices=['replay', 'enrichment', 'latest'], default='replay')
     parser.add_argument('--repetitions', type=int, default=1)
+    parser.add_argument('--replay-measurements', nargs='+', choices=['counted', 'timing'], default=['counted'])
     parser.add_argument('--replay-only', action='store_true')
+    parser.add_argument('--document-lookup-only', action='store_true')
     args = parser.parse_args()
     if min(args.documents, args.dimensions, args.samples, args.vector_samples, *args.documents_per_record, *args.batches, args.repetitions) <= 0:
         parser.error('counts and sample sizes must be positive')
@@ -54,22 +57,24 @@ def main():
     def save():
         (args.output / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
 
-    for replay_source, kind, records, budgeted, batch in itertools.product(
-            args.replay_sources, args.index_kinds, args.documents_per_record, ([False, True] if args.replay_operation == 'replay' else [False]), args.batches):
+    for measurement, replay_source, kind, records, budgeted, batch in itertools.product(
+            ([] if args.document_lookup_only else args.replay_measurements), args.replay_sources, args.index_kinds, args.documents_per_record, ([False, True] if args.replay_operation == 'replay' else [False]), args.batches):
         for pair in range(args.samples):
             for variant in (['baseline', 'changed'] if pair % 2 == 0 else ['changed', 'baseline']):
-                label = f'replay-{replay_source}-{kind}-{records}-{budgeted}-{batch}-{pair}-{variant}'
+                label = f'replay-{measurement}-{replay_source}-{kind}-{records}-{budgeted}-{batch}-{pair}-{variant}'
                 lines = run(label, [binaries[variant] / 'replay-allocation-bench', args.documents,
-                                   batch, 1, 'budgeted' if budgeted else 'unbudgeted', records, kind, replay_source, args.replay_operation, args.repetitions], env)
+                                   batch, 1, 'budgeted' if budgeted else 'unbudgeted', records, kind, replay_source, args.replay_operation, args.repetitions, measurement], env)
                 data = json.loads(next(x for x in lines if x.startswith('{')))
                 if data.get('source', 'journal') != replay_source:
                     raise ValueError('both replay binaries must support the requested source')
                 if data.get('operation', 'replay') != args.replay_operation or data.get('repetitions', 1) != args.repetitions:
                     raise ValueError('both replay binaries must support the requested operation and repetitions')
+                if data.get('measurement', 'counted') != measurement:
+                    raise ValueError('both replay binaries must support the requested measurement')
                 results.append(dict(workload='replay', variant=variant, pair=pair, **data))
                 print(label, data['elapsed_ns'], flush=True)
                 save()
-    for mode in ([] if args.replay_only else ['counted', 'timing']):
+    for mode in ([] if args.replay_only or args.document_lookup_only else ['counted', 'timing']):
         child_env = env.copy()
         if mode == 'counted':
             child_env['ANTFLY_COUNT_BENCH_ALLOCATIONS'] = '1'
@@ -91,27 +96,46 @@ def main():
                                         measurement=mode, **data, **counts))
                     print(label, data['run_ns'], flush=True)
                     save()
-    replay_checksums = {x['checksum'] for x in results if x['workload'] == 'replay'}
+    if args.document_lookup_only:
+        for pair in range(args.samples):
+            for variant in (['baseline', 'changed'] if pair % 2 == 0 else ['changed', 'baseline']):
+                label = f'document-{pair}-{variant}'
+                lines = run(label, [binaries[variant] / 'document-lookup-bench'], env)
+                measurements = [json.loads(line.split('document_lookup_bench ', 1)[1])
+                                for line in lines if 'document_lookup_bench {' in line]
+                if {x['measurement'] for x in measurements} != {'counted', 'timing'} or len(measurements) != 2:
+                    raise ValueError('both document collector binaries must emit counted and timing results')
+                for data in measurements:
+                    results.append(dict(workload='document', source='primary', variant=variant, pair=pair, **data))
+                print(label, [(x['measurement'], x['elapsed_ns']) for x in measurements], flush=True)
+                save()
+    replay_checksums = {x['checksum'] for x in results if x['workload'] in ('replay', 'document')}
     if len(replay_checksums) > 1:
         raise ValueError('baseline and candidate replay checksums differ')
+    def measurement_mode(x, workload):
+        measurement = x.get('measurement', 'counted')
+        return measurement + ('-budgeted' if x.get('budgeted') else '-unbudgeted') if workload == 'replay' else measurement
+
     summary = {}
-    for workload in ['replay', 'vector']:
+    for workload in ['replay', 'vector', 'document']:
         groups = sorted({(x.get('source', 'journal'), x.get('index_kind', 'none'), x.get('documents_per_record', 1), x.get('batch', 0),
-                          x.get('measurement', 'budgeted' if x.get('budgeted') else 'unbudgeted'))
+                          measurement_mode(x, workload))
                          for x in results if x['workload'] == workload})
         for replay_source, kind, records, batch, mode in groups:
             group = {v: [x for x in results if x['workload'] == workload and x['variant'] == v
                          and x.get('source', 'journal') == replay_source and x.get('index_kind', 'none') == kind and x.get('documents_per_record', 1) == records and x.get('batch', 0) == batch
-                         and x.get('measurement', 'budgeted' if x.get('budgeted') else 'unbudgeted') == mode]
+                         and measurement_mode(x, workload) == mode]
                      for v in binaries}
-            fields = ['elapsed_ns', 'allocations', 'allocated_bytes', 'peak_live_bytes'] if workload == 'replay' else [
+            fields = ['elapsed_ns', 'allocations', 'allocated_bytes', 'peak_live_bytes'] if workload in ('replay', 'document') else [
                 'run_ns', 'final_checkpoint_ns', 'max_batch_ns', 'allocations', 'allocated_bytes', 'peak_additional_live_bytes']
+            if workload in ('replay', 'document') and mode.startswith('timing'):
+                fields = ['elapsed_ns']
             stats = {f: {v: statistics.median(x[f] for x in xs) for v, xs in group.items()}
                      for f in fields if all(f in x for xs in group.values() for x in xs)}
             for values in stats.values():
                 values['change_percent'] = (100 * (values['changed'] / values['baseline'] - 1)
                                             if values['baseline'] else 0.0 if not values['changed'] else None)
-            field = 'elapsed_ns' if workload == 'replay' else 'run_ns'
+            field = 'elapsed_ns' if workload in ('replay', 'document') else 'run_ns'
             ratios = [100 * (next(x[field] for x in group['changed'] if x['pair'] == pair) /
                             next(x[field] for x in group['baseline'] if x['pair'] == pair) - 1)
                       for pair in range(len(group['baseline']))

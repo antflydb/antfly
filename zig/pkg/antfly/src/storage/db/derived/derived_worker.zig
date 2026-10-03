@@ -291,6 +291,7 @@ pub fn catchUpIndexFromMatchingCursor(
         const had_retained_scratch = decode_scratch.retainedCapacityBytes() != 0;
         var retried_fresh = false;
         var collection_limit = options.max_records_per_window;
+        var retry_stats = replay_source_mod.MatchingRecordStats{};
         const chunk_stats = collect: while (true) {
             const collected = replay_cursor.forEachNext(collection_limit, &builder, replayChunkConsumeRecord) catch |err| {
                 // An empty window gets one retry after reclaiming cached
@@ -302,6 +303,7 @@ pub fn catchUpIndexFromMatchingCursor(
                 {
                     // No-op records already advanced the cursor. Keep the
                     // remaining record quota rather than restarting the window.
+                    retry_stats.add(replay_cursor.last_scan_stats);
                     if (collection_limit != 0) collection_limit -= builder.accepted_records;
                     builder.resetEmptyWindow();
                     builder.minimal_key_blocks = true;
@@ -312,7 +314,8 @@ pub fn catchUpIndexFromMatchingCursor(
                 }
                 return err;
             };
-            break :collect collected;
+            retry_stats.add(collected);
+            break :collect retry_stats;
         };
         stats.window_collect_ns += monotonicTimeNs() - collect_started_ns;
         if (chunk_stats.last_sequence == 0) {
@@ -338,6 +341,7 @@ pub fn catchUpIndexFromMatchingCursor(
             });
         }
 
+        const collected_bytes = builder.tracked_bytes;
         const batch = try builder.finishBorrowed(chunk_stats.last_sequence);
         var window_open = false;
         errdefer if (window_open) {
@@ -391,7 +395,7 @@ pub fn catchUpIndexFromMatchingCursor(
             }
         }
         completed_windows += 1;
-        call_bytes +|= builder.tracked_bytes;
+        call_bytes +|= collected_bytes;
         // Oversized single records retain the existing one-record progress
         // exception, but cannot multiply it across coalesced chunks.
         if (options.max_call_bytes != 0 and call_bytes >= options.max_call_bytes) break;
@@ -809,12 +813,29 @@ const ReplayChunkBuilder = struct {
         self.tracked_bytes = next_tracked_bytes;
     }
 
+    fn releaseDeduplication(self: *@This()) !void {
+        const bytes = (@as(u64, self.seen_changed_docs.capacity()) + self.seen_deleted_docs.capacity() +
+            self.seen_overwritten_docs.capacity() + self.seen_changed_artifacts.capacity()) * @sizeOf([]const u8);
+        self.seen_changed_docs.deinit(self.alloc);
+        self.seen_deleted_docs.deinit(self.alloc);
+        self.seen_overwritten_docs.deinit(self.alloc);
+        self.seen_changed_artifacts.deinit(self.alloc);
+        self.seen_changed_docs = .empty;
+        self.seen_deleted_docs = .empty;
+        self.seen_overwritten_docs = .empty;
+        self.seen_changed_artifacts = .empty;
+        try self.observeTrackedBytes(self.tracked_bytes - bytes);
+    }
+
     /// Borrows keys, target metadata, and document descriptors from this
     /// builder. Apply callbacks must finish using them before returning (or
     /// clone them), just as with the previous per-window owned batch.
     /// Only builder.deinit owns cleanup; never call deinitDerivedBatch here.
     fn finishBorrowed(self: *@This(), sequence: u64) !derived_types.DerivedBatch {
         const count = self.changed_doc_keys.items.len;
+        // Deduplication is complete. Release maps and admission before the
+        // descriptors are allocated, avoiding overlap with publication/apply.
+        try self.releaseDeduplication();
         self.documents = try self.alloc.alloc(derived_types.DerivedDocument, count);
         const targets: []const derived_types.DerivedTargetRef = switch (self.index_ref.kind) {
             .full_text, .algebraic => blk: {
@@ -829,16 +850,12 @@ const ReplayChunkBuilder = struct {
         for (self.changed_doc_keys.items, self.documents) |key, *doc| {
             doc.* = .{ .key = key, .action = .upsert, .targets = targets };
         }
-        // Deduplication is finished. Do not carry its maps into indexing,
-        // where they would overlap with the consumer's working set.
-        self.seen_changed_docs.deinit(self.alloc);
-        self.seen_deleted_docs.deinit(self.alloc);
-        self.seen_overwritten_docs.deinit(self.alloc);
-        self.seen_changed_artifacts.deinit(self.alloc);
-        self.seen_changed_docs = .empty;
-        self.seen_deleted_docs = .empty;
-        self.seen_overwritten_docs = .empty;
-        self.seen_changed_artifacts = .empty;
+        // Keys now live in document descriptors; the temporary pointer list
+        // has no consumer. Release both its storage and its admitted capacity.
+        const key_list_bytes = @as(u64, self.changed_doc_keys.capacity) * @sizeOf([]const u8);
+        self.changed_doc_keys.deinit(self.alloc);
+        self.changed_doc_keys = .empty;
+        try self.observeTrackedBytes(self.tracked_bytes - key_list_bytes);
         return .{
             .sequence = sequence,
             .documents = self.documents,
@@ -2145,9 +2162,10 @@ test "replay batch descriptor admission is deduplicated and finish needs no new 
     const spare = manager.availableAdmissionBytes(.derived_replay_window);
     var other = try manager.reserve(.derived_replay_window, spare);
     defer other.release();
+    const released = @as(u64, builder.changed_doc_keys.capacity + builder.seen_changed_docs.capacity()) * @sizeOf([]const u8);
     const batch = try builder.finishBorrowed(1);
     try std.testing.expectEqual(@as(usize, 2), batch.documents.len);
-    try std.testing.expectEqual(admitted, builder.tracked_bytes);
+    try std.testing.expectEqual(admitted - released, builder.tracked_bytes);
 }
 
 test "catchUpIndex reclaims changing record shapes under a tight hard budget" {
@@ -2171,6 +2189,8 @@ test "catchUpIndex reclaims changing record shapes under a tight hard budget" {
     const retry = try catchUpIndexFromMatchingCursor(alloc, &cursor, index, &capture, testApplyCapture, .{ .resource_manager = &manager, .max_records_per_window = 1 });
     try std.testing.expectEqual(@as(usize, 20), capture.applied_deleted_keys);
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(usize, 2), retry.scanned_entries);
+    try std.testing.expectEqual(@as(usize, 2), retry.replay_scan_batches);
     try std.testing.expectEqual(@as(u64, 2), retry.last_applied_sequence);
     try std.testing.expectEqual(@as(usize, 8), capture.applied_documents);
 }
@@ -2240,6 +2260,8 @@ test "catchUpIndex no-op records do not disable compact key admission" {
     defer cursor.deinit(alloc);
     const index: index_manager_mod.ManagedIndexRef = .{ .name = "text", .kind = .full_text };
     const retry = try catchUpIndexFromMatchingCursor(alloc, &cursor, index, &capture, testApplyCapture, .{ .resource_manager = &manager, .max_records_per_window = 2, .max_windows_per_call = 1 });
+    try std.testing.expectEqual(@as(usize, 2), retry.scanned_entries);
+    try std.testing.expectEqual(@as(usize, 2), retry.replay_scan_batches);
     try std.testing.expectEqual(@as(u64, 2), retry.last_applied_sequence);
     try std.testing.expectEqual(@as(usize, 1), capture.applied_documents);
 }
@@ -2291,4 +2313,26 @@ fn replayMetadataAllocationFailure(alloc: Allocator) !void {
 
 test "replay metadata initial reservation releases every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, replayMetadataAllocationFailure, .{});
+}
+
+test "replay publication releases temporary metadata storage and admission before apply" {
+    const Counter = @import("../../../allocation_bench_support.zig").Counter;
+    var counter: Counter = .{};
+    var manager = resource_manager_mod.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 750 } });
+    defer manager.deinit(std.testing.allocator);
+    var builder = ReplayChunkBuilder.init(counter.allocator(), .{ .name = "text", .kind = .full_text }, &manager, 0);
+    defer builder.deinit();
+    builder.minimal_key_blocks = true;
+    try builder.appendRecord(.{ .changed_doc_keys = &.{ "a", "b" } });
+    const batch = try builder.finishBorrowed(1);
+    try std.testing.expectEqual(@as(usize, 2), batch.documents.len);
+    try std.testing.expectEqualStrings("a", batch.documents[0].key);
+    try std.testing.expectEqualStrings("b", batch.documents[1].key);
+    try std.testing.expectEqual(@as(u64, counter.live), builder.tracked_bytes);
+    try std.testing.expectEqual(@as(usize, 0), builder.changed_doc_keys.capacity);
+    var apply_bytes: u64 = 0;
+    try manager.adjustUsage(.document_extraction_working_set, &apply_bytes, 400);
+    defer manager.adjustUsage(.document_extraction_working_set, &apply_bytes, 0) catch unreachable;
+    try std.testing.expect(counter.live + 400 <= 750);
+    try std.testing.expect(counter.peak <= 750);
 }

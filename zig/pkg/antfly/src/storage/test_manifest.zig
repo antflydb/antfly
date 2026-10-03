@@ -126,6 +126,7 @@ comptime {
     _ = @import("db/artifact_ids.zig");
     _ = @import("db/backfill_state.zig");
     _ = @import("db/batcher.zig");
+    _ = @import("db/lookup_key_scratch.zig");
     _ = @import("db/catalog/enrichment_catalog.zig");
     _ = @import("db/catalog/index_manager.zig");
     _ = @import("db/catalog/resolver_catalog.zig");

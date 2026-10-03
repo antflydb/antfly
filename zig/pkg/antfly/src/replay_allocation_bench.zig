@@ -49,7 +49,8 @@ pub fn main(init: std.process.Init) !void {
     if (repetitions == 0 or (operation == .replay and repetitions != 1)) return error.InvalidRepetitions;
     const index: indexes.ManagedIndexRef = .{ .name = "title_body", .kind = kind };
     if (batch == 0 or documents_per_record == 0) return error.InvalidBatch;
-    const setup = std.heap.c_allocator;
+    const counting = args.len <= 10 or !std.mem.eql(u8, args[10], "timing");
+    const setup = std.heap.smp_allocator;
     var log = try journal.Journal.open("allocation-benchmark-memory", .{
         .backend = .lsm_memory,
         .lsm_options = .{ .flush_threshold = 512, .compact_threshold_runs = 256, .wal_enabled = false, .obsolete_retention_ns = 0 },
@@ -85,6 +86,7 @@ pub fn main(init: std.process.Init) !void {
     }
     for (0..samples + 1) |sample| {
         var counter: Counter = .{};
+        const run_alloc = if (counting) counter.allocator() else std.heap.smp_allocator;
         var consumer: Consumer = .{};
         var manager = resources.ResourceManager.init(.{});
         defer manager.deinit(setup);
@@ -92,7 +94,7 @@ pub fn main(init: std.process.Init) !void {
         var windows: usize = 0;
         switch (operation) {
             .replay => {
-                const stats = try worker.catchUpIndexWithOptions(counter.allocator(), replay_source, index, 0, &consumer, Consumer.apply, .{
+                const stats = try worker.catchUpIndexWithOptions(run_alloc, replay_source, index, 0, &consumer, Consumer.apply, .{
                     .resource_manager = if (budgeted) &manager else null,
                     .max_records_per_window = batch,
                     .max_items_per_window = batch,
@@ -100,8 +102,8 @@ pub fn main(init: std.process.Init) !void {
                 windows = stats.applied_entries;
             },
             .enrichment => {
-                const groups = try replay_source.collectEnrichmentDocumentGroups(counter.allocator(), 0);
-                defer source.freePendingDocumentGroups(counter.allocator(), groups);
+                const groups = try replay_source.collectEnrichmentDocumentGroups(run_alloc, 0);
+                defer source.freePendingDocumentGroups(run_alloc, groups);
                 for (groups) |group| {
                     const id = try std.fmt.parseInt(usize, group.doc_key["document-".len..], 10);
                     const last_event = @min(count, (id + 1) * repetitions);
@@ -113,7 +115,7 @@ pub fn main(init: std.process.Init) !void {
                 }
             },
             .latest => {
-                const latest = try replay_source.latestMatchingSequence(counter.allocator(), 0, worker.targetHintForManagedIndex(index));
+                const latest = try replay_source.latestMatchingSequence(run_alloc, 0, worker.targetHintForManagedIndex(index));
                 if (latest != sequence) return error.InvalidLatestSequence;
             },
         }
@@ -125,8 +127,8 @@ pub fn main(init: std.process.Init) !void {
             .latest => 0,
         };
         if (consumer.count != expected_count or consumer.checksum != (if (operation == .latest) @as(usize, 0) else expected_checksum) or counter.live != 0) return error.InvalidReplayOrLeakedMemory;
-        if (sample != 0) std.debug.print("{{\"sample\":{d},\"documents\":{d},\"batch\":{d},\"budgeted\":{},\"documents_per_record\":{d},\"index_kind\":\"{s}\",\"source\":\"{s}\",\"operation\":\"{s}\",\"repetitions\":{d},\"elapsed_ns\":{d},\"allocations\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d},\"windows\":{d}}}\n", .{
-            sample, count, batch, budgeted, documents_per_record, @tagName(kind), if (primary) "primary" else "journal", @tagName(operation), repetitions, elapsed, counter.calls, counter.bytes, counter.peak, consumer.checksum, windows,
+        if (sample != 0) std.debug.print("{{\"sample\":{d},\"documents\":{d},\"batch\":{d},\"budgeted\":{},\"documents_per_record\":{d},\"index_kind\":\"{s}\",\"source\":\"{s}\",\"operation\":\"{s}\",\"repetitions\":{d},\"measurement\":\"{s}\",\"elapsed_ns\":{d},\"allocations\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d},\"windows\":{d}}}\n", .{
+            sample, count, batch, budgeted, documents_per_record, @tagName(kind), if (primary) "primary" else "journal", @tagName(operation), repetitions, if (counting) "counted" else "timing", elapsed, counter.calls, counter.bytes, counter.peak, consumer.checksum, windows,
         });
     }
 }

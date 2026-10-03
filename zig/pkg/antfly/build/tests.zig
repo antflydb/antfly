@@ -162,10 +162,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const replay_allocation_tests = b.addTest(.{
         .root_module = replay_allocation_mod,
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
-        .filters = &.{ "storage.db.derived.", "replay batcher", "dense replay preserves", "sparse replay preserves" },
+        .filters = &.{ "storage.db.derived.", "lookup scratch", "replay batcher", "dense replay preserves", "sparse replay preserves" },
     });
     b.step("replay-allocation-test", "Run replay ownership, scratch retention and window contracts")
         .dependOn(&b.addRunArtifact(replay_allocation_tests).step);
+    const lookup_key_bench_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lookup_key_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, lookup_key_bench_mod, true, true);
+    const lookup_key_bench = b.addExecutable(.{ .name = "lookup-key-bench", .root_module = lookup_key_bench_mod });
+    b.step("lookup-key-bench", "Measure document lookup key preparation with pooled and individual ownership")
+        .dependOn(&b.addInstallArtifact(lookup_key_bench, .{}).step);
     const replay_allocation_bench_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/replay_allocation_bench.zig"),
         .target = target,
@@ -5545,7 +5554,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_index_maintenance_vopr = addFilteredTestRunArtifactWithRuntimeFilters(b, graph_metric_integration_tests, &.{"index maintenance VOPR "});
     vopr_test_step.dependOn(&run_index_maintenance_vopr.step);
 
+    const document_lookup_bench = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{"db document lookup allocation benchmark"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("document-lookup-bench", "Build validated real document collector allocation/timing benchmark")
+        .dependOn(&b.addInstallArtifact(document_lookup_bench, .{ .dest_sub_path = "document-lookup-bench" }).step);
+
     const replay_document_integration_filters = [_][]const u8{
+        "collectDocumentWrites batches sorted document reads",
+        "collectDocumentWrites skips missing out-of-range",
         "db reopens persisted index catalog and text index",
         "db derived text replay admits natural segments below hard segment limit",
         "db managed full text admission replays transitive artifact producers",
@@ -5978,6 +5997,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.source_proof_batch.",
             "storage.db.backfill_state.",
             "storage.db.batcher.",
+            "storage.db.lookup_key_scratch.",
             "storage.db.config.",
             "storage.db.apply_receipts.",
             "storage.db.durable_outbox.",

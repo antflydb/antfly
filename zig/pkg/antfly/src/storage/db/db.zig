@@ -278,6 +278,7 @@ const graph_pattern_mod = @import("../../graph/pattern.zig");
 const graph_node_identity = @import("../../graph/node_identity.zig");
 const mapper = @import("document_mapper.zig");
 const relational_store = @import("relational_store.zig");
+const lookup_key_scratch = @import("lookup_key_scratch.zig");
 const relational_columns = @import("relational_columns.zig");
 const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 const planning_adapter_mod = @import("planning_adapter.zig");
@@ -70518,13 +70519,14 @@ fn collectSparseFieldWritesProfiled(
 ) !OwnedSparseFieldWrites {
     const PendingDocumentWrite = struct {
         doc_key: []const u8,
-        store_key: []u8,
+        store_key: []const u8,
         inline_value: ?[]const u8,
     };
 
+    var lookup_keys = lookup_key_scratch.Scratch.init(alloc, documents.len);
+    defer lookup_keys.deinit();
     var pending = std.ArrayListUnmanaged(PendingDocumentWrite).empty;
     defer {
-        for (pending.items) |item| alloc.free(item.store_key);
         pending.deinit(alloc);
     }
 
@@ -70580,7 +70582,7 @@ fn collectSparseFieldWritesProfiled(
         }
         try pending.append(alloc, .{
             .doc_key = doc.key,
-            .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key, opts.relational_base_rows),
+            .store_key = try lookup_keys.key(doc.key, opts.relational_base_rows),
             .inline_value = doc.cleaned_value,
         });
     }
@@ -70689,13 +70691,14 @@ fn collectDocumentWritesProfiled(
 ) !OwnedBatchWrites {
     const PendingDocumentWrite = struct {
         doc_key: []const u8,
-        store_key: []u8,
+        store_key: []const u8,
         inline_value: ?[]const u8,
     };
 
+    var lookup_keys = lookup_key_scratch.Scratch.init(alloc, documents.len);
+    defer lookup_keys.deinit();
     var pending = std.ArrayListUnmanaged(PendingDocumentWrite).empty;
     defer {
-        for (pending.items) |item| alloc.free(item.store_key);
         pending.deinit(alloc);
     }
 
@@ -70733,7 +70736,7 @@ fn collectDocumentWritesProfiled(
         }
         try pending.append(alloc, .{
             .doc_key = doc.key,
-            .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key, opts.relational_base_rows),
+            .store_key = try lookup_keys.key(doc.key, opts.relational_base_rows),
             .inline_value = doc.cleaned_value,
         });
     }
@@ -70947,13 +70950,14 @@ fn collectTextDocumentWritesForIndex(
 ) !CollectedTextDocumentWrites {
     const PendingTextWrite = struct {
         doc_key: []const u8,
-        store_key: []u8,
+        store_key: []const u8,
         inline_value: ?[]const u8,
     };
 
+    var lookup_keys = lookup_key_scratch.Scratch.init(alloc, documents.len);
+    defer lookup_keys.deinit();
     var pending = std.ArrayListUnmanaged(PendingTextWrite).empty;
     defer {
-        for (pending.items) |item| alloc.free(item.store_key);
         pending.deinit(alloc);
     }
 
@@ -71002,7 +71006,7 @@ fn collectTextDocumentWritesForIndex(
         }
         try pending.append(alloc, .{
             .doc_key = doc.key,
-            .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key, opts.relational_base_rows),
+            .store_key = try lookup_keys.key(doc.key, opts.relational_base_rows),
             .inline_value = doc.cleaned_value,
         });
     }
@@ -150350,3 +150354,55 @@ pub const test_support = if (builtin.is_test) struct {
     pub const ensureDurableReplicationStartupBarrier = fixture_owner.DB.ensureDurableReplicationStartupBarrier;
     pub const flushDurableReplicationOutboxes = fixture_owner.DB.flushDurableReplicationOutboxes;
 } else struct {};
+
+test "db document lookup allocation benchmark" {
+    const Counter = @import("../../allocation_bench_support.zig").Counter;
+    const alloc = std.testing.allocator;
+    const count = 50_000;
+    const batch_size = 256;
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+    const names = try alloc.alloc([24]u8, count);
+    defer alloc.free(names);
+    const docs = try alloc.alloc(derived_types.DerivedDocument, count);
+    defer alloc.free(docs);
+    const stored = try alloc.alloc(docstore_mod.KVPair, count);
+    defer alloc.free(stored);
+    var initialized: usize = 0;
+    defer for (stored[0..initialized]) |write| alloc.free(write.key);
+    const value = "{\"title\":\"document value\"}";
+    for (names, docs, stored, 0..) |*name, *doc, *write, i| {
+        const key = try std.fmt.bufPrint(name, "document-{d:0>10}", .{i});
+        doc.* = .{ .key = key, .action = .upsert };
+        write.* = .{ .key = try replayDocumentStoreKeyAlloc(alloc, key, false), .value = value };
+        initialized += 1;
+    }
+    try store.putBatch(stored, &.{});
+    for (0..2) |measurement| {
+        for (0..2) |sample| {
+            var counter: Counter = .{};
+            const run_alloc = if (measurement == 0) counter.allocator() else std.heap.smp_allocator;
+            var checksum: usize = 0;
+            const started = monotonicTimeNs();
+            var offset: usize = 0;
+            while (offset < count) {
+                const end = @min(count, offset + batch_size);
+                var writes = try collectDocumentWrites(run_alloc, &store, docs[offset..end], .{ .start = "", .end = "" });
+                defer writes.deinit();
+                try std.testing.expectEqual(end - offset, writes.items.len);
+                for (writes.items, docs[offset..end]) |write, doc| {
+                    try std.testing.expectEqualStrings(doc.key, write.key);
+                    try std.testing.expectEqualStrings(value, write.value);
+                    for (write.key) |byte| checksum +%= byte;
+                }
+                offset = end;
+            }
+            const elapsed = monotonicTimeNs() - started;
+            try std.testing.expectEqual(@as(usize, 0), counter.live);
+            if (sample != 0) std.debug.print("document_lookup_bench {{\"documents\":{d},\"batch\":{d},\"measurement\":\"{s}\",\"elapsed_ns\":{d},\"allocations\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d}}}\n", .{ count, batch_size, if (measurement == 0) "counted" else "timing", elapsed, counter.calls, counter.bytes, counter.peak, checksum });
+        }
+    }
+}

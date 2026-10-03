@@ -40,7 +40,7 @@ pub const MatchingRecordStats = struct {
     scan_batches: usize = 0,
     last_sequence: u64 = 0,
 
-    fn add(self: *MatchingRecordStats, other: MatchingRecordStats) void {
+    pub fn add(self: *MatchingRecordStats, other: MatchingRecordStats) void {
         self.matched_entries += other.matched_entries;
         self.scanned_entries += other.scanned_entries;
         self.hint_filter_skips += other.hint_filter_skips;
@@ -50,6 +50,9 @@ pub const MatchingRecordStats = struct {
 };
 
 pub const MatchingCursor = struct {
+    /// Statistics from the latest collection attempt, including accepted
+    /// entries before a consumer error. Rejected lookahead is not counted.
+    last_scan_stats: MatchingRecordStats = .{},
     state: union(enum) {
         journal: JournalMatchingCursor,
         primary_store: PrimaryStoreMatchingCursor,
@@ -77,15 +80,18 @@ pub const MatchingCursor = struct {
         ctx: *anyopaque,
         consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
     ) !MatchingRecordStats {
+        self.last_scan_stats = .{};
         return switch (self.state) {
             .journal => |*cursor| journalMatchingCursorForEachNext(
                 cursor,
+                &self.last_scan_stats,
                 max_matched_entries,
                 ctx,
                 consume,
             ),
             .primary_store => |*cursor| primaryStoreMatchingCursorForEachNext(
                 cursor,
+                &self.last_scan_stats,
                 max_matched_entries,
                 ctx,
                 consume,
@@ -255,6 +261,7 @@ fn primaryStoreFallbackScanBudget(max_matched_entries: usize) usize {
 
 fn journalMatchingCursorForEachNext(
     cursor: *JournalMatchingCursor,
+    stats_out: *MatchingRecordStats,
     max_matched_entries: usize,
     ctx: *anyopaque,
     consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
@@ -286,6 +293,7 @@ fn journalMatchingCursorForEachNext(
         }
     };
     var scan = Scan{ .cursor = cursor, .max_matched = max_matched_entries, .consumer_ctx = ctx, .consume = consume };
+    defer stats_out.* = scan.stats;
     // Payloads are borrowed only while collecting. The stream closes its read
     // transaction before apply, and rejected lookahead remains at the cursor.
     try cursor.journal.iterateOpaqueFromStreamingWithContext(cursor.next_sequence + 1, &scan, Scan.visit);
@@ -294,12 +302,14 @@ fn journalMatchingCursorForEachNext(
 
 fn primaryStoreMatchingCursorForEachNext(
     cursor: *PrimaryStoreMatchingCursor,
+    stats_out: *MatchingRecordStats,
     max_matched_entries: usize,
     ctx: *anyopaque,
     consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
 ) !MatchingRecordStats {
     if (cursor.hint_exhausted) return .{};
     var stats = MatchingRecordStats{ .scan_batches = 1 };
+    defer stats_out.* = stats;
     const max_scanned_entries = if (cursor.fallback_all)
         primaryStoreFallbackScanBudget(max_matched_entries)
     else
@@ -1509,4 +1519,41 @@ test "replay source enrichment validates corruption in skipped binary fields" {
     defer alloc.free(encoded);
     _ = try journal.appendOpaque(encoded[0 .. encoded.len - 1]);
     try std.testing.expectError(error.UnexpectedEndOfInput, Source.fromJournal(&journal).collectEnrichmentDocumentGroups(alloc, 0));
+}
+
+test "replay cursor exposes partial scan statistics on consumer failure for both sources" {
+    const alloc = std.testing.allocator;
+    var journal = try change_journal_mod.Journal.open("partial-scan-stats", .{ .backend = .lsm_memory });
+    defer journal.close();
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try docstore_mod.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    for (1..4) |sequence| {
+        const encoded = try change_journal_mod.encodeRecord(alloc, .{ .sequence = sequence, .target_hints = if (sequence == 1) &.{.graph} else &.{.full_text} });
+        defer alloc.free(encoded);
+        _ = try journal.appendOpaque(encoded);
+        try store.appendReplayOpaque(alloc, sequence, encoded);
+    }
+    const Context = struct {
+        reject: bool = true,
+        fn consume(ptr: *anyopaque, sequence: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (sequence == 3 and self.reject) return error.ResourceBudgetExceeded;
+        }
+    };
+    for ([_]Source{ Source.fromJournal(&journal), Source.fromPrimaryStore(&store, null, null) }, 0..) |source, i| {
+        var cursor = try source.openMatchingCursor(alloc, 0, .full_text);
+        defer cursor.deinit(alloc);
+        var ctx: Context = .{};
+        try std.testing.expectError(error.ResourceBudgetExceeded, cursor.forEachNext(0, &ctx, Context.consume));
+        try std.testing.expectEqual(@as(usize, 1), cursor.last_scan_stats.matched_entries);
+        try std.testing.expectEqual(@as(usize, if (i == 0) 2 else 1), cursor.last_scan_stats.scanned_entries);
+        try std.testing.expectEqual(@as(usize, if (i == 0) 1 else 0), cursor.last_scan_stats.hint_filter_skips);
+        try std.testing.expectEqual(@as(usize, 1), cursor.last_scan_stats.scan_batches);
+        ctx.reject = false;
+        const resumed = try cursor.forEachNext(0, &ctx, Context.consume);
+        try std.testing.expectEqual(@as(usize, 1), resumed.matched_entries);
+        try std.testing.expectEqual(@as(u64, 3), resumed.last_sequence);
+    }
 }
