@@ -29724,6 +29724,7 @@ pub const IndexManager = struct {
             for (legacy_keys) |key| self.alloc.free(@constCast(key));
         }
 
+        try sortLegacyOrdinalProbes(alloc, legacy_keys, missing_ordinals);
         try mutable_txn.getManySorted(legacy_keys, legacy_values);
         for (legacy_values, missing_ordinals) |maybe_raw, ordinal| {
             if (maybe_raw) |raw| {
@@ -33935,6 +33936,50 @@ fn legacyDenseVectorIdMappingKey(alloc: Allocator, index_name: []const u8, vecto
 
 fn legacyDenseOrdinalMappingKey(alloc: Allocator, index_name: []const u8, ordinal: doc_identity.DocOrdinal) ![]u8 {
     return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:dense:{s}:ordinal:{d}", .{ index_name, ordinal });
+}
+
+/// Legacy ordinal keys spell the ordinal in decimal, so numeric order is not
+/// byte order ("...:999" sorts after "...:1000"). Sorted multi-gets require
+/// ascending keys; Lite rejects anything else with InvalidBatch. Reorder the
+/// keys byte-wise, keeping each ordinal paired with its key.
+fn sortLegacyOrdinalProbes(alloc: Allocator, keys: [][]const u8, ordinals: []doc_identity.DocOrdinal) !void {
+    std.debug.assert(keys.len == ordinals.len);
+    const Probe = struct {
+        key: []const u8,
+        ordinal: doc_identity.DocOrdinal,
+
+        fn lessThan(_: void, lhs: @This(), rhs: @This()) bool {
+            return std.mem.lessThan(u8, lhs.key, rhs.key);
+        }
+    };
+    const probes = try alloc.alloc(Probe, keys.len);
+    defer alloc.free(probes);
+    for (probes, keys, ordinals) |*probe, key, ordinal| probe.* = .{ .key = key, .ordinal = ordinal };
+    std.sort.pdq(Probe, probes, {}, Probe.lessThan);
+    for (probes, keys, ordinals) |probe, *key, *ordinal| {
+        key.* = probe.key;
+        ordinal.* = probe.ordinal;
+    }
+}
+
+test "legacy dense ordinal probes are byte-ordered for sorted multi-gets" {
+    const alloc = std.testing.allocator;
+    var ordinals = [_]doc_identity.DocOrdinal{ 9, 999, 1000, 10000 };
+    var keys: [ordinals.len][]const u8 = undefined;
+    for (&keys, ordinals) |*key, ordinal| key.* = try legacyDenseOrdinalMappingKey(alloc, "vec", ordinal);
+    defer for (keys) |key| alloc.free(@constCast(key));
+    // Numeric order is not byte order once the decimal widths differ.
+    try std.testing.expect(std.mem.order(u8, keys[1], keys[2]) == .gt);
+
+    try sortLegacyOrdinalProbes(alloc, &keys, &ordinals);
+    for (keys[1..], keys[0 .. keys.len - 1]) |key, previous| {
+        try std.testing.expect(std.mem.order(u8, previous, key) == .lt);
+    }
+    for (keys, ordinals) |key, ordinal| {
+        const expected = try legacyDenseOrdinalMappingKey(alloc, "vec", ordinal);
+        defer alloc.free(expected);
+        try std.testing.expectEqualStrings(expected, key);
+    }
 }
 
 fn legacyDenseOrdinalMemberPrefix(alloc: Allocator, index_name: []const u8, ordinal: doc_identity.DocOrdinal) ![]u8 {
