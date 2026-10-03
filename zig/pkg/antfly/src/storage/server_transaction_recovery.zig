@@ -865,7 +865,7 @@ test "replicated recovery batches proven followers preserves uncertain debt and 
     }
 }
 
-pub fn runDbRecoveryOnce(self: *@import("antfly_local_sources").storage_db_db.DB, config: Config) !types.TransactionRecoveryStats {
+pub fn runDbRecoveryOnce(self: *@import("antfly_source_root").antfly_sources.physical_db.DB, config: Config) !types.TransactionRecoveryStats {
     var replication_mutation = try self.admitTransactionRecovery();
     defer if (replication_mutation) |*lease| lease.release();
     if (!config.enabled) return .{};

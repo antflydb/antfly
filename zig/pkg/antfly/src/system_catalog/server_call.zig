@@ -26,6 +26,8 @@ pub const Call = union(enum) {
     setting_snapshot: @import("antfly_local_sources").system_catalog_settings.Scope,
     policy_snapshot: @import("antfly_local_sources").system_catalog_policies.SnapshotRequest,
     policy_install_snapshot: @import("antfly_local_sources").system_catalog_policies.InstallRequest,
+    /// Returns a PublicationStamp, or JSON null when no policy was provisioned.
+    /// Unsupported capabilities and inconsistent publications remain errors.
     policy_publication_status: u64,
     /// Narrow, linearizable supervisor work queue; excludes policy definitions.
     policy_publication_work: u64,

@@ -7793,7 +7793,15 @@ pub const Backend = struct {
         defer self.maintenance_io_budget_remaining = saved_budget;
 
         var flushes: u64 = 0;
-        if (self.activeImmutableMemtableCount() > 0 and try self.flushOldestImmutableMemtable()) {
+        // A direct-bulk-ingest batch queues its already-sorted state as an
+        // immutable memtable so it can be published without a mutable-insert
+        // detour; it is not an ordinary flush candidate. Forcing it through
+        // the normal flush path here would record a spurious flush and
+        // defeat the bulk flush-threshold multiplier the caller configured.
+        // Bulk sessions defer their memtable flush to session finish (see
+        // finishBulkIngestSessionWithOptionsLocked); only the manifest
+        // checkpoint below must not wait for that.
+        if (!self.bulkIngestActive() and self.activeImmutableMemtableCount() > 0 and try self.flushOldestImmutableMemtable()) {
             flushes = 1;
         }
         var manifest_publishes: u64 = 0;

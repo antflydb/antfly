@@ -48,7 +48,10 @@ fn runProductionDataServerScenario(options: ScenarioOptions) !void {
         // The production HTTP stack intentionally uses large fixed parser and
         // formatting buffers. Match a production worker thread's stack rather
         // than the compact default used by protocol-level VOPR scenarios.
-        .tasks = .{ .stack_size = 8 * 1024 * 1024 },
+        // 8 MiB overflowed under Debug codegen on the equivalent
+        // single-DataServer Raft-merge campaign (data/runtime.zig); use the
+        // same 32 MiB headroom here.
+        .tasks = .{ .stack_size = 32 * 1024 * 1024 },
         .network = .{ .max_sockets = options.max_sockets },
         .instrumentation = .{ .enabled = options.prioritize_time, .map_digest = 0x44535652 },
     });

@@ -2747,7 +2747,14 @@ pub const HealthSource = struct {
             &async_indexing_stats,
             self.data_server.provisioned_storage.resource_manager.derivedRecoverableRetryStats(),
         );
-        try writeAsyncIndexingMetrics(writer, async_indexing_stats);
+        async_indexing_stats.derived_workers.replay_document_not_visible_skipped_total =
+            self.data_server.provisioned_storage.resource_manager.replayDocumentNotVisibleSkippedTotalAll();
+        const replay_not_visible_skipped_by_index = try self.data_server.provisioned_storage.resource_manager.snapshotReplayDocumentNotVisibleSkipped(self.data_server.alloc);
+        defer {
+            for (replay_not_visible_skipped_by_index) |entry| self.data_server.alloc.free(entry.index_name);
+            self.data_server.alloc.free(replay_not_visible_skipped_by_index);
+        }
+        try writeAsyncIndexingMetrics(writer, async_indexing_stats, replay_not_visible_skipped_by_index);
         try antfly.db.query_metrics.writePrometheus(writer);
         try antfly.db.enrichment_utf8_text.writePrometheus(writer);
     }
@@ -3212,6 +3219,7 @@ fn writeTextMergeMetrics(writer: *std.Io.Writer, stats: antfly.db.types.TextMerg
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_quarantined_segments", "gauge", "Cached write full-text source segments currently quarantined after failure", stats.quarantined_segments);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_retry_after_ns", "gauge", "Latest monotonic retry-after timestamp for cached write full-text merge work", stats.retry_after_ns);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_deferred_for_pressure_total", "counter", "Cached write full-text merge attempts deferred for resource pressure", stats.deferred_for_pressure);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_forced_drains_total", "counter", "Cached write full-text merges force-drained after the tiered policy found nothing to merge", stats.forced_drains);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_backpressure_events_total", "counter", "Cached write full-text merge backpressure events", stats.backpressure_events);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_backpressure_ns_total", "counter", "Nanoseconds spent under full-text merge backpressure", stats.backpressure_ns);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_backpressure_timeouts_total", "counter", "Full-text merge backpressure deadlines reached", stats.backpressure_timeouts);
@@ -3233,7 +3241,11 @@ const AsyncMutexMetricField = enum {
     max_hold_ns,
 };
 
-fn writeAsyncIndexingMetrics(writer: *std.Io.Writer, stats: antfly.db.types.AsyncIndexingStats) !void {
+fn writeAsyncIndexingMetrics(
+    writer: *std.Io.Writer,
+    stats: antfly.db.types.AsyncIndexingStats,
+    replay_not_visible_skipped_by_index: []const resource_manager_mod.IndexReplayDocumentNotVisibleSkipped,
+) !void {
     try health_metrics.appendPromMetric(writer, "antfly_async_index_workers", "gauge", "Derived-index workers running across cached writable tables", stats.derived_workers.workers);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_workers_with_replay_debt", "gauge", "Derived-index workers whose target sequence is ahead of their applied sequence", stats.derived_workers.workers_with_replay_debt);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_max_replay_lag_sequences", "gauge", "Largest target-minus-applied sequence lag across derived-index workers", stats.derived_workers.max_replay_lag_sequences);
@@ -3243,6 +3255,15 @@ fn writeAsyncIndexingMetrics(writer: *std.Io.Writer, stats: antfly.db.types.Asyn
     try appendDerivedRetrySample(writer, "replay_document_not_visible", stats.derived_workers.replay_document_not_visible_retries);
     try appendDerivedRetrySample(writer, "artifact_repair_required", stats.derived_workers.artifact_repair_required_retries);
     try appendDerivedRetrySample(writer, "not_found", stats.derived_workers.not_found_retries);
+    try health_metrics.appendPromMetric(writer, "antfly_replay_document_not_visible_skipped_total", "counter", "Documents given up on by derived replay after bounded error.ReplayDocumentNotVisible retries, summed across indexes", stats.derived_workers.replay_document_not_visible_skipped_total);
+    if (replay_not_visible_skipped_by_index.len > 0) {
+        try health_metrics.appendPromMetricHeader(writer, "antfly_replay_document_not_visible_skipped_by_index_total", "counter", "Documents given up on by derived replay after bounded error.ReplayDocumentNotVisible retries, labeled by index");
+        for (replay_not_visible_skipped_by_index) |entry| {
+            try health_metrics.appendPromSampleLabeled(writer, "antfly_replay_document_not_visible_skipped_by_index_total", &.{
+                .{ .name = "index", .value = entry.index_name },
+            }, entry.count);
+        }
+    }
 
     try writeAsyncMutexMetricFamily(writer, stats, .lock_calls, "antfly_async_index_mutex_lock_calls_total", "counter", "Async indexing mutex lock attempts");
     try writeAsyncMutexMetricFamily(writer, stats, .contended_calls, "antfly_async_index_mutex_contended_calls_total", "counter", "Async indexing mutex lock attempts that encountered contention");
@@ -28073,6 +28094,15 @@ const RemoteMetadataSource = struct {
     }
 
     fn storeRootReadiness(self: *RemoteMetadataSource) !bool {
+        // Registration probes readiness before every other metadata call it
+        // makes. A deterministic workload that injects an unreachable/stale
+        // leader through `fetch_head_error` must see that same fault here,
+        // exactly as `fetchHeadWithBudget` already does for ordinary status
+        // reads; otherwise this probe instead reaches live transport the
+        // workload never modeled a response for.
+        if (@import("builtin").is_test) {
+            if (self.test_faults.fetch_head_error) |err| return err;
+        }
         return self.withMetadataApiClient(bool, struct {
             fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, _: void) !bool {
                 return client.storeRootReadiness(base_uri);
@@ -28081,6 +28111,9 @@ const RemoteMetadataSource = struct {
     }
 
     fn storeRootSigningReadiness(self: *RemoteMetadataSource) !bool {
+        if (@import("builtin").is_test) {
+            if (self.test_faults.fetch_head_error) |err| return err;
+        }
         return self.withMetadataApiClient(bool, struct {
             fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, _: void) !bool {
                 return client.storeRootSigningReadiness(base_uri);
@@ -31898,7 +31931,10 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
 
     var vopr_io = try vopr.vopr_io.VoprIo.init(.{
         .seed = 0x4d55_4c54_4944_4154,
-        .tasks = .{ .stack_size = 8 * 1024 * 1024 },
+        // Three full DataServers replicating a Raft merge/split is a
+        // strictly larger version of the single-server campaign below; see
+        // the matching comment there for why 8 MiB overflowed under Debug.
+        .tasks = .{ .stack_size = 32 * 1024 * 1024 },
         .network = .{ .max_sockets = 16_384 },
         .required = .of(&.{
             .clock_read,
@@ -44317,18 +44353,38 @@ fn consumerTests() type {
             var host_sentinel: antfly.raft.ManagedHttpHostService = undefined;
             server.data_raft = &host_sentinel;
             server.data_raft_metadata_sync_requested = .init(false);
-            try server.refreshDataRaftMetadataForBatchWithBudget(source.awakeNs() + std.time.ns_per_s, null);
+            // `refreshDataRaftMetadataForBatchWithBudget` builds its own
+            // routing clock from `self.dataRaftIo()`, which is null here
+            // (backend_runtime is never set in this test) and so checks the
+            // deadline against `platform_time.monotonicNs()` -- a different
+            // clock, on a different epoch, than `source.io`'s "awake" clock
+            // that `source.awakeNs()` reads. A deadline computed from one
+            // and checked against the other is not "too tight under load",
+            // it is simply wrong on every run; only widening the budget
+            // happened to mask it when the two epochs started close
+            // together. This call means to test success, not timing, so
+            // give it a deadline that cannot expire under either clock
+            // instead of trying to translate between them.
+            try server.refreshDataRaftMetadataForBatchWithBudget(std.math.maxInt(u64), null);
             try std.testing.expect(server.data_raft_metadata_sync_requested.load(.acquire));
             try std.testing.expectEqual(forwarding_clone_count, source.test_faults.snapshot_result_clones);
             server.data_raft_metadata_sync_requested.store(false, .release);
             try std.testing.expectError(error.Timeout, server.refreshDataRaftMetadataForBatchWithBudget(0, null));
             var canceled_preflight: antfly.raft.transport.http_common.RequestCancellation = .{};
             canceled_preflight.cancel();
-            try std.testing.expectError(error.Cancelled, server.refreshDataRaftMetadataForBatchWithBudget(source.awakeNs() + std.time.ns_per_s, &canceled_preflight));
+            // Cancellation is checked before the deadline (RouteBudget.check),
+            // so the clock mismatch above cannot mask this assertion -- but
+            // use the same non-expiring deadline for consistency with the
+            // success case above.
+            try std.testing.expectError(error.Cancelled, server.refreshDataRaftMetadataForBatchWithBudget(std.math.maxInt(u64), &canceled_preflight));
             try std.testing.expect(!server.data_raft_metadata_sync_requested.load(.acquire));
             server.data_raft = null;
             for ([_]DataRaftMutationDiscovery{ .catalog, .cached }) |discovery| {
-                const endpoint = (try server.dataApiUriForNode(alloc, 2, .{ .discovery = discovery }, source.awakeNs() + std.time.ns_per_s)).?;
+                // Same clock mismatch as above: dataApiUriForNode ->
+                // acquireDataForwardingPeers also builds its routing clock
+                // from self.dataRaftIo() (null, backend_runtime unset), not
+                // source.io.
+                const endpoint = (try server.dataApiUriForNode(alloc, 2, .{ .discovery = discovery }, std.math.maxInt(u64))).?;
                 defer alloc.free(endpoint);
                 try std.testing.expectEqualStrings("http://new", endpoint);
                 try std.testing.expectEqual(forwarding_clone_count, source.test_faults.snapshot_result_clones);
@@ -54681,7 +54737,16 @@ fn implementationTests() type {
             // host-backed differential boundary; no native thread drives consensus.
             var vopr_io = try vopr.vopr_io.VoprIo.init(.{
                 .seed = 0x4441_5441_4d45_5247,
-                .tasks = .{ .stack_size = 8 * 1024 * 1024 },
+                // Debug builds keep every frame in this call chain
+                // unoptimized (DataServer -> Raft apply -> merge replication
+                // -> local batch wait), and the old 8 MiB fiber stack
+                // overflowed into an adjacent task's heap allocation,
+                // corrupting its `kernel`/`current` state and crashing (with
+                // an unwalkable fiber stack) deep in the scheduler on
+                // resume. 32 MiB reproduces clean across 40+ runs with
+                // headroom; see the VoprIo task kernel for the stack
+                // allocation itself.
+                .tasks = .{ .stack_size = 32 * 1024 * 1024 },
                 .required = .of(&.{
                     .clock_read,
                     .sleep,

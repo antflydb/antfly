@@ -1646,7 +1646,7 @@ pub const AnswerAgentSteps = struct {
 
 /// Configuration for the Antfly inference chunking provider. Antfly inference is Antfly's built-in ML service for local chunking. The model name maps to ONNX model directory names (similar to how Ollama works). **Chunking Models:** - fixed: Simple fixed-size chunking by token count (built-in, no ONNX required) - Any other name will attempt to load from models/chunkers/{name}/ directory **Deduplication:** - Within a single document write, chunk results are deduplicated when multiple indexes share the same source text and chunker configuration, so the source is chunked at most once per write.
 pub const AntflyChunkerConfig = struct {
-    /// Maximum number of chunks to generate per document.
+    /// Maximum number of chunks to generate per document. Zero (the default when omitted) means unlimited: the document is chunked in full. Set an explicit value up to 4096 to cap output; any chunks beyond the cap are silently omitted, so treat a result whose chunk count equals `max_chunks` as potentially truncated.
     max_chunks: ?i64 = null,
     /// Confidence threshold for model-based chunking (0.0-1.0).
     threshold: ?f32 = null,
@@ -3548,7 +3548,7 @@ pub const ChatToolsConfig = struct {
 
 /// Per-request configuration for chunking. All fields are optional - zero/omitted values use chunker defaults.
 pub const ChunkOptions = struct {
-    /// Maximum number of chunks to generate per document.
+    /// Maximum number of chunks to generate per document. Zero (the default when omitted) means unlimited: the document is chunked in full. Set an explicit value up to 4096 to cap output; any chunks beyond the cap are silently omitted, so treat a result whose chunk count equals `max_chunks` as potentially truncated.
     max_chunks: ?i64 = null,
     /// Confidence threshold for model-based chunking (0.0-1.0).
     threshold: ?f32 = null,
@@ -3595,7 +3595,7 @@ pub const ChunkOptions = struct {
 
 /// A unified configuration for a chunking provider.
 pub const ChunkerConfig = struct {
-    /// Maximum number of chunks to generate per document.
+    /// Maximum number of chunks to generate per document. Zero (the default when omitted) means unlimited: the document is chunked in full. Set an explicit value up to 4096 to cap output; any chunks beyond the cap are silently omitted, so treat a result whose chunk count equals `max_chunks` as potentially truncated.
     max_chunks: ?i64 = null,
     /// Confidence threshold for model-based chunking (0.0-1.0).
     threshold: ?f32 = null,
@@ -21793,7 +21793,7 @@ pub const InferenceChunk = struct {
 pub const InferenceChunkConfig = struct {
     /// The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
     model: ?[]const u8 = null,
-    /// Maximum number of chunks to generate per document.
+    /// Maximum number of chunks to generate per document. Zero (the default when omitted) means unlimited: the document is chunked in full. Set an explicit value up to 4096 to cap output; any chunks beyond the cap are silently omitted, so treat a result whose chunk count equals `max_chunks` as potentially truncated.
     max_chunks: ?i64 = null,
     /// Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models and VAD audio models.
     threshold: ?f32 = null,

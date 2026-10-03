@@ -760,7 +760,7 @@ test "ordered artifact inventory document worker fairly resumes nonempty childre
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/unit-worker-directory", .{tmp.sub_path});
     defer alloc.free(path);
-    var db = try @import("db.zig").DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+    var db = try @import("antfly_source_root").antfly_sources.physical_db.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
     defer db.close();
     try db.setSchemaJson(alloc, "{}");
     try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "text", .chunk_size = 4 });

@@ -27,6 +27,9 @@ pub fn needsMerge(
 ) !bool {
     const snap = index.snapshot();
     if (snap.segments.len < 2) return false;
+    // Scheduling and planning must agree about force-drain debt. A policy
+    // miss above the tier target still needs a task, including after reopen.
+    if (snap.segments.len > policy.max_segments_per_tier) return true;
 
     const infos = try buildSegmentInfosAlloc(alloc, snap);
     defer alloc.free(infos);
@@ -34,6 +37,36 @@ pub fn needsMerge(
     const planned = (try policy.plan(alloc, infos)) orelse return false;
     alloc.free(planned);
     return true;
+}
+
+/// Force-drain the smallest eligible segments from an already-filtered
+/// candidate list (segments not currently in flight or quarantined). Used
+/// when the tiered policy finds nothing to merge (every eligible segment
+/// floors to the same effective size under floor_segment_size, or no pair
+/// fits under max_segment_size) while the index still holds more live
+/// segments than its steady-state tier target, so producer admission always
+/// has a merge in flight to wait on instead of retrying
+/// TextMergeBackpressureTimeout against a scheduler that gave up.
+pub fn planForceDrainFromInfos(
+    alloc: Allocator,
+    infos: []const merger_mod.SegmentInfo,
+    max_segments_at_once: usize,
+) ![]usize {
+    const plan_len = @min(infos.len, max_segments_at_once);
+    const candidates = try alloc.dupe(merger_mod.SegmentInfo, infos);
+    defer alloc.free(candidates);
+
+    std.mem.sort(merger_mod.SegmentInfo, candidates, {}, struct {
+        fn lessThan(_: void, a: merger_mod.SegmentInfo, b: merger_mod.SegmentInfo) bool {
+            if (a.has_deletions != b.has_deletions) return a.has_deletions;
+            if (a.size != b.size) return a.size < b.size;
+            return a.index < b.index;
+        }
+    }.lessThan);
+
+    const planned = try alloc.alloc(usize, plan_len);
+    for (planned, 0..) |*seg_idx, i| seg_idx.* = candidates[i].index;
+    return planned;
 }
 
 pub fn planPolicyMergeAlloc(

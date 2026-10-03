@@ -83,6 +83,9 @@ pub const AddTestsResult = struct {
     standalone_runtime_test_step: *std.Build.Step,
     standalone_initial_fk_tests: *std.Build.Step.Compile,
     standalone_policy_ha_tests: *std.Build.Step.Compile,
+    lite_cmd_tests: *std.Build.Step.Compile,
+    lib_standalone_runtime_tests: *std.Build.Step.Compile,
+    public_api_parity_tests: *std.Build.Step.Compile,
     vopr_test_step: *std.Build.Step,
     integration_test_step: *std.Build.Step,
     chaos_test_step: *std.Build.Step,
@@ -268,7 +271,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-system-catalog-report-bench", "Run opt-in report apply, repair and selected admission workloads").dependOn(&run_admission_bench.step);
     const system_catalog_api_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
-        .filters = &.{ "system catalog", "ordinary read needs no principal without policy but active policy fails closed", "FK publication upgrade response excludes unknown mutation outcomes", "FK publication reports missing setting authority as service unavailable", "prepared query routing", "routing session pins every table", "metadata.table status encoder", "metadata.table detail encoder", "public table constraint lifecycle accepts explicit epoch zero" },
+        .filters = &.{ "system catalog", "ordinary reads and writes distinguish absent policy from unavailable authority", "FK publication upgrade response excludes unknown mutation outcomes", "FK publication reports missing setting authority as service unavailable", "prepared query routing", "routing session pins every table", "metadata.table status encoder", "metadata.table detail encoder", "public table constraint lifecycle accepts explicit epoch zero" },
     });
     const system_catalog_api_step = b.step("antfly-system-catalog-api-test", "Run qualified catalog HTTP authorization and protocol tests");
     system_catalog_api_step.dependOn(&b.addRunArtifact(system_catalog_api_tests).step);
@@ -318,6 +321,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     @import("../../antfly-embedded/build/storage.zig").configureLmdb(b, data_consumer_module, lmdb_engine_mod, true);
     data_consumer_module.addImport("antfly_admin_openapi", antfly_imports.admin_openapi);
     data_consumer_module.addImport("antfly_internal_openapi", antfly_imports.internal_openapi);
+    // HA replication test fixtures in data/runtime.zig construct a real
+    // physical DB (not just the ABI owner boundary), which pulls the vector
+    // index engine in directly.
+    data_consumer_module.addImport("antfly_vectorindex", vectorindex_mod);
     const data_implementation_module = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/data_runtime_implementation_test_root.zig"),
         .target = target,
@@ -758,15 +765,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     secret_store_abi_test_step.dependOn(&run_secret_store_abi_tests.step);
     lib_common_secrets_test_step.dependOn(&run_secret_store_abi_tests.step);
 
+    const runtime_io_abi_provider_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/runtime_io_abi_test_provider.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
     const runtime_io_abi_provider = b.addLibrary(.{
         .name = "runtime-io-abi-test-provider",
         .linkage = .static,
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("pkg/antfly/src/runtime_io_abi_test_provider.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
+        .root_module = runtime_io_abi_provider_mod,
     });
     antfly_imports.configureRuntimeContracts(runtime_io_abi_provider.root_module);
     antfly_imports.storage_boundary.configureSources(runtime_io_abi_provider.root_module, false, false);
@@ -787,14 +795,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_runtime_io_abi_tests = b.addRunArtifact(runtime_io_abi_tests);
     b.step("runtime-io-abi-test", "Run executor contracts across independent error domains").dependOn(&run_runtime_io_abi_tests.step);
 
+    const scan_sink_provider_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/runtime_scan_sink_test_provider.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const scan_sink_provider = b.addLibrary(.{
         .name = "runtime-scan-sink-test-provider",
         .linkage = .static,
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("pkg/antfly/src/runtime_scan_sink_test_provider.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+        .root_module = scan_sink_provider_mod,
     });
     antfly_imports.configureRuntimeContracts(scan_sink_provider.root_module);
     antfly_imports.storage_boundary.configureSources(scan_sink_provider.root_module, false, false);
@@ -2536,6 +2545,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_raft_transition_runtime_docid_tests = api_tests_addTests_result.run_raft_transition_runtime_docid_tests;
     const run_api_table_writes_production_regression_unit_tests = api_tests_addTests_result.run_api_table_writes_production_regression_unit_tests;
     const run_lib_docid_lifecycle_tests = api_tests_addTests_result.run_lib_docid_lifecycle_tests;
+    const public_api_parity_tests = api_tests_addTests_result.public_api_parity_tests;
 
     const openapi_root_check_step = b.step("openapi-root-check", "Check that the bundled root OpenAPI spec matches the modular Zig specs");
     openapi_root_check_step.dependOn(&openapi_root_check.step);
@@ -2758,6 +2768,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("vector-migration-test", "Run source ownership migration and recovery tests").dependOn(&b.addRunArtifact(vector_migration_tests).step);
 
     const resource_budget_runtime_filters = [_][]const u8{
+        "resource manager replay skip snapshots clean up every allocation failure",
+        "resource manager records and snapshots replay-document-not-visible skips per owner and index",
         "default tokenizer cache budget is aligned with its resource slice",
         "default lake range cache queue budget is aligned with its terminal resource slice",
         "identity allocation failure rolls back every memory ledger",
@@ -4483,8 +4495,31 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const system_catalog_standalone_step = b.step("antfly-system-catalog-standalone-test", "Run standalone catalog checkpoint and rollback tests");
     system_catalog_standalone_step.dependOn(&b.addRunArtifact(system_catalog_standalone_tests).step);
+    // This filter set boots the real CLI/standalone and Lite server paths
+    // (HA, hot-standby, Lite adoption, ...), which reach the real
+    // storage-kernel owner through api/kernel_owner_source.zig the same way
+    // production does, regardless of the control-only source selection.
+    // Clone standalone_runtime_test_mod instead of reusing it directly so
+    // only this one compile carries the storage owner archive; root
+    // composition links it below rather than every standalone runtime
+    // consumer (system_catalog_standalone_tests, standalone_restore_tests).
+    const lib_standalone_runtime_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/standalone_runtime_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    standalone_runtime_imports.configure(b, lib_standalone_runtime_test_mod, true, true);
+    lib_standalone_runtime_test_mod.addImport("antfly_openapi_specs", standalone_runtime_imports.runtime.embedded_openapi);
+    const usermgr_storage_lib_standalone_runtime_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    usermgr_storage_lib_standalone_runtime_test_mod.addImport("antfly_root", lib_standalone_runtime_test_mod);
+    usermgr_storage_lib_standalone_runtime_test_mod.addImport("antfly_platform", platform_mod);
+    lib_standalone_runtime_test_mod.addImport("usermgr_storage", usermgr_storage_lib_standalone_runtime_test_mod);
     const lib_standalone_runtime_tests = b.addTest(.{
-        .root_module = standalone_runtime_test_mod,
+        .root_module = lib_standalone_runtime_test_mod,
         .filters = &.{
             "standalone runtime module compiles",
             "standalone.runtime.test.system catalog",
@@ -4743,6 +4778,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
     });
     const run_server_db_tests = addCuratedTestRunArtifact(b, server_db_tests, &server_db_filters);
+    // Recovery and replicated-commit fixtures live in the server test root.
+    // Keep them in the DB transaction gate through their actual owner module.
+    run_lib_db_txn_tests.step.dependOn(&run_server_db_tests.step);
     b.step("antfly-server-db-test", "Run server ordered apply and transaction recovery integration tests").dependOn(&run_server_db_tests.step);
     // Server integration owns an independent aggregate slice. Do not send a
     // local-root caller filter to it; the dedicated server gate narrows its
@@ -5216,6 +5254,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // server adapter; broad DB fixtures still need the shared storage imports.
     antfly_imports.configureEmbedded(b, db_test_mod, true);
     antfly_imports.storage_boundary.configureSources(db_test_mod, false, false);
+    db_test_mod.addImport("runtime_failure_abi", antfly_imports.storage_boundary.failure);
+    db_test_mod.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    db_test_mod.addImport("antfly_cancellation", antfly_imports.cancellation);
+    db_test_mod.addImport("antfly_template_content", antfly_imports.template_content);
+    db_test_mod.addImport("antfly_runtime_fs", antfly_imports.runtime_fs);
+    db_test_mod.addImport("antfly_cache_budget", antfly_imports.cache_budget);
+    db_test_mod.addImport("antfly_inference_execution_context", antfly_imports.inference_execution_context);
+    db_test_mod.addImport("antfly_inference_work", antfly_imports.inference_work);
+    db_test_mod.addImport("antfly_sparse_embedding", antfly_imports.sparse_embedding);
     const transcribing_db_test_stub_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/testing/transcribing_stub.zig"),
         .target = target,
@@ -5837,6 +5884,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     antfly_imports.configureRuntimeContracts(sparse_test_mod);
     antfly_imports.storage_boundary.configureSources(sparse_test_mod, false, false);
     sparse_test_mod.addImport("bloom", bloom_mod);
+    sparse_test_mod.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    sparse_test_mod.addImport("antfly_cache_budget", antfly_imports.cache_budget);
+    sparse_test_mod.addImport("antfly_runtime_fs", antfly_imports.runtime_fs);
+    sparse_test_mod.addImport("antfly_cancellation", antfly_imports.cancellation);
     // Sparse lifecycle tests reach BackendRuntime through shared storage code;
     // its lazy PDF lane is part of that module graph even when the test itself
     // does not render a document.
@@ -6810,6 +6861,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .standalone_runtime_test_step = lib_standalone_runtime_test_step,
         .standalone_initial_fk_tests = standalone_initial_fk_tests,
         .standalone_policy_ha_tests = standalone_policy_ha_tests,
+        .lite_cmd_tests = lite_cmd_tests,
+        .lib_standalone_runtime_tests = lib_standalone_runtime_tests,
+        .public_api_parity_tests = public_api_parity_tests,
         .vopr_test_step = vopr_test_step,
         .integration_test_step = integration_test_step,
         .chaos_test_step = chaos_test_step,

@@ -811,6 +811,7 @@ const TextMergeScheduler = struct {
     last_merge_elapsed_ns: u64 = 0,
     last_merge_peak_task_alloc_bytes: u64 = 0,
     deferred_for_pressure: u64 = 0,
+    forced_drains: u64 = 0,
 
     fn deinit(self: *TextMergeScheduler, alloc: Allocator) void {
         for (self.in_flight.items) |*merge| merge.deinit(alloc);
@@ -1723,6 +1724,17 @@ pub const IndexManager = struct {
         // producer admission sample this bit without taking every index's
         // apply mutex, so it must not be a plain concurrently-mutated bool.
         compaction_pending: std.atomic.Value(bool) = .init(false),
+        // A merge's byte reservation is sized from a point-in-time estimate,
+        // but deletion deltas that commit while the merge builds also compete
+        // inside that same fixed ceiling (see TextMergeBudgetAllocator). Under
+        // a sustained heavy write rate, a wide merge plan can take long enough
+        // to build that accumulating deltas alone exhaust the reservation,
+        // and retrying the identical plan hits the same wall every time since
+        // the write rate has not changed. Shrink the segment count admitted
+        // per attempt after such a failure so the next merge builds faster
+        // and has a narrower window to accumulate deltas in, and let it grow
+        // back on success so steady state is unaffected.
+        merge_segment_cap: std.atomic.Value(u32) = .init(std.math.maxInt(u32)),
 
         pub fn lockAnalysisShared(self: *TextIndex) void {
             self.analysis_mutex.lockShared();
@@ -1945,12 +1957,21 @@ pub const IndexManager = struct {
                 defer reader.deinit();
                 for (0..reader.doc_count) |doc_idx| {
                     const doc_id: u32 = @intCast(doc_idx);
-                    if (try reader.docOrdinal(doc_id)) |ordinal| {
-                        _ = ordinal;
-                        ordinal_count += 1;
-                    } else if (try reader.storedDoc(doc_id)) |stored| {
+                    // The stored id is the document's own unique key and takes
+                    // priority: chunk members intentionally share their
+                    // parent's ordinal (see result_shape.zig), so an ordinal
+                    // alone cannot distinguish one chunk from its siblings.
+                    // Keying by ordinal first would collide every sibling
+                    // chunk into the same slot and discard the rest as
+                    // "duplicates" even though they are distinct live
+                    // documents. Ordinal-only identity remains correct for
+                    // any document that genuinely has no stored id.
+                    if (try reader.storedDoc(doc_id)) |stored| {
                         _ = stored;
                         id_count += 1;
+                    } else if (try reader.docOrdinal(doc_id)) |ordinal| {
+                        _ = ordinal;
+                        ordinal_count += 1;
                     } else {
                         return error.MissingMergeDocumentIdentity;
                     }
@@ -1976,10 +1997,10 @@ pub const IndexManager = struct {
                 for (0..reader.doc_count) |doc_idx| {
                     const doc_id: u32 = @intCast(doc_idx);
                     const location: OutputLocation = .{ .segment = @intCast(output_idx), .doc = doc_id };
-                    if (try reader.docOrdinal(doc_id)) |ordinal| {
-                        try insertOrdinal(ordinals, ordinal, location);
-                    } else if (try reader.storedDoc(doc_id)) |stored| {
+                    if (try reader.storedDoc(doc_id)) |stored| {
                         try insertId(ids, stored.id, location);
+                    } else if (try reader.docOrdinal(doc_id)) |ordinal| {
+                        try insertOrdinal(ordinals, ordinal, location);
                     } else unreachable;
                 }
             }
@@ -5895,6 +5916,74 @@ pub const IndexManager = struct {
             }
         }
 
+        fn appendDenseFieldParsed(
+            alloc: Allocator,
+            field: DenseFieldWritePlan,
+            doc_key: []const u8,
+            root: std.json.Value,
+            extracted: *mapper.ExtractedWrite,
+        ) !void {
+            const vector = (try mapper.extractDenseVectorFieldFromParsed(alloc, root, field.field_name, field.dims)) orelse return;
+            errdefer alloc.free(vector);
+            const index_name = try alloc.dupe(u8, field.index_name);
+            errdefer alloc.free(index_name);
+            const owned_doc_key = try alloc.dupe(u8, doc_key);
+            errdefer alloc.free(owned_doc_key);
+            try appendDenseEmbeddingToExtractedWrite(alloc, extracted, .{
+                .index_name = index_name,
+                .doc_key = owned_doc_key,
+                .vector = vector,
+            });
+        }
+
+        fn appendSparseFieldParsed(
+            alloc: Allocator,
+            field: SparseFieldWritePlan,
+            doc_key: []const u8,
+            root: std.json.Value,
+            extracted: *mapper.ExtractedWrite,
+        ) !void {
+            var sparse_vec = (try mapper.extractSparseVectorFieldFromParsed(alloc, root, field.field_name)) orelse return;
+            errdefer sparse_vec.deinit(alloc);
+            const index_name = try alloc.dupe(u8, field.index_name);
+            errdefer alloc.free(index_name);
+            const owned_doc_key = try alloc.dupe(u8, doc_key);
+            errdefer alloc.free(owned_doc_key);
+            try appendSparseEmbeddingToExtractedWrite(alloc, extracted, .{
+                .index_name = index_name,
+                .doc_key = owned_doc_key,
+                .indices = sparse_vec.indices,
+                .values = sparse_vec.values,
+            });
+            sparse_vec.indices = &.{};
+            sparse_vec.values = &.{};
+        }
+
+        /// Document-mode analogue of
+        /// `appendIndexFieldEmbeddingsFromPreparedToExtractedWrite` for raw
+        /// writes that have no relational ordinal row to consult: both dense
+        /// and sparse direct-field vectors come from the parsed JSON body
+        /// alone, read against this owned per-generation snapshot instead of
+        /// the live `dense_indexes`/`sparse_indexes` catalog arrays. Safe to
+        /// call after the catalog lock that produced this snapshot has been
+        /// released, including across chunking/inference work.
+        pub fn appendIndexFieldEmbeddingsFromParsedToExtractedWrite(
+            self: WritePlanSnapshot,
+            alloc: Allocator,
+            doc_key: []const u8,
+            root: std.json.Value,
+            extracted: *mapper.ExtractedWrite,
+        ) !void {
+            for (self.dense_fields) |field| {
+                if (hasExplicitDenseEmbedding(extracted.dense_embeddings, field.index_name)) continue;
+                try appendDenseFieldParsed(alloc, field, doc_key, root, extracted);
+            }
+            for (self.sparse_fields) |field| {
+                if (hasExplicitSparseEmbedding(extracted.sparse_embeddings, field.index_name)) continue;
+                try appendSparseFieldParsed(alloc, field, doc_key, root, extracted);
+            }
+        }
+
         fn generatedConsumerSatisfied(
             extracted: mapper.ExtractedWrite,
             kind: enrichment_types.GeneratedEnrichmentKind,
@@ -6869,6 +6958,18 @@ pub const IndexManager = struct {
         }
         self.alloc.free(self.base_path);
         self.native_read_scratch.destroy();
+        // PR #957 review on the #938 escalation commit: the process-wide
+        // ResourceManager's replay-document-not-visible tracker is keyed in
+        // part by this IndexManager's own address (see
+        // resource_manager_mod.replayOwnerIdFromPtr), so it must be told
+        // this owner is gone -- both to let that address be reused by a
+        // later IndexManager without inheriting stale retry/skip state, and
+        // so the tracker cannot grow without bound across DB/table
+        // open-close churn. Do this before destroying resource_manager
+        // below, in case it is the same instance as owned_resource_manager.
+        if (self.resource_manager) |manager| {
+            manager.removeReplayNotVisibleOwner(resource_manager_mod.replayOwnerIdFromPtr(self));
+        }
         if (self.owned_resource_manager) |manager| {
             manager.deinit(self.alloc);
             self.alloc.destroy(manager);
@@ -15702,7 +15803,7 @@ pub const IndexManager = struct {
         // Use the publication predicate, including implicit full-text chunk
         // routing. A failed dependency inspection must conservatively schedule
         // replay, which will surface the error, never silently skip a delete.
-        return textIndexShouldConsumeDoc(self, entry, key) catch true;
+        return textIndexShouldRetireDeletedDoc(self, entry, key) catch true;
     }
 
     pub fn textIndexIsChunkBacked(self: *const IndexManager, alloc: Allocator, name: ?[]const u8) !bool {
@@ -17753,6 +17854,23 @@ pub const IndexManager = struct {
         return try textIndexShouldConsumeDoc(self, entry, key);
     }
 
+    /// Like textPublicationContextConsumesKeyAssumeCatalogLocked, for a key
+    /// being deleted: also retires members of chunk artifacts that no longer
+    /// route into the index.
+    pub fn textPublicationContextRetiresDeletedKeyAssumeCatalogLocked(
+        self: *IndexManager,
+        index_name: []const u8,
+        context: TextPublicationContext,
+        key: []const u8,
+    ) !bool {
+        const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
+        if (entry.instance_id != context.instance_id) return error.IndexNotFound;
+        entry.lockAnalysisShared();
+        defer entry.unlockAnalysisShared();
+        if (entry.projection_revision != context.projection_revision) return error.IndexNotFound;
+        return try textIndexShouldRetireDeletedDoc(self, entry, key);
+    }
+
     /// Plan the natural segment fan-out before producer admission. Projection
     /// is repeated during publication, but tokenization and segment construction
     /// still happen only once. Using the same source and segment splitters as
@@ -18296,6 +18414,7 @@ pub const IndexManager = struct {
             .last_merge_error = types.RuntimeErrorName.init(self.text_merge_scheduler.lastMergeError(now_ns)),
             .retry_after_ns = self.text_merge_scheduler.retryAfterNs(now_ns),
             .deferred_for_pressure = self.text_merge_scheduler.deferred_for_pressure,
+            .forced_drains = self.text_merge_scheduler.forced_drains,
         };
 
         for (self.text_indexes.items) |*entry| {
@@ -18357,6 +18476,7 @@ pub const IndexManager = struct {
             .last_merge_error = types.RuntimeErrorName.init(self.text_merge_scheduler.lastMergeErrorForIndex(index_name, now_ns)),
             .retry_after_ns = self.text_merge_scheduler.retryAfterNsForIndex(index_name, now_ns),
             .deferred_for_pressure = self.text_merge_scheduler.deferred_for_pressure,
+            .forced_drains = self.text_merge_scheduler.forced_drains,
         };
 
         const entry = self.textIndexEntry(index_name) orelse return stats;
@@ -22122,7 +22242,20 @@ pub const IndexManager = struct {
                 else => return err,
             };
             if (maybe_task) |task| return task;
-            if (!has_in_flight and !self.text_merge_scheduler.indexHasActiveQuarantine(entry.config.name, now_ns)) TextMergeScheduler.noteComplete(entry);
+            // A null task can mean genuinely nothing left to merge, or a
+            // transient planning miss (every eligible segment already
+            // in-flight or quarantined, a resource-pressure defer inside
+            // beginTextMergeTaskForEntry, etc). Clearing compaction_pending
+            // here without re-checking whether the index still needs a
+            // merge would drop the only signal that would have retried it:
+            // nothing else re-arms compaction_pending once it is cleared.
+            if (!has_in_flight and !self.text_merge_scheduler.indexHasActiveQuarantine(entry.config.name, now_ns)) {
+                if (try self.textIndexNeedsMerge(&entry.persistent, activeTextMergePolicy())) {
+                    TextMergeScheduler.schedule(entry);
+                } else {
+                    TextMergeScheduler.noteComplete(entry);
+                }
+            }
         }
         return null;
     }
@@ -22363,6 +22496,11 @@ pub const IndexManager = struct {
                 result.elapsed_ns,
                 result.peak_task_alloc_bytes,
             );
+            // A completed merge proves the current write rate can sustain a
+            // merge this wide; let the next plan use the policy's normal
+            // width again instead of staying shrunk from an earlier
+            // mid-build budget failure (see merge_segment_cap).
+            entry.merge_segment_cap.store(std.math.maxInt(u32), .release);
         }
         return applied;
     }
@@ -22370,6 +22508,23 @@ pub const IndexManager = struct {
     pub fn cancelTextMergeTask(self: *IndexManager, task: *const TextMergeTask) void {
         self.completeTextMergeTaskTracking(task);
         if (self.textIndexEntry(task.index_name)) |entry| TextMergeScheduler.schedule(entry);
+    }
+
+    /// Like `cancelTextMergeTask`, but for a merge whose byte reservation ran
+    /// out mid-build rather than at admission. Retrying the identical plan
+    /// would hit the same wall under the same write rate (deletion deltas
+    /// that commit while the merge builds compete inside that same fixed
+    /// ceiling; see `TextMergeBudgetAllocator` and `merge_segment_cap`), so
+    /// shrink the segment count admitted for this index's next attempt
+    /// instead of spinning on a doomed plan.
+    pub fn noteTextMergeResourceBudgetExceeded(self: *IndexManager, task: *const TextMergeTask) void {
+        self.completeTextMergeTaskTracking(task);
+        if (self.textIndexEntry(task.index_name)) |entry| {
+            const attempted: u32 = @intCast(task.merge_indices.len);
+            const shrunk = @max(2, attempted / 2);
+            entry.merge_segment_cap.store(shrunk, .release);
+            TextMergeScheduler.schedule(entry);
+        }
     }
 
     pub fn noteTextMergeFailure(self: *IndexManager, task: *const TextMergeTask, err: anyerror) void {
@@ -22422,7 +22577,24 @@ pub const IndexManager = struct {
         }
         if (infos.items.len < 2) return null;
 
-        const planned = (try activeTextMergePolicy().plan(self.alloc, infos.items)) orelse return null;
+        const policy = activeTextMergePolicy();
+        const planned = (try policy.plan(self.alloc, infos.items)) orelse blk: {
+            // The tiered policy found nothing to merge (for example every
+            // eligible segment floors to the same effective size under
+            // floor_segment_size, or no pair fits under max_segment_size)
+            // while the index still holds more live segments than its
+            // steady-state tier target. Force-drain the smallest eligible
+            // segments so producer admission always has a merge in flight to
+            // wait on instead of retrying TextMergeBackpressureTimeout
+            // against a scheduler that gave up.
+            if (snap.segments.len <= policy.max_segments_per_tier) return null;
+            self.text_merge_scheduler.forced_drains += 1;
+            break :blk try text_index_maintenance.planForceDrainFromInfos(
+                self.alloc,
+                infos.items,
+                force_merge_max_segments_at_once,
+            );
+        };
         defer self.alloc.free(planned);
         if (planned.len < 2) return null;
 
@@ -22431,7 +22603,16 @@ pub const IndexManager = struct {
         // a smaller merge can make forward progress. Adapt admission down to
         // a pair before reporting pressure; otherwise a synchronous
         // `full_index` drain can mistake one oversized plan for no merge debt.
-        var admitted_len = planned.len;
+        //
+        // A prior execution of this same width may also have run out of its
+        // byte reservation mid-build (deletion deltas that commit while a
+        // wide merge is still building compete inside that same fixed
+        // ceiling), which the admission walk-down below cannot see since the
+        // static reservation estimate for this width alone still fits.
+        // Start from whatever width last actually finished instead of
+        // re-admitting the same doomed plan every attempt.
+        var admitted_len = @min(planned.len, @as(usize, entry.merge_segment_cap.load(.acquire)));
+        if (admitted_len < 2) admitted_len = @min(planned.len, 2);
         var task = while (true) {
             break self.copyTextMergeTask(entry.config.name, &entry.persistent, snap, planned[0..admitted_len]) catch |err| switch (err) {
                 error.ResourceBudgetExceeded => {
@@ -22785,10 +22966,15 @@ pub const IndexManager = struct {
             while (delta_iter.next()) |doc_id| {
                 if (doc_id >= frozen_seg.reader.doc_count) return error.InvalidSegment;
 
-                const location = if (try frozen_seg.reader.docOrdinal(doc_id)) |ordinal|
-                    result.outputForOrdinal(ordinal)
-                else if (try frozen_seg.reader.storedDoc(doc_id)) |stored|
+                // Mirror buildPublicationLookup's identity priority: the
+                // stored id is the document's own unique key and must be
+                // checked first, since chunk members share their parent's
+                // ordinal and buildPublicationLookup keyed them by id, not
+                // ordinal, whenever a stored id was present.
+                const location = if (try frozen_seg.reader.storedDoc(doc_id)) |stored|
                     result.outputForId(stored.id)
+                else if (try frozen_seg.reader.docOrdinal(doc_id)) |ordinal|
+                    result.outputForOrdinal(ordinal)
                 else
                     null;
                 const output = location orelse return error.MissingMergeDocumentIdentity;
@@ -30159,6 +30345,18 @@ fn textIndexShouldConsumeDoc(self: *const IndexManager, entry: *const IndexManag
     if (!internal_keys.isInternalUserKey(key) and docstore_mod.KeyEncoder.parseEdgeKey(key) == null) return true;
     if (!internal_keys.isChunkArtifactRecordKey(key)) return false;
     return try self.textIndexIsChunkBacked(self.alloc, entry.config.name);
+}
+
+fn textIndexShouldRetireDeletedDoc(self: *const IndexManager, entry: *const IndexManager.TextIndex, key: []const u8) !bool {
+    if (try textIndexShouldConsumeDoc(self, entry, key)) return true;
+    // A chunk artifact whose enrichment was deleted no longer routes into the
+    // default index, but members it published earlier may still be posted
+    // there. Deleting its rows must also retire those postings; retiring an
+    // absent member is a no-op.
+    if (entry.chunk_name != null or entry.source_artifact_names.len > 0) return false;
+    if (!internal_keys.isChunkArtifactRecordKey(key)) return false;
+    const chunk_name = (try internal_keys.artifactNameView(key)) orelse return true;
+    return self.getEnrichment(.chunk, chunk_name) == null;
 }
 
 fn visibleBaseDocumentRowKey(self: *const IndexManager, key: []const u8) bool {
@@ -42792,6 +42990,173 @@ test "text merge task carries concurrent deletes into publication" {
     try std.testing.expectEqual(@as(u64, 11), published.liveDocCount());
 }
 
+test "text merge publication keeps every chunk member sharing one parent ordinal" {
+    // Chunk members intentionally share their parent document's ordinal
+    // (see result_shape.zig) but each still carries its own unique stored
+    // id, exactly like every real (non-benchmark) text-indexing path -
+    // introducer.zig's buildSegmentWithExtraSections calls
+    // addStoredDocBorrowed unconditionally for every document. A merge
+    // publication that keys identity by ordinal alone treats every sibling
+    // chunk after the first as a duplicate of the same identity and drops
+    // it; keying by the always-unique stored id first (this fix) must keep
+    // all of them.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    try manager.addAllNoBackfill(&store, &.{
+        .{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        },
+    });
+    const entry = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
+
+    // Build a segment the same way production chunk-backed indexing does:
+    // every document keeps its stored id (unlike indexTextKernelDocuments,
+    // which sets store_documents=false for its embedded-kernel-benchmark
+    // caller only).
+    const indexKeepingStoredIds = struct {
+        fn run(mgr: *IndexManager, e: *IndexManager.TextIndex, docs: []const introducer_mod.TextDocument) !void {
+            var segment_arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer segment_arena_state.deinit();
+            var build_ctx = TextSegmentSinkBuildContext{
+                .alloc = segment_arena_state.allocator(),
+                .projection_batch = .{ .docs = docs, .observed_field_analyzers = &.{} },
+                .text_analysis = e.text_analysis,
+                .build_options = .{ .resource_manager = mgr.resource_manager },
+            };
+            _ = try e.persistent.indexSegmentFromSinkBuilder(&build_ctx, buildTextSegmentIntoSink);
+            try mgr.finalizeTextBatchMutations(e, .{
+                .compact_text_segment_threshold = 2,
+                .defer_text_compaction = true,
+            }, .{ .indexed_any = true });
+        }
+    }.run;
+
+    // Parent "p1" has three chunks sharing ordinal 500, split across both
+    // source segments so the merge must reconcile a same-ordinal collision
+    // both within and across its inputs. Parent "p2" has one chunk with a
+    // different ordinal as a control.
+    const fields_p1_0 = [_]introducer_mod.TextField{.{ .field_name = "body", .text = "alpha chunk zero" }};
+    const fields_p1_1 = [_]introducer_mod.TextField{.{ .field_name = "body", .text = "alpha chunk one" }};
+    try indexKeepingStoredIds(&manager, entry, &.{
+        .{ .id = "chunk:p1:0", .stored_data = "{\"n\":0}", .text_fields = &fields_p1_0, .doc_ordinal = 500 },
+        .{ .id = "chunk:p1:1", .stored_data = "{\"n\":1}", .text_fields = &fields_p1_1, .doc_ordinal = 500 },
+    });
+
+    const fields_p1_2 = [_]introducer_mod.TextField{.{ .field_name = "body", .text = "alpha chunk two" }};
+    const fields_p2_0 = [_]introducer_mod.TextField{.{ .field_name = "body", .text = "beta chunk zero" }};
+    try indexKeepingStoredIds(&manager, entry, &.{
+        .{ .id = "chunk:p1:2", .stored_data = "{\"n\":2}", .text_fields = &fields_p1_2, .doc_ordinal = 500 },
+        .{ .id = "chunk:p2:0", .stored_data = "{\"n\":0}", .text_fields = &fields_p2_0, .doc_ordinal = 600 },
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), entry.persistent.snapshot().segments.len);
+    try std.testing.expectEqual(@as(u64, 4), entry.persistent.snapshot().liveDocCount());
+
+    // Two segments sit well under the tiered policy's steady-state tier
+    // target, so drive the merge directly rather than through the
+    // scheduler (which would correctly decline to merge this few segments
+    // outside this test).
+    const snap = entry.persistent.acquireSnapshot();
+    defer snap.release();
+    var task = try manager.copyTextMergeTask("ft_v1", &entry.persistent, snap, &.{ 0, 1 });
+    defer task.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), task.merge_indices.len);
+    // beginTextMergeTaskForEntry performs these two steps after
+    // copyTextMergeTask; replicate them so the concurrent delete below
+    // records into this task's deletion state and finishTextMergeTask
+    // recognizes the task as still in flight instead of stale.
+    try entry.attachMergeDeletionState(alloc, task.deletion_state);
+    defer entry.detachMergeDeletionState(task.deletion_state);
+    try manager.text_merge_scheduler.registerSource(alloc, task.index_name, task.source, task.deletion_state);
+
+    // Race a delete of exactly one chunk (sharing ordinal 500 with two live
+    // siblings) against the unlocked build, the same way a concurrent
+    // rewrite races a scheduled merge in production.
+    const opts: IndexBatchOptions = .{ .defer_text_compaction = true };
+    try manager.deleteTextBatchByNameWithOptions("ft_v1", &.{"chunk:p1:1"}, opts);
+
+    var result = try IndexManager.executeTextMergeTask(alloc, &task);
+    defer result.deinit(alloc);
+    var merged_docs: u32 = 0;
+    for (result.prepared_segments) |*prepared| {
+        var reader = try segment_mod.SegmentReader.init(alloc, prepared.data.bytes());
+        defer reader.deinit();
+        merged_docs += reader.doc_count;
+    }
+    for (result.segments) |segment_bytes| {
+        var reader = try segment_mod.SegmentReader.init(alloc, segment_bytes);
+        defer reader.deinit();
+        merged_docs += reader.doc_count;
+    }
+    // Nothing is dropped at merge-build time: the concurrent delete has not
+    // applied to the frozen snapshot the merge built from.
+    try std.testing.expectEqual(@as(u32, 4), merged_docs);
+
+    // The concurrent delete forces the off-lock identity lookup. Before this
+    // fix, building it raised error.DuplicateMergeDocumentIdentity the
+    // moment it saw the second document with ordinal 500 and silently
+    // dropped every subsequent same-ordinal sibling from the publication.
+    try std.testing.expectError(
+        error.TextMergePublicationLookupRequired,
+        manager.finishTextMergeTask(&task, &result),
+    );
+    try IndexManager.prepareTextMergeTaskPublicationLookup(&task, &result);
+    try std.testing.expect(result.publication_lookup_built);
+    // Every document here has a stored id, so identity is keyed by id, not
+    // by the shared ordinal: no ordinal-collision path was even exercised,
+    // and every chunk (including the two ordinal-500 siblings besides the
+    // one that raced a delete) kept its own distinct identity slot.
+    try std.testing.expectEqual(@as(usize, 0), result.output_ordinals.len);
+    try std.testing.expect(result.outputForId("chunk:p1:0") != null);
+    try std.testing.expect(result.outputForId("chunk:p1:1") != null);
+    try std.testing.expect(result.outputForId("chunk:p1:2") != null);
+    try std.testing.expect(result.outputForId("chunk:p2:0") != null);
+
+    const applied = try manager.finishTextMergeTask(&task, &result);
+    try std.testing.expect(applied);
+    try std.testing.expectEqual(@as(u64, 0), manager.textMergeStats().failed_merges);
+
+    const published = entry.persistent.snapshot();
+    try std.testing.expectEqual(@as(usize, 1), published.segments.len);
+    // Exactly the raced delete's target is gone; its two ordinal-500
+    // siblings and the unrelated ordinal-600 chunk all survived.
+    try std.testing.expectEqual(@as(u32, 3), published.liveDocCount());
+
+    const seg = &published.segments[0];
+    var seen = std.StringHashMapUnmanaged(bool).empty;
+    defer {
+        var it = seen.keyIterator();
+        while (it.next()) |key| alloc.free(key.*);
+        seen.deinit(alloc);
+    }
+    for (0..seg.reader.doc_count) |doc_idx| {
+        const stored = (try seg.reader.storedDoc(@intCast(doc_idx))) orelse return error.TestUnexpectedResult;
+        const is_deleted = if (seg.shared.deleted) |*deleted| deleted.contains(@intCast(doc_idx)) else false;
+        try seen.put(alloc, try alloc.dupe(u8, stored.id), is_deleted);
+    }
+    try std.testing.expectEqual(@as(usize, 4), seen.count());
+    try std.testing.expectEqual(true, seen.get("chunk:p1:1").?);
+    try std.testing.expectEqual(false, seen.get("chunk:p1:0").?);
+    try std.testing.expectEqual(false, seen.get("chunk:p1:2").?);
+    try std.testing.expectEqual(false, seen.get("chunk:p2:0").?);
+}
+
 test "text merge deletion delta allocation failure invalidates task state" {
     const alloc = std.testing.allocator;
     var failing = std.testing.FailingAllocator.init(alloc, .{});
@@ -45915,4 +46280,67 @@ test "graph artifact rebuild lease drains scheduler pins and excludes new snapsh
     while (!pending.acquired.load(.acquire)) @import("antfly_platform").time.yieldNow();
     try std.testing.expect(!manager.catalog_mutex.tryLockShared());
     pending.release.store(true, .release);
+}
+
+test "text force drain schedules policy misses above the tier target" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    setBenchmarkTextMergePolicyOverride(.{ .max_segments_per_tier = 10, .max_segment_size = 1, .floor_segment_size = 0 });
+    defer setBenchmarkTextMergePolicyOverride(null);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    {
+        var manager = try IndexManager.initWithOptions(alloc, path, .{});
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addAllNoBackfill(&store, &.{.{ .name = "ft_v1", .kind = .full_text, .config_json = "{\"field\":\"title\"}" }});
+        const opts: IndexBatchOptions = .{ .compact_text = false, .compact_text_segment_threshold = 2, .defer_text_compaction = true };
+        for (0..12) |i| {
+            const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
+            defer alloc.free(key);
+            const value = try std.fmt.allocPrint(alloc, "{{\"title\":\"force drain {d}\"}}", .{i});
+            defer alloc.free(value);
+            try store.putBatch(&.{.{ .key = key, .value = value }}, &.{});
+            try manager.indexTextBatchByNameWithOptions(&store, "ft_v1", &.{.{ .key = key, .value = value }}, opts);
+            if (i == 0) {
+                // Every source fits individually, but no pair fits the ordinary
+                // plan. A wider bounded merge can still compact their shared
+                // section overhead and reduce the segment count.
+                const first = manager.textIndexEntry("ft_v1").?.persistent.snapshot().segments[0];
+                const source_bytes = first.data.bytes().len;
+                setBenchmarkTextMergePolicyOverride(.{ .max_segments_per_tier = 10, .max_segment_size = source_bytes + source_bytes / 2, .floor_segment_size = 0 });
+            }
+        }
+        const entry = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
+        try std.testing.expectEqual(@as(usize, 12), entry.persistent.snapshot().segments.len);
+        try std.testing.expect(entry.compaction_pending.load(.acquire));
+        if (try manager.beginTextMergeTask()) |returned| {
+            var task = returned;
+            defer task.deinit(alloc);
+            manager.cancelTextMergeTask(&task);
+        } else return error.ForceDrainWasNotScheduled;
+    }
+    // Reopen must discover the same debt even though no ordinary plan fits.
+    var reopened = try IndexManager.initWithOptions(alloc, path, .{});
+    defer reopened.deinit();
+    reopened.updateRange(.{ .start = "", .end = "" });
+    try reopened.load(&store);
+    const reopened_entry = reopened.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
+    try std.testing.expect(reopened_entry.compaction_pending.load(.acquire));
+    var task = (try reopened.beginTextMergeTask()) orelse return error.ForceDrainWasNotScheduled;
+    defer task.deinit(alloc);
+    try std.testing.expect(task.source.len >= 2);
+    var result = try IndexManager.executeTextMergeTask(alloc, &task);
+    defer result.deinit(alloc);
+    try std.testing.expect(try reopened.finishTextMergeTask(&task, &result));
+    try std.testing.expect(reopened_entry.persistent.snapshot().segments.len < 12);
+    // A tier target that already covers all segments must still go idle.
+    setBenchmarkTextMergePolicyOverride(.{ .max_segments_per_tier = 20, .max_segment_size = 1, .floor_segment_size = 0 });
+    try std.testing.expect((try reopened.beginTextMergeTask()) == null);
+    try std.testing.expect(!reopened_entry.compaction_pending.load(.acquire));
 }

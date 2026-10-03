@@ -1440,9 +1440,13 @@ test "relational integrity restore follower repairs projection and CHECK debt be
         }
         try std.testing.expect(validated);
         try applyRestoreReplica(&target, .{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .published } } }, validate_index + 1, ha);
-        var result = try target.search(alloc, .{ .index_name = "text", .full_text = .{ .match = .{ .field = "text", .text = "keyword" } }, .limit = 1 });
+        // Verify every restored row is query-visible. A one-hit window has
+        // only a bounded total after stored-row visibility validation.
+        var result = try target.search(alloc, .{ .index_name = "text", .full_text = .{ .match = .{ .field = "text", .text = "keyword" } }, .limit = row_count });
         defer result.deinit();
+        try std.testing.expectEqual(@as(usize, row_count), result.hits.len);
         try std.testing.expectEqual(@as(u32, row_count), result.total_hits);
+        try std.testing.expectEqual(.exact, result.total_hits_relation);
     }
 }
 

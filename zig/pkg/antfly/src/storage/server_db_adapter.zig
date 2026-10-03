@@ -117,8 +117,8 @@ pub fn restoreAuthenticatedReplicaToStagedGeneration(
     alloc: std.mem.Allocator,
     snapshot_root: []const u8,
     path: []const u8,
-    opts: @import("antfly_local_sources").storage_db_db.OpenOptions,
+    opts: @import("antfly_source_root").antfly_sources.physical_db.OpenOptions,
     namespace: @import("antfly_local_sources").storage_db_doc_identity.Namespace,
 ) !void {
-    try @import("antfly_local_sources").storage_db_db.DB.restoreIdentityPreservingSnapshotToStagedGeneration(staged, alloc, snapshot_root, path, opts, namespace);
+    try @import("antfly_source_root").antfly_sources.physical_db.DB.restoreIdentityPreservingSnapshotToStagedGeneration(staged, alloc, snapshot_root, path, opts, namespace);
 }

@@ -614,3 +614,5 @@ pub const graph_mutation_identity = @import("graph/mutation_identity.zig");
 pub const graph_relationship_filter = @import("graph/relationship_filter.zig");
 pub const common_json_number = @import("common/json_number.zig");
 pub const storage_graph_cleanup_contract = @import("storage/graph_cleanup_contract.zig");
+pub const storage_db_query_member_identity = @import("storage/db/query/member_identity.zig");
+pub const storage_document_mutation_revision = @import("storage/document_mutation_revision.zig");

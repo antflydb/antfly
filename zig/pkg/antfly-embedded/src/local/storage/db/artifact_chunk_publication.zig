@@ -755,7 +755,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/unit-chunk-receiver", .{tmp.sub_path});
     defer alloc.free(path);
-    var db = try @import("db.zig").DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 0x0101010101010101, .shard_id = 0x0101010101010101, .range_id = 0x0101010101010101 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+    var db = try @import("antfly_source_root").antfly_sources.physical_db.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 0x0101010101010101, .shard_id = 0x0101010101010101, .range_id = 0x0101010101010101 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
     var db_open = true;
     defer if (db_open) db.close();
     try db.setSchemaJson(alloc, "{}");
@@ -1579,7 +1579,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
     read_open = false;
     db.close();
     db_open = false;
-    db = try @import("db.zig").DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 0x0101010101010101, .shard_id = 0x0101010101010101, .range_id = 0x0101010101010101 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+    db = try @import("antfly_source_root").antfly_sources.physical_db.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 0x0101010101010101, .shard_id = 0x0101010101010101, .range_id = 0x0101010101010101 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
     db_open = true;
     // Lost-reply retry is applied through the real ordered control path after
     // restart, with no re-enumeration or second advancement of the prefix.
@@ -1773,7 +1773,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
         }
         db.close();
         db_open = false;
-        db = try @import("db.zig").DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 0x0101010101010101, .shard_id = 0x0101010101010101, .range_id = 0x0101010101010101 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+        db = try @import("antfly_source_root").antfly_sources.physical_db.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 0x0101010101010101, .shard_id = 0x0101010101010101, .range_id = 0x0101010101010101 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
         db_open = true;
         var snapshot = try db.core.store.beginReadTxn();
         defer snapshot.abort();

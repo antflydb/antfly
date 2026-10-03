@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const member_identity = @import("member_identity.zig");
 const Allocator = std.mem.Allocator;
 const types = @import("../types.zig");
 const doc_set = @import("../doc_set.zig");
@@ -125,6 +126,21 @@ pub const StoredPatternFilterExecutor = struct {
         doc_ids: []const []const u8,
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet = null,
+    // Member/chunk-mode hits are separate full-text/vector documents from
+    // their parent row and never carry the parent's own fields in their own
+    // stored payload. When set, `filter_query`/`exclusion_query` match member
+    // hits against the resolved parent row instead (issue #931).
+    resolve_parent_id: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        hit: types.SearchHit,
+    ) anyerror![]u8 = null,
+    load_parent_stored: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        parent_id: []const u8,
+    ) anyerror!?[]u8 = null,
 };
 
 pub const SearchResultPostprocessor = struct {
@@ -221,6 +237,45 @@ fn rewriteLocalTotalAfterObservedDrop(result: *types.SearchResult, source: types
     rewriteLocalTotal(result, source, original_hits_len, local_total);
 }
 
+/// Drops hits whose `stored_data` is still `null` after a projected-source
+/// hydration pass (issue #929: an orphaned full-text/sparse/dense posting
+/// pointing at a stored document row that no longer exists). Callers must
+/// only invoke this immediately after a hydration pass that is expected to
+/// have populated every hit's `stored_data` when present; any hit still
+/// carrying a `null` at that point is treated as a permanently missing
+/// stored document rather than a transient/uninitialized state, and is
+/// dropped from the result (with `total_hits` adjusted the same way
+/// `filterVisibleSearchResult` and the dedupe helpers already do). Returns
+/// the number of hits dropped so callers can log it once per query.
+pub fn dropSearchHitsWithMissingStoredData(alloc: Allocator, result: *types.SearchResult) !usize {
+    var dropped: usize = 0;
+    for (result.hits) |hit| {
+        if (hit.stored_data == null) dropped += 1;
+    }
+    if (dropped == 0) return 0;
+
+    const source = result.*;
+    const original_hits_len = result.hits.len;
+    var kept = try std.ArrayListUnmanaged(types.SearchHit).initCapacity(alloc, original_hits_len - dropped);
+    errdefer {
+        for (kept.items) |*hit| hit.deinit(alloc);
+        kept.deinit(alloc);
+    }
+
+    for (result.hits) |*hit| {
+        if (hit.stored_data == null) {
+            hit.deinit(alloc);
+        } else {
+            kept.appendAssumeCapacity(hit.*);
+        }
+    }
+
+    alloc.free(result.hits);
+    result.hits = try kept.toOwnedSlice(alloc);
+    rewriteLocalTotalAfterObservedDrop(result, source, original_hits_len, result.hits.len);
+    return dropped;
+}
+
 pub fn dedupeSearchHitsById(alloc: Allocator, result: *types.SearchResult) !void {
     if (allHitsHaveDocOrdinals(result.hits)) return try dedupeSearchHitsByOrdinal(alloc, result);
 
@@ -254,44 +309,13 @@ fn dedupeSearchHitsByExactId(alloc: Allocator, result: *types.SearchResult) !voi
     rewriteLocalTotalAfterObservedDrop(result, source, original_hits_len, result.hits.len);
 }
 
-const SearchMemberIdentity = struct {
-    source_table: ?[]const u8,
-    id: []const u8,
-    artifact_ref: ?types.ArtifactRef,
-};
-
-const SearchMemberIdentityContext = struct {
-    pub fn hash(_: SearchMemberIdentityContext, identity: SearchMemberIdentity) u64 {
-        var hasher = std.hash.Wyhash.init(0x4152_5449_4641_4354);
-        hashOptionalBytes(&hasher, identity.source_table);
-        if (identity.artifact_ref) |artifact_ref| {
-            hasher.update(&.{1});
-            hashArtifactRef(&hasher, artifact_ref);
-        } else {
-            hasher.update(&.{0});
-            hashLengthPrefixedBytes(&hasher, identity.id);
-        }
-        return hasher.final();
-    }
-
-    pub fn eql(_: SearchMemberIdentityContext, left: SearchMemberIdentity, right: SearchMemberIdentity) bool {
-        if (!optionalBytesEqual(left.source_table, right.source_table)) return false;
-        if (left.artifact_ref) |left_ref| {
-            const right_ref = right.artifact_ref orelse return false;
-            return artifactRefsEqual(left_ref, right_ref);
-        }
-        if (right.artifact_ref != null) return false;
-        return std.mem.eql(u8, left.id, right.id);
-    }
-};
-
 fn dedupeSearchHitsByMemberIdentity(alloc: Allocator, result: *types.SearchResult) !void {
     const source = result.*;
     const original_hits_len = result.hits.len;
     var seen = std.HashMapUnmanaged(
-        SearchMemberIdentity,
+        member_identity.Identity,
         void,
-        SearchMemberIdentityContext,
+        member_identity.Context,
         std.hash_map.default_max_load_percentage,
     ).empty;
     defer seen.deinit(alloc);
@@ -303,11 +327,7 @@ fn dedupeSearchHitsByMemberIdentity(alloc: Allocator, result: *types.SearchResul
     }
 
     for (result.hits) |hit| {
-        const identity = SearchMemberIdentity{
-            .source_table = hit.source_table,
-            .id = hit.id,
-            .artifact_ref = hit.artifact_ref,
-        };
+        const identity = member_identity.Identity.fromHit(hit);
         const gop = try seen.getOrPut(alloc, identity);
         if (gop.found_existing) continue;
         try deduped.append(alloc, try hit.clone(alloc));
@@ -320,77 +340,6 @@ fn dedupeSearchHitsByMemberIdentity(alloc: Allocator, result: *types.SearchResul
     if (result.hits.len > 0) alloc.free(result.hits);
     result.hits = owned_hits;
     rewriteLocalTotalAfterObservedDrop(result, source, original_hits_len, result.hits.len);
-}
-
-fn hashArtifactRef(hasher: *std.hash.Wyhash, artifact_ref: types.ArtifactRef) void {
-    hashLengthPrefixedBytes(hasher, artifact_ref.document_id);
-    hashLengthPrefixedBytes(hasher, artifact_ref.name);
-    hasher.update(&.{@intFromEnum(artifact_ref.kind)});
-    hashOptionalU32(hasher, artifact_ref.chunk_id);
-    hashOptionalBytes(hasher, artifact_ref.unit_id);
-    if (artifact_ref.source) |source| {
-        hasher.update(&.{1});
-        hasher.update(&.{@intFromEnum(source.kind)});
-        hashLengthPrefixedBytes(hasher, source.name);
-        hashOptionalU32(hasher, source.chunk_id);
-        hashOptionalBytes(hasher, source.unit_id);
-    } else {
-        hasher.update(&.{0});
-    }
-}
-
-fn hashLengthPrefixedBytes(hasher: *std.hash.Wyhash, value: []const u8) void {
-    var len_bytes: [@sizeOf(u64)]u8 = undefined;
-    std.mem.writeInt(u64, &len_bytes, value.len, .little);
-    hasher.update(&len_bytes);
-    hasher.update(value);
-}
-
-fn hashOptionalBytes(hasher: *std.hash.Wyhash, value: ?[]const u8) void {
-    if (value) |bytes| {
-        hasher.update(&.{1});
-        hashLengthPrefixedBytes(hasher, bytes);
-    } else {
-        hasher.update(&.{0});
-    }
-}
-
-fn hashOptionalU32(hasher: *std.hash.Wyhash, value: ?u32) void {
-    if (value) |number| {
-        hasher.update(&.{1});
-        var bytes: [@sizeOf(u32)]u8 = undefined;
-        std.mem.writeInt(u32, &bytes, number, .little);
-        hasher.update(&bytes);
-    } else {
-        hasher.update(&.{0});
-    }
-}
-
-fn artifactRefsEqual(left: types.ArtifactRef, right: types.ArtifactRef) bool {
-    if (left.kind != right.kind or
-        left.chunk_id != right.chunk_id or
-        !std.mem.eql(u8, left.document_id, right.document_id) or
-        !std.mem.eql(u8, left.name, right.name) or
-        !optionalBytesEqual(left.unit_id, right.unit_id))
-    {
-        return false;
-    }
-    if (left.source) |left_source| {
-        const right_source = right.source orelse return false;
-        return left_source.kind == right_source.kind and
-            left_source.chunk_id == right_source.chunk_id and
-            std.mem.eql(u8, left_source.name, right_source.name) and
-            optionalBytesEqual(left_source.unit_id, right_source.unit_id);
-    }
-    return right.source == null;
-}
-
-fn optionalBytesEqual(left: ?[]const u8, right: ?[]const u8) bool {
-    if (left) |left_bytes| {
-        const right_bytes = right orelse return false;
-        return std.mem.eql(u8, left_bytes, right_bytes);
-    }
-    return right == null;
 }
 
 fn dedupeSearchHitsByOrdinal(alloc: Allocator, result: *types.SearchResult) !void {
@@ -500,7 +449,6 @@ pub fn reshapeChunkBackedResult(
         for (parents.items) |*hit| hit.deinit(alloc);
         parents.deinit(alloc);
     }
-
     for (raw.hits, 0..) |chunk_hit, chunk_index| {
         var unit_identity = if (group_by_unit)
             try resolveHitUnitIdentity(
@@ -1513,22 +1461,53 @@ pub fn applyStoredSearchPatternFilters(
     const exclusion_needs_stored = if (compiled_exclusion) |compiled| compiled.needsStoredDoc() else false;
     const needs_stored = filter_needs_stored or exclusion_needs_stored;
 
+    // Member/chunk-mode hits are a separate full-text/vector document from
+    // their parent row: their own stored payload never carries the parent's
+    // fields. When the caller wired parent resolution, match against the
+    // resolved parent row instead of the hit's own stored data (issue #931).
+    const member_mode = req.return_mode == .member or req.return_mode == .chunk;
+    const parent_aware = member_mode and executor.resolve_parent_id != null and executor.load_parent_stored != null;
+    // load_parent_stored projects the parent row through the RESPONSE
+    // request's own field selection (`req.fields`/`req.include_all_fields`).
+    // A predicate field the caller didn't ask back in the response (e.g.
+    // selecting only `body` while filtering on `category`) would otherwise
+    // be stripped before the matcher below ever sees it, silently turning a
+    // positive filter into a rejection and an exclusion into a no-op
+    // (PR #957 review blocker 3). Evaluate predicates against the
+    // unprojected parent row; the response's own projection is applied
+    // separately when the final hit is shaped.
+    var unprojected_parent_req = req;
+    unprojected_parent_req.fields = &.{};
+    unprojected_parent_req.include_all_fields = true;
+
     const source = result;
     const original_hits_len = result.hits.len;
 
     var missing_indices = std.ArrayListUnmanaged(usize).empty;
     defer missing_indices.deinit(alloc);
     for (result.hits, 0..) |hit, i| {
-        if (needs_stored and hit.stored_data == null) try missing_indices.append(alloc, i);
+        if (needs_stored and !parent_aware and hit.stored_data == null) try missing_indices.append(alloc, i);
     }
 
-    const loaded_many = if (needs_stored and executor.load_many_stored != null and missing_indices.items.len > 0) blk: {
+    const loaded_many = if (needs_stored and !parent_aware and executor.load_many_stored != null and missing_indices.items.len > 0) blk: {
         const keys = try alloc.alloc([]const u8, missing_indices.items.len);
         defer alloc.free(keys);
         for (missing_indices.items, 0..) |hit_index, i| keys[i] = result.hits[hit_index].id;
         break :blk try executor.load_many_stored.?(executor.ctx, alloc, keys);
     } else null;
     defer if (loaded_many) |values| freeOptionalOwnedBytes(alloc, values);
+
+    // Parent rows are deduped and cached by resolved parent id so several
+    // chunks of the same parent only load and parse that row once.
+    var parent_stored_cache = std.StringHashMapUnmanaged(?[]u8).empty;
+    defer {
+        var it = parent_stored_cache.iterator();
+        while (it.next()) |entry| {
+            alloc.free(entry.key_ptr.*);
+            if (entry.value_ptr.*) |bytes| alloc.free(bytes);
+        }
+        parent_stored_cache.deinit(alloc);
+    }
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -1548,7 +1527,21 @@ pub fn applyStoredSearchPatternFilters(
             break :blk loaded_many.?[loaded_missing_index];
         } else null;
         const parsed_stored = if (needs_stored) blk: {
-            const maybe_stored = if (hit.stored_data) |stored|
+            const maybe_stored: ?[]u8 = if (parent_aware) pblk: {
+                const parent_id = executor.resolve_parent_id.?(executor.ctx, alloc, hit) catch |err| switch (err) {
+                    error.InvalidChunkArtifact, error.StoredDocMissing => break :pblk null,
+                    else => return err,
+                };
+                defer alloc.free(parent_id);
+                if (parent_stored_cache.get(parent_id)) |cached| break :pblk cached;
+                const loaded = try executor.load_parent_stored.?(executor.ctx, alloc, unprojected_parent_req, parent_id);
+                errdefer if (loaded) |bytes| alloc.free(bytes);
+                const owned_key = try alloc.dupe(u8, parent_id);
+                errdefer alloc.free(owned_key);
+                // Transfer both allocations only after insertion succeeds.
+                try parent_stored_cache.put(alloc, owned_key, loaded);
+                break :pblk loaded;
+            } else if (hit.stored_data) |stored|
                 stored
             else if (loaded_many != null)
                 batch_loaded_stored
@@ -1558,9 +1551,26 @@ pub fn applyStoredSearchPatternFilters(
                 keep_hits[i] = false;
                 continue;
             };
-            defer if (hit.stored_data == null and loaded_many == null) alloc.free(stored);
+            defer if (!parent_aware and hit.stored_data == null and loaded_many == null) alloc.free(stored);
             break :blk try std.json.parseFromSlice(std.json.Value, hit_alloc, stored, .{});
         } else null;
+
+        // Member/chunk-mode hits are a separate document from their parent
+        // row and only share its ordinal, not its own `_id`/doc_id. A
+        // doc_id clause inside filter_query_json/exclusion_query_json
+        // (including one lowered from query.bool.filter/must_not's native
+        // doc_id query via liftChunkBoolFilterClausesAlloc /
+        // lowerTextQueryToStoredPatternValueAlloc) must match the resolved
+        // parent id, not the chunk's own hit.id, or it silently matches
+        // nothing (PR #957 review blocker 6).
+        const resolved_match_parent_id: ?[]u8 = if (parent_aware) pidblk: {
+            break :pidblk executor.resolve_parent_id.?(executor.ctx, alloc, hit) catch |err| switch (err) {
+                error.InvalidChunkArtifact, error.StoredDocMissing => break :pidblk null,
+                else => return err,
+            };
+        } else null;
+        defer if (resolved_match_parent_id) |parent_id| alloc.free(parent_id);
+        const match_id: []const u8 = resolved_match_parent_id orelse hit.id;
 
         var keep = true;
         if (has_positive_doc_ids) {
@@ -1581,15 +1591,15 @@ pub fn applyStoredSearchPatternFilters(
         if (keep and compiled_filter != null) {
             const compiled = compiled_filter.?;
             keep = if (filter_needs_stored)
-                try compiled.matches(hit_alloc, hit.id, parsed_stored.?.value)
+                try compiled.matches(hit_alloc, match_id, parsed_stored.?.value)
             else
-                try compiled.matches(hit_alloc, hit.id, .null);
+                try compiled.matches(hit_alloc, match_id, .null);
         }
         if (keep and compiled_exclusion != null) {
             keep = !(if (exclusion_needs_stored)
-                try compiled_exclusion.?.matches(hit_alloc, hit.id, parsed_stored.?.value)
+                try compiled_exclusion.?.matches(hit_alloc, match_id, parsed_stored.?.value)
             else
-                try compiled_exclusion.?.matches(hit_alloc, hit.id, .null));
+                try compiled_exclusion.?.matches(hit_alloc, match_id, .null));
         }
 
         keep_hits[i] = keep;
@@ -1657,6 +1667,8 @@ pub fn postprocessTextSearchResult(
         .load_many_stored = processor.load_many_stored,
         .resolve_doc_set_doc_ids = processor.resolve_doc_set_doc_ids,
         .resolve_doc_ids_to_doc_set = processor.resolve_doc_ids_to_doc_set,
+        .resolve_parent_id = if (chunk_backed) processor.resolve_parent_id else null,
+        .load_parent_stored = if (chunk_backed) processor.load_parent_stored else null,
     });
     if (chunk_backed) {
         // Chunk members intentionally share their parent document ordinal.
@@ -1702,16 +1714,11 @@ pub fn postprocessVectorSearchResult(
         .filter_many = processor.filter_visible_many,
     });
     errdefer filtered.deinit();
-    // Artifact-backed vector indexes retain one independent member for every
-    // (artifact, source key). Raw member modes therefore deduplicate by the
-    // complete artifact identity, not by the resolved document key. Grouped
-    // document-level search still returns each logical document once, with raw
-    // score order making the first occurrence authoritative. Chunk members
-    // remain distinct until hierarchy grouping.
-    if (req.return_mode == .member or req.return_mode == .chunk) {
+    // Preserve complete member identity before hierarchy grouping. Raw modes
+    // expose each member; source/unit modes subsequently fold all members
+    // sharing that hierarchy identity and keep the best relevance score.
+    if (req.return_mode == .member or req.return_mode == .chunk or chunk_backed) {
         try dedupeSearchHitsByMemberIdentity(alloc, &filtered);
-    } else if (chunk_backed) {
-        try dedupeSearchHitsByExactId(alloc, &filtered);
     } else {
         try dedupeSearchHitsById(alloc, &filtered);
     }
@@ -1733,6 +1740,8 @@ pub fn postprocessVectorSearchResult(
         .load_many_stored = processor.load_many_stored,
         .resolve_doc_set_doc_ids = processor.resolve_doc_set_doc_ids,
         .resolve_doc_ids_to_doc_set = processor.resolve_doc_ids_to_doc_set,
+        .resolve_parent_id = if (chunk_backed) processor.resolve_parent_id else null,
+        .load_parent_stored = if (chunk_backed) processor.load_parent_stored else null,
     });
 }
 
@@ -1967,6 +1976,74 @@ test "dedupeSearchHitsById uses ordinals when hit page is complete" {
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 1), result.hits[0].doc_ordinal);
     try std.testing.expectEqualStrings("doc:b", result.hits[1].id);
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 2), result.hits[1].doc_ordinal);
+}
+
+test "dropSearchHitsWithMissingStoredData drops orphaned postings and rewrites total_hits" {
+    const alloc = std.testing.allocator;
+
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = try alloc.alloc(types.SearchHit, 3),
+        .total_hits = 3,
+    };
+    defer result.deinit();
+    result.hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .stored_data = try alloc.dupe(u8, "{}") };
+    // Issue #929: the posting for doc:b survived an orphaned chunk delete
+    // but its stored row is gone, so the hydration pass leaves stored_data
+    // null for it.
+    result.hits[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .stored_data = null };
+    result.hits[2] = .{ .id = try alloc.dupe(u8, "doc:c"), .stored_data = try alloc.dupe(u8, "{}") };
+
+    const dropped = try dropSearchHitsWithMissingStoredData(alloc, &result);
+
+    try std.testing.expectEqual(@as(usize, 1), dropped);
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:c", result.hits[1].id);
+}
+
+test "dropSearchHitsWithMissingStoredData is a no-op when nothing is missing" {
+    const alloc = std.testing.allocator;
+
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = try alloc.alloc(types.SearchHit, 2),
+        .total_hits = 2,
+    };
+    defer result.deinit();
+    result.hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .stored_data = try alloc.dupe(u8, "{}") };
+    result.hits[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .stored_data = try alloc.dupe(u8, "{}") };
+    const hits_ptr = result.hits.ptr;
+
+    const dropped = try dropSearchHitsWithMissingStoredData(alloc, &result);
+
+    try std.testing.expectEqual(@as(usize, 0), dropped);
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(hits_ptr, result.hits.ptr);
+}
+
+test "dropSearchHitsWithMissingStoredData keeps an approximate total approximate" {
+    const alloc = std.testing.allocator;
+
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = try alloc.alloc(types.SearchHit, 2),
+        .total_hits = 100,
+        .total_hits_relation = .gte,
+    };
+    defer result.deinit();
+    result.hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .stored_data = null };
+    result.hits[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .stored_data = try alloc.dupe(u8, "{}") };
+
+    const dropped = try dropSearchHitsWithMissingStoredData(alloc, &result);
+
+    try std.testing.expectEqual(@as(usize, 1), dropped);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.gte, result.total_hits_relation);
 }
 
 test "exact-id dedupe preserves distinct chunks sharing a parent ordinal" {
@@ -2374,6 +2451,138 @@ test "applyStoredSearchPatternFilters reports lower-bound total for filtered pag
     }
 }
 
+const TestParentFieldFilterLoader = struct {
+    load_stored_calls: usize = 0,
+    load_parent_calls: usize = 0,
+
+    fn resolveParentId(_: ?*anyopaque, alloc: Allocator, hit: types.SearchHit) ![]u8 {
+        const sep = std.mem.indexOfScalar(u8, hit.id, '#') orelse return error.InvalidChunkArtifact;
+        return try alloc.dupe(u8, hit.id[0..sep]);
+    }
+
+    fn loadParentStored(ctx: ?*anyopaque, alloc: Allocator, _: types.SearchRequest, parent_id: []const u8) !?[]u8 {
+        const self: *TestParentFieldFilterLoader = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        self.load_parent_calls += 1;
+        if (std.mem.eql(u8, parent_id, "doc:a")) return try alloc.dupe(u8, "{\"category\":\"garden\"}");
+        if (std.mem.eql(u8, parent_id, "doc:b")) return try alloc.dupe(u8, "{\"category\":\"finance\"}");
+        return null;
+    }
+
+    fn loadStored(ctx: ?*anyopaque, _: Allocator, _: []const u8) !?[]u8 {
+        // A member-mode chunk hit's own payload never carries a parent field
+        // like `category`; parent-aware filtering must never consult it.
+        const self: *TestParentFieldFilterLoader = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        self.load_stored_calls += 1;
+        return error.TestUnexpectedResult;
+    }
+};
+
+test "applyStoredSearchPatternFilters matches member-mode chunk hits against the parent row (#931)" {
+    const alloc = std.testing.allocator;
+    var hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a#0") };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b#0") };
+
+    var loader = TestParentFieldFilterLoader{};
+    var result = try applyStoredSearchPatternFilters(alloc, .{
+        .return_mode = .member,
+        .filter_query_json = "{\"term\":{\"category\":\"garden\"}}",
+    }, .{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+    }, .{
+        .ctx = &loader,
+        .load_stored = TestParentFieldFilterLoader.loadStored,
+        .resolve_parent_id = TestParentFieldFilterLoader.resolveParentId,
+        .load_parent_stored = TestParentFieldFilterLoader.loadParentStored,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:a#0", result.hits[0].id);
+    try std.testing.expectEqual(@as(usize, 0), loader.load_stored_calls);
+}
+
+test "applyStoredSearchPatternFilters drops member-mode chunk hits via parent-row exclusion_query (#931)" {
+    const alloc = std.testing.allocator;
+    var hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a#0") };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b#0") };
+
+    var loader = TestParentFieldFilterLoader{};
+    var result = try applyStoredSearchPatternFilters(alloc, .{
+        .return_mode = .member,
+        .exclusion_query_json = "{\"term\":{\"category\":\"garden\"}}",
+    }, .{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+    }, .{
+        .ctx = &loader,
+        .load_stored = TestParentFieldFilterLoader.loadStored,
+        .resolve_parent_id = TestParentFieldFilterLoader.resolveParentId,
+        .load_parent_stored = TestParentFieldFilterLoader.loadParentStored,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b#0", result.hits[0].id);
+    try std.testing.expectEqual(@as(usize, 0), loader.load_stored_calls);
+}
+
+test "applyStoredSearchPatternFilters caches parent row loads across chunks of the same parent (#931)" {
+    const alloc = std.testing.allocator;
+    var hits = try alloc.alloc(types.SearchHit, 3);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a#0") };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:a#1") };
+    hits[2] = .{ .id = try alloc.dupe(u8, "doc:b#0") };
+
+    var loader = TestParentFieldFilterLoader{};
+    var result = try applyStoredSearchPatternFilters(alloc, .{
+        .return_mode = .member,
+        .filter_query_json = "{\"term\":{\"category\":\"garden\"}}",
+    }, .{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 3,
+    }, .{
+        .ctx = &loader,
+        .load_stored = TestParentFieldFilterLoader.loadStored,
+        .resolve_parent_id = TestParentFieldFilterLoader.resolveParentId,
+        .load_parent_stored = TestParentFieldFilterLoader.loadParentStored,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    // doc:a is the parent of two hits but must only be loaded once.
+    try std.testing.expectEqual(@as(usize, 2), loader.load_parent_calls);
+}
+
+test "applyStoredSearchPatternFilters evaluates filters against the hit's own payload without parent callbacks" {
+    const alloc = std.testing.allocator;
+    var hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .stored_data = try alloc.dupe(u8, "{\"title\":\"alpha\"}") };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .stored_data = try alloc.dupe(u8, "{\"title\":\"beta\"}") };
+
+    var loader = TestStoredLoader{};
+    var result = try applyStoredSearchPatternFilters(alloc, .{
+        .filter_query_json = "{\"term\":{\"title\":\"beta\"}}",
+    }, .{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+    }, .{
+        .ctx = &loader,
+        .load_stored = TestStoredLoader.loadStored,
+        .load_many_stored = TestStoredLoader.loadManyStored,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+}
+
 const TestPostprocessor = struct {
     fn isVisible(_: ?*anyopaque, _: Allocator, _: types.SearchHit) !bool {
         return true;
@@ -2624,12 +2833,14 @@ test "reshapeChunkBackedResult uses the best descendant relevance score and dist
         .doc_ordinal = 7,
         .score = 0.6,
         .distance = 0.4,
+        .artifact_ref = .{ .document_id = try alloc.dupe(u8, "doc:a"), .name = try alloc.dupe(u8, "chunks_v1"), .kind = .chunk, .chunk_id = 0 },
     };
     raw_hits[1] = .{
         .id = try alloc.dupe(u8, "doc:a#1"),
         .doc_ordinal = 7,
         .score = 0.4,
         .distance = 0.6,
+        .artifact_ref = .{ .document_id = try alloc.dupe(u8, "doc:a"), .name = try alloc.dupe(u8, "chunks_v1"), .kind = .chunk, .chunk_id = 1 },
     };
 
     var result = try reshapeChunkBackedResult(alloc, .{
@@ -3102,4 +3313,92 @@ test "externalizeSearchResultArtifactIds externalizes nested unit chunk hits" {
     try std.testing.expectEqual(types.ArtifactKind.chunk, artifact_ref.kind);
     try std.testing.expectEqual(@as(?u32, 0), artifact_ref.chunk_id);
     try std.testing.expectEqualStrings("page:000001", artifact_ref.unit_id.?);
+}
+
+test "reshapeChunkBackedResult source grouping folds assets embeddings and mixed members before paging" {
+    const alloc = std.testing.allocator;
+    for (0..3) |variant| {
+        for ([_]types.ReturnMode{ .parent, .parent_with_chunks, .member, .chunk }) |mode| {
+            for (0..2) |offset| {
+                const hits = try alloc.alloc(types.SearchHit, 3);
+                for (hits, 0..) |*hit, i| {
+                    const document_id: []const u8 = if (i == 1) "doc:b" else "doc:a";
+                    hit.* = .{
+                        .id = try std.fmt.allocPrint(alloc, "{s}#{d}", .{ document_id, i }),
+                        .doc_ordinal = if (i == 1) 8 else 7,
+                        .score = if (i == 0) 0.2 else if (i == 1) 0.7 else 0.9,
+                        .distance = if (i == 0) 0.8 else if (i == 1) 0.3 else 0.1,
+                        .artifact_ref = .{
+                            .document_id = try alloc.dupe(u8, document_id),
+                            .name = try alloc.dupe(u8, if (i == 0) "first" else "second"),
+                            .kind = if (variant == 0) .asset else if (variant == 1 or i == 0) .embedding else .chunk,
+                            .unit_id = if (variant == 0) try std.fmt.allocPrint(alloc, "page:{d}", .{i}) else null,
+                            .chunk_id = if (variant == 2 and i != 0) @intCast(i) else null,
+                        },
+                    };
+                }
+                var result = try reshapeChunkBackedResult(alloc, .{
+                    .return_mode = mode,
+                    .offset = if (mode == .member or mode == .chunk) 0 else @intCast(offset),
+                    .limit = if (mode == .member or mode == .chunk) 3 else 1,
+                    .include_stored = false,
+                }, .{ .alloc = alloc, .hits = hits, .total_hits = 3 }, .{
+                    .ctx = null,
+                    .resolve_parent_id = TestChunkParentShaper.resolveParentId,
+                    .load_parent_stored = TestChunkParentShaper.loadParentStored,
+                });
+                defer result.deinit();
+                if (mode == .member or mode == .chunk) {
+                    // Raw modes retain every distinct source/unit identity.
+                    try std.testing.expectEqual(@as(u32, 3), result.total_hits);
+                    try std.testing.expectEqual(@as(usize, 3), result.hits.len);
+                } else {
+                    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+                    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+                    const hit = result.hits[0];
+                    try std.testing.expectEqualStrings(if (offset == 0) "doc:a" else "doc:b", hit.id);
+                    try std.testing.expectEqual(@as(?f32, if (offset == 0) 0.9 else 0.7), hit.score);
+                    try std.testing.expectEqual(@as(?f32, if (offset == 0) 0.1 else 0.3), hit.distance);
+                    if (mode == .parent_with_chunks) {
+                        try std.testing.expectEqual(@as(usize, if (variant == 2) 1 else 0), hit.chunk_hits.len);
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "parent field filter cache owns allocation failures and preserves input" {
+    const Harness = struct {
+        fn run(alloc: Allocator) !void {
+            const ids = [_][]const u8{ "doc:a#0", "doc:a#1", "doc:b#0", "doc:c#0", "doc:c#1" };
+            var raw = types.SearchResult{ .alloc = alloc, .hits = &.{}, .total_hits = ids.len };
+            defer raw.deinit();
+            raw.hits = try alloc.alloc(types.SearchHit, ids.len);
+            for (raw.hits) |*hit| hit.* = .{ .id = &.{} };
+            for (raw.hits, ids) |*hit, id| hit.id = try alloc.dupe(u8, id);
+            var loader = TestParentFieldFilterLoader{};
+            var result = applyStoredSearchPatternFilters(alloc, .{
+                .return_mode = .member,
+                .filter_query_json = "{\"term\":{\"category\":\"garden\"}}",
+            }, raw, .{
+                .ctx = &loader,
+                .load_stored = TestParentFieldFilterLoader.loadStored,
+                .resolve_parent_id = TestParentFieldFilterLoader.resolveParentId,
+                .load_parent_stored = TestParentFieldFilterLoader.loadParentStored,
+            }) catch |err| {
+                // A failed cache/load/filter operation must leave the input
+                // owned by the caller, including every member identity.
+                try std.testing.expectEqual(@as(usize, ids.len), raw.hits.len);
+                for (raw.hits, ids) |hit, id| try std.testing.expectEqualStrings(id, hit.id);
+                return err;
+            };
+            raw = .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 };
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+            try std.testing.expectEqual(@as(usize, 3), loader.load_parent_calls);
+            try std.testing.expectEqual(@as(usize, 0), loader.load_stored_calls);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }

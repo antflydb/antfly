@@ -42,6 +42,7 @@ pub const AddTestsResult = struct {
     run_lib_api_storage_authority_tests: *std.Build.Step.Run,
     api_table_writes_docid_test_mod: *std.Build.Module,
     write_implementation_tests: *std.Build.Step.Compile,
+    public_api_parity_tests: *std.Build.Step.Compile,
     api_table_reads_docid_test_mod: *std.Build.Module,
     run_lib_api_docid_tests: *std.Build.Step.Run,
     api_derived_coverage_test_mod: *std.Build.Module,
@@ -1665,7 +1666,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-api-relational-rows-test", "Run generated relational row and schema boundary contracts").dependOn(&addFilteredTestRunArtifact(b, api_relational_row_contract_tests).step);
     const restore_lookup_authority_tests = b.addTest(.{
         .root_module = api_public_table_http_docid_test_mod,
-        .filters = &.{ "private restore lookup plan identity", "compiled lookup wire preserves binary scope" },
+        .filters = &.{ "private restore lookup plan identity", "compiled lookup wire preserves binary scope", "ancestors-only hierarchy survives the internal wire re-encode without a stray group_by" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-restore-lookup-authority-test", "Run private restore lookup authority parsing and compiled wire regressions").dependOn(&addFilteredTestRunArtifact(b, restore_lookup_authority_tests).step);
@@ -2419,6 +2420,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_lib_api_storage_authority_tests = run_lib_api_storage_authority_tests,
         .api_table_writes_docid_test_mod = api_table_writes_docid_test_mod,
         .write_implementation_tests = write_implementation_tests,
+        .public_api_parity_tests = public_api_parity_tests,
         .api_table_reads_docid_test_mod = api_table_reads_docid_test_mod,
         .run_lib_api_docid_tests = run_lib_api_docid_tests,
         .api_derived_coverage_test_mod = api_derived_coverage_test_mod,

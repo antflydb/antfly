@@ -801,6 +801,26 @@ pub fn create(b: *std.Build) ?Artifacts {
         owner_tests.integration_test_step.dependOn(&run.step);
     }
 
+    // These three compile real CLI/server boot paths (Lite command tests,
+    // the standalone runtime's HA/hot-standby/Lite surface, and the public
+    // API parity e2e suite) that reach the real storage-kernel owner through
+    // api/kernel_owner_source.zig the same way production does, independent
+    // of the control-only source selection most unit tests use. Each already
+    // compiles from its own dedicated module (not the shared antfly_test_mod
+    // or standalone_runtime_test_mod), so linking the owner archive here
+    // reaches only this one compile per fixture.
+    for ([_]*std.Build.Step.Compile{
+        owner_tests.lite_cmd_tests,
+        owner_tests.lib_standalone_runtime_tests,
+        owner_tests.public_api_parity_tests,
+    }) |tests| {
+        const entry = linked_consumer_modules.getOrPut(b.allocator, tests.root_module) catch @panic("OOM");
+        if (entry.found_existing) continue;
+        tests.root_module.addObject(consumer_test_metadata.object);
+        inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
+            tests.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(@as(@import("pkg/antfly/build/runtime.zig").RuntimeLibraryUnit, unit))].?);
+    }
+
     const storage_owner_runs = @import("pkg/antfly/build/storage_owner_tests.zig").add(b, target, optimize, production_antfly_imports, vopr_mod, lmdb_engine_mod, runtime_library_artifacts);
     b.step("antfly-storage-owner-test", "Run real compiled storage owner ABI regressions").dependOn(&storage_owner_runs.runs[0].step);
     b.step("antfly-storage-owner-source-test", "Run compiled owner source and callback regressions").dependOn(&storage_owner_runs.runs[1].step);

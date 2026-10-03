@@ -347,7 +347,14 @@ const assets_replay_cursor_scope = scope_name ++ ".assets";
 const dense_replay_cursor_scope = scope_name ++ ".dense";
 const writer_locked_retry_count: usize = 1000;
 const writer_locked_retry_sleep_ns: u64 = 100_000;
-const generated_replay_default_window_items: usize = 2048;
+/// Matches `generated_preparation_default_window_items` below: a backlog
+/// smaller than one window previously published nothing until the window
+/// fully drained, making a healthy small-to-medium backlog (most interactive
+/// workloads) look frozen for as long as it takes to work through it.
+/// `ANTFLY_ENRICHMENT_WINDOW_ITEMS` remains available to raise this back up
+/// for throughput-sensitive deployments that would rather amortize publish
+/// overhead over a larger window.
+const generated_replay_default_window_items: usize = 64;
 /// Bound source preparation independently from the larger derived-record
 /// publication window. Preparing an entire corpus before the first provider
 /// batch delays queryability after restart and retains one request plan and
@@ -2113,6 +2120,19 @@ fn effectiveRequestEmbedBatchItems(runtime: *EnrichmentRuntime, request: enrichm
         .chunk_text => return configured,
     };
     return @min(configured, recoveryBatchCap(runtime, recovery_key));
+}
+
+const DocumentExtractionBudgetDenial = error{ DocumentExtractionWorkingSetTooLarge, ResourceTemporarilyUnavailable };
+
+/// DocumentExtractionWorkingSetTooLarge is terminal, so reserve it for a
+/// document whose own demand exceeds the shared working-set slice. A denial
+/// caused by other concurrent extractions holding the slice is contention and
+/// retries like any other ResourceTemporarilyUnavailable.
+pub fn documentExtractionBudgetDenialError(budgeted: *const resource_manager_mod.BudgetedAllocator) DocumentExtractionBudgetDenial {
+    return if (budgeted.deniedByOwnDemand())
+        error.DocumentExtractionWorkingSetTooLarge
+    else
+        error.ResourceTemporarilyUnavailable;
 }
 
 const EnrichmentErrorDisposition = enum {
@@ -11050,7 +11070,7 @@ const PreparedDocumentSourceCache = struct {
         self.lockAllocator();
         defer self.allocator_mutex.unlock();
         if (err == error.OutOfMemory and self.budgeted != null and self.budgeted.?.denied())
-            return error.DocumentExtractionWorkingSetTooLarge;
+            return documentExtractionBudgetDenialError(&self.budgeted.?);
         return err;
     }
 
@@ -11157,7 +11177,7 @@ test "shared PDF coordinator state is admitted separately from render windows" {
     try std.testing.expect(manager.sliceStats(.document_extraction_working_set).used_bytes >= state.len);
     try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, PdfWindowCompositeLease.create(alloc, alloc, &manager, 1, 32 * 1024, 1));
     try std.testing.expectError(error.OutOfMemory, coordinator.reservation.allocator().alloc(u8, 32 * 1024));
-    try std.testing.expect(coordinator.allocationDenied());
+    try std.testing.expect(coordinator.allocationDeniedError() != null);
 }
 
 test "prepared document source cache isolates credentials and reuses bytes" {
@@ -12935,7 +12955,7 @@ fn processDocumentExtractionAsset(
     ) catch |raw_err| {
         const err: anyerror = if (raw_err == error.OutOfMemory and
             prepared_sources.budgeted != null and prepared_sources.budgeted.?.denied())
-            error.DocumentExtractionWorkingSetTooLarge
+            documentExtractionBudgetDenialError(&prepared_sources.budgeted.?)
         else
             raw_err;
         if (shouldYieldRequestError(runtime, err)) return err;
@@ -13179,11 +13199,14 @@ fn processDocumentExtractionAsset(
         collect_ctx.releasePdfCoordinator();
         config.pdf_decode_limits = configured_pdf_decode_limits;
         config.pdf_render_max_inflight_bytes = configured_pdf_render_inflight_bytes;
-        const err: anyerror = if (raw_err == error.OutOfMemory and
-            ((collection_budgeted != null and collection_budgeted.?.denied()) or
-                (prepared_sources.budgeted != null and prepared_sources.budgeted.?.denied()) or
-                pdf_inspection_reservation.limit_exceeded))
+        const err: anyerror = if (raw_err != error.OutOfMemory)
+            raw_err
+        else if (pdf_inspection_reservation.limit_exceeded)
             error.DocumentExtractionWorkingSetTooLarge
+        else if (collection_budgeted != null and collection_budgeted.?.denied())
+            documentExtractionBudgetDenialError(&collection_budgeted.?)
+        else if (prepared_sources.budgeted != null and prepared_sources.budgeted.?.denied())
+            documentExtractionBudgetDenialError(&prepared_sources.budgeted.?)
         else
             raw_err;
         if (shouldYieldRequestError(runtime, err)) return err;
@@ -13224,14 +13247,14 @@ fn processDocumentExtractionAsset(
 
     const desired_unit_descriptors = documentExtractionUnitDescriptorsFromKeysAlloc(collection_alloc, desired_unit_keys.items, desired_unit_fingerprints.items) catch |err| {
         if (err == error.OutOfMemory and collection_budgeted != null and collection_budgeted.?.denied())
-            return error.DocumentExtractionWorkingSetTooLarge;
+            return documentExtractionBudgetDenialError(&collection_budgeted.?);
         return err;
     };
     defer collection_alloc.free(desired_unit_descriptors);
 
     const navigation_digest = hierarchy_navigation.artifactDigestAlloc(collection_alloc, desired_unit_descriptors) catch |err| {
         if (err == error.OutOfMemory and collection_budgeted != null and collection_budgeted.?.denied())
-            return error.DocumentExtractionWorkingSetTooLarge;
+            return documentExtractionBudgetDenialError(&collection_budgeted.?);
         return err;
     };
     defer collection_alloc.free(navigation_digest);
@@ -13250,7 +13273,7 @@ fn processDocumentExtractionAsset(
         true,
     ) catch |err| {
         if (err == error.OutOfMemory and collection_budgeted != null and collection_budgeted.?.denied())
-            return error.DocumentExtractionWorkingSetTooLarge;
+            return documentExtractionBudgetDenialError(&collection_budgeted.?);
         return err;
     };
     defer collection_alloc.free(new_state);
@@ -13304,25 +13327,25 @@ fn processDocumentExtractionAsset(
 
     var desired_unit_key_set = borrowedRuntimeKeySet(collection_alloc, desired_unit_keys.items) catch |err| {
         if (err == error.OutOfMemory and collection_budgeted != null and collection_budgeted.?.denied())
-            return error.DocumentExtractionWorkingSetTooLarge;
+            return documentExtractionBudgetDenialError(&collection_budgeted.?);
         return err;
     };
     defer desired_unit_key_set.deinit(collection_alloc);
     var desired_chunk_key_set = borrowedRuntimeKeySet(collection_alloc, desired_chunk_keys.items) catch |err| {
         if (err == error.OutOfMemory and collection_budgeted != null and collection_budgeted.?.denied())
-            return error.DocumentExtractionWorkingSetTooLarge;
+            return documentExtractionBudgetDenialError(&collection_budgeted.?);
         return err;
     };
     defer desired_chunk_key_set.deinit(collection_alloc);
     var previous_unit_key_set = borrowedRuntimeKeySet(collection_alloc, previous_state.unit_keys) catch |err| {
         if (err == error.OutOfMemory and collection_budgeted != null and collection_budgeted.?.denied())
-            return error.DocumentExtractionWorkingSetTooLarge;
+            return documentExtractionBudgetDenialError(&collection_budgeted.?);
         return err;
     };
     defer previous_unit_key_set.deinit(collection_alloc);
     var previous_chunk_key_set = borrowedRuntimeKeySet(collection_alloc, previous_state.chunk_keys) catch |err| {
         if (err == error.OutOfMemory and collection_budgeted != null and collection_budgeted.?.denied())
-            return error.DocumentExtractionWorkingSetTooLarge;
+            return documentExtractionBudgetDenialError(&collection_budgeted.?);
         return err;
     };
     defer previous_chunk_key_set.deinit(collection_alloc);
@@ -14244,13 +14267,13 @@ const RuntimePdfOcrCoordinator = struct {
             config.pdf_decode_limits,
             self.deadline.probe(),
         ) catch |err| {
-            if (self.allocationDenied()) return error.DocumentExtractionWorkingSetTooLarge;
+            if (self.allocationDeniedError()) |denial| return denial;
             return err;
         };
         self.session_initialized = true;
         errdefer self.session.deinit();
         self.session.prepareForBatchRendering() catch |err| {
-            if (self.allocationDenied()) return error.DocumentExtractionWorkingSetTooLarge;
+            if (self.allocationDeniedError()) |denial| return denial;
             return err;
         };
         try self.configureRenderBudget(config);
@@ -14279,7 +14302,7 @@ const RuntimePdfOcrCoordinator = struct {
             source,
             self.deadline.probe(),
         ) catch |err| {
-            if (self.allocationDenied()) return error.DocumentExtractionWorkingSetTooLarge;
+            if (self.allocationDeniedError()) |denial| return denial;
             return err;
         };
         self.session_initialized = true;
@@ -14298,8 +14321,10 @@ const RuntimePdfOcrCoordinator = struct {
         }
     }
 
-    fn allocationDenied(self: *const @This()) bool {
-        return self.reservation.limit_exceeded or (if (self.budgeted) |*budgeted| budgeted.denied() else false);
+    fn allocationDeniedError(self: *const @This()) ?DocumentExtractionBudgetDenial {
+        if (self.reservation.limit_exceeded) return error.DocumentExtractionWorkingSetTooLarge;
+        if (self.budgeted) |*budgeted| if (budgeted.denied()) return documentExtractionBudgetDenialError(budgeted);
+        return null;
     }
 
     fn configureRenderBudget(self: *@This(), config: document_extraction_mod.Config) !void {
@@ -15376,10 +15401,10 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithBackingAllocator(
         pdf_coordinator,
     ) catch |err| {
         if (pdf_coordinator) |coordinator| {
-            if (coordinator.allocationDenied()) return error.DocumentExtractionWorkingSetTooLarge;
+            if (coordinator.allocationDeniedError()) |denial| return denial;
         }
         if (budgeted_allocator) |*budgeted| {
-            if (budgeted.denied()) return error.DocumentExtractionWorkingSetTooLarge;
+            if (budgeted.denied()) return documentExtractionBudgetDenialError(budgeted);
         }
         return err;
     };
@@ -19274,7 +19299,13 @@ const RuntimeDocumentReplaySegmentLease = struct {
                 .document_extraction_working_set,
                 runtime_document_replay_segment_memory_bytes,
             ) catch |err| switch (err) {
-                error.ResourceBudgetExceeded => return error.DocumentExtractionWorkingSetTooLarge,
+                error.ResourceBudgetExceeded => {
+                    const hard_limit = resource_manager.memoryHardLimitForSlice(.document_extraction_working_set);
+                    return if (hard_limit > 0 and runtime_document_replay_segment_memory_bytes > hard_limit)
+                        error.DocumentExtractionWorkingSetTooLarge
+                    else
+                        error.ResourceTemporarilyUnavailable;
+                },
                 else => return err,
             };
         }
@@ -19451,7 +19482,7 @@ const RuntimeDocumentUnitSpool = struct {
         const unit_alloc = if (budgeted) |*allocator| allocator.allocator() else self.runtime_alloc;
         replayEncodedWithAllocator(unit_alloc, encoded, sink) catch |err| {
             if (err == error.OutOfMemory and budgeted != null and budgeted.?.denied())
-                return error.DocumentExtractionWorkingSetTooLarge;
+                return documentExtractionBudgetDenialError(&budgeted.?);
             return err;
         };
     }
@@ -20449,12 +20480,13 @@ const RuntimeDocumentExtractionResourceTracker = struct {
     fn reserveAdditional(self: *@This(), bytes: usize) !void {
         const additional = std.math.cast(u64, bytes) orelse return error.DocumentExtractionWorkingSetTooLarge;
         if (self.manager) |manager| {
-            const stats = manager.sliceStats(.document_extraction_working_set);
+            // Own demand is bounded by the tighter of the slice and node limits.
+            const hard_limit = manager.memoryHardLimitForSlice(.document_extraction_working_set);
             const operation_current = std.math.add(u64, self.current_bytes, self.externallyAccountedDownloadedBytes()) catch
                 return error.DocumentExtractionWorkingSetTooLarge;
             const operation_next = std.math.add(u64, operation_current, additional) catch
                 return error.DocumentExtractionWorkingSetTooLarge;
-            if (stats.hard_limit_bytes > 0 and operation_next > stats.hard_limit_bytes)
+            if (hard_limit > 0 and operation_next > hard_limit)
                 return error.DocumentExtractionWorkingSetTooLarge;
         }
         const next = std.math.add(u64, self.current_bytes, additional) catch return error.DocumentExtractionWorkingSetTooLarge;
@@ -20464,10 +20496,11 @@ const RuntimeDocumentExtractionResourceTracker = struct {
     fn setBytes(self: *@This(), bytes: usize) !void {
         const next = std.math.cast(u64, bytes) orelse return error.ResourceBudgetExceeded;
         if (self.manager) |manager| {
-            const stats = manager.sliceStats(.document_extraction_working_set);
+            // Own demand is bounded by the tighter of the slice and node limits.
+            const hard_limit = manager.memoryHardLimitForSlice(.document_extraction_working_set);
             const operation_next = std.math.add(u64, next, self.externallyAccountedDownloadedBytes()) catch
                 return error.DocumentExtractionWorkingSetTooLarge;
-            if (stats.hard_limit_bytes > 0 and operation_next > stats.hard_limit_bytes)
+            if (hard_limit > 0 and operation_next > hard_limit)
                 return error.DocumentExtractionWorkingSetTooLarge;
         }
         return try self.setAccountedBytes(next);
@@ -20475,12 +20508,16 @@ const RuntimeDocumentExtractionResourceTracker = struct {
 
     fn setAccountedBytes(self: *@This(), next: u64) !void {
         const manager = self.manager orelse return;
-        const stats = manager.sliceStats(.document_extraction_working_set);
-        if (stats.hard_limit_bytes > 0 and next > stats.hard_limit_bytes) {
+        // Own demand is bounded by the tighter of the slice and node limits.
+        const hard_limit = manager.memoryHardLimitForSlice(.document_extraction_working_set);
+        if (hard_limit > 0 and next > hard_limit) {
             return error.DocumentExtractionWorkingSetTooLarge;
         }
         manager.adjustUsage(.document_extraction_working_set, &self.current_bytes, next) catch |err| switch (err) {
-            error.ResourceBudgetExceeded => return error.DocumentExtractionWorkingSetTooLarge,
+            // The own-demand check above already rejected `next` exceeding
+            // the slice or node hard limit, so this failure means other
+            // owners hold the memory: retryable contention.
+            error.ResourceBudgetExceeded => return error.ResourceTemporarilyUnavailable,
             else => return err,
         };
     }
@@ -20512,6 +20549,41 @@ test "document extraction working set accounts generated unit cache bytes" {
 
     try tracker.updateWorkingSet(40, 0, &writes, &deletes, &window);
     try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, tracker.updateWorkingSet(40, 60, &writes, &deletes, &window));
+}
+
+test "document extraction working set contention is retryable while own oversize stays terminal" {
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+        .soft_limit_bytes = 0,
+        .hard_limit_bytes = 100,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var other = RuntimeDocumentExtractionResourceTracker{ .manager = &manager };
+    defer other.deinit();
+    try other.setBytes(60);
+
+    var tracker = RuntimeDocumentExtractionResourceTracker{ .manager = &manager };
+    defer tracker.deinit();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, tracker.setBytes(50));
+    try std.testing.expect(isRetryableEnrichmentError(error.ResourceTemporarilyUnavailable));
+    try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, tracker.setBytes(101));
+    try std.testing.expect(!isRetryableEnrichmentError(error.DocumentExtractionWorkingSetTooLarge));
+
+    try other.setBytes(0);
+    try tracker.setBytes(50);
+}
+
+test "document extraction working set over the node memory limit stays terminal" {
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+        .soft_limit_bytes = 0,
+        .hard_limit_bytes = 200,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets, .memory_budget = .{ .hard_limit_bytes = 100 } });
+    var tracker = RuntimeDocumentExtractionResourceTracker{ .manager = &manager };
+    defer tracker.deinit();
+    try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, tracker.setBytes(150));
+    try tracker.setBytes(50);
 }
 
 test "budgeted document download composes with materialization accounting" {
@@ -20999,7 +21071,7 @@ const RuntimeDocumentExtractionMaterializeContext = struct {
         return self.onUnitWithAllocator(working_alloc, unit) catch |err| {
             if (err == error.OutOfMemory) {
                 if (budgeted) |*allocator| if (allocator.denied())
-                    return error.DocumentExtractionWorkingSetTooLarge;
+                    return documentExtractionBudgetDenialError(allocator);
             }
             return err;
         };
@@ -21629,6 +21701,11 @@ fn prepareGraphAssetForRuntime(
             try deletes.append(runtime.alloc, try internal_keys.graphEdgeTtlLifetimeKeyAlloc(runtime.alloc, edge_key, graph_entry.config.name, graph_entry.config.coverage_generation, state_key));
             try deletes.append(runtime.alloc, try internal_keys.graphEdgeTtlTombstoneKeyAlloc(runtime.alloc, edge_key, graph_entry.config.name, graph_entry.config.coverage_generation, state_key));
         };
+        var raw_scanned_contender_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (raw_scanned_contender_keys.items) |key| runtime.alloc.free(@constCast(key));
+            raw_scanned_contender_keys.deinit(runtime.alloc);
+        }
         if (previous_keys == null and runtime.index_manager.graphArtifactSources(graph_entry.config.name).len <= 1) {
             const protected_keys = try runtimeResolutionMentionStateKeysForGraphSourceAlloc(runtime, request.doc_key, graph_entry.config.name, source);
             defer freeOwnedConstKeySlice(runtime.alloc, protected_keys);
@@ -21643,6 +21720,13 @@ fn prepareGraphAssetForRuntime(
                 if (protected_set.contains(entry.key)) continue;
                 try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, entry.key));
                 try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, entry.key);
+                // This edge has no tracked per-document state (previous_keys
+                // is null), so it is only found by the raw scan above. Feed
+                // it into the contender reconciliation below as a departing
+                // previous key; otherwise its per-(edge,state) contender row
+                // and the per-document visible-count witness never get
+                // updated, and they go stale once the edge is deleted here.
+                try appendUniqueDupeConstKey(runtime.alloc, &raw_scanned_contender_keys, entry.key);
             }
         }
 
@@ -21656,9 +21740,10 @@ fn prepareGraphAssetForRuntime(
             request.doc_key,
             graph_entry.config.name,
             state_key,
-            previous_keys orelse &.{},
+            if (previous_keys) |keys| keys else raw_scanned_contender_keys.items,
             writes.items[0..graph_write_count],
             graph_entry.config.coverage_generation,
+            previous_keys == null,
         );
         defer reconciled.deinit(runtime.alloc);
         if (reconciled.visible_count > edge_limit) return error.ResourceLimitExceeded;
@@ -21669,7 +21754,11 @@ fn prepareGraphAssetForRuntime(
             for (affected.items) |key| runtime.alloc.free(key);
             affected.deinit(runtime.alloc);
         }
-        if (previous_keys) |keys| for (keys) |key| try appendUniqueIndexedRuntimeKey(runtime.alloc, &affected, &affected_keys, key);
+        if (previous_keys) |keys| {
+            for (keys) |key| try appendUniqueIndexedRuntimeKey(runtime.alloc, &affected, &affected_keys, key);
+        } else {
+            for (raw_scanned_contender_keys.items) |key| try appendUniqueIndexedRuntimeKey(runtime.alloc, &affected, &affected_keys, key);
+        }
         for (writes.items[0..graph_write_count]) |write| try appendUniqueIndexedRuntimeKey(runtime.alloc, &affected, &affected_keys, write.key);
         try delete_keys.sync(runtime.alloc, deletes.items);
         for (affected.items) |edge_key| {
@@ -21767,6 +21856,11 @@ fn prepareGraphAssetDeleteForRuntime(
             try deletes.append(runtime.alloc, try internal_keys.graphEdgeTtlLifetimeKeyAlloc(runtime.alloc, edge_key, graph_entry.config.name, graph_entry.config.coverage_generation, state_key));
             try deletes.append(runtime.alloc, try internal_keys.graphEdgeTtlTombstoneKeyAlloc(runtime.alloc, edge_key, graph_entry.config.name, graph_entry.config.coverage_generation, state_key));
         };
+        var raw_scanned_contender_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (raw_scanned_contender_keys.items) |key| runtime.alloc.free(@constCast(key));
+            raw_scanned_contender_keys.deinit(runtime.alloc);
+        }
         if (previous_keys == null and runtime.index_manager.graphArtifactSources(graph_entry.config.name).len <= 1) {
             const protected_keys = try runtimeResolutionMentionStateKeysForGraphSourceAlloc(runtime, request.doc_key, graph_entry.config.name, source);
             defer freeOwnedConstKeySlice(runtime.alloc, protected_keys);
@@ -21780,6 +21874,11 @@ fn prepareGraphAssetDeleteForRuntime(
                 if (protected_set.contains(entry.key)) continue;
                 try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, entry.key));
                 try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, entry.key);
+                // See the matching comment in materializeGraphAssetForRuntime:
+                // this edge is only visible via the raw scan above, so it
+                // must be reconciled as a departing contender or the
+                // per-document visible-count witness goes stale.
+                try appendUniqueDupeConstKey(runtime.alloc, &raw_scanned_contender_keys, entry.key);
             }
         }
 
@@ -21800,15 +21899,20 @@ fn prepareGraphAssetDeleteForRuntime(
             for (affected.items) |key| runtime.alloc.free(key);
             affected.deinit(runtime.alloc);
         }
-        if (previous_keys) |keys| for (keys) |edge_key| try appendUniqueIndexedRuntimeKey(runtime.alloc, &affected, &affected_keys, edge_key);
+        if (previous_keys) |keys| {
+            for (keys) |edge_key| try appendUniqueIndexedRuntimeKey(runtime.alloc, &affected, &affected_keys, edge_key);
+        } else {
+            for (raw_scanned_contender_keys.items) |edge_key| try appendUniqueIndexedRuntimeKey(runtime.alloc, &affected, &affected_keys, edge_key);
+        }
         var reconciled = try runtimeReconcileGraphEdgeContenders(
             runtime,
             request.doc_key,
             graph_entry.config.name,
             state_key,
-            previous_keys orelse &.{},
+            if (previous_keys) |keys| keys else raw_scanned_contender_keys.items,
             &.{},
             graph_entry.config.coverage_generation,
+            previous_keys == null,
         );
         defer reconciled.deinit(runtime.alloc);
         try delete_keys.sync(runtime.alloc, deletes.items);
@@ -22206,6 +22310,7 @@ fn runtimeReconcileGraphEdgeContenders(
     previous_keys: []const []const u8,
     graph_writes: []const KVPair,
     expected_generation: u64,
+    force_witness_verify: bool,
 ) !RuntimeGraphContenderResult {
     const alloc = runtime.alloc;
     var result = RuntimeGraphContenderResult{};
@@ -22309,6 +22414,31 @@ fn runtimeReconcileGraphEdgeContenders(
         }
     }
     if (saw_current_contender and !count_present) return error.InvalidGraphEdgeContenderCount;
+    if (force_witness_verify and changes.count() == 0 and count_present) {
+        // Callers set `force_witness_verify` when they have no local
+        // previous-keys tracking for this state (the asset-state root was
+        // null or raw-scanned, not loaded). With nothing in `changes` to
+        // reconcile, the branches above leave `result.visible_count` as a
+        // verbatim echo of the stored witness. That witness goes stale
+        // whenever something clears this document's graph-asset-state root
+        // and contender rows directly (for example, deleting the primary
+        // document) without updating the per-document visible-count
+        // witness. Recompute it from the actual contender rows instead of
+        // trusting a witness that may no longer describe reality.
+        const contender_prefix = try internal_keys.graphEdgeContenderIndexPrefixAlloc(alloc, doc_key, index_name);
+        defer alloc.free(contender_prefix);
+        const existing_contenders = try backend_scan.scanPrefix(alloc, &runtime.store, contender_prefix);
+        defer backend_scan.freeResults(alloc, existing_contenders);
+        var distinct_edges = std.StringHashMapUnmanaged(void).empty;
+        defer distinct_edges.deinit(alloc);
+        for (existing_contenders) |contender| {
+            if (std.mem.eql(u8, contender.key, count_key)) continue;
+            if (internal_keys.isGraphEdgeTtlLifetimeKey(contender.key) or internal_keys.isGraphEdgeTtlTombstoneKey(contender.key)) continue;
+            const view = (try graph_edge_contender.decode(contender.value, expected_generation)) orelse continue;
+            try distinct_edges.put(alloc, view.edge_key, {});
+        }
+        result.visible_count = distinct_edges.count();
+    }
     const encoded_count = try graph_edge_contender.encodeVisibleCount(expected_generation, result.visible_count);
     try result.writes.append(alloc, .{ .key = try alloc.dupe(u8, count_key), .value = try alloc.dupe(u8, &encoded_count) });
 
@@ -25508,7 +25638,7 @@ fn processPdfPageImageEmbedding(
     defer if (metadata_budgeted) |*budgeted| budgeted.deinit();
     const metadata_alloc = if (metadata_budgeted) |*budgeted| budgeted.allocator() else runtime.alloc;
     processPdfPageImageEmbeddingWithAllocator(runtime, metadata_alloc, request, dense_embedder, consumer_indexes, prepared_sources, window) catch |err| {
-        if (err == error.OutOfMemory and metadata_budgeted != null and metadata_budgeted.?.denied()) return error.DocumentExtractionWorkingSetTooLarge;
+        if (err == error.OutOfMemory and metadata_budgeted != null and metadata_budgeted.?.denied()) return documentExtractionBudgetDenialError(&metadata_budgeted.?);
         return err;
     };
 }
@@ -29166,7 +29296,7 @@ fn storedChunkEmbeddingSourcesForRequest(
 
 test "ordered artifact inventory embedding fallback reads selected chunk generations including empty output" {
     const alloc = std.testing.allocator;
-    const db_mod = @import("../db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const chunks = @import("../artifact_chunk_manifest.zig");
     const generations = @import("../artifact_chunk_generation.zig");
     var tmp = std.testing.tmpDir(.{});
@@ -32146,7 +32276,7 @@ test "asset batch fallback isolates malformed envelope and preserves typed mixed
 
 test "ordered artifact inventory unit chunk callback reconstructs publishes and retires accepted inputs" {
     const alloc = std.testing.allocator;
-    const db_mod = @import("../db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const publication = ordered_publication;
     const manifest = @import("../artifact_chunk_manifest.zig");
     const Harness = struct {
@@ -32299,7 +32429,7 @@ test "ordered artifact inventory unit chunk callback reconstructs publishes and 
 }
 
 test "ordered artifact inventory chunk callback waits for acceptance and atomically publishes empty streams" {
-    const db_mod = @import("../db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const inventory = @import("../artifact_chunk_manifest.zig");
     const alloc = std.testing.allocator;
     const Harness = struct {
@@ -32476,7 +32606,7 @@ test "ordered artifact inventory chunk callback waits for acceptance and atomica
 
 test "ordered artifact inventory authored document callbacks bypass providers and publication" {
     const alloc = std.testing.allocator;
-    const db_mod = @import("../db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const publication = ordered_publication;
     const Harness = struct {
         calls: usize = 0,
@@ -32557,7 +32687,7 @@ test "ordered artifact inventory chunk vector callback publishes and retires wit
 }
 
 fn testOrderedChunkVectorCallback(dense: bool) !void {
-    const db_mod = @import("../db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const inventory = @import("../artifact_chunk_manifest.zig");
     const alloc = std.testing.allocator;
     const Harness = struct {
@@ -33115,7 +33245,7 @@ fn testOrderedAssetCallback(generated: bool, graph: bool) !void {
 }
 
 fn testOrderedAssetLifecycle(generated: bool, graph: bool, delete_live: bool) !void {
-    const db_mod = @import("../db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const alloc = std.testing.allocator;
     const Harness = struct {
         encoded: ?[]u8 = null,

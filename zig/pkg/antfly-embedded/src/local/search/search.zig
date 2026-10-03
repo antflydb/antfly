@@ -1266,8 +1266,30 @@ fn executeMatchAll(
 ) !SearchResult {
     // Use filter to get all doc IDs
     const filter = query_mod.Filter{ .match_all = {} };
-    const doc_ids = try snap.executeFilter(alloc, filter);
-    defer alloc.free(doc_ids);
+    const raw_doc_ids = try snap.executeFilter(alloc, filter);
+    defer alloc.free(raw_doc_ids);
+
+    // Unlike every other query type, match_all never goes through the
+    // scorer/collector path (FastTopK et al.) that consults
+    // filter_doc_nums/exclude_doc_nums, and it is not always wrapped in a
+    // bool_query whose executeBoolAllHit fallback re-applies those
+    // constraints as a safety net. Apply them directly here so a match_all
+    // query never silently ignores a filter_query/exclusion_query (or a
+    // bool.must_not) that the caller resolved into native doc numbers.
+    var owned_filtered: ?[]u32 = null;
+    defer if (owned_filtered) |owned| alloc.free(owned);
+    const doc_ids: []const u32 = if (!requestHasDocNumConstraints(request))
+        raw_doc_ids
+    else blk: {
+        var filtered = try std.ArrayListUnmanaged(u32).initCapacity(alloc, raw_doc_ids.len);
+        errdefer filtered.deinit(alloc);
+        for (raw_doc_ids) |doc_id| {
+            if (requestAllowsDocNum(request, doc_id)) filtered.appendAssumeCapacity(doc_id);
+        }
+        const owned = try filtered.toOwnedSlice(alloc);
+        owned_filtered = owned;
+        break :blk owned;
+    };
 
     // Build hits (no scoring, all score 1.0)
     const total: u32 = @intCast(doc_ids.len);
@@ -3640,6 +3662,69 @@ test "bool fallback applies native doc number constraints" {
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqual(@as(u32, 0), result.hits[0].doc_id);
     try std.testing.expectEqualStrings("doc1", result.hits[0].id.?);
+}
+
+test "match_all applies native doc number constraints (#931)" {
+    const alloc = std.testing.allocator;
+
+    const seg_bytes = try buildTestSegmentWithStoredDocs(alloc, &.{
+        .{ .id = "doc1", .data = "{\"title\":\"hello one\"}", .terms = &.{
+            .{ .term = "hello", .freq = 1, .norm = 10 },
+        } },
+        .{ .id = "doc2", .data = "{\"title\":\"hello two\"}", .terms = &.{
+            .{ .term = "hello", .freq = 1, .norm = 10 },
+        } },
+        .{ .id = "doc3", .data = "{\"title\":\"hello three\"}", .terms = &.{
+            .{ .term = "hello", .freq = 1, .norm = 10 },
+        } },
+    });
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snap = writer.snapshot();
+
+    // Unlike every other query type (see "bool fallback applies native doc
+    // number constraints" above), match_all never went through a path that
+    // consulted filter_doc_nums/exclude_doc_nums, so a match_all query
+    // silently ignored a resolved exclusion (exclusion_query/bool.must_not).
+    const exclude_doc_nums = [_]u32{1};
+    var excluded = try execute(alloc, snap, .{
+        .query = .{ .match_all = {} },
+        .k = 10,
+        .exclude_doc_nums = &exclude_doc_nums,
+    });
+    defer excluded.deinit();
+    try std.testing.expectEqual(@as(u32, 2), excluded.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), excluded.hits.len);
+    for (excluded.hits) |hit| try std.testing.expect(hit.doc_id != 1);
+
+    const include_doc_nums = [_]u32{ 0, 2 };
+    var filtered = try execute(alloc, snap, .{
+        .query = .{ .match_all = {} },
+        .k = 10,
+        .filter_doc_nums = &include_doc_nums,
+        .filter_doc_nums_positive = true,
+        .exclude_doc_nums = &exclude_doc_nums,
+    });
+    defer filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 2), filtered.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), filtered.hits.len);
+    try std.testing.expectEqual(@as(u32, 0), filtered.hits[0].doc_id);
+    try std.testing.expectEqual(@as(u32, 2), filtered.hits[1].doc_id);
+
+    // Offset/limit paginate over the already-constrained set, not the raw one.
+    var paged = try execute(alloc, snap, .{
+        .query = .{ .match_all = {} },
+        .k = 1,
+        .offset = 1,
+        .exclude_doc_nums = &exclude_doc_nums,
+    });
+    defer paged.deinit();
+    try std.testing.expectEqual(@as(u32, 2), paged.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), paged.hits.len);
+    try std.testing.expectEqual(@as(u32, 2), paged.hits[0].doc_id);
 }
 
 test "exact inclusive term range preserves prefix constant scores" {

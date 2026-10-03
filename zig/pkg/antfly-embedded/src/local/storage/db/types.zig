@@ -612,9 +612,11 @@ pub const ArtifactSourceRef = struct {
     unit_id: ?[]u8 = null,
 
     pub fn clone(self: ArtifactSourceRef, alloc: Allocator) !ArtifactSourceRef {
+        const name = try alloc.dupe(u8, self.name);
+        errdefer alloc.free(name);
         return .{
             .kind = self.kind,
-            .name = try alloc.dupe(u8, self.name),
+            .name = name,
             .chunk_id = self.chunk_id,
             .unit_id = if (self.unit_id) |unit_id| try alloc.dupe(u8, unit_id) else null,
         };
@@ -636,12 +638,18 @@ pub const ArtifactRef = struct {
     source: ?ArtifactSourceRef = null,
 
     pub fn clone(self: ArtifactRef, alloc: Allocator) !ArtifactRef {
+        const document_id = try alloc.dupe(u8, self.document_id);
+        errdefer alloc.free(document_id);
+        const name = try alloc.dupe(u8, self.name);
+        errdefer alloc.free(name);
+        const unit_id = if (self.unit_id) |id| try alloc.dupe(u8, id) else null;
+        errdefer if (unit_id) |id| alloc.free(id);
         return .{
-            .document_id = try alloc.dupe(u8, self.document_id),
-            .name = try alloc.dupe(u8, self.name),
+            .document_id = document_id,
+            .name = name,
             .kind = self.kind,
             .chunk_id = self.chunk_id,
-            .unit_id = if (self.unit_id) |unit_id| try alloc.dupe(u8, unit_id) else null,
+            .unit_id = unit_id,
             .source = if (self.source) |source| try source.clone(alloc) else null,
         };
     }
@@ -2696,15 +2704,15 @@ pub const ChunkHit = struct {
     artifact_ref: ?ArtifactRef = null,
 
     pub fn clone(self: ChunkHit, alloc: Allocator) !ChunkHit {
-        return .{
-            .id = try alloc.dupe(u8, self.id),
-            .score = self.score,
-            .distance = self.distance,
-            .stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null,
-            .ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null,
-            .ancestor_unit_data = if (self.ancestor_unit_data) |data| try alloc.dupe(u8, data) else null,
-            .artifact_ref = if (self.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null,
-        };
+        var cloned: ChunkHit = .{ .id = try alloc.dupe(u8, self.id) };
+        errdefer cloned.deinit(alloc);
+        cloned.score = self.score;
+        cloned.distance = self.distance;
+        cloned.stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null;
+        cloned.ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null;
+        cloned.ancestor_unit_data = if (self.ancestor_unit_data) |data| try alloc.dupe(u8, data) else null;
+        cloned.artifact_ref = if (self.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null;
+        return cloned;
     }
 
     pub fn deinit(self: *ChunkHit, alloc: Allocator) void {
@@ -3380,6 +3388,7 @@ pub const TextMergeStats = struct {
     last_merge_error: RuntimeErrorName = .{},
     retry_after_ns: u64 = 0,
     deferred_for_pressure: u64 = 0,
+    forced_drains: u64 = 0,
     backpressure_events: u64 = 0,
     backpressure_ns: u64 = 0,
     backpressure_timeouts: u64 = 0,
@@ -3531,6 +3540,7 @@ pub fn accumulateTextMergeStats(dst: *TextMergeStats, src: TextMergeStats) void 
     if (src.last_merge_error.len != 0) dst.last_merge_error = src.last_merge_error;
     dst.retry_after_ns = @max(dst.retry_after_ns, src.retry_after_ns);
     dst.deferred_for_pressure +|= src.deferred_for_pressure;
+    dst.forced_drains +|= src.forced_drains;
     dst.backpressure_events +|= src.backpressure_events;
     dst.backpressure_ns +|= src.backpressure_ns;
     dst.backpressure_timeouts +|= src.backpressure_timeouts;
@@ -4810,6 +4820,10 @@ pub const DerivedWorkerStats = struct {
     replay_document_not_visible_retries: u64 = 0,
     artifact_repair_required_retries: u64 = 0,
     not_found_retries: u64 = 0,
+    /// Documents given up on by bounded replay-document-not-visible
+    /// escalation, summed across every index (see
+    /// ResourceManager.replayDocumentNotVisibleSkippedTotalAll).
+    replay_document_not_visible_skipped_total: u64 = 0,
 };
 
 pub const BulkCoalescingStats = struct {
@@ -4961,6 +4975,7 @@ pub fn accumulateAsyncIndexingStats(dst: *AsyncIndexingStats, src: AsyncIndexing
     dst.derived_workers.replay_document_not_visible_retries += src.derived_workers.replay_document_not_visible_retries;
     dst.derived_workers.artifact_repair_required_retries += src.derived_workers.artifact_repair_required_retries;
     dst.derived_workers.not_found_retries += src.derived_workers.not_found_retries;
+    dst.derived_workers.replay_document_not_visible_skipped_total += src.derived_workers.replay_document_not_visible_skipped_total;
 }
 
 pub fn freeResolverReplayDiagnostics(alloc: Allocator, stats: ResolverReplayDiagnostics) void {
