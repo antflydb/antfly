@@ -73,11 +73,15 @@ pub const Budget = struct {
     rows: usize = 128,
     records: usize = 1024,
     output_bytes: usize = 1024 * 1024,
+    /// Soft page target; a single legal row may exceed it. output_bytes
+    /// remains the hard row and page allocation limit.
+    target_bytes: usize = 0,
     time_ns: u64 = 5 * std.time.ns_per_ms,
 
     fn validate(self: Budget) !void {
         if (self.rows == 0 or self.rows > 4096 or self.records == 0 or self.records > 65_536 or
             self.output_bytes == 0 or self.output_bytes > 16 * 1024 * 1024 or
+            self.target_bytes > self.output_bytes or
             self.time_ns == 0 or self.time_ns > std.time.ns_per_s) return error.InvalidRelationalRowsBudget;
     }
 };
@@ -679,8 +683,9 @@ pub const Reader = struct {
                 if (std.mem.order(u8, key.items, self.owned_lower) == .lt or std.mem.order(u8, key.items, self.owned_upper) != .lt) break :blk null;
                 break :blk key.items;
             } else blk: {
-                // The first companion can sort before the primary row. Probe
-                // the exact primary once, then skip the entire document family.
+                // The timestamp companion sorts before the primary row. Walk
+                // the already pinned cursor to it instead of a point lookup
+                // that reparses the persisted-run index for every document.
                 if (internal.isRelationalRowKey(kv.key)) break :blk kv.key;
                 const end = (internal.findComponentTerminator(kv.key, 1) orelse return error.InvalidInternalUserKey) + 2;
                 const key = try temporary.alloc(u8, end + 1);
@@ -688,22 +693,37 @@ pub const Reader = struct {
                 key[end] = internal.relational_row_kind;
                 break :blk key;
             };
+            // A primary locator may advance the cursor and invalidate kv.key.
+            // All record kinds in this family have the same owner successor.
+            const continuation_key = if (self.index == null) primary orelse kv.key else kv.key;
             if (primary) |key| {
-                if (!self.index_only and !std.mem.eql(u8, key, kv.key)) result.primary_lookups += 1;
-                const raw = if (self.index_only or std.mem.eql(u8, key, kv.key)) kv.value else self.read.get(key) catch |err| switch (err) {
-                    error.NotFound => {
-                        if (self.index != null) return error.InvalidRelationalIndexForwardKey;
-                        // Orphan companions still consume one bounded unit of
-                        // work, but cannot force a scan through every artifact.
-                        continuation.clearRetainingCapacity();
-                        try continuation.appendSlice(alloc, kv.key);
-                        if (result.records_examined >= budget.records or time.monotonicNs() - started >= budget.time_ns) {
-                            exhausted = false;
-                            break;
-                        }
-                        continue;
-                    },
-                    else => return err,
+                const raw_optional: ?[]const u8 = if (self.index_only or std.mem.eql(u8, key, kv.key)) kv.value else if (self.index == null) locate: {
+                    if (std.mem.order(u8, kv.key, key) == .gt) break :locate null;
+                    // One adjacent step handles the ordinary timestamp/row
+                    // pair; seek only when another companion intervenes. This
+                    // keeps artifact-heavy and orphan families bounded too.
+                    var candidate = try cursor.next();
+                    if (candidate) |item| if (std.mem.order(u8, item.key, key) == .lt) {
+                        candidate = try cursor.seekAtOrAfter(key);
+                    };
+                    break :locate if (candidate) |item| if (std.mem.eql(u8, item.key, key)) item.value else null else null;
+                } else lookup: {
+                    result.primary_lookups += 1;
+                    break :lookup self.read.get(key) catch |err| switch (err) {
+                        error.NotFound => return error.InvalidRelationalIndexForwardKey,
+                        else => return err,
+                    };
+                };
+                const raw = raw_optional orelse {
+                    // Orphan companions still consume one bounded unit of
+                    // work, but cannot force a scan through every artifact.
+                    continuation.clearRetainingCapacity();
+                    try continuation.appendSlice(alloc, continuation_key);
+                    if (result.records_examined >= budget.records or time.monotonicNs() - started >= budget.time_ns) {
+                        exhausted = false;
+                        break;
+                    }
+                    continue;
                 };
                 const row = if (self.index_only) try self.coveringView(kv.key, raw) else self.rowView(raw) catch |err| {
                     if (err == error.RelationalIndexColumnTypeMismatch) try self.observeFailedRow(key, raw);
@@ -742,7 +762,8 @@ pub const Reader = struct {
                         if (!self.index_only) try self.observeFailedRow(key, raw);
                         return error.RelationalRowResultTooLarge;
                     }
-                    if (size > budget.output_bytes - result.output_bytes) {
+                    const target = if (budget.target_bytes == 0) budget.output_bytes else budget.target_bytes;
+                    if (size > budget.output_bytes - result.output_bytes or (output.items.len != 0 and size > target -| result.output_bytes)) {
                         exhausted = false;
                         break;
                     }
@@ -767,8 +788,8 @@ pub const Reader = struct {
                 }
             }
             continuation.clearRetainingCapacity();
-            try continuation.appendSlice(alloc, kv.key);
-            if (output.items.len >= budget.rows or result.records_examined >= budget.records or time.monotonicNs() - started >= budget.time_ns) {
+            try continuation.appendSlice(alloc, continuation_key);
+            if (output.items.len >= budget.rows or (budget.target_bytes != 0 and result.output_bytes >= budget.target_bytes) or result.records_examined >= budget.records or time.monotonicNs() - started >= budget.time_ns) {
                 exhausted = false;
                 break;
             }

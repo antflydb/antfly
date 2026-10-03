@@ -2304,18 +2304,18 @@ test "storage.hot_standby admin exec renders operator plan command" {
     try expectContains(table_body, "actions.0.executor=admin_api\n");
     try expectContains(table_body, "actions.0.fence_authority=kubernetes_lease\n");
     try expectContains(table_body, "actions.0.admin_method=POST\n");
-    try expectContains(table_body, "actions.0.admin_path=" ++ admin_api.routes.ha_fence ++ "\n");
+    try expectContains(table_body, "actions.0.admin_path=" ++ admin_api.routes.hot_standby_fence ++ "\n");
     try expectContains(table_body, "actions.1.kind=assess_promotion\n");
     try expectContains(table_body, "actions.1.depends_on=acquire_fence\n");
-    try expectContains(table_body, "actions.1.admin_path=" ++ admin_api.routes.ha_promotion_assess ++ "\n");
+    try expectContains(table_body, "actions.1.admin_path=" ++ admin_api.routes.hot_standby_promotion_assess ++ "\n");
     try expectContains(table_body, "actions.2.kind=promote_standby\n");
     try expectContains(table_body, "actions.2.depends_on=assess_promotion\n");
-    try expectContains(table_body, "actions.2.admin_path=" ++ admin_api.routes.ha_promotion_current_fence ++ "\n");
+    try expectContains(table_body, "actions.2.admin_path=" ++ admin_api.routes.hot_standby_promotion_current_fence ++ "\n");
     try expectContains(table_body, "actions.3.kind=update_primary_endpoint\n");
     try expectContains(table_body, "actions.3.executor=controller_action\n");
     try expectContains(table_body, "actions.3.route_to=standby-a\n");
     try expectContains(table_body, "actions.4.kind=demote_former_primary\n");
-    try expectContains(table_body, "actions.4.admin_path=" ++ admin_api.routes.ha_rejoin_assess ++ "\n");
+    try expectContains(table_body, "actions.4.admin_path=" ++ admin_api.routes.hot_standby_rejoin_assess ++ "\n");
 }
 
 test "storage.hot_standby admin exec operator plan assesses former primary rejoin" {

@@ -17,8 +17,12 @@ release changes belong to the separate licensing PR.
 | `build_support/antfly` | Shared module composition, dependency configuration, runtime contracts and test collection |
 
 Portable local transaction receipts and replication records remain with the DB.
-Raft application and hot-standby lifecycle remain server features implemented by
-adapters. Backup artifact decoding and local restore staging are local operations;
+Raft application, hot-standby lifecycle, and durability policy remain server features
+implemented by adapters. The local ports contain borrowed or captured write admission,
+generation pinning, commit requirements, and publication/completion callbacks.
+Policy, waits, and telemetry stay in the server adapters; copied captures retain
+configuration by value while their pointer and slice targets remain borrowed.
+Backup artifact decoding and local restore staging are local operations;
 coordinated snapshot publication and cluster restore remain server operations.
 Existing shared contracts and generated OpenAPI ownership remain in their existing
 embedded/shared-library/server-API packages. Authored YAML remains in `specs/openapi`.

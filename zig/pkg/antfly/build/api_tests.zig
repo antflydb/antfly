@@ -67,6 +67,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const public_api_parity_default_filters = [_][]const u8{
         "SQL API cross-table MERGE retains both source and target range proofs",
         "api http server authenticates bounded online merge owner routes",
+        "online merge private standalone rewrite port pins authority and never fabricates Raft coordinates",
         "online merge private port fences owners cancellation and deadlines before dispatch",
         "online merge private port preserves source recovery errors through foreign runtime dispatch",
         "join planning",
@@ -167,7 +168,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api http server prefers metadata-owned restore over inline write-source restore",
         "api http server does not retry authoritative metadata table-exists conflict",
         "api http server retries interrupted metadata restore publication",
-        "public API request body limit matches Go linear merge contract",
         "api query contract parses direct JSON-pointer path aliases",
         "api query contract serializes derived hierarchy ancestry",
         "api query contract serializes mention evidence hierarchy",
@@ -269,7 +269,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "SQL JSON null metadata",
         "SQL session metadata",
         "SQL staged statements",
-        "relational row query statement",
         "relational row query coordinator",
         "httpx antfly schema update returns full table status after projection",
         "httpx antfly schema update owns self partial support and requires coordinated publication",
@@ -308,10 +307,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_test_mod,
         .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, public_api_parity_runtime_filters),
         // The macOS debug root includes the complete public transport,
-        // generated-contract, and native-index surface. ReleaseSafe test
-        // compilation currently peaks above 13 GiB; reserve the measured
+        // generated-contract, and native-index surface. Debug test
+        // compilation currently peaks at 15.09 GB; reserve the measured
         // envelope so the scheduler does not reject a successful compile.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 15 else 7) * 1024 * 1024 * 1024,
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
             .mode = .simple,
@@ -399,9 +398,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         &lib_api_auth_default_filters,
     );
     const lib_api_auth_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
-        // The server API fixture closure peaks at 11.21 GB on macOS.
+        // macOS Debug measured 11.43 GB for the linked auth surface.
         .max_rss = if (target.result.os.tag == .macos) 12 * 1024 * 1024 * 1024 else 0,
+        .root_module = antfly_test_mod,
         .filters = lib_api_auth_runtime_filters,
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
@@ -1622,6 +1621,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
     }, write_implementation_tests);
     b.step("antfly-api-aggregation-test", "Run captured aggregation collection, completeness and generation regressions").dependOn(&api_aggregation_tests.run(b).step);
+    const rewrite_admission_contract_tests = b.addTest(.{
+        .root_module = api_transactions_docid_test_mod,
+        .filters = &.{ "distributed txn rewrite admission", "relational integrity restore staging rewrite intent" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-rewrite-admission-contract-test", "Verify scoped rewrite admission and durable intent binding")
+        .dependOn(&addFilteredTestRunArtifact(b, rewrite_admission_contract_tests).step);
+    const row_semantics_codec_tests = b.addTest(.{
+        .root_module = api_transactions_docid_test_mod,
+        .filters = &.{ "distributed txn prepare preserves JSON null", "distributed txn prepare JSON null", "internal batch JSON null", "distributed txn range guard wire" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-row-semantics-codec-test", "Verify fail-closed row semantics envelopes and allocation failure cleanup")
+        .dependOn(&addFilteredTestRunArtifact(b, row_semantics_codec_tests).step);
     const api_transaction_contract_tests = b.addTest(.{
         .root_module = api_transactions_docid_test_mod,
         .filters = &.{ "distributed txn", "hosted participant", "stable distributed transaction retry", "internal batch parser owns binary staged restore controls", "merge page internal codec", "online merge private", "durable SQL session rejects duplicate savepoint ids" },

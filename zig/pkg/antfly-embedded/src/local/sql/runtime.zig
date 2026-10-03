@@ -30,7 +30,8 @@ pub const Limits = struct {
     scan_rows: usize = 100_000,
     retained_bytes: usize = 8 * 1024 * 1024,
     page_rows: u32 = 256,
-    scan_pages: usize = 1024,
+    page_bytes: usize = 256 * 1024,
+    scan_pages: usize = 16_384,
 };
 pub const Column = describe.Column;
 pub const Output = struct {
@@ -98,7 +99,7 @@ pub const Result = struct {
 
 pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, parameters: []const Json, limits: Limits) !Result {
     if (limits.result_rows == 0 or limits.result_rows > 4096 or limits.mutation_rows == 0 or limits.mutation_rows > 4096 or
-        limits.page_rows == 0 or limits.page_rows > 4096 or limits.scan_rows == 0) return error.InvalidSqlLimit;
+        limits.page_rows == 0 or limits.page_rows > 4096 or limits.page_bytes == 0 or limits.scan_rows == 0) return error.InvalidSqlLimit;
     if (parameters.len != compiled.parameter_count) return error.InvalidSqlParameters;
     try backend.vtable.checkpoint(backend.ptr);
     var pinned_settings: ?@import("setting_catalog.zig").View = null;
@@ -255,6 +256,7 @@ pub const Context = struct {
                 // Row identity has a separate native key boundary; never
                 // pretend it is a document property in a storage predicate.
                 const bound_value = try self.value(comparison.value, column);
+                if (column.type == .json) return;
                 // A JSON-null value is not SQL NULL. The current native
                 // condition envelope cannot express that operand, so retain
                 // this comparison in the already bound typed residual.
@@ -288,6 +290,7 @@ pub const Context = struct {
             },
             .is_null => |test_null| {
                 const column = try table_def.column(test_null.field);
+                if (column.type == .json) return;
                 if (std.mem.eql(u8, column.name, "_id")) {
                     if (!test_null.negated) output.empty = true;
                     return;
@@ -378,10 +381,10 @@ pub const Context = struct {
             if (page_count > self.limits.scan_pages) return error.SqlProgramLimitExceeded;
             var page_arena = std.heap.ArenaAllocator.init(self.alloc);
             defer page_arena.deinit();
-            const wanted = if (statement.count_all or top_k != null) self.limits.page_rows else @min(
-                self.limits.page_rows,
-                (offset -| scanned) + (limit - rows.items.len) + @as(usize, if (statement.limit == null) 1 else 0),
-            );
+            // Native pages bound scan work independently of the number of
+            // residual matches still needed. LIMIT 1 must not impose a
+            // 1024-row scan ceiling on a selective scalar predicate.
+            const wanted = self.limits.page_rows;
             const page = try scan_state.page(self, page_arena.allocator(), table_def, .{
                 .fields = native_fields.items,
                 .primary_order = self.binding.primary_order,
@@ -449,7 +452,8 @@ pub const Context = struct {
             const ordered = try operator.finish(self.arena);
             const remaining = ordered.len -| offset;
             if (statement.limit == null and remaining > limit) return error.SqlResultTooLarge;
-            for (ordered[@min(offset, ordered.len)..][0..@min(remaining, limit)]) |row| {
+            for (0..@min(offset, ordered.len)) |index| operator.releaseFinishedRow(index);
+            for (ordered[@min(offset, ordered.len)..][0..@min(remaining, limit)], @min(offset, ordered.len)..) |row, index| {
                 try self.checkpoint();
                 const cells = try self.arena.alloc(Json, row.values.len);
                 const nulls = try self.arena.alloc(bool, row.values.len);
@@ -459,6 +463,7 @@ pub const Context = struct {
                 }
                 try rows.append(self.arena, cells);
                 try null_rows.append(self.arena, nulls);
+                operator.releaseFinishedRow(index);
             }
         }
         if (statement.count_all and offset == 0) {
@@ -552,7 +557,7 @@ pub const Context = struct {
             const document: Json = .{ .object = object };
             retained = std.math.add(usize, retained, jsonSize(document) + key.string.len) catch return error.SqlProgramLimitExceeded;
             if (retained > self.limits.retained_bytes) return error.SqlProgramLimitExceeded;
-            mutation.* = .{ .key = key.string, .expected_version = 0, .row = document, .json_null_fields = json_null_fields.items };
+            mutation.* = .{ .key = key.string, .expected_version = 0, .unique_absence = true, .row = document, .json_null_fields = json_null_fields.items };
         }
         try self.checkpoint();
         const resolved = if (statement.conflict) |clause| try @import("conflict.zig").resolve(self, table_def, clause, self.binding.conflict orelse return error.InvalidSqlBackendResponse, mutations, &.{}) else mutations;
@@ -615,7 +620,7 @@ pub const Context = struct {
             const identity = key orelse try (self.backend.vtable.generate_row_id orelse return error.SqlRowIdentityRequired)(self.backend.ptr, self.arena);
             if (identity.len == 0 or !std.unicode.utf8ValidateSlice(identity)) return error.InvalidSqlBackendResponse;
             if ((try keys.getOrPut(self.arena, identity)).found_existing and (statement.conflict == null or !@import("conflict.zig").allowsDuplicateKeys(statement.conflict.?))) return error.DuplicateSqlRow;
-            mutation.* = .{ .key = identity, .expected_version = 0, .row = .{ .object = object }, .json_null_fields = json_null_fields.items };
+            mutation.* = .{ .key = identity, .expected_version = 0, .unique_absence = true, .row = .{ .object = object }, .json_null_fields = json_null_fields.items };
         }
         try self.checkpoint();
         const resolved = if (statement.conflict) |clause| try @import("conflict.zig").resolve(self, table, clause, self.binding.conflict orelse return error.InvalidSqlBackendResponse, mutations, captured) else mutations;
@@ -861,7 +866,7 @@ pub const Context = struct {
         for (input, prepared) |original, mutation| {
             if (!std.mem.eql(u8, mutation.key, original.key) or mutation.expected_version != original.expected_version or
                 !std.meta.eql(mutation.expected_content_digest, original.expected_content_digest) or
-                mutation.predicate_only != original.predicate_only or (mutation.row == null) != (original.row == null)) return error.InvalidSqlBackendResponse;
+                mutation.unique_absence != original.unique_absence or mutation.predicate_only != original.predicate_only or (mutation.row == null) != (original.row == null)) return error.InvalidSqlBackendResponse;
             if (mutation.conflict_guard != original.conflict_guard) return error.InvalidSqlBackendResponse;
         }
         try self.checkpoint();
@@ -869,10 +874,15 @@ pub const Context = struct {
             try fences.appendSlice(self.arena, prepared);
             break :blk fences.items;
         };
+        // Commit-only wire buffers have their own lifetime. Growing them in
+        // the result arena amplifies retained preimages and cannot reclaim
+        // serialization capacity before the statement result is released.
+        var commit_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer commit_arena.deinit();
         output.mutation_outcome = if (committed.len == 0) .committed else if (did_prepare)
-            try (self.backend.vtable.mutate_prepared orelse return error.UnsupportedSqlExecution)(self.backend.ptr, self.arena, table, committed)
+            try (self.backend.vtable.mutate_prepared orelse return error.UnsupportedSqlExecution)(self.backend.ptr, commit_arena.allocator(), table, committed)
         else
-            try self.backend.vtable.mutate(self.backend.ptr, self.arena, table, committed);
+            try self.backend.vtable.mutate(self.backend.ptr, commit_arena.allocator(), table, committed);
         return output;
     }
 };
@@ -885,7 +895,7 @@ fn coerce(alloc: std.mem.Allocator, raw: Json, kind: ast.ColumnType) !Json {
             else => return err,
         } };
     }
-    return describe.coerce(raw, kind);
+    return describe.coerceAlloc(alloc, raw, kind);
 }
 
 fn contains(items: []const []const u8, needle: []const u8) bool {
@@ -1047,6 +1057,32 @@ const TestBackend = struct {
         if (self.cancelled) return error.Cancelled;
     }
 };
+
+test "SQL commit serialization is released before the statement result" {
+    const Provider = struct {
+        fn mutate(_: *anyopaque, alloc: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+            try std.testing.expect(mutations[0].unique_absence);
+            // Model a provider's temporary wire buffer. The callback contract
+            // supplies an arena and owns its lifetime even on allocation failure.
+            const wire = try alloc.alloc(u8, 256 * 1024);
+            @memset(wire, 1);
+            return .committed;
+        }
+        fn run(alloc: std.mem.Allocator) !void {
+            var provider: TestBackend = .{};
+            const backend: catalog.Backend = .{ .ptr = &provider, .vtable = &.{ .resolve = TestBackend.resolve, .scan = TestBackend.scan, .mutate = mutate, .checkpoint = TestBackend.checkpoint } };
+            var compiled = try compiler.compile(alloc, "INSERT INTO things (_id,id) VALUES ('one',1)", .{});
+            defer compiled.deinit();
+            var budget: MemoryBudget = .{ .backing = alloc, .limit = 1024 * 1024 };
+            var result = try execute(budget.allocator(), backend, &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.output.rows_affected);
+            try std.testing.expect(budget.peak >= 256 * 1024);
+            try std.testing.expect(budget.live < 64 * 1024);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Provider.run, .{});
+}
 
 test "SQL EXPLAIN binds authorized plans without reading or writing rows" {
     const Authority = struct {
@@ -2168,4 +2204,26 @@ test "SQL typed mutations preserve JSON null separately from SQL NULL and filter
     try std.testing.expectEqual(@as(usize, 1), selected.output.rows.len);
     try std.testing.expectEqualStrings("a", selected.output.rows[0][0].string);
     try std.testing.expect(!selected.output.sql_nulls.?[0][1]);
+}
+
+test "SQL LIMIT scan pages are independent of residual selectivity" {
+    var backend: TestBackend = .{ .row_count = 3000 };
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT _id FROM things WHERE _id LIKE '%2999' LIMIT 1", .{});
+    defer compiled.deinit();
+    var result = try execute(std.testing.allocator, backend.iface(), &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+    try std.testing.expectEqualStrings("2999", result.output.rows[0][0].string);
+    try std.testing.expectEqual(@as(usize, 12), backend.pages);
+}
+
+test "SQL virtual relation byte pages preserve continuation and release exhausted sources" {
+    var backend: TestBackend = .{ .row_count = 5000 };
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT count(*) FROM (SELECT _id FROM things) q", .{});
+    defer compiled.deinit();
+    var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{ .page_bytes = 1, .retained_bytes = 512 * 1024 });
+    defer result.deinit();
+    try std.testing.expectEqualStrings("5000", result.output.rows[0][0].string);
+    try std.testing.expectEqual(backend.statement_opens, backend.statement_closes);
+    try std.testing.expect(result.peakMemoryBytes() < 512 * 1024);
 }

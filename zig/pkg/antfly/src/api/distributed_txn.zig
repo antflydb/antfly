@@ -2396,7 +2396,8 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     const guarded = req.req.range_guards.len != 0;
-    if (guarded) try out.appendSlice(alloc, "[\"range-prepare-v1\",");
+    const row_semantics = @import("antfly_local_sources").api_batch.requiresRowSemanticsEnvelope(req.req.writes, req.req.predicates);
+    if (row_semantics) try out.appendSlice(alloc, "[\"row-semantics-prepare-v1\",") else if (guarded) try out.appendSlice(alloc, "[\"range-prepare-v1\",");
     try out.appendSlice(alloc, "{\"txn_id\":\"");
     try out.appendSlice(alloc, &txn_hex);
     try out.appendSlice(alloc, "\",\"topology_epoch\":");
@@ -2414,11 +2415,18 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
         if (i > 0) try out.append(alloc, ',');
         const encoded = try std.fmt.allocPrint(
             alloc,
-            "{{\"key\":{f},\"value\":{s}}}",
+            "{{\"key\":{f},\"value\":{s}",
             .{ std.json.fmt(write.key, .{}), write.value },
         );
         defer alloc.free(encoded);
         try out.appendSlice(alloc, encoded);
+        if (write.json_null_fields.len != 0) {
+            const fields = try std.json.Stringify.valueAlloc(alloc, write.json_null_fields, .{});
+            defer alloc.free(fields);
+            try out.appendSlice(alloc, ",\"json_null_fields\":");
+            try out.appendSlice(alloc, fields);
+        }
+        try out.append(alloc, '}');
     }
     try out.appendSlice(alloc, "],\"deletes\":[");
     for (req.req.deletes, 0..) |key, i| {
@@ -2462,6 +2470,7 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
         const encoded = try std.json.Stringify.valueAlloc(alloc, .{
             .key = predicate.key,
             .expected_version = predicate.expected_version,
+            .unique_absence = if (predicate.unique_absence) @as(?bool, true) else null,
             .expected_content_digest = if (predicate.expected_content_digest != null) @as(?[]const u8, &digest_hex) else null,
         }, .{ .emit_null_optional_fields = false });
         defer alloc.free(encoded);
@@ -2514,7 +2523,7 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
         try out.appendSlice(alloc, encoded);
     }
     try out.append(alloc, '}');
-    if (guarded) try out.append(alloc, ']');
+    if (guarded or row_semantics) try out.append(alloc, ']');
     return try out.toOwnedSlice(alloc);
 }
 
@@ -2682,10 +2691,13 @@ pub fn freeTxnBeginRequest(alloc: std.mem.Allocator, req: *TxnBeginRequest) void
 pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPrepareRequest {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false });
     defer parsed.deinit();
-    const guarded = parsed.value == .array;
-    const root = if (guarded) blk: {
+    const wrapped = parsed.value == .array;
+    var row_semantics = false;
+    const root = if (wrapped) blk: {
         const entries = parsed.value.array.items;
-        if (entries.len != 2 or entries[0] != .string or !std.mem.eql(u8, entries[0].string, "range-prepare-v1")) return error.InvalidTxnRequest;
+        if (entries.len != 2 or entries[0] != .string) return error.InvalidTxnRequest;
+        row_semantics = std.mem.eql(u8, entries[0].string, "row-semantics-prepare-v1");
+        if (!row_semantics and !std.mem.eql(u8, entries[0].string, "range-prepare-v1")) return error.InvalidTxnRequest;
         break :blk entries[1];
     } else parsed.value;
     const obj = switch (root) {
@@ -2732,7 +2744,10 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     var route_fence = if (obj.get("route_fence")) |value| try std.json.parseFromValue(@import("../metadata/api.zig").CatalogRouteFence, alloc, value, .{}) else null;
     defer if (route_fence) |*fence| fence.deinit();
     if (range_guards_owner != null and range_guards_owner.?.value.len != 0 and route_fence == null) return error.InvalidTxnRequest;
-    if (guarded != (range_guards_owner != null and range_guards_owner.?.value.len != 0)) return error.InvalidTxnRequest;
+    const has_guards = range_guards_owner != null and range_guards_owner.?.value.len != 0;
+    if (has_guards and !wrapped) return error.InvalidTxnRequest;
+    if (wrapped and !row_semantics and !has_guards) return error.InvalidTxnRequest;
+    if (@import("antfly_local_sources").api_batch.requiresRowSemanticsEnvelope(writes, predicates) and !row_semantics) return error.InvalidTxnRequest;
     return .{
         .route_fence = if (route_fence) |fence| fence.value else null,
         .txn_id = txn_id,
@@ -2804,6 +2819,27 @@ test "SQL document schema epoch survives distributed prepare transport" {
         defer freeTxnPrepareRequest(alloc, &parsed);
         try std.testing.expectEqual(@as(?u32, version), parsed.req.schema_version);
         try std.testing.expect(parsed.req.relational_schema_version == null);
+    }
+}
+
+test "distributed txn prepare preserves JSON null provenance and rejects invalid fields" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeTxnPrepareRequest(alloc, .{ .txn_id = @splat(1), .req = .{
+        .writes = &.{.{ .key = "row", .value = "{\"j\":null,\"sql_null\":null}", .json_null_fields = &.{"j"} }},
+    } });
+    defer alloc.free(encoded);
+    var parsed = try parseTxnPrepareRequest(alloc, encoded);
+    defer freeTxnPrepareRequest(alloc, &parsed);
+    try std.testing.expectEqual(@as(usize, 1), parsed.req.writes[0].json_null_fields.len);
+    try std.testing.expectEqualStrings("j", parsed.req.writes[0].json_null_fields[0]);
+    for ([_][]const u8{
+        "{\"value\":{\"j\":null},\"key\":\"row\",\"json_null_fields\":[\"missing\"]}",
+        "{\"value\":{\"j\":1},\"key\":\"row\",\"json_null_fields\":[\"j\"]}",
+        "{\"value\":{\"j\":null},\"key\":\"row\",\"json_null_fields\":[\"j\",\"j\"]}",
+    }) |write| {
+        const body = try std.fmt.allocPrint(alloc, "{{\"txn_id\":\"01010101010101010101010101010101\",\"writes\":[{s}],\"deletes\":[],\"transforms\":[],\"predicates\":[]}}", .{write});
+        defer alloc.free(body);
+        try std.testing.expectError(error.InvalidTxnRequest, parseTxnPrepareRequest(alloc, body));
     }
 }
 
@@ -3127,6 +3163,8 @@ fn parseTxnWrites(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.typ
         for (out[0..initialized]) |write| {
             alloc.free(@constCast(write.key));
             alloc.free(@constCast(write.value));
+            for (write.json_null_fields) |field| alloc.free(field);
+            if (write.json_null_fields.len != 0) alloc.free(write.json_null_fields);
         }
         if (out.len > 0) alloc.free(out);
     }
@@ -3139,9 +3177,24 @@ fn parseTxnWrites(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.typ
         errdefer alloc.free(key);
         const raw_value = obj.get("value") orelse return error.InvalidTxnRequest;
         const encoded_value = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(raw_value, .{})});
+        errdefer alloc.free(encoded_value);
+        var fields: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer fields.deinit(alloc);
+        if (obj.get("json_null_fields")) |names| {
+            if (names != .array or names.array.items.len > 256 or raw_value != .object) return error.InvalidTxnRequest;
+            for (names.array.items) |name| {
+                if (name != .string or name.string.len == 0) return error.InvalidTxnRequest;
+                const cell = raw_value.object.get(name.string) orelse return error.InvalidTxnRequest;
+                if (cell != .null) return error.InvalidTxnRequest;
+                for (fields.items) |prior| if (std.mem.eql(u8, prior, name.string)) return error.InvalidTxnRequest;
+                try fields.append(alloc, name.string);
+            }
+        }
+        const owned_fields = try db_mod.types.cloneJsonNullFields(alloc, fields.items);
         out[i] = .{
             .key = key,
             .value = encoded_value,
+            .json_null_fields = owned_fields,
         };
         initialized += 1;
     }
@@ -3152,6 +3205,8 @@ fn freeTxnWrites(alloc: std.mem.Allocator, writes: []const db_mod.types.Transact
     for (writes) |write| {
         alloc.free(@constCast(write.key));
         alloc.free(@constCast(write.value));
+        for (write.json_null_fields) |field| alloc.free(field);
+        if (write.json_null_fields.len != 0) alloc.free(write.json_null_fields);
     }
     if (writes.len > 0) alloc.free(@constCast(writes));
 }
@@ -3304,10 +3359,12 @@ fn parseTxnPredicates(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod
             _ = std.fmt.hexToBytes(&digest, encoded.string) catch return error.InvalidTxnRequest;
             content_digest = digest;
         }
+        const unique_absence = if (obj.get("unique_absence")) |flag| if (flag == .bool and (expected_version == 0 or !flag.bool)) flag.bool else return error.InvalidTxnRequest else false;
         out[i] = .{
             .key = try alloc.dupe(u8, requireString(obj, "key")),
             .expected_version = expected_version,
             .expected_content_digest = content_digest,
+            .unique_absence = unique_absence,
         };
         initialized += 1;
     }
@@ -6899,4 +6956,30 @@ fn consumerTests() type {
 }
 comptime {
     if (@import("builtin").is_test) _ = consumer_tests;
+}
+
+test "distributed txn prepare JSON null and insert preconditions survive allocation failures" {
+    const Harness = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            const encoded = try encodeTxnPrepareRequest(alloc, .{ .txn_id = @splat(1), .req = .{ .writes = &.{.{ .key = "row", .value = "{\"j\":null}", .json_null_fields = &.{"j"} }}, .predicates = &.{.{ .key = "row", .expected_version = 0, .unique_absence = true }} } });
+            defer alloc.free(encoded);
+            var parsed = try parseTxnPrepareRequest(alloc, encoded);
+            defer freeTxnPrepareRequest(alloc, &parsed);
+            try std.testing.expectEqualStrings("j", parsed.req.writes[0].json_null_fields[0]);
+            try std.testing.expect(parsed.req.predicates[0].unique_absence);
+            const prefix = "[\"row-semantics-prepare-v1\",";
+            try std.testing.expect(std.mem.startsWith(u8, encoded, prefix));
+            // Released decoders accept only an object (or the known range
+            // marker); they reject this new envelope before parsing writes.
+            var legacy = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+            defer legacy.deinit();
+            try std.testing.expect(legacy.value == .array);
+            if (parseTxnPrepareRequest(alloc, encoded[prefix.len .. encoded.len - 1])) |value| {
+                var unexpected = value;
+                freeTxnPrepareRequest(alloc, &unexpected);
+                return error.TestExpectedError;
+            } else |err| if (err != error.InvalidTxnRequest) return err;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }

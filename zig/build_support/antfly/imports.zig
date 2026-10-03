@@ -210,6 +210,7 @@ pub const AntflyRootImports = struct {
         // The public/test facade exposes the whole implementation. Production
         // archives use the owner constructors below to keep caches independent.
         self.configureBase(mod, link_libc);
+        mod.addImport("antfly_inference_host", self.inference_host);
         self.configureServerContracts(mod);
         mod.addImport("antfly_lite_options", self.lite_options);
         inline for (import_table) |entry| mod.addImport(entry.name, @field(self, entry.field));
@@ -393,12 +394,14 @@ pub const AntflyRootImports = struct {
 
     /// This driver exercises storage and HTTP API implementations in one root.
     pub fn configureStorageBenchmark(self: @This(), b: *std.Build, mod: *std.Build.Module) void {
+        mod.addImport("antfly_inference_host", self.inference_host);
         self.configureStorageDependencies(b, mod, true);
         inline for (api_imports) |field| self.addImport(mod, field);
         mod.addImport("antfly_openapi_specs", self.embedded_openapi);
     }
 
-    /// Minimal runtime contracts used by both full and focused local DB roots.
+    /// Shared runtime contracts for standalone test and implementation roots.
+    /// These imports own no storage, consensus, or inference implementation.
     pub fn configureRuntimeContracts(self: @This(), mod: *std.Build.Module) void {
         mod.addImport("antfly_cancellation", self.cancellation);
         mod.addImport("antfly_cache_budget", self.cache_budget);
@@ -443,7 +446,6 @@ pub const AntflyRootImports = struct {
         mod.addImport("antfly_inference_request_types", self.inference_request_types);
         mod.addImport("antfly_inference_runtime_paths", self.inference_runtime_paths);
         mod.addImport("antfly_inference_query_embedding_cache", self.inference_query_embedding_cache);
-        mod.addImport("antfly_inference_host", self.inference_host);
         if (link_libc and !self.platform_link_libc) {
             platform_build.addFilesystemCapacitySource(
                 mod,

@@ -29,7 +29,7 @@ const Allocator = std.mem.Allocator;
 pub const Digest = [32]u8;
 
 pub const Policies = struct {
-    defaults: expressions.Set.DefaultsPolicy = .preserve_absence,
+    default_columns: []const []const u8 = &.{},
     dropped_columns: enum(u8) { reject, allow } = .reject,
 };
 
@@ -63,6 +63,7 @@ pub const Program = struct {
     /// versions need not differ: the two immutable registries never alias.
     source_ordinals: []?u32,
     policies: Policies,
+    default_mask: ?[]bool,
     source_schema_digest: Digest,
     target_schema_digest: Digest,
     identity: Digest,
@@ -86,6 +87,27 @@ pub const Program = struct {
         const from = source.tableSchema().relational_columns;
         const to = target.tableSchema().relational_columns;
         if (from.len > max_columns or to.len > max_columns) return error.RelationalRewriteBudgetExceeded;
+        // Resolve once, retaining names from our owned target view. Snapshot
+        // and tail rows use the same ordinal mask without string lookups.
+        if (policies.default_columns.len > to.len) return error.InvalidRestoreStagingCommand;
+        const mask = if (policies.default_columns.len != 0) try alloc.alloc(bool, to.len) else null;
+        errdefer if (mask) |value| alloc.free(value);
+        const names = try alloc.alloc([]const u8, policies.default_columns.len);
+        errdefer alloc.free(names);
+        if (mask) |value| {
+            @memset(value, false);
+            for (policies.default_columns, names) |name, *owned_name| {
+                const ordinal = target.physicalLayout().ordinalForName(to, name) orelse return error.InvalidRestoreStagingCommand;
+                if (value[ordinal]) return error.InvalidRestoreStagingCommand;
+                const set = target.validator().?.execution.expressions orelse return error.InvalidRestoreStagingCommand;
+                const has_default = for (set.bindings) |binding| {
+                    if (binding.ordinal == ordinal and !binding.generated) break true;
+                } else false;
+                if (!has_default) return error.InvalidRestoreStagingCommand;
+                value[ordinal] = true;
+                owned_name.* = to[ordinal].name;
+            }
+        }
         const mapping = try alloc.alloc(?u32, to.len);
         errdefer alloc.free(mapping);
         for (to, mapping) |column, *ordinal| {
@@ -104,19 +126,25 @@ pub const Program = struct {
         const source_digest = try schemaDigest(alloc, source_json, source);
         const target_digest = if (template) |existing| existing.target_schema_digest else try schemaDigest(alloc, target_json, target);
         var hash = std.crypto.hash.Blake3.init(.{});
-        hash.update("antfly.relational-row-transform.v1\x00");
+        hash.update("antfly.relational-row-transform.v2\x00");
         hash.update(&source_digest);
         hash.update(&target_digest);
-        hash.update(&.{ @intFromEnum(policies.defaults), @intFromEnum(policies.dropped_columns) });
+        hash.update(&.{ @intFromEnum(policies.dropped_columns), @intFromBool(mask != null) });
+        if (mask) |value| {
+            hash.update("scoped-defaults-v1");
+            for (value) |enabled| hash.update(&.{@intFromBool(enabled)});
+        }
         var identity: Digest = undefined;
         hash.final(&identity);
-        return .{ .alloc = alloc, .source = source, .target = target, .source_ordinals = mapping, .policies = policies, .source_schema_digest = source_digest, .target_schema_digest = target_digest, .identity = identity };
+        return .{ .alloc = alloc, .source = source, .target = target, .source_ordinals = mapping, .policies = .{ .default_columns = names, .dropped_columns = policies.dropped_columns }, .default_mask = mask, .source_schema_digest = source_digest, .target_schema_digest = target_digest, .identity = identity };
     }
 
     pub fn deinit(self: *Program) void {
         self.source.release();
         self.target.release();
         self.alloc.free(self.source_ordinals);
+        self.alloc.free(self.policies.default_columns);
+        if (self.default_mask) |mask| self.alloc.free(mask);
         self.* = undefined;
     }
 
@@ -172,7 +200,7 @@ pub const Program = struct {
             }
         }
         if (expression_set) |set| {
-            try set.applyValuesWithPolicy(arena, values, present, self.policies.defaults);
+            try set.applyValuesWithDefaultMask(arena, values, present, if (self.default_mask != null) .apply_to_absent else .preserve_absence, self.default_mask);
             for (set.bindings) |binding| {
                 if (!binding.generated and cells[binding.ordinal] != null) continue;
                 if (!present[binding.ordinal]) continue;

@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 71;
+pub const abi_version: u32 = 72;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -438,6 +438,8 @@ pub const MetadataApplyOpenRequest = extern struct {
     _reserved0: u16 = 0,
     context: ?*anyopaque = null,
     root_dir: BorrowedBytes = .{},
+    /// Existing process-owned durable system keyspace. Retained by the callee.
+    system_store: ?*anyopaque = null,
 };
 
 pub const MetadataApplyBatchRequest = extern struct {

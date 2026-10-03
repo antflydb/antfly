@@ -107,6 +107,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_sql_tests = shared.run_sql_tests;
     const run_pgwire_tests = shared.run_pgwire_tests;
     const openapi_root_check = shared.openapi_root_check;
+    const openapi_docs_test = shared.openapi_docs_test;
     const protobuf_mod = shared.protobuf_mod;
     const platform_mod = shared.platform_mod;
     const objectstore_mod = shared.objectstore_mod;
@@ -599,6 +600,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_lib_ha_compat_tests = owner_tests.run_lib_ha_compat_tests;
     const antfly_test_step = owner_tests.antfly_test_step;
     const unit_test_step = owner_tests.unit_test_step;
+    unit_test_step.dependOn(&b.addRunArtifact(openapi_docs_test).step);
     unit_test_step.dependOn(&run_sql_tests.step);
     unit_test_step.dependOn(&run_pgwire_tests.step);
     unit_test_step.dependOn(&pdf_integration.run.step);
@@ -784,7 +786,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     production_antfly_imports.storage_boundary.configureSources(graph_transfer_tests.root_module, false, false);
     const run_graph_transfer_tests = b.addRunArtifact(graph_transfer_tests);
     b.step("antfly-graph-transfer-test", "Validate certified graph artifact generation transfer").dependOn(&run_graph_transfer_tests.step);
-    owner_tests.unit_test_step.dependOn(&run_graph_transfer_tests.step);
+    // The storage lanes already own every named graph-transfer contract.
+    // Keep this focused target without compiling a duplicate aggregate image.
     const standalone_policy_ha_tests = owner_tests.standalone_policy_ha_tests;
     standalone_policy_ha_tests.root_module.addObject(consumer_test_metadata.object);
     inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|

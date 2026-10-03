@@ -87,12 +87,11 @@ test "relational integrity restore staging Raft controls retain HA append obliga
             defer stored_bootstrap.deinit();
             try std.testing.expectEqualStrings("docs", stored_bootstrap.value.table_name);
         }
-        target.local_execution.replication_async_batch_mirror = .{
-            .publisher = hot_standby_publisher_adapter.bind(&primary),
+        target.local_execution.replication_async_batch_mirror = hot_standby_publisher_adapter.bindMirror(&primary, .{
             .sync_policy = .{ .mode = if (synchronous) .remote_write else .async, .standby_names = &.{"standby"}, .failure_policy = .block },
             .sync_wait_ctx = &ack,
             .sync_wait_fn = Ack.wait,
-        };
+        });
         const begin: types.BatchRequest = .{ .restore_staging = .{ .begin = scope } };
         if (synchronous) {
             try std.testing.expectError(error.InjectedRestoreMirrorWaitFailure, @import("../server_db_adapter.zig").applyOrdered(&target, begin, .{ .term = 1, .index = 1 }));

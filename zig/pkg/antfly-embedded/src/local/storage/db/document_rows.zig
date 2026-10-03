@@ -27,6 +27,7 @@ pub const Session = struct {
     table: catalog.Table,
     projection: document.Projection,
     include_document: bool,
+    page_bytes: usize,
     include_primary_digest: bool,
     condition_projection: document.Projection,
     conditions: []const types.RelationalRowQuery.Condition,
@@ -57,6 +58,7 @@ pub const Session = struct {
         errdefer arena.deinit();
         const owned = arena.allocator();
         const input = opts.relational_query orelse try std.json.parseFromSliceLeaky(types.RelationalRowQuery, owned, opts.relational_query_json, .{ .allocate = .alloc_always, .parse_numbers = false, .ignore_unknown_fields = true });
+        if (input.page_bytes == 0 or input.page_bytes > 16 * 1024 * 1024) return error.InvalidRelationalRowsRequest;
         if (input.fields.len > 256 or input.conditions.len > 256 or input.index != null or input.after != null or input.lower != null or input.upper != null) return error.InvalidRelationalRowsRequest;
         const version = if (schema) |view| view.version() else 0;
         if (input.schema_version) |expected| if (expected != version) return error.PreparedGenerationChanged;
@@ -97,6 +99,7 @@ pub const Session = struct {
             .table = table,
             .projection = projection,
             .include_document = opts.sql_document_preimage,
+            .page_bytes = input.page_bytes,
             .include_primary_digest = opts.include_content_hashes or opts.sql_document_preimage,
             .condition_projection = condition_projection,
             .conditions = conditions,
@@ -213,7 +216,7 @@ pub const Session = struct {
             fn admit(raw: ?*anyopaque, candidate: []const u8) !store_mod.DocStore.ScanAction {
                 const ctx: *@This() = @ptrCast(@alignCast(raw.?));
                 try ctx.session.checkpoint();
-                if (ctx.visited != 0 and (ctx.rows.items.len >= ctx.limit or ctx.visited >= 1024 or ctx.bytes >= 16 * 1024 * 1024 or time.monotonicNs() -| ctx.begin >= 5 * std.time.ns_per_ms)) {
+                if (ctx.visited != 0 and (ctx.rows.items.len >= ctx.limit or ctx.visited >= 1024 or ctx.bytes >= ctx.session.page_bytes or time.monotonicNs() -| ctx.begin >= 5 * std.time.ns_per_ms)) {
                     ctx.more = true;
                     return .stop;
                 }

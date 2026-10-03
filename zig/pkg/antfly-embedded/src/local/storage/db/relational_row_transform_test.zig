@@ -73,7 +73,7 @@ fn sourceRow(program: *const transform.Program, allocator: std.mem.Allocator, js
 test "relational index system rewrite transforms independent same-version schemas and preserves historical absence NULL timestamps" {
     var preserve = try transform.Program.init(alloc, source_schema, target_schema, .{});
     defer preserve.deinit();
-    var apply = try transform.Program.init(alloc, source_schema, target_schema, .{ .defaults = .apply_to_absent });
+    var apply = try transform.Program.init(alloc, source_schema, target_schema, .{ .default_columns = &.{"n"} });
     defer apply.deinit();
     try std.testing.expect(!std.mem.eql(u8, &preserve.identity, &apply.identity));
     try std.testing.expect(!std.mem.eql(u8, &preserve.source_schema_digest, &preserve.target_schema_digest));
@@ -181,7 +181,7 @@ test "relational index system rewrite target overflow CHECK and required failure
     var missing = try transform.Program.init(alloc, source_schema, required, .{ .dropped_columns = .allow });
     defer missing.deinit();
     try std.testing.expectError(error.InvalidRelationalRow, missing.transform(alloc, source.packed_row));
-    var filled = try transform.Program.init(alloc, source_schema, required, .{ .dropped_columns = .allow, .defaults = .apply_to_absent });
+    var filled = try transform.Program.init(alloc, source_schema, required, .{ .dropped_columns = .allow, .default_columns = &.{"n"} });
     defer filled.deinit();
     var result = try filled.transform(alloc, source.packed_row);
     defer result.deinit(alloc);
@@ -244,4 +244,64 @@ test "relational index system rewrite retains full-root source and target valida
 
 test "relational index system rewrite allocation failures release both immutable epochs and all row buffers" {
     try std.testing.checkAllAllocationFailures(alloc, exerciseAllocations, .{});
+}
+
+// Rows from BOTH layouts predate the added column. The oldest also predates
+// an unrelated column whose subsequently changed DEFAULT must not backfill.
+test "SQL scoped defaults preserve older absent columns across historical layouts" {
+    const Harness = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const oldest = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}";
+            const latest = "{\"version\":3,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"column_defaults\":[{\"column\":\"old_col\",\"expression\":{\"op\":\"literal\",\"type\":\"integer\",\"value\":7}},{\"column\":\"new_col\",\"expression\":{\"op\":\"literal\",\"type\":\"integer\",\"value\":9}}],\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"integer\"},\"old_col\":{\"type\":[\"integer\",\"null\"]},\"new_col\":{\"type\":[\"integer\",\"null\"]}},\"additionalProperties\":false}}}}";
+            const newer = "{\"version\":2,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"column_defaults\":[{\"column\":\"old_col\",\"expression\":{\"op\":\"literal\",\"type\":\"integer\",\"value\":7}}],\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"integer\"},\"old_col\":{\"type\":[\"integer\",\"null\"]}},\"additionalProperties\":false}}}}";
+            var template = try transform.Program.init(allocator, oldest, latest, .{ .default_columns = &.{"new_col"} });
+            var template_open = true;
+            defer if (template_open) template.deinit();
+            var program = try transform.Program.initWithTarget(allocator, oldest, &template);
+            defer program.deinit();
+            template.deinit();
+            template_open = false;
+            var source = try sourceRow(&program, allocator, "{\"x\":1}");
+            defer source.deinit(allocator);
+            var result = try program.transform(allocator, source.packed_row);
+            defer result.deinit(allocator);
+            const row = try codec.ordinalRowView(result.packed_row, program.target.tableSchema().*, program.target.physicalLayout());
+            try std.testing.expect(try row.findCell(row.ordinalForName("old_col").?) == null);
+            try std.testing.expectEqual(@as(i64, 9), (try row.findCell(row.ordinalForName("new_col").?)).?.value.i64_val);
+            var unscoped = try transform.Program.init(allocator, oldest, latest, .{});
+            defer unscoped.deinit();
+            try std.testing.expect(!std.mem.eql(u8, &program.identity, &unscoped.identity));
+            var programs = try @import("relational_rewrite_program.zig").ProgramSet.init(allocator, &.{ oldest, newer }, latest, .{ .default_columns = &.{"new_col"} });
+            defer programs.deinit();
+            const intent: @import("relational_rewrite_contract.zig").Intent = .{ .source_schemas = &.{ oldest, newer }, .target_schema = latest, .default_columns = &.{"new_col"}, .program_digest = programs.identity };
+            const bytes = try std.json.Stringify.valueAlloc(allocator, intent, .{});
+            defer allocator.free(bytes);
+            var recovered = try std.json.parseFromSlice(@import("relational_rewrite_contract.zig").Intent, allocator, bytes, .{ .allocate = .alloc_always });
+            defer recovered.deinit();
+            try recovered.value.validate();
+            var restored = try transform.Program.init(allocator, oldest, latest, .{ .default_columns = recovered.value.default_columns });
+            defer restored.deinit();
+            try std.testing.expectEqualSlices(u8, &program.identity, &restored.identity);
+            var restored_set = try @import("relational_rewrite_program.zig").ProgramSet.initIntent(allocator, recovered.value);
+            defer restored_set.deinit();
+            try std.testing.expectEqualSlices(u8, &programs.identity, &restored_set.identity);
+            const recent_program = &restored_set.programs[1];
+            for ([_][]const u8{ "{\"x\":2}", "{\"x\":2,\"old_col\":null}" }) |document| {
+                var recent = try sourceRow(recent_program, allocator, document);
+                defer recent.deinit(allocator);
+                var rewritten = try recent_program.transform(allocator, recent.packed_row);
+                defer rewritten.deinit(allocator);
+                const recent_row = try codec.ordinalRowView(rewritten.packed_row, recent_program.target.tableSchema().*, recent_program.target.physicalLayout());
+                if (try recent_row.findCell(recent_row.ordinalForName("old_col").?)) |cell| try std.testing.expect(cell.is_null);
+                try std.testing.expectEqual(@as(i64, 9), (try recent_row.findCell(recent_row.ordinalForName("new_col").?)).?.value.i64_val);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Harness.run, .{});
+}
+
+test "SQL scoped defaults reject unknown duplicate and nondefault columns" {
+    try std.testing.expectError(error.InvalidRestoreStagingCommand, transform.Program.init(alloc, source_schema, target_schema, .{ .default_columns = &.{"missing"} }));
+    try std.testing.expectError(error.InvalidRestoreStagingCommand, transform.Program.init(alloc, source_schema, target_schema, .{ .default_columns = &.{ "n", "n" } }));
+    try std.testing.expectError(error.InvalidRestoreStagingCommand, transform.Program.init(alloc, source_schema, target_schema, .{ .default_columns = &.{"x"} }));
 }

@@ -373,16 +373,16 @@ pub fn bindPrimary(primary: *const primary_mod.Primary) storage_contract.Borrowe
 }
 
 pub fn bindStandby(standby: *standby_mod.Standby) storage_contract.BorrowedWriteGate {
-    return .{ .ptr = standby, .check_fn = checkStandby };
+    return .{ .ptr = standby, .check_fn = checkStandby, .allows_background_work = false };
 }
 
-pub fn bindFencedPrimary(gate: FencedPrimary) storage_contract.FencedWriteGate {
-    return .{ .primary = gate.primary, .fence_store = gate.fence_store, .node_id = gate.node_id, .check_fn = checkFenced };
+pub fn bindFencedPrimary(gate: FencedPrimary) storage_contract.CapturedWriteGate {
+    return .{ .capture = storage_contract.BorrowedCapture.init(FencedPrimary, gate), .check_fn = checkFenced, .equal_fn = equalFenced };
 }
 
-pub fn runtimeFencedPrimary(gate: storage_contract.FencedWriteGate) !FencedPrimary {
+pub fn runtimeFencedPrimary(gate: storage_contract.CapturedWriteGate) !FencedPrimary {
     if (gate.check_fn != checkFenced) return error.UnsupportedReplicationWriteGate;
-    return .{ .primary = @ptrCast(@alignCast(gate.primary)), .fence_store = @ptrCast(@alignCast(gate.fence_store)), .node_id = gate.node_id };
+    return gate.capture.read(FencedPrimary);
 }
 
 fn checkPrimary(ptr: *const anyopaque) !void {
@@ -395,7 +395,13 @@ fn checkStandby(ptr: *const anyopaque) !void {
     try requireWrite(try evaluateStandby(standby, .{}));
 }
 
-fn checkFenced(gate: storage_contract.FencedWriteGate) !void {
+fn equalFenced(left: storage_contract.CapturedWriteGate, right: storage_contract.CapturedWriteGate) bool {
+    const a = runtimeFencedPrimary(left) catch return false;
+    const b = runtimeFencedPrimary(right) catch return false;
+    return a.primary == b.primary and a.fence_store == b.fence_store and std.mem.eql(u8, a.node_id, b.node_id);
+}
+
+fn checkFenced(gate: storage_contract.CapturedWriteGate) !void {
     try requireWrite(try evaluateFencedPrimary(try runtimeFencedPrimary(gate), .{}));
 }
 

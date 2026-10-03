@@ -27,7 +27,7 @@ const requiresDurableLifecycleReplication = @import("antfly_local_sources").stor
 pub fn applyOrdered(
     owner: anytype,
     req: types.BatchRequest,
-    identity: types.RaftAppliedEntryIdentity,
+    identity: types.OrderedApplyReceipt,
 ) anyerror!void {
     const db = physicalOwner(owner);
     const mirror_scoped_restore = requiresDurableLifecycleReplication(req) and db.local_execution.replication_async_batch_mirror != null;
@@ -96,7 +96,7 @@ pub fn applyStorageKernelReplicatedBatchAtRaftEntry(
     table_name: []const u8,
     group_id: u64,
     req: types.BatchRequest,
-    raft_entry: types.RaftAppliedEntryIdentity,
+    raft_entry: types.OrderedApplyReceipt,
 ) !void {
     // The leader admitted this immutable command under the descriptor pinned
     // in its Raft entry. A follower may already have a newer durable schema

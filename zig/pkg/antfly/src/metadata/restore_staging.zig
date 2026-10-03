@@ -1596,9 +1596,9 @@ test "relational integrity restore staging rewrite intent binds original schema 
     const original_digest = try plan.digest(alloc);
     const scope = try ownerScope(alloc, plan, original_digest, targets[0], targets[0].ranges[0]);
     try std.testing.expectEqualSlices(u8, &source.pin(), &scope.rewrite.?.retained_pin);
-    targets[0].rewrite.?.apply_defaults_to_absent = true;
+    targets[0].rewrite.?.default_columns = &.{"x"};
     try std.testing.expect(!std.mem.eql(u8, &original_digest, &try plan.digest(alloc)));
-    targets[0].rewrite.?.apply_defaults_to_absent = false;
+    targets[0].rewrite.?.default_columns = &.{};
     targets[0].rewrite.?.source_schemas = &.{new_schema};
     try std.testing.expectError(error.InvalidRestoreStaging, plan.validate(alloc));
     targets[0].rewrite.?.source_schemas = &.{old_schema};

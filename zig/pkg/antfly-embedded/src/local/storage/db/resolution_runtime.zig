@@ -631,6 +631,13 @@ pub fn recordReviewDecision(
     try store.put(override_key, bytes);
 }
 
+pub const ReviewDecision = struct {
+    local_id: []const u8,
+    decision: resolver_lib.Decision,
+    table: []const u8,
+    key: []const u8,
+};
+
 pub fn buildReviewDecisionBytesAlloc(
     gpa: std.mem.Allocator,
     existing_raw: ?[]const u8,
@@ -639,43 +646,48 @@ pub fn buildReviewDecisionBytesAlloc(
     table: []const u8,
     key: []const u8,
 ) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(gpa);
-    try out.append(gpa, '{');
-    var first = true;
+    return buildReviewDecisionsBytesAlloc(gpa, existing_raw, &.{.{ .local_id = local_id, .decision = decision, .table = table, .key = key }});
+}
 
-    // Copy existing entries, replacing any for this local_id.
+/// Apply a curation batch in linear expected time. Preserve unrelated entries
+/// while parsing and serializing the override object once, regardless of the
+/// number of mentions redirected by a merge.
+pub fn buildReviewDecisionsBytesAlloc(gpa: std.mem.Allocator, existing_raw: ?[]const u8, decisions: []const ReviewDecision) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var object: std.json.ObjectMap = .empty;
     if (existing_raw) |raw| {
-        if (std.json.parseFromSlice(std.json.Value, gpa, raw, .{})) |parsed| {
-            var p = parsed;
-            defer p.deinit();
-            if (p.value == .object) {
-                var it = p.value.object.iterator();
-                while (it.next()) |e| {
-                    if (std.mem.eql(u8, e.key_ptr.*, local_id)) continue;
-                    const v_str = try std.json.Stringify.valueAlloc(gpa, e.value_ptr.*, .{});
-                    defer gpa.free(v_str);
-                    const kv = try std.fmt.allocPrint(gpa, "{f}:{s}", .{ std.json.fmt(e.key_ptr.*, .{}), v_str });
-                    defer gpa.free(kv);
-                    if (!first) try out.append(gpa, ',');
-                    first = false;
-                    try out.appendSlice(gpa, kv);
-                }
-            }
-        } else |_| {}
+        if (std.json.parseFromSlice(std.json.Value, scratch, raw, .{})) |parsed| {
+            if (parsed.value == .object) object = parsed.value.object;
+        } else |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {},
+        }
     }
+    for (decisions) |update| {
+        var value: std.json.ObjectMap = .empty;
+        try value.put(scratch, "decision", .{ .string = @tagName(update.decision) });
+        try value.put(scratch, "table", .{ .string = update.table });
+        try value.put(scratch, "key", .{ .string = update.key });
+        try object.put(scratch, update.local_id, .{ .object = value });
+    }
+    return std.json.Stringify.valueAlloc(gpa, std.json.Value{ .object = object }, .{});
+}
 
-    if (!first) try out.append(gpa, ',');
-    const entry = try std.fmt.allocPrint(gpa, "{f}:{{\"decision\":\"{s}\",\"table\":{f},\"key\":{f}}}", .{
-        std.json.fmt(local_id, .{}),
-        @tagName(decision),
-        std.json.fmt(table, .{}),
-        std.json.fmt(key, .{}),
+test "batched review decisions preserve unrelated overrides and escaped identities" {
+    const alloc = testing.allocator;
+    const raw = try buildReviewDecisionsBytesAlloc(alloc, "{\"keep\":{\"decision\":\"reject\"},\"replace\":{\"decision\":\"reject\"}}", &.{
+        .{ .local_id = "replace", .decision = .match, .table = "entities", .key = "survivor" },
+        .{ .local_id = "quoted\"id", .decision = .match, .table = "entities", .key = "survivor" },
     });
-    defer gpa.free(entry);
-    try out.appendSlice(gpa, entry);
-    try out.append(gpa, '}');
-    return try out.toOwnedSlice(gpa);
+    defer alloc.free(raw);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 3), parsed.value.object.count());
+    try testing.expectEqualStrings("reject", parsed.value.object.get("keep").?.object.get("decision").?.string);
+    try testing.expectEqualStrings("survivor", parsed.value.object.get("replace").?.object.get("key").?.string);
+    try testing.expectEqualStrings("survivor", parsed.value.object.get("quoted\"id").?.object.get("key").?.string);
 }
 
 /// Adapts the storage `DenseEmbedder` to the resolver's `MentionEmbedder` seam,

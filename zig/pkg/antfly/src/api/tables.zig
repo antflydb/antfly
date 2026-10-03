@@ -151,6 +151,8 @@ fn normalizeRawCreateTableIndexesAlloc(
     comptime preserve_canonical_default: bool,
 ) ![]u8 {
     if (value != .object) return error.InvalidCreateTableRequest;
+    // Trusted, normalized catalogs may explicitly omit search indexes.
+    if (preserve_canonical_default and value.object.count() == 0) return alloc.dupe(u8, "{}");
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);

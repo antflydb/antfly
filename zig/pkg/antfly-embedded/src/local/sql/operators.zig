@@ -79,6 +79,7 @@ pub const TopK = struct {
     comparisons: usize = 0,
     copied_rows: usize = 0,
     finished: bool = false,
+    released: usize = 0,
     // Replacement exchanges a candidate with the displaced root. Retaining
     // that root's arena avoids one allocator round-trip per competitive row.
     scratch: ?std.heap.ArenaAllocator = null,
@@ -93,7 +94,7 @@ pub const TopK = struct {
     }
 
     pub fn deinit(self: *TopK) void {
-        for (self.entries[0..self.count]) |*entry| entry.deinit();
+        for (self.entries[self.released..self.count]) |*entry| entry.deinit();
         if (self.scratch) |*scratch| scratch.deinit();
         self.alloc.free(self.entries);
         self.alloc.free(self.orders);
@@ -180,9 +181,19 @@ pub const TopK = struct {
         }
     }
 
+    /// Once sorted, result encoding consumes each row and promptly releases
+    /// its source arena. Peak memory need not retain two complete result sets.
+    pub fn releaseFinishedRow(self: *TopK, index: usize) void {
+        std.debug.assert(self.finished and index == self.released and index < self.count);
+        self.retained_bytes -= self.entries[index].allocatedBytes();
+        self.entries[index].deinit();
+        self.released += 1;
+    }
+
     /// Returns rows in requested order, with original ordinal as a stable tie
     /// breaker. Returned cell data remains owned by this operator until deinit.
     pub fn finish(self: *TopK, alloc: Allocator) ![]const Row {
+        if (self.released != 0) return error.InvalidSqlBackendResponse;
         if (!self.finished) {
             var end = self.count;
             while (end > 1) {
@@ -353,8 +364,27 @@ pub const GroupResult = struct { keys: []const Datum, aggregates: []const Datum,
 /// from one native page; only the build relation occupies retained memory.
 pub const HashJoin = struct {
     pub const Limits = struct { rows: usize = 100000, bytes: usize = 8 * 1024 * 1024 };
-    const Entry = struct { row: OwnedRow, next: ?usize, matched: bool = false };
-    pub const Match = struct { index: usize, values: []const Datum };
+    const PackedRow = struct {
+        width: usize,
+        values: []const Datum,
+        ordinals: []const u32,
+        keys: []const Datum,
+    };
+    const Entry = struct { row: PackedRow, next: ?usize, matched: bool = false };
+    pub const Match = struct {
+        index: usize,
+        row: PackedRow,
+
+        /// Expand positional NULL slots only for the current candidate. Cell
+        /// payloads continue to borrow the immutable packed build relation.
+        pub fn materializeValues(self: Match, alloc: Allocator) ![]const Datum {
+            if (self.row.values.len == self.row.width) return alloc.dupe(Datum, self.row.values);
+            const result = try alloc.alloc(Datum, self.row.width);
+            @memset(result, .{});
+            for (self.row.ordinals, self.row.values) |ordinal, value| result[ordinal] = value;
+            return result;
+        }
+    };
     pub const Probe = struct {
         owner: *HashJoin,
         keys: []const Datum,
@@ -366,11 +396,11 @@ pub const HashJoin = struct {
                 self.cursor = entry.next;
                 self.owner.probes += 1;
                 var equal = true;
-                for (entry.row.row.keys, self.keys) |left, right| if ((try scalar.compare(left.value, right.value)) != .eq) {
+                for (entry.row.keys, self.keys) |left, right| if ((try scalar.compare(left.value, right.value)) != .eq) {
                     equal = false;
                     break;
                 };
-                if (equal) return .{ .index = index, .values = entry.row.row.values };
+                if (equal) return .{ .index = index, .row = entry.row };
             }
             return null;
         }
@@ -379,6 +409,9 @@ pub const HashJoin = struct {
     backing: Allocator,
     budget: MemoryBudget,
     limits: Limits,
+    // Build rows share an append-only arena: per-row arenas amplify small
+    // projections and waste quota on thousands of tiny allocation headers.
+    rows: std.heap.ArenaAllocator,
     entries: std.ArrayList(Entry) = .empty,
     heads: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     key_count: ?usize = null,
@@ -388,12 +421,13 @@ pub const HashJoin = struct {
     pub fn create(alloc: Allocator, limits: Limits) !*HashJoin {
         if (limits.bytes < @sizeOf(HashJoin)) return error.SqlProgramLimitExceeded;
         const self = try alloc.create(HashJoin);
-        self.* = .{ .backing = alloc, .budget = .{ .backing = alloc, .limit = limits.bytes - @sizeOf(HashJoin) }, .limits = limits };
+        self.* = .{ .backing = alloc, .budget = .{ .backing = alloc, .limit = limits.bytes - @sizeOf(HashJoin) }, .limits = limits, .rows = undefined };
+        self.rows = std.heap.ArenaAllocator.init(self.budget.allocator());
         return self;
     }
     pub fn deinit(self: *HashJoin) void {
         const alloc = self.budget.allocator();
-        for (self.entries.items) |*entry| entry.row.deinit();
+        self.rows.deinit();
         self.entries.deinit(alloc);
         self.heads.deinit(alloc);
         std.debug.assert(self.budget.live == 0);
@@ -421,8 +455,22 @@ pub const HashJoin = struct {
         try self.entries.ensureUnusedCapacity(alloc, 1);
         if (key_hash != null) try self.heads.ensureUnusedCapacity(alloc, 1);
         const index = self.entries.items.len;
-        const owned = try OwnedRow.init(alloc, .{ .values = values, .keys = keys, .ordinal = index });
-        self.entries.appendAssumeCapacity(.{ .row = owned, .next = if (key_hash) |hashed| self.heads.get(hashed) else null });
+        const owned = self.rows.allocator();
+        var present: usize = 0;
+        for (values) |value| present += @intFromBool(!value.sql_null);
+        const sparse = present != values.len;
+        const present_values = try owned.alloc(Datum, present);
+        const ordinals: []u32 = if (sparse) try owned.alloc(u32, present) else &.{};
+        var position: usize = 0;
+        for (values, 0..) |value, ordinal| if (!value.sql_null) {
+            present_values[position] = try cloneDatum(owned, value);
+            if (sparse) ordinals[position] = std.math.cast(u32, ordinal) orelse return error.SqlProgramLimitExceeded;
+            position += 1;
+        };
+        const key_values = try owned.alloc(Datum, keys.len);
+        for (keys, key_values) |key, *value| value.* = try cloneDatum(owned, key);
+        const row: PackedRow = .{ .width = values.len, .values = present_values, .ordinals = ordinals, .keys = key_values };
+        self.entries.appendAssumeCapacity(.{ .row = row, .next = if (key_hash) |hashed| self.heads.get(hashed) else null });
         if (key_hash) |hashed| self.heads.putAssumeCapacity(hashed, index);
     }
     pub fn probe(self: *HashJoin, keys: []const Datum) !Probe {
@@ -439,7 +487,7 @@ pub const HashJoin = struct {
             const index = next.*;
             next.* += 1;
             const entry = self.entries.items[index];
-            if (!entry.matched) return .{ .index = index, .values = entry.row.row.values };
+            if (!entry.matched) return .{ .index = index, .row = entry.row };
         }
         return null;
     }
@@ -612,7 +660,7 @@ fn cloneJson(alloc: Allocator, value: Json, depth: usize) error{ OutOfMemory, Sq
         else => value,
     };
 }
-fn datumBytes(value: Datum) !usize {
+pub fn datumBytes(value: Datum) !usize {
     return jsonBytes(value.value, 0);
 }
 fn jsonBytes(value: Json, depth: usize) error{SqlProgramLimitExceeded}!usize {
@@ -653,6 +701,23 @@ test "SQL top K retains bounded competitive rows with stable null ordering" {
     try std.testing.expectEqual(@as(u64, 3), descending[0].ordinal);
     try std.testing.expectEqual(@as(u64, 1), descending[1].ordinal);
     try std.testing.expectEqual(@as(u64, 2), descending[2].ordinal);
+}
+
+test "SQL top K encoding releases retained rows incrementally" {
+    const alloc = std.testing.allocator;
+    var top = try TopK.init(alloc, 2, &.{.{}}, 128 * 1024);
+    defer top.deinit();
+    const text = [_]u8{'x'} ** 16384;
+    for (0..2) |i| try top.add(.{ .values = &.{Datum.json(.{ .string = &text })}, .keys = &.{Datum.json(.{ .integer = @intCast(i) })}, .ordinal = i });
+    const result = try top.finish(alloc);
+    defer alloc.free(result);
+    const before = top.retained_bytes;
+    top.releaseFinishedRow(0);
+    try std.testing.expect(top.retained_bytes < before);
+    try std.testing.expectEqualStrings(&text, result[1].values[0].value.string);
+    try std.testing.expectError(error.InvalidSqlBackendResponse, top.finish(alloc));
+    top.releaseFinishedRow(1);
+    try std.testing.expect(top.retained_bytes < 1024);
 }
 
 test "SQL aggregates preserve empty null exact integer and large average semantics" {
@@ -811,6 +876,53 @@ test "SQL hash join streams duplicate matches and preserves unmatched SQL NULL r
     var null_probe = try join.probe(&.{.{}});
     try std.testing.expect((try null_probe.next()) == null);
     var cursor: usize = 0;
-    try std.testing.expectEqualStrings("null", join.unmatched(&cursor).?.values[0].value.string);
+    const remaining = try join.unmatched(&cursor).?.materializeValues(std.testing.allocator);
+    defer std.testing.allocator.free(remaining);
+    try std.testing.expectEqualStrings("null", remaining[0].value.string);
     try std.testing.expect(join.unmatched(&cursor) == null);
+}
+
+test "SQL hash join packs sparse five thousand row build under the default quota" {
+    const join = try HashJoin.create(std.testing.allocator, .{});
+    defer join.deinit();
+    var values = [_]Datum{Datum{}} ** 12;
+    for (0..5000) |i| {
+        values[0] = Datum.json(.{ .integer = @intCast(i) });
+        try join.add(&values, values[0..1]);
+    }
+    var probe = try join.probe(&.{Datum.json(.{ .integer = 4999 })});
+    const match = (try probe.next()).?;
+    const expanded = try match.materializeValues(std.testing.allocator);
+    defer std.testing.allocator.free(expanded);
+    try std.testing.expectEqual(@as(usize, 12), expanded.len);
+    try std.testing.expectEqual(@as(i64, 4999), expanded[0].value.integer);
+    try std.testing.expect(expanded[11].sql_null);
+    try std.testing.expect(join.budget.peak < 2 * 1024 * 1024);
+    try std.testing.expect((try probe.next()) == null);
+}
+
+test "SQL packed hash join preserves SQL NULL and JSON null through allocation failures" {
+    const Harness = struct {
+        fn run(alloc: Allocator) !void {
+            const join = try HashJoin.create(alloc, .{});
+            defer join.deinit();
+            try join.add(&.{ .{}, Datum.json(.null), Datum.json(.{ .string = "owned" }), .{} }, &.{Datum.json(.{ .integer = 1 })});
+            try join.add(&.{ .{}, .{}, .{} }, &.{.{}});
+            var probe = try join.probe(&.{Datum.json(.{ .integer = 1 })});
+            const match = (try probe.next()).?;
+            const values = try match.materializeValues(alloc);
+            defer alloc.free(values);
+            try std.testing.expect(values[0].sql_null and values[3].sql_null);
+            try std.testing.expect(!values[1].sql_null and values[1].value == .null);
+            try std.testing.expectEqualStrings("owned", values[2].value.string);
+            join.markMatched(match.index);
+            var cursor: usize = 0;
+            const unmatched = try join.unmatched(&cursor).?.materializeValues(alloc);
+            defer alloc.free(unmatched);
+            try std.testing.expectEqual(@as(usize, 3), unmatched.len);
+            for (unmatched) |value| try std.testing.expect(value.sql_null);
+            try std.testing.expect(join.unmatched(&cursor) == null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }

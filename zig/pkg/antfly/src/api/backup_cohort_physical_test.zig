@@ -47,18 +47,18 @@ test "relational backup cohort pin cancellation survives absent live catalog and
 }
 
 test "relational backup cohort HA controls retain freeze and release across replay" {
-    try testTopologyHAControls(false, false);
+    try testTopologyHotStandbyControls(false, false);
 }
 
 test "relational backup cohort and topology Raft controls retain freeze and abort across HA replay" {
-    try testTopologyHAControls(true, false);
+    try testTopologyHotStandbyControls(true, false);
 }
 
 test "relational backup cohort topology HA split cutover preserves binary range and coverage" {
-    try testTopologyHAControls(true, true);
+    try testTopologyHotStandbyControls(true, true);
 }
 
-fn testTopologyHAControls(comptime replicated: bool, comptime split: bool) !void {
+fn testTopologyHotStandbyControls(comptime replicated: bool, comptime split: bool) !void {
     const replication_ingress = @import("antfly_local_sources").storage_db_replication_ingress;
     const std = @import("std");
     const db = @import("antfly_local_sources").storage_db_mod;
@@ -76,7 +76,7 @@ fn testTopologyHAControls(comptime replicated: bool, comptime split: bool) !void
     var runtime = try db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer runtime.deinit();
     const namespace: @import("antfly_local_sources").storage_db_doc_identity.Namespace = .{ .table_id = 2, .shard_id = 3, .range_id = 4 };
-    var source = try db.DB.open(alloc, try std.fmt.allocPrint(a, "{s}/source", .{root}), .{ .backend_runtime = runtime.ptr(), .identity_namespace = namespace, .replication_async_batch_mirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary) }, .replication_write_gate = .{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .start_optional_runtimes = false, .start_index_workers = false });
+    var source = try db.DB.open(alloc, try std.fmt.allocPrint(a, "{s}/source", .{root}), .{ .backend_runtime = runtime.ptr(), .identity_namespace = namespace, .replication_async_batch_mirror = hot_standby_publisher_adapter.bindMirror(&primary, .{}), .replication_write_gate = .{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .start_optional_runtimes = false, .start_index_workers = false });
     defer source.close();
     var target = try db.DB.open(alloc, try std.fmt.allocPrint(a, "{s}/target", .{root}), .{ .backend_runtime = runtime.ptr(), .identity_namespace = namespace, .start_optional_runtimes = false, .start_index_workers = false });
     defer target.close();

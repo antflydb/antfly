@@ -83,7 +83,7 @@ pub const Owners = struct {
         self.io.sleep(.fromNanoseconds(@intCast(ns)), .awake) catch unreachable;
     }
 
-    pub fn primaryConfig(self: *Owners) runtime.DataServerHAConfig {
+    pub fn primaryConfig(self: *Owners) runtime.DataServerHotStandbyConfig {
         const primary = &self.primary.?;
         return .{
             .admin_context = .{ .primary = primary, .primary_node_id = "primary", .fence_store = &self.fences.? },
@@ -119,7 +119,7 @@ pub const Owners = struct {
             .replica_root_dir = self.primary_root,
             .backend_runtime = backend,
             .api_server_cfg = .{ .admin_bearer_token = token },
-            .ha = self.primaryConfig(),
+            .hot_standby = self.primaryConfig(),
         }, self.catalogSource(), self.statusSource());
         try self.primary_server.?.startPublicHttp();
         self.primary_uri = try self.primary_server.?.baseUri(self.alloc);
@@ -148,7 +148,7 @@ pub const Owners = struct {
             .replica_root_dir = self.replica_root,
             .api_server_cfg = .{},
             .backend_runtime = backend,
-            .ha = .{
+            .hot_standby = .{
                 .admin_context = .{ .standby = &self.standby.?, .standby_node_id = "standby", .fence_store = &self.fences.? },
                 .standby_owner = &self.standby,
                 .admin_bearer_token = token,
@@ -160,7 +160,7 @@ pub const Owners = struct {
     }
 
     pub fn catchUp(self: *Owners, executor: http.RequestExecutor, upstream: []const u8) !void {
-        _ = try self.server.?.replicateHAStandbyUntilCaughtUp(executor, upstream, "standby", .{ .max_records = 8 });
+        _ = try self.server.?.replicateHotStandbyStandbyUntilCaughtUp(executor, upstream, "standby", .{ .max_records = 8 });
         if (self.primary.?.lastLsn() == 0) return error.ProductionStandbyEmptyReplicationStream;
         const progress = self.standby.?.currentProgress();
         self.observed_progress = progress;
@@ -217,9 +217,9 @@ pub const Owners = struct {
         self.fences = null;
         self.fences = try hot_standby.fencing.Store.open(self.alloc, fence_path, .{ .wal_options = self.options });
         try self.standbyAdmin(executor, 200);
-        if (self.standby != null or self.server.?.ha_promoted_primary == null)
+        if (self.standby != null or self.server.?.hot_standby_promoted_primary == null)
             return error.ProductionStandbyPromotionNotAdopted;
-        const promoted = &self.server.?.ha_promoted_primary.?;
+        const promoted = &self.server.?.hot_standby_promoted_primary.?;
         self.promoted_lsn = promoted.lastLsn();
         self.promoted_sound = promoted.identity.timeline_id == 2 and
             promoted.identity.epoch == 2 and promoted.lastLsn() > self.boundary;

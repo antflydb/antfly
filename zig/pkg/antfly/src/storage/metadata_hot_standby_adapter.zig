@@ -64,12 +64,12 @@ pub const Adapter = struct {
             lsn = prior orelse try (try hot_standby_publisher_adapter.runtimePrimary(mirror)).append(.{ .kind = .metadata_mutation, .payload_codec = .binary, .shard_id = 0, .table_id = 0, .payload = frame });
             search_from = lsn +| 1;
         }
-        if (mirror.last_lsn) |last| last.store(lsn, .release);
+        if (hot_standby_publisher_adapter.options(mirror).last_lsn) |last| last.store(lsn, .release);
         unlock(ptr);
         locked = false;
-        if (mirror.sync_policy.mode != .async) {
-            if (mirror.sync_wait_fn) |wait| try wait(mirror.sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.publisher.ptr, lsn, mirror.sync_policy);
-            const decision = try @import("hot_standby/commit_gate.zig").evaluate(try hot_standby_publisher_adapter.runtimePrimary(mirror), lsn, mirror.sync_policy);
+        if (hot_standby_publisher_adapter.options(mirror).sync_policy.mode != .async) {
+            if (hot_standby_publisher_adapter.options(mirror).sync_wait_fn) |wait| try wait(hot_standby_publisher_adapter.options(mirror).sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.publisher.ptr, lsn, hot_standby_publisher_adapter.options(mirror).sync_policy);
+            const decision = try @import("hot_standby/commit_gate.zig").evaluate(try hot_standby_publisher_adapter.runtimePrimary(mirror), lsn, hot_standby_publisher_adapter.options(mirror).sync_policy);
             if (!decision.shouldAcknowledge()) return error.HASyncCommitWouldBlock;
         }
         try lock(ptr);

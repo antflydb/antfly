@@ -20,7 +20,7 @@
 //! target LSN satisfies the configured async/remote-write/remote-apply policy.
 
 const std = @import("std");
-const replication_policy = @import("antfly_local_sources").storage_db_replication_policy;
+const replication_policy = @import("durability_policy.zig");
 const Allocator = std.mem.Allocator;
 const backup_manifest = @import("backup_manifest.zig");
 const replication_log = @import("replication_log.zig");

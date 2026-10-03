@@ -733,7 +733,7 @@ pub const Capture = struct {
     pub fn touch(self: *Capture, alloc: Allocator, txn: anytype, key: []const u8, primary: bool, cache: ?*std.atomic.Value(u8)) !void {
         if (self.staging) return;
         errdefer self.poisoned = true;
-        if (std.mem.eql(u8, key, &internal_keys.raft_document_applied_entry_key)) {
+        if (std.mem.eql(u8, key, &internal_keys.ordered_document_applied_entry_key)) {
             try @import("source_authority.zig").requireRaftMarkerAllowed(txn);
             self.raft_marker = true;
         }

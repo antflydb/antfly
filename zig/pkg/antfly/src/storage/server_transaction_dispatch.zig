@@ -53,7 +53,7 @@ pub fn applyReplicatedTransactionMutationAtRaftEntry(
     table_name: []const u8,
     group_id: u64,
     req: db_mod.types.BatchRequest,
-    raft_entry: db_mod.RaftAppliedEntryIdentity,
+    raft_entry: db_mod.OrderedApplyReceipt,
 ) !void {
     try applyReplicatedTransactionMutationInternal(alloc, db, table_name, group_id, req, .none, raft_entry);
 }
@@ -65,7 +65,7 @@ pub fn applyReplicatedTransactionMutationInternal(
     group_id: u64,
     req: db_mod.types.BatchRequest,
     visibility_cancellation: db_mod.types.CancellationToken,
-    raft_entry: ?db_mod.RaftAppliedEntryIdentity,
+    raft_entry: ?db_mod.OrderedApplyReceipt,
 ) !void {
     const mutation = req.transaction orelse return error.InvalidBatchRequest;
     try @import("antfly_local_sources").storage_range_protection.validateRequest(req);
@@ -133,7 +133,7 @@ pub fn applyReplicatedTransactionMutationInternal(
                 .relational_repair = req.relational_repair,
             };
             if (raft_entry) |entry|
-                try db.writeReplicatedTransactionAtRaftEntry(prepare.txn_id, intents, entry)
+                try db.writeReplicatedTransactionAtOrderedReceipt(prepare.txn_id, intents, entry)
             else
                 try db.writeTransaction(prepare.txn_id, intents);
         },
@@ -149,7 +149,7 @@ pub fn applyReplicatedTransactionMutationInternal(
                     transactions_mod.TxnError.TxnNotFound => if (resolve.status == .aborted) false else return err,
                     else => return err,
                 };
-                try db.resolveReplicatedTransactionAtRaftEntry(
+                try db.resolveReplicatedTransactionAtOrderedReceipt(
                     resolve.txn_id,
                     resolve.status,
                     resolve.commit_version,
@@ -179,7 +179,7 @@ pub fn applyReplicatedTransactionMutationInternal(
             }
         },
         .acknowledge => |ack| (if (raft_entry) |entry|
-            db.markReplicatedTransactionParticipantResolvedAtRaftEntry(ack.txn_id, ack.participant, entry)
+            db.markReplicatedTransactionParticipantResolvedAtOrderedReceipt(ack.txn_id, ack.participant, entry)
         else
             db.markTransactionParticipantResolved(ack.txn_id, ack.participant)) catch |err| switch (err) {
             // Cleanup and acknowledgements are independently retryable Raft
@@ -189,7 +189,7 @@ pub fn applyReplicatedTransactionMutationInternal(
             else => return err,
         },
         .acknowledge_many => |ack| (if (raft_entry) |entry|
-            db.markReplicatedTransactionParticipantsResolvedAtRaftEntry(ack.txn_id, ack.participants, entry)
+            db.markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(ack.txn_id, ack.participants, entry)
         else
             db.markTransactionParticipantsResolved(ack.txn_id, ack.participants)) catch |err| switch (err) {
             transactions_mod.TxnError.TxnNotFound => {},
@@ -197,7 +197,7 @@ pub fn applyReplicatedTransactionMutationInternal(
         },
         .cleanup => |cleanup| {
             if (raft_entry) |entry|
-                _ = try db.cleanupReplicatedTransactionAtRaftEntry(
+                _ = try db.cleanupReplicatedTransactionAtOrderedReceipt(
                     cleanup.txn_id,
                     cleanup.cutoff_timestamp,
                     cleanup.retained_cutoff_timestamp,

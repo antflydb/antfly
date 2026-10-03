@@ -620,7 +620,7 @@ test "ordered artifact inventory document stream closure requires current output
                 var marker: [16]u8 = undefined;
                 std.mem.writeInt(u64, marker[0..8], 1, .little);
                 std.mem.writeInt(u64, marker[8..16], index + 2, .little);
-                try db.core.store.putBatch(&.{ .{ .key = output, .value = value }, .{ .key = &keys.raft_document_applied_entry_key, .value = &marker } }, &.{});
+                try db.core.store.putBatch(&.{ .{ .key = output, .value = value }, .{ .key = &keys.ordered_document_applied_entry_key, .value = &marker } }, &.{});
                 var read = try db.core.store.beginReadTxn();
                 defer read.abort();
                 try std.testing.expect((try publication.readReceipt(&read, command, source)) != null);

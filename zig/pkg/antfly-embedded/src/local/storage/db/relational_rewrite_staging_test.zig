@@ -249,7 +249,7 @@ test "relational index system rewrite immutable program set binds policy and all
     var reopened = try rewrite.ProgramSet.initIntent(alloc, intent);
     defer reopened.deinit();
     try std.testing.expectEqualSlices(u8, &programs.identity, &reopened.identity);
-    intent.apply_defaults_to_absent = true;
+    intent.allow_column_drops = true;
     try std.testing.expectError(error.RestoreStagingScopeChanged, rewrite.ProgramSet.initIntent(alloc, intent));
     try std.testing.expectError(error.InvalidRestoreStagingCommand, rewrite.ProgramSet.init(alloc, &.{ source_schema, source_schema }, target_schema, .{}));
     const historical = try std.mem.replaceOwned(u8, alloc, source_schema, "\"version\":1", "\"version\":3");

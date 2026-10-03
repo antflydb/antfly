@@ -198,14 +198,14 @@ fn admissionFactsJson(db: *DB, alloc: Allocator, request: wire.Request, cancella
             eligible = false; // Resume this exact already-started ordinary plan.
         }
     }
-    const marker = txn.get(&@import("../internal_keys.zig").raft_document_applied_entry_key) catch |err| switch (err) {
+    const marker = txn.get(&@import("../internal_keys.zig").ordered_document_applied_entry_key) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
     };
     const term = if (marker) |raw| blk: {
-        if (raw.len != 16 or std.mem.readInt(u64, raw[8..16], .little) == 0) return error.CorruptRaftAppliedEntry;
+        if (raw.len != 16 or std.mem.readInt(u64, raw[8..16], .little) == 0) return error.CorruptOrderedApplyReceipt;
         const value = std.mem.readInt(u64, raw[0..8], .little);
-        if (value == 0) return error.CorruptRaftAppliedEntry;
+        if (value == 0) return error.CorruptOrderedApplyReceipt;
         break :blk value;
     } else 0;
     try cancellation.check();

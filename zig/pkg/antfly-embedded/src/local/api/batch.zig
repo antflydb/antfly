@@ -610,8 +610,14 @@ fn parseBatchRequestWithOptions(
         else => return error.InvalidBatchRequest,
     };
     defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidBatchRequest;
-    const root = parsed.value.object;
+    const versioned = parsed.value == .array;
+    const root_value = if (versioned) blk: {
+        const entries = parsed.value.array.items;
+        if (!allow_internal or entries.len != 2 or entries[0] != .string or !std.mem.eql(u8, entries[0].string, "row-semantics-batch-v1")) return error.InvalidBatchRequest;
+        break :blk entries[1];
+    } else parsed.value;
+    if (root_value != .object) return error.InvalidBatchRequest;
+    const root = root_value.object;
     if (!allow_internal and (root.get("_graph_writes") != null or root.get("_graph_deletes") != null))
         return error.InvalidBatchRequest;
 
@@ -635,6 +641,28 @@ fn parseBatchRequestWithOptions(
         break :writes &.{};
     };
     errdefer if (page_effects == null) freeWrites(alloc, writes);
+    if (root.get("_json_null_fields")) |provenance| {
+        if (!allow_internal or page_effects != null or provenance != .object) return error.InvalidBatchRequest;
+        var entries = provenance.object.iterator();
+        while (entries.next()) |entry| {
+            const write = for (writes) |*write| {
+                if (std.mem.eql(u8, write.key, entry.key_ptr.*)) break write;
+            } else return error.InvalidBatchRequest;
+            if (entry.value_ptr.* != .array or entry.value_ptr.array.items.len > 256) return error.InvalidBatchRequest;
+            var names: std.ArrayList([]const u8) = .empty;
+            defer names.deinit(alloc);
+            const row = try std.json.parseFromSlice(std.json.Value, alloc, write.value, .{});
+            defer row.deinit();
+            if (row.value != .object) return error.InvalidBatchRequest;
+            for (entry.value_ptr.array.items) |name| {
+                if (name != .string or name.string.len == 0) return error.InvalidBatchRequest;
+                if ((row.value.object.get(name.string) orelse return error.InvalidBatchRequest) != .null) return error.InvalidBatchRequest;
+                for (names.items) |prior| if (std.mem.eql(u8, prior, name.string)) return error.InvalidBatchRequest;
+                try names.append(alloc, name.string);
+            }
+            write.json_null_fields = try db_mod.types.cloneJsonNullFields(alloc, names.items);
+        }
+    }
 
     const deletes: [][]const u8 = deletes: {
         if (page_effects) |effects| break :deletes effects.value.deletes;
@@ -885,10 +913,12 @@ fn parseBatchRequestWithOptions(
                 _ = std.fmt.hexToBytes(&bytes, encoded.string) catch return error.InvalidBatchRequest;
                 digest = bytes;
             }
+            const unique_absence = if (item.object.get("unique_absence")) |flag| if (flag == .bool and (version == 0 or !flag.bool)) flag.bool else return error.InvalidBatchRequest else false;
             items[i] = .{
                 .key = try alloc.dupe(u8, key_value.string),
                 .expected_version = version,
                 .expected_content_digest = digest,
+                .unique_absence = unique_absence,
             };
             initialized += 1;
         }
@@ -1494,11 +1524,32 @@ fn parseBatchRequestWithOptions(
     try @import("../storage/db/merge_proof_adoption.zig").validateRequest(result_value.req);
     try @import("../storage/db/online_source_contract.zig").validateRequest(result_value.req);
     try @import("../storage/db/artifact_inventory.zig").validateRequest(result_value.req);
+    if (requiresRowSemanticsEnvelope(result_value.req.writes, result_value.req.predicates) and !versioned) return error.InvalidBatchRequest;
     return result_value;
 }
 
 pub fn encodeBatchResponse(alloc: std.mem.Allocator, result: BatchResult) ![]u8 {
     return try ant_json.valueAlloc(alloc, result, .{ .emit_null_optional_fields = false });
+}
+
+test "internal batch preserves JSON null provenance without public injection" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeBatchRequest(alloc, .{ .writes = &.{.{ .key = "row", .value = "{\"j\":null,\"sql_null\":null}", .json_null_fields = &.{"j"} }} });
+    defer alloc.free(encoded);
+    var parsed = try parseInternalBatchRequest(alloc, encoded);
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), parsed.req.writes[0].json_null_fields.len);
+    try std.testing.expectEqualStrings("j", parsed.req.writes[0].json_null_fields[0]);
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
+    try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(alloc, "{\"inserts\":{\"row\":{\"j\":1}},\"_json_null_fields\":{\"row\":[\"j\"]}}"));
+}
+
+/// Features older object decoders silently discard require a distinct root
+/// envelope. Raft and HTTP use this same codec and fail closed on old readers.
+pub fn requiresRowSemanticsEnvelope(writes: anytype, predicates: []const db_mod.types.TransactionVersionPredicate) bool {
+    for (writes) |write| if (write.json_null_fields.len != 0) return true;
+    for (predicates) |predicate| if (predicate.unique_absence) return true;
+    return false;
 }
 
 pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
@@ -1591,6 +1642,8 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const writer = &out.writer;
+    const versioned = requiresRowSemanticsEnvelope(req.writes, req.predicates);
+    if (versioned) try writer.writeAll("[\"row-semantics-batch-v1\",");
 
     try writer.writeAll("{\"inserts\":{");
     for (if (req.merge_page != null) &.{} else req.writes, 0..) |write, i| {
@@ -1604,6 +1657,13 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
         try writer.print("{f}", .{std.json.fmt(key, .{})});
     }
     try writer.writeAll("]");
+    var first_null = true;
+    for (if (req.merge_page != null) &.{} else req.writes) |write| if (write.json_null_fields.len != 0) {
+        if (first_null) try writer.writeAll(",\"_json_null_fields\":{") else try writer.writeByte(',');
+        first_null = false;
+        try writer.print("{f}:{f}", .{ std.json.fmt(write.key, .{}), std.json.fmt(write.json_null_fields, .{}) });
+    };
+    if (!first_null) try writer.writeByte('}');
     if (req.merge_page != null) {
         // Preserve exact JSON bytes and arbitrary binary row keys; reparsing
         // ordinary inserts would change whitespace/numeric spellings under
@@ -1615,9 +1675,10 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
         try writer.writeAll(",\"_merge_page_effects\":{\"writes\":[");
         for (req.writes, 0..) |write, index| {
             if (index != 0) try writer.writeByte(',');
-            try writer.print("{{\"key\":{f},\"value\":{f}}}", .{
+            try writer.print("{{\"key\":{f},\"value\":{f},\"json_null_fields\":{f}}}", .{
                 std.json.fmt(write.key, .{ .emit_strings_as_arrays = true }),
                 std.json.fmt(write.value, .{}),
+                std.json.fmt(write.json_null_fields, .{}),
             });
         }
         try writer.print("],\"deletes\":{f}}}", .{std.json.fmt(req.deletes, .{ .emit_strings_as_arrays = true })});
@@ -1807,6 +1868,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
                 std.json.fmt(predicate.key, .{}), predicate.expected_version,
             });
             if (predicate.expected_content_digest) |digest| try writer.print(",\"expected_content_digest\":\"{s}\"", .{std.fmt.bytesToHex(digest, .lower)});
+            if (predicate.unique_absence) try writer.writeAll(",\"unique_absence\":true");
             try writer.writeByte('}');
         }
         try writer.writeByte(']');
@@ -1966,6 +2028,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
         try writer.writeByte('}');
     }
     try writer.print(",\"sync_level\":\"{s}\"}}", .{syncLevelName(req.sync_level)});
+    if (versioned) try writer.writeByte(']');
     return try out.toOwnedSlice();
 }
 
@@ -2996,4 +3059,30 @@ fn consumerTests() type {
 }
 comptime {
     if (@import("builtin").is_test) _ = consumer_tests;
+}
+
+test "internal batch JSON null and insert precondition codecs survive allocation failures" {
+    const Harness = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            const encoded = try encodeBatchRequest(alloc, .{ .writes = &.{.{ .key = "row", .value = "{\"j\":null}", .json_null_fields = &.{"j"} }}, .predicates = &.{.{ .key = "row", .expected_version = 0, .unique_absence = true }}, .transaction = .{ .prepare = .{ .txn_id = @splat(1), .topology_epoch = 1 } } });
+            defer alloc.free(encoded);
+            var parsed = try parseInternalBatchRequest(alloc, encoded);
+            defer parsed.deinit(alloc);
+            try std.testing.expectEqualStrings("j", parsed.req.writes[0].json_null_fields[0]);
+            try std.testing.expect(parsed.req.predicates[0].unique_absence);
+            const prefix = "[\"row-semantics-batch-v1\",";
+            try std.testing.expect(std.mem.startsWith(u8, encoded, prefix));
+            // Released decoders accept only an object (or the known range
+            // marker); they reject this new envelope before parsing writes.
+            var legacy = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+            defer legacy.deinit();
+            try std.testing.expect(legacy.value == .array);
+            if (parseInternalBatchRequest(alloc, encoded[prefix.len .. encoded.len - 1])) |value| {
+                var unexpected = value;
+                unexpected.deinit(alloc);
+                return error.TestExpectedError;
+            } else |err| if (err != error.InvalidBatchRequest) return err;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }

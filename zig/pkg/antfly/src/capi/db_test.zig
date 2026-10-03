@@ -261,7 +261,7 @@ const metadataApplyPreparedSnapshotCancel = server_api.metadataApplyPreparedSnap
 const metadataApplyPreparedSnapshotDestroy = server_api.metadataApplyPreparedSnapshotDestroy;
 const metadataApplyStoreAddListeners = server_api.metadataApplyStoreAddListeners;
 const metadataApplyStoreRemoveListeners = server_api.metadataApplyStoreRemoveListeners;
-const metadataApplyStoreBindHA = server_api.metadataApplyStoreBindHA;
+const metadataApplyStoreBindHotStandby = server_api.metadataApplyStoreBindHotStandby;
 const metadataApplyStoreProjection = server_api.metadataApplyStoreProjection;
 const metadataReconcileReplicaRoot = server_api.metadataReconcileReplicaRoot;
 const dataApplyStoreOpen = server_api.dataApplyStoreOpen;
@@ -304,11 +304,11 @@ const storageOwnerBulkBegin = server_api.storageOwnerBulkBegin;
 const storageOwnerBulkFinish = server_api.storageOwnerBulkFinish;
 const storageOwnerBulkAbort = server_api.storageOwnerBulkAbort;
 const storageOwnerOperationTableName = server_api.storageOwnerOperationTableName;
-const storageHASeedFailure = server_api.storageHASeedFailure;
-const validateHASeedRequest = server_api.validateHASeedRequest;
-const storageHASeedActivateJson = server_api.storageHASeedActivateJson;
-const storageHASeedValidateJson = server_api.storageHASeedValidateJson;
-const storageHASeedPruneJson = server_api.storageHASeedPruneJson;
+const storageHotStandbySeedFailure = server_api.storageHotStandbySeedFailure;
+const validateHotStandbySeedRequest = server_api.validateHotStandbySeedRequest;
+const storageHotStandbySeedActivateJson = server_api.storageHotStandbySeedActivateJson;
+const storageHotStandbySeedValidateJson = server_api.storageHotStandbySeedValidateJson;
+const storageHotStandbySeedPruneJson = server_api.storageHotStandbySeedPruneJson;
 const StorageOwnerDocumentChildRangeDispatch = server_api.StorageOwnerDocumentChildRangeDispatch;
 const StorageOwnerCommittedBatchEffects = server_api.StorageOwnerCommittedBatchEffects;
 const storageOwnerCallbackStatusToError = server_api.storageOwnerCallbackStatusToError;
@@ -1124,7 +1124,7 @@ test "storage owner open rejects prior ABI before reading expanded request field
 test "storage HA seed boundary preserves status and exact failure identity" {
     var response: kernel_owner_abi.OwnedBytes = .{};
     var failure: kernel_owner_abi.FailureIdentity = .{};
-    const status = storageHASeedActivateJson(&.{
+    const status = storageHotStandbySeedActivateJson(&.{
         .version = 0,
         .operation = .activate,
         .request_json = .fromSlice("{}"),
@@ -2110,7 +2110,16 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"index_layout\":\"native_index_catalog_pages\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"index_layout\":\"lsm") == null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"index_namespace\":\"__antfly_lite\"") != null);
-    const expected_format_version = try std.fmt.allocPrint(alloc, "\"format_version\":{d}", .{antfly.lite.native.indexed_format_version});
+    const format_version = blk: {
+        // Simulate the allocator's exclusive file lock. Handle status must
+        // remain available without opening a competing external reader.
+        var held = try std.Io.Dir.cwd().openFile(std.testing.io, src_path, .{ .mode = .read_write, .lock = .exclusive });
+        defer held.close(std.testing.io);
+        const guard = public.enterHandle(src_handle, .read) orelse return error.InvalidHandle;
+        defer guard.leave();
+        break :blk guard.handle.owned_lite_backend.?.storageStatus().format_version.?;
+    };
+    const expected_format_version = try std.fmt.allocPrint(alloc, "\"format_version\":{d}", .{format_version});
     defer alloc.free(expected_format_version);
     try std.testing.expect(std.mem.indexOf(u8, status_json, expected_format_version) != null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"page_size\":4096") != null);
@@ -4268,7 +4277,6 @@ test "storage owner runtime status bulk recovery bridge preserves identities cap
     bridge.config = .{ .callback_ctx = &capture, .replicated_metadata = 1, .acknowledge_participants_fn = Capture.acknowledge };
     const config = bridge.dbConfig();
     try std.testing.expect(config.factory != null);
-    try std.testing.expect(server_api.test_support.transactionRecoveryConfig(&bridge).acknowledge_participants_fn != null);
     try StorageOwnerTransactionRecovery.acknowledgeParticipants(&bridge, @splat(5), "owner", &.{ "first", "second" });
     for ([_]anyerror{ error.UnsupportedOperation, error.UnsupportedRaftBatchProtocolVersion, error.RaftBatchWriteOutcomeUnknown }) |err| {
         capture.result = kernel_error_identity.statusFromError(err);
@@ -4277,7 +4285,7 @@ test "storage owner runtime status bulk recovery bridge preserves identities cap
     try std.testing.expectError(error.InvalidParticipant, StorageOwnerTransactionRecovery.acknowledgeParticipants(&bridge, @splat(5), "owner", &.{}));
     try std.testing.expectEqual(@as(usize, 4), capture.calls);
     bridge.config.acknowledge_participants_fn = null;
-    try std.testing.expect(server_api.test_support.transactionRecoveryConfig(&bridge).acknowledge_participants_fn == null);
+    try std.testing.expectError(error.UnsupportedOperation, StorageOwnerTransactionRecovery.acknowledgeParticipants(&bridge, @splat(5), "owner", &.{ "first", "second" }));
 }
 
 // These callbacks are installed only by the private server owner. Public Lite
