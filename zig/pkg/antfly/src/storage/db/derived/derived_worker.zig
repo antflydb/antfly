@@ -280,19 +280,15 @@ pub fn catchUpIndexFromMatchingCursor(
         builder.target_sequence = options.target_sequence;
         builder.decode_scratch = &decode_scratch;
         builder.scratch_alloc = scratch_alloc;
+        builder.scratch_budget = if (scratch_budget) |*budget| budget else null;
         defer builder.deinit();
 
         const collect_started_ns = monotonicTimeNs();
-        const chunk_stats = replay_cursor.forEachNext(
+        const chunk_stats = try replay_cursor.forEachNext(
             options.max_records_per_window,
             &builder,
             replayChunkConsumeRecord,
-        ) catch |err| {
-            if (err == error.OutOfMemory) {
-                if (scratch_budget) |*budget| if (budget.denied()) return error.ResourceBudgetExceeded;
-            }
-            return err;
-        };
+        );
         stats.window_collect_ns += monotonicTimeNs() - collect_started_ns;
         if (chunk_stats.last_sequence == 0) {
             break;
@@ -451,6 +447,7 @@ const ReplayChunkBuilder = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager,
     decode_scratch: *change_journal_mod.BorrowedBinaryRecordScratch = undefined,
     scratch_alloc: Allocator = undefined,
+    scratch_budget: ?*resource_manager_mod.BudgetedAllocator = null,
     documents: []derived_types.DerivedDocument = &.{},
     target: [1]derived_types.DerivedTargetRef = undefined,
     max_chunk_bytes: u64,
@@ -519,6 +516,10 @@ const ReplayChunkBuilder = struct {
         errdefer list.items.len -= 1;
         var next_tracked_bytes = self.tracked_bytes;
         next_tracked_bytes +|= owned.len;
+        // Reserve descriptors with their keys, before the window is published.
+        // finishBorrowed consumes this credit without another admission step.
+        if (list == &self.changed_doc_keys)
+            next_tracked_bytes +|= @sizeOf(derived_types.DerivedDocument);
         next_tracked_bytes +|= @as(u64, @intCast(list.capacity - prior_list_capacity)) * @sizeOf([]const u8);
         next_tracked_bytes +|= @as(u64, @intCast(seen.capacity() - prior_seen_capacity)) * (@sizeOf([]const u8) + @sizeOf(void));
         try self.observeTrackedBytes(next_tracked_bytes);
@@ -565,7 +566,58 @@ const ReplayChunkBuilder = struct {
         if (self.tracked_bytes == 0 and self.item_count == 0) return false;
         if (self.max_chunk_bytes > 0 and self.tracked_bytes + recordEstimatedBytesForIndex(record, self.index_ref.kind, self.estimatedDenseVectorBytes()) > self.max_chunk_bytes) return true;
         if (self.max_items > 0 and self.item_count + recordItemCountForIndex(record, self.index_ref.kind) > self.max_items) return true;
+        if (self.resource_manager) |manager| {
+            // The hard limit also covers shared decode scratch and other replay
+            // workers. Size the next record against available admission, rather
+            // than discovering descriptor/key growth at publication time.
+            if (self.recordAdmissionBytes(record) > manager.availableAdmissionBytes(.derived_replay_window)) return true;
+        }
         return false;
+    }
+
+    fn keyAdmissionBytes(
+        list: *const std.ArrayListUnmanaged([]const u8),
+        seen: *const std.StringHashMapUnmanaged(void),
+        keys: []const []const u8,
+        descriptor_bytes: u64,
+        artifact_kind: ?db_types.IndexKind,
+    ) u64 {
+        var count: u64 = 0;
+        var bytes: u64 = 0;
+        for (keys) |key| {
+            if (key.len == 0 or seen.contains(key)) continue;
+            if (artifact_kind) |kind| {
+                if (kind == .graph) {
+                    if (!internal_keys.isGraphEdgeArtifactKey(key) and !internal_keys.isAssetArtifactKey(key) and
+                        !internal_keys.isChunkArtifactRecordKey(key) and !internal_keys.isResolutionArtifactKey(key)) continue;
+                } else if (!internal_keys.isEmbeddingArtifactKey(key) and !internal_keys.isDerivedEmbeddingArtifactKey(key)) continue;
+            }
+            count +|= 1;
+            bytes +|= key.len +| descriptor_bytes;
+        }
+        if (count == 0) return 0;
+        // Duplicate keys within this record may overestimate growth; they never
+        // under-admit it. Use a conservative map bound without depending on
+        // the standard library's private load-factor/capacity implementation.
+        const next_len = std.math.cast(usize, @as(u64, @intCast(list.items.len)) +| count) orelse return std.math.maxInt(u64);
+        const list_capacity = if (next_len > list.capacity) std.ArrayListUnmanaged([]const u8).growCapacity(next_len) else list.capacity;
+        bytes +|= @as(u64, @intCast(list_capacity - list.capacity)) *| @sizeOf([]const u8);
+        const map_capacity = @max(@as(u64, seen.capacity()), @max(@as(u64, 8), (@as(u64, seen.count()) +| count) *| 4));
+        bytes +|= (map_capacity - seen.capacity()) *| @sizeOf([]const u8);
+        return bytes;
+    }
+
+    fn recordAdmissionBytes(self: *const @This(), record: change_journal_mod.Record) u64 {
+        var bytes = keyAdmissionBytes(&self.deleted_doc_keys, &self.seen_deleted_docs, record.deleted_doc_keys, 0, null);
+        if (self.index_ref.kind != .graph) {
+            bytes +|= keyAdmissionBytes(&self.changed_doc_keys, &self.seen_changed_docs, record.changed_doc_keys, @sizeOf(derived_types.DerivedDocument), null);
+            bytes +|= keyAdmissionBytes(&self.overwritten_doc_keys, &self.seen_overwritten_docs, record.overwritten_doc_keys, 0, null);
+        }
+        if (self.index_ref.kind == .graph or self.index_ref.kind == .dense_vector or self.index_ref.kind == .sparse_vector)
+            bytes +|= keyAdmissionBytes(&self.changed_artifact_keys, &self.seen_changed_artifacts, record.changed_artifact_keys, 0, self.index_ref.kind);
+        if (self.index_ref.kind == .dense_vector)
+            bytes +|= @as(u64, @intCast(countEmbeddingArtifactKeys(record.changed_artifact_keys))) *| self.estimatedDenseVectorBytes();
+        return bytes;
     }
 
     fn estimatedDenseVectorBytes(self: *const @This()) u64 {
@@ -587,7 +639,6 @@ const ReplayChunkBuilder = struct {
     /// Only builder.deinit owns cleanup; never call deinitDerivedBatch here.
     fn finishBorrowed(self: *@This(), sequence: u64) !derived_types.DerivedBatch {
         const count = self.changed_doc_keys.items.len;
-        try self.observeTrackedBytes(self.tracked_bytes +| @as(u64, @intCast(count)) * @sizeOf(derived_types.DerivedDocument));
         self.documents = try self.alloc.alloc(derived_types.DerivedDocument, count);
         const targets: []const derived_types.DerivedTargetRef = switch (self.index_ref.kind) {
             .full_text, .algebraic => blk: {
@@ -625,8 +676,32 @@ const ReplayChunkBuilder = struct {
 fn replayChunkConsumeRecord(ctx: *anyopaque, sequence: u64, payload: []const u8) !void {
     const builder: *ReplayChunkBuilder = @ptrCast(@alignCast(ctx));
     if (builder.target_sequence != 0 and sequence > builder.target_sequence) return replay_source_mod.StopReplayChunk.StopReplayChunk;
+    // A full window does not need to allocate descriptors for a lookahead
+    // record. StopReplayChunk leaves that record at the cursor for the retry.
+    if (builder.max_items != 0 and builder.item_count >= builder.max_items)
+        return replay_source_mod.StopReplayChunk.StopReplayChunk;
     if (change_journal_mod.looksLikeBinaryRecord(payload)) {
-        const record = try change_journal_mod.decodeBinaryRecordBorrowedScratch(builder.scratch_alloc, payload, builder.decode_scratch);
+        const denial_generation = if (builder.scratch_budget) |budget| budget.denialGeneration() else 0;
+        const record = change_journal_mod.decodeBinaryRecordBorrowedScratch(builder.scratch_alloc, payload, builder.decode_scratch) catch |err| {
+            if (err == error.OutOfMemory) {
+                if (builder.scratch_budget) |budget| {
+                    if (budget.denialGeneration() != denial_generation) {
+                        // Partial lookahead scratch is disposable. Release it
+                        // before applying the already collected window; its
+                        // keys are owned independently by the builder.
+                        builder.decode_scratch.trimRetainedCapacity(builder.scratch_alloc, 0);
+                        _ = budget.releaseUnusedCredit();
+                        if (builder.item_count != 0) return replay_source_mod.StopReplayChunk.StopReplayChunk;
+                        return error.ResourceBudgetExceeded;
+                    }
+                }
+            }
+            return err;
+        };
+        // Scratch and the builder share the slice. Amortized spare credit
+        // must not crowd out keys/descriptors, especially when only the
+        // aggregate budget is configured. Retained buffers stay charged.
+        if (builder.scratch_budget) |budget| _ = budget.releaseUnusedCredit();
         if (builder.wouldOverflowWithRecord(record)) return replay_source_mod.StopReplayChunk.StopReplayChunk;
         try builder.appendRecord(record);
         return;
@@ -643,6 +718,8 @@ fn recordEstimatedBytesForIndex(record: change_journal_mod.Record, kind: db_type
         estimatedStringListBytes(record.deleted_doc_keys) +
         estimatedStringListBytes(record.overwritten_doc_keys) +
         estimatedStringListBytes(record.changed_artifact_keys);
+    if (kind != .graph)
+        total +|= @as(u64, @intCast(record.changed_doc_keys.len)) *| @sizeOf(derived_types.DerivedDocument);
     if (kind == .dense_vector) {
         total +|= @as(u64, @intCast(countEmbeddingArtifactKeys(record.changed_artifact_keys))) * estimated_dense_vector_bytes;
     }
@@ -1435,6 +1512,10 @@ test "catchUpIndex subchunks one oversized full text record before advancing its
         .target_hints = &.{.full_text},
     });
 
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 2048 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
     var capture = TestApplyCapture{ .alloc = alloc };
     defer capture.deinit();
     const stats = try catchUpIndexWithOptions(
@@ -1444,9 +1525,11 @@ test "catchUpIndex subchunks one oversized full text record before advancing its
         0,
         &capture,
         testApplyCapture,
-        .{ .max_items_per_window = 2 },
+        .{ .max_items_per_window = 2, .max_chunk_bytes = 512, .resource_manager = &manager },
     );
 
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expect(manager.snapshot().memory.peak_bytes <= 2048);
     try std.testing.expectEqual(@as(usize, 1), stats.scanned_entries);
     try std.testing.expectEqual(@as(usize, 1), stats.applied_entries);
     try std.testing.expectEqual(@as(usize, 3), capture.call_count);
@@ -1788,4 +1871,95 @@ test "catchUpIndex accounts shared decoding scratch and releases it after apply 
     try std.testing.expectError(error.InjectedApplyFailure, catchUpIndexWithOptions(alloc, replay_source_mod.Source.fromJournal(&log), .{ .name = "text", .kind = .full_text }, 0, &manager, Consumer.apply, .{ .resource_manager = &manager }));
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+}
+
+test "catchUpIndex admits document descriptors during collection and progresses under hard limits" {
+    const alloc = std.testing.allocator;
+    for ([_]db_types.IndexKind{ .full_text, .algebraic, .dense_vector, .sparse_vector }) |kind| {
+        for ([_]bool{ false, true }) |aggregate_limited| {
+            var budgets = resource_manager_mod.Options.defaultBudgets();
+            budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = .{ .soft_limit_bytes = 1000, .hard_limit_bytes = if (aggregate_limited) 0 else 1000 };
+            var manager = resource_manager_mod.ResourceManager.init(.{
+                .budgets = budgets,
+                .memory_budget = .{ .hard_limit_bytes = if (aggregate_limited) 1000 else 0 },
+            });
+            defer manager.deinit(alloc);
+            var log = try change_journal_mod.Journal.open("descriptor-window-admission", testInMemoryJournalOpenOptions());
+            defer log.close();
+            for ([_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i", "j" }, 1..) |key, sequence|
+                try appendChangeJournalRecord(&log, alloc, .{ .sequence = sequence, .changed_doc_keys = &.{key}, .target_hints = &.{targetHintForManagedIndex(.{ .name = "index", .kind = kind })} });
+            var capture = TestApplyCapture{ .alloc = alloc };
+            defer capture.deinit();
+            const stats = try catchUpIndexWithOptions(alloc, replay_source_mod.Source.fromJournal(&log), .{ .name = "index", .kind = kind }, 0, &capture, testApplyCapture, .{ .resource_manager = &manager, .max_chunk_bytes = 1000 });
+            try std.testing.expectEqual(@as(usize, 10), capture.applied_documents);
+            try std.testing.expectEqual(@as(u64, 10), stats.last_applied_sequence);
+            try std.testing.expect(capture.call_count > 1);
+            const snapshot = manager.snapshot();
+            try std.testing.expect(snapshot.memory.peak_bytes <= 1000);
+            try std.testing.expectEqual(@as(u64, 0), snapshot.memory.used_bytes);
+            try std.testing.expectEqual(@as(u64, 0), snapshot.memory.accounting_errors);
+        }
+    }
+}
+
+test "catchUpIndex yields collected window on lookahead admission and preserves the cursor" {
+    const alloc = std.testing.allocator;
+    // Zero exercises admission denial; one exercises the pre-decode item bound.
+    for ([_]usize{ 0, 1 }) |max_items| {
+        var log = try change_journal_mod.Journal.open("lookahead-window-admission", testInMemoryJournalOpenOptions());
+        defer log.close();
+        try appendChangeJournalRecord(&log, alloc, .{ .sequence = 1, .changed_doc_keys = &.{"a"}, .target_hints = &.{.full_text} });
+        var keys: [200][]const u8 = undefined;
+        var names: [200][8]u8 = undefined;
+        for (&keys, &names, 0..) |*key, *name, i| key.* = try std.fmt.bufPrint(name, "key{d}", .{i});
+        try appendChangeJournalRecord(&log, alloc, .{ .sequence = 2, .changed_doc_keys = &keys, .target_hints = &.{.full_text} });
+        var budgets = resource_manager_mod.Options.defaultBudgets();
+        budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = .{ .soft_limit_bytes = 2000, .hard_limit_bytes = 2000 };
+        var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+        defer manager.deinit(alloc);
+        var capture = TestApplyCapture{ .alloc = alloc };
+        defer capture.deinit();
+        var cursor = try replay_source_mod.Source.fromJournal(&log).openMatchingCursor(alloc, 0, .full_text);
+        defer cursor.deinit(alloc);
+        const index: index_manager_mod.ManagedIndexRef = .{ .name = "text", .kind = .full_text };
+        const first = try catchUpIndexFromMatchingCursor(alloc, &cursor, index, &capture, testApplyCapture, .{ .resource_manager = &manager, .max_items_per_window = max_items, .max_windows_per_call = 1 });
+        try std.testing.expectEqual(@as(u64, 1), first.last_applied_sequence);
+        try std.testing.expectEqual(@as(usize, 1), capture.applied_documents);
+        const snapshot = manager.snapshot();
+        try std.testing.expectEqual(@as(u64, 0), snapshot.memory.used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), snapshot.memory.accounting_errors);
+        if (max_items != 0) try std.testing.expectEqual(@as(u64, 0), snapshot.slices[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)].hard_limit_rejections);
+        // A record that cannot fit even in an empty window remains a hard
+        // admission error, without bypassing the limit or consuming its cursor.
+        try std.testing.expectError(error.ResourceBudgetExceeded, catchUpIndexFromMatchingCursor(alloc, &cursor, index, &capture, testApplyCapture, .{ .resource_manager = &manager }));
+        try std.testing.expectEqual(@as(usize, 1), capture.applied_documents);
+        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+        // With enough space, the same cursor must replay the deferred record
+        // exactly once. Its sequence cannot be consumed by failed lookahead.
+        const second = try catchUpIndexFromMatchingCursor(alloc, &cursor, index, &capture, testApplyCapture, .{});
+        try std.testing.expectEqual(@as(u64, 2), second.last_applied_sequence);
+        try std.testing.expectEqual(@as(usize, 201), capture.applied_documents);
+        const end = try catchUpIndexFromMatchingCursor(alloc, &cursor, index, &capture, testApplyCapture, .{});
+        try std.testing.expectEqual(@as(usize, 0), end.applied_entries);
+    }
+}
+
+test "replay batch descriptor admission is deduplicated and finish needs no new credit" {
+    const alloc = std.testing.allocator;
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 1000 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+    var builder = ReplayChunkBuilder.init(alloc, .{ .name = "text", .kind = .full_text }, &manager, 1000);
+    defer builder.deinit();
+    try builder.appendRecord(.{ .changed_doc_keys = &.{ "a", "b" } });
+    const admitted = builder.tracked_bytes;
+    try builder.appendRecord(.{ .changed_doc_keys = &.{ "a", "b", "a" } });
+    try std.testing.expectEqual(admitted, builder.tracked_bytes);
+    const spare = manager.availableAdmissionBytes(.derived_replay_window);
+    var other = try manager.reserve(.derived_replay_window, spare);
+    defer other.release();
+    const batch = try builder.finishBorrowed(1);
+    try std.testing.expectEqual(@as(usize, 2), batch.documents.len);
+    try std.testing.expectEqual(admitted, builder.tracked_bytes);
 }

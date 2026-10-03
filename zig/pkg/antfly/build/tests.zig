@@ -5564,7 +5564,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const replay_document_integration_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &replay_document_integration_filters,
-        .max_rss = 8 * 1024 * 1024 * 1024,
+        // Broad DB codegen peaked at 12.04 GB on macOS during validation.
+        .max_rss = 12 * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("replay-document-integration-test", "Verify replay consumers across text, algebraic, graph and document bodies")
