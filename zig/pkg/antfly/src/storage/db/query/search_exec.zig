@@ -108,6 +108,9 @@ pub const SearchTextDispatcher = struct {
 };
 
 pub const SearchTextQueryExecutor = struct {
+    /// Primary rows can disappear independently of a derived posting. Keep
+    /// the complete candidate prefix until postprocess has checked presence.
+    filter_candidate_presence: bool = false,
     ctx: ?*anyopaque,
     load_projected_documents: ?LoadProjectedDocuments = null,
     text_index_entry: *const fn (
@@ -219,6 +222,9 @@ pub const GraphIndexEstimate = runtime_preflight.GraphIndexEstimate;
 pub const RuntimePreflightSummary = runtime_preflight.RuntimePreflightSummary;
 
 pub const DenseSearchExecutor = struct {
+    /// Primary rows can disappear independently of a derived posting. Keep
+    /// the complete candidate prefix until postprocess has checked presence.
+    filter_candidate_presence: bool = false,
     ctx: ?*anyopaque,
     text_index_entry: *const fn (
         ctx: ?*anyopaque,
@@ -334,6 +340,9 @@ pub const ProfiledDenseSearchResult = struct {
 };
 
 pub const SparseSearchExecutor = struct {
+    /// Primary rows can disappear independently of a derived posting. Keep
+    /// the complete candidate prefix until postprocess has checked presence.
+    filter_candidate_presence: bool = false,
     ctx: ?*anyopaque,
     text_index_entry: *const fn (
         ctx: ?*anyopaque,
@@ -11658,9 +11667,10 @@ pub fn searchTextQuery(
             return err;
         };
     }
-    const adaptive_late_visibility = late_visibility_paginate and !exact_late_visibility_totals;
+    const adaptive_late_visibility = (late_visibility_paginate or executor.filter_candidate_presence) and
+        !exact_late_visibility_totals and !effective_req.count_only and effective_req.limit != 0;
     const requested_visible_end = effective_req.offset +| effective_req.limit;
-    const collect_window_candidates = group_chunk_parents or late_visibility_paginate or requires_field_sort;
+    const collect_window_candidates = group_chunk_parents or late_visibility_paginate or requires_field_sort or executor.filter_candidate_presence;
     const grouped_requires_full_window = group_chunk_parents and
         (effective_req.count_only or
             effective_req.limit == 0 or
@@ -11706,7 +11716,7 @@ pub fn searchTextQuery(
             postprocess_req.resolved_doc_filter = effective_req.resolved_doc_filter;
             postprocess_req.resolved_doc_filter_owned = effective_req.resolved_doc_filter_owned;
         }
-        if (late_visibility_paginate or requires_field_sort or group_chunk_parents) {
+        if (collect_window_candidates) {
             postprocess_req.offset = 0;
             postprocess_req.limit = candidate_limit;
         }
@@ -11851,7 +11861,10 @@ pub fn searchTextQuery(
             candidate_limit = grown_limit;
             continue;
         }
-        if ((adaptive_late_visibility or group_chunk_parents) and !candidates_exhausted) {
+        const observed_candidate_drop = out.hits.len < result.hits.len;
+        if ((late_visibility_paginate or group_chunk_parents or
+            (executor.filter_candidate_presence and observed_candidate_drop)) and !candidates_exhausted)
+        {
             out.total_hits = visible_candidate_count;
             out.total_hits_relation = .gte;
         }
@@ -11878,7 +11891,7 @@ pub fn searchTextQuery(
             } else {
                 try sortAndPageSearchResultInPlace(&out, effective_req, executor.ctx, executor.load_stored, field_sort_plan, null);
             }
-        } else if ((late_visibility_paginate or group_chunk_parents) and !effective_req.count_only) {
+        } else if ((late_visibility_paginate or group_chunk_parents or executor.filter_candidate_presence) and !effective_req.count_only) {
             try paginateSearchResultInPlace(&out, effective_req.offset, effective_req.limit);
         }
         if (!requires_field_sort and !effective_req.count_only and collect_score_profile) {
@@ -12997,7 +13010,7 @@ fn searchDenseInternal(
         postprocess_req.resolved_doc_filter_owned = req.resolved_doc_filter_owned;
     }
     const expansive_postprocessing = group_chunk_parents or unresolved_stored_filters;
-    const full_candidate_window = expansive_postprocessing or multi_source_members;
+    const full_candidate_window = expansive_postprocessing or multi_source_members or executor.filter_candidate_presence;
     const page_candidate_window = pagingCandidateWindow(paging);
     const score_order_k = scoreOrderCandidateWindowK(dense.k, paging);
     const effort = resolvedSearchEffort(req.search_effort);
@@ -13042,7 +13055,7 @@ fn searchDenseInternal(
         // Only pay for active-membership verification when the broad exclusion
         // could make this candidate window exhaustive. The common large-table
         // top-k path remains an O(tombstones) mapping plus the normal HBC query.
-        if (!full_candidate_window and score_order_k >= bounded_full_candidate_count - coarse_excluded) {
+        if (!expansive_postprocessing and !multi_source_members and score_order_k >= bounded_full_candidate_count - coarse_excluded) {
             const active_excluded = try countActiveDenseVectorIdsAlloc(
                 alloc,
                 entry,
@@ -13072,7 +13085,7 @@ fn searchDenseInternal(
         // too-small leaf budget and can miss additional source groups.
         const resolved_search_width = resolveSearchWidth(hbc_effective_k, effort, index_stats);
         profile.resolved_search_width = resolved_search_width;
-        const exhaustive_broad_live_window = !full_candidate_window and
+        const exhaustive_broad_live_window = !expansive_postprocessing and !multi_source_members and
             native_constraints.broad_live_exclude_ids.len > 0 and
             hbc_effective_k >= bounded_full_candidate_count;
         const hbc_req: vectorindex_mod.SearchRequest = .{
@@ -13458,7 +13471,7 @@ fn searchDenseInternal(
             candidate_tail_score,
             !candidate_window_incomplete,
         );
-        const needs_more_visible_candidates = unresolved_stored_filters and visible_candidate_count < page_candidate_window;
+        const needs_more_visible_candidates = (unresolved_stored_filters or executor.filter_candidate_presence) and visible_candidate_count < page_candidate_window;
         const needs_more_multi_source_candidates = multi_source_members and visible_candidate_count < page_candidate_window;
         if (full_candidate_window and
             candidate_window_incomplete and
@@ -15131,7 +15144,7 @@ pub fn searchSparse(
         postprocess_req.resolved_doc_filter_owned = req.resolved_doc_filter_owned;
     }
     const expansive_postprocessing = group_chunk_parents or unresolved_stored_filters;
-    const full_candidate_window = expansive_postprocessing or multi_source_members;
+    const full_candidate_window = expansive_postprocessing or multi_source_members or executor.filter_candidate_presence;
     const bounded_sparse_candidate_count: u64 = if (native_constraints.positive_filter)
         @as(u64, native_constraints.filter_doc_ids.len) +| @as(u64, native_constraints.filter_doc_nums.len)
     else
@@ -15282,7 +15295,7 @@ pub fn searchSparse(
             candidate_tail_score,
             !candidate_window_incomplete,
         );
-        const needs_more_visible_candidates = unresolved_stored_filters and visible_candidate_count < pagingCandidateWindow(paging);
+        const needs_more_visible_candidates = (unresolved_stored_filters or executor.filter_candidate_presence) and visible_candidate_count < pagingCandidateWindow(paging);
         const needs_more_multi_source_candidates = multi_source_members and visible_candidate_count < pagingCandidateWindow(paging);
         if (full_candidate_window and
             candidate_window_incomplete and

@@ -47708,6 +47708,7 @@ pub const DB = struct {
         const start_ns = platform_time.monotonicNs();
         errdefer observeSearchFailureMetric(metric_name, .search, platform_time.monotonicNs() -| start_ns);
         const result = try db_query_search.searchTextQuery(alloc, execution_req, text_query, .{
+            .filter_candidate_presence = true,
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .text_index_is_chunk_backed = textIndexIsChunkBackedCallback,
@@ -47716,7 +47717,7 @@ pub const DB = struct {
             .project_stored_search = projectStoredBytesForSearchCallback,
             .load_stored = loadStoredSearchDocumentCallback,
             .load_projected_documents = loadProjectedSearchDocumentManyCallback,
-            .is_expired_key = isExpiredDocumentKeyCallback,
+            .is_expired_key = isNonvisibleStoredSearchKeyCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
@@ -47981,7 +47982,7 @@ pub const DB = struct {
         return try db_query_result_shape.postprocessTextSearchResult(alloc, req, raw, chunk_backed, .{
             .ctx = self,
             .is_visible = isVisibleSearchHitCallback,
-            .filter_visible_many = filterVisibleSearchHitsManyCallback,
+            .filter_visible_many = filterStoredSearchCandidatesManyCallback,
             .resolve_parent_id = resolveChunkParentIdCallback,
             .load_parent_stored = loadParentStoredForSearchCallback,
             .load_stored = loadStoredSearchDocumentCallback,
@@ -48516,6 +48517,7 @@ pub const DB = struct {
         if (bench_profile) prove_ns = platform_time.monotonicNs() - prove_start_ns;
         const inner_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         const result = try db_query_search.searchDense(alloc, algebraic_filter.req, dense, .{
+            .filter_candidate_presence = true,
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .dense_index = denseIndexCallback,
@@ -48633,6 +48635,7 @@ pub const DB = struct {
         }
         try self.proveVectorSearchAccessPath(algebraic_filter.req.index_name, .dense_vector, hasNativeDocIdConstraints(algebraic_filter.req));
         const profiled = db_query_search.searchDenseProfiled(alloc, algebraic_filter.req, dense, .{
+            .filter_candidate_presence = true,
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .dense_index = denseIndexCallback,
@@ -48698,6 +48701,7 @@ pub const DB = struct {
         if (bench_profile) prove_ns = platform_time.monotonicNs() - prove_start_ns;
         const inner_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         const result = try db_query_search.searchSparse(alloc, algebraic_filter.req, sparse, .{
+            .filter_candidate_presence = true,
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .sparse_index = sparseIndexCallback,
@@ -49483,7 +49487,7 @@ pub const DB = struct {
             });
         }
         fn executor(self: *@This()) db_query_search.DenseSearchExecutor {
-            return .{ .ctx = self, .text_index_entry = text, .dense_index = index, .lookup_doc_key = key, .lookup_vector_id = vectorId, .all_docs_visible_fast = allVisible, .load_projected_document = projected, .hbc_search = @This().search, .hbc_search_profiled = profiled, .postprocess = postprocess };
+            return .{ .filter_candidate_presence = true, .ctx = self, .text_index_entry = text, .dense_index = index, .lookup_doc_key = key, .lookup_vector_id = vectorId, .all_docs_visible_fast = allVisible, .load_projected_document = projected, .hbc_search = @This().search, .hbc_search_profiled = profiled, .postprocess = postprocess };
         }
     };
 
@@ -49794,7 +49798,7 @@ pub const DB = struct {
         return try db_query_result_shape.postprocessVectorSearchResult(alloc, req, raw, chunk_backed, .{
             .ctx = self,
             .is_visible = if (chunk_backed) isVisibleSearchHitCallback else isVisibleNonChunkSearchHitCallback,
-            .filter_visible_many = filterVisibleSearchHitsManyCallback,
+            .filter_visible_many = filterStoredSearchCandidatesManyCallback,
             .resolve_parent_id = resolveChunkParentIdCallback,
             .load_parent_stored = loadParentStoredForSearchCallback,
             .load_stored = loadStoredSearchDocumentCallback,
@@ -49821,7 +49825,7 @@ pub const DB = struct {
             .load_projected_documents = loadProjectedSearchDocumentManyCallback,
             .load_stored = loadStoredSearchDocumentCallback,
             .load_many_stored = loadStoredSearchDocumentManyCallback,
-            .is_expired_key = isExpiredDocumentKeyCallback,
+            .is_expired_key = isNonvisibleStoredSearchKeyCallback,
         });
     }
 
@@ -62609,6 +62613,40 @@ fn loadDocumentTimestampsMany(self: *DB, alloc: Allocator, keys: []const []const
     return timestamps;
 }
 
+fn filterPresentSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.SearchHit) ![]bool {
+    const keep = try alloc.alloc(bool, hits.len);
+    errdefer alloc.free(keep);
+    @memset(keep, true);
+    if (hits.len == 0) return keep;
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const ProbeKey = struct { key: []const u8, hit_index: usize };
+    var pending = std.ArrayListUnmanaged(ProbeKey).empty;
+    // Probe each member's own row. Ancestor hydration may belong to another
+    // range; an absent local source/unit is not proof this member is missing.
+    for (hits, 0..) |hit, i| {
+        try pending.append(scratch, .{ .key = try encodeStoreLookupKeyAlloc(self, scratch, hit.id), .hit_index = i });
+    }
+    std.mem.sort(ProbeKey, pending.items, {}, struct {
+        fn lessThan(_: void, a: ProbeKey, b: ProbeKey) bool {
+            return std.mem.order(u8, a.key, b.key) == .lt;
+        }
+    }.lessThan);
+    const keys = try scratch.alloc([]const u8, pending.items.len);
+    const values = try scratch.alloc(?[]const u8, pending.items.len);
+    @memset(values, null);
+    for (pending.items, 0..) |item, i| keys[i] = item.key;
+    var txn = try self.core.store.beginProbeTxn();
+    defer txn.abort();
+    try txn.getManySorted(keys, values);
+    for (pending.items, values) |item, value| if (value == null) {
+        keep[item.hit_index] = false;
+    };
+    return keep;
+}
+
 fn filterVisibleSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.SearchHit) ![]bool {
     const keep = try alloc.alloc(bool, hits.len);
     errdefer alloc.free(keep);
@@ -62711,6 +62749,23 @@ fn isVisibleSearchHitCallback(
 ) anyerror!bool {
     const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
     return try isVisibleSearchHit(self, alloc, hit);
+}
+
+// Derived text/vector candidates must have primary rows before grouping
+// or paging. Graph-only vertices retain their separate visibility contract.
+fn filterStoredSearchCandidatesManyCallback(
+    ctx: ?*anyopaque,
+    alloc: Allocator,
+    hits: []const types.SearchHit,
+) anyerror![]bool {
+    const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    const present = try filterPresentSearchHitsMany(self, alloc, hits);
+    errdefer alloc.free(present);
+    if (ttlDurationNs(self) == 0) return present;
+    const visible = try filterVisibleSearchHitsMany(self, alloc, hits);
+    defer alloc.free(visible);
+    for (present, visible) |*keep, live| keep.* = keep.* and live;
+    return present;
 }
 
 fn filterVisibleSearchHitsManyCallback(
@@ -63222,6 +63277,25 @@ fn isExpiredDocumentKeyCallback(
     key: []const u8,
 ) anyerror!bool {
     const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    return try isExpiredDocumentKey(self, alloc, key);
+}
+
+fn isNonvisibleStoredSearchKeyCallback(
+    ctx: ?*anyopaque,
+    alloc: Allocator,
+    key: []const u8,
+) anyerror!bool {
+    const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    const store_key = try encodeStoreLookupKeyAlloc(self, alloc, key);
+    defer alloc.free(store_key);
+    {
+        var txn = try self.core.store.beginProbeTxn();
+        defer txn.abort();
+        _ = txn.get(store_key) catch |err| switch (err) {
+            error.NotFound => return true,
+            else => return err,
+        };
+    }
     return try isExpiredDocumentKey(self, alloc, key);
 }
 
@@ -106300,10 +106374,13 @@ test "db query drops full text hits whose stored document row was deleted direct
         .config_json = "{}",
     });
 
+    try db.addIndex(.{ .name = "dv_rows", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}" });
+    try db.addIndex(.{ .name = "sp_rows", .kind = .sparse_vector, .config_json = "{\"field\":\"sparse\"}" });
+
     try db.batch(.{
         .writes = &.{
-            .{ .key = "doc:a", .value = "{\"body\":\"alpha beta gamma\"}" },
-            .{ .key = "doc:b", .value = "{\"body\":\"alpha delta epsilon\"}" },
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha beta gamma\",\"embedding\":[0,0],\"sparse\":{\"indices\":[1],\"values\":[5]}}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"alpha delta epsilon\",\"embedding\":[1,0],\"sparse\":{\"indices\":[1],\"values\":[4]}}" },
         },
         .sync_level = .full_index,
     });
@@ -106334,6 +106411,73 @@ test "db query drops full text hits whose stored document row was deleted direct
     // stored row, the same end state left by #929's enrichment-delete +
     // reprocess sequence (or a crash mid-purge).
     try db.core.store.delete(orphaned_doc_key);
+
+    // A child range can own a member while source/unit hydration is remote.
+    const remote_member_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc:remote", "remote_chunks", "document:000001", 0);
+    defer alloc.free(remote_member_key);
+    try db.core.store.put(remote_member_key, "{}");
+    defer db.core.store.delete(remote_member_key) catch {};
+
+    const PresenceAllocationCheck = struct {
+        fn run(test_alloc: Allocator, active_db: *DB, remote_key: []u8) !void {
+            const keep = try filterPresentSearchHitsMany(active_db, test_alloc, &.{
+                .{ .id = @constCast("doc:a") },
+                .{ .id = @constCast("doc:b") },
+                .{ .id = remote_key },
+            });
+            defer test_alloc.free(keep);
+            try std.testing.expectEqualSlices(bool, &.{ false, true, true }, keep);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, PresenceAllocationCheck.run, .{ &db, remote_member_key });
+
+    // Presence is a candidate visibility rule, including IDs-only and count
+    // requests. Apply it before offset/limit, and refill an orphaned top hit.
+    for ([_]bool{ false, true }) |include_stored| {
+        for ([_]types.TextQuery{ .{ .match_all = {} }, .{ .match = .{ .field = "body", .text = "alpha" } } }) |query| {
+            var page = try db.search(alloc, .{ .index_name = "ft_rows", .full_text = query, .include_stored = include_stored, .limit = 1 });
+            defer page.deinit();
+            try std.testing.expectEqual(@as(usize, 1), page.hits.len);
+            try std.testing.expectEqualStrings("doc:b", page.hits[0].id);
+            try std.testing.expectEqual(@as(u32, 1), page.total_hits);
+            var after = try db.search(alloc, .{ .index_name = "ft_rows", .full_text = query, .include_stored = include_stored, .offset = 1, .limit = 1 });
+            defer after.deinit();
+            try std.testing.expectEqual(@as(usize, 0), after.hits.len);
+            try std.testing.expectEqual(@as(u32, 1), after.total_hits);
+            var count = try db.search(alloc, .{ .index_name = "ft_rows", .full_text = query, .count_only = true });
+            defer count.deinit();
+            try std.testing.expectEqual(@as(u32, 1), count.total_hits);
+        }
+    }
+
+    for ([_]bool{ false, true }) |include_stored| {
+        for ([_]bool{ false, true }) |is_sparse| {
+            var req: types.SearchRequest = .{ .index_name = if (is_sparse) "sp_rows" else "dv_rows", .include_stored = include_stored, .limit = 1 };
+            if (is_sparse) req.query = .{ .sparse_knn = .{ .indices = &.{1}, .values = &.{1}, .k = 1 } } else req.dense = .{ .vector = &.{ 0, 0 }, .k = 1 };
+            var page = try db.search(alloc, req);
+            defer page.deinit();
+            try std.testing.expectEqual(@as(usize, 1), page.hits.len);
+            try std.testing.expectEqualStrings("doc:b", page.hits[0].id);
+            req.offset = 1;
+            var after = try db.search(alloc, req);
+            defer after.deinit();
+            try std.testing.expectEqual(@as(usize, 0), after.hits.len);
+        }
+    }
+
+    for ([_]bool{ false, true }) |include_stored| {
+        var sorted = try db.search(alloc, .{
+            .index_name = "ft_rows",
+            .full_text = .{ .match_all = {} },
+            .order_by = &.{.{ .field = "_id" }},
+            .include_stored = include_stored,
+            .limit = 1,
+        });
+        defer sorted.deinit();
+        try std.testing.expectEqual(@as(usize, 1), sorted.hits.len);
+        try std.testing.expectEqualStrings("doc:b", sorted.hits[0].id);
+        try std.testing.expectEqual(@as(u32, 1), sorted.total_hits);
+    }
 
     // A term unique to the now-orphaned row must come back empty, not fail
     // the query (matches the issue's `query {"query": "harbor"} -> 500`).
@@ -106887,6 +107031,30 @@ test "db document extraction chunks units through source artifact enrichment" {
     defer alloc.free(refreshed_dense_artifact_payload);
     const refreshed_sparse_artifact_payload = try db.core.store.get(alloc, sparse_artifact_key);
     defer alloc.free(refreshed_sparse_artifact_payload);
+
+    // A live source/unit must not resurrect an orphaned member when grouped.
+    // Presence applies to the raw member before either grouping or hydration.
+    try db.core.store.delete(chunk_key);
+    for (std.enums.values(types.ReturnMode)) |mode| {
+        for ([_]bool{ false, true }) |include_stored| {
+            var missing = try db.search(alloc, .{
+                .index_name = "ft_document_chunks",
+                .full_text = .{ .match = .{ .field = "text", .text = "delta" } },
+                .return_mode = mode,
+                .include_stored = include_stored,
+                .limit = 1,
+            });
+            defer missing.deinit();
+            try std.testing.expectEqual(@as(usize, 0), missing.hits.len);
+            try std.testing.expectEqual(@as(u32, 0), missing.total_hits);
+        }
+    }
+    var missing_dense = try db.search(alloc, .{ .index_name = "document_vectors", .dense = .{ .vector = query_vec, .k = 1 }, .limit = 1, .include_stored = false });
+    defer missing_dense.deinit();
+    try std.testing.expectEqual(@as(usize, 0), missing_dense.hits.len);
+    var missing_sparse = try db.search(alloc, .{ .index_name = "document_chunk_sparse_v1", .query = .{ .sparse_knn = .{ .indices = sparse_query.indices, .values = sparse_query.values, .k = 1 } }, .limit = 1, .include_stored = false });
+    defer missing_sparse.deinit();
+    try std.testing.expectEqual(@as(usize, 0), missing_sparse.hits.len);
 
     try db.batch(.{
         .writes = &.{.{

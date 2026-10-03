@@ -22504,7 +22504,7 @@ pub const IndexManager = struct {
             // segments so producer admission always has a merge in flight to
             // wait on instead of retrying TextMergeBackpressureTimeout
             // against a scheduler that gave up.
-            if (infos.items.len <= policy.max_segments_per_tier) return null;
+            if (snap.segments.len <= policy.max_segments_per_tier) return null;
             self.text_merge_scheduler.forced_drains += 1;
             break :blk try text_index_maintenance.planForceDrainFromInfos(
                 self.alloc,
@@ -46155,4 +46155,67 @@ test "graph artifact rebuild lease drains scheduler pins and excludes new snapsh
     while (!pending.acquired.load(.acquire)) @import("antfly_platform").time.yieldNow();
     try std.testing.expect(!manager.catalog_mutex.tryLockShared());
     pending.release.store(true, .release);
+}
+
+test "text force drain schedules policy misses above the tier target" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    setBenchmarkTextMergePolicyOverride(.{ .max_segments_per_tier = 10, .max_segment_size = 1, .floor_segment_size = 0 });
+    defer setBenchmarkTextMergePolicyOverride(null);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    {
+        var manager = try IndexManager.initWithOptions(alloc, path, .{});
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addAllNoBackfill(&store, &.{.{ .name = "ft_v1", .kind = .full_text, .config_json = "{\"field\":\"title\"}" }});
+        const opts: IndexBatchOptions = .{ .compact_text = false, .compact_text_segment_threshold = 2, .defer_text_compaction = true };
+        for (0..12) |i| {
+            const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
+            defer alloc.free(key);
+            const value = try std.fmt.allocPrint(alloc, "{{\"title\":\"force drain {d}\"}}", .{i});
+            defer alloc.free(value);
+            try store.putBatch(&.{.{ .key = key, .value = value }}, &.{});
+            try manager.indexTextBatchByNameWithOptions(&store, "ft_v1", &.{.{ .key = key, .value = value }}, opts);
+            if (i == 0) {
+                // Every source fits individually, but no pair fits the ordinary
+                // plan. A wider bounded merge can still compact their shared
+                // section overhead and reduce the segment count.
+                const first = manager.textIndexEntry("ft_v1").?.persistent.snapshot().segments[0];
+                const source_bytes = first.data.bytes().len;
+                setBenchmarkTextMergePolicyOverride(.{ .max_segments_per_tier = 10, .max_segment_size = source_bytes + source_bytes / 2, .floor_segment_size = 0 });
+            }
+        }
+        const entry = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
+        try std.testing.expectEqual(@as(usize, 12), entry.persistent.snapshot().segments.len);
+        try std.testing.expect(entry.compaction_pending.load(.acquire));
+        if (try manager.beginTextMergeTask()) |returned| {
+            var task = returned;
+            defer task.deinit(alloc);
+            manager.cancelTextMergeTask(&task);
+        } else return error.ForceDrainWasNotScheduled;
+    }
+    // Reopen must discover the same debt even though no ordinary plan fits.
+    var reopened = try IndexManager.initWithOptions(alloc, path, .{});
+    defer reopened.deinit();
+    reopened.updateRange(.{ .start = "", .end = "" });
+    try reopened.load(&store);
+    const reopened_entry = reopened.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
+    try std.testing.expect(reopened_entry.compaction_pending.load(.acquire));
+    var task = (try reopened.beginTextMergeTask()) orelse return error.ForceDrainWasNotScheduled;
+    defer task.deinit(alloc);
+    try std.testing.expect(task.source.len >= 2);
+    var result = try IndexManager.executeTextMergeTask(alloc, &task);
+    defer result.deinit(alloc);
+    try std.testing.expect(try reopened.finishTextMergeTask(&task, &result));
+    try std.testing.expect(reopened_entry.persistent.snapshot().segments.len < 12);
+    // A tier target that already covers all segments must still go idle.
+    setBenchmarkTextMergePolicyOverride(.{ .max_segments_per_tier = 20, .max_segment_size = 1, .floor_segment_size = 0 });
+    try std.testing.expect((try reopened.beginTextMergeTask()) == null);
+    try std.testing.expect(!reopened_entry.compaction_pending.load(.acquire));
 }
