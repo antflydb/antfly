@@ -1297,7 +1297,7 @@ fn addressToPosix(address: Address, storage: *PosixAddress) posix.socklen_t {
         .ip4 => |ip4| {
             storage.in = .{
                 .port = std.mem.nativeToBig(u16, ip4.port),
-                .addr = @bitCast(ip4.bytes),
+                .addr = std.mem.bytesToValue(u32, &ip4.bytes),
             };
             return @sizeOf(posix.sockaddr.in);
         },
@@ -1317,7 +1317,7 @@ fn addressFromPosix(storage: *const PosixAddress) Address {
     return switch (storage.any.family) {
         posix.AF.INET => .{ .ip4 = .{
             .port = std.mem.bigToNative(u16, storage.in.port),
-            .bytes = @bitCast(storage.in.addr),
+            .bytes = std.mem.toBytes(storage.in.addr),
         } },
         posix.AF.INET6 => .{ .ip6 = .{
             .port = std.mem.bigToNative(u16, storage.in6.port),

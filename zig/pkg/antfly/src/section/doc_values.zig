@@ -85,7 +85,7 @@ pub const DocValuesWriter = struct {
         const num_chunks: u32 = if (num_entries == 0) 0 else (num_entries - 1) / self.chunk_size + 1;
 
         // Write num_chunks
-        try out.appendSlice(self.alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, num_chunks))));
+        try out.appendSlice(self.alloc, &@as([4]u8, @bitCast(@as(u32, num_chunks))));
 
         // Reserve space for chunk offset table
         const offset_table_start = out.items.len;
@@ -107,11 +107,11 @@ pub const DocValuesWriter = struct {
 
             // numDocs in chunk
             const chunk_docs: u32 = @intCast(chunk_entries.len);
-            try chunk_buf.appendSlice(self.alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, chunk_docs))));
+            try chunk_buf.appendSlice(self.alloc, &@as([4]u8, @bitCast(@as(u32, chunk_docs))));
 
             for (chunk_entries) |*e| {
-                try chunk_buf.appendSlice(self.alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, e.doc_id))));
-                try chunk_buf.appendSlice(self.alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(e.value.len))))));
+                try chunk_buf.appendSlice(self.alloc, &@as([4]u8, @bitCast(@as(u32, e.doc_id))));
+                try chunk_buf.appendSlice(self.alloc, &@as([4]u8, @bitCast(@as(u32, @as(u32, @intCast(e.value.len))))));
                 try chunk_buf.appendSlice(self.alloc, e.value);
             }
 
@@ -123,7 +123,7 @@ pub const DocValuesWriter = struct {
             // Record chunk end offset (relative to data_start)
             const chunk_end_offset: u64 = out.items.len - data_start;
             const off_pos = offset_table_start + chunk_idx * 8;
-            out.items[off_pos..][0..8].* = @bitCast(std.mem.nativeToLittle(u64, chunk_end_offset));
+            out.items[off_pos..][0..8].* = @bitCast(@as(u64, chunk_end_offset));
 
             entry_idx = chunk_end;
         }

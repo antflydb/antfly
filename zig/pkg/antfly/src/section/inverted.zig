@@ -359,12 +359,12 @@ fn writeCurrentHeader(
     std.debug.assert(dst.len >= v7_header_size);
     @memcpy(dst[0..4], "INVT");
     dst[4] = version;
-    dst[5..9].* = @bitCast(std.mem.nativeToLittle(u32, doc_count));
-    dst[9..17].* = @bitCast(std.mem.nativeToLittle(u64, total_field_len));
-    dst[17..21].* = @bitCast(std.mem.nativeToLittle(u32, chunk_size));
-    dst[21..25].* = @bitCast(std.mem.nativeToLittle(u32, fst_len));
-    dst[25..29].* = @bitCast(std.mem.nativeToLittle(u32, bloom_len));
-    dst[29..33].* = @bitCast(std.mem.nativeToLittle(u32, norms_len));
+    dst[5..9].* = @bitCast(@as(u32, doc_count));
+    dst[9..17].* = @bitCast(@as(u64, total_field_len));
+    dst[17..21].* = @bitCast(@as(u32, chunk_size));
+    dst[21..25].* = @bitCast(@as(u32, fst_len));
+    dst[25..29].* = @bitCast(@as(u32, bloom_len));
+    dst[29..33].* = @bitCast(@as(u32, norms_len));
 }
 
 // ============================================================================
@@ -452,7 +452,7 @@ pub const InvertedIndexBuildProfile = struct {
 };
 
 fn appendLeU32(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u32) !void {
-    try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, value))));
+    try out.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, value))));
 }
 
 fn commonPrefixLen(a: []const u8, b: []const u8) usize {
@@ -1242,11 +1242,11 @@ fn appendPostingSkipData(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), chu
     var chunk_index: usize = postings_skip_stride_chunks;
     while (chunk_index < chunks.len) : (chunk_index += postings_skip_stride_chunks) {
         const boundary = chunks[chunk_index - 1];
-        try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, boundary.max_doc))));
-        try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(chunk_index))))));
-        try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, boundary.chunk_id))));
+        try out.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, boundary.max_doc))));
+        try out.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, @as(u32, @intCast(chunk_index))))));
+        try out.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, boundary.chunk_id))));
         const payload_end = boundary.doc_ctrl_off + boundary.doc_ctrl_len;
-        try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, payload_end))));
+        try out.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, payload_end))));
     }
 }
 
@@ -4581,16 +4581,16 @@ fn remapSingleContributorPostings(
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
 
-    try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, postings.doc_freq))));
-    try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(bitmap_bytes.len))))));
+    try out.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, postings.doc_freq))));
+    try out.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, @as(u32, @intCast(bitmap_bytes.len))))));
     try out.appendSlice(alloc, bitmap_bytes);
-    try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(freq_norm_bytes.len))))));
+    try out.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, @as(u32, @intCast(freq_norm_bytes.len))))));
     try out.appendSlice(alloc, freq_norm_bytes);
-    try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, num_chunks))));
+    try out.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, num_chunks))));
     try out.appendSlice(alloc, block_max_meta);
 
     const positions_len: u32 = if (postings.positions_data) |pd| @intCast(pd.len) else 0;
-    try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, positions_len))));
+    try out.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, positions_len))));
     if (postings.positions_data) |pd| {
         try out.appendSlice(alloc, pd);
     }
@@ -4645,9 +4645,9 @@ fn shiftBlockMaxWholeChunks(
     const out = try alloc.alloc(u8, @as(usize, num_chunks) * 6);
     for (0..num_chunks) |chunk_idx| {
         const base = chunk_idx * 6;
-        out[base..][0..2].* = @bitCast(std.mem.nativeToLittle(u16, 0));
-        out[base + 2 ..][0..2].* = @bitCast(std.mem.nativeToLittle(u16, std.math.maxInt(u16)));
-        out[base + 4 ..][0..2].* = @bitCast(std.mem.nativeToLittle(u16, 0));
+        out[base..][0..2].* = @bitCast(@as(u16, 0));
+        out[base + 2 ..][0..2].* = @bitCast(@as(u16, std.math.maxInt(u16)));
+        out[base + 4 ..][0..2].* = @bitCast(@as(u16, 0));
     }
     if (postings.block_max) |bm| {
         const dst_off = @as(usize, chunk_delta) * 6;
@@ -4702,9 +4702,9 @@ fn rebuildShiftedBlockMax(
 
     for (0..num_chunks) |chunk_idx| {
         const base = chunk_idx * 6;
-        out[base..][0..2].* = @bitCast(std.mem.nativeToLittle(u16, chunk_max_freq[chunk_idx]));
-        out[base + 2 ..][0..2].* = @bitCast(std.mem.nativeToLittle(u16, chunk_min_norm[chunk_idx]));
-        out[base + 4 ..][0..2].* = @bitCast(std.mem.nativeToLittle(u16, chunk_max_norm[chunk_idx]));
+        out[base..][0..2].* = @bitCast(@as(u16, chunk_max_freq[chunk_idx]));
+        out[base + 2 ..][0..2].* = @bitCast(@as(u16, chunk_min_norm[chunk_idx]));
+        out[base + 4 ..][0..2].* = @bitCast(@as(u16, chunk_max_norm[chunk_idx]));
     }
 
     return out;
@@ -7104,10 +7104,10 @@ test "legacy section versions are rejected by current reader" {
     defer alloc.free(section);
     @memcpy(section[0..4], "INVT");
     section[4] = 5;
-    section[5..9].* = @bitCast(std.mem.nativeToLittle(u32, @as(u32, 2)));
-    section[9..17].* = @bitCast(std.mem.nativeToLittle(u64, @as(u64, 3)));
-    section[17..21].* = @bitCast(std.mem.nativeToLittle(u32, @as(u32, 1024)));
-    section[21..25].* = @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(fst_bytes.len))));
+    section[5..9].* = @bitCast(@as(u32, @as(u32, 2)));
+    section[9..17].* = @bitCast(@as(u64, @as(u64, 3)));
+    section[17..21].* = @bitCast(@as(u32, @as(u32, 1024)));
+    section[21..25].* = @bitCast(@as(u32, @as(u32, @intCast(fst_bytes.len))));
     @memcpy(section[25..][0..fst_bytes.len], fst_bytes);
 
     try std.testing.expectError(error.UnsupportedVersion, InvertedIndexReader.init(alloc, section));
@@ -7144,8 +7144,8 @@ test "current reader reopens origin-main v23 postings and block-max layout" {
         const dst = current_block_max_start + chunk_idx * 6;
         @memcpy(expanded[dst..][0..2], current[src..][0..2]);
         const norm: u16 = @intCast(fieldNormFromId(current[src + 2]));
-        expanded[dst + 2 ..][0..2].* = @bitCast(std.mem.nativeToLittle(u16, norm));
-        expanded[dst + 4 ..][0..2].* = @bitCast(std.mem.nativeToLittle(u16, norm));
+        expanded[dst + 2 ..][0..2].* = @bitCast(@as(u16, norm));
+        expanded[dst + 4 ..][0..2].* = @bitCast(@as(u16, norm));
     }
     const current_block_max_end = current_block_max_start + @as(usize, stored_chunks) * 3;
     const legacy_block_max_end = current_block_max_start + @as(usize, stored_chunks) * 6;

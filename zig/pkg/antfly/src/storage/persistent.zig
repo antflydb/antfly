@@ -3507,10 +3507,10 @@ pub const PersistentIndex = struct {
         const range_key = segmentRangeMetaKey(seg_id);
         var buf = try alloc.alloc(u8, 8 + key_range.min_doc_key.len + key_range.max_doc_key.len);
         defer alloc.free(buf);
-        buf[0..4].* = @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(key_range.min_doc_key.len))));
+        buf[0..4].* = @bitCast(@as(u32, @as(u32, @intCast(key_range.min_doc_key.len))));
         @memcpy(buf[4..][0..key_range.min_doc_key.len], key_range.min_doc_key);
         const max_off = 4 + key_range.min_doc_key.len;
-        buf[max_off..][0..4].* = @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(key_range.max_doc_key.len))));
+        buf[max_off..][0..4].* = @bitCast(@as(u32, @as(u32, @intCast(key_range.max_doc_key.len))));
         @memcpy(buf[max_off + 4 ..][0..key_range.max_doc_key.len], key_range.max_doc_key);
         try txn.put(.meta, &range_key, buf);
     }

@@ -57,6 +57,25 @@ currently live under `pkg/inference/`.
   support and exposes flags such as `-Dmetal=...`, `-Dcuda=...`, and
   `-Donnx=...`.
 
+The [0.17 release notes](https://ziglang.org/download/0.17.0/release-notes.html)
+also describe changes that can compile successfully while changing behavior:
+
+- Array/vector `@bitCast` now uses logical bits independently of host byte
+  order. Binary encoders must not combine array bitcasts with `nativeToLittle`
+  or `nativeToBig`; use explicit `std.mem.writeInt` byte order, or logical
+  bitcasts with `@byteSwap` for big-endian output. Protobuf and HBC key tests
+  evaluate real encoders at compile time so cross-compilation checks bytes too.
+- Stack-first allocations use the release's `std.heap.BufferFirstAllocator`
+  with caller-owned, aligned buffers. The release notes call this redesigned
+  API `StackFallbackAllocator`.
+- Configure-time macOS SDK discovery through `xcrun` poisons the configuration
+  cache so switching Xcode cannot silently retain a previous SDK path.
+- LLVM loop vectorization remains disabled in 0.17. Keep explicit SIMD kernels
+  and benchmark inference performance before attributing changes to the upgrade.
+- Incremental compilation with `-fincremental --watch` is an optional Linux
+  x86_64 development workflow. Release/qualification builds retain their
+  existing compiler and linker settings.
+
 ## Common Builds
 
 ```sh

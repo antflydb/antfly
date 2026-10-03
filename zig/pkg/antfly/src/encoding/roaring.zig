@@ -788,19 +788,19 @@ pub const RoaringBitmap = struct {
         var pos: usize = 0;
 
         // Num containers
-        buf[pos..][0..2].* = @bitCast(std.mem.nativeToLittle(u16, @as(u16, @intCast(n))));
+        buf[pos..][0..2].* = @bitCast(@as(u16, @as(u16, @intCast(n))));
         pos += 2;
 
         // Keys
         for (self.keys.items) |k| {
-            buf[pos..][0..2].* = @bitCast(std.mem.nativeToLittle(u16, k));
+            buf[pos..][0..2].* = @bitCast(@as(u16, k));
             pos += 2;
         }
 
         // Cardinalities (stored as card - 1)
         for (self.containers.items) |*c| {
             const card: u16 = @intCast(c.cardinality() - 1);
-            buf[pos..][0..2].* = @bitCast(std.mem.nativeToLittle(u16, card));
+            buf[pos..][0..2].* = @bitCast(@as(u16, card));
             pos += 2;
         }
 
@@ -809,13 +809,13 @@ pub const RoaringBitmap = struct {
             switch (c.*) {
                 .array => |*a| {
                     for (a.items) |v| {
-                        buf[pos..][0..2].* = @bitCast(std.mem.nativeToLittle(u16, v));
+                        buf[pos..][0..2].* = @bitCast(@as(u16, v));
                         pos += 2;
                     }
                 },
                 .bitmap => |b| {
                     for (b) |word| {
-                        buf[pos..][0..8].* = @bitCast(std.mem.nativeToLittle(u64, word));
+                        buf[pos..][0..8].* = @bitCast(@as(u64, word));
                         pos += 8;
                     }
                 },

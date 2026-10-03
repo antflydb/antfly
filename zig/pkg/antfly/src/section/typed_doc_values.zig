@@ -279,7 +279,7 @@ pub const TypedDocValuesWriter = struct {
 
         // Header: value_type + num_chunks
         try out.append(self.alloc, @backingInt(self.value_type));
-        try out.appendSlice(self.alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, num_chunks))));
+        try out.appendSlice(self.alloc, &@as([4]u8, @bitCast(@as(u32, num_chunks))));
 
         // Reserve space for chunk offset table
         const offset_table_start = out.items.len;
@@ -297,11 +297,11 @@ pub const TypedDocValuesWriter = struct {
             defer chunk_data.deinit(self.alloc);
 
             const chunk_doc_count: u32 = @intCast(chunk_entries.len);
-            try chunk_data.appendSlice(self.alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, chunk_doc_count))));
+            try chunk_data.appendSlice(self.alloc, &@as([4]u8, @bitCast(@as(u32, chunk_doc_count))));
 
             // Doc IDs
             for (chunk_entries) |e| {
-                try chunk_data.appendSlice(self.alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, e.doc_id))));
+                try chunk_data.appendSlice(self.alloc, &@as([4]u8, @bitCast(@as(u32, e.doc_id))));
             }
 
             // Values (type-specific)
@@ -317,7 +317,7 @@ pub const TypedDocValuesWriter = struct {
             // Write chunk end offset
             const chunk_end: u64 = @intCast(out.items.len);
             const off_pos = offset_table_start + chunk_idx * 8;
-            out.items[off_pos..][0..8].* = @bitCast(std.mem.nativeToLittle(u64, chunk_end));
+            out.items[off_pos..][0..8].* = @bitCast(@as(u64, chunk_end));
         }
 
         return try self.alloc.dupe(u8, out.items);
@@ -327,11 +327,11 @@ pub const TypedDocValuesWriter = struct {
         switch (self.value_type) {
             .u64_val => {
                 const v = value.u64_val;
-                try out.appendSlice(self.alloc, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, v))));
+                try out.appendSlice(self.alloc, &@as([8]u8, @bitCast(@as(u64, v))));
             },
             .i64_val => {
                 const v = value.i64_val;
-                try out.appendSlice(self.alloc, &@as([8]u8, @bitCast(std.mem.nativeToLittle(i64, v))));
+                try out.appendSlice(self.alloc, &@as([8]u8, @bitCast(@as(i64, v))));
             },
             .f64_val => {
                 const v = value.f64_val;
@@ -348,17 +348,17 @@ pub const TypedDocValuesWriter = struct {
             .bytes_val => {
                 const bytes = value.bytes_val;
                 const len: u32 = @intCast(bytes.len);
-                try out.appendSlice(self.alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, len))));
+                try out.appendSlice(self.alloc, &@as([4]u8, @bitCast(@as(u32, len))));
                 try out.appendSlice(self.alloc, bytes);
             },
             .numeric_val => switch (value.numeric_val) {
                 .u64_val => |v| {
                     try out.append(self.alloc, 0);
-                    try out.appendSlice(self.alloc, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, v))));
+                    try out.appendSlice(self.alloc, &@as([8]u8, @bitCast(@as(u64, v))));
                 },
                 .i64_val => |v| {
                     try out.append(self.alloc, 1);
-                    try out.appendSlice(self.alloc, &@as([8]u8, @bitCast(std.mem.nativeToLittle(i64, v))));
+                    try out.appendSlice(self.alloc, &@as([8]u8, @bitCast(@as(i64, v))));
                 },
                 .f64_val => |v| {
                     try out.append(self.alloc, 2);
@@ -791,8 +791,8 @@ fn decodeNumericValue(raw: [9]u8) !NumericValue {
 fn buildSingleDocFixedSectionAlloc(alloc: Allocator, value_type: ValueType, doc_id: u32, value_bytes: []const u8) ![]u8 {
     var chunk = std.ArrayListUnmanaged(u8).empty;
     defer chunk.deinit(alloc);
-    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 1))));
-    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, doc_id))));
+    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, 1))));
+    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, doc_id))));
     try chunk.appendSlice(alloc, value_bytes);
 
     const compressed = try snappy.encode(alloc, chunk.items);
@@ -801,9 +801,9 @@ fn buildSingleDocFixedSectionAlloc(alloc: Allocator, value_type: ValueType, doc_
     var data = std.ArrayListUnmanaged(u8).empty;
     defer data.deinit(alloc);
     try data.append(alloc, @backingInt(value_type));
-    try data.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 1))));
+    try data.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, 1))));
     const chunk_end: u64 = @intCast(5 + 8 + compressed.len);
-    try data.appendSlice(alloc, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, chunk_end))));
+    try data.appendSlice(alloc, &@as([8]u8, @bitCast(@as(u64, chunk_end))));
     try data.appendSlice(alloc, compressed);
     return try data.toOwnedSlice(alloc);
 }
@@ -951,9 +951,9 @@ test "typed doc values reader rejects malformed bytes value lengths" {
 
     var chunk = std.ArrayListUnmanaged(u8).empty;
     defer chunk.deinit(alloc);
-    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 1))));
-    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 0))));
-    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 8))));
+    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, 1))));
+    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, 0))));
+    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, 8))));
     try chunk.appendSlice(alloc, "abc");
 
     const compressed = try snappy.encode(alloc, chunk.items);
@@ -962,9 +962,9 @@ test "typed doc values reader rejects malformed bytes value lengths" {
     var data = std.ArrayListUnmanaged(u8).empty;
     defer data.deinit(alloc);
     try data.append(alloc, @backingInt(ValueType.bytes_val));
-    try data.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 1))));
+    try data.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, 1))));
     const chunk_end: u64 = @intCast(5 + 8 + compressed.len);
-    try data.appendSlice(alloc, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, chunk_end))));
+    try data.appendSlice(alloc, &@as([8]u8, @bitCast(@as(u64, chunk_end))));
     try data.appendSlice(alloc, compressed);
 
     var reader = try TypedDocValuesReader.init(alloc, data.items);

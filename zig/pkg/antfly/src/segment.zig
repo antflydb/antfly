@@ -441,11 +441,11 @@ pub const SegmentWriter = struct {
             const id_offset: u64 = @intCast(sink.len() - id_bytes_start);
             try sink.appendSlice(doc.id);
             const entry_pos = doc_table_start + i * stored_fields_v4_doc_entry_size;
-            try sink.writeAt(entry_pos, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, id_offset))));
-            try sink.writeAt(entry_pos + 8, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(doc.id.len))))));
+            try sink.writeAt(entry_pos, &@as([8]u8, @bitCast(@as(u64, id_offset))));
+            try sink.writeAt(entry_pos + 8, &@as([4]u8, @bitCast(@as(u32, @as(u32, @intCast(doc.id.len))))));
         }
         const id_bytes_len: u64 = @intCast(sink.len() - id_bytes_start);
-        try sink.writeAt(id_bytes_len_pos, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, id_bytes_len))));
+        try sink.writeAt(id_bytes_len_pos, &@as([8]u8, @bitCast(@as(u64, id_bytes_len))));
 
         const metadata_length: u64 = @intCast(sink.len() - stored_start);
         const data_start = sink.len();
@@ -471,9 +471,9 @@ pub const SegmentWriter = struct {
                 try chunk.appendSlice(self.alloc, raw_data);
 
                 const entry_pos = doc_table_start + doc_index * stored_fields_v4_doc_entry_size;
-                try sink.writeAt(entry_pos + 12, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(block_idx))))));
-                try sink.writeAt(entry_pos + 16, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, doc_offset))));
-                try sink.writeAt(entry_pos + 20, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(raw_data.len))))));
+                try sink.writeAt(entry_pos + 12, &@as([4]u8, @bitCast(@as(u32, @as(u32, @intCast(block_idx))))));
+                try sink.writeAt(entry_pos + 16, &@as([4]u8, @bitCast(@as(u32, doc_offset))));
+                try sink.writeAt(entry_pos + 20, &@as([4]u8, @bitCast(@as(u32, @as(u32, @intCast(raw_data.len))))));
             }
 
             const encode_start = platform_time.monotonicNs();
@@ -484,11 +484,11 @@ pub const SegmentWriter = struct {
             try sink.appendSlice(compressed);
             try sink.writeAt(
                 block_checksums_start + @as(usize, block_idx) * 4,
-                &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, Crc32.hash(compressed)))),
+                &@as([4]u8, @bitCast(@as(u32, Crc32.hash(compressed)))),
             );
 
             const block_end_offset: u64 = @intCast(sink.len() - data_start);
-            try sink.writeAt(block_offsets_start + @as(usize, block_idx) * 8, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, block_end_offset))));
+            try sink.writeAt(block_offsets_start + @as(usize, block_idx) * 8, &@as([8]u8, @bitCast(@as(u64, block_end_offset))));
         }
         return metadata_length;
     }
@@ -1717,13 +1717,13 @@ fn writeMergedStoredFields(alloc: Allocator, sink: *SegmentSink, inputs: []const
             try sink.appendSlice(doc.id);
             const entry_pos = doc_table_start + @as(usize, out_doc_id) * stored_fields_v4_doc_entry_size;
             const id_offset: u64 = @intCast(sink.len() - id_bytes_start - doc.id.len);
-            try sink.writeAt(entry_pos, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, id_offset))));
-            try sink.writeAt(entry_pos + 8, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(doc.id.len))))));
+            try sink.writeAt(entry_pos, &@as([8]u8, @bitCast(@as(u64, id_offset))));
+            try sink.writeAt(entry_pos + 8, &@as([4]u8, @bitCast(@as(u32, @as(u32, @intCast(doc.id.len))))));
             out_doc_id += 1;
         }
     }
     const id_bytes_len: u64 = @intCast(sink.len() - id_bytes_start);
-    try sink.writeAt(id_bytes_len_pos, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, id_bytes_len))));
+    try sink.writeAt(id_bytes_len_pos, &@as([8]u8, @bitCast(@as(u64, id_bytes_len))));
 
     const metadata_length: u64 = @intCast(sink.len() - stored_start);
     const data_start = sink.len();
@@ -1766,9 +1766,9 @@ fn writeMergedStoredFields(alloc: Allocator, sink: *SegmentSink, inputs: []const
             try appendU32LE(alloc, &chunk, @intCast(stored.data.len));
             try chunk.appendSlice(alloc, stored.data);
             const entry_pos = doc_table_start + @as(usize, out_doc_id) * stored_fields_v4_doc_entry_size;
-            try sink.writeAt(entry_pos + 12, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, block_idx))));
-            try sink.writeAt(entry_pos + 16, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, doc_offset))));
-            try sink.writeAt(entry_pos + 20, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(stored.data.len))))));
+            try sink.writeAt(entry_pos + 12, &@as([4]u8, @bitCast(@as(u32, block_idx))));
+            try sink.writeAt(entry_pos + 16, &@as([4]u8, @bitCast(@as(u32, doc_offset))));
+            try sink.writeAt(entry_pos + 20, &@as([4]u8, @bitCast(@as(u32, @as(u32, @intCast(stored.data.len))))));
             out_doc_id += 1;
             docs_in_block += 1;
             doc_id_usize += 1;
@@ -1811,11 +1811,11 @@ fn writeMergedStoredFieldsInOrder(
         try sink.appendSlice(doc.id);
         const entry_pos = doc_table_start + out_doc_id * stored_fields_v4_doc_entry_size;
         const id_offset: u64 = @intCast(sink.len() - id_bytes_start - doc.id.len);
-        try sink.writeAt(entry_pos, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, id_offset))));
-        try sink.writeAt(entry_pos + 8, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(doc.id.len))))));
+        try sink.writeAt(entry_pos, &@as([8]u8, @bitCast(@as(u64, id_offset))));
+        try sink.writeAt(entry_pos + 8, &@as([4]u8, @bitCast(@as(u32, @as(u32, @intCast(doc.id.len))))));
     }
     const id_bytes_len: u64 = @intCast(sink.len() - id_bytes_start);
-    try sink.writeAt(id_bytes_len_pos, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, id_bytes_len))));
+    try sink.writeAt(id_bytes_len_pos, &@as([8]u8, @bitCast(@as(u64, id_bytes_len))));
 
     const metadata_length: u64 = @intCast(sink.len() - stored_start);
     const data_start = sink.len();
@@ -1837,9 +1837,9 @@ fn writeMergedStoredFieldsInOrder(
         try appendU32LE(alloc, &chunk, @intCast(stored.data.len));
         try chunk.appendSlice(alloc, stored.data);
         const entry_pos = doc_table_start + out_doc_id * stored_fields_v4_doc_entry_size;
-        try sink.writeAt(entry_pos + 12, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, block_idx))));
-        try sink.writeAt(entry_pos + 16, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, doc_offset))));
-        try sink.writeAt(entry_pos + 20, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(stored.data.len))))));
+        try sink.writeAt(entry_pos + 12, &@as([4]u8, @bitCast(@as(u32, block_idx))));
+        try sink.writeAt(entry_pos + 16, &@as([4]u8, @bitCast(@as(u32, doc_offset))));
+        try sink.writeAt(entry_pos + 20, &@as([4]u8, @bitCast(@as(u32, @as(u32, @intCast(stored.data.len))))));
         docs_in_block += 1;
     }
     if (chunk.items.len > 0) {
@@ -1925,10 +1925,10 @@ fn flushMergedStoredBlock(
     try sink.appendSlice(compressed);
     try sink.writeAt(
         block_checksums_start + @as(usize, block_idx) * 4,
-        &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, Crc32.hash(compressed)))),
+        &@as([4]u8, @bitCast(@as(u32, Crc32.hash(compressed)))),
     );
     const block_end_offset: u64 = @intCast(sink.len() - data_start);
-    try sink.writeAt(block_offsets_start + @as(usize, block_idx) * 8, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, block_end_offset))));
+    try sink.writeAt(block_offsets_start + @as(usize, block_idx) * 8, &@as([8]u8, @bitCast(@as(u64, block_end_offset))));
     chunk.clearRetainingCapacity();
 }
 
@@ -1954,18 +1954,18 @@ fn copyMergedStoredBlockIfPossible(
     try sink.appendSlice(block);
     try sink.writeAt(
         block_checksums_start + @as(usize, out_block_idx) * 4,
-        &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, block_checksum))),
+        &@as([4]u8, @bitCast(@as(u32, block_checksum))),
     );
     const block_end_offset: u64 = @intCast(sink.len() - data_start);
-    try sink.writeAt(block_offsets_start + @as(usize, out_block_idx) * 8, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, block_end_offset))));
+    try sink.writeAt(block_offsets_start + @as(usize, out_block_idx) * 8, &@as([8]u8, @bitCast(@as(u64, block_end_offset))));
 
     var i: u32 = 0;
     while (i < copied_docs) : (i += 1) {
         const loc = (try reader.v4StoredDocLocation(start_doc_id + i)) orelse return null;
         const entry_pos = doc_table_start + @as(usize, out_doc_id + i) * stored_fields_v4_doc_entry_size;
-        try sink.writeAt(entry_pos + 12, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, out_block_idx))));
-        try sink.writeAt(entry_pos + 16, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(loc.doc_offset))))));
-        try sink.writeAt(entry_pos + 20, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, loc.raw_len))));
+        try sink.writeAt(entry_pos + 12, &@as([4]u8, @bitCast(@as(u32, out_block_idx))));
+        try sink.writeAt(entry_pos + 16, &@as([4]u8, @bitCast(@as(u32, @as(u32, @intCast(loc.doc_offset))))));
+        try sink.writeAt(entry_pos + 20, &@as([4]u8, @bitCast(@as(u32, loc.raw_len))));
     }
 
     return copied_docs;
@@ -2734,51 +2734,51 @@ fn decodeBoundBytesAlloc(alloc: Allocator, data: []const u8, pos: *usize) ![]con
 // ============================================================================
 
 fn appendU16LE(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), val: u16) !void {
-    try out.appendSlice(alloc, &@as([2]u8, @bitCast(std.mem.nativeToLittle(u16, val))));
+    try out.appendSlice(alloc, &@as([2]u8, @bitCast(@as(u16, val))));
 }
 
 fn sinkAppendU16LE(sink: *SegmentSink, val: u16) !void {
-    try sink.appendSlice(&@as([2]u8, @bitCast(std.mem.nativeToLittle(u16, val))));
+    try sink.appendSlice(&@as([2]u8, @bitCast(@as(u16, val))));
 }
 
 fn appendU32LE(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), val: u32) !void {
-    try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, val))));
+    try out.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, val))));
 }
 
 fn sinkAppendU32LE(sink: *SegmentSink, val: u32) !void {
-    try sink.appendSlice(&@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, val))));
+    try sink.appendSlice(&@as([4]u8, @bitCast(@as(u32, val))));
 }
 
 fn appendU64LE(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), val: u64) !void {
-    try out.appendSlice(alloc, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, val))));
+    try out.appendSlice(alloc, &@as([8]u8, @bitCast(@as(u64, val))));
 }
 
 fn sinkAppendU64LE(sink: *SegmentSink, val: u64) !void {
-    try sink.appendSlice(&@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, val))));
+    try sink.appendSlice(&@as([8]u8, @bitCast(@as(u64, val))));
 }
 
 fn appendU16BE(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), val: u16) !void {
-    try out.appendSlice(alloc, &@as([2]u8, @bitCast(std.mem.nativeToBig(u16, val))));
+    try out.appendSlice(alloc, &@as([2]u8, @bitCast(@byteSwap(@as(u16, val)))));
 }
 
 fn sinkAppendU16BE(sink: *SegmentSink, val: u16) !void {
-    try sink.appendSlice(&@as([2]u8, @bitCast(std.mem.nativeToBig(u16, val))));
+    try sink.appendSlice(&@as([2]u8, @bitCast(@byteSwap(@as(u16, val)))));
 }
 
 fn appendU32BE(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), val: u32) !void {
-    try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToBig(u32, val))));
+    try out.appendSlice(alloc, &@as([4]u8, @bitCast(@byteSwap(@as(u32, val)))));
 }
 
 fn sinkAppendU32BE(sink: *SegmentSink, val: u32) !void {
-    try sink.appendSlice(&@as([4]u8, @bitCast(std.mem.nativeToBig(u32, val))));
+    try sink.appendSlice(&@as([4]u8, @bitCast(@byteSwap(@as(u32, val)))));
 }
 
 fn appendU64BE(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), val: u64) !void {
-    try out.appendSlice(alloc, &@as([8]u8, @bitCast(std.mem.nativeToBig(u64, val))));
+    try out.appendSlice(alloc, &@as([8]u8, @bitCast(@byteSwap(@as(u64, val)))));
 }
 
 fn sinkAppendU64BE(sink: *SegmentSink, val: u64) !void {
-    try sink.appendSlice(&@as([8]u8, @bitCast(std.mem.nativeToBig(u64, val))));
+    try sink.appendSlice(&@as([8]u8, @bitCast(@byteSwap(@as(u64, val)))));
 }
 
 fn writeSegmentVersionChecksumAndMagic(sink: *SegmentSink, metadata_offset: usize) !void {
@@ -3595,8 +3595,8 @@ test "segment sorted merge preserves index sort and remaps doc addressed section
 fn buildLegacyF64DocValuesSectionAlloc(alloc: Allocator, doc_id: u32, value: f64) ![]u8 {
     var chunk_data = std.ArrayListUnmanaged(u8).empty;
     defer chunk_data.deinit(alloc);
-    try chunk_data.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 1))));
-    try chunk_data.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, doc_id))));
+    try chunk_data.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, 1))));
+    try chunk_data.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, doc_id))));
     try chunk_data.appendSlice(alloc, &@as([8]u8, @bitCast(value)));
 
     const compressed = try snappy.encode(alloc, chunk_data.items);
@@ -3605,11 +3605,11 @@ fn buildLegacyF64DocValuesSectionAlloc(alloc: Allocator, doc_id: u32, value: f64
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     try out.append(alloc, @backingInt(typed_dv.ValueType.f64_val));
-    try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 1))));
+    try out.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, 1))));
     const offset_pos = out.items.len;
     try out.appendNTimes(alloc, 0, 8);
     try out.appendSlice(alloc, compressed);
-    out.items[offset_pos..][0..8].* = @bitCast(std.mem.nativeToLittle(u64, @as(u64, @intCast(out.items.len))));
+    out.items[offset_pos..][0..8].* = @bitCast(@as(u64, @as(u64, @intCast(out.items.len))));
     return try out.toOwnedSlice(alloc);
 }
 

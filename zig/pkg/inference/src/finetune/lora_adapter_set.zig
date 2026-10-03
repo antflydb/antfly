@@ -19,7 +19,6 @@
 // buffers; LoRAAdapterSet owns a flat slice of LoRALayer values.
 
 const std = @import("std");
-const compat = @import("compat.zig");
 const lora = @import("lora.zig");
 
 // ----------------------------------------------------------------------------
@@ -414,8 +413,9 @@ fn applyLayerDelta(layer: *const LoRALayer, hidden: []f32, alpha: f32, scaling: 
     const rows = hidden.len / layer.in_features;
     if (rows == 0) return;
 
-    var stack = compat.stackFallback(4096, std.heap.page_allocator);
-    const alloc = stack.get();
+    var stack_buffer: [4096]u8 align(@alignOf(f32)) = undefined;
+    var stack: std.heap.BufferFirstAllocator = .init(&stack_buffer, std.heap.page_allocator);
+    const alloc = stack.allocator();
     const tmp = alloc.alloc(f32, rank) catch return;
     defer alloc.free(tmp);
 

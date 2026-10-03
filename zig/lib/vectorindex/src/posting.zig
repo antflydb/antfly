@@ -655,7 +655,7 @@ pub const AssignmentMap = struct {
     pub fn put(index: anytype, txn: anytype, vector_id: VectorId, posting_id: PostingId) !void {
         var key_buf: [10]u8 = undefined;
         var val_buf: [8]u8 = undefined;
-        val_buf = @bitCast(std.mem.nativeToLittle(u64, posting_id));
+        val_buf = @bitCast(@as(u64, posting_id));
         try index.putNamespaced(txn, .vecs, hbc.encodeVecLeafKey(&key_buf, vector_id), &val_buf);
     }
 

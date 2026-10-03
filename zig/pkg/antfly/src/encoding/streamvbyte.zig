@@ -195,10 +195,10 @@ fn encodeGroupShuffle(comptime ctrl: u8, values: [4]u32, dst: *[16]u8) usize {
     const n = data_len_table[ctrl];
 
     const input_bytes: [16]u8 = @bitCast([4]u32{
-        std.mem.nativeToLittle(u32, values[0]),
-        std.mem.nativeToLittle(u32, values[1]),
-        std.mem.nativeToLittle(u32, values[2]),
-        std.mem.nativeToLittle(u32, values[3]),
+        values[0],
+        values[1],
+        values[2],
+        values[3],
     });
     const input_vec: @Vector(16, u8) = input_bytes;
     const zero_vec: @Vector(16, u8) = @splat(0);
@@ -244,8 +244,7 @@ fn encodeGroupScalar(values: []const u32, dst: []u8) struct { ctrl: u8, n: usize
         const length: usize = encodedLength(v);
         ctrl |= @as(u8, @intCast(length - 1)) << @intCast(i * 2);
 
-        const le = std.mem.nativeToLittle(u32, v);
-        const le_bytes: [4]u8 = @bitCast(le);
+        const le_bytes: [4]u8 = @bitCast(v);
         for (0..length) |b| {
             dst[pos + b] = le_bytes[b];
         }
@@ -704,8 +703,7 @@ test "SIMD group encoder emits scalar StreamVByte bytes for every control byte" 
                 else => unreachable,
             };
 
-            const le = std.mem.nativeToLittle(u32, values[i]);
-            const bytes: [4]u8 = @bitCast(le);
+            const bytes: [4]u8 = @bitCast(values[i]);
             @memcpy(expected[expected_len..][0..len], bytes[0..len]);
             expected_len += len;
         }

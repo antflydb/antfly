@@ -13,7 +13,6 @@
 // limitations under the License.
 
 const std = @import("std");
-const std_compat = @import("compat.zig");
 const build_info = @import("build_info");
 const build_options = @import("build_options");
 
@@ -6078,7 +6077,7 @@ fn isQwen35Family(family: []const u8) bool {
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    return std_compat.indexOfIgnoreCase(haystack, needle) != null;
+    return std.ascii.findIgnoreCase(haystack, needle) != null;
 }
 
 fn containsQwen35Signal(path: []const u8) bool {

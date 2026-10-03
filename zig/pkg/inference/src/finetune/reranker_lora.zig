@@ -13,7 +13,6 @@
 // limitations under the License.
 
 const std = @import("std");
-const std_compat = @import("compat.zig");
 const assets = @import("assets/reranker_lora.zig");
 
 const compat = @import("../io/compat.zig");
@@ -2594,8 +2593,9 @@ fn backwardLinearRowsInputWithLoRA(
             grad_in_row[i] += sum;
         }
         if (pair) |lora_pair| {
-            var tmp_rank = std_compat.stackFallback(4096, std.heap.page_allocator);
-            const alloc = tmp_rank.get();
+            var tmp_rank_buffer: [4096]u8 align(@alignOf(f32)) = undefined;
+            var tmp_rank: std.heap.BufferFirstAllocator = .init(&tmp_rank_buffer, std.heap.page_allocator);
+            const alloc = tmp_rank.allocator();
             const tmp = alloc.alloc(f32, lora_pair.rank) catch continue;
             defer alloc.free(tmp);
             const scale = lora_alpha / @as(f32, @floatFromInt(lora_pair.rank));
@@ -2721,8 +2721,9 @@ fn scoreAdaptedExample(
     pooled: []const f32,
     head: *const reranker_head.RerankerHead,
 ) f64 {
-    var transformed = std_compat.stackFallback(8192, std.heap.page_allocator);
-    const alloc = transformed.get();
+    var transformed_buffer: [8192]u8 align(@alignOf(f32)) = undefined;
+    var transformed: std.heap.BufferFirstAllocator = .init(&transformed_buffer, std.heap.page_allocator);
+    const alloc = transformed.allocator();
     const output = alloc.alloc(f32, layer.output_dim) catch return reranker_head.scoreHead(head, pooled);
     defer alloc.free(output);
     computeLinearOutput(output, pooled, layer.base_weight, layer.input_dim, layer.output_dim);
@@ -2750,8 +2751,9 @@ fn applyAdapterDelta(
     alpha: f32,
 ) void {
     const scale = alpha / @as(f32, @floatFromInt(rank));
-    var low_rank = std_compat.stackFallback(4096, std.heap.page_allocator);
-    const alloc = low_rank.get();
+    var low_rank_buffer: [4096]u8 align(@alignOf(f32)) = undefined;
+    var low_rank: std.heap.BufferFirstAllocator = .init(&low_rank_buffer, std.heap.page_allocator);
+    const alloc = low_rank.allocator();
     const tmp = alloc.alloc(f32, rank) catch return;
     defer alloc.free(tmp);
     @memset(tmp, 0);

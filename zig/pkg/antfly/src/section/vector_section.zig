@@ -241,18 +241,18 @@ fn buildRaBitQIndex(
     try blob.append(alloc, rabitq_version);
 
     // Dims (u32 LE)
-    const dims_le: [4]u8 = @bitCast(std.mem.nativeToLittle(u32, @intCast(dims)));
+    const dims_le: [4]u8 = @bitCast(@as(u32, @intCast(dims)));
     try blob.appendSlice(alloc, &dims_le);
 
     // Metric (u8)
     try blob.append(alloc, @as(u8, @intCast(@backingInt(content.metric))));
 
     // Seed (u64 LE)
-    const seed_le: [8]u8 = @bitCast(std.mem.nativeToLittle(u64, seed));
+    const seed_le: [8]u8 = @bitCast(@as(u64, seed));
     try blob.appendSlice(alloc, &seed_le);
 
     // Num vectors (u32 LE)
-    const nvecs_le: [4]u8 = @bitCast(std.mem.nativeToLittle(u32, @intCast(nvecs)));
+    const nvecs_le: [4]u8 = @bitCast(@as(u32, @intCast(nvecs)));
     try blob.appendSlice(alloc, &nvecs_le);
 
     // Raw vectors (for reconstruction during merges)
@@ -260,7 +260,7 @@ fn buildRaBitQIndex(
     try blob.appendSlice(alloc, raw_bytes);
 
     // Quantized set (protobuf)
-    const qs_size_le: [4]u8 = @bitCast(std.mem.nativeToLittle(u32, @intCast(qs_bytes.len)));
+    const qs_size_le: [4]u8 = @bitCast(@as(u32, @intCast(qs_bytes.len)));
     try blob.appendSlice(alloc, &qs_size_le);
     try blob.appendSlice(alloc, qs_bytes);
 

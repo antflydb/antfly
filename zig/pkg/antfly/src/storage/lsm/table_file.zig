@@ -1020,7 +1020,7 @@ pub fn encodeWithFilterToSinkOptions(
 
     const physical_entry_data_len = sink.len() - entry_data_start;
     const physical_entry_data_len_u32 = try checkedU32(physical_entry_data_len);
-    try sink.writeAt(entry_data_len_offset, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, physical_entry_data_len_u32))));
+    try sink.writeAt(entry_data_len_offset, &@as([4]u8, @bitCast(@as(u32, physical_entry_data_len_u32))));
 
     const metadata_offset = sink.len();
     var metadata_sink_impl = ChecksummedTableSink{ .parent = sink };
@@ -1353,8 +1353,8 @@ pub const StreamingEncoder = struct {
         const entry_data_len_u32 = try checkedU32(self.logical_entry_data_len);
         const physical_entry_data_len = self.sink.len() - self.entry_data_start;
         const physical_entry_data_len_u32 = try checkedU32(physical_entry_data_len);
-        try self.sink.writeAt(self.entry_count_offset, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, try checkedU32(self.entry_count)))));
-        try self.sink.writeAt(self.entry_data_len_offset, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, physical_entry_data_len_u32))));
+        try self.sink.writeAt(self.entry_count_offset, &@as([4]u8, @bitCast(@as(u32, try checkedU32(self.entry_count)))));
+        try self.sink.writeAt(self.entry_data_len_offset, &@as([4]u8, @bitCast(@as(u32, physical_entry_data_len_u32))));
 
         var filter = self.filter_builder.finish();
         self.filter_builder_active = false;
