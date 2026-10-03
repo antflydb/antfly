@@ -82647,10 +82647,15 @@ test "db native document filters preserve paged totals across representations" {
             var ordinal = try db.search(alloc, req);
             defer ordinal.deinit();
 
-            // The native engine counted all three matches before paging. Neither
-            // their representation nor an empty result page changes that count.
-            try std.testing.expectEqual(@as(u32, 3), public.total_hits);
-            try std.testing.expectEqual(types.TotalHitsRelation.exact, public.total_hits_relation);
+            // Native postings alone cannot prove that uncollected matches
+            // still have stored rows. Partial text windows report their
+            // verified visible prefix; exhausted windows and primary/native
+            // collectors retain exact totals. Filter representation must not
+            // change either the count proof or the returned page.
+            const partial_text_window = (shape == .match_all or shape == .full_text) and !page.count_only and
+                page.offset +| page.limit < 3;
+            try std.testing.expectEqual(if (partial_text_window) page.offset +| page.limit else @as(u32, 3), public.total_hits);
+            try std.testing.expectEqual(if (partial_text_window) types.TotalHitsRelation.gte else .exact, public.total_hits_relation);
             try std.testing.expectEqual(public.total_hits, ordinal.total_hits);
             try std.testing.expectEqual(public.total_hits_relation, ordinal.total_hits_relation);
             const expected_page_len: usize = if (page.count_only) 0 else @min(page.limit, 3 -| page.offset);
@@ -106516,6 +106521,81 @@ test "db query drops full text hits whose stored document row was deleted direct
     try std.testing.expectEqual(@as(u32, 1), all_result.total_hits);
     try std.testing.expectEqual(@as(usize, 1), all_result.hits.len);
     try std.testing.expectEqualStrings("doc:b", all_result.hits[0].id);
+}
+
+test "db text totals require presence proof beyond the requested page" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "ft_rows", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"alpha\"}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    // The same prefix is returned before and after the unseen row goes
+    // missing. Neither query can prove an exact total from that prefix.
+    for ([_]bool{ false, true }) |orphaned| {
+        if (orphaned) {
+            const key = try internal_keys.documentKeyAlloc(alloc, "doc:b");
+            defer alloc.free(key);
+            try db.core.store.delete(key);
+        }
+        const expected_total: u32 = if (orphaned) 1 else 2;
+        for ([_]bool{ false, true }) |include_stored| {
+            for ([_]types.TextQuery{
+                .{ .match_all = {} },
+                .{ .match = .{ .field = "body", .text = "alpha" } },
+            }) |query| {
+                var req = types.SearchRequest{ .index_name = "ft_rows", .full_text = query, .include_stored = include_stored, .limit = 1 };
+                var page = try db.search(alloc, req);
+                defer page.deinit();
+                try std.testing.expectEqual(@as(usize, 1), page.hits.len);
+                try std.testing.expectEqualStrings("doc:a", page.hits[0].id);
+                try std.testing.expectEqual(@as(u32, 1), page.total_hits);
+                try std.testing.expectEqual(types.TotalHitsRelation.gte, page.total_hits_relation);
+
+                req.count_only = true;
+                var count = try db.search(alloc, req);
+                defer count.deinit();
+                try std.testing.expectEqual(expected_total, count.total_hits);
+                try std.testing.expectEqual(types.TotalHitsRelation.exact, count.total_hits_relation);
+
+                req.count_only = false;
+                req.limit = 2;
+                var complete = try db.search(alloc, req);
+                defer complete.deinit();
+                try std.testing.expectEqual(expected_total, complete.total_hits);
+                try std.testing.expectEqual(types.TotalHitsRelation.exact, complete.total_hits_relation);
+                try std.testing.expectEqual(@as(usize, expected_total), complete.hits.len);
+
+                req.limit = 1;
+                req.offset = 1;
+                var tail = try db.search(alloc, req);
+                defer tail.deinit();
+                try std.testing.expectEqual(expected_total, tail.total_hits);
+                try std.testing.expectEqual(types.TotalHitsRelation.exact, tail.total_hits_relation);
+                try std.testing.expectEqual(@as(usize, if (orphaned) 0 else 1), tail.hits.len);
+
+                // Native field-sort collectors check every counted row, so
+                // their limited pages still have an exact presence proof.
+                req.offset = 0;
+                req.order_by = &.{.{ .field = "_id" }};
+                var sorted = try db.search(alloc, req);
+                defer sorted.deinit();
+                try std.testing.expectEqual(expected_total, sorted.total_hits);
+                try std.testing.expectEqual(types.TotalHitsRelation.exact, sorted.total_hits_relation);
+                try std.testing.expectEqual(@as(usize, 1), sorted.hits.len);
+            }
+        }
+    }
 }
 
 test "db materialized dense enrichment survives artifact write list growth" {

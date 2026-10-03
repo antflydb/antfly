@@ -452,6 +452,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_db_query_default_filters = [_][]const u8{
         "db query drops full text hits whose stored document row was deleted directly from the store",
         "db native document filters preserve paged totals across representations",
+        "db text totals require presence proof beyond the requested page",
         "db document extraction chunks units through source artifact enrichment",
         "composed fusion preserves the coordinator reranker window",
         "composed vector component window matches component paging",

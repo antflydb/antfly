@@ -11861,9 +11861,15 @@ pub fn searchTextQuery(
             candidate_limit = grown_limit;
             continue;
         }
-        const observed_candidate_drop = out.hits.len < result.hits.len;
+        // Native totals count postings, whereas presence/visibility and
+        // grouping define the returned population. A partial window proves
+        // only the visible prefix, even if none of its candidates were
+        // dropped: an unseen posting may have no backing row. Keep exact
+        // totals only after exhausting the candidate population. Native
+        // sorted collectors above retain their independent proof by checking
+        // visibility for every counted match before admitting a page.
         if ((late_visibility_paginate or group_chunk_parents or
-            (executor.filter_candidate_presence and observed_candidate_drop)) and !candidates_exhausted)
+            executor.filter_candidate_presence) and !candidates_exhausted)
         {
             out.total_hits = visible_candidate_count;
             out.total_hits_relation = .gte;
