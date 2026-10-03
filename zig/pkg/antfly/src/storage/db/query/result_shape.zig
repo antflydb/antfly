@@ -2966,18 +2966,24 @@ test "reshapeChunkBackedResult orders equal-score parent hits by doc id" {
 test "reshapeChunkBackedResult uses the best descendant relevance score and distance" {
     const alloc = std.testing.allocator;
 
+    // A real chunk hit always carries a chunk artifact_ref (or an
+    // artifact-encoded id hitHasChunkIdentity can decode); mark these the
+    // same way so same-parent folding doesn't mistake them for independent
+    // direct members of one document (#931's multi-source guard).
     var raw_hits = try alloc.alloc(types.SearchHit, 2);
     raw_hits[0] = .{
         .id = try alloc.dupe(u8, "doc:a#0"),
         .doc_ordinal = 7,
         .score = 0.6,
         .distance = 0.4,
+        .artifact_ref = .{ .document_id = try alloc.dupe(u8, "doc:a"), .name = try alloc.dupe(u8, "chunks_v1"), .kind = .chunk, .chunk_id = 0 },
     };
     raw_hits[1] = .{
         .id = try alloc.dupe(u8, "doc:a#1"),
         .doc_ordinal = 7,
         .score = 0.4,
         .distance = 0.6,
+        .artifact_ref = .{ .document_id = try alloc.dupe(u8, "doc:a"), .name = try alloc.dupe(u8, "chunks_v1"), .kind = .chunk, .chunk_id = 1 },
     };
 
     var result = try reshapeChunkBackedResult(alloc, .{
