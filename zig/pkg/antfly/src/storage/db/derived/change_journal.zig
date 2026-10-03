@@ -159,36 +159,39 @@ pub fn deinitRecord(alloc: Allocator, record: *Record) void {
     record.* = undefined;
 }
 
-fn appendUniqueString(
-    alloc: Allocator,
-    list: *std.ArrayListUnmanaged([]const u8),
-    value: []const u8,
-) !void {
-    if (value.len == 0) return;
-    for (list.items) |existing| {
-        if (std.mem.eql(u8, existing, value)) return;
-    }
+fn appendUniqueStringIndexed(alloc: Allocator, list: *std.ArrayListUnmanaged([]const u8), seen: *std.StringHashMapUnmanaged(void), value: []const u8) !void {
+    if (value.len == 0 or seen.contains(value)) return;
     const owned = try alloc.dupe(u8, value);
     errdefer alloc.free(owned);
+    try seen.put(alloc, owned, {});
+    errdefer _ = seen.remove(owned);
     try list.append(alloc, owned);
 }
 
 pub fn recordFromDerivedBatch(alloc: Allocator, batch: derived_types.DerivedBatch, sequence: u64) !Record {
+    var changed_doc_keys_seen = std.StringHashMapUnmanaged(void).empty;
+    defer changed_doc_keys_seen.deinit(alloc);
     var changed_doc_keys = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
         for (changed_doc_keys.items) |key| alloc.free(key);
         changed_doc_keys.deinit(alloc);
     }
+    var deleted_doc_keys_seen = std.StringHashMapUnmanaged(void).empty;
+    defer deleted_doc_keys_seen.deinit(alloc);
     var deleted_doc_keys = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
         for (deleted_doc_keys.items) |key| alloc.free(key);
         deleted_doc_keys.deinit(alloc);
     }
+    var overwritten_doc_keys_seen = std.StringHashMapUnmanaged(void).empty;
+    defer overwritten_doc_keys_seen.deinit(alloc);
     var overwritten_doc_keys = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
         for (overwritten_doc_keys.items) |key| alloc.free(key);
         overwritten_doc_keys.deinit(alloc);
     }
+    var changed_artifact_keys_seen = std.StringHashMapUnmanaged(void).empty;
+    defer changed_artifact_keys_seen.deinit(alloc);
     var changed_artifact_keys = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
         for (changed_artifact_keys.items) |key| alloc.free(key);
@@ -198,7 +201,7 @@ pub fn recordFromDerivedBatch(alloc: Allocator, batch: derived_types.DerivedBatc
     errdefer target_hints.deinit(alloc);
 
     for (batch.documents) |doc| {
-        if (doc.action == .upsert) try appendUniqueString(alloc, &changed_doc_keys, doc.key);
+        if (doc.action == .upsert) try appendUniqueStringIndexed(alloc, &changed_doc_keys, &changed_doc_keys_seen, doc.key);
         if (doc.action == .upsert) {
             try appendUniqueHintAlloc(alloc, &target_hints, .dense_vector);
             try appendUniqueHintAlloc(alloc, &target_hints, .sparse_vector);
@@ -214,8 +217,8 @@ pub fn recordFromDerivedBatch(alloc: Allocator, batch: derived_types.DerivedBatc
             }
         }
     }
-    for (batch.deleted_keys) |key| try appendUniqueString(alloc, &deleted_doc_keys, key);
-    for (batch.overwritten_doc_keys) |key| try appendUniqueString(alloc, &overwritten_doc_keys, key);
+    for (batch.deleted_keys) |key| try appendUniqueStringIndexed(alloc, &deleted_doc_keys, &deleted_doc_keys_seen, key);
+    for (batch.overwritten_doc_keys) |key| try appendUniqueStringIndexed(alloc, &overwritten_doc_keys, &overwritten_doc_keys_seen, key);
     if (batch.deleted_keys.len > 0) {
         try appendUniqueHintAlloc(alloc, &target_hints, .full_text);
         try appendUniqueHintAlloc(alloc, &target_hints, .dense_vector);
@@ -229,7 +232,7 @@ pub fn recordFromDerivedBatch(alloc: Allocator, batch: derived_types.DerivedBatc
         try appendUniqueHintAlloc(alloc, &target_hints, .sparse_vector);
         try appendUniqueHintAlloc(alloc, &target_hints, .algebraic);
     }
-    for (batch.changed_artifact_keys) |key| try appendUniqueString(alloc, &changed_artifact_keys, key);
+    for (batch.changed_artifact_keys) |key| try appendUniqueStringIndexed(alloc, &changed_artifact_keys, &changed_artifact_keys_seen, key);
     for (batch.changed_artifact_keys) |key| {
         if (internal_keys.isGraphEdgeArtifactKey(key)) {
             try appendUniqueHintAlloc(alloc, &target_hints, .graph);
@@ -259,37 +262,37 @@ pub fn recordFromDerivedBatch(alloc: Allocator, batch: derived_types.DerivedBatc
 
     if (batch.dense_embeddings.len > 0) try appendUniqueHintAlloc(alloc, &target_hints, .dense_vector);
     for (batch.dense_embeddings) |embedding| {
-        if (embedding.artifact_key) |artifact_key| try appendUniqueString(alloc, &changed_artifact_keys, artifact_key);
+        if (embedding.artifact_key) |artifact_key| try appendUniqueStringIndexed(alloc, &changed_artifact_keys, &changed_artifact_keys_seen, artifact_key);
     }
 
     if (batch.sparse_embeddings.len > 0) try appendUniqueHintAlloc(alloc, &target_hints, .sparse_vector);
     for (batch.sparse_embeddings) |embedding| {
-        if (embedding.artifact_key) |artifact_key| try appendUniqueString(alloc, &changed_artifact_keys, artifact_key);
+        if (embedding.artifact_key) |artifact_key| try appendUniqueStringIndexed(alloc, &changed_artifact_keys, &changed_artifact_keys_seen, artifact_key);
     }
 
     if (batch.graph_doc_clears.len > 0 or batch.graph_writes.len > 0 or batch.graph_deletes.len > 0) {
         try appendUniqueHintAlloc(alloc, &target_hints, .graph);
     }
-    for (batch.graph_doc_clears) |clear| try appendUniqueString(alloc, &changed_doc_keys, clear.key);
-    for (batch.graph_writes) |write| try appendUniqueString(alloc, &changed_doc_keys, if (write.owner_document.len > 0) write.owner_document else if (write.owner.len > 0) write.owner else write.source);
+    for (batch.graph_doc_clears) |clear| try appendUniqueStringIndexed(alloc, &changed_doc_keys, &changed_doc_keys_seen, clear.key);
+    for (batch.graph_writes) |write| try appendUniqueStringIndexed(alloc, &changed_doc_keys, &changed_doc_keys_seen, if (write.owner_document.len > 0) write.owner_document else if (write.owner.len > 0) write.owner else write.source);
     // Edge deletes preserve the source document. Recording the source as
     // deleted makes graph replay clear its complete adjacency instead of only
     // applying the target-specific artifact deletion.
-    for (batch.graph_deletes) |delete| try appendUniqueString(alloc, &changed_doc_keys, if (delete.owner_document.len > 0) delete.owner_document else if (delete.owner.len > 0) delete.owner else delete.source);
+    for (batch.graph_deletes) |delete| try appendUniqueStringIndexed(alloc, &changed_doc_keys, &changed_doc_keys_seen, if (delete.owner_document.len > 0) delete.owner_document else if (delete.owner.len > 0) delete.owner else delete.source);
     for (batch.graph_writes) |write| {
         const artifact_key = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, if (write.owner_document.len > 0) write.owner_document else if (write.owner.len > 0) write.owner else write.source, write.index_name, write.edge_type, write.target, write.source, write.edge_id);
         defer alloc.free(artifact_key);
-        try appendUniqueString(alloc, &changed_artifact_keys, artifact_key);
+        try appendUniqueStringIndexed(alloc, &changed_artifact_keys, &changed_artifact_keys_seen, artifact_key);
     }
     for (batch.graph_deletes) |delete| {
         const artifact_key = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, if (delete.owner_document.len > 0) delete.owner_document else if (delete.owner.len > 0) delete.owner else delete.source, delete.index_name, delete.edge_type, delete.target, delete.source, delete.edge_id);
         defer alloc.free(artifact_key);
-        try appendUniqueString(alloc, &changed_artifact_keys, artifact_key);
+        try appendUniqueStringIndexed(alloc, &changed_artifact_keys, &changed_artifact_keys_seen, artifact_key);
     }
 
     if (batch.generated_enrichment_refs.len > 0) try appendUniqueHintAlloc(alloc, &target_hints, .enrichment);
     for (batch.generated_enrichment_refs) |ref| {
-        try appendUniqueString(alloc, &changed_doc_keys, ref.doc_key);
+        try appendUniqueStringIndexed(alloc, &changed_doc_keys, &changed_doc_keys_seen, ref.doc_key);
     }
 
     // Transfer each list into a record that already has a cleanup owner.
@@ -1391,4 +1394,34 @@ test "change journal graph refresh cursor resumes every key without allocating b
     while (truncated.next(payload[0 .. payload.len - 1])) |item| {
         try std.testing.expect(item != .done);
     } else |err| try std.testing.expectEqual(error.UnexpectedEndOfInput, err);
+}
+
+test "change journal graph indexed record retains unique first occurrence ordering on allocation failures" {
+    const Fixture = struct {
+        fn run(alloc: Allocator) !void {
+            var record = try recordFromDerivedBatch(alloc, .{
+                .deleted_keys = &.{ "b", "a", "b" },
+                .overwritten_doc_keys = &.{ "a", "a", "b" },
+                .changed_artifact_keys = &.{ "edge2", "edge1", "edge2" },
+                .generated_enrichment_refs = &.{
+                    .{ .kind = .asset, .doc_key = "a", .index_name = "context", .artifact_name = "context" },
+                    .{ .kind = .asset, .doc_key = "a", .index_name = "context", .artifact_name = "context" },
+                },
+            }, 42);
+            defer deinitRecord(alloc, &record);
+            try std.testing.expectEqual(@as(usize, 2), record.deleted_doc_keys.len);
+            try std.testing.expectEqualStrings("b", record.deleted_doc_keys[0]);
+            try std.testing.expectEqualStrings("a", record.deleted_doc_keys[1]);
+            try std.testing.expectEqual(@as(usize, 2), record.overwritten_doc_keys.len);
+            try std.testing.expectEqualStrings("a", record.overwritten_doc_keys[0]);
+            try std.testing.expectEqualStrings("b", record.overwritten_doc_keys[1]);
+            try std.testing.expectEqual(@as(usize, 2), record.changed_artifact_keys.len);
+            try std.testing.expectEqualStrings("edge2", record.changed_artifact_keys[0]);
+            try std.testing.expectEqualStrings("edge1", record.changed_artifact_keys[1]);
+            try std.testing.expectEqual(@as(usize, 1), record.changed_doc_keys.len);
+            try std.testing.expectEqualStrings("a", record.changed_doc_keys[0]);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }

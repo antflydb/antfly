@@ -1111,6 +1111,22 @@ budget against the reconciled durable count. Admission checks the final batch
 state, so a deletion and replacement at the limit can commit together, and
 rejected additions publish neither contender state nor replay work.
 
+Generated graph preparation uses private, disposable stage rows. A replay pass
+owns the enrichment lease and drains all its execution lanes before returning.
+The next owner reclaims abandoned stage rows in pages of at most 256 keys before
+starting new work, including after restart when replay is already caught up.
+Both stage writes and cleanup validate the exact enrichment lease in the write
+transaction; a superseded owner cannot recreate reclaimed rows or delete its
+successor's preparations. Cleanup is restartable and honors foreground deadlines.
+It never promotes an abandoned stage, advances replay coverage, or retries a
+provider. Original durable inputs remain the authority for regeneration.
+
+Generated replacement and withdrawal use allocator-accounted hash indexes for
+write/delete membership, affected identities, and replay artifact deduplication.
+Journal construction retains first-occurrence ordering with indexed admission.
+These operations take expected linear work in the number of keys rather than
+repeatedly scanning a growing replacement batch while holding publication.
+
 Document and relational TTL deletion take the same publication lease and retire
 all selected direct/source deadline rows in the primary deletion transaction.
 The due-key collector snapshots the input slice table before appending deletes,

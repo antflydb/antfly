@@ -153930,3 +153930,111 @@ test "db graph fact failed neighbor producer blocks downstream stale artifact co
     } else false;
     try std.testing.expect(downstream_failed);
 }
+
+test "db graph fact orphan stages recover after reopen with no replay debt" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("graph-stage-recovery");
+    defer tmp.cleanup();
+    const prefix = "\x00\x00__graph_stage__:v1:";
+    {
+        var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        // More than two pages of abandoned preparations from earlier owners.
+        // The legacy stage format has no manifest and remains recoverable.
+        var batch = try db.core.store.beginWriteBatch();
+        errdefer batch.abort();
+        for (0..513) |i| {
+            var buf: [80]u8 = undefined;
+            const key = try std.fmt.bufPrint(&buf, "{s}{d:0>8}", .{ prefix, i });
+            try batch.put(key, "unpublished graph payload");
+        }
+        try batch.put("unrelated", "keep");
+        try batch.commit();
+    }
+    var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    var config: enrichment_runtime_mod.Config = .{ .enable_without_producers = true };
+    try db.initOptionalEnrichmentRuntime(&config);
+    const runtime = db.enrichment_runtime.?;
+    const before = runtime.stats();
+    try std.testing.expect(runtime.graph_stage_recovery_pending);
+    try std.testing.expectError(error.EnrichmentWaitTimeout, runtime.catchUpUntilWithVisibilityDeadline(0, .{}, 0));
+    try std.testing.expect(runtime.graph_stage_recovery_pending);
+    try runtime.catchUpUntil(0);
+    try std.testing.expect(!runtime.graph_stage_recovery_pending);
+    var page = try @import("../backend_scan.zig").scanPrefixKeysPage(alloc, &runtime.store, prefix, 1);
+    defer page.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), page.keys.len);
+    const kept = try db.core.store.get(alloc, "unrelated");
+    defer alloc.free(kept);
+    try std.testing.expectEqualStrings("keep", kept);
+    const after = runtime.stats();
+    try std.testing.expectEqual(before.applied_sequence, after.applied_sequence);
+    try std.testing.expectEqual(before.processed_requests, after.processed_requests);
+    try std.testing.expectEqual(before.error_count, after.error_count);
+    try std.testing.expectEqual(before.retryable_error_count, after.retryable_error_count);
+    try std.testing.expectEqual(@as(u64, 0), db.core.store.lastReplaySequence(0));
+}
+
+test "db graph fact orphan stage maintenance preserves terminal worker failure" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("graph-stage-failed-owner");
+    defer tmp.cleanup();
+    var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    const stage = "\x00\x00__graph_stage__:v1:old";
+    try db.core.store.put(stage, "unpublished");
+    var config: enrichment_runtime_mod.Config = .{ .enable_without_producers = true };
+    try db.initOptionalEnrichmentRuntime(&config);
+    const runtime = db.enrichment_runtime.?;
+    runtime.worker_failed = true;
+    runtime.last_error_name = "InvalidExtractorResponse";
+    runtime.target_sequence = 1;
+    try std.testing.expectError(error.EnrichmentWorkerFailed, runtime.catchUpUntil(1));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, stage));
+    try std.testing.expect(runtime.worker_failed);
+    try std.testing.expectEqualStrings("InvalidExtractorResponse", runtime.last_error_name.?);
+    try std.testing.expectEqual(@as(u64, 0), runtime.applied_sequence);
+}
+
+test "db graph fact generated replacement retains overlap and retires withdrawn edges" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("graph-indexed-replacement");
+    defer tmp.cleanup();
+    var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "facts", .kind = .graph, .config_json =
+        \\{"source":{"artifact":"relations_v1","path":"$","nodes":{"source":"{{ _item.source }}","target":"{{ _item.target }}"},"edge":{"edge_id":"{{ _doc.key }}","type":"RELATES_TO"}},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}}
+    });
+    var config: enrichment_runtime_mod.Config = .{ .enable_without_producers = true };
+    try db.initOptionalEnrichmentRuntime(&config);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const rows = try a.alloc(struct { source: []const u8, target: []const u8 }, 96);
+    for (0..2) |phase| {
+        for (rows, 0..) |*row, i| row.* = .{ .source = "alice", .target = try std.fmt.allocPrint(a, "target:{d}", .{i + phase * 48}) };
+        const raw = try std.json.Stringify.valueAlloc(a, .{ .relations = rows }, .{});
+        try db.batch(.{ .writes = &.{.{ .key = "facts-owner", .value = raw }}, .sync_level = .write });
+        try db.enrichment_runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
+        try db.runDerivedUntil(db.core.nextDerivedSequence());
+        const entry = db.core.index_manager.graphIndex("facts").?;
+        const edges = try entry.index.getEdges(alloc, "alice", "RELATES_TO", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(rows.len, edges.len);
+        var seen: [96]bool = @splat(false);
+        for (edges) |edge| {
+            const number = try std.fmt.parseInt(usize, edge.target["target:".len..], 10);
+            try std.testing.expect(number >= phase * 48 and number < phase * 48 + rows.len);
+            const offset = number - phase * 48;
+            try std.testing.expect(!seen[offset]);
+            seen[offset] = true;
+        }
+    }
+    try db.batch(.{ .deletes = &.{"facts-owner"}, .sync_level = .write });
+    try db.enrichment_runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    const edges = try db.core.index_manager.graphIndex("facts").?.index.getEdges(alloc, "alice", "RELATES_TO", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 0), edges.len);
+}
