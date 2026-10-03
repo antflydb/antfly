@@ -317,7 +317,9 @@ options:
    compute.
 
 The plan starts with the GLiNER2 layout (the exact distillation target) and
-decides between these options at step 7, with measurements.
+decides between these options at step 7, with measurements. Measured
+2026-10-03: the shared trunk trades extraction for retrieval and stays far
+below a dedicated embedder, so option 3 is proposed (see Status).
 
 ### Expected cost
 
@@ -537,7 +539,7 @@ Independent of Antenna, serving span checkpoints (Decide) through the
 learned `classifier` would fix the legacy classification path. It is not on
 the critical path because step 0 can score Decide in PyTorch.
 
-## Status (2026-09-29)
+## Status (2026-10-03)
 
 ### Step 0: baselines (done)
 
@@ -619,11 +621,19 @@ different sizes; see the report for caveats).
   classification label markers; the next pool adds real label sets.
 - **Decision head:** a Laya decision head trained on the frozen Antenna trunk
   (`scripts/antenna/init_decision_head.py`, `freeze_layers` set to the layer
-  count plus one; Open-Jev, then Laya's step-0 split) scores 0.476 on Laya's
-  step-0 typed-decision eval, against
+  count plus one; Open-Jev, then Laya's step-0 split) scores 0.511 on Laya's
+  step-0 typed-decision eval on the clean trunk, against
   0.387 for released Laya-large and about 0.62 for Laya's full step-0
   fine-tune. The trunk stays bit-identical, so it keeps serving the GLiNER
   heads.
+- **Embeddings (step 7):** the shared trunk does not embed well.
+  - A head on the frozen trunk reaches 55% of granite-embedding-english-r2's
+    SQuAD retrieval NDCG@10 (0.454 against 0.823).
+  - Training the top eight layers reaches 69% and costs about 0.05 NER F1.
+  - Proposed: option 3, a separate pass with the embedder Antfly already ships
+    (Qwen3-Embedding-0.6B).
+  - Details:
+    [work-log/completed/inference/antenna/2026-10-03-embedding-layout.md](../../../../../work-log/completed/inference/antenna/2026-10-03-embedding-layout.md).
 
 ### Step 2: fused ModernBERT training attention (done)
 

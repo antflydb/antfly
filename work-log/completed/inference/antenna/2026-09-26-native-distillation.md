@@ -360,10 +360,5 @@ bit-identical losses.
 
 - Restaurant-style types beyond SNIPS (amenity, hours, price, rating) from a
   permissive source, or teacher-labelled restaurant queries.
-- Decision head on run19's trunk, with the same curriculum.
-- Classification markers are the remaining gap. The mixed pool has 216 real
-  class names and fills the rest of each label list from entity types; add
-  many real label sets (intents, topics, sentiment and stance scales,
-  decision questions) and rerun the probe and stage 3.
-- Typed decisions sit below every other student here; the pool has no
-  decision-style questions.
+- Embedding layout and classification targets continue in
+  2026-10-03-embedding-layout.md.
