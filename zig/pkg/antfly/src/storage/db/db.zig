@@ -35312,10 +35312,10 @@ pub const DB = struct {
                 try @import("relational_integrity_retirement.zig").requireMutable(&read);
                 try @import("restore_staging.zig").requireScope(alloc, &read, null, false);
                 if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
-                // This local administrative entry point cannot invent a Raft
-                // position. Hosted owners must order curation through their owner.
-                if (try @import("../source_authority.zig").load(&read)) |authority| {
-                    if (authority.kind == .raft) return error.OnlineSourceScopeChanged;
+                // Local administration cannot invent an ordered publication
+                // position. External owners must order curation through their owner.
+                if (try @import("../source_authority.zig").publicationOwner(&read)) |owner| {
+                    if (owner.mode == .ordered) return error.OnlineSourceScopeChanged;
                 }
             }
             if (self.core.index_manager.graphIndex(index_name) == null) return error.IndexNotFound;
@@ -37750,15 +37750,15 @@ pub const DB = struct {
     }
 
     fn advanceArtifactProducerBaselinePageWithAllocator(self: *DB, scratch: Allocator) !bool {
-        const owner_kind = blk: {
+        const publication_mode = blk: {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
             if (try @import("artifact_publication.zig").authority(&read) == null) {
                 self.artifact_producer_baseline_pending.store(false, .release);
                 return true;
             }
-            const owner = (try @import("../source_authority.zig").load(&read)) orelse return error.ArtifactCatalogDrift;
-            break :blk owner.kind;
+            const owner = (try @import("../source_authority.zig").publicationOwner(&read)) orelse return error.ArtifactCatalogDrift;
+            break :blk owner.mode;
         };
         const retired_work = try @import("artifact_producer_obligations.zig").collectObsoleteWorkPage(scratch, self.core.store);
         const retired_proofs = try @import("artifact_producer_provenance.zig").collectObsoletePage(scratch, self.core.store);
@@ -37772,7 +37772,7 @@ pub const DB = struct {
         const retired_authored = try @import("artifact_authored_acceptance.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
         const swept_authored = try @import("artifact_authored_acceptance.zig").collectCurrentPage(scratch, self.core.store, self.root_incarnation);
         const retired = retired_work and retired_proofs and retired_checkpoints and retired_streams and retired_completions and retired_native and retired_inventories and retired_units and retired_unit_jobs and retired_authored and swept_authored;
-        if (owner_kind == .raft) {
+        if (publication_mode == .ordered) {
             var prepared = (try @import("artifact_producer_baseline.zig").prepareRaft(scratch, self.core.store)) orelse {
                 var validation = (try @import("artifact_producer_validation.zig").prepareRaft(scratch, self.core.store)) orelse {
                     self.artifact_producer_baseline_pending.store(!retired, .release);
