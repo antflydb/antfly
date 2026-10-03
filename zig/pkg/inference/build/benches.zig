@@ -32,6 +32,7 @@ fn createCpuComputeModule(ctx: Context, source: []const u8) *std.Build.Module {
     });
     module.addOptions("build_options", runtime_build.addBuildOptions(ctx.b, .{
         .enable_system_blas = ctx.backend.enable_system_blas,
+        .enable_runtime_openblas = ctx.backend.enable_runtime_openblas,
         .enable_native_quant_dispatch_stats = ctx.backend.enable_native_quant_dispatch_stats,
     }));
     if (ctx.backend.enable_system_blas)
@@ -227,6 +228,7 @@ pub fn addGliner25(ctx: Context) *std.Build.Module {
         }),
     });
     decide_bench.root_module.addImport("inference_internal", ctx.graph.inference_internal_mod);
+    decide_bench.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
     decide_bench.root_module.link_libc = true;
     ctx.step("bench-gliner25-decide-build", "Build the loaded-model GLiNER2.5-Decide request benchmark").dependOn(&b.addInstallArtifact(decide_bench, .{}).step);
     // Use the shared optimize value for the entire dependency graph. The
@@ -242,6 +244,7 @@ pub fn addGliner25(ctx: Context) *std.Build.Module {
     });
     gliner25_cpu_bench_exe.root_module.addImport("build_options", ctx.graph.build_options_mod);
     gliner25_cpu_bench_exe.root_module.addImport("inference_internal", ctx.graph.inference_internal_mod);
+    gliner25_cpu_bench_exe.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
     // The imported native runtime owns backend and BLAS linkage.
     gliner25_cpu_bench_exe.root_module.link_libc = true;
     const install_gliner25_cpu_bench = b.addInstallArtifact(gliner25_cpu_bench_exe, .{});
@@ -258,6 +261,7 @@ pub fn addGliner25(ctx: Context) *std.Build.Module {
     });
     gliner25_cuda_bench_exe.root_module.addImport("build_options", ctx.graph.build_options_mod);
     gliner25_cuda_bench_exe.root_module.addImport("inference_internal", ctx.graph.inference_internal_mod);
+    gliner25_cuda_bench_exe.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
     gliner25_cuda_bench_exe.root_module.link_libc = true;
     const install_gliner25_cuda_bench = b.addInstallArtifact(gliner25_cuda_bench_exe, .{});
     ctx.step("bench-gliner25-cuda-build", "Build the GLiNER2.5 CUDA direct-core worker (requires CUDA and ReleaseFast)").dependOn(&install_gliner25_cuda_bench.step);

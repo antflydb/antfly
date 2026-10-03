@@ -28,6 +28,8 @@ const BackendKind = ops.BackendKind;
 const ComputeBackend = ops.ComputeBackend;
 const CT = ops.CT;
 const native = @import("../backends/native.zig");
+pub const useBlas = native.useBlas;
+pub const blasThreads = native.openblas.threadLimit;
 const activations_mod = @import("../backends/activations.zig");
 const deberta_tiled = @import("deberta_tiled_attention.zig");
 const deberta_training = @import("deberta_training_attention.zig");
@@ -4062,7 +4064,7 @@ fn linearNoBiasSourceTensorChunked(
     }
 
     const target_weight_bytes: usize = 8 * 1024 * 1024;
-    const scratch_row_elements = std.math.add(usize, in_dim, if (build_options.enable_system_blas) 0 else rows) catch return error.ShapeMismatch;
+    const scratch_row_elements = std.math.add(usize, in_dim, if (native.useBlas()) 0 else rows) catch return error.ShapeMismatch;
     const scratch_row_bytes = std.math.mul(usize, scratch_row_elements, @sizeOf(f32)) catch return error.ShapeMismatch;
     const block_rows = @max(@as(usize, 1), @min(out_dim, target_weight_bytes / @max(@as(usize, 1), scratch_row_bytes)));
     const scratch_bytes = std.math.mul(usize, block_rows, scratch_row_bytes) catch return error.ShapeMismatch;
@@ -4078,7 +4080,7 @@ fn linearNoBiasSourceTensorChunked(
     defer if (self.run_budget) |budget| budget.releaseEstimate(scratch_estimate);
     const weight_block = try self.allocator.alloc(f32, block_rows * in_dim);
     defer self.allocator.free(weight_block);
-    const output_block = try self.allocator.alloc(f32, if (build_options.enable_system_blas) 0 else rows * block_rows);
+    const output_block = try self.allocator.alloc(f32, if (native.useBlas()) 0 else rows * block_rows);
     defer self.allocator.free(output_block);
 
     var row_start: usize = 0;
@@ -4086,7 +4088,7 @@ fn linearNoBiasSourceTensorChunked(
         if (self.io) |io| try io.checkCancel();
         const row_count = @min(block_rows, out_dim - row_start);
         try convertTensorRowsToF32(tensor, row_start, row_count, in_dim, weight_block[0 .. row_count * in_dim]);
-        if (build_options.enable_system_blas) {
+        if (native.useBlas()) {
             try native.sgemmTransBStrided(
                 self.io,
                 rows,
@@ -35751,7 +35753,7 @@ fn disentangledRelativeAttentionWithControlOp(ctx: *anyopaque, q_ct: CT, k_ct: C
         const output = try deberta_tiled.forward(self.allocator, .{ .batch = batch, .sequence = seq_len, .heads = num_heads, .head_dim = head_dim }, .{ .q = Q, .k = K, .v = V, .qr = Q_r, .kr = K_r, .mask = mask }, .{ .control = control, .io = self.io });
         return self.makeOwnedBuf(output);
     }
-    if (build_options.enable_system_blas and seq_len >= 64) {
+    if (native.useBlas() and seq_len >= 64) {
         const output = try debertaDisentangledAttentionBlasMaterialized(self.allocator, Q, K, V, Q_r, K_r, mask, batch, seq_len, num_heads, head_dim);
         return self.makeOwnedBuf(output);
     }
