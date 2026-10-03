@@ -20,6 +20,7 @@ test {
     _ = @import("aggregate_binding.zig");
     _ = @import("compiler.zig");
     _ = @import("scalar.zig");
+    _ = @import("decision_eval.zig");
     _ = @import("describe.zig");
     _ = @import("runtime.zig");
     _ = @import("insert_test.zig");

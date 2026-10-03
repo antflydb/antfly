@@ -488,14 +488,26 @@ pub const GraphQuery = struct {
     /// Query-wide row limit for canonical MATCH results. Shards may over-fetch
     /// to let the coordinator determine truncation accurately.
     return_limit: u32 = 0,
+    evaluation_output_limit: ?u32 = null,
     aggregates: []const NamedCountAggregate = &.{},
     include_documents: bool = false,
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
+    /// Fetch expression inputs independently of the final document projection.
+    defer_document_projection: bool = false,
     metrics: []const GraphMetricRead = &.{},
     order_by: []const GraphMetricOrder = &.{},
     where_metric: []const GraphMetricFilter = &.{},
     include_metric_status: bool = false,
+
+    pub fn documentRetrievalQuery(self: @This()) @This() {
+        var retrieval = self;
+        if (self.defer_document_projection) {
+            retrieval.fields = &.{};
+            retrieval.include_all_fields = true;
+        }
+        return retrieval;
+    }
 };
 
 pub const NamedCountAggregate = struct {

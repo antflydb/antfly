@@ -42,6 +42,7 @@ pub const Node = struct {
         literal_rows: []const []const scalar.Datum,
     },
 };
+pub const virtual_table_name = "$sql_relation";
 pub const Bound = struct { root: *const Node, scans: []const catalog.StatementScan, table: catalog.Table, statement: ast.Select };
 
 fn qualified(node: *const ast.Scalar) bool {
@@ -102,7 +103,7 @@ pub const ResolveAdapter = struct {
     backend: catalog.Backend,
     table: catalog.Table,
     pub fn iface(self: *ResolveAdapter) catalog.Backend {
-        return .{ .ptr = self, .settings_view = self.backend.settings_view, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
+        return .{ .ptr = self, .settings_view = self.backend.settings_view, .decision_provider = self.backend.decision_provider, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
     }
     fn resolve(ptr: *anyopaque, _: Allocator, _: ast.Name, action: catalog.Action) !catalog.Table {
         if (action != .read) return error.UnsupportedSqlExecution;
@@ -133,7 +134,7 @@ pub const TargetResolveAdapter = struct {
     cache_sources: bool = false,
     source_tables: std.StringHashMapUnmanaged(catalog.Table) = .empty,
     pub fn iface(self: *@This()) catalog.Backend {
-        return .{ .ptr = self, .settings_view = self.backend.settings_view, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
+        return .{ .ptr = self, .settings_view = self.backend.settings_view, .decision_provider = self.backend.decision_provider, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
     }
     fn resolve(ptr: *anyopaque, alloc: Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
         // This adapter is only used while binding the read side of a mutation.
@@ -443,7 +444,7 @@ const Builder = struct {
     fn virtualTable(self: *Builder, columns: []const Column) !catalog.Table {
         const result = try self.alloc.alloc(catalog.Column, columns.len);
         for (columns, result) |column, *out| out.* = .{ .name = column.internal, .path = column.internal, .type = column.type, .nullable = column.nullable };
-        return .{ .id = 0, .physical_name = "$sql_relation", .schema_version = 0, .columns = result };
+        return .{ .id = 0, .physical_name = virtual_table_name, .schema_version = 0, .columns = result };
     }
     fn scalarColumns(self: *Builder, columns: []const Column) ![]const scalar.Column {
         const result = try self.alloc.alloc(scalar.Column, columns.len);

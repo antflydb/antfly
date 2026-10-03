@@ -203,6 +203,7 @@ pub const DdlReceipt = struct {
 pub const DdlOutcome = struct { mutation_outcome: ?MutationOutcome = .committed, receipt: ?DdlReceipt = null };
 
 pub const Backend = struct {
+    decision_provider: ?@import("../functions/decisions.zig").DecisionProvider = null,
     ptr: *anyopaque,
     vtable: *const VTable,
     /// Runtime captures a fresh owner-authorized view for each statement.
