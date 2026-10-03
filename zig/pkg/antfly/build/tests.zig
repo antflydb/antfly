@@ -2734,6 +2734,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("vector-migration-test", "Run source ownership migration and recovery tests").dependOn(&b.addRunArtifact(vector_migration_tests).step);
 
     const resource_budget_runtime_filters = [_][]const u8{
+        "resource manager replay skip snapshots clean up every allocation failure",
+        "resource manager records and snapshots replay-document-not-visible skips per owner and index",
         "default tokenizer cache budget is aligned with its resource slice",
         "default lake range cache queue budget is aligned with its terminal resource slice",
         "identity allocation failure rolls back every memory ledger",

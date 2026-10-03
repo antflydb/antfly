@@ -943,19 +943,23 @@ pub const ReplayNotVisibleTracker = struct {
                 gop.value_ptr.* +|= entry.value_ptr.skipped_total;
             }
         }
-        var out = std.ArrayListUnmanaged(IndexReplayDocumentNotVisibleSkipped).empty;
+        // The final size is known: reserve the output before copying names,
+        // then transfer each allocation directly into an initialized entry.
+        const out = try alloc.alloc(IndexReplayDocumentNotVisibleSkipped, totals.count());
+        var initialized: usize = 0;
         errdefer {
-            for (out.items) |item| alloc.free(item.index_name);
-            out.deinit(alloc);
+            for (out[0..initialized]) |item| alloc.free(item.index_name);
+            alloc.free(out);
         }
         var totals_it = totals.iterator();
         while (totals_it.next()) |entry| {
-            try out.append(alloc, .{
+            out[initialized] = .{
                 .index_name = try alloc.dupe(u8, entry.key_ptr.*),
                 .count = entry.value_ptr.*,
-            });
+            };
+            initialized += 1;
         }
-        return try out.toOwnedSlice(alloc);
+        return out;
     }
 
     /// Removes every tracked window for `owner` (called when its
@@ -6108,4 +6112,61 @@ test "resource manager forgets an owner's replay-document-not-visible state when
         try std.testing.expect(!manager.shouldEscalateReplayDocumentNotVisible(test_owner_a, "full_text_index_v0", 7));
     }
     try std.testing.expect(manager.shouldEscalateReplayDocumentNotVisible(test_owner_a, "full_text_index_v0", 7));
+}
+
+test "resource manager replay skip snapshots clean up every allocation failure" {
+    const Case = struct {
+        fn validate(snapshot: []const IndexReplayDocumentNotVisibleSkipped, index_count: usize) !void {
+            try std.testing.expectEqual(index_count, snapshot.len);
+            var seen = [_]bool{false} ** 17;
+            for (snapshot) |entry| {
+                try std.testing.expect(std.mem.startsWith(u8, entry.index_name, "index_"));
+                const index = try std.fmt.parseUnsigned(usize, entry.index_name[6..], 10);
+                try std.testing.expect(index < index_count);
+                try std.testing.expect(!seen[index]);
+                seen[index] = true;
+                try std.testing.expectEqual(@as(u64, 3), entry.count);
+            }
+        }
+
+        fn run(alloc: std.mem.Allocator, index_count: usize) !void {
+            // Populate the tracker independently of the failing snapshot
+            // allocator, so every injected failure exercises snapshot cleanup.
+            var manager = ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+            defer manager.deinit(std.testing.allocator);
+            for (0..index_count) |i| {
+                var buf: [32]u8 = undefined;
+                const name = try std.fmt.bufPrint(&buf, "index_{d}", .{i});
+                manager.recordReplayDocumentNotVisibleSkipped(test_owner_a, name);
+                manager.recordReplayDocumentNotVisibleSkipped(test_owner_a, name);
+                manager.recordReplayDocumentNotVisibleSkipped(test_owner_b, name);
+            }
+            // A tracked retry without a skip must not appear in the snapshot.
+            _ = manager.shouldEscalateReplayDocumentNotVisible(test_owner_a, "unskipped", 7);
+
+            const snapshot = manager.snapshotReplayDocumentNotVisibleSkipped(alloc) catch |err| {
+                // Failure cannot consume tracker state or prevent a later
+                // metrics scrape from recovering the same aggregate counts.
+                try std.testing.expectEqual(@as(u64, @intCast(index_count * 3)), manager.replayDocumentNotVisibleSkippedTotalAll());
+                const recovered = try manager.snapshotReplayDocumentNotVisibleSkipped(std.testing.allocator);
+                defer {
+                    for (recovered) |entry| std.testing.allocator.free(entry.index_name);
+                    std.testing.allocator.free(recovered);
+                }
+                try validate(recovered, index_count);
+                return err;
+            };
+            defer {
+                for (snapshot) |entry| alloc.free(entry.index_name);
+                alloc.free(snapshot);
+            }
+            try validate(snapshot, index_count);
+            try std.testing.expectEqual(@as(u64, @intCast(index_count * 3)), manager.replayDocumentNotVisibleSkippedTotalAll());
+        }
+    };
+    // Cover empty output, the original single-entry leak, map growth, and
+    // cleanup after any prefix of successfully copied names.
+    for ([_]usize{ 0, 1, 17 }) |index_count| {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{index_count});
+    }
 }
