@@ -1515,8 +1515,7 @@ pub const DocStore = struct {
                 };
                 // Equal document keys in a foreign source table do not make
                 // an independently owned fact into a source-owned inline edge.
-                if (source_table) |declared| if (!std.mem.eql(u8, declared, here)) return null;
-                if (target_table) |declared| if (!std.mem.eql(u8, declared, here)) return null;
+                if (!@import("../graph/metadata_tables.zig").inlineEndpointsAreLocal(source_table, target_table, here)) return null;
             }
         }
         return target;
@@ -2237,6 +2236,7 @@ pub const DocStore = struct {
         for (candidates.items, keys) |candidate, *key| key.* = candidate.key;
         try txn.getManySorted(keys, values);
         const mask = try alloc.alloc(bool, writes.len);
+        errdefer alloc.free(mask);
         @memset(mask, false);
         for (candidates.items, values) |candidate, value| if (value) |stamp| {
             mask[candidate.index] = try retirementSuppressesRelationship(txn, scratch, writes[candidate.index].key, stamp);
@@ -6203,4 +6203,27 @@ test "graph qualified bulk rewrites remove old local membership and admit fresh 
     var page = (try store.prepareGraphEndpointCleanupPage(alloc)).?;
     defer page.deinit();
     try std.testing.expectEqual(@as(usize, 0), page.writes.len);
+}
+
+test "graph endpoint cleanup bulk retirement mask releases ownership on decoding failure" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    const edge = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, "source", "g", "R", "target", "source", "id");
+    defer alloc.free(edge);
+    const marker = try internal_keys.graphRetirementKeyAlloc(alloc, edge);
+    defer alloc.free(marker);
+    // Bypass normal admission to simulate a damaged persisted stamp. The same
+    // ownership path must unwind allocation and storage errors during decoding.
+    {
+        var raw = try backend.beginBatchWithOptions(.{});
+        defer raw.abort();
+        try raw.put(.{}, marker, "invalid");
+        try raw.commit();
+    }
+    var batch = try store.beginWriteBatch();
+    defer batch.abort();
+    try std.testing.expectError(error.InvalidGraphRetirement, DocStore.graphBulkRetirementMask(alloc, batch.asTxn(), &.{.{ .key = edge, .value = "edge" }}));
 }

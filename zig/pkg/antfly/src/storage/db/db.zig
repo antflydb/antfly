@@ -30602,6 +30602,10 @@ pub const DB = struct {
         defer targets.deinit(scratch);
         var read = try self.core.store.beginProbeTxn();
         defer read.abort();
+        const owning_table: ?[]const u8 = self.local_execution.row_policy_table_name orelse (read.get(internal_keys.graph_owning_table_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        });
         var rows = std.heap.ArenaAllocator.init(alloc);
         defer rows.deinit();
         const row_alloc = rows.allocator();
@@ -30634,6 +30638,12 @@ pub const DB = struct {
             try augmentExtractedWriteWithGraphFieldEdgesParsed(self, row_alloc, intent.key, root, &extracted);
             for (extracted.graph_writes) |edge| {
                 if (edge.owner_document.len != 0 and !std.mem.eql(u8, edge.owner_document, edge.source)) continue;
+                if (edge.owner.len != 0 and !std.mem.eql(u8, edge.owner, edge.source)) continue;
+                var table_scratch = graph_metadata_tables.Scratch.init(row_alloc, null);
+                defer table_scratch.deinit();
+                const source_table = try table_scratch.table(edge.metadata_json, "source_table");
+                const target_table = try table_scratch.table(edge.metadata_json, "target_table");
+                if (!graph_metadata_tables.inlineEndpointsAreLocal(source_table, target_table, owning_table)) continue;
                 if (targets.contains(edge.target)) continue;
                 const target = try scratch.dupe(u8, edge.target);
                 // Request preparation owns all predicate bytes until prepare.
@@ -152764,4 +152774,54 @@ test "db rewriteEntityEdges preserves explicit fact identities after local repli
     defer graph_mod.GraphIndex.freeEdges(alloc, survivor);
     try std.testing.expectEqual(@as(usize, 1), survivor.len);
     try std.testing.expectEqualStrings("two", survivor[0].edge_id);
+}
+
+test "db graph endpoint cleanup transaction guards respect physical endpoint tables" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("qualified-transaction-guards");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    db.local_execution.row_policy_table_name = "facts";
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+    const foreign = "{\"_edges\":{\"g\":{\"R\":[{\"target\":\"hub\",\"metadata\":{\"target_table\":\"people\"}}]}}}";
+    const first = try db.beginTransaction(1);
+    try db.writeTransaction(first, .{ .writes = &.{.{ .key = "a", .value = foreign }} });
+    // A foreign dependency must not lock the same document key in this table.
+    try graphTestApplyOrdered(&db, .{ .deletes = &.{"hub"} }, .{ .term = 1, .index = 1 });
+    try db.abortTransaction(first, 2);
+    // Subsequent admission also works from the durable table identity when
+    // the caller has no execution-time table override.
+    db.local_execution.row_policy_table_name = null;
+    for ([_][]const u8{
+        "{\"target_table\":\"people\"}",
+        "{\"source_table\":\"people\"}",
+        "{\"source_table\":\"facts\",\"target_table\":\"people\"}",
+        "{\"source_table\":\"people\",\"target_table\":\"facts\"}",
+    }) |metadata| {
+        const value = try std.fmt.allocPrint(alloc, "{{\"_edges\":{{\"g\":{{\"R\":[{{\"target\":\"hub\",\"metadata\":{s}}}]}}}}}}", .{metadata});
+        defer alloc.free(value);
+        for (0..2) |entrypoint| {
+            const txn_id = try db.beginTransaction(3);
+            if (entrypoint == 0)
+                try db.writeIntents(txn_id, &.{.{ .key = "a", .value = value }}, &.{})
+            else
+                try db.writeTransaction(txn_id, .{ .writes = &.{.{ .key = "a", .value = value }} });
+            try db.abortTransaction(txn_id, 4);
+        }
+    }
+    const local = "{\"_edges\":{\"g\":{\"R\":[{\"target\":\"hub\",\"metadata\":{\"source_table\":\"facts\",\"target_table\":\"facts\"}}]}}}";
+    const rejected = try db.beginTransaction(5);
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.writeTransaction(rejected, .{ .writes = &.{.{ .key = "a", .value = local }} }));
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.writeIntents(rejected, &.{.{ .key = "a", .value = local }}, &.{}));
+    try db.abortTransaction(rejected, 6);
+    while (try db.prepareGraphEndpointCleanupBatch(alloc)) |selected| {
+        var plan = selected;
+        defer plan.deinit();
+        try db.batch(plan.request());
+    }
+    const accepted = try db.beginTransaction(7);
+    try db.writeTransaction(accepted, .{ .writes = &.{.{ .key = "a", .value = local }} });
+    try std.testing.expectError(error.IntentConflict, graphTestApplyOrdered(&db, .{ .deletes = &.{"hub"} }, .{ .term = 1, .index = 2 }));
+    try db.abortTransaction(accepted, 8);
 }

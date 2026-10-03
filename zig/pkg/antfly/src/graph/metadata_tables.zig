@@ -7,6 +7,20 @@
 const std = @import("std");
 const work = @import("work_budget.zig");
 
+/// Source-owned relationships participate in endpoint retirement only when
+/// both endpoints belong to the producer's physical table. Without a table
+/// identity, only unqualified endpoints are local. Share this rule between
+/// transaction admission and the durable incoming directory.
+pub fn inlineEndpointsAreLocal(source_table: ?[]const u8, target_table: ?[]const u8, owning_table: ?[]const u8) bool {
+    inline for (.{ source_table, target_table }) |declared| {
+        if (declared) |table| {
+            const here = owning_table orelse return false;
+            if (!std.mem.eql(u8, table, here)) return false;
+        }
+    }
+    return true;
+}
+
 pub const Scratch = struct {
     memory: work.RetainedAllocator,
     strings: std.ArrayListUnmanaged([]u8) = .empty,

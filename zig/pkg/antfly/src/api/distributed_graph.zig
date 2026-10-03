@@ -3284,13 +3284,13 @@ fn canonicalGraphStepAlloc(
         if (params.min_weight) |minimum| if (edge.weight < minimum) continue;
         if (params.max_weight) |maximum| if (edge.weight > maximum) continue;
         if (!std.math.isFinite(edge.weight)) return error.InvalidGraphEdgeValue;
+        const endpoint = try graph_traversal_mod.resolveAdjacent(&table_scratch, edge, key, current_table, expansion_table, params.direction);
+        if (!endpoint.connected) continue;
         if (node_count == capacity) {
             if (work_budget.remaining_nodes <= work_budget.remaining_edges)
                 return work_budget.exhaust(.explored_nodes, work_budget.max_nodes);
             return work_budget.exhaust(.explored_edges, work_budget.max_edges);
         }
-        const endpoint = try graph_traversal_mod.resolveAdjacent(&table_scratch, edge, key, current_table, expansion_table, params.direction);
-        if (!endpoint.connected) continue;
         const adjacent = endpoint.key;
         const declared_table = endpoint.table;
         path_edges[node_count] = .{
@@ -13198,6 +13198,15 @@ test "distributed graph edge reader routes outgoing and fans out incoming adjace
 
     state.strict_scan_ceiling = false;
     state.equal_key_endpoints = true;
+    // A physical edge can share the key while departing from another table.
+    // It consumes scan allowance, but no logical neighbor capacity.
+    var wrong_table_budget = graph_pattern_mod.WorkBudget.init(0, 7);
+    tie_reader.physical_work_budget = &wrong_table_budget;
+    var wrong_table_step = try canonicalGraphStepAlloc(alloc, tie_reader, "docs", "docs", "doc:a", .{ .direction = .out, .edge_types = &.{"links"} }, &wrong_table_budget);
+    defer wrong_table_step.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), wrong_table_step.visibleNodes().len);
+    try std.testing.expect(wrong_table_budget.exhaustion() == null);
+    try std.testing.expect(wrong_table_budget.remaining_physical_edges < 7);
     for ([_]struct { current: []const u8, direction: graph_mod.EdgeDirection, adjacent_table: []const u8, orientation: graph_mod.EdgeDirection }{
         .{ .current = "docs", .direction = .in, .adjacent_table = "people", .orientation = .in },
         .{ .current = "docs", .direction = .both, .adjacent_table = "people", .orientation = .in },
