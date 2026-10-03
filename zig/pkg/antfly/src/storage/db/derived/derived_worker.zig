@@ -290,15 +290,19 @@ pub fn catchUpIndexFromMatchingCursor(
         const collect_started_ns = monotonicTimeNs();
         const had_retained_scratch = decode_scratch.retainedCapacityBytes() != 0;
         var retried_fresh = false;
+        var collection_limit = options.max_records_per_window;
         const chunk_stats = collect: while (true) {
-            const collected = replay_cursor.forEachNext(options.max_records_per_window, &builder, replayChunkConsumeRecord) catch |err| {
+            const collected = replay_cursor.forEachNext(collection_limit, &builder, replayChunkConsumeRecord) catch |err| {
                 // An empty window gets one retry after reclaiming cached
                 // scratch and key-block slack. The failed record has not
                 // advanced the cursor; a fresh exact-sized retry is bounded.
                 if (err == error.ResourceBudgetExceeded and
-                    (had_retained_scratch or builder.hasSpareKeyCapacity()) and
-                    !retried_fresh and builder.accepted_records == 0)
+                    (had_retained_scratch or builder.hasSpareKeyCapacity() or builder.had_spare_metadata) and
+                    !retried_fresh and !builder.has_accepted_work)
                 {
+                    // No-op records already advanced the cursor. Keep the
+                    // remaining record quota rather than restarting the window.
+                    if (collection_limit != 0) collection_limit -= builder.accepted_records;
                     builder.resetEmptyWindow();
                     builder.minimal_key_blocks = true;
                     decode_scratch.trimRetainedCapacity(scratch_alloc, 0);
@@ -473,7 +477,9 @@ const ReplayChunkBuilder = struct {
     // Each block includes its header and is admitted at its full allocation
     // size before allocation. Keys live through apply and are freed together.
     key_blocks: ?*KeyBlock = null,
+    has_accepted_work: bool = false,
     accepted_records: usize = 0,
+    had_spare_metadata: bool = false,
     minimal_key_blocks: bool = false,
     documents: []derived_types.DerivedDocument = &.{},
     target: [1]derived_types.DerivedTargetRef = undefined,
@@ -555,18 +561,46 @@ const ReplayChunkBuilder = struct {
         return @intCast(preferred);
     }
 
+    fn hasOutput(self: *const @This()) bool {
+        return self.changed_doc_keys.items.len != 0 or self.deleted_doc_keys.items.len != 0 or
+            self.overwritten_doc_keys.items.len != 0 or self.changed_artifact_keys.items.len != 0;
+    }
+
+    fn allocateKeyBlock(self: *@This(), bytes: usize) !void {
+        const previous = self.tracked_bytes;
+        try self.observeTrackedBytes(previous +| bytes);
+        errdefer self.observeTrackedBytes(previous) catch {};
+        const memory = try self.alloc.alignedAlloc(u8, .of(KeyBlock), bytes);
+        const block: *KeyBlock = @ptrCast(memory.ptr);
+        block.* = .{ .next = self.key_blocks, .allocation_len = bytes, .used = 0 };
+        self.key_blocks = block;
+    }
+
+    fn compactRecordKeys(self: *@This(), starts: [4]usize) !void {
+        const lists = .{ &self.changed_doc_keys, &self.deleted_doc_keys, &self.overwritten_doc_keys, &self.changed_artifact_keys };
+        const maps = .{ &self.seen_changed_docs, &self.seen_deleted_docs, &self.seen_overwritten_docs, &self.seen_changed_artifacts };
+        var bytes: usize = 0;
+        inline for (lists, starts) |list, start| {
+            for (list.items[start..]) |key| bytes = try std.math.add(usize, bytes, key.len);
+        }
+        if (bytes == 0) return;
+        try self.allocateKeyBlock(try std.math.add(usize, @sizeOf(KeyBlock), bytes));
+        inline for (lists, maps, starts) |list, seen, start| {
+            for (list.items[start..]) |*key| {
+                const entry = seen.getEntry(key.*).?;
+                const owned = try self.copyKey(key.*);
+                entry.key_ptr.* = owned;
+                key.* = owned;
+            }
+        }
+    }
+
     fn copyKey(self: *@This(), value: []const u8) ![]const u8 {
         if (self.key_blocks == null or self.key_blocks.?.allocation_len - @sizeOf(KeyBlock) - self.key_blocks.?.used < value.len) {
             const minimum = std.math.add(usize, @sizeOf(KeyBlock), value.len) catch return error.OutOfMemory;
             const headroom = if (self.resource_manager) |manager| manager.availableAdmissionBytes(.derived_replay_window) else std.math.maxInt(u64);
             const bytes = @max(minimum, self.preferredKeyBlockBytes(headroom));
-            const previous = self.tracked_bytes;
-            try self.observeTrackedBytes(previous +| bytes);
-            errdefer self.observeTrackedBytes(previous) catch {};
-            const memory = try self.alloc.alignedAlloc(u8, .of(KeyBlock), bytes);
-            const block: *KeyBlock = @ptrCast(memory.ptr);
-            block.* = .{ .next = self.key_blocks, .allocation_len = bytes, .used = 0 };
-            self.key_blocks = block;
+            try self.allocateKeyBlock(bytes);
         }
         const block = self.key_blocks.?;
         const start = @sizeOf(KeyBlock) + block.used;
@@ -584,7 +618,9 @@ const ReplayChunkBuilder = struct {
     ) !void {
         if (value.len == 0) return;
         if (seen.contains(value)) return;
-        const owned = try self.copyKey(value);
+        // Compact collection borrows new keys only until appendRecord finishes.
+        // Deduplication precedes allocation of one exact block for the record.
+        const owned = if (self.minimal_key_blocks) value else try self.copyKey(value);
         const prior_list_capacity = list.capacity;
         const prior_seen_capacity = seen.capacity();
         try seen.put(self.alloc, owned, {});
@@ -601,37 +637,83 @@ const ReplayChunkBuilder = struct {
         try self.observeTrackedBytes(next_tracked_bytes);
     }
 
+    fn artifactMatches(key: []const u8, kind: ?db_types.IndexKind) bool {
+        return if (kind) |selected| if (selected == .graph)
+            internal_keys.isGraphEdgeArtifactKey(key) or internal_keys.isAssetArtifactKey(key) or
+                internal_keys.isChunkArtifactRecordKey(key) or internal_keys.isResolutionArtifactKey(key)
+        else
+            internal_keys.isEmbeddingArtifactKey(key) or internal_keys.isDerivedEmbeddingArtifactKey(key) else true;
+    }
+
+    fn reserveKeyMetadata(self: *@This(), list: *std.ArrayListUnmanaged([]const u8), seen: *std.StringHashMapUnmanaged(void), keys: []const []const u8, kind: ?db_types.IndexKind) !void {
+        // Reserve once at the first bulk record of a window, rather than
+        // repeating capacity planning and map probes for subsequent records. Compact admission stays incremental and deduplication-aware.
+        // The bounded hint avoids large reservations for duplicate-heavy records.
+        if (self.minimal_key_blocks or list.items.len != 0 or seen.count() != 0 or keys.len < 16 or keys.len > 128) return;
+        var new_count: usize = 0;
+        for (keys) |key| {
+            if (key.len != 0 and artifactMatches(key, kind) and !seen.contains(key)) new_count += 1;
+        }
+        if (new_count < 16) return;
+        const desired_list = std.ArrayListUnmanaged([]const u8).growCapacity(try std.math.add(usize, list.items.len, new_count));
+        const desired_map = try std.math.add(usize, seen.count(), new_count);
+        const prior_list = list.capacity;
+        const prior_map = seen.capacity();
+        const list_upper = @max(prior_list, desired_list);
+        const map_upper = @max(@as(u64, prior_map), @max(@as(u64, 8), @as(u64, desired_map) *| 4));
+        const upper = @as(u64, list_upper - prior_list) *| @sizeOf([]const u8) +|
+            (map_upper - prior_map) *| @sizeOf([]const u8);
+        if (upper == 0) return;
+        if (self.resource_manager) |manager| {
+            if (upper > manager.availableAdmissionBytes(.derived_replay_window)) return;
+        }
+        const previous = self.tracked_bytes;
+        self.observeTrackedBytes(previous +| upper) catch |err| {
+            // An optional optimization cannot turn concurrent pressure into a
+            // rejection of a record that incremental admission can still fit.
+            if (err == error.ResourceBudgetExceeded) return;
+            return err;
+        };
+        self.had_spare_metadata = true;
+        errdefer self.observeTrackedBytes(previous +|
+            @as(u64, list.capacity - prior_list) * @sizeOf([]const u8) +|
+            @as(u64, seen.capacity() - prior_map) * @sizeOf([]const u8)) catch {};
+        try list.ensureTotalCapacityPrecise(self.alloc, desired_list);
+        try seen.ensureTotalCapacity(self.alloc, std.math.cast(u32, desired_map) orelse return error.Overflow);
+        try self.observeTrackedBytes(previous +|
+            @as(u64, list.capacity - prior_list) * @sizeOf([]const u8) +|
+            @as(u64, seen.capacity() - prior_map) * @sizeOf([]const u8));
+    }
+
+    fn appendKeys(self: *@This(), list: *std.ArrayListUnmanaged([]const u8), seen: *std.StringHashMapUnmanaged(void), keys: []const []const u8, comptime kind: ?db_types.IndexKind) !void {
+        if (keys.len >= 16 and keys.len <= 128) try self.reserveKeyMetadata(list, seen, keys, kind);
+        for (keys) |key| if (artifactMatches(key, kind)) try self.appendUniqueKey(list, seen, key);
+    }
+
     fn appendRecord(self: *@This(), record: change_journal_mod.Record) !void {
+        const starts: [4]usize = if (self.minimal_key_blocks)
+            .{ self.changed_doc_keys.items.len, self.deleted_doc_keys.items.len, self.overwritten_doc_keys.items.len, self.changed_artifact_keys.items.len }
+        else
+            undefined;
         self.item_count +|= recordItemCountForIndex(record, self.index_ref.kind);
         switch (self.index_ref.kind) {
             .full_text, .algebraic => {
-                for (record.changed_doc_keys) |key| try self.appendUniqueKey(&self.changed_doc_keys, &self.seen_changed_docs, key);
-                for (record.deleted_doc_keys) |key| try self.appendUniqueKey(&self.deleted_doc_keys, &self.seen_deleted_docs, key);
-                for (record.overwritten_doc_keys) |key| try self.appendUniqueKey(&self.overwritten_doc_keys, &self.seen_overwritten_docs, key);
+                try self.appendKeys(&self.changed_doc_keys, &self.seen_changed_docs, record.changed_doc_keys, null);
+                try self.appendKeys(&self.deleted_doc_keys, &self.seen_deleted_docs, record.deleted_doc_keys, null);
+                try self.appendKeys(&self.overwritten_doc_keys, &self.seen_overwritten_docs, record.overwritten_doc_keys, null);
             },
             .dense_vector, .sparse_vector => {
-                for (record.changed_doc_keys) |key| try self.appendUniqueKey(&self.changed_doc_keys, &self.seen_changed_docs, key);
-                for (record.deleted_doc_keys) |key| try self.appendUniqueKey(&self.deleted_doc_keys, &self.seen_deleted_docs, key);
-                for (record.overwritten_doc_keys) |key| try self.appendUniqueKey(&self.overwritten_doc_keys, &self.seen_overwritten_docs, key);
-                for (record.changed_artifact_keys) |key| {
-                    if (!internal_keys.isEmbeddingArtifactKey(key) and !internal_keys.isDerivedEmbeddingArtifactKey(key)) continue;
-                    try self.appendUniqueKey(&self.changed_artifact_keys, &self.seen_changed_artifacts, key);
-                }
+                try self.appendKeys(&self.changed_doc_keys, &self.seen_changed_docs, record.changed_doc_keys, null);
+                try self.appendKeys(&self.deleted_doc_keys, &self.seen_deleted_docs, record.deleted_doc_keys, null);
+                try self.appendKeys(&self.overwritten_doc_keys, &self.seen_overwritten_docs, record.overwritten_doc_keys, null);
+                try self.appendKeys(&self.changed_artifact_keys, &self.seen_changed_artifacts, record.changed_artifact_keys, .dense_vector);
             },
             .graph => {
-                for (record.deleted_doc_keys) |key| try self.appendUniqueKey(&self.deleted_doc_keys, &self.seen_deleted_docs, key);
-                for (record.changed_artifact_keys) |key| {
-                    if (!internal_keys.isGraphEdgeArtifactKey(key) and
-                        !internal_keys.isAssetArtifactKey(key) and
-                        !internal_keys.isChunkArtifactRecordKey(key) and
-                        !internal_keys.isResolutionArtifactKey(key))
-                    {
-                        continue;
-                    }
-                    try self.appendUniqueKey(&self.changed_artifact_keys, &self.seen_changed_artifacts, key);
-                }
+                try self.appendKeys(&self.deleted_doc_keys, &self.seen_deleted_docs, record.deleted_doc_keys, null);
+                try self.appendKeys(&self.changed_artifact_keys, &self.seen_changed_artifacts, record.changed_artifact_keys, .graph);
             },
         }
+        if (self.minimal_key_blocks) try self.compactRecordKeys(starts);
         if (self.index_ref.kind == .dense_vector) {
             const vector_bytes = @as(u64, @intCast(countEmbeddingArtifactKeys(record.changed_artifact_keys))) * self.estimatedDenseVectorBytes();
             try self.observeTrackedBytes(self.tracked_bytes +| vector_bytes);
@@ -652,7 +734,7 @@ const ReplayChunkBuilder = struct {
         return false;
     }
 
-    const KeyAdmission = struct { remaining: usize, preferred: usize };
+    const KeyAdmission = struct { remaining: usize, preferred: usize, compact: bool, compact_bytes: u64 = 0 };
 
     fn keyAdmissionBytes(
         list: *const std.ArrayListUnmanaged([]const u8),
@@ -666,14 +748,13 @@ const ReplayChunkBuilder = struct {
         var bytes: u64 = 0;
         for (keys) |key| {
             if (key.len == 0 or seen.contains(key)) continue;
-            if (artifact_kind) |kind| {
-                if (kind == .graph) {
-                    if (!internal_keys.isGraphEdgeArtifactKey(key) and !internal_keys.isAssetArtifactKey(key) and
-                        !internal_keys.isChunkArtifactRecordKey(key) and !internal_keys.isResolutionArtifactKey(key)) continue;
-                } else if (!internal_keys.isEmbeddingArtifactKey(key) and !internal_keys.isDerivedEmbeddingArtifactKey(key)) continue;
-            }
+            if (!artifactMatches(key, artifact_kind)) continue;
             count +|= 1;
             bytes +|= descriptor_bytes;
+            if (key_space.compact) {
+                key_space.compact_bytes +|= key.len;
+                continue;
+            }
             if (key_space.remaining < key.len) {
                 const allocation = @max(@as(u64, key_space.preferred), @as(u64, key.len) +| @sizeOf(KeyBlock));
                 bytes +|= allocation;
@@ -697,6 +778,7 @@ const ReplayChunkBuilder = struct {
         var key_space = KeyAdmission{
             .remaining = if (self.key_blocks) |block| block.allocation_len - @sizeOf(KeyBlock) - block.used else 0,
             .preferred = self.preferredKeyBlockBytes(headroom),
+            .compact = self.minimal_key_blocks,
         };
         var bytes: u64 = 0;
         if (self.index_ref.kind != .graph) {
@@ -710,6 +792,7 @@ const ReplayChunkBuilder = struct {
             bytes +|= keyAdmissionBytes(&self.changed_artifact_keys, &self.seen_changed_artifacts, record.changed_artifact_keys, 0, self.index_ref.kind, &key_space);
         if (self.index_ref.kind == .dense_vector)
             bytes +|= @as(u64, @intCast(countEmbeddingArtifactKeys(record.changed_artifact_keys))) *| self.estimatedDenseVectorBytes();
+        if (key_space.compact_bytes != 0) bytes +|= key_space.compact_bytes +| @sizeOf(KeyBlock);
         return bytes;
     }
 
@@ -801,6 +884,7 @@ fn replayChunkConsumeRecord(ctx: *anyopaque, sequence: u64, payload: []const u8)
         if (builder.scratch_budget) |budget| _ = budget.releaseUnusedCredit();
         if (builder.wouldOverflowWithRecord(record)) return replay_source_mod.StopReplayChunk.StopReplayChunk;
         try builder.appendRecord(record);
+        if (!builder.has_accepted_work) builder.has_accepted_work = builder.hasOutput();
         builder.accepted_records += 1;
         return;
     }
@@ -809,6 +893,7 @@ fn replayChunkConsumeRecord(ctx: *anyopaque, sequence: u64, payload: []const u8)
     defer record.deinit();
     if (builder.wouldOverflowWithRecord(record.record)) return replay_source_mod.StopReplayChunk.StopReplayChunk;
     try builder.appendRecord(record.record);
+    if (!builder.has_accepted_work) builder.has_accepted_work = builder.hasOutput();
     builder.accepted_records += 1;
 }
 
@@ -1925,16 +2010,18 @@ test "replay batch borrows shared text and algebraic targets and clones own thei
     }
 }
 
-fn replayBatchAllocationFailure(alloc: Allocator, kind: db_types.IndexKind) !void {
+fn replayBatchAllocationFailure(alloc: Allocator, kind: db_types.IndexKind, compact: bool) !void {
     var builder = ReplayChunkBuilder.init(alloc, .{ .name = "projection", .kind = kind }, null, 0);
     defer builder.deinit();
-    try builder.appendRecord(.{ .changed_doc_keys = &.{ "a", "b", "c" }, .deleted_doc_keys = &.{"deleted"} });
+    builder.minimal_key_blocks = compact;
+    try builder.appendRecord(.{ .changed_doc_keys = &.{ "a", "b", "c" }, .deleted_doc_keys = &.{"deleted"}, .overwritten_doc_keys = &.{"overwritten"}, .changed_artifact_keys = &.{ "\x01doc\x00\x00\x20embedding\x00\x00index\x00\x00", "\x01doc\x00\x00\x20graph\x00\x00index\x00\x00\x32edge\x00\x00target\x00\x00" } });
     _ = try builder.finishBorrowed(1);
 }
 
 test "replay batch cleans up every allocation failure before borrowed publication" {
-    for ([_]db_types.IndexKind{ .full_text, .algebraic, .dense_vector, .sparse_vector, .graph }) |kind|
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, replayBatchAllocationFailure, .{kind});
+    for ([_]db_types.IndexKind{ .full_text, .algebraic, .dense_vector, .sparse_vector, .graph }) |kind| {
+        for ([_]bool{ false, true }) |compact| try std.testing.checkAllAllocationFailures(std.testing.allocator, replayBatchAllocationFailure, .{ kind, compact });
+    }
 }
 
 test "replay batch budget denial rolls back key ownership" {
@@ -2134,4 +2221,74 @@ test "catchUpIndex drops key block slack before rejecting an otherwise fitting r
     try std.testing.expectEqual(@as(usize, 1), capture.applied_documents);
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
     try std.testing.expect(manager.snapshot().memory.peak_bytes <= 580);
+}
+
+test "catchUpIndex no-op records do not disable compact key admission" {
+    const alloc = std.testing.allocator;
+    var journal = try change_journal_mod.Journal.open("review-noop-admission", testInMemoryJournalOpenOptions());
+    defer journal.close();
+    try appendChangeJournalRecord(&journal, alloc, .{ .sequence = 1, .changed_artifact_keys = &.{"ignored-by-text"}, .target_hints = &.{.full_text} });
+    try appendChangeJournalRecord(&journal, alloc, .{ .sequence = 2, .changed_doc_keys = &.{"a"}, .target_hints = &.{.full_text} });
+    try appendChangeJournalRecord(&journal, alloc, .{ .sequence = 3, .target_hints = &.{.full_text} });
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 580 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+    var capture = TestApplyCapture{ .alloc = alloc };
+    defer capture.deinit();
+    var cursor = try replay_source_mod.Source.fromJournal(&journal).openMatchingCursor(alloc, 0, .full_text);
+    defer cursor.deinit(alloc);
+    const index: index_manager_mod.ManagedIndexRef = .{ .name = "text", .kind = .full_text };
+    const retry = try catchUpIndexFromMatchingCursor(alloc, &cursor, index, &capture, testApplyCapture, .{ .resource_manager = &manager, .max_records_per_window = 2, .max_windows_per_call = 1 });
+    try std.testing.expectEqual(@as(u64, 2), retry.last_applied_sequence);
+    try std.testing.expectEqual(@as(usize, 1), capture.applied_documents);
+}
+
+test "catchUpIndex compact fallback shares one key block per record" {
+    const alloc = std.testing.allocator;
+    var journal = try change_journal_mod.Journal.open("review-header-admission", testInMemoryJournalOpenOptions());
+    defer journal.close();
+    const record: change_journal_mod.Record = .{ .sequence = 1, .changed_doc_keys = &.{ "a", "b" }, .target_hints = &.{.full_text} };
+    try appendChangeJournalRecord(&journal, alloc, record);
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 750 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+    var capture = TestApplyCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const index: index_manager_mod.ManagedIndexRef = .{ .name = "text", .kind = .full_text };
+    const stats = try catchUpIndexWithOptions(alloc, replay_source_mod.Source.fromJournal(&journal), index, 0, &capture, testApplyCapture, .{ .resource_manager = &manager });
+    try std.testing.expectEqual(@as(u64, 1), stats.last_applied_sequence);
+    try std.testing.expectEqual(@as(usize, 2), capture.applied_documents);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expect(manager.snapshot().memory.peak_bytes <= 750);
+}
+
+test "replay metadata hint cannot reject a duplicate-heavy record under a hard budget" {
+    const alloc = std.testing.allocator;
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 600 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+    var builder = ReplayChunkBuilder.init(alloc, .{ .name = "text", .kind = .full_text }, &manager, 0);
+    defer builder.deinit();
+    const repeated = [_][]const u8{"a"} ** 128;
+    try builder.appendRecord(.{ .changed_doc_keys = &repeated });
+    const batch = try builder.finishBorrowed(1);
+    try std.testing.expectEqual(@as(usize, 1), batch.documents.len);
+    try std.testing.expect(manager.snapshot().memory.peak_bytes <= 600);
+}
+
+fn replayMetadataAllocationFailure(alloc: Allocator) !void {
+    var builder = ReplayChunkBuilder.init(alloc, .{ .name = "text", .kind = .full_text }, null, 0);
+    defer builder.deinit();
+    var names: [32][8]u8 = undefined;
+    var keys: [32][]const u8 = undefined;
+    for (&names, &keys, 0..) |*name, *key, i| key.* = try std.fmt.bufPrint(name, "doc-{d}", .{i});
+    try builder.appendRecord(.{ .changed_doc_keys = &keys });
+    _ = try builder.finishBorrowed(1);
+}
+
+test "replay metadata initial reservation releases every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, replayMetadataAllocationFailure, .{});
 }

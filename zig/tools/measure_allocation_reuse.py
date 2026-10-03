@@ -33,9 +33,11 @@ def main():
     parser.add_argument('--replay-sources', nargs='+', choices=['journal', 'primary'], default=['journal'])
     parser.add_argument('--documents-per-record', nargs='+', type=int, default=[1, 128])
     parser.add_argument('--batches', nargs='+', type=int, default=[256, 1024])
+    parser.add_argument('--replay-operation', choices=['replay', 'enrichment', 'latest'], default='replay')
+    parser.add_argument('--repetitions', type=int, default=1)
     parser.add_argument('--replay-only', action='store_true')
     args = parser.parse_args()
-    if min(args.documents, args.dimensions, args.samples, args.vector_samples, *args.documents_per_record, *args.batches) <= 0:
+    if min(args.documents, args.dimensions, args.samples, args.vector_samples, *args.documents_per_record, *args.batches, args.repetitions) <= 0:
         parser.error('counts and sample sizes must be positive')
     args.output.mkdir(parents=True, exist_ok=False)
     binaries = {'baseline': args.baseline_bin.resolve(), 'changed': args.candidate_bin.resolve()}
@@ -53,15 +55,17 @@ def main():
         (args.output / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
 
     for replay_source, kind, records, budgeted, batch in itertools.product(
-            args.replay_sources, args.index_kinds, args.documents_per_record, [False, True], args.batches):
+            args.replay_sources, args.index_kinds, args.documents_per_record, ([False, True] if args.replay_operation == 'replay' else [False]), args.batches):
         for pair in range(args.samples):
             for variant in (['baseline', 'changed'] if pair % 2 == 0 else ['changed', 'baseline']):
                 label = f'replay-{replay_source}-{kind}-{records}-{budgeted}-{batch}-{pair}-{variant}'
                 lines = run(label, [binaries[variant] / 'replay-allocation-bench', args.documents,
-                                   batch, 1, 'budgeted' if budgeted else 'unbudgeted', records, kind, replay_source], env)
+                                   batch, 1, 'budgeted' if budgeted else 'unbudgeted', records, kind, replay_source, args.replay_operation, args.repetitions], env)
                 data = json.loads(next(x for x in lines if x.startswith('{')))
                 if data.get('source', 'journal') != replay_source:
                     raise ValueError('both replay binaries must support the requested source')
+                if data.get('operation', 'replay') != args.replay_operation or data.get('repetitions', 1) != args.repetitions:
+                    raise ValueError('both replay binaries must support the requested operation and repetitions')
                 results.append(dict(workload='replay', variant=variant, pair=pair, **data))
                 print(label, data['elapsed_ns'], flush=True)
                 save()
@@ -87,6 +91,9 @@ def main():
                                         measurement=mode, **data, **counts))
                     print(label, data['run_ns'], flush=True)
                     save()
+    replay_checksums = {x['checksum'] for x in results if x['workload'] == 'replay'}
+    if len(replay_checksums) > 1:
+        raise ValueError('baseline and candidate replay checksums differ')
     summary = {}
     for workload in ['replay', 'vector']:
         groups = sorted({(x.get('source', 'journal'), x.get('index_kind', 'none'), x.get('documents_per_record', 1), x.get('batch', 0),
@@ -102,12 +109,14 @@ def main():
             stats = {f: {v: statistics.median(x[f] for x in xs) for v, xs in group.items()}
                      for f in fields if all(f in x for xs in group.values() for x in xs)}
             for values in stats.values():
-                values['change_percent'] = 100 * (values['changed'] / values['baseline'] - 1)
+                values['change_percent'] = (100 * (values['changed'] / values['baseline'] - 1)
+                                            if values['baseline'] else 0.0 if not values['changed'] else None)
             field = 'elapsed_ns' if workload == 'replay' else 'run_ns'
             ratios = [100 * (next(x[field] for x in group['changed'] if x['pair'] == pair) /
                             next(x[field] for x in group['baseline'] if x['pair'] == pair) - 1)
-                      for pair in range(len(group['baseline']))]
-            stats['paired_elapsed_change_percent_median'] = statistics.median(ratios)
+                      for pair in range(len(group['baseline']))
+                      if next(x[field] for x in group['baseline'] if x['pair'] == pair) != 0]
+            stats['paired_elapsed_change_percent_median'] = statistics.median(ratios) if ratios else None
             summary[f'{workload}-{replay_source}-{kind}-{records}-{batch}-{mode}'] = stats
     (args.output / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
     print(json.dumps(summary, indent=2))
