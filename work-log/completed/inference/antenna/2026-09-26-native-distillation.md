@@ -293,9 +293,57 @@ epoch, Open-Jev hurts score questions, as it left Laya's own eval unchanged
 by three epochs on the step-0 split it helps (0.476 against 0.434, soft
 cross-entropy 1.094 against 1.135), mostly on choice and score questions.
 
+### A clean recipe: only permissively licensed training data
+
+Checking each source's own terms before publishing weights:
+- **AG News:** the AG corpus page restricts it to research and "any other non-commercial activity".
+- **MIT restaurant (and MIT movie):** MIT SLS publishes no license.
+- **CrossNER:** MIT-licensed. Usable.
+
+`scripts/antenna/antenna_training_sets.py` pins permissive training-only sets:
+HuffPost News Category (CC BY 4.0), DBpedia (CC BY-SA 3.0), MASSIVE intents
+and slots (Apache 2.0 / CC BY 4.0), Few-NERD (CC BY-SA 4.0) and MultiCoNER v2
+(CC BY 4.0). `teacher_targets.py --recipe clean` builds stage 3 rows from
+Banking77, HuffPost, DBpedia and MASSIVE intents (classification) and CrossNER
+AI/literature/music, Few-NERD, MASSIVE slots and MultiCoNER v2 (NER).
+
+Large type sets are sampled per row like large label sets: every gold type
+plus negatives, up to 24 queries. With all 66 Few-NERD types, the job stopped
+on `BoundaryQueryLimitExceeded`.
+
+The clean pool is run19's mix with HuffPost (20,000) in place of AG News.
+AG News and MIT restaurant remain evaluation sets only.
+
+Distilling on it (run21) gives 0.655 / 0.372 classification and 0.503 / 0.520
+NER, within noise of run19. A decision head on its trunk (dec7, same
+curriculum) reaches 0.511 on the step-0 typed-decision eval, the best so far
+(0.476 on run17's trunk, 0.443 on run19's).
+
+Stage 3 (run22), grouped by what each run trained on:
+
+| | run20 (AG News, MIT) | run22 (clean) |
+| --- | --- | --- |
+| Banking77 (both trained) | 0.586 | 0.626 |
+| CrossNER AI, literature, music NER (both trained) | 0.696 | 0.698 |
+| CLINC150, SST-5, typed decisions (neither) | 0.388 | 0.372 |
+| CrossNER politics, science, MIT movie NER (neither) | 0.632 | 0.619 |
+| AG News (run20 only) | 0.852 | 0.728 |
+| MIT restaurant (run20 only) | 0.778 | 0.436 |
+
+The clean model matches on everything both runs saw or both held out. It
+loses restaurant-style slot NER, which MASSIVE's assistant-command slots
+don't replace. The private Hugging Face repo antflydb/antenna-0 now holds the
+clean `student/` (run21), `gliner/` (run22) and `decision/` (dec7). Its git
+history still has the earlier version.
+
+Run21 finished on the throughput branch (#959). Resumed from its own pause
+checkpoint, it ran at 209 microbatches per minute against 49, with
+bit-identical losses.
+
 ## Next
 
-- Evaluate run19 and its stage 3 against run18.
+- A permissive restaurant-style slot set (SNIPS, license to confirm) for the
+  clean stage 3.
 - Decision head on run19's trunk, with the same curriculum.
 - Classification markers are the remaining gap. The mixed pool has 216 real
   class names and fills the rest of each label list from entity types; add

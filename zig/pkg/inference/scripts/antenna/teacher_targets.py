@@ -233,12 +233,24 @@ def entity_rows(
                 }
                 for index, (start, end, kind) in enumerate(sorted(set(spans)))
             ]
+            # Large type sets (Few-NERD's 66, MASSIVE's 55) are sampled per
+            # row like large label sets: every type the row's spans use, plus
+            # shuffled negatives, within the job's query budget.
+            schema_types = types
+            if len(types) > args.max_labels:
+                present = sorted({kind for _, _, kind in spans})
+                count = max(len(present), rng.randint(args.min_labels, args.max_labels))
+                schema_types = present + rng.sample(
+                    [kind for kind in types if kind not in present],
+                    count - len(present),
+                )
+                rng.shuffle(schema_types)
             rows.append(
                 {
                     "version": 1,
                     "id": record["id"],
                     "text": text,
-                    "schema": {"entities": types},
+                    "schema": {"entities": schema_types},
                     "entities": entities,
                 }
             )
