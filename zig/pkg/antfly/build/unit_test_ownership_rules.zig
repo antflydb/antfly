@@ -27,6 +27,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
             "api.indexes.consumerTests.Suite.test.serviceable full text replacement remains queryable while rebuilding",
             "api.openapi_contract.test.",
             "api.public_table_http.test.query dependency errors expose a stable JSON retry contract",
+            "api.table_reads.consumerTests.Suite.test.api query contract graph evaluation preserves base hit paging and shard windows",
             "api.restore_jobs.test.",
             "api.table_writes.implementationTests.Suite.test.provisioned table write source drop table waits for active read cache lease",
             "api.table_writes.implementationTests.Suite.test.write cache retirement is allocation-free after entry installation",

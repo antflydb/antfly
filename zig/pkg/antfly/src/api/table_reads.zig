@@ -3226,11 +3226,15 @@ fn lookupRoutingDeadline(catalog: table_catalog.CatalogSource, opts: db_mod.type
     return catalog.deadlineFrom(.{ .deadline_ns = opts.execution_deadline_ns, .io = opts.execution_io });
 }
 
+fn scanRoutingDeadline(catalog: table_catalog.CatalogSource, opts: db_mod.types.ScanOptions) ?u64 {
+    return catalog.deadlineFrom(.{ .deadline_ns = opts.execution_deadline_ns });
+}
+
 fn provisionedConsistencyDeadline(catalog: table_catalog.CatalogSource, request: ProvisionedConsistencyRequest) ?u64 {
     return switch (request) {
         .search => |req| queryRoutingDeadline(catalog, req),
         .lookup => |lookup| lookupRoutingDeadline(catalog, lookup.opts),
-        .scan => null,
+        .scan => |scan_request| scanRoutingDeadline(catalog, scan_request.opts),
     };
 }
 
@@ -7203,7 +7207,7 @@ pub const HostedProvisionedTableReadSource = struct {
     fn openRelationalRead(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?@import("table_read_source.zig").RelationalReadView {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         if (self.local_read_source == null) return try self.openRemoteRelationalRead(alloc, table, from, to, opts, consistency);
-        var snapshot = try table_catalog.routedSpanSnapshotUntil(alloc, self.catalog, table, from, to, opts.execution_deadline_ns);
+        var snapshot = try table_catalog.routedSpanSnapshotUntil(alloc, self.catalog, table, from, to, scanRoutingDeadline(self.catalog, opts));
         defer snapshot.deinit(alloc);
         if (snapshot.group_ids.len != 1) return try self.openRemoteRelationalRead(alloc, table, from, to, opts, consistency);
         const group = snapshot.group_ids[0];
@@ -7216,7 +7220,7 @@ pub const HostedProvisionedTableReadSource = struct {
         const local_source = self.groupLocalSourceWithFence(fence);
         const view = (try local_source.openRelationalReadGroupLocal(alloc, group, table, from, to, opts, consistency)) orelse return null;
         errdefer view.deinit();
-        try table_catalog.validatePinnedTopologyEpochUntil(alloc, self.catalog, table, snapshot.topology_epoch, opts.execution_deadline_ns);
+        try table_catalog.validatePinnedTopologyEpochUntil(alloc, self.catalog, table, snapshot.topology_epoch, scanRoutingDeadline(self.catalog, opts));
         return view;
     }
 
@@ -7247,12 +7251,12 @@ pub const HostedProvisionedTableReadSource = struct {
         sink: ScanStreamSink,
     ) !bool {
         const hosted: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        var routing_session = try table_catalog.RoutingSession.initForRoute(alloc, hosted.catalog, table_name, .{ .span = .{ .from_key = from_key, .to_key = to_key } }, opts.execution_deadline_ns);
+        var routing_session = try table_catalog.RoutingSession.initForRoute(alloc, hosted.catalog, table_name, .{ .span = .{ .from_key = from_key, .to_key = to_key } }, scanRoutingDeadline(hosted.catalog, opts));
         defer routing_session.deinit();
         var routed_source = hosted.*;
         routed_source.catalog = routing_session.catalog();
         const self = &routed_source;
-        var route_snapshot = try table_catalog.routedSpanSnapshotUntil(alloc, self.catalog, table_name, from_key, to_key, opts.execution_deadline_ns);
+        var route_snapshot = try table_catalog.routedSpanSnapshotUntil(alloc, self.catalog, table_name, from_key, to_key, scanRoutingDeadline(self.catalog, opts));
         defer route_snapshot.deinit(alloc);
         const group_ids = route_snapshot.group_ids;
         if (group_ids.len == 0) return false;
@@ -7295,7 +7299,7 @@ pub const HostedProvisionedTableReadSource = struct {
             if (ordered) |*merge| try merge.endGroup();
         }
         if (ordered) |*merge| {
-            try table_catalog.validatePinnedTopologyEpochUntil(alloc, hosted.catalog, table_name, route_snapshot.topology_epoch, opts.execution_deadline_ns);
+            try table_catalog.validatePinnedTopologyEpochUntil(alloc, hosted.catalog, table_name, route_snapshot.topology_epoch, scanRoutingDeadline(hosted.catalog, opts));
             const result = try merge.finishAlloc();
             defer alloc.free(result);
             _ = try scanRemainingTimeoutMs(opts);
@@ -18639,6 +18643,17 @@ fn consumerTests() type {
             try std.testing.expect(deadline > routing_now);
             try std.testing.expect(deadline <= routing_now + 5 * ns);
             try std.testing.expectEqual(native_deadline, req.execution_deadline_ns.?);
+            const scan_opts = db_mod.types.ScanOptions{ .execution_deadline_ns = native_deadline };
+            const scan_deadline = scanRoutingDeadline(catalog, scan_opts).?;
+            try std.testing.expect(scan_deadline > routing_now);
+            try std.testing.expect(scan_deadline <= routing_now + 5 * ns);
+            try std.testing.expectEqual(native_deadline, scan_opts.execution_deadline_ns.?);
+            try catalog.budget(scan_deadline).checkpoint();
+            try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, catalog.budget(scanRoutingDeadline(catalog, .{ .execution_deadline_ns = 0 })).checkpoint());
+            try std.testing.expect(scanRoutingDeadline(catalog, .{}) == null);
+            const consistency_scan_deadline = provisionedConsistencyDeadline(catalog, .{ .scan = .{ .from_key = "", .to_key = "", .opts = scan_opts } }).?;
+            try std.testing.expect(consistency_scan_deadline > routing_now);
+            try std.testing.expect(consistency_scan_deadline <= routing_now + 5 * ns);
             try catalog.budget(deadline).checkpoint();
             try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, catalog.budget(queryRoutingDeadline(catalog, .{ .execution_deadline_ns = 0 })).checkpoint());
             try std.testing.expect(queryRoutingDeadline(catalog, .{}) == null);
@@ -18707,6 +18722,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(?u64, 123), lookupRoutingDeadline(catalog, .{ .execution_deadline_ns = 123, .execution_io = catalog.io }));
             const native_routes = table_catalog.CatalogSource{ .ptr = undefined, .vtable = undefined };
             try std.testing.expectEqual(native_deadline, queryRoutingDeadline(native_routes, req).?);
+            try std.testing.expectEqual(native_deadline, scanRoutingDeadline(native_routes, scan_opts).?);
         }
 
         test "graph table queries have one fresh-topology retry" {
